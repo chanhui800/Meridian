@@ -156,7 +156,17 @@
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
       Router.register('traffic', renderTraffic);
-      Router.register('diagnostics', renderDiag);
+      if (typeof renderDiag === 'function') {
+        Router.register('diagnostics', renderDiag);
+      } else {
+        console.error('renderDiag is not defined; diagnostics page script failed to load');
+        Router.register('diagnostics', function() {
+          var page = document.getElementById('page-diagnostics');
+          if (page) {
+            page.innerHTML = '<div class="diag-card diag-card-wide"><div class="diag-empty">诊断页面脚本加载失败，请强制刷新浏览器缓存后重试。</div></div>';
+          }
+        });
+      }
       Router.init();
       appBootstrapped = true;
     }
