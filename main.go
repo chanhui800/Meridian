@@ -174,6 +174,7 @@ type DB struct {
 }
 
 func openDB(path string) (*DB, error) {
+	setSecureFileCreationMask()
 	sqlDB, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
@@ -181,9 +182,27 @@ func openDB(path string) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 	d := &DB{db: sqlDB}
 	if err := d.migrate(); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	if err := hardenDatabaseFilePermissions(path); err != nil {
+		sqlDB.Close()
 		return nil, err
 	}
 	return d, nil
+}
+
+func hardenDatabaseFilePermissions(path string) error {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		// #nosec G703 -- the database path is operator-controlled and never derived from a request.
+		if err := os.Chmod(candidate, 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("secure database file %s: %w", candidate, err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) Close() { d.db.Close() }
