@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,6 +64,15 @@ func decodeBody(t *testing.T, rr *httptest.ResponseRecorder) map[string]interfac
 		t.Fatalf("decode response: %v body=%s", err, rr.Body.String())
 	}
 	return body
+}
+
+func mustUserCount(t *testing.T, db *DB) int {
+	t.Helper()
+	count, err := db.UserCount()
+	if err != nil {
+		t.Fatalf("UserCount: %v", err)
+	}
+	return count
 }
 
 func TestGenerateTokenPreservesSpecialCharacters(t *testing.T) {
@@ -467,6 +477,32 @@ func TestPrepareWebSocketUpstreamHeadersRebuildsForwardingHeaders(t *testing.T) 
 	}
 }
 
+func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
+	var siteTraffic atomic.Int64
+	siteTraffic.Store(10 << 20)
+	recorder := httptest.NewRecorder()
+	writer := &rateLimitedWriter{
+		ResponseWriter: recorder,
+		bytesPerSec:    1024,
+		written:        &siteTraffic,
+		start:          time.Now().Add(-time.Second),
+	}
+	payload := bytes.Repeat([]byte("x"), 512)
+	n, err := writer.Write(payload)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len(payload) || recorder.Body.Len() != len(payload) {
+		t.Fatalf("wrote=%d body=%d, want %d", n, recorder.Body.Len(), len(payload))
+	}
+	if writer.requestWritten != int64(len(payload)) {
+		t.Fatalf("requestWritten = %d, want %d", writer.requestWritten, len(payload))
+	}
+	if got := siteTraffic.Load(); got != (10<<20)+int64(len(payload)) {
+		t.Fatalf("site traffic = %d, want %d", got, (10<<20)+len(payload))
+	}
+}
+
 func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	css, err := web.StaticFiles.ReadFile("static/css/style.css")
 	if err != nil {
@@ -507,6 +543,9 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
+	}
+	if strings.Contains(string(indexHTML), "fonts.googleapis.com") || strings.Contains(string(indexHTML), "fonts.gstatic.com") {
+		t.Error("index must not request fonts blocked by the Content-Security-Policy")
 	}
 }
 
@@ -625,7 +664,7 @@ func TestSetupRequiresTokenAndCreatesOnlyOneAdmin(t *testing.T) {
 	if wrong.Code != http.StatusForbidden {
 		t.Fatalf("wrong setup token status = %d, want 403", wrong.Code)
 	}
-	if got := app.db.UserCount(); got != 0 {
+	if got := mustUserCount(t, app.db); got != 0 {
 		t.Fatalf("user count after rejected setup = %d, want 0", got)
 	}
 
@@ -637,7 +676,7 @@ func TestSetupRequiresTokenAndCreatesOnlyOneAdmin(t *testing.T) {
 	if ok.Code != http.StatusOK {
 		t.Fatalf("valid setup status = %d body=%s", ok.Code, ok.Body.String())
 	}
-	if got := app.db.UserCount(); got != 1 {
+	if got := mustUserCount(t, app.db); got != 1 {
 		t.Fatalf("user count after setup = %d, want 1", got)
 	}
 }
@@ -673,7 +712,7 @@ func TestCreateInitialUserIsAtomic(t *testing.T) {
 	if created != 1 || alreadyExists != contenders-1 {
 		t.Fatalf("created=%d alreadyExists=%d, want 1 and %d", created, alreadyExists, contenders-1)
 	}
-	if got := app.db.UserCount(); got != 1 {
+	if got := mustUserCount(t, app.db); got != 1 {
 		t.Fatalf("user count = %d, want 1", got)
 	}
 }
@@ -764,6 +803,27 @@ func TestHandleAuthCheckExposesConfiguredSingleAdminMode(t *testing.T) {
 	}
 }
 
+func TestDatabaseReadFailuresAreReported(t *testing.T) {
+	app := newTestApp(t)
+	app.db.Close()
+	if _, err := app.db.UserCount(); err == nil {
+		t.Fatal("UserCount unexpectedly ignored a closed database")
+	}
+	if _, err := app.db.DashboardStats(); err == nil {
+		t.Fatal("DashboardStats unexpectedly ignored a closed database")
+	}
+	if _, err := app.pm.StartAllEnabled(); err == nil {
+		t.Fatal("StartAllEnabled unexpectedly ignored a closed database")
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/check", nil)
+	app.handleAuthCheck(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("auth check status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestDiagnoseSiteUsesRootSystemInfoProbe(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/System/Info/Public" {
@@ -780,6 +840,9 @@ func TestDiagnoseSiteUsesRootSystemInfoProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
+	inst := &ProxyInstance{Site: *site, startedAt: time.Now().Add(-3 * time.Second)}
+	inst.reqCount.Store(7)
+	app.pm.proxies[site.ID] = inst
 
 	result := diagnoseSite(site, app.pm)
 	if result.Health.Status != "online" {
@@ -799,6 +862,15 @@ func TestDiagnoseSiteUsesRootSystemInfoProbe(t *testing.T) {
 	}
 	if result.Health.Probe.HTTPStatus != http.StatusOK {
 		t.Fatalf("probe.http_status = %d, want 200", result.Health.Probe.HTTPStatus)
+	}
+	if !result.Proxy.Running {
+		t.Fatal("proxy.running = false, want true")
+	}
+	if result.Proxy.TotalReqs != 7 {
+		t.Fatalf("proxy.total_requests = %d, want 7", result.Proxy.TotalReqs)
+	}
+	if result.Proxy.Uptime == "" {
+		t.Fatal("proxy.uptime is empty for a running site")
 	}
 }
 
@@ -1300,6 +1372,9 @@ func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
+	if got := rr.Result().Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
 
 	var site Site
 	if err := json.Unmarshal(rr.Body.Bytes(), &site); err != nil {
@@ -1315,6 +1390,34 @@ func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 	}
 	if reloaded.PlaybackTargetURL != "https://media.example.com" {
 		t.Fatalf("persisted playback_target_url = %q, want %q", reloaded.PlaybackTargetURL, "https://media.example.com")
+	}
+}
+
+func TestStartSiteRejectsCorruptStreamHosts(t *testing.T) {
+	app := newTestApp(t)
+	base := Site{
+		ID:           999,
+		Name:         "corrupt-stream-hosts",
+		ListenPort:   freePort(t),
+		TargetURL:    "http://127.0.0.1:8096",
+		PlaybackMode: "direct",
+		UAMode:       "infuse",
+		Enabled:      true,
+	}
+
+	invalidJSON := base
+	invalidJSON.StreamHosts = "{"
+	if err := app.pm.StartSite(invalidJSON); err == nil || !strings.Contains(err.Error(), "invalid stream_hosts") {
+		t.Fatalf("invalid JSON error = %v", err)
+	}
+
+	invalidURL := base
+	invalidURL.StreamHosts = `["file://media.example.com/path"]`
+	if err := app.pm.StartSite(invalidURL); err == nil || !strings.Contains(err.Error(), "invalid stream host") {
+		t.Fatalf("invalid stream host error = %v", err)
+	}
+	if app.pm.IsRunning(base.ID) {
+		t.Fatal("corrupt site unexpectedly started")
 	}
 }
 

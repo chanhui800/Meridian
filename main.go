@@ -347,10 +347,12 @@ type TrafficLog struct {
 	RecordedAt string `json:"recorded_at"`
 }
 
-func (d *DB) UserCount() int {
+func (d *DB) UserCount() (int, error) {
 	var n int
-	d.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n)
-	return n
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (d *DB) CreateUser(username, password string) (int64, error) {
@@ -569,17 +571,23 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	return logs, nil
 }
 
-func (d *DB) DashboardStats() map[string]interface{} {
+func (d *DB) DashboardStats() (map[string]interface{}, error) {
 	var total, online int
-	d.db.QueryRow("SELECT COUNT(*) FROM sites").Scan(&total)
-	d.db.QueryRow("SELECT COUNT(*) FROM sites WHERE enabled=1").Scan(&online)
 	var totalTraffic int64
-	d.db.QueryRow("SELECT COALESCE(SUM(traffic_used),0) FROM sites").Scan(&totalTraffic)
+	if err := d.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(traffic_used), 0)
+		FROM sites
+	`).Scan(&total, &online, &totalTraffic); err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
 		"total_sites":   total,
 		"online_sites":  online,
 		"total_traffic": totalTraffic,
-	}
+	}, nil
 }
 
 type redirectFollowTransport struct {
@@ -639,6 +647,7 @@ type ProxyInstance struct {
 	Site             Site
 	server           *http.Server
 	listener         net.Listener
+	startedAt        time.Time
 	bytesIn          atomic.Int64
 	bytesOut         atomic.Int64
 	reqCount         atomic.Int64
@@ -699,9 +708,10 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 
 type rateLimitedWriter struct {
 	http.ResponseWriter
-	bytesPerSec int64
-	written     *atomic.Int64
-	start       time.Time
+	bytesPerSec    int64
+	written        *atomic.Int64
+	requestWritten int64
+	start          time.Time
 }
 
 func (w *rateLimitedWriter) Write(b []byte) (int, error) {
@@ -716,7 +726,7 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 		if elapsed < 0.001 {
 			elapsed = 0.001
 		}
-		allowed := int64(elapsed*float64(w.bytesPerSec)) - w.written.Load()
+		allowed := int64(elapsed*float64(w.bytesPerSec)) - w.requestWritten
 		if allowed <= 0 {
 			time.Sleep(10 * time.Millisecond)
 			continue
@@ -727,10 +737,14 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 		}
 		n, err := w.ResponseWriter.Write(chunk)
 		w.written.Add(int64(n))
+		w.requestWritten += int64(n)
 		totalWritten += n
 		b = b[n:]
 		if err != nil {
 			return totalWritten, err
+		}
+		if n == 0 {
+			return totalWritten, io.ErrNoProgress
 		}
 	}
 	return totalWritten, nil
@@ -1097,20 +1111,24 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		playbackHostsSet[redirectHostKey(playbackTarget)] = true
 	}
 	var extraHosts []string
-	if site.StreamHosts != "" && site.StreamHosts != "[]" {
-		json.Unmarshal([]byte(site.StreamHosts), &extraHosts)
+	if strings.TrimSpace(site.StreamHosts) != "" {
+		if err := json.Unmarshal([]byte(site.StreamHosts), &extraHosts); err != nil {
+			return fmt.Errorf("invalid stream_hosts: %w", err)
+		}
 	}
 	for _, raw := range extraHosts {
-		if parsed, e := normalizeTargetURL(raw); e == nil {
-			playbackHostsSet[redirectHostKey(parsed)] = true
-			if playbackTarget == nil {
-				playbackTarget = parsed
-			}
+		parsed, err := normalizeTargetURL(raw)
+		if err != nil {
+			return fmt.Errorf("invalid stream host %q: %w", raw, err)
+		}
+		playbackHostsSet[redirectHostKey(parsed)] = true
+		if playbackTarget == nil {
+			playbackTarget = parsed
 		}
 	}
 
 	profile := getUAProfile(site.UAMode)
-	inst := &ProxyInstance{Site: site}
+	inst := &ProxyInstance{Site: site, startedAt: time.Now()}
 	inst.persistedTraffic.Store(site.TrafficUsed)
 
 	isRedirectMode := playbackTarget != nil && site.PlaybackMode == "redirect"
@@ -1257,8 +1275,11 @@ func (pm *ProxyManager) IsRunning(id int64) bool {
 	return ok
 }
 
-func (pm *ProxyManager) StartAllEnabled() {
-	sites, _ := pm.database.ListSites()
+func (pm *ProxyManager) StartAllEnabled() (int, error) {
+	sites, err := pm.database.ListSites()
+	if err != nil {
+		return 0, err
+	}
 	for _, s := range sites {
 		if s.Enabled {
 			if err := pm.StartSite(s); err != nil {
@@ -1266,6 +1287,7 @@ func (pm *ProxyManager) StartAllEnabled() {
 			}
 		}
 	}
+	return len(sites), nil
 }
 
 // Flush traffic counters to DB periodically
@@ -1298,6 +1320,16 @@ func (pm *ProxyManager) GetRunningCount() int {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return len(pm.proxies)
+}
+
+func (pm *ProxyManager) GetSiteRuntime(id int64) (requests int64, startedAt time.Time, running bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	inst, ok := pm.proxies[id]
+	if !ok {
+		return 0, time.Time{}, false
+	}
+	return inst.reqCount.Load(), inst.startedAt, true
 }
 
 // GracefulShutdown stops all proxies gracefully
@@ -1761,9 +1793,20 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	}
 
 	// Proxy status
+	totalRequests, startedAt, running := pm.GetSiteRuntime(site.ID)
+	uptime := ""
+	if running && !startedAt.IsZero() {
+		duration := time.Since(startedAt).Round(time.Second)
+		if duration < 0 {
+			duration = 0
+		}
+		uptime = duration.String()
+	}
 	result.Proxy = DiagProxy{
-		Running:    pm.IsRunning(site.ID),
+		Running:    running,
 		ListenPort: site.ListenPort,
+		TotalReqs:  totalRequests,
+		Uptime:     uptime,
 	}
 
 	return result
@@ -1983,15 +2026,20 @@ func staticHandler(staticFS fs.FS) http.Handler {
 	})
 }
 
-func (a *App) jsonOK(w http.ResponseWriter, data interface{}) {
+func (a *App) jsonResponse(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("write JSON response: %v", err)
+	}
+}
+
+func (a *App) jsonOK(w http.ResponseWriter, data interface{}) {
+	a.jsonResponse(w, http.StatusOK, data)
 }
 
 func (a *App) jsonErr(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	a.jsonResponse(w, status, map[string]string{"error": msg})
 }
 
 func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -2016,7 +2064,12 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, 405, "method not allowed")
 		return
 	}
-	if a.db.UserCount() > 0 {
+	userCount, err := a.db.UserCount()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "setup status unavailable")
+		return
+	}
+	if userCount > 0 {
 		a.jsonErr(w, 400, "admin user already exists")
 		return
 	}
@@ -2110,7 +2163,12 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	needsSetup := a.db.UserCount() == 0
+	userCount, err := a.db.UserCount()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "setup status unavailable")
+		return
+	}
+	needsSetup := userCount == 0
 	a.jsonOK(w, map[string]interface{}{
 		"needs_setup":          needsSetup,
 		"mode":                 "single_admin",
@@ -2121,7 +2179,11 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/dashboard
 func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	stats := a.db.DashboardStats()
+	stats, err := a.db.DashboardStats()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "dashboard unavailable")
+		return
+	}
 	stats["running_sites"] = a.pm.GetRunningCount()
 	a.jsonOK(w, stats)
 }
@@ -2199,8 +2261,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		w.WriteHeader(201)
-		a.jsonOK(w, site)
+		a.jsonResponse(w, http.StatusCreated, site)
 
 	default:
 		a.jsonErr(w, 405, "method not allowed")
@@ -2364,7 +2425,11 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/traffic/")
 
 	if path == "overview" {
-		stats := a.db.DashboardStats()
+		stats, err := a.db.DashboardStats()
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "traffic overview unavailable")
+			return
+		}
 		a.jsonOK(w, stats)
 		return
 	}
@@ -2420,20 +2485,29 @@ func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Send initial data immediately
-	a.sendSSEEvent(w, flusher)
+	if err := a.sendSSEEvent(w, flusher); err != nil {
+		log.Printf("send initial SSE event: %v", err)
+		return
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			a.sendSSEEvent(w, flusher)
+			if err := a.sendSSEEvent(w, flusher); err != nil {
+				log.Printf("send SSE event: %v", err)
+				return
+			}
 		}
 	}
 }
 
-func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) {
-	stats := a.db.DashboardStats()
+func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
+	stats, err := a.db.DashboardStats()
+	if err != nil {
+		return err
+	}
 	stats["running_sites"] = a.pm.GetRunningCount()
 	stats["total_requests"] = a.pm.GetTotalRequests()
 	stats["uptime_seconds"] = int(time.Since(startTime).Seconds())
@@ -2454,15 +2528,21 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) {
 	a.pm.mu.RUnlock()
 	stats["live_sites"] = siteStats
 
-	data, _ := json.Marshal(stats)
-	fmt.Fprintf(w, "data: %s\n\n", data) // #nosec G705 -- json.Marshal escapes control characters before the SSE frame is written.
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil { // #nosec G705 -- json.Marshal escapes control characters before the SSE frame is written.
+		return err
+	}
 	flusher.Flush()
+	return nil
 }
 
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.4.0"
+var appVersion = "v1.4.2"
 
 func main() {
 	port := 9090
@@ -2506,7 +2586,10 @@ func main() {
 	defer db.Close()
 
 	pm := NewProxyManager(db)
-	pm.StartAllEnabled()
+	loadedSiteCount, err := pm.StartAllEnabled()
+	if err != nil {
+		log.Fatalf("failed to load sites: %v", err)
+	}
 
 	// Traffic flush goroutine with context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2526,7 +2609,11 @@ func main() {
 	}()
 
 	setupToken := ""
-	if db.UserCount() == 0 {
+	userCount, err := db.UserCount()
+	if err != nil {
+		log.Fatalf("failed to count users: %v", err)
+	}
+	if userCount == 0 {
 		setupToken = strings.TrimSpace(os.Getenv("SETUP_TOKEN"))
 		if setupToken == "" {
 			setupToken, err = generateSetupToken()
@@ -2589,7 +2676,7 @@ func main() {
 	log.Println("============================================================")
 	log.Printf("  Meridian - Emby reverse proxy management panel %s", appVersion)
 	log.Printf("  Listening on: http://0.0.0.0%s", addr)
-	log.Printf("  Sites loaded: %d (%d running)", func() int { s, _ := db.ListSites(); return len(s) }(), pm.GetRunningCount())
+	log.Printf("  Sites loaded: %d (%d running)", loadedSiteCount, pm.GetRunningCount())
 	log.Println("  Features: WebSocket proxy, TLS diagnostics, traffic limits")
 	log.Println("============================================================")
 
