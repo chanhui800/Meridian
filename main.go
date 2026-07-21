@@ -608,9 +608,7 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if err != nil {
 			break
 		}
-		if locURL.Host == "" {
-			locURL = req.URL.ResolveReference(locURL)
-		}
+		locURL = req.URL.ResolveReference(locURL)
 		locURL.Scheme = strings.ToLower(locURL.Scheme)
 		if (locURL.Scheme != "http" && locURL.Scheme != "https") || !t.playbackHosts[redirectHostKey(locURL)] {
 			break
@@ -941,6 +939,60 @@ func applyUAProfileHeaders(header http.Header, profile UAProfile) {
 	}
 }
 
+func removeClientForwardingHeaders(header http.Header) {
+	for name := range header {
+		lowerName := strings.ToLower(name)
+		if lowerName == "forwarded" || lowerName == "x-real-ip" || strings.HasPrefix(lowerName, "x-forwarded-") {
+			delete(header, name)
+		}
+	}
+}
+
+func setTrustedForwardingHeaders(header http.Header, inbound *http.Request) {
+	removeClientForwardingHeaders(header)
+	if inbound == nil {
+		return
+	}
+	if peerIP := remoteAddressIP(inbound.RemoteAddr); peerIP != nil {
+		header.Set("X-Forwarded-For", peerIP.String())
+		header.Set("X-Real-IP", peerIP.String())
+	}
+	if inbound.Host != "" {
+		header.Set("X-Forwarded-Host", inbound.Host)
+	}
+	forwardedProto := "http"
+	if inbound.TLS != nil {
+		forwardedProto = "https"
+	}
+	header.Set("X-Forwarded-Proto", forwardedProto)
+}
+
+func prepareUpstreamHeaders(header http.Header, inbound *http.Request, profile UAProfile) {
+	setTrustedForwardingHeaders(header, inbound)
+	applyUAProfileHeaders(header, profile)
+}
+
+func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, profile UAProfile) http.Header {
+	header := inbound.Header.Clone()
+	for _, name := range []string{
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Proxy-Connection",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+	} {
+		header.Del(name)
+	}
+	header.Set("Connection", "Upgrade")
+	header.Set("Upgrade", "websocket")
+	header.Set("Host", target.Host)
+	prepareUpstreamHeaders(header, inbound, profile)
+	return header
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, profile UAProfile, inst *ProxyInstance) {
 	scheme := "ws"
 	if target.Scheme == "https" {
@@ -995,9 +1047,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, pr
 		log.Printf("[WS] write request line: %v", err)
 		return
 	}
-	r.Header.Set("Host", target.Host)
-	applyUAProfileHeaders(r.Header, profile)
-	if err := r.Header.Write(upstreamConn); err != nil {
+	upstreamHeader := prepareWebSocketUpstreamHeaders(r, target, profile)
+	if err := upstreamHeader.Write(upstreamConn); err != nil {
 		log.Printf("[WS] write request headers: %v", err)
 		return
 	}
@@ -1070,16 +1121,16 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	proxy := &httputil.ReverseProxy{
 		Transport: proxyTransport,
-		Director: func(req *http.Request) {
+		Rewrite: func(proxyReq *httputil.ProxyRequest) {
 			var upstream *url.URL
 			if isRedirectMode {
 				upstream = target
 			} else {
-				upstream = upstreamTargetForRequest(req, target, playbackTarget)
+				upstream = upstreamTargetForRequest(proxyReq.In, target, playbackTarget)
 			}
-			applyUpstreamURL(req.URL, upstream)
-			req.Host = upstream.Host
-			applyUAProfileHeaders(req.Header, profile)
+			applyUpstreamURL(proxyReq.Out.URL, upstream)
+			proxyReq.Out.Host = upstream.Host
+			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, profile)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[%s] proxy error: %v", site.Name, err)

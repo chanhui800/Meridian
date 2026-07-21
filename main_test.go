@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -288,6 +289,44 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 		}
 	})
 
+	t.Run("follows protocol-relative redirect", func(t *testing.T) {
+		calls := 0
+		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"//media.example.com/custom/play/path"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("proxied")),
+				Request:    req,
+			}, nil
+		})
+		transport := &redirectFollowTransport{
+			base:          base,
+			playbackHosts: map[string]bool{redirectHostKey(configured): true},
+			profile:       getUAProfile("infuse"),
+		}
+		req := httptest.NewRequest(http.MethodGet, "https://api.example.com/custom/play/path", nil)
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != 2 || resp.StatusCode != http.StatusOK {
+			t.Fatalf("protocol-relative redirect calls=%d status=%d, want calls=2 status=200", calls, resp.StatusCode)
+		}
+		if got := resp.Request.URL.String(); got != "https://media.example.com/custom/play/path" {
+			t.Fatalf("protocol-relative redirect URL = %q", got)
+		}
+	})
+
 	t.Run("does not follow POST request", func(t *testing.T) {
 		calls := 0
 		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -314,6 +353,118 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 			t.Fatalf("API redirect calls=%d status=%d, want calls=1 status=307", calls, resp.StatusCode)
 		}
 	})
+}
+
+func TestReverseProxyRebuildsForwardingHeadersAfterHopHeaderRemoval(t *testing.T) {
+	target, err := normalizeTargetURL("https://upstream.example.com/emby")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	profile := getUAProfile("infuse")
+	var captured *http.Request
+	proxy := &httputil.ReverseProxy{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			captured = req.Clone(req.Context())
+			captured.Header = req.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		}),
+		Rewrite: func(proxyReq *httputil.ProxyRequest) {
+			applyUpstreamURL(proxyReq.Out.URL, target)
+			proxyReq.Out.Host = target.Host
+			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, profile)
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://meridian.example:50001/Videos/1/stream", nil)
+	req.RemoteAddr = "198.51.100.24:43210"
+	req.Header.Set("Connection", "User-Agent, X-Forwarded-For")
+	req.Header.Set("User-Agent", "attacker-controlled")
+	req.Header.Set("Forwarded", "for=203.0.113.8;proto=https")
+	req.Header.Set("X-Forwarded-For", "203.0.113.8")
+	req.Header.Set("X-Forwarded-Host", "attacker.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Custom", "must-not-pass")
+	req.Header.Set("X-Real-IP", "203.0.113.9")
+	rr := httptest.NewRecorder()
+	proxy.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if captured == nil {
+		t.Fatal("transport did not receive an outbound request")
+	}
+	if captured.URL.String() != "https://upstream.example.com/emby/Videos/1/stream" {
+		t.Fatalf("outbound URL = %q", captured.URL.String())
+	}
+	if captured.Host != target.Host {
+		t.Fatalf("outbound Host = %q, want %q", captured.Host, target.Host)
+	}
+	if got := captured.Header.Get("User-Agent"); got != profile.UserAgent {
+		t.Fatalf("outbound User-Agent = %q, want profile value %q", got, profile.UserAgent)
+	}
+	for name, want := range map[string]string{
+		"X-Forwarded-For":   "198.51.100.24",
+		"X-Real-IP":         "198.51.100.24",
+		"X-Forwarded-Host":  "meridian.example:50001",
+		"X-Forwarded-Proto": "http",
+	} {
+		if got := captured.Header.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"Forwarded", "X-Forwarded-Custom"} {
+		if got := captured.Header.Get(name); got != "" {
+			t.Errorf("untrusted %s leaked upstream: %q", name, got)
+		}
+	}
+}
+
+func TestPrepareWebSocketUpstreamHeadersRebuildsForwardingHeaders(t *testing.T) {
+	target, err := normalizeTargetURL("https://upstream.example.com/emby")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	profile := getUAProfile("infuse")
+	req := httptest.NewRequest(http.MethodGet, "http://meridian.example:50001/socket", nil)
+	req.RemoteAddr = "198.51.100.25:54321"
+	req.Header.Set("Connection", "Upgrade, User-Agent")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("User-Agent", "attacker-controlled")
+	req.Header.Set("Forwarded", "for=203.0.113.10")
+	req.Header.Set("X-Forwarded-For", "203.0.113.10")
+	req.Header.Set("X-Forwarded-Custom", "must-not-pass")
+	req.Header.Set("X-Real-IP", "203.0.113.11")
+	req.Header.Set("Proxy-Connection", "keep-alive")
+
+	header := prepareWebSocketUpstreamHeaders(req, target, profile)
+	if got := req.Header.Get("Forwarded"); got == "" {
+		t.Fatal("preparing WebSocket headers mutated the inbound request")
+	}
+	for name, want := range map[string]string{
+		"Connection":        "Upgrade",
+		"Upgrade":           "websocket",
+		"Host":              target.Host,
+		"User-Agent":        profile.UserAgent,
+		"X-Forwarded-For":   "198.51.100.25",
+		"X-Real-IP":         "198.51.100.25",
+		"X-Forwarded-Host":  "meridian.example:50001",
+		"X-Forwarded-Proto": "http",
+	} {
+		if got := header.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"Forwarded", "X-Forwarded-Custom", "Proxy-Connection"} {
+		if got := header.Get(name); got != "" {
+			t.Errorf("untrusted WebSocket header %s leaked upstream: %q", name, got)
+		}
+	}
 }
 
 func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
