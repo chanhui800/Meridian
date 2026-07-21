@@ -566,7 +566,8 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if locURL.Host == "" {
 			locURL = req.URL.ResolveReference(locURL)
 		}
-		if !t.playbackHosts[strings.ToLower(locURL.Host)] {
+		locURL.Scheme = strings.ToLower(locURL.Scheme)
+		if (locURL.Scheme != "http" && locURL.Scheme != "https") || !t.playbackHosts[redirectHostKey(locURL)] {
 			break
 		}
 		resp.Body.Close()
@@ -711,13 +712,15 @@ func isWebSocketUpgrade(r *http.Request) bool {
 
 func normalizeTargetURL(addr string) (*url.URL, error) {
 	addr = strings.TrimSpace(addr)
+	addr = strings.ReplaceAll(addr, "：", ":")
 	if addr == "" {
 		return nil, fmt.Errorf("target URL is required")
 	}
 	if len(addr) > 2048 {
 		return nil, fmt.Errorf("target URL is too long")
 	}
-	if !strings.Contains(addr, "://") {
+	explicitScheme := strings.Contains(addr, "://")
+	if !explicitScheme {
 		addr = "http://" + addr
 	}
 	parsed, err := url.Parse(addr)
@@ -725,6 +728,9 @@ func normalizeTargetURL(addr string) (*url.URL, error) {
 		return nil, err
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	if !explicitScheme && parsed.Port() == "443" {
+		parsed.Scheme = "https"
+	}
 	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" || parsed.Opaque != "" {
 		return nil, fmt.Errorf("invalid target URL")
 	}
@@ -741,6 +747,19 @@ func normalizeTargetURL(addr string) (*url.URL, error) {
 		}
 	}
 	return parsed, nil
+}
+
+func redirectHostKey(target *url.URL) string {
+	host := strings.ToLower(strings.TrimSuffix(target.Hostname(), "."))
+	if host == "" {
+		return ""
+	}
+	port := target.Port()
+	scheme := strings.ToLower(target.Scheme)
+	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func validateSiteSettings(name string, listenPort int, targetURL, playbackTargetURL, playbackMode string, streamHosts []string, uaMode string, quota int64, speedLimit int) error {
@@ -926,7 +945,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	// Build playback hosts set from playback_target_url + stream_hosts
 	playbackHostsSet := make(map[string]bool)
 	if playbackTarget != nil {
-		playbackHostsSet[strings.ToLower(playbackTarget.Host)] = true
+		playbackHostsSet[redirectHostKey(playbackTarget)] = true
 	}
 	var extraHosts []string
 	if site.StreamHosts != "" && site.StreamHosts != "[]" {
@@ -934,7 +953,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	}
 	for _, raw := range extraHosts {
 		if parsed, e := normalizeTargetURL(raw); e == nil {
-			playbackHostsSet[strings.ToLower(parsed.Host)] = true
+			playbackHostsSet[redirectHostKey(parsed)] = true
 			if playbackTarget == nil {
 				playbackTarget = parsed
 			}

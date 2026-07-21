@@ -154,18 +154,18 @@ function showSiteModal(site) {
   document.getElementById('modal-body').innerHTML = `
     <div class="form-group">
       <label>站点名称</label>
-      <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" required>
+      <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
     </div>
     <div class="form-group">
       <label>主回源地址</label>
-      <input type="text" class="form-input" id="m-target" value="${isEdit ? esc(site.target_url) : ''}" placeholder="如：192.168.1.10:8096 或 https://emby.example.com" required>
-      <div class="form-help">网页、API 和默认回源都走这里。</div>
+      <input type="text" class="form-input" id="m-target" value="${isEdit ? esc(site.target_url) : ''}" placeholder="如：192.168.1.10:8096 或 https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required>
+      <div class="form-help">网页、API 和默认回源都走这里。未写协议时，:443 自动使用 HTTPS，其他端口默认 HTTP。</div>
     </div>
     <div class="form-group">
       <label>播放回源列表（可选，留空跟随主回源）</label>
       <div id="m-playback-list"></div>
       <button type="button" class="btn-ghost" id="m-add-playback" style="margin-top:6px;font-size:13px">+ 添加播放回源</button>
-      <div class="form-help">播放、转码或直链资源的独立上游地址。可添加多个，用于多推流/播放节点场景。</div>
+      <div class="form-help">播放、转码或直链资源的独立上游地址。可添加多个；未写协议时，:443 自动使用 HTTPS。</div>
     </div>
     <div class="form-group" id="playback-mode-group" style="display:none">
       <label>播放模式</label>
@@ -177,7 +177,7 @@ function showSiteModal(site) {
     </div>
     <div class="form-group">
       <label>监听端口</label>
-      <input type="number" class="form-input" id="m-port" value="${isEdit ? site.listen_port : ''}" placeholder="如：8001" required>
+      <input type="number" class="form-input" id="m-port" value="${isEdit ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric" required>
     </div>
     <div class="form-group">
       <label>UA 模式</label>
@@ -189,7 +189,7 @@ function showSiteModal(site) {
     </div>
     <div class="form-group">
       <label>流量额度 (GB, 0=不限)</label>
-      <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0">
+      <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
     </div>
   `;
 
@@ -216,7 +216,7 @@ function showSiteModal(site) {
   function renderPlaybackInputs() {
     listContainer.innerHTML = existingHosts.map((val, idx) => `
       <div style="display:flex;gap:6px;margin-bottom:6px;align-items:center">
-        <input type="text" class="form-input m-pb-input" value="${esc(val)}" placeholder="${idx === 0 ? '主播放回源地址' : '额外播放回源地址'}" style="flex:1">
+        <input type="text" class="form-input m-pb-input" value="${esc(val)}" placeholder="${idx === 0 ? '主播放回源地址' : '额外播放回源地址'}" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" style="flex:1">
         ${existingHosts.length > 1 ? `<button type="button" class="btn-ghost danger m-pb-remove" data-idx="${idx}" style="padding:4px 8px;font-size:13px;flex-shrink:0">删除</button>` : ''}
       </div>
     `).join('');
@@ -279,7 +279,7 @@ function showSiteModal(site) {
     }
   };
 
-  openModal();
+  openModal({ closeOnBackdrop: true });
 }
 
 // Global actions
@@ -320,7 +320,7 @@ window.deleteSiteAction = function(id, name) {
   `;
   document.getElementById('delete-cancel').addEventListener('click', closeModal);
   document.getElementById('delete-confirm').addEventListener('click', () => confirmDelete(id));
-  openModal();
+  openModal({ closeOnBackdrop: true });
 };
 
 window.confirmDelete = async function(id) {

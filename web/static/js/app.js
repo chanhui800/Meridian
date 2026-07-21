@@ -10,6 +10,7 @@
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
+  let modalPreviousFocus = null;
   let authStatus = {
     needs_setup: false,
     mode: 'single_admin',
@@ -19,12 +20,22 @@
 
   window.openModal = function(options) {
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
-    document.getElementById('modal-overlay').classList.add('active');
+    modalPreviousFocus = document.activeElement;
+    const overlay = document.getElementById('modal-overlay');
+    document.getElementById('modal-body').scrollTop = 0;
+    overlay.classList.add('active');
+    overlay.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
   };
 
   window.closeModal = function() {
     modalBackdropClosable = false;
-    document.getElementById('modal-overlay').classList.remove('active');
+    const overlay = document.getElementById('modal-overlay');
+    overlay.classList.remove('active');
+    overlay.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-open');
+    if (modalPreviousFocus && modalPreviousFocus.isConnected) modalPreviousFocus.focus();
+    modalPreviousFocus = null;
   };
 
   document.getElementById('modal-overlay').addEventListener('click', function(e) {
@@ -32,6 +43,10 @@
   });
 
   document.getElementById('modal-close').addEventListener('click', closeModal);
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('modal-overlay').classList.contains('active')) closeModal();
+  });
 
   async function checkAuth() {
     if (API.token) {

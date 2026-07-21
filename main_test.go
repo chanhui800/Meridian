@@ -16,7 +16,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"meridian/web"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func newTestApp(t *testing.T) *App {
 	t.Helper()
@@ -149,6 +157,97 @@ func TestNormalizeTargetURLRejectsUnsafeForms(t *testing.T) {
 	}
 	if target.String() != "http://example.com:8096" {
 		t.Fatalf("normalized target = %q, want http://example.com:8096", target)
+	}
+}
+
+func TestNormalizeTargetURLInfersHTTPSForPort443(t *testing.T) {
+	for _, input := range []string{"example.com:443", "example.com：443"} {
+		target, err := normalizeTargetURL(input)
+		if err != nil {
+			t.Fatalf("normalizeTargetURL(%q): %v", input, err)
+		}
+		if target.String() != "https://example.com:443" {
+			t.Fatalf("normalizeTargetURL(%q) = %q, want https://example.com:443", input, target)
+		}
+	}
+
+	explicitHTTP, err := normalizeTargetURL("http://example.com:443")
+	if err != nil {
+		t.Fatalf("normalize explicit HTTP target: %v", err)
+	}
+	if explicitHTTP.Scheme != "http" {
+		t.Fatalf("explicit HTTP scheme = %q, want http", explicitHTTP.Scheme)
+	}
+}
+
+func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
+	configured, err := normalizeTargetURL("media.example.com:443")
+	if err != nil {
+		t.Fatalf("normalize configured playback target: %v", err)
+	}
+	if got := redirectHostKey(configured); got != "media.example.com" {
+		t.Fatalf("redirect host key = %q, want media.example.com", got)
+	}
+
+	calls := 0
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("proxied")),
+			Request:    req,
+		}, nil
+	})
+	transport := &redirectFollowTransport{
+		base:          base,
+		playbackHosts: map[string]bool{redirectHostKey(configured): true},
+		profile:       getUAProfile("infuse"),
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/Videos/1/stream", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	defer resp.Body.Close()
+	if calls != 2 || resp.StatusCode != http.StatusOK {
+		t.Fatalf("redirect follow calls=%d status=%d, want calls=2 status=200", calls, resp.StatusCode)
+	}
+	if got := resp.Request.URL.String(); got != "https://media.example.com/Videos/1/stream" {
+		t.Fatalf("followed URL = %q", got)
+	}
+}
+
+func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
+	css, err := web.StaticFiles.ReadFile("static/css/style.css")
+	if err != nil {
+		t.Fatalf("read embedded CSS: %v", err)
+	}
+	for _, rule := range []string{
+		"max-height: calc(100dvh - 48px)",
+		"overflow-y: auto",
+		"-webkit-overflow-scrolling: touch",
+		".btn-modal { flex: 1; min-height: 44px",
+	} {
+		if !strings.Contains(string(css), rule) {
+			t.Errorf("mobile modal CSS missing %q", rule)
+		}
+	}
+
+	appJS, err := web.StaticFiles.ReadFile("static/js/app.js")
+	if err != nil {
+		t.Fatalf("read embedded app JavaScript: %v", err)
+	}
+	if !strings.Contains(string(appJS), "document.getElementById('modal-body').scrollTop = 0") {
+		t.Error("opening a modal must reset the form scroll position")
 	}
 }
 
