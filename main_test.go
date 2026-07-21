@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -185,8 +186,8 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalize configured playback target: %v", err)
 	}
-	if got := redirectHostKey(configured); got != "media.example.com" {
-		t.Fatalf("redirect host key = %q, want media.example.com", got)
+	if got := redirectHostKey(configured); got != "https://media.example.com" {
+		t.Fatalf("redirect host key = %q, want https://media.example.com", got)
 	}
 
 	calls := 0
@@ -224,6 +225,60 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 	if got := resp.Request.URL.String(); got != "https://media.example.com/Videos/1/stream" {
 		t.Fatalf("followed URL = %q", got)
 	}
+
+	t.Run("rejects scheme downgrade", func(t *testing.T) {
+		calls := 0
+		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"http://media.example.com/Videos/1/stream"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		})
+		transport := &redirectFollowTransport{
+			base:          base,
+			playbackHosts: map[string]bool{redirectHostKey(configured): true},
+			profile:       getUAProfile("infuse"),
+		}
+		req := httptest.NewRequest(http.MethodGet, "http://api.example.com/Videos/1/stream", nil)
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != 1 || resp.StatusCode != http.StatusFound {
+			t.Fatalf("downgrade redirect calls=%d status=%d, want calls=1 status=302", calls, resp.StatusCode)
+		}
+	})
+
+	t.Run("does not follow non-playback request", func(t *testing.T) {
+		calls := 0
+		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusTemporaryRedirect,
+				Header:     http.Header{"Location": []string{"https://media.example.com/Users/AuthenticateByName"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		})
+		transport := &redirectFollowTransport{
+			base:          base,
+			playbackHosts: map[string]bool{redirectHostKey(configured): true},
+			profile:       getUAProfile("infuse"),
+		}
+		req := httptest.NewRequest(http.MethodPost, "http://api.example.com/Users/AuthenticateByName", strings.NewReader(`{"Username":"test"}`))
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != 1 || resp.StatusCode != http.StatusTemporaryRedirect {
+			t.Fatalf("API redirect calls=%d status=%d, want calls=1 status=307", calls, resp.StatusCode)
+		}
+	})
 }
 
 func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
@@ -248,6 +303,83 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	}
 	if !strings.Contains(string(appJS), "document.getElementById('modal-body').scrollTop = 0") {
 		t.Error("opening a modal must reset the form scroll position")
+	}
+
+	sitesJS, err := web.StaticFiles.ReadFile("static/js/pages/sites.js")
+	if err != nil {
+		t.Fatalf("read embedded sites JavaScript: %v", err)
+	}
+	if !strings.Contains(string(sitesJS), "openModal({ closeOnBackdrop: false })") {
+		t.Error("site add/edit form must not close when its backdrop is clicked")
+	}
+
+	indexHTML, err := web.StaticFiles.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index HTML: %v", err)
+	}
+	for _, asset := range []string{"/css/style.css?v=1.4.2", "/js/pages/sites.js?v=1.4.2", "/js/app.js?v=1.4.2"} {
+		if !strings.Contains(string(indexHTML), asset) {
+			t.Errorf("index must cache-bust updated asset %q", asset)
+		}
+	}
+}
+
+func TestStaticHandlerDisablesCaching(t *testing.T) {
+	staticFS, err := fs.Sub(web.StaticFiles, "static")
+	if err != nil {
+		t.Fatalf("static fs: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	staticHandler(staticFS).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/js/pages/sites.js", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := rr.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("Pragma = %q, want no-cache", got)
+	}
+	if got := rr.Header().Get("Expires"); got != "0" {
+		t.Fatalf("Expires = %q, want 0", got)
+	}
+}
+
+func TestAPIClientClearsRejectedStoredToken(t *testing.T) {
+	apiJS, err := web.StaticFiles.ReadFile("static/js/api.js")
+	if err != nil {
+		t.Fatalf("read embedded API JavaScript: %v", err)
+	}
+	source := string(apiJS)
+	for _, expected := range []string{"res.status === 401", "this.logout()", "window.location.reload()"} {
+		if !strings.Contains(source, expected) {
+			t.Errorf("API client missing %q", expected)
+		}
+	}
+}
+
+func TestRequestClientKeyUsesOnlyConfiguredTrustedProxy(t *testing.T) {
+	trusted, err := parseTrustedProxyCIDRs("172.17.0.0/16")
+	if err != nil {
+		t.Fatalf("parse trusted proxies: %v", err)
+	}
+
+	trustedRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	trustedRequest.RemoteAddr = "172.17.0.1:45678"
+	trustedRequest.Header.Set("X-Real-IP", "203.0.113.25")
+	if got := requestClientKey(trustedRequest, trusted); got != "203.0.113.25" {
+		t.Fatalf("trusted proxy client key = %q", got)
+	}
+
+	untrustedRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	untrustedRequest.RemoteAddr = "198.51.100.7:45678"
+	untrustedRequest.Header.Set("X-Real-IP", "203.0.113.25")
+	if got := requestClientKey(untrustedRequest, trusted); got != "198.51.100.7" {
+		t.Fatalf("untrusted proxy client key = %q", got)
+	}
+
+	if _, err := parseTrustedProxyCIDRs("not-a-network"); err == nil {
+		t.Fatal("invalid trusted proxy CIDR unexpectedly accepted")
 	}
 }
 
@@ -1053,6 +1185,43 @@ func TestProxyRoutesPlaybackRequestsToPlaybackTarget(t *testing.T) {
 	}
 	if body := mustReadBody(t, playbackResp); !strings.Contains(body, "playback:/emby/Videos/123/stream") {
 		t.Fatalf("playback route body = %q", body)
+	}
+}
+
+func TestProxyPreservesConfiguredUpstreamBasePath(t *testing.T) {
+	app := newTestApp(t)
+	received := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.URL.RequestURI()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	site, err := app.db.CreateSite("base-path", freePort(t), upstream.URL+"/emby?from=base", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/System/Info/Public?client=1", site.ListenPort))
+	if err != nil {
+		t.Fatalf("GET through proxy: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	select {
+	case got := <-received:
+		if got != "/emby/System/Info/Public?from=base&client=1" {
+			t.Fatalf("upstream request URI = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not receive request")
 	}
 }
 

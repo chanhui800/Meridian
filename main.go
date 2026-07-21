@@ -426,9 +426,14 @@ func (d *DB) ListSites() ([]Site, error) {
 	for rows.Next() {
 		var s Site
 		var enabled int
-		rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
 		s.Enabled = enabled == 1
 		sites = append(sites, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	if sites == nil {
 		sites = []Site{}
@@ -459,7 +464,10 @@ func (d *DB) CreateSite(name string, port int, targetURL, playbackTargetURL, pla
 	if err != nil {
 		return nil, err
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
 	return d.GetSite(id)
 }
 
@@ -475,15 +483,25 @@ func (d *DB) UpdateSite(id int64, name string, port int, targetURL, playbackTarg
 }
 
 func (d *DB) DeleteSite(id int64) error {
-	tx, _ := d.db.Begin()
-	tx.Exec("DELETE FROM traffic_logs WHERE site_id=?", id)
-	tx.Exec("DELETE FROM sites WHERE id=?", id)
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM traffic_logs WHERE site_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM sites WHERE id=?", id); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 func (d *DB) ToggleSite(id int64) (bool, error) {
 	var enabled int
-	d.db.QueryRow("SELECT enabled FROM sites WHERE id=?", id).Scan(&enabled)
+	if err := d.db.QueryRow("SELECT enabled FROM sites WHERE id=?", id).Scan(&enabled); err != nil {
+		return false, err
+	}
 	newVal := 1 - enabled
 	_, err := d.db.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", newVal, id)
 	return newVal == 1, err
@@ -537,8 +555,13 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	var logs []TrafficLog
 	for rows.Next() {
 		var l TrafficLog
-		rows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.RecordedAt)
+		if err := rows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.RecordedAt); err != nil {
+			return nil, err
+		}
 		logs = append(logs, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	if logs == nil {
 		logs = []TrafficLog{}
@@ -569,6 +592,9 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, err
+	}
+	if (req.Method != http.MethodGet && req.Method != http.MethodHead) || !isPlaybackRequest(req.URL.Path) {
+		return resp, nil
 	}
 	for i := 0; i < 3; i++ {
 		if resp.StatusCode != 301 && resp.StatusCode != 302 && resp.StatusCode != 307 && resp.StatusCode != 308 {
@@ -775,10 +801,61 @@ func redirectHostKey(target *url.URL) string {
 	}
 	port := target.Port()
 	scheme := strings.ToLower(target.Scheme)
-	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
-		return host
+	if scheme != "http" && scheme != "https" {
+		return ""
 	}
-	return net.JoinHostPort(host, port)
+	authority := host
+	if strings.Contains(host, ":") {
+		authority = "[" + host + "]"
+	}
+	if port != "" && !((scheme == "http" && port == "80") || (scheme == "https" && port == "443")) {
+		authority = net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + authority
+}
+
+func singleJoiningSlash(a, b string) string {
+	aSlash := strings.HasSuffix(a, "/")
+	bSlash := strings.HasPrefix(b, "/")
+	switch {
+	case aSlash && bSlash:
+		return a + b[1:]
+	case !aSlash && !bSlash:
+		return a + "/" + b
+	default:
+		return a + b
+	}
+}
+
+func joinURLPath(base, request *url.URL) (joinedPath, joinedRawPath string) {
+	if base.RawPath == "" && request.RawPath == "" {
+		return singleJoiningSlash(base.Path, request.Path), ""
+	}
+	basePath := base.EscapedPath()
+	requestPath := request.EscapedPath()
+	baseSlash := strings.HasSuffix(basePath, "/")
+	requestSlash := strings.HasPrefix(requestPath, "/")
+	switch {
+	case baseSlash && requestSlash:
+		return base.Path + request.Path[1:], basePath + requestPath[1:]
+	case !baseSlash && !requestSlash:
+		return base.Path + "/" + request.Path, basePath + "/" + requestPath
+	default:
+		return base.Path + request.Path, basePath + requestPath
+	}
+}
+
+func applyUpstreamURL(requestURL, upstream *url.URL) {
+	requestURL.Scheme = upstream.Scheme
+	requestURL.Host = upstream.Host
+	requestURL.Path, requestURL.RawPath = joinURLPath(upstream, requestURL)
+	switch {
+	case upstream.RawQuery == "":
+	case requestURL.RawQuery == "":
+		requestURL.RawQuery = upstream.RawQuery
+	default:
+		requestURL.RawQuery = upstream.RawQuery + "&" + requestURL.RawQuery
+	}
 }
 
 func validateSiteSettings(name string, listenPort int, targetURL, playbackTargetURL, playbackMode string, streamHosts []string, uaMode string, quota int64, speedLimit int) error {
@@ -911,7 +988,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, pr
 		log.Printf("[WS] set handshake deadline: %v", err)
 		return
 	}
-	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, r.URL.RequestURI())
+	upstreamURL := *r.URL
+	applyUpstreamURL(&upstreamURL, target)
+	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, upstreamURL.RequestURI())
 	if _, err := io.WriteString(upstreamConn, reqLine); err != nil { // #nosec G705 -- net/http rejects control characters in the parsed method and RequestURI.
 		log.Printf("[WS] write request line: %v", err)
 		return
@@ -998,8 +1077,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			} else {
 				upstream = upstreamTargetForRequest(req, target, playbackTarget)
 			}
-			req.URL.Scheme = upstream.Scheme
-			req.URL.Host = upstream.Host
+			applyUpstreamURL(req.URL, upstream)
 			req.Host = upstream.Host
 			applyUAProfileHeaders(req.Header, profile)
 		},
@@ -1646,6 +1724,7 @@ type App struct {
 	setupToken       string
 	loginLimiter     *loginRateLimiter
 	loginLimiterOnce sync.Once
+	trustedProxies   []*net.IPNet
 }
 
 const (
@@ -1725,10 +1804,56 @@ func (a *App) limiter() *loginRateLimiter {
 	return a.loginLimiter
 }
 
-func requestClientKey(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
+func parseTrustedProxyCIDRs(value string) ([]*net.IPNet, error) {
+	var networks []*net.IPNet
+	for _, raw := range strings.Split(value, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TRUSTED_PROXY_CIDRS entry %q: %w", raw, err)
+		}
+		networks = append(networks, network)
+	}
+	return networks, nil
+}
+
+func remoteAddressIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return net.ParseIP(host)
+	}
+	return net.ParseIP(remoteAddr)
+}
+
+func isTrustedProxy(ip net.IP, networks []*net.IPNet) bool {
+	if ip == nil {
+		return false
+	}
+	for _, network := range networks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func requestClientKey(r *http.Request, trustedProxies []*net.IPNet) string {
+	peerIP := remoteAddressIP(r.RemoteAddr)
+	if isTrustedProxy(peerIP, trustedProxies) {
+		if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
+			return forwarded.String()
+		}
+		for _, raw := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+			if forwarded := net.ParseIP(strings.TrimSpace(raw)); forwarded != nil {
+				return forwarded.String()
+			}
+		}
+	}
+	if peerIP != nil {
+		return peerIP.String()
 	}
 	if r.RemoteAddr != "" {
 		return r.RemoteAddr
@@ -1783,6 +1908,27 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		next.ServeHTTP(w, r)
+	})
+}
+
+func staticHandler(staticFS fs.FS) http.Handler {
+	fileServer := http.FileServer(http.FS(staticFS))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		path := r.URL.Path
+		if path == "/" {
+			path = "/index.html"
+		}
+		f, err := staticFS.Open(strings.TrimPrefix(path, "/"))
+		if err == nil {
+			_ = f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		r.URL.Path = "/"
+		fileServer.ServeHTTP(w, r)
 	})
 }
 
@@ -1869,7 +2015,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"` // #nosec G117 -- request-only credential DTO; the value is never serialized or stored in plaintext.
 	}
-	client := requestClientKey(r)
+	client := requestClientKey(r, a.trustedProxies)
 	if allowed, retryAfter := a.limiter().allow(client, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Seconds()+0.5))))
 		a.jsonErr(w, http.StatusTooManyRequests, "too many login attempts; try again later")
@@ -2340,7 +2486,17 @@ func main() {
 		log.Printf("Initial setup token: %s", setupToken)
 	}
 
-	app := &App{db: db, pm: pm, setupToken: setupToken, loginLimiter: newLoginRateLimiter()}
+	trustedProxies, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		log.Fatalf("invalid trusted proxy configuration: %v", err)
+	}
+	app := &App{
+		db:             db,
+		pm:             pm,
+		setupToken:     setupToken,
+		loginLimiter:   newLoginRateLimiter(),
+		trustedProxies: trustedProxies,
+	}
 
 	mux := http.NewServeMux()
 
@@ -2365,22 +2521,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize embedded files: %v", err)
 	}
-	fileServer := http.FileServer(http.FS(staticFS))
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if path == "/" {
-			path = "/index.html"
-		}
-		f, err := staticFS.Open(strings.TrimPrefix(path, "/"))
-		if err == nil {
-			f.Close()
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-		r.URL.Path = "/"
-		fileServer.ServeHTTP(w, r)
-	})
+	mux.Handle("/", staticHandler(staticFS))
 
 	// HTTP server with graceful shutdown
 	addr := fmt.Sprintf(":%d", port)

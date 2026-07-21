@@ -15,7 +15,13 @@ const API = {
 
     const res = await fetch(path, opts);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Request failed');
+    if (!res.ok) {
+      if (res.status === 401 && path !== '/api/auth/login') {
+        this.logout();
+        window.location.reload();
+      }
+      throw new Error(data.error || 'Request failed');
+    }
     return data;
   },
 

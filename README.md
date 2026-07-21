@@ -124,6 +124,7 @@ JWT_SECRET=$(openssl rand -hex 32) ./meridian
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
 | `JWT_SECRET` | 进程启动时随机生成 | 至少 32 字节的 JWT 签名密钥。**生产环境必须显式设置**，否则每次重启后会话全部失效 |
 | `SETUP_TOKEN` | 首次启动时随机生成 | 首次创建管理员所需的一次性初始化令牌；未设置时会写入启动日志 |
+| `TRUSTED_PROXY_CIDRS` | 空 | 允许提供 `X-Real-IP`/`X-Forwarded-For` 的反向代理 CIDR，多个值用逗号分隔；不要填写不受信任的客户端网段 |
 
 ### Docker Compose
 
@@ -207,6 +208,8 @@ Meridian/
 播放地址为可选项。不设置时所有请求走同一上游。
 
 地址没有写协议时，Meridian 会把 `域名:443`（也兼容中文全角冒号 `：443`）识别为 HTTPS；其他端口仍默认按 HTTP 处理。HTTPS 使用非 443 端口时请明确写成 `https://域名:端口`。重定向模式会把 `https://域名:443` 和省略默认端口的 `https://域名` 视为同一播放回源。
+
+如果上游实际部署在子路径下，可以直接填写完整基础路径，例如 `https://emby.example.com/emby`；Meridian 会把客户端请求路径安全地拼接到该基础路径。重定向播放模式只会跟随 GET/HEAD 播放请求，并要求重定向目标的协议、域名和端口与已配置播放回源一致，不会把 HTTPS 自动降级到 HTTP。
 
 设置后以下路径会路由到播放上游：
 `/Videos/`、`/emby/Videos/`、`/Audio/`、`/emby/Audio/`、`/LiveTV/`、`/emby/LiveTV/`、`/Items/.../Download`
