@@ -18,8 +18,9 @@ WORKDIR /app
 RUN addgroup -S meridian && \
     adduser -S -D -H -u 10001 -G meridian meridian && \
     mkdir -p /app/data && \
-    chown -R meridian:meridian /app
-COPY --from=builder --chown=meridian:meridian /app/meridian .
+    chown meridian:meridian /app/data && \
+    chmod 0700 /app/data
+COPY --from=builder --chown=root:root --chmod=0555 /app/meridian /app/meridian
 
 EXPOSE 9090
 
