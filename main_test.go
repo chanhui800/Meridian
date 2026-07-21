@@ -253,7 +253,42 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 		}
 	})
 
-	t.Run("does not follow non-playback request", func(t *testing.T) {
+	t.Run("follows custom GET redirect path", func(t *testing.T) {
+		calls := 0
+		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/custom/play/path"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("proxied")),
+				Request:    req,
+			}, nil
+		})
+		transport := &redirectFollowTransport{
+			base:          base,
+			playbackHosts: map[string]bool{redirectHostKey(configured): true},
+			profile:       getUAProfile("infuse"),
+		}
+		req := httptest.NewRequest(http.MethodGet, "http://api.example.com/custom/play/path", nil)
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip: %v", err)
+		}
+		defer resp.Body.Close()
+		if calls != 2 || resp.StatusCode != http.StatusOK {
+			t.Fatalf("custom redirect calls=%d status=%d, want calls=2 status=200", calls, resp.StatusCode)
+		}
+	})
+
+	t.Run("does not follow POST request", func(t *testing.T) {
 		calls := 0
 		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			calls++

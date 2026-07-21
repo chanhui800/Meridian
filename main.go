@@ -593,7 +593,7 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if err != nil {
 		return nil, err
 	}
-	if (req.Method != http.MethodGet && req.Method != http.MethodHead) || !isPlaybackRequest(req.URL.Path) {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return resp, nil
 	}
 	for i := 0; i < 3; i++ {
