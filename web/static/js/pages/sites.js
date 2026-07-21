@@ -279,7 +279,7 @@ function showSiteModal(site) {
     }
   };
 
-  openModal({ closeOnBackdrop: true });
+  openModal();
 }
 
 // Global actions
