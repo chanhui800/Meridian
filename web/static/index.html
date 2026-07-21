@@ -29,6 +29,11 @@
         <label>密码</label>
         <input type="password" class="form-input" id="inp-password" placeholder="••••••••" autocomplete="current-password" required>
       </div>
+      <div class="form-group" id="setup-token-group" hidden>
+        <label for="inp-setup-token">初始化令牌</label>
+        <input type="password" class="form-input" id="inp-setup-token" autocomplete="off" placeholder="请从 Meridian 启动日志中复制">
+        <div class="form-help">首次创建管理员时需要。令牌只会出现在服务启动日志中。</div>
+      </div>
       <button type="submit" class="btn-login" id="btn-login">登录</button>
     </form>
     <div class="login-footer" id="login-footer">正在检查初始化状态...</div>

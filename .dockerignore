@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+*.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+meridian
+meridian.exe
+*.exe
+.idea
+.vscode

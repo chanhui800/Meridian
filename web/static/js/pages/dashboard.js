@@ -186,7 +186,7 @@ async function loadDashboardTable() {
         <td style="font-weight:600">${esc(s.name)}</td>
         <td><span class="status-badge"><span class="status-led ${s.running ? 'on' : 'off'}"></span>${s.running ? '运行中' : '已停止'}</span></td>
         <td class="mono">${esc(s.target_url)}</td>
-        <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${uaNameMap[s.ua_mode] || s.ua_mode}</span></td>
+        <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></td>
         <td class="mono">:${s.listen_port}</td>
         <td>${formatBytes(s.traffic_used)}</td>
       </tr>
@@ -211,7 +211,11 @@ function formatBytes(bytes) {
 }
 
 function esc(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
+  return String(str).replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[char]);
 }

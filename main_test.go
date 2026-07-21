@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,7 +13,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func newTestApp(t *testing.T) *App {
@@ -93,10 +97,76 @@ func TestResolveJWTSecretGeneratesRandomFallback(t *testing.T) {
 	}
 }
 
+func TestResolveJWTSecretRequiresSufficientEntropy(t *testing.T) {
+	if _, _, err := resolveJWTSecret("too-short"); err == nil {
+		t.Fatal("short JWT_SECRET unexpectedly accepted")
+	}
+	configured := strings.Repeat("x", 32)
+	secret, ephemeral, err := resolveJWTSecret(configured)
+	if err != nil {
+		t.Fatalf("resolveJWTSecret configured value: %v", err)
+	}
+	if ephemeral || string(secret) != configured {
+		t.Fatalf("configured JWT secret not preserved")
+	}
+}
+
 func TestTLSIssuerNameFallsBackSafely(t *testing.T) {
 	name := tlsIssuerName(nil)
 	if name != "" {
 		t.Fatalf("nil issuer name = %q, want empty", name)
+	}
+}
+
+func TestSecureTLSConfigEnablesVerification(t *testing.T) {
+	config := secureTLSConfig("emby.example.com")
+	if config.InsecureSkipVerify {
+		t.Fatal("TLS certificate verification must remain enabled")
+	}
+	if config.ServerName != "emby.example.com" {
+		t.Fatalf("ServerName = %q, want emby.example.com", config.ServerName)
+	}
+	if config.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("MinVersion = %d, want TLS 1.2", config.MinVersion)
+	}
+}
+
+func TestNormalizeTargetURLRejectsUnsafeForms(t *testing.T) {
+	for _, target := range []string{
+		"file://server/path",
+		"http://user:password@example.com",
+		"https://example.com/path#fragment",
+		"http://example.com:70000",
+	} {
+		if _, err := normalizeTargetURL(target); err == nil {
+			t.Errorf("normalizeTargetURL(%q) unexpectedly succeeded", target)
+		}
+	}
+
+	target, err := normalizeTargetURL("example.com:8096")
+	if err != nil {
+		t.Fatalf("normalizeTargetURL valid target: %v", err)
+	}
+	if target.String() != "http://example.com:8096" {
+		t.Fatalf("normalized target = %q, want http://example.com:8096", target)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	handler := securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if got := rr.Header().Get("Content-Security-Policy"); !strings.Contains(got, "script-src 'self'") || !strings.Contains(got, "frame-ancestors 'none'") {
+		t.Fatalf("unexpected Content-Security-Policy: %q", got)
+	}
+	if got := rr.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("X-Frame-Options = %q, want DENY", got)
 	}
 }
 
@@ -123,6 +193,128 @@ func TestHandleAuthCheckExposesSingleAdminModeBeforeSetup(t *testing.T) {
 	}
 	if got := mustBoolValue(t, body, "jwt_secret_ephemeral"); !got {
 		t.Fatalf("jwt_secret_ephemeral = %v, want true", got)
+	}
+}
+
+func TestSetupRequiresTokenAndCreatesOnlyOneAdmin(t *testing.T) {
+	app := newTestApp(t)
+	app.setupToken = "one-time-setup-token"
+
+	wrong := httptest.NewRecorder()
+	wrongReq := httptest.NewRequest(http.MethodPost, "/api/auth/setup", strings.NewReader(`{
+		"username":"admin","password":"correct horse battery staple","setup_token":"wrong"
+	}`))
+	app.handleSetup(wrong, wrongReq)
+	if wrong.Code != http.StatusForbidden {
+		t.Fatalf("wrong setup token status = %d, want 403", wrong.Code)
+	}
+	if got := app.db.UserCount(); got != 0 {
+		t.Fatalf("user count after rejected setup = %d, want 0", got)
+	}
+
+	ok := httptest.NewRecorder()
+	okReq := httptest.NewRequest(http.MethodPost, "/api/auth/setup", strings.NewReader(`{
+		"username":"admin","password":"correct horse battery staple","setup_token":"one-time-setup-token"
+	}`))
+	app.handleSetup(ok, okReq)
+	if ok.Code != http.StatusOK {
+		t.Fatalf("valid setup status = %d body=%s", ok.Code, ok.Body.String())
+	}
+	if got := app.db.UserCount(); got != 1 {
+		t.Fatalf("user count after setup = %d, want 1", got)
+	}
+}
+
+func TestCreateInitialUserIsAtomic(t *testing.T) {
+	app := newTestApp(t)
+	const contenders = 4
+	var wg sync.WaitGroup
+	results := make(chan error, contenders)
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := app.db.CreateInitialUser(fmt.Sprintf("admin-%d", i), "correct horse battery staple")
+			results <- err
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	created := 0
+	alreadyExists := 0
+	for err := range results {
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, errAdminAlreadyExists):
+			alreadyExists++
+		default:
+			t.Fatalf("unexpected setup error: %v", err)
+		}
+	}
+	if created != 1 || alreadyExists != contenders-1 {
+		t.Fatalf("created=%d alreadyExists=%d, want 1 and %d", created, alreadyExists, contenders-1)
+	}
+	if got := app.db.UserCount(); got != 1 {
+		t.Fatalf("user count = %d, want 1", got)
+	}
+}
+
+func TestLoginUsesGenericErrorsAndRateLimit(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+
+	login := func(username, password string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(fmt.Sprintf(
+			`{"username":%q,"password":%q}`, username, password,
+		)))
+		req.RemoteAddr = "203.0.113.10:12345"
+		app.handleLogin(rr, req)
+		return rr
+	}
+
+	unknown := login("missing", "wrong password")
+	badPassword := login("admin", "wrong password")
+	if unknown.Code != http.StatusUnauthorized || badPassword.Code != http.StatusUnauthorized {
+		t.Fatalf("credential failure statuses = %d, %d; want 401", unknown.Code, badPassword.Code)
+	}
+	if unknown.Body.String() != badPassword.Body.String() {
+		t.Fatalf("credential failure responses differ: %q vs %q", unknown.Body.String(), badPassword.Body.String())
+	}
+
+	for i := 0; i < maxLoginFailures-2; i++ {
+		login("admin", "wrong password")
+	}
+	blocked := login("admin", "correct horse battery staple")
+	if blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked login status = %d, want 429", blocked.Code)
+	}
+	if blocked.Header().Get("Retry-After") == "" {
+		t.Fatal("blocked login is missing Retry-After")
+	}
+}
+
+func TestCORSAllowsSameOriginAndRejectsCrossOrigin(t *testing.T) {
+	handler := cors(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	same := httptest.NewRecorder()
+	sameReq := httptest.NewRequest(http.MethodGet, "http://panel.example/api/auth/check", nil)
+	sameReq.Header.Set("Origin", "https://panel.example")
+	handler(same, sameReq)
+	if same.Code != http.StatusOK || same.Header().Get("Access-Control-Allow-Origin") != "https://panel.example" {
+		t.Fatalf("same-origin request status=%d allow-origin=%q", same.Code, same.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	cross := httptest.NewRecorder()
+	crossReq := httptest.NewRequest(http.MethodGet, "http://panel.example/api/auth/check", nil)
+	crossReq.Header.Set("Origin", "https://evil.example")
+	handler(cross, crossReq)
+	if cross.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin request status = %d, want 403", cross.Code)
 	}
 }
 
@@ -375,11 +567,7 @@ func TestHandleSiteDiagExposesSeparatePlaybackTLS(t *testing.T) {
 	}))
 	defer apiServer.Close()
 
-	var playbackMethod string
-	var playbackPath string
 	playbackServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		playbackMethod = r.Method
-		playbackPath = r.URL.Path
 		if r.Method == http.MethodGet && r.URL.Path == "/System/Info/Public" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -434,26 +622,23 @@ func TestHandleSiteDiagExposesSeparatePlaybackTLS(t *testing.T) {
 	if got := mustStringValue(t, playbackProbe, "method"); got != http.MethodGet {
 		t.Fatalf("playback probe.method = %q, want GET", got)
 	}
-	if got := mustNumberValue(t, playbackProbe, "http_status"); got != http.StatusOK {
-		t.Fatalf("playback probe.http_status = %d, want 200", got)
+	if got := mustStringValue(t, playbackProbe, "url"); got != playbackServer.URL+"/System/Info/Public" {
+		t.Fatalf("playback probe.url = %q, want metadata URL", got)
 	}
-	if got := mustStringValue(t, playbackHealth, "status"); got != "online" {
-		t.Fatalf("playback health.status = %q, want online", got)
+	if got := mustStringValue(t, playbackHealth, "status"); got != "offline" {
+		t.Fatalf("playback health.status = %q, want offline for an untrusted test certificate", got)
 	}
-	if got := mustStringValue(t, playbackHealth, "emby_version"); got != "4.8.2.0" {
-		t.Fatalf("playback health.emby_version = %q, want 4.8.2.0", got)
+	if got := mustStringValue(t, playbackHealth, "error"); got == "" {
+		t.Fatal("playback health.error should report TLS verification failure")
 	}
 	if got := mustBoolValue(t, playbackTLS, "enabled"); !got {
 		t.Fatalf("playback tls.enabled = %v, want true", got)
 	}
+	if got := mustBoolValue(t, playbackTLS, "valid"); got {
+		t.Fatalf("playback tls.valid = %v, want false for an untrusted test certificate", got)
+	}
 	if got := mustStringValue(t, playback, "effective_url"); got != playbackServer.URL {
 		t.Fatalf("playback effective_url = %q, want %q", got, playbackServer.URL)
-	}
-	if playbackMethod != http.MethodGet {
-		t.Fatalf("playback request method = %q, want GET", playbackMethod)
-	}
-	if playbackPath != "/System/Info/Public" {
-		t.Fatalf("playback request path = %q, want /System/Info/Public", playbackPath)
 	}
 }
 
@@ -720,6 +905,8 @@ func TestProxyRoutesPlaybackRequestsToPlaybackTarget(t *testing.T) {
 	app := newTestApp(t)
 
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'")
 		w.Write([]byte("api:" + r.URL.Path))
 	}))
 	defer apiServer.Close()
@@ -737,12 +924,24 @@ func TestProxyRoutesPlaybackRequestsToPlaybackTarget(t *testing.T) {
 		t.Fatalf("StartSite: %v", err)
 	}
 	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+	app.pm.mu.RLock()
+	proxyServer := app.pm.proxies[site.ID].server
+	app.pm.mu.RUnlock()
+	if proxyServer.ReadHeaderTimeout != 10*time.Second || proxyServer.IdleTimeout != 120*time.Second || proxyServer.MaxHeaderBytes != 64<<10 {
+		t.Fatalf("proxy server limits not configured: %+v", proxyServer)
+	}
 
 	mainResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/System/Info", site.ListenPort))
 	if err != nil {
 		t.Fatalf("GET main route: %v", err)
 	}
 	defer mainResp.Body.Close()
+	if got := mainResp.Header.Get("X-Frame-Options"); got != "SAMEORIGIN" {
+		t.Fatalf("upstream X-Frame-Options = %q, want SAMEORIGIN", got)
+	}
+	if got := mainResp.Header.Get("Content-Security-Policy"); got != "default-src 'none'" {
+		t.Fatalf("upstream Content-Security-Policy = %q, want preserved value", got)
+	}
 
 	playbackResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/emby/Videos/123/stream", site.ListenPort))
 	if err != nil {

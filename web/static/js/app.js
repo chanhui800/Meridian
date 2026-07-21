@@ -5,6 +5,8 @@
   const shellEl = document.getElementById('app-shell');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
+  const setupTokenGroupEl = document.getElementById('setup-token-group');
+  const setupTokenInputEl = document.getElementById('inp-setup-token');
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
@@ -12,6 +14,7 @@
     needs_setup: false,
     mode: 'single_admin',
     jwt_secret_ephemeral: false,
+    setup_token_required: false,
   };
 
   window.openModal = function(options) {
@@ -74,6 +77,8 @@
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(true);
     loginEl._isSetup = true;
+    setupTokenGroupEl.hidden = !authStatus.setup_token_required;
+    setupTokenInputEl.required = !!authStatus.setup_token_required;
   }
 
   function showLoginMode() {
@@ -81,6 +86,8 @@
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(false);
     loginEl._isSetup = false;
+    setupTokenGroupEl.hidden = true;
+    setupTokenInputEl.required = false;
   }
 
   function startDashboardRefresh() {
@@ -105,14 +112,20 @@
     e.preventDefault();
     const username = document.getElementById('inp-username').value.trim();
     const password = document.getElementById('inp-password').value;
+    const setupToken = setupTokenInputEl.value.trim();
 
     if (!username || !password) {
       Toast.error('请填写用户名和密码');
       return;
     }
 
-    if (password.length < 6) {
-      Toast.error('密码至少 6 位');
+    if (loginEl._isSetup && password.length < 12) {
+      Toast.error('管理员密码至少需要 12 位');
+      return;
+    }
+
+    if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {
+      Toast.error('请填写启动日志中的初始化令牌');
       return;
     }
 
@@ -122,7 +135,7 @@
     try {
       let res;
       if (loginEl._isSetup) {
-        res = await API.setup(username, password);
+        res = await API.setup(username, password, setupToken);
         Toast.success('管理员创建成功');
       } else {
         res = await API.login(username, password);

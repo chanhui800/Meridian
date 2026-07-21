@@ -22,7 +22,9 @@ const API = {
   // Auth
   checkSetup() { return this.request('GET', '/api/auth/check'); },
   login(username, password) { return this.request('POST', '/api/auth/login', { username, password }); },
-  setup(username, password) { return this.request('POST', '/api/auth/setup', { username, password }); },
+  setup(username, password, setupToken) {
+    return this.request('POST', '/api/auth/setup', { username, password, setup_token: setupToken });
+  },
 
   // Dashboard
   dashboard() { return this.request('GET', '/api/dashboard'); },

@@ -55,7 +55,7 @@ async function loadSites() {
           </div>
           <div class="site-row">
             <span class="site-row-label">UA 模式</span>
-            <span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${uaNameMap[s.ua_mode] || s.ua_mode}</span>
+            <span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span>
           </div>
           ${s.traffic_quota > 0 ? `
           <div class="progress-wrap">
@@ -75,12 +75,24 @@ async function loadSites() {
           `}
         </div>
         <div class="site-actions">
-          <button class="btn-ghost" onclick="toggleSiteAction(${s.id})">${s.enabled ? '停用' : '启用'}</button>
-          <button class="btn-ghost" onclick="editSiteAction(${s.id})">编辑</button>
-          <button class="btn-ghost danger" onclick="deleteSiteAction(${s.id},'${esc(s.name)}')">删除</button>
+          <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}">${s.enabled ? '停用' : '启用'}</button>
+          <button class="btn-ghost" data-site-action="edit" data-site-id="${s.id}">编辑</button>
+          <button class="btn-ghost danger" data-site-action="delete" data-site-id="${s.id}">删除</button>
         </div>
       </div>`;
     }).join('');
+
+    const sitesById = new Map(sites.map(site => [site.id, site]));
+    grid.querySelectorAll('[data-site-action]').forEach(button => {
+      button.addEventListener('click', () => {
+        const id = Number(button.dataset.siteId);
+        const site = sitesById.get(id);
+        if (!site) return;
+        if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
+        if (button.dataset.siteAction === 'edit') showSiteModal(site);
+        if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
+      });
+    });
   } catch (e) {
     Toast.error('加载站点失败: ' + e.message);
   }
@@ -182,9 +194,11 @@ function showSiteModal(site) {
   `;
 
   document.getElementById('modal-footer').innerHTML = `
-    <button class="btn-modal secondary" onclick="closeModal()">取消</button>
+    <button class="btn-modal secondary" id="m-cancel">取消</button>
     <button class="btn-modal primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
   `;
+
+  document.getElementById('m-cancel').addEventListener('click', closeModal);
 
   // Build initial playback list from existing data
   const listContainer = document.getElementById('m-playback-list');
@@ -291,11 +305,21 @@ window.editSiteAction = async function(id) {
 
 window.deleteSiteAction = function(id, name) {
   document.getElementById('modal-title').textContent = '确认删除';
-  document.getElementById('modal-body').innerHTML = `<p style="color:var(--white-60)">确定要删除站点 <strong>${name}</strong> 吗？此操作不可撤销。</p>`;
+  const modalBody = document.getElementById('modal-body');
+  modalBody.replaceChildren();
+  const message = document.createElement('p');
+  message.style.color = 'var(--white-60)';
+  message.append('确定要删除站点 ');
+  const strong = document.createElement('strong');
+  strong.textContent = String(name);
+  message.append(strong, ' 吗？此操作不可撤销。');
+  modalBody.appendChild(message);
   document.getElementById('modal-footer').innerHTML = `
-    <button class="btn-modal secondary" onclick="closeModal()">取消</button>
-    <button class="btn-modal primary" style="background:var(--red)" onclick="confirmDelete(${id})">删除</button>
+    <button class="btn-modal secondary" id="delete-cancel">取消</button>
+    <button class="btn-modal primary" id="delete-confirm" style="background:var(--red)">删除</button>
   `;
+  document.getElementById('delete-cancel').addEventListener('click', closeModal);
+  document.getElementById('delete-confirm').addEventListener('click', () => confirmDelete(id));
   openModal();
 };
 
