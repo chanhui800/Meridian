@@ -534,6 +534,11 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(sitesJS), "openModal({ closeOnBackdrop: false })") {
 		t.Error("site add/edit form must not close when its backdrop is clicked")
 	}
+	for _, snippet := range []string{`id="m-speed"`, "speed_limit: parseInt(document.getElementById('m-speed').value || 0)"} {
+		if !strings.Contains(string(sitesJS), snippet) {
+			t.Errorf("site form must expose and submit speed limit; missing %q", snippet)
+		}
+	}
 
 	indexHTML, err := web.StaticFiles.ReadFile("static/index.html")
 	if err != nil {
@@ -1305,6 +1310,34 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	}
 	if !app.pm.IsRunning(site.ID) {
 		t.Fatalf("expected original site to keep running")
+	}
+}
+
+func TestHandleSiteUpdatePreservesOmittedSpeedLimit(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("limited", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 25)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if enabled, err := app.db.ToggleSite(site.ID); err != nil || enabled {
+		t.Fatalf("disable site: enabled=%v err=%v", enabled, err)
+	}
+
+	body := strings.NewReader(`{"name":"limited","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.SpeedLimit != 25 {
+		t.Fatalf("speed_limit = %d, want preserved value 25", reloaded.SpeedLimit)
 	}
 }
 

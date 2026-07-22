@@ -2337,7 +2337,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			StreamHosts       *[]string `json:"stream_hosts"`
 			UAMode            string    `json:"ua_mode"`
 			Quota             int64     `json:"traffic_quota"`
-			SpeedLimit        int       `json:"speed_limit"`
+			SpeedLimit        *int      `json:"speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
@@ -2359,6 +2359,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		if req.UAMode == "" {
 			req.UAMode = oldSite.UAMode
 		}
+		speedLimit := oldSite.SpeedLimit
+		if req.SpeedLimit != nil {
+			speedLimit = *req.SpeedLimit
+		}
 		req.Name = strings.TrimSpace(req.Name)
 		playbackMode = strings.ToLower(strings.TrimSpace(playbackMode))
 		req.UAMode = strings.ToLower(strings.TrimSpace(req.UAMode))
@@ -2367,11 +2371,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, "invalid stream_hosts")
 			return
 		}
-		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, playbackTargetURL, playbackMode, streamHostList, req.UAMode, req.Quota, req.SpeedLimit); err != nil {
+		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, playbackTargetURL, playbackMode, streamHostList, req.UAMode, req.Quota, speedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := a.db.UpdateSite(id, req.Name, req.ListenPort, req.TargetURL, playbackTargetURL, playbackMode, streamHosts, req.UAMode, req.Quota, req.SpeedLimit); err != nil {
+		if err := a.db.UpdateSite(id, req.Name, req.ListenPort, req.TargetURL, playbackTargetURL, playbackMode, streamHosts, req.UAMode, req.Quota, speedLimit); err != nil {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}

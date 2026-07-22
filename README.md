@@ -72,13 +72,21 @@ bash <(curl -sL https://raw.githubusercontent.com/snnabb/Meridian/master/install
 
 ```bash
 docker run -d --name meridian \
-  -p 9090:9090 -p 8001-8010:8001-8010 \
+  --restart unless-stopped \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --ulimit nofile=65536:65536 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  -p 127.0.0.1:9090:9090 -p 8001-8010:8001-8010 \
   -v meridian-data:/app/data \
   -e JWT_SECRET=$(openssl rand -hex 32) \
   ghcr.io/snnabb/meridian:latest
 ```
 
 > `8001-8010` 是反代站点监听端口范围，按实际需要调整。
+>
+> 管理面板默认只映射到宿主机 `127.0.0.1:9090`，建议再通过 HTTPS 反向代理访问。如果确实需要直接通过公网 IP 访问，可改成 `-p 9090:9090`，并同时配置防火墙白名单。
 >
 > 首次启动后运行 `docker logs meridian` 查看初始化令牌，再在面板中创建管理员。
 >
@@ -133,8 +141,19 @@ services:
   meridian:
     image: ghcr.io/snnabb/meridian:latest
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
       - "8001-8010:8001-8010"
     volumes:
       - meridian-data:/app/data

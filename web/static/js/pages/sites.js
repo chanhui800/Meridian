@@ -191,6 +191,11 @@ function showSiteModal(site) {
       <label>流量额度 (GB, 0=不限)</label>
       <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
     </div>
+    <div class="form-group">
+      <label>单连接限速 (Mbps, 0=不限)</label>
+      <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
+      <div class="form-help">限制单个 HTTP 请求的响应速度；WebSocket 连接不受此项影响。</div>
+    </div>
   `;
 
   document.getElementById('modal-footer').innerHTML = `
@@ -257,6 +262,7 @@ function showSiteModal(site) {
       listen_port: parseInt(document.getElementById('m-port').value),
       ua_mode: document.getElementById('m-ua').value,
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
+      speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
 
     if (!data.name || !data.target_url || !data.listen_port) {
