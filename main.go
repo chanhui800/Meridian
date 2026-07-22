@@ -32,8 +32,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/net/netutil"
+	"github.com/go-crypt/x/bcrypt"
 	_ "modernc.org/sqlite"
 
 	"meridian/web"
@@ -1214,7 +1213,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
-	listener = netutil.LimitListener(listener, 2048)
+	listener = limitListener(listener, 2048)
 
 	server := &http.Server{
 		Handler:           handler,
@@ -2546,7 +2545,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.4.2"
+var appVersion = "v1.4.3"
 
 func main() {
 	port := 9090

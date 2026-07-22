@@ -3,8 +3,7 @@ module meridian
 go 1.26.5
 
 require (
-	golang.org/x/crypto v0.54.0
-	golang.org/x/net v0.56.0
+	github.com/go-crypt/x v0.4.16
 	modernc.org/sqlite v1.47.0
 )
 
