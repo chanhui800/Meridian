@@ -77,6 +77,14 @@ run_test_root_command() {
     command install "${install_args[@]}"
 }
 
+run_as_test_root() {
+    if [ "${EUID}" -eq 0 ]; then
+        command "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 for valid in example.com panel.example.com xn--fsqu00a.xn--0zwm56d; do
     valid_domain "$valid" || { printf 'FAIL: valid domain rejected: %s\n' "$valid" >&2; exit 1; }
 done
@@ -256,12 +264,12 @@ assert_eq 'v9.9.9' "$($PREVIOUS_BIN --version)" 'retained previous version'
 assert_eq "$domain_env_before" "$(sha256_file "${DATA_DIR}/.env")" 'update preserves .env'
 assert_dir "$BACKUP_DIR"
 
-backup_count_before=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
+backup_count_before=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 if ! (do_update) >"${TEST_ROOT}/update-current.log" 2>&1; then
     cat "${TEST_ROOT}/update-current.log" >&2
     exit 1
 fi
-backup_count_after=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
+backup_count_after=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 assert_eq "$backup_count_before" "$backup_count_after" 'latest update is a no-op'
 
 # Exercise the password transaction with a mock binary. The real command and
@@ -269,7 +277,8 @@ assert_eq "$backup_count_before" "$backup_count_after" 'latest update is a no-op
 printf 'old-database-state\n' > "${DATA_DIR}/meridian.db"
 printf 'JWT_SECRET=old-jwt-secret-000000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
     "$DATA_DIR" > "${DATA_DIR}/.env"
-cat > "${INSTALL_DIR}/${BIN_NAME}" <<'MOCKBIN'
+password_mock_binary="${TEST_ROOT}/password-mock-meridian"
+cat > "$password_mock_binary" <<'MOCKBIN'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then
     echo v9.9.10
@@ -284,7 +293,8 @@ if [ "${1:-}" = "admin" ] && [ "${2:-}" = "reset-password" ]; then
 fi
 exit 1
 MOCKBIN
-chmod 0755 "${INSTALL_DIR}/${BIN_NAME}"
+chmod 0755 "$password_mock_binary"
+run_as_test_root install -m 0755 "$password_mock_binary" "${INSTALL_DIR}/${BIN_NAME}"
 touch "$SERVICE_FILE"
 export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
 
@@ -305,9 +315,9 @@ run_password_case() {
         cp "$2" "$1/db"
     }
     archive_auth_snapshot() {
-        mkdir -p "$BACKUP_DIR"
+        run_as_test_root mkdir -p "$BACKUP_DIR"
         LAST_BACKUP_PATH="${BACKUP_DIR}/password-test.tar.gz"
-        tar -C "$1" -czf "$LAST_BACKUP_PATH" .
+        run_as_test_root tar -C "$1" -czf "$LAST_BACKUP_PATH" .
     }
     printf 'test-password-123\ntest-password-123\n' | do_password
 }
@@ -352,9 +362,7 @@ do_uninstall >"${TEST_ROOT}/uninstall-keep.log" 2>&1
 assert_dir "$DATA_DIR"
 assert_dir "$BACKUP_DIR"
 
-mkdir -p "$INSTALL_DIR"
-printf '#!/usr/bin/env sh\nexit 0\n' > "${INSTALL_DIR}/${BIN_NAME}"
-chmod 0755 "${INSTALL_DIR}/${BIN_NAME}"
+run_as_test_root install -m 0755 "${mock_bin_dir}/nginx" "${INSTALL_DIR}/${BIN_NAME}"
 PURGE_DATA=1
 do_uninstall >"${TEST_ROOT}/uninstall-purge.log" 2>&1
 [ ! -e "$DATA_DIR" ] || { echo 'FAIL: data directory not purged' >&2; exit 1; }
