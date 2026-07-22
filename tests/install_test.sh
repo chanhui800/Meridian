@@ -54,6 +54,29 @@ assert_not_contains() {
     fi
 }
 
+run_test_root_command() {
+    local command_name="$1" arg
+    shift
+    if [ "$command_name" != install ]; then
+        command "$command_name" "$@"
+        return
+    fi
+
+    local install_args=()
+    while [ "$#" -gt 0 ]; do
+        arg="$1"
+        shift
+        case "$arg" in
+            -o|-g)
+                [ "$#" -gt 0 ] || return 1
+                shift
+                ;;
+            *) install_args+=("$arg") ;;
+        esac
+    done
+    command install "${install_args[@]}"
+}
+
 for valid in example.com panel.example.com xn--fsqu00a.xn--0zwm56d; do
     valid_domain "$valid" || { printf 'FAIL: valid domain rejected: %s\n' "$valid" >&2; exit 1; }
 done
@@ -111,7 +134,7 @@ rm -f -- "$conflict_file"
 
 printf 'server { server_name unrelated.example.com; }\n' > "$NGINX_CONFIG"
 if (
-    as_root() { command "$@"; }
+    as_root() { run_test_root_command "$@"; }
     is_systemd() { return 0; }
     configure_panel_domain panel.example.com ""
 ); then
@@ -135,7 +158,7 @@ if (
             printf '%s\n' "$*" > "$certbot_log"
             return 1
         fi
-        command "$@"
+        run_test_root_command "$@"
     }
     is_systemd() { return 0; }
     install_panel_dependencies() { return 0; }
@@ -162,7 +185,7 @@ if ! (
         if [ "$1" = certbot ]; then
             return 0
         fi
-        command "$@"
+        run_test_root_command "$@"
     }
     is_systemd() { return 0; }
     install_panel_dependencies() { return 0; }
