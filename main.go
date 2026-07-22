@@ -368,6 +368,16 @@ func (d *DB) CreateUser(username, password string) (int64, error) {
 
 var errAdminAlreadyExists = errors.New("admin user already exists")
 var errInvalidCredentials = errors.New("invalid username or password")
+var errAdminNotConfigured = errors.New("administrator is not configured")
+var errMultipleAdmins = errors.New("multiple administrator accounts found")
+var errInvalidAdminPassword = errors.New("password must be 12-72 bytes")
+
+func validateAdminPassword(password string) error {
+	if len(password) < 12 || len(password) > 72 {
+		return errInvalidAdminPassword
+	}
+	return nil
+}
 
 func (d *DB) CreateInitialUser(username, password string) (int64, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -415,6 +425,46 @@ func (d *DB) VerifyUser(username, password string) (int64, error) {
 		return 0, errInvalidCredentials
 	}
 	return id, nil
+}
+
+func (d *DB) ResetAdminPassword(password string) error {
+	if err := validateAdminPassword(password); err != nil {
+		return err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+		return err
+	}
+	switch {
+	case count == 0:
+		return errAdminNotConfigured
+	case count != 1:
+		return errMultipleAdmins
+	}
+
+	result, err := tx.Exec("UPDATE users SET password_hash=?", string(hash))
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("updated %d administrator rows, want 1", rows)
+	}
+	return tx.Commit()
 }
 
 func (d *DB) ListSites() ([]Site, error) {
@@ -2545,9 +2595,114 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.4.3"
+var appVersion = "v1.5.0"
+
+func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	switch args[0] {
+	case "--version", "-v":
+		if len(args) != 1 {
+			return true, errors.New("version command does not accept arguments")
+		}
+		_, err := fmt.Fprintln(output, appVersion)
+		return true, err
+	case "admin":
+		return true, runAdminCommand(args[1:], input, output)
+	default:
+		return false, nil
+	}
+}
+
+func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
+	if len(args) == 0 || args[0] != "reset-password" {
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin")
+	}
+	var dbPath string
+	passwordStdin := false
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--db":
+			if dbPath != "" || i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return errors.New("--db requires exactly one non-empty path")
+			}
+			dbPath = args[i+1]
+			i++
+		case "--password-stdin":
+			if passwordStdin {
+				return errors.New("--password-stdin may only be specified once")
+			}
+			passwordStdin = true
+		default:
+			return errors.New("unknown reset-password argument")
+		}
+	}
+	if dbPath == "" || !passwordStdin {
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin")
+	}
+
+	password, err := readPasswordLine(input)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	if err := db.ResetAdminPassword(password); err != nil {
+		return fmt.Errorf("reset administrator password: %w", err)
+	}
+	_, err = fmt.Fprintln(output, "administrator password updated")
+	return err
+}
+
+func readPasswordLine(input io.Reader) (string, error) {
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64), 74)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("read password: %w", err)
+		}
+		return "", errors.New("password input is empty")
+	}
+	password := strings.TrimSuffix(scanner.Text(), "\r")
+	if scanner.Scan() {
+		return "", errors.New("password input must contain exactly one line")
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	if err := validateAdminPassword(password); err != nil {
+		return "", err
+	}
+	return password, nil
+}
+
+func panelListenAddress(bindAddress string, port int) (string, error) {
+	bindAddress = strings.TrimSpace(bindAddress)
+	if bindAddress == "" {
+		bindAddress = "0.0.0.0"
+	}
+	if net.ParseIP(bindAddress) == nil {
+		return "", fmt.Errorf("PANEL_BIND_ADDR must be an IP address, got %q", bindAddress)
+	}
+	if port < 1 || port > 65535 {
+		return "", fmt.Errorf("panel port must be between 1 and 65535, got %d", port)
+	}
+	return net.JoinHostPort(bindAddress, strconv.Itoa(port)), nil
+}
 
 func main() {
+	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "meridian: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	port := 9090
 	dbPath := "meridian.db"
 	if jwtSecretEphemeral {
@@ -2566,9 +2721,6 @@ func main() {
 	// Command line args
 	for i, arg := range os.Args[1:] {
 		switch arg {
-		case "--version", "-v":
-			fmt.Println(appVersion)
-			os.Exit(0)
 		case "--port", "-p":
 			if i+1 < len(os.Args)-1 {
 				if p, err := strconv.Atoi(os.Args[i+2]); err == nil {
@@ -2664,8 +2816,12 @@ func main() {
 	}
 	mux.Handle("/", staticHandler(staticFS))
 
-	// HTTP server with graceful shutdown
-	addr := fmt.Sprintf(":%d", port)
+	// HTTP server with graceful shutdown. Site listeners remain independently
+	// bound by ProxyManager and are not affected by PANEL_BIND_ADDR.
+	addr, err := panelListenAddress(os.Getenv("PANEL_BIND_ADDR"), port)
+	if err != nil {
+		log.Fatalf("invalid panel listen address: %v", err)
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           securityHeaders(mux),
@@ -2678,7 +2834,7 @@ func main() {
 
 	log.Println("============================================================")
 	log.Printf("  Meridian - Emby reverse proxy management panel %s", appVersion)
-	log.Printf("  Listening on: http://0.0.0.0%s", addr)
+	log.Printf("  Listening on: http://%s", addr)
 	log.Printf("  Sites loaded: %d (%d running)", loadedSiteCount, pm.GetRunningCount())
 	log.Println("  Features: WebSocket proxy, TLS diagnostics, traffic limits")
 	log.Println("============================================================")

@@ -544,7 +544,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.4.3", "/js/pages/sites.js?v=1.4.3", "/js/app.js?v=1.4.3"} {
+	for _, asset := range []string{"/css/style.css?v=1.5.0", "/js/pages/sites.js?v=1.5.0", "/js/app.js?v=1.5.0"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -749,6 +749,175 @@ func TestVerifyUserAcceptsExistingXCryptoBcryptHash(t *testing.T) {
 	}
 	if _, err := app.db.VerifyUser("legacy-admin", "not-the-password"); !errors.Is(err, errInvalidCredentials) {
 		t.Fatalf("wrong password error = %v, want invalid credentials", err)
+	}
+}
+
+func TestResetAdminPasswordUpdatesOnlyConfiguredAdministrator(t *testing.T) {
+	app := newTestApp(t)
+	const oldPassword = "correct horse battery staple"
+	const newPassword = "new correct horse battery staple"
+	if _, err := app.db.CreateInitialUser("admin", oldPassword); err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+	if err := app.db.ResetAdminPassword(newPassword); err != nil {
+		t.Fatalf("ResetAdminPassword: %v", err)
+	}
+	if _, err := app.db.VerifyUser("admin", oldPassword); !errors.Is(err, errInvalidCredentials) {
+		t.Fatalf("old password error = %v, want invalid credentials", err)
+	}
+	if _, err := app.db.VerifyUser("admin", newPassword); err != nil {
+		t.Fatalf("new password rejected: %v", err)
+	}
+}
+
+func TestResetAdminPasswordRejectsInvalidDatabaseStateAndLength(t *testing.T) {
+	app := newTestApp(t)
+	if err := app.db.ResetAdminPassword("long enough password"); !errors.Is(err, errAdminNotConfigured) {
+		t.Fatalf("empty database error = %v, want administrator not configured", err)
+	}
+	if _, err := app.db.CreateUser("admin-one", "correct horse battery staple"); err != nil {
+		t.Fatalf("CreateUser one: %v", err)
+	}
+	if _, err := app.db.CreateUser("admin-two", "correct horse battery staple"); err != nil {
+		t.Fatalf("CreateUser two: %v", err)
+	}
+	if err := app.db.ResetAdminPassword("another valid password"); !errors.Is(err, errMultipleAdmins) {
+		t.Fatalf("multiple users error = %v, want multiple administrators", err)
+	}
+	for _, password := range []string{"too-short", strings.Repeat("x", 73)} {
+		if err := app.db.ResetAdminPassword(password); !errors.Is(err, errInvalidAdminPassword) {
+			t.Fatalf("password length %d error = %v, want invalid password", len(password), err)
+		}
+	}
+}
+
+func TestResetAdminPasswordAcceptsLengthBoundaries(t *testing.T) {
+	for _, length := range []int{12, 72} {
+		app := newTestApp(t)
+		if _, err := app.db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+			t.Fatalf("CreateInitialUser: %v", err)
+		}
+		password := strings.Repeat("x", length)
+		if err := app.db.ResetAdminPassword(password); err != nil {
+			t.Fatalf("length %d rejected: %v", length, err)
+		}
+		if _, err := app.db.VerifyUser("admin", password); err != nil {
+			t.Fatalf("length %d password did not verify: %v", length, err)
+		}
+	}
+}
+
+func TestAdminResetPasswordCommandReadsPasswordOnlyFromStdin(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "command.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	if _, err := db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+		db.Close()
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+	db.Close()
+
+	const newPassword = "stdin-only replacement password"
+	var output bytes.Buffer
+	handled, err := runCommandLine(
+		[]string{"admin", "reset-password", "--db", dbPath, "--password-stdin"},
+		strings.NewReader(newPassword+"\n"),
+		&output,
+	)
+	if err != nil {
+		t.Fatalf("runCommandLine: %v", err)
+	}
+	if !handled {
+		t.Fatal("admin command was not handled")
+	}
+	if strings.Contains(output.String(), newPassword) {
+		t.Fatal("command output exposed the password")
+	}
+
+	verifyDB, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer verifyDB.Close()
+	if _, err := verifyDB.VerifyUser("admin", newPassword); err != nil {
+		t.Fatalf("new password rejected: %v", err)
+	}
+}
+
+func TestAdminResetPasswordCommandRejectsUnsafeInputShapes(t *testing.T) {
+	const misplacedPassword = "must-not-appear-in-errors"
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		input string
+	}{
+		{name: "missing stdin flag", args: []string{"admin", "reset-password", "--db", "test.db"}, input: "valid replacement password\n"},
+		{name: "password argument", args: []string{"admin", "reset-password", "--db", "test.db", "--password", misplacedPassword}},
+		{name: "multiple lines", args: []string{"admin", "reset-password", "--db", "test.db", "--password-stdin"}, input: "valid replacement password\nsecond line\n"},
+		{name: "too long", args: []string{"admin", "reset-password", "--db", "test.db", "--password-stdin"}, input: strings.Repeat("x", 73) + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handled, err := runCommandLine(tc.args, strings.NewReader(tc.input), io.Discard)
+			if !handled || err == nil {
+				t.Fatalf("handled=%v err=%v, want handled error", handled, err)
+			}
+			if strings.Contains(err.Error(), misplacedPassword) {
+				t.Fatal("command error exposed a password-shaped argument")
+			}
+		})
+	}
+}
+
+func TestJWTSecretRotationInvalidatesExistingToken(t *testing.T) {
+	originalSecret := jwtSecret
+	originalEphemeral := jwtSecretEphemeral
+	t.Cleanup(func() {
+		jwtSecret = originalSecret
+		jwtSecretEphemeral = originalEphemeral
+	})
+
+	jwtSecret = []byte("old-test-signing-secret-000000000000")
+	token, err := generateToken(1, "admin")
+	if err != nil {
+		t.Fatalf("generateToken: %v", err)
+	}
+	jwtSecret = []byte("new-test-signing-secret-000000000000")
+	if _, _, err := validateToken(token); err == nil {
+		t.Fatal("token signed before JWT secret rotation remained valid")
+	}
+}
+
+func TestPanelListenAddressSeparatesPanelFromSiteListeners(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bind string
+		port int
+		want string
+	}{
+		{name: "default", port: 9090, want: "0.0.0.0:9090"},
+		{name: "loopback", bind: "127.0.0.1", port: 9090, want: "127.0.0.1:9090"},
+		{name: "ipv6", bind: "::1", port: 9090, want: "[::1]:9090"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := panelListenAddress(tc.bind, tc.port)
+			if err != nil || got != tc.want {
+				t.Fatalf("panelListenAddress() = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		bind string
+		port int
+	}{
+		{bind: "panel.example.com", port: 9090},
+		{bind: "127.0.0.1", port: 0},
+		{bind: "127.0.0.1", port: 65536},
+	} {
+		if _, err := panelListenAddress(tc.bind, tc.port); err == nil {
+			t.Fatalf("panelListenAddress(%q, %d) unexpectedly succeeded", tc.bind, tc.port)
+		}
 	}
 }
 
