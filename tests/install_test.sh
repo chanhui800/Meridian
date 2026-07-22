@@ -121,9 +121,10 @@ if ! do_backup >"${TEST_ROOT}/backup.log" 2>&1; then
     exit 1
 fi
 assert_dir "$BACKUP_DIR"
-backup_file=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
-assert_file "$backup_file"
-tar -tzf "$backup_file" | grep -q '/.env$'
+backup_file=$(as_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+[ -n "$backup_file" ] || { echo "FAIL: backup archive not found" >&2; exit 1; }
+as_root test -f "$backup_file" || { echo "FAIL: missing file $backup_file" >&2; exit 1; }
+as_root tar -tzf "$backup_file" | grep -q '/.env$'
 
 export PURGE_DATA=0
 do_uninstall >"${TEST_ROOT}/uninstall-keep.log" 2>&1
