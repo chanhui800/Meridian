@@ -14,6 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.16.0
+
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
@@ -23,6 +27,8 @@ jobs:
           go mod verify
           go test -race ./...
           go vet ./...
+          find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
+          node --test tests/sites_ua_mode.test.js
           bash -n install.sh
           bash -n tests/install_test.sh
           shellcheck install.sh tests/install_test.sh
