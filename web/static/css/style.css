@@ -508,6 +508,7 @@ tr:hover td { background: var(--surface); }
 .pill-blue   { background: rgba(10,132,255,.15); color: var(--blue); }
 .pill-green  { background: var(--green-dim); color: var(--green); }
 .pill-orange { background: var(--orange-dim); color: var(--orange); }
+.pill-purple { background: rgba(191,90,242,.16); color: var(--purple); }
 
 .latency { font-variant-numeric: tabular-nums; }
 .latency.good { color: var(--green); }

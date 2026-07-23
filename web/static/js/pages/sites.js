@@ -146,6 +146,32 @@ function renderPlaybackRow(site) {
   return rows;
 }
 
+function customUAFormState(mode, site) {
+  const isCustom = mode === 'custom';
+  return {
+    visible: isCustom,
+    required: isCustom,
+    customUserAgent: isCustom && site ? (site.custom_user_agent || '') : '',
+    customClient: isCustom && site ? (site.custom_client || '') : '',
+    customVersion: isCustom && site ? (site.custom_version || '') : '',
+  };
+}
+
+function buildCustomUAPayload(mode, customUserAgent, customClient, customVersion) {
+  if (mode !== 'custom') {
+    return {
+      custom_user_agent: '',
+      custom_client: '',
+      custom_version: '',
+    };
+  }
+  return {
+    custom_user_agent: String(customUserAgent || '').trim(),
+    custom_client: String(customClient || '').trim(),
+    custom_version: String(customVersion || '').trim(),
+  };
+}
+
 function showSiteModal(site) {
   const isEdit = !!site;
   const title = isEdit ? '编辑站点' : '添加站点';
@@ -185,7 +211,15 @@ function showSiteModal(site) {
         <option value="infuse" ${(!isEdit || site.ua_mode === 'infuse') ? 'selected' : ''}>Infuse</option>
         <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
         <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
+        <option value="custom">自定义</option>
       </select>
+    </div>
+    <div class="form-group" id="m-custom-ua-group" hidden>
+      <label>自定义身份</label>
+      <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
+      <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
+      <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
+      <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
     </div>
     <div class="form-group">
       <label>流量额度 (GB, 0=不限)</label>
@@ -204,6 +238,29 @@ function showSiteModal(site) {
   `;
 
   document.getElementById('m-cancel').addEventListener('click', closeModal);
+
+  const uaSelect = document.getElementById('m-ua');
+  const customUAGroup = document.getElementById('m-custom-ua-group');
+  const customUAInputs = [
+    document.getElementById('m-custom-ua'),
+    document.getElementById('m-custom-client'),
+    document.getElementById('m-custom-version'),
+  ];
+  const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'infuse', site);
+  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'infuse';
+  customUAInputs[0].value = initialUAState.customUserAgent;
+  customUAInputs[1].value = initialUAState.customClient;
+  customUAInputs[2].value = initialUAState.customVersion;
+
+  function toggleCustomUAFields() {
+    const state = customUAFormState(uaSelect.value);
+    customUAGroup.hidden = !state.visible;
+    customUAInputs.forEach(input => {
+      input.required = state.required;
+    });
+  }
+  toggleCustomUAFields();
+  uaSelect.addEventListener('change', toggleCustomUAFields);
 
   // Build initial playback list from existing data
   const listContainer = document.getElementById('m-playback-list');
@@ -253,6 +310,13 @@ function showSiteModal(site) {
 
   document.getElementById('m-submit').onclick = async () => {
     const allHosts = existingHosts.map(h => h.trim()).filter(Boolean);
+    const uaMode = uaSelect.value;
+    const customUAPayload = buildCustomUAPayload(
+      uaMode,
+      customUAInputs[0].value,
+      customUAInputs[1].value,
+      customUAInputs[2].value,
+    );
     const data = {
       name: document.getElementById('m-name').value.trim(),
       target_url: document.getElementById('m-target').value.trim(),
@@ -260,13 +324,18 @@ function showSiteModal(site) {
       playback_mode: document.getElementById('m-playback-mode').value,
       stream_hosts: allHosts.length > 1 ? allHosts.slice(1) : [],
       listen_port: parseInt(document.getElementById('m-port').value),
-      ua_mode: document.getElementById('m-ua').value,
+      ua_mode: uaMode,
+      ...customUAPayload,
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
 
     if (!data.name || !data.target_url || !data.listen_port) {
       Toast.error('请填写所有必填项');
+      return;
+    }
+    if (uaMode === 'custom' && (!data.custom_user_agent || !data.custom_client || !data.custom_version)) {
+      Toast.error('请完整填写自定义 User-Agent、Client 和 Version');
       return;
     }
 

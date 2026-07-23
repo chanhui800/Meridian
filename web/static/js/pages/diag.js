@@ -168,6 +168,9 @@ function renderTLSCard(title, subtitle, upstream, staggerClass) {
 }
 
 function renderHeadersCard(headers, staggerClass) {
+  const profileError = headers.profile_error
+    ? '<div class="diag-row"><span class="diag-key">身份配置</span><span class="diag-val bad diag-wrap">' + esc(headers.profile_error) + '</span></div>'
+    : '';
   return `
     <div class="diag-card fade-up ${staggerClass}">
       <div class="diag-head">
@@ -176,7 +179,7 @@ function renderHeadersCard(headers, staggerClass) {
         </div>
         <div>
           <div class="diag-title">请求头配置</div>
-          <div class="diag-subtitle">Meridian 发往上游时将带上的 UA / Client</div>
+          <div class="diag-subtitle">Meridian 发往上游时将带上的 UA / Client / Version</div>
         </div>
       </div>
       <div class="diag-rows">
@@ -184,6 +187,7 @@ function renderHeadersCard(headers, staggerClass) {
         <div class="diag-row"><span class="diag-key">当前 UA</span><span class="diag-val diag-wrap">${diagText(headers.current_ua)}</span></div>
         <div class="diag-row"><span class="diag-key">Client 字段</span><span class="diag-val">${diagText(headers.client_field)}</span></div>
         <div class="diag-row"><span class="diag-key">Version 字段</span><span class="diag-val">${diagText(headers.version_field)}</span></div>
+        ${profileError}
       </div>
     </div>
   `;

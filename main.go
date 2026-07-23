@@ -24,7 +24,6 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,7 +32,8 @@ import (
 	"time"
 
 	"github.com/go-crypt/x/bcrypt"
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"meridian/web"
 )
@@ -51,11 +51,107 @@ var uaProfiles = map[string]UAProfile{
 	"client": {Name: "Client", UserAgent: "Emby-Theater/4.7.0", Client: "Emby Theater", Version: "4.7.0"},
 }
 
+const (
+	customUAMode          = "custom"
+	maxCustomUserAgentLen = 1024
+	maxCustomClientLen    = 128
+	maxCustomVersionLen   = 64
+)
+
 func getUAProfile(mode string) UAProfile {
 	if p, ok := uaProfiles[strings.ToLower(mode)]; ok {
 		return p
 	}
 	return uaProfiles["infuse"]
+}
+
+func validateCustomUAValue(field, value string, maxLen int, allowQuotes bool) error {
+	if value == "" {
+		return fmt.Errorf("custom %s is required", field)
+	}
+	if len(value) > maxLen {
+		return fmt.Errorf("custom %s must be at most %d bytes", field, maxLen)
+	}
+	for _, r := range value {
+		if r < 0x20 || r > 0x7e {
+			return fmt.Errorf("custom %s must contain printable ASCII characters only", field)
+		}
+		if !allowQuotes && (r == '"' || r == '\\') {
+			return fmt.Errorf("custom %s must not contain quotes or backslashes", field)
+		}
+	}
+	return nil
+}
+
+func normalizeUAConfig(mode, userAgent, client, version string) (string, string, string, string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != customUAMode {
+		if _, ok := uaProfiles[mode]; !ok {
+			return "", "", "", "", fmt.Errorf("unknown ua_mode")
+		}
+		return mode, "", "", "", nil
+	}
+
+	userAgent = strings.TrimSpace(userAgent)
+	client = strings.TrimSpace(client)
+	version = strings.TrimSpace(version)
+	if err := validateCustomUAValue("user_agent", userAgent, maxCustomUserAgentLen, true); err != nil {
+		return "", "", "", "", err
+	}
+	if err := validateCustomUAValue("client", client, maxCustomClientLen, false); err != nil {
+		return "", "", "", "", err
+	}
+	if err := validateCustomUAValue("version", version, maxCustomVersionLen, false); err != nil {
+		return "", "", "", "", err
+	}
+	return mode, userAgent, client, version, nil
+}
+
+func resolveSiteUAProfile(site Site) (UAProfile, error) {
+	mode, userAgent, client, version, err := normalizeUAConfig(site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion)
+	if err != nil {
+		return UAProfile{}, err
+	}
+	if mode == customUAMode {
+		return UAProfile{Name: "Custom", UserAgent: userAgent, Client: client, Version: version}, nil
+	}
+	return uaProfiles[mode], nil
+}
+
+func mergeSiteUAConfig(old Site, requestedMode, requestedUserAgent, requestedClient, requestedVersion *string) (string, string, string, string, error) {
+	hasCustomFields := requestedUserAgent != nil || requestedClient != nil || requestedVersion != nil
+	if hasCustomFields && (requestedUserAgent == nil || requestedClient == nil || requestedVersion == nil) {
+		return "", "", "", "", fmt.Errorf("custom User-Agent, Client, and Version must be provided together")
+	}
+
+	mode := old.UAMode
+	userAgent := old.CustomUserAgent
+	client := old.CustomClient
+	version := old.CustomVersion
+	if requestedMode != nil {
+		mode = *requestedMode
+	}
+	if hasCustomFields {
+		userAgent = *requestedUserAgent
+		client = *requestedClient
+		version = *requestedVersion
+	}
+
+	if requestedMode == nil && !hasCustomFields {
+		return normalizeUAConfig(mode, userAgent, client, version)
+	}
+
+	normalizedMode := strings.ToLower(strings.TrimSpace(mode))
+	if normalizedMode != customUAMode {
+		if hasCustomFields && (strings.TrimSpace(userAgent) != "" || strings.TrimSpace(client) != "" || strings.TrimSpace(version) != "") {
+			return "", "", "", "", fmt.Errorf("custom fields require ua_mode custom")
+		}
+		return normalizeUAConfig(normalizedMode, "", "", "")
+	}
+	if !hasCustomFields {
+		return "", "", "", "", fmt.Errorf("custom ua_mode requires User-Agent, Client, and Version")
+	}
+	return normalizeUAConfig(normalizedMode, userAgent, client, version)
 }
 
 var jwtSecret []byte
@@ -206,8 +302,55 @@ func hardenDatabaseFilePermissions(path string) error {
 
 func (d *DB) Close() { d.db.Close() }
 
+const (
+	migrationRetryDelay    = 25 * time.Millisecond
+	migrationRetryDeadline = 5 * time.Second
+)
+
 func (d *DB) migrate() error {
-	_, err := d.db.Exec(`
+	deadline := time.Now().Add(migrationRetryDeadline)
+	for {
+		err := d.migrateOnce()
+		if err == nil || !isSQLiteBusyError(err) || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(migrationRetryDelay)
+	}
+}
+
+func isSQLiteBusyError(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	// SQLite encodes the primary result code in the low byte of extended errors.
+	switch sqliteErr.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *DB) migrateOnce() error {
+	ctx := context.Background()
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	if _, err := conn.ExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		username TEXT UNIQUE NOT NULL,
@@ -220,8 +363,12 @@ func (d *DB) migrate() error {
 		listen_port INTEGER NOT NULL UNIQUE,
 		target_url TEXT NOT NULL,
 		playback_target_url TEXT NOT NULL DEFAULT '',
+		playback_mode TEXT NOT NULL DEFAULT 'direct',
 		stream_hosts TEXT NOT NULL DEFAULT '[]',
 		ua_mode TEXT DEFAULT 'infuse',
+		custom_user_agent TEXT NOT NULL DEFAULT '',
+		custom_client TEXT NOT NULL DEFAULT '',
+		custom_version TEXT NOT NULL DEFAULT '',
 		enabled INTEGER DEFAULT 1,
 		traffic_quota BIGINT DEFAULT 0,
 		traffic_used BIGINT DEFAULT 0,
@@ -237,88 +384,73 @@ func (d *DB) migrate() error {
 		recorded_at DATETIME NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_traffic_site_time ON traffic_logs(site_id, recorded_at);
-	`)
-	if err != nil {
+	`); err != nil {
 		return err
 	}
 
-	var hasPlaybackTargetColumn int
-	if err := d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name='playback_target_url'").Scan(&hasPlaybackTargetColumn); err != nil {
-		return err
-	}
-	if hasPlaybackTargetColumn == 0 {
-		if _, err := d.db.Exec("ALTER TABLE sites ADD COLUMN playback_target_url TEXT NOT NULL DEFAULT ''"); err != nil {
+	for _, migration := range []struct {
+		column string
+		sql    string
+	}{
+		{"playback_target_url", "ALTER TABLE sites ADD COLUMN playback_target_url TEXT NOT NULL DEFAULT ''"},
+		{"playback_mode", "ALTER TABLE sites ADD COLUMN playback_mode TEXT NOT NULL DEFAULT 'direct'"},
+		{"stream_hosts", "ALTER TABLE sites ADD COLUMN stream_hosts TEXT NOT NULL DEFAULT '[]'"},
+		{"custom_user_agent", "ALTER TABLE sites ADD COLUMN custom_user_agent TEXT NOT NULL DEFAULT ''"},
+		{"custom_client", "ALTER TABLE sites ADD COLUMN custom_client TEXT NOT NULL DEFAULT ''"},
+		{"custom_version", "ALTER TABLE sites ADD COLUMN custom_version TEXT NOT NULL DEFAULT ''"},
+	} {
+		exists, err := sqliteColumnExists(ctx, conn, migration.column)
+		if err != nil {
 			return err
 		}
-	}
-
-	var hasPlaybackModeColumn int
-	if err := d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name='playback_mode'").Scan(&hasPlaybackModeColumn); err != nil {
-		return err
-	}
-	if hasPlaybackModeColumn == 0 {
-		if _, err := d.db.Exec("ALTER TABLE sites ADD COLUMN playback_mode TEXT NOT NULL DEFAULT 'direct'"); err != nil {
-			return err
-		}
-	}
-
-	var hasStreamHostsColumn int
-	if err := d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name='stream_hosts'").Scan(&hasStreamHostsColumn); err != nil {
-		return err
-	}
-	if hasStreamHostsColumn == 0 {
-		if _, err := d.db.Exec("ALTER TABLE sites ADD COLUMN stream_hosts TEXT NOT NULL DEFAULT '[]'"); err != nil {
-			return err
+		if !exists {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
 		}
 	}
 
 	var hasHourlyIndex int
-	if err := d.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_hour'").Scan(&hasHourlyIndex); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_hour'").Scan(&hasHourlyIndex); err != nil {
 		return err
 	}
-	if hasHourlyIndex > 0 {
-		return nil
+	if hasHourlyIndex == 0 {
+		if _, err := conn.ExecContext(ctx, `
+			CREATE TABLE traffic_logs_dedup (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+				bytes_in BIGINT DEFAULT 0,
+				bytes_out BIGINT DEFAULT 0,
+				recorded_at DATETIME NOT NULL
+			);
+			INSERT INTO traffic_logs_dedup (site_id, bytes_in, bytes_out, recorded_at)
+			SELECT site_id, SUM(bytes_in), SUM(bytes_out), recorded_at
+			FROM traffic_logs
+			GROUP BY site_id, recorded_at;
+			DELETE FROM traffic_logs;
+			INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at)
+			SELECT site_id, bytes_in, bytes_out, recorded_at
+			FROM traffic_logs_dedup;
+			DROP TABLE traffic_logs_dedup;
+			CREATE UNIQUE INDEX idx_traffic_site_hour ON traffic_logs(site_id, recorded_at);
+		`); err != nil {
+			return err
+		}
 	}
 
-	tx, err := d.db.Begin()
-	if err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	committed = true
+	return nil
+}
 
-	if _, err := tx.Exec(`
-		CREATE TABLE traffic_logs_dedup (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-			bytes_in BIGINT DEFAULT 0,
-			bytes_out BIGINT DEFAULT 0,
-			recorded_at DATETIME NOT NULL
-		);
-	`); err != nil {
-		return err
+func sqliteColumnExists(ctx context.Context, conn *sql.Conn, column string) (bool, error) {
+	var count int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
+		return false, err
 	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO traffic_logs_dedup (site_id, bytes_in, bytes_out, recorded_at)
-		SELECT site_id, SUM(bytes_in), SUM(bytes_out), recorded_at
-		FROM traffic_logs
-		GROUP BY site_id, recorded_at;
-	`); err != nil {
-		return err
-	}
-
-	if _, err := tx.Exec(`
-		DELETE FROM traffic_logs;
-		INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at)
-		SELECT site_id, bytes_in, bytes_out, recorded_at
-		FROM traffic_logs_dedup;
-		DROP TABLE traffic_logs_dedup;
-		CREATE UNIQUE INDEX idx_traffic_site_hour ON traffic_logs(site_id, recorded_at);
-	`); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return count > 0, nil
 }
 
 type Site struct {
@@ -330,6 +462,9 @@ type Site struct {
 	PlaybackMode      string `json:"playback_mode"`
 	StreamHosts       string `json:"stream_hosts"`
 	UAMode            string `json:"ua_mode"`
+	CustomUserAgent   string `json:"custom_user_agent"`
+	CustomClient      string `json:"custom_client"`
+	CustomVersion     string `json:"custom_version"`
 	Enabled           bool   `json:"enabled"`
 	TrafficQuota      int64  `json:"traffic_quota"`
 	TrafficUsed       int64  `json:"traffic_used"`
@@ -468,7 +603,7 @@ func (d *DB) ResetAdminPassword(password string) error {
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
+	rows, err := d.db.Query("SELECT id, name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -477,7 +612,7 @@ func (d *DB) ListSites() ([]Site, error) {
 	for rows.Next() {
 		var s Site
 		var enabled int
-		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Enabled = enabled == 1
@@ -495,8 +630,8 @@ func (d *DB) ListSites() ([]Site, error) {
 func (d *DB) GetSite(id int64) (*Site, error) {
 	var s Site
 	var enabled int
-	err := d.db.QueryRow("SELECT id, name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	err := d.db.QueryRow("SELECT id, name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
+		Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -505,12 +640,33 @@ func (d *DB) GetSite(id int64) (*Site, error) {
 }
 
 func (d *DB) CreateSite(name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode string, quota int64, speedLimit int) (*Site, error) {
-	if streamHosts == "" {
-		streamHosts = "[]"
+	return d.CreateSiteWithCustomUA(name, port, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, "", "", "", quota, speedLimit)
+}
+
+func (d *DB) CreateSiteWithCustomUA(name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) (*Site, error) {
+	return d.CreateSiteRecord(Site{
+		Name:              name,
+		ListenPort:        port,
+		TargetURL:         targetURL,
+		PlaybackTargetURL: playbackTargetURL,
+		PlaybackMode:      playbackMode,
+		StreamHosts:       streamHosts,
+		UAMode:            uaMode,
+		CustomUserAgent:   customUserAgent,
+		CustomClient:      customClient,
+		CustomVersion:     customVersion,
+		TrafficQuota:      quota,
+		SpeedLimit:        speedLimit,
+	})
+}
+
+func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
+	if site.StreamHosts == "" {
+		site.StreamHosts = "[]"
 	}
 	res, err := d.db.Exec(
-		"INSERT INTO sites (name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?)",
-		name, port, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, quota, speedLimit,
+		"INSERT INTO sites (name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+		site.Name, site.ListenPort, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -523,12 +679,34 @@ func (d *DB) CreateSite(name string, port int, targetURL, playbackTargetURL, pla
 }
 
 func (d *DB) UpdateSite(id int64, name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode string, quota int64, speedLimit int) error {
-	if streamHosts == "" {
-		streamHosts = "[]"
+	return d.UpdateSiteWithCustomUA(id, name, port, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, "", "", "", quota, speedLimit)
+}
+
+func (d *DB) UpdateSiteWithCustomUA(id int64, name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) error {
+	return d.UpdateSiteRecord(Site{
+		ID:                id,
+		Name:              name,
+		ListenPort:        port,
+		TargetURL:         targetURL,
+		PlaybackTargetURL: playbackTargetURL,
+		PlaybackMode:      playbackMode,
+		StreamHosts:       streamHosts,
+		UAMode:            uaMode,
+		CustomUserAgent:   customUserAgent,
+		CustomClient:      customClient,
+		CustomVersion:     customVersion,
+		TrafficQuota:      quota,
+		SpeedLimit:        speedLimit,
+	})
+}
+
+func (d *DB) UpdateSiteRecord(site Site) error {
+	if site.StreamHosts == "" {
+		site.StreamHosts = "[]"
 	}
 	_, err := d.db.Exec(
-		"UPDATE sites SET name=?, listen_port=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		name, port, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, quota, speedLimit, id,
+		"UPDATE sites SET name=?, listen_port=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		site.Name, site.ListenPort, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.TrafficQuota, site.SpeedLimit, site.ID,
 	)
 	return err
 }
@@ -689,8 +867,174 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 	return resp, nil
 }
 
-var embyAuthClientRe = regexp.MustCompile(`(?i)(Client=")[^"]*"`)
-var embyAuthVersionRe = regexp.MustCompile(`(?i)(Version=")[^"]*"`)
+type embyAuthAttribute struct {
+	name       string
+	valueStart int
+	valueEnd   int
+}
+
+func isEmbyAuthWhitespace(value byte) bool {
+	return value == ' ' || value == '\t'
+}
+
+func isEmbyAuthToken(value byte) bool {
+	return value >= 'a' && value <= 'z' ||
+		value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9' ||
+		value == '-' || value == '_'
+}
+
+func parseEmbyAuthorizationAttributes(value string, offset int) ([]embyAuthAttribute, bool) {
+	attributes := make([]embyAuthAttribute, 0, 4)
+	for {
+		for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+			offset++
+		}
+		nameStart := offset
+		for offset < len(value) && isEmbyAuthToken(value[offset]) {
+			offset++
+		}
+		if nameStart == offset {
+			return nil, false
+		}
+		name := value[nameStart:offset]
+		for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+			offset++
+		}
+		if offset >= len(value) || value[offset] != '=' {
+			return nil, false
+		}
+		offset++
+		for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+			offset++
+		}
+		if offset >= len(value) || value[offset] != '"' {
+			return nil, false
+		}
+		offset++
+		valueStart := offset
+		for offset < len(value) && value[offset] != '"' {
+			if value[offset] == '\\' || value[offset] < 0x20 || value[offset] == 0x7f {
+				return nil, false
+			}
+			offset++
+		}
+		if offset >= len(value) {
+			return nil, false
+		}
+		attributes = append(attributes, embyAuthAttribute{
+			name:       name,
+			valueStart: valueStart,
+			valueEnd:   offset,
+		})
+		offset++
+		for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+			offset++
+		}
+		if offset == len(value) {
+			return attributes, true
+		}
+		if value[offset] != ',' {
+			return nil, false
+		}
+		offset++
+		if offset == len(value) {
+			return nil, false
+		}
+	}
+}
+
+func rewriteEmbyAuthorizationValue(value string, profile UAProfile) string {
+	offset := 0
+	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+		offset++
+	}
+	schemeStart := offset
+	for offset < len(value) && isEmbyAuthToken(value[offset]) {
+		offset++
+	}
+	if schemeStart == offset {
+		return value
+	}
+	scheme := value[schemeStart:offset]
+	if !strings.EqualFold(scheme, "MediaBrowser") && !strings.EqualFold(scheme, "Emby") {
+		return value
+	}
+	if offset < len(value) && !isEmbyAuthWhitespace(value[offset]) {
+		return value
+	}
+	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+		offset++
+	}
+	if offset == len(value) {
+		prefix := value
+		if len(value) == schemeStart+len(scheme) {
+			prefix += " "
+		}
+		return prefix + "Client=\"" + profile.Client + "\", Version=\"" + profile.Version + "\""
+	}
+
+	attributes, ok := parseEmbyAuthorizationAttributes(value, offset)
+	if !ok {
+		return value
+	}
+	clientIndex, versionIndex := -1, -1
+	for index, attribute := range attributes {
+		switch {
+		case strings.EqualFold(attribute.name, "Client"):
+			if clientIndex >= 0 {
+				return value
+			}
+			clientIndex = index
+		case strings.EqualFold(attribute.name, "Version"):
+			if versionIndex >= 0 {
+				return value
+			}
+			versionIndex = index
+		}
+	}
+
+	type replacement struct {
+		start int
+		end   int
+		value string
+	}
+	replacements := make([]replacement, 0, 2)
+	if clientIndex >= 0 {
+		attribute := attributes[clientIndex]
+		replacements = append(replacements, replacement{attribute.valueStart, attribute.valueEnd, profile.Client})
+	}
+	if versionIndex >= 0 {
+		attribute := attributes[versionIndex]
+		replacements = append(replacements, replacement{attribute.valueStart, attribute.valueEnd, profile.Version})
+	}
+
+	if len(replacements) == 2 && replacements[0].start < replacements[1].start {
+		replacements[0], replacements[1] = replacements[1], replacements[0]
+	}
+	rewritten := value
+	for _, replacement := range replacements {
+		rewritten = rewritten[:replacement.start] + replacement.value + rewritten[replacement.end:]
+	}
+	if clientIndex < 0 {
+		rewritten += ", Client=\"" + profile.Client + "\""
+	}
+	if versionIndex < 0 {
+		rewritten += ", Version=\"" + profile.Version + "\""
+	}
+	return rewritten
+}
+
+func rewriteEmbyAuthorizationHeaders(header http.Header, headerName string, profile UAProfile) {
+	for name, values := range header {
+		if !strings.EqualFold(name, headerName) {
+			continue
+		}
+		for index, value := range values {
+			values[index] = rewriteEmbyAuthorizationValue(value, profile)
+		}
+	}
+}
 
 type ProxyInstance struct {
 	Site             Site
@@ -919,7 +1263,7 @@ func applyUpstreamURL(requestURL, upstream *url.URL) {
 	}
 }
 
-func validateSiteSettings(name string, listenPort int, targetURL, playbackTargetURL, playbackMode string, streamHosts []string, uaMode string, quota int64, speedLimit int) error {
+func validateSiteSettings(name string, listenPort int, targetURL, playbackTargetURL, playbackMode string, streamHosts []string, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) error {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 100 || strings.ContainsAny(name, "\r\n") {
 		return fmt.Errorf("name must be 1-100 characters without line breaks")
@@ -938,8 +1282,8 @@ func validateSiteSettings(name string, listenPort int, targetURL, playbackTarget
 	if playbackMode != "direct" && playbackMode != "redirect" {
 		return fmt.Errorf("playback_mode must be direct or redirect")
 	}
-	if _, ok := uaProfiles[uaMode]; !ok {
-		return fmt.Errorf("unknown ua_mode")
+	if _, _, _, _, err := normalizeUAConfig(uaMode, customUserAgent, customClient, customVersion); err != nil {
+		return err
 	}
 	if quota < 0 || speedLimit < 0 {
 		return fmt.Errorf("traffic_quota and speed_limit must not be negative")
@@ -982,24 +1326,8 @@ func upstreamTargetForRequest(r *http.Request, apiTarget, playbackTarget *url.UR
 
 func applyUAProfileHeaders(header http.Header, profile UAProfile) {
 	header.Set("User-Agent", profile.UserAgent)
-	if auth := header.Get("X-Emby-Authorization"); auth != "" {
-		if embyAuthClientRe.MatchString(auth) {
-			auth = embyAuthClientRe.ReplaceAllString(auth, `${1}`+profile.Client+`"`)
-		}
-		if embyAuthVersionRe.MatchString(auth) {
-			auth = embyAuthVersionRe.ReplaceAllString(auth, `${1}`+profile.Version+`"`)
-		}
-		header.Set("X-Emby-Authorization", auth)
-	}
-	if auth := header.Get("Authorization"); auth != "" {
-		if embyAuthClientRe.MatchString(auth) {
-			auth = embyAuthClientRe.ReplaceAllString(auth, `${1}`+profile.Client+`"`)
-		}
-		if embyAuthVersionRe.MatchString(auth) {
-			auth = embyAuthVersionRe.ReplaceAllString(auth, `${1}`+profile.Version+`"`)
-		}
-		header.Set("Authorization", auth)
-	}
+	rewriteEmbyAuthorizationHeaders(header, "X-Emby-Authorization", profile)
+	rewriteEmbyAuthorizationHeaders(header, "Authorization", profile)
 }
 
 func removeClientForwardingHeaders(header http.Header) {
@@ -1176,7 +1504,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 	}
 
-	profile := getUAProfile(site.UAMode)
+	profile, err := resolveSiteUAProfile(site)
+	if err != nil {
+		return fmt.Errorf("invalid UA profile: %w", err)
+	}
 	inst := &ProxyInstance{Site: site, startedAt: time.Now()}
 	inst.persistedTraffic.Store(site.TrafficUsed)
 
@@ -1458,6 +1789,7 @@ type DiagHeaders struct {
 	CurrentUA    string `json:"current_ua"`
 	ClientField  string `json:"client_field"`
 	VersionField string `json:"version_field"`
+	ProfileError string `json:"profile_error,omitempty"`
 }
 
 type DiagProxy struct {
@@ -1794,7 +2126,7 @@ func diagnoseUpstreamTarget(targetURL, probeKind string) (DiagUpstream, string) 
 }
 
 func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
-	profile := getUAProfile(site.UAMode)
+	profile, profileErr := resolveSiteUAProfile(*site)
 	primary, primaryKey := diagnoseUpstreamTarget(site.TargetURL, "metadata_api")
 	primary.Configured = true
 	primary.ShowHealth = true
@@ -1834,11 +2166,17 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	}
 
 	// Headers
-	result.Headers = DiagHeaders{
-		UAApplied:    true,
-		CurrentUA:    profile.UserAgent,
-		ClientField:  profile.Client,
-		VersionField: profile.Version,
+	if profileErr != nil {
+		result.Headers = DiagHeaders{
+			ProfileError: "invalid stored UA configuration",
+		}
+	} else {
+		result.Headers = DiagHeaders{
+			UAApplied:    true,
+			CurrentUA:    profile.UserAgent,
+			ClientField:  profile.Client,
+			VersionField: profile.Version,
+		}
 	}
 
 	// Proxy status
@@ -1864,6 +2202,7 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 type App struct {
 	db               *DB
 	pm               *ProxyManager
+	siteLifecycleMu  sync.Mutex
 	setupToken       string
 	loginLimiter     *loginRateLimiter
 	loginLimiterOnce sync.Once
@@ -2266,6 +2605,9 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PlaybackMode      string   `json:"playback_mode"`
 			StreamHosts       []string `json:"stream_hosts"`
 			UAMode            string   `json:"ua_mode"`
+			CustomUserAgent   string   `json:"custom_user_agent"`
+			CustomClient      string   `json:"custom_client"`
+			CustomVersion     string   `json:"custom_version"`
 			Quota             int64    `json:"traffic_quota"`
 			SpeedLimit        int      `json:"speed_limit"`
 		}
@@ -2285,8 +2627,16 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = strings.TrimSpace(req.Name)
 		req.PlaybackMode = strings.ToLower(strings.TrimSpace(req.PlaybackMode))
-		req.UAMode = strings.ToLower(strings.TrimSpace(req.UAMode))
-		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.Quota, req.SpeedLimit); err != nil {
+		normalizedMode, customUserAgent, customClient, customVersion, err := normalizeUAConfig(req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.UAMode = normalizedMode
+		req.CustomUserAgent = customUserAgent
+		req.CustomClient = customClient
+		req.CustomVersion = customVersion
+		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -2294,7 +2644,22 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		if req.StreamHosts == nil {
 			streamHostsJSON = []byte("[]")
 		}
-		site, err := a.db.CreateSite(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, string(streamHostsJSON), req.UAMode, req.Quota, req.SpeedLimit)
+		a.siteLifecycleMu.Lock()
+		defer a.siteLifecycleMu.Unlock()
+		site, err := a.db.CreateSiteRecord(Site{
+			Name:              req.Name,
+			ListenPort:        req.ListenPort,
+			TargetURL:         req.TargetURL,
+			PlaybackTargetURL: req.PlaybackTargetURL,
+			PlaybackMode:      req.PlaybackMode,
+			StreamHosts:       string(streamHostsJSON),
+			UAMode:            req.UAMode,
+			CustomUserAgent:   req.CustomUserAgent,
+			CustomClient:      req.CustomClient,
+			CustomVersion:     req.CustomVersion,
+			TrafficQuota:      req.Quota,
+			SpeedLimit:        req.SpeedLimit,
+		})
 		if err != nil {
 			a.jsonErr(w, 500, err.Error())
 			return
@@ -2334,6 +2699,8 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case action == "toggle" && r.Method == "POST":
+		a.siteLifecycleMu.Lock()
+		defer a.siteLifecycleMu.Unlock()
 		newState, err := a.db.ToggleSite(id)
 		if err != nil {
 			a.jsonErr(w, 500, err.Error())
@@ -2372,6 +2739,8 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, result)
 
 	case action == "" && r.Method == "PUT":
+		a.siteLifecycleMu.Lock()
+		defer a.siteLifecycleMu.Unlock()
 		oldSite, err := a.db.GetSite(id)
 		if err != nil {
 			a.jsonErr(w, 404, "site not found")
@@ -2384,7 +2753,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			PlaybackTargetURL *string   `json:"playback_target_url"`
 			PlaybackMode      *string   `json:"playback_mode"`
 			StreamHosts       *[]string `json:"stream_hosts"`
-			UAMode            string    `json:"ua_mode"`
+			UAMode            *string   `json:"ua_mode"`
+			CustomUserAgent   *string   `json:"custom_user_agent"`
+			CustomClient      *string   `json:"custom_client"`
+			CustomVersion     *string   `json:"custom_version"`
 			Quota             int64     `json:"traffic_quota"`
 			SpeedLimit        *int      `json:"speed_limit"`
 		}
@@ -2405,26 +2777,40 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			sh, _ := json.Marshal(*req.StreamHosts)
 			streamHosts = string(sh)
 		}
-		if req.UAMode == "" {
-			req.UAMode = oldSite.UAMode
-		}
 		speedLimit := oldSite.SpeedLimit
 		if req.SpeedLimit != nil {
 			speedLimit = *req.SpeedLimit
 		}
+		uaMode, customUserAgent, customClient, customVersion, uaErr := mergeSiteUAConfig(*oldSite, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
+		if uaErr != nil {
+			a.jsonErr(w, http.StatusBadRequest, uaErr.Error())
+			return
+		}
 		req.Name = strings.TrimSpace(req.Name)
 		playbackMode = strings.ToLower(strings.TrimSpace(playbackMode))
-		req.UAMode = strings.ToLower(strings.TrimSpace(req.UAMode))
 		var streamHostList []string
 		if err := json.Unmarshal([]byte(streamHosts), &streamHostList); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, "invalid stream_hosts")
 			return
 		}
-		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, playbackTargetURL, playbackMode, streamHostList, req.UAMode, req.Quota, speedLimit); err != nil {
+		candidate := *oldSite
+		candidate.Name = req.Name
+		candidate.ListenPort = req.ListenPort
+		candidate.TargetURL = req.TargetURL
+		candidate.PlaybackTargetURL = playbackTargetURL
+		candidate.PlaybackMode = playbackMode
+		candidate.StreamHosts = streamHosts
+		candidate.UAMode = uaMode
+		candidate.CustomUserAgent = customUserAgent
+		candidate.CustomClient = customClient
+		candidate.CustomVersion = customVersion
+		candidate.TrafficQuota = req.Quota
+		candidate.SpeedLimit = speedLimit
+		if err := validateSiteSettings(candidate.Name, candidate.ListenPort, candidate.TargetURL, candidate.PlaybackTargetURL, candidate.PlaybackMode, streamHostList, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := a.db.UpdateSite(id, req.Name, req.ListenPort, req.TargetURL, playbackTargetURL, playbackMode, streamHosts, req.UAMode, req.Quota, speedLimit); err != nil {
+		if err := a.db.UpdateSiteRecord(candidate); err != nil {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
@@ -2434,12 +2820,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if site.Enabled {
-			needsPreStop := oldSite.Enabled && oldSite.ListenPort == site.ListenPort
+			needsPreStop := oldSite.Enabled && oldSite.ListenPort == site.ListenPort && a.pm.IsRunning(id)
 			if needsPreStop {
 				a.pm.StopSite(id)
 			}
 			if err := a.pm.StartSite(*site); err != nil {
-				if rollbackErr := a.db.UpdateSite(oldSite.ID, oldSite.Name, oldSite.ListenPort, oldSite.TargetURL, oldSite.PlaybackTargetURL, oldSite.PlaybackMode, oldSite.StreamHosts, oldSite.UAMode, oldSite.TrafficQuota, oldSite.SpeedLimit); rollbackErr != nil {
+				if rollbackErr := a.db.UpdateSiteRecord(*oldSite); rollbackErr != nil {
 					a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; rollback update: %v", err, rollbackErr))
 					return
 				}
@@ -2448,9 +2834,9 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 					a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; reload rollback site: %v", err, getErr))
 					return
 				}
-				if oldSite.Enabled && !a.pm.IsRunning(id) {
+				if needsPreStop {
 					if restartErr := a.pm.StartSite(*restoredSite); restartErr != nil {
-						a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; restore previous site: %v", err, restartErr))
+						a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; restored configuration is enabled but proxy is not running: %v", err, restartErr))
 						return
 					}
 				}
@@ -2461,6 +2847,8 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, site)
 
 	case action == "" && r.Method == "DELETE":
+		a.siteLifecycleMu.Lock()
+		defer a.siteLifecycleMu.Unlock()
 		a.pm.StopSite(id)
 		if err := a.db.DeleteSite(id); err != nil {
 			a.jsonErr(w, 500, err.Error())
@@ -2595,7 +2983,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.0"
+var appVersion = "v1.5.1"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {

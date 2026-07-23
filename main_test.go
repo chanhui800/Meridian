@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,173 @@ func mustUserCount(t *testing.T, db *DB) int {
 		t.Fatalf("UserCount: %v", err)
 	}
 	return count
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func TestNormalizeCustomUAConfig(t *testing.T) {
+	mode, userAgent, client, version, err := normalizeUAConfig(" CUSTOM ", "  Meridian/$1  ", "  Custom Client  ", " 1.2.3 ")
+	if err != nil {
+		t.Fatalf("normalize custom config: %v", err)
+	}
+	if mode != customUAMode || userAgent != "Meridian/$1" || client != "Custom Client" || version != "1.2.3" {
+		t.Fatalf("normalized custom config = %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		userAgent string
+		client    string
+		version   string
+	}{
+		{"missing user agent", "", "Client", "1.0"},
+		{"missing client", "UA", "", "1.0"},
+		{"missing version", "UA", "Client", ""},
+		{"whitespace only", " ", "Client", "1.0"},
+		{"too long user agent", strings.Repeat("a", maxCustomUserAgentLen+1), "Client", "1.0"},
+		{"too long client", "UA", strings.Repeat("a", maxCustomClientLen+1), "1.0"},
+		{"too long version", "UA", "Client", strings.Repeat("a", maxCustomVersionLen+1)},
+		{"new line", "UA\nnext", "Client", "1.0"},
+		{"non ascii", "UA", "Clïent", "1.0"},
+		{"client quote", "UA", "Client\"", "1.0"},
+		{"version backslash", "UA", "Client", "1\\0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, _, _, err := normalizeUAConfig("custom", tc.userAgent, tc.client, tc.version); err == nil {
+				t.Fatal("invalid custom UA configuration unexpectedly accepted")
+			}
+		})
+	}
+
+	mode, userAgent, client, version, err = normalizeUAConfig("web", "stale", "stale", "stale")
+	if err != nil {
+		t.Fatalf("normalize preset config: %v", err)
+	}
+	if mode != "web" || userAgent != "" || client != "" || version != "" {
+		t.Fatalf("preset did not clear custom fields: %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+}
+
+func TestMergeSiteUAConfigUsesCompleteSnapshots(t *testing.T) {
+	old := Site{
+		UAMode:          customUAMode,
+		CustomUserAgent: "Old UA",
+		CustomClient:    "Old Client",
+		CustomVersion:   "1.0",
+	}
+
+	mode, userAgent, client, version, err := mergeSiteUAConfig(old, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("preserve existing custom config: %v", err)
+	}
+	if mode != customUAMode || userAgent != "Old UA" || client != "Old Client" || version != "1.0" {
+		t.Fatalf("preserved config = %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+
+	if _, _, _, _, err := mergeSiteUAConfig(old, stringPointer(customUAMode), nil, nil, nil); err == nil {
+		t.Fatal("custom mode without its full triplet unexpectedly accepted")
+	}
+	if _, _, _, _, err := mergeSiteUAConfig(old, nil, stringPointer("New UA"), nil, stringPointer("2.0")); err == nil {
+		t.Fatal("partial custom triplet unexpectedly accepted")
+	}
+
+	mode, userAgent, client, version, err = mergeSiteUAConfig(old, stringPointer("web"), stringPointer(""), stringPointer(""), stringPointer(""))
+	if err != nil {
+		t.Fatalf("switch to preset: %v", err)
+	}
+	if mode != "web" || userAgent != "" || client != "" || version != "" {
+		t.Fatalf("preset switch did not clear custom values: %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+}
+
+func createLegacySiteDatabase(t *testing.T, dbPath string, withHourlyIndex bool) {
+	t.Helper()
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	t.Cleanup(func() { legacy.Close() })
+
+	if _, err := legacy.Exec("CREATE TABLE sites (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, listen_port INTEGER NOT NULL UNIQUE, target_url TEXT NOT NULL, ua_mode TEXT DEFAULT 'infuse', enabled INTEGER DEFAULT 1, traffic_quota BIGINT DEFAULT 0, traffic_used BIGINT DEFAULT 0, speed_limit INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"); err != nil {
+		t.Fatalf("create legacy sites: %v", err)
+	}
+	if _, err := legacy.Exec("CREATE TABLE traffic_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, site_id INTEGER NOT NULL, bytes_in BIGINT DEFAULT 0, bytes_out BIGINT DEFAULT 0, recorded_at DATETIME NOT NULL)"); err != nil {
+		t.Fatalf("create legacy traffic logs: %v", err)
+	}
+	if _, err := legacy.Exec("INSERT INTO sites (name, listen_port, target_url, ua_mode, enabled, traffic_quota, traffic_used, speed_limit) VALUES ('legacy', 19001, 'http://127.0.0.1:8096', 'infuse', 1, 0, 0, 0)"); err != nil {
+		t.Fatalf("insert legacy site: %v", err)
+	}
+	if withHourlyIndex {
+		if _, err := legacy.Exec("CREATE UNIQUE INDEX idx_traffic_site_hour ON traffic_logs(site_id, recorded_at)"); err != nil {
+			t.Fatalf("create legacy hourly index: %v", err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+}
+
+func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
+	for _, withHourlyIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hourly index=%v", withHourlyIndex), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "legacy.db")
+			createLegacySiteDatabase(t, dbPath, withHourlyIndex)
+
+			db, err := openDB(dbPath)
+			if err != nil {
+				t.Fatalf("migrate legacy database: %v", err)
+			}
+			defer db.Close()
+
+			for _, column := range []string{"playback_target_url", "playback_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version"} {
+				var count int
+				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
+					t.Fatalf("inspect %s: %v", column, err)
+				}
+				if count != 1 {
+					t.Fatalf("column %s count=%d, want 1", column, count)
+				}
+			}
+			site, err := db.GetSite(1)
+			if err != nil {
+				t.Fatalf("read migrated site: %v", err)
+			}
+			if site.UAMode != "infuse" || site.CustomUserAgent != "" || site.CustomClient != "" || site.CustomVersion != "" {
+				t.Fatalf("migrated site UA config = %#v", site)
+			}
+		})
+	}
+}
+
+func TestMigrateSerializesConcurrentLegacyDatabaseOpens(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent-legacy.db")
+	createLegacySiteDatabase(t, dbPath, false)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			db, err := openDB(dbPath)
+			if err == nil {
+				db.Close()
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent migration: %v", err)
+		}
+	}
 }
 
 func TestGenerateTokenPreservesSpecialCharacters(t *testing.T) {
@@ -544,7 +712,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.5.0", "/js/pages/sites.js?v=1.5.0", "/js/app.js?v=1.5.0"} {
+	for _, asset := range []string{"/css/style.css?v=1.5.1", "/js/pages/sites.js?v=1.5.1", "/js/app.js?v=1.5.1"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -1360,6 +1528,135 @@ func TestApplyUAProfileHeadersRewritesClientAndVersionIdentity(t *testing.T) {
 	}
 }
 
+func TestApplyCustomUAProfileHeadersSafelyRewritesOnlyValidEmbyValues(t *testing.T) {
+	profile := UAProfile{
+		Name:      "Custom",
+		UserAgent: "Meridian/" + "$" + "1/" + "$" + "{1}$",
+		Client:    "Client/" + "$" + "1/" + "$" + "{1}$",
+		Version:   "1." + "$" + "0$",
+	}
+	valid := "MediaBrowser Device=\"TV\", DeviceId=\"device-1\", Version=\"old\", Client=\"old\""
+	missing := "Emby Device=\"Tablet\", DeviceId=\"device-2\""
+	duplicate := "MediaBrowser Client=\"one\", Client=\"two\", Version=\"old\""
+	escaped := "MediaBrowser Client=\"bad\\\\\\\"value\", Device=\"TV\""
+	header := http.Header{
+		"X-Emby-Authorization": []string{valid, missing, duplicate, escaped},
+		"Authorization":        []string{"Bearer opaque-token"},
+	}
+
+	applyUAProfileHeaders(header, profile)
+
+	if got := header.Get("User-Agent"); got != profile.UserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
+	}
+	values := header.Values("X-Emby-Authorization")
+	if len(values) != 4 {
+		t.Fatalf("authorization values=%d, want 4", len(values))
+	}
+	wantValid := "MediaBrowser Device=\"TV\", DeviceId=\"device-1\", Version=\"" + profile.Version + "\", Client=\"" + profile.Client + "\""
+	if values[0] != wantValid {
+		t.Fatalf("rewritten header = %q, want %q", values[0], wantValid)
+	}
+	if !strings.Contains(values[1], "Device=\"Tablet\"") || !strings.Contains(values[1], "DeviceId=\"device-2\"") || !strings.Contains(values[1], "Client=\""+profile.Client+"\"") || !strings.Contains(values[1], "Version=\""+profile.Version+"\"") {
+		t.Fatalf("missing-field header = %q", values[1])
+	}
+	if values[2] != duplicate {
+		t.Fatalf("duplicate Client header was modified: %q", values[2])
+	}
+	if values[3] != escaped {
+		t.Fatalf("escaped header was modified: %q", values[3])
+	}
+	if got := header.Get("Authorization"); got != "Bearer opaque-token" {
+		t.Fatalf("unsupported Authorization scheme was modified: %q", got)
+	}
+}
+
+func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T) {
+	profile := UAProfile{
+		Name:      "Custom",
+		UserAgent: "Meridian Test/1.0",
+		Client:    "Meridian Test",
+		Version:   "1.0.0",
+	}
+	authorization := "MediaBrowser Device=\"TV\", DeviceId=\"device-1\", Client=\"old\", Version=\"old\""
+	assertIdentity := func(t *testing.T, header http.Header) {
+		t.Helper()
+		if got := header.Get("User-Agent"); got != profile.UserAgent {
+			t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
+		}
+		got := header.Get("X-Emby-Authorization")
+		for _, want := range []string{"Device=\"TV\"", "DeviceId=\"device-1\"", "Client=\"" + profile.Client + "\"", "Version=\"" + profile.Version + "\""} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("authorization = %q, missing %q", got, want)
+			}
+		}
+	}
+
+	t.Run("http", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "http://meridian.example/System/Info", nil)
+		request.Header.Set("X-Emby-Authorization", authorization)
+		header := request.Header.Clone()
+		prepareUpstreamHeaders(header, request, profile)
+		assertIdentity(t, header)
+	})
+
+	t.Run("websocket", func(t *testing.T) {
+		target, err := normalizeTargetURL("https://upstream.example.com")
+		if err != nil {
+			t.Fatalf("normalize target: %v", err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "http://meridian.example/socket", nil)
+		request.Header.Set("Connection", "Upgrade")
+		request.Header.Set("Upgrade", "websocket")
+		request.Header.Set("X-Emby-Authorization", authorization)
+		header := prepareWebSocketUpstreamHeaders(request, target, profile)
+		assertIdentity(t, header)
+	})
+
+	t.Run("redirect", func(t *testing.T) {
+		target, err := normalizeTargetURL("https://media.example.com")
+		if err != nil {
+			t.Fatalf("normalize target: %v", err)
+		}
+		calls := 0
+		var followedHeaders http.Header
+		transport := &redirectFollowTransport{
+			playbackHosts: map[string]bool{redirectHostKey(target): true},
+			profile:       profile,
+			base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return &http.Response{
+						StatusCode: http.StatusFound,
+						Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+						Request:    request,
+					}, nil
+				}
+				followedHeaders = request.Header.Clone()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    request,
+				}, nil
+			}),
+		}
+		request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
+		request.Header.Set("X-Emby-Authorization", authorization)
+		applyUAProfileHeaders(request.Header, profile)
+		response, err := transport.RoundTrip(request)
+		if err != nil {
+			t.Fatalf("follow redirect: %v", err)
+		}
+		response.Body.Close()
+		if calls != 2 {
+			t.Fatalf("calls = %d, want 2", calls)
+		}
+		assertIdentity(t, followedHeaders)
+	})
+}
+
 func TestHandleSiteDiagReturnsSpoofedVersionField(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/System/Info/Public" {
@@ -1512,6 +1809,60 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	}
 }
 
+func TestHandleSiteUpdateFailureRestoresCustomUAFields(t *testing.T) {
+	app := newTestApp(t)
+	initialPort := freePort(t)
+	site, err := app.db.CreateSiteWithCustomUA("custom-stable", initialPort, "http://127.0.0.1:8096", "", "direct", "[]", customUAMode, "Old UA", "Old Client", "1.0", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSiteWithCustomUA: %v", err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupied listen: %v", err)
+	}
+	conflictPort := occupied.Addr().(*net.TCPAddr).Port
+	occupied.Close()
+	occupied, err = net.Listen("tcp", fmt.Sprintf(":%d", conflictPort))
+	if err != nil {
+		t.Fatalf("occupied wildcard listen: %v", err)
+	}
+	defer occupied.Close()
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":              "custom-stable",
+		"listen_port":       conflictPort,
+		"target_url":        "http://127.0.0.1:8096",
+		"ua_mode":           "custom",
+		"custom_user_agent": "New UA",
+		"custom_client":     "New Client",
+		"custom_version":    "2.0",
+	})
+	if err != nil {
+		t.Fatalf("marshal update: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(payload)))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	restored, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if restored.ListenPort != initialPort || restored.UAMode != customUAMode || restored.CustomUserAgent != "Old UA" || restored.CustomClient != "Old Client" || restored.CustomVersion != "1.0" {
+		t.Fatalf("rollback did not restore full custom snapshot: %#v", restored)
+	}
+	if !app.pm.IsRunning(site.ID) {
+		t.Fatal("original custom proxy should remain running")
+	}
+}
+
 func TestHandleSiteUpdatePreservesOmittedSpeedLimit(t *testing.T) {
 	app := newTestApp(t)
 	port := freePort(t)
@@ -1625,6 +1976,166 @@ func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 	}
 }
 
+func TestHandleSitesCreatesCustomUAAndPresetUpdateClearsIt(t *testing.T) {
+	app := newTestApp(t)
+	createPayload, err := json.Marshal(map[string]interface{}{
+		"name":              "custom-identity",
+		"listen_port":       freePort(t),
+		"target_url":        "http://127.0.0.1:8096",
+		"ua_mode":           "custom",
+		"custom_user_agent": "Meridian Custom/1.0",
+		"custom_client":     "Meridian Custom",
+		"custom_version":    "1.0.0",
+	})
+	if err != nil {
+		t.Fatalf("marshal create payload: %v", err)
+	}
+	createRecorder := httptest.NewRecorder()
+	app.handleSites(createRecorder, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(createPayload)))
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(createRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(created.ID) })
+	if created.UAMode != customUAMode || created.CustomUserAgent != "Meridian Custom/1.0" || created.CustomClient != "Meridian Custom" || created.CustomVersion != "1.0.0" {
+		t.Fatalf("created custom site = %#v", created)
+	}
+
+	updatePayload, err := json.Marshal(map[string]interface{}{
+		"name":        created.Name,
+		"listen_port": created.ListenPort,
+		"target_url":  created.TargetURL,
+		"ua_mode":     "web",
+	})
+	if err != nil {
+		t.Fatalf("marshal update payload: %v", err)
+	}
+	updateRecorder := httptest.NewRecorder()
+	app.handleSiteByID(updateRecorder, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(created.ID), bytes.NewReader(updatePayload)))
+	if updateRecorder.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", updateRecorder.Code, updateRecorder.Body.String())
+	}
+	reloaded, err := app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatalf("load updated site: %v", err)
+	}
+	if reloaded.UAMode != "web" || reloaded.CustomUserAgent != "" || reloaded.CustomClient != "" || reloaded.CustomVersion != "" {
+		t.Fatalf("preset update did not clear custom fields: %#v", reloaded)
+	}
+}
+
+func TestHandleSitesRejectsInvalidCustomUA(t *testing.T) {
+	for _, values := range []map[string]string{
+		{"custom_user_agent": "", "custom_client": "Client", "custom_version": "1.0"},
+		{"custom_user_agent": "UA", "custom_client": "Bad\"", "custom_version": "1.0"},
+		{"custom_user_agent": "UA\nnext", "custom_client": "Client", "custom_version": "1.0"},
+	} {
+		t.Run(values["custom_client"]+values["custom_user_agent"], func(t *testing.T) {
+			app := newTestApp(t)
+			payload := map[string]interface{}{
+				"name":        "invalid-custom",
+				"listen_port": freePort(t),
+				"target_url":  "http://127.0.0.1:8096",
+				"ua_mode":     "custom",
+			}
+			for key, value := range values {
+				payload[key] = value
+			}
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			rr := httptest.NewRecorder()
+			app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(body)))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+			}
+			if sites, err := app.db.ListSites(); err != nil || len(sites) != 0 {
+				t.Fatalf("invalid custom site was persisted: sites=%#v err=%v", sites, err)
+			}
+		})
+	}
+}
+
+func TestHandleSiteDiagUsesResolvedCustomUAProfile(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/System/Info/Public" {
+			w.Write([]byte("{\"Version\":\"4.9.0\"}"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	app := newTestApp(t)
+	site, err := app.db.CreateSiteWithCustomUA("diag-custom", freePort(t), upstream.URL, "", "direct", "[]", customUAMode, "Custom UA/1.0", "Custom Client", "1.0.0", 0, 0)
+	if err != nil {
+		t.Fatalf("create custom site: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, httptest.NewRequest(http.MethodGet, "/api/sites/"+jsonNumber64(site.ID)+"/diag", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("diag status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	headers := mustMapValue(t, decodeBody(t, rr), "headers")
+	if got := mustStringValue(t, headers, "current_ua"); got != "Custom UA/1.0" {
+		t.Fatalf("current_ua = %q", got)
+	}
+	if got := mustStringValue(t, headers, "client_field"); got != "Custom Client" {
+		t.Fatalf("client_field = %q", got)
+	}
+	if got := mustStringValue(t, headers, "version_field"); got != "1.0.0" {
+		t.Fatalf("version_field = %q", got)
+	}
+}
+
+func TestCleanDatabaseInitializationAPIFlow(t *testing.T) {
+	app := newTestApp(t)
+	app.setupToken = "clean-database-setup-token"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
+	mux.HandleFunc("/api/auth/setup", cors(app.handleSetup))
+	mux.HandleFunc("/api/auth/login", cors(app.handleLogin))
+	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
+
+	check := httptest.NewRecorder()
+	mux.ServeHTTP(check, httptest.NewRequest(http.MethodGet, "/api/auth/check", nil))
+	if check.Code != http.StatusOK || !mustBoolValue(t, decodeBody(t, check), "needs_setup") {
+		t.Fatalf("initial auth check = status %d body=%s", check.Code, check.Body.String())
+	}
+
+	setupBody := strings.NewReader("{\"username\":\"admin\",\"password\":\"correct horse battery staple\",\"setup_token\":\"clean-database-setup-token\"}")
+	setup := httptest.NewRecorder()
+	mux.ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", setupBody))
+	if setup.Code != http.StatusOK {
+		t.Fatalf("setup status=%d body=%s", setup.Code, setup.Body.String())
+	}
+
+	login := httptest.NewRecorder()
+	mux.ServeHTTP(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader("{\"username\":\"admin\",\"password\":\"correct horse battery staple\"}")))
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
+	}
+	token := mustStringValue(t, decodeBody(t, login), "token")
+
+	secondSetup := httptest.NewRecorder()
+	mux.ServeHTTP(secondSetup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", strings.NewReader("{\"username\":\"other\",\"password\":\"correct horse battery staple\",\"setup_token\":\"clean-database-setup-token\"}")))
+	if secondSetup.Code != http.StatusBadRequest {
+		t.Fatalf("second setup status=%d body=%s", secondSetup.Code, secondSetup.Body.String())
+	}
+
+	sitesRequest := httptest.NewRequest(http.MethodGet, "/api/sites", nil)
+	sitesRequest.Header.Set("Authorization", "Bearer "+token)
+	sites := httptest.NewRecorder()
+	mux.ServeHTTP(sites, sitesRequest)
+	if sites.Code != http.StatusOK {
+		t.Fatalf("authenticated sites status=%d body=%s", sites.Code, sites.Body.String())
+	}
+}
+
 func TestStartSiteRejectsCorruptStreamHosts(t *testing.T) {
 	app := newTestApp(t)
 	base := Site{
@@ -1647,6 +2158,14 @@ func TestStartSiteRejectsCorruptStreamHosts(t *testing.T) {
 	invalidURL.StreamHosts = `["file://media.example.com/path"]`
 	if err := app.pm.StartSite(invalidURL); err == nil || !strings.Contains(err.Error(), "invalid stream host") {
 		t.Fatalf("invalid stream host error = %v", err)
+	}
+	invalidUA := base
+	invalidUA.UAMode = customUAMode
+	invalidUA.CustomUserAgent = "Custom UA"
+	invalidUA.CustomClient = ""
+	invalidUA.CustomVersion = "1.0"
+	if err := app.pm.StartSite(invalidUA); err == nil || !strings.Contains(err.Error(), "invalid UA profile") {
+		t.Fatalf("invalid custom UA profile error = %v", err)
 	}
 	if app.pm.IsRunning(base.ID) {
 		t.Fatal("corrupt site unexpectedly started")
