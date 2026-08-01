@@ -637,6 +637,8 @@ find_domain_conflict() {
     [ -d "$NGINX_ROOT" ] || return 1
     while IFS= read -r file; do
         [ "$file" = "$NGINX_CONFIG" ] && continue
+        # AWK field references below must remain literal rather than expand in Shell.
+        # shellcheck disable=SC2016
         if as_root awk -v domain="$domain" '
             function matches_server_name(name, suffix, prefix, suffix_len) {
                 gsub(/^"+/, "", name)
