@@ -41,7 +41,7 @@ Meridian 把这些事情打包成一个单二进制程序，带管理界面，�
 | **WebSocket 代理** | 完整支持 Emby 的 WebSocket 通信 |
 | **SSE 实时推送** | 仪表盘数据通过 Server-Sent Events 实时更新 |
 | **故障诊断** | 回源健康检测、上游 TLS 证书检查、请求头预览 |
-| **JWT 认证** | Bearer Token 认证，密码 bcrypt 存储 |
+| **JWT 认证** | HttpOnly 会话 Cookie 认证，密码 bcrypt 存储 |
 | **单二进制部署** | 前端嵌入二进制，SQLite 持久化，无外部依赖 |
 
 ---
@@ -85,6 +85,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 ### Docker
 
 ```bash
+export MERIDIAN_SETUP_TOKEN="$(openssl rand -hex 32)"  # 保存此值，首次登录时需要输入
 docker run -d --name meridian \
   --restart unless-stopped \
   --read-only \
@@ -93,16 +94,17 @@ docker run -d --name meridian \
   --ulimit nofile=65536:65536 \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   -p 127.0.0.1:9090:9090 -p 8001-8010:8001-8010 \
-  -v meridian-data:/app/data \
-  -e JWT_SECRET=$(openssl rand -hex 32) \
-  ghcr.io/snnabb/meridian:latest
+	-v meridian-data:/app/data \
+	-e JWT_SECRET=$(openssl rand -hex 32) \
+	-e SETUP_TOKEN="$MERIDIAN_SETUP_TOKEN" \
+	ghcr.io/snnabb/meridian:latest
 ```
 
 > `8001-8010` 是反代站点监听端口范围，按实际需要调整。
 >
 > 管理面板默认只映射到宿主机 `127.0.0.1:9090`，建议再通过 HTTPS 反向代理访问。如果确实需要直接通过公网 IP 访问，可改成 `-p 9090:9090`，并同时配置防火墙白名单。
 >
-> 首次启动后运行 `docker logs meridian` 查看初始化令牌，再在面板中创建管理员。
+> 首次创建管理员前必须设置并妥善保存 `SETUP_TOKEN`；服务不会把它写入启动日志。上面的命令把随机值保存在 `MERIDIAN_SETUP_TOKEN` 中，请在关闭当前 shell 前记入密码管理器，以便在面板中输入。
 >
 > 官方镜像会在推送 `v*` 标签时由 GitHub Actions 构建并推送到 GHCR。若仓库尚未发布版本，或 GHCR 中暂时没有可用镜像，请改用源码构建。
 
@@ -111,6 +113,7 @@ docker run -d --name meridian \
 ```powershell
 Invoke-WebRequest -Uri "https://github.com/snnabb/Meridian/releases/latest/download/meridian-windows-amd64.exe" -OutFile "meridian.exe"
 $env:JWT_SECRET = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
+$env:SETUP_TOKEN = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
 .\meridian.exe
 ```
 
@@ -121,10 +124,10 @@ $env:JWT_SECRET = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max
 ```bash
 git clone https://github.com/snnabb/Meridian.git && cd Meridian
 go build -o meridian .
-JWT_SECRET=$(openssl rand -hex 32) ./meridian
+JWT_SECRET=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) ./meridian
 ```
 
-未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。也可以预先设置 `SETUP_TOKEN` 环境变量。
+未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。源码、Docker 和 Windows 部署必须在首次启动前显式设置 `SETUP_TOKEN`；服务不会自动生成或记录该值。
 
 ---
 
@@ -152,7 +155,7 @@ unset ADMIN_PASSWORD
 | `PANEL_BIND_ADDR` | `0.0.0.0` | 仅控制管理面板的绑定地址；域名模式由安装器设为 `127.0.0.1`，不影响站点监听端口 |
 | `PANEL_DOMAIN` | 空 | 安装器记录的单个管理面板域名；不作为播放回源配置 |
 | `JWT_SECRET` | 进程启动时随机生成 | 至少 32 字节的 JWT 签名密钥。**生产环境必须显式设置**，否则每次重启后会话全部失效 |
-| `SETUP_TOKEN` | 首次启动时随机生成 | 首次创建管理员所需的一次性初始化令牌；未设置时会写入启动日志 |
+| `SETUP_TOKEN` | 无 | 数据库中没有管理员时必须设置的初始化令牌；首次创建成功后仅从进程内存清除，服务不会记录其值 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 允许提供 `X-Real-IP`/`X-Forwarded-For` 的反向代理 CIDR，多个值用逗号分隔；不要填写不受信任的客户端网段 |
 
 ### Docker Compose
@@ -179,7 +182,8 @@ services:
     volumes:
       - meridian-data:/app/data
     environment:
-      - JWT_SECRET=your-secret-here  # 替换为一个固定随机字符串
+      - JWT_SECRET=your-secret-here    # 替换为一个固定随机字符串
+      - SETUP_TOKEN=your-setup-token   # 首次启动前设置并妥善保存
 
 volumes:
   meridian-data:
@@ -281,9 +285,9 @@ Meridian/
 ## 运维要点
 
 - **JWT 密钥**：未设置 `JWT_SECRET` 时每次启动生成随机密钥，重启后会话全部失效
-- **首次初始化**：数据库中没有管理员时必须提供启动日志中的初始化令牌，创建操作在数据库中原子执行
-- **登录保护**：同一来源在 15 分钟内连续失败 5 次后会被暂时限制 15 分钟
-- **浏览器边界**：管理 API 默认只允许同源浏览器请求，并发送 CSP、防嵌入和 MIME 嗅探保护头
+- **首次初始化**：数据库中没有管理员时必须预先配置 `SETUP_TOKEN`，创建操作在数据库中原子执行，服务不会记录令牌
+- **登录保护**：同一来源在 15 分钟内连续失败 5 次后会被暂时限制 15 分钟；限流记录会过期并在容量达到上限时按最近使用情况淘汰
+- **浏览器边界**：管理 API 使用 `HttpOnly`、`SameSite=Strict` 会话 Cookie，只允许同源的状态变更请求，并发送 CSP、防嵌入和 MIME 嗅探保护头
 - **流量持久化**：每 60 秒刷入 SQLite，异常退出可能丢失最近一分钟计量
 - **操作原子性**：站点创建/启停/更新如反代绑定失败，会回滚数据库并返回错误
 - **优雅关闭**：收到 `SIGINT`/`SIGTERM` 后先 flush 流量再退出
@@ -384,7 +388,7 @@ Meridian `v1` 明确定位为一个**单管理员、轻量、可直接落地**�
 
 - 后端代码保持在 `main.go`，不拆分文件
 - 前端使用 hash 路由（`#/dashboard`、`#/sites`、`#/diagnostics`）
-- API 认证使用 JWT Bearer Token
+- API 认证使用 HttpOnly JWT 会话 Cookie
 - SQLite 驱动名为 `sqlite`（不是 `sqlite3`）
 - 静态资源通过 `go:embed` 嵌入二进制
 

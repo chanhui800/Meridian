@@ -65,7 +65,7 @@ function startDashSSE() {
 function queueDashSSERetry() {
   if (dashRetryTimer) clearTimeout(dashRetryTimer);
   dashRetryTimer = setTimeout(() => {
-    if (Router.current === 'dashboard' && API.token) startFetchSSE();
+    if (Router.current === 'dashboard' && API.authenticated) startFetchSSE();
   }, 5000);
 }
 
@@ -76,10 +76,15 @@ async function startFetchSSE() {
 
   try {
     const resp = await fetch('/api/events', {
-      headers: { 'Authorization': 'Bearer ' + API.token },
+      credentials: 'same-origin',
       signal: controller.signal,
     });
 
+    if (resp.status === 401) {
+      await API.logout();
+      window.location.reload();
+      return;
+    }
     if (!resp.ok) throw new Error('SSE failed');
     if (dashAbortController !== controller) return;
 

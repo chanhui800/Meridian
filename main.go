@@ -157,6 +157,11 @@ func mergeSiteUAConfig(old Site, requestedMode, requestedUserAgent, requestedCli
 var jwtSecret []byte
 var jwtSecretEphemeral bool
 
+const (
+	sessionCookieName = "meridian_session"
+	sessionDuration   = 72 * time.Hour
+)
+
 func init() {
 	var err error
 	jwtSecret, jwtSecretEphemeral, err = resolveJWTSecret(os.Getenv("JWT_SECRET"))
@@ -250,12 +255,15 @@ func base64urlDecode(s string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(s)
 }
 
-func generateSetupToken() (string, error) {
-	b := make([]byte, 24)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+func configuredSetupToken(userCount int, value string) (string, error) {
+	if userCount > 0 {
+		return "", nil
 	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	token := strings.TrimSpace(value)
+	if token == "" {
+		return "", errors.New("SETUP_TOKEN must be configured before creating the first administrator")
+	}
+	return token, nil
 }
 
 func setupTokenMatches(expected, provided string) bool {
@@ -1199,6 +1207,15 @@ func normalizeTargetURL(addr string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// redactUpstreamURL keeps operator logs useful without retaining credentials,
+// paths, or signed query parameters from configured upstreams.
+func redactUpstreamURL(target *url.URL) string {
+	if target == nil || target.Scheme == "" || target.Host == "" {
+		return "configured upstream"
+	}
+	return strings.ToLower(target.Scheme) + "://" + target.Host
+}
+
 func redirectHostKey(target *url.URL) string {
 	host := strings.ToLower(strings.TrimSuffix(target.Hostname(), "."))
 	if host == "" {
@@ -1619,14 +1636,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	pm.mu.Unlock()
 
 	go func() {
+		upstreamLogTarget := redactUpstreamURL(target)
 		if len(playbackHostsSet) > 0 {
 			hosts := make([]string, 0, len(playbackHostsSet))
 			for h := range playbackHostsSet {
 				hosts = append(hosts, h)
 			}
-			log.Printf("[%s] proxy :%d -> %s (playback hosts: %s, mode: %s, UA: %s)", site.Name, site.ListenPort, site.TargetURL, strings.Join(hosts, ", "), site.PlaybackMode, site.UAMode)
+			log.Printf("[%s] proxy :%d -> %s (playback hosts: %s, mode: %s, UA: %s)", site.Name, site.ListenPort, upstreamLogTarget, strings.Join(hosts, ", "), site.PlaybackMode, site.UAMode)
 		} else {
-			log.Printf("[%s] proxy :%d -> %s (UA: %s)", site.Name, site.ListenPort, site.TargetURL, site.UAMode)
+			log.Printf("[%s] proxy :%d -> %s (UA: %s)", site.Name, site.ListenPort, upstreamLogTarget, site.UAMode)
 		}
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Printf("[%s] server error: %v", site.Name, err)
@@ -2203,6 +2221,7 @@ type App struct {
 	db               *DB
 	pm               *ProxyManager
 	siteLifecycleMu  sync.Mutex
+	setupTokenMu     sync.Mutex
 	setupToken       string
 	loginLimiter     *loginRateLimiter
 	loginLimiterOnce sync.Once
@@ -2221,50 +2240,88 @@ type loginAttempt struct {
 	failures     int
 	firstFailure time.Time
 	blockedUntil time.Time
+	lastSeen     time.Time
 }
 
 type loginRateLimiter struct {
-	mu       sync.Mutex
-	attempts map[string]loginAttempt
+	mu         sync.Mutex
+	attempts   map[string]loginAttempt
+	maxEntries int
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
-	return &loginRateLimiter{attempts: make(map[string]loginAttempt)}
+	return newLoginRateLimiterWithLimit(maxTrackedLoginClients)
 }
 
-func (l *loginRateLimiter) keyFor(client string) string {
-	if _, exists := l.attempts[client]; !exists && len(l.attempts) >= maxTrackedLoginClients {
-		return "__overflow__"
+func newLoginRateLimiterWithLimit(maxEntries int) *loginRateLimiter {
+	if maxEntries < 1 {
+		maxEntries = 1
 	}
-	return client
+	return &loginRateLimiter{
+		attempts:   make(map[string]loginAttempt),
+		maxEntries: maxEntries,
+	}
+}
+
+func (l *loginRateLimiter) pruneExpired(now time.Time) {
+	for client, attempt := range l.attempts {
+		if now.Before(attempt.blockedUntil) {
+			continue
+		}
+		if attempt.firstFailure.IsZero() || !now.Before(attempt.firstFailure.Add(loginFailureWindow)) {
+			delete(l.attempts, client)
+		}
+	}
+}
+
+func (l *loginRateLimiter) evictLeastRecentlySeen() {
+	var oldestClient string
+	var oldestSeen time.Time
+	for client, attempt := range l.attempts {
+		seen := attempt.lastSeen
+		if seen.IsZero() {
+			seen = attempt.firstFailure
+		}
+		if oldestClient == "" || seen.Before(oldestSeen) {
+			oldestClient = client
+			oldestSeen = seen
+		}
+	}
+	if oldestClient != "" {
+		delete(l.attempts, oldestClient)
+	}
 }
 
 func (l *loginRateLimiter) allow(client string, now time.Time) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	client = l.keyFor(client)
+	l.pruneExpired(now)
 	attempt, ok := l.attempts[client]
 	if !ok {
 		return true, 0
 	}
+	attempt.lastSeen = now
 	if now.Before(attempt.blockedUntil) {
+		l.attempts[client] = attempt
 		return false, attempt.blockedUntil.Sub(now)
 	}
-	if now.Sub(attempt.firstFailure) >= loginFailureWindow {
-		delete(l.attempts, client)
-	}
+	l.attempts[client] = attempt
 	return true, 0
 }
 
 func (l *loginRateLimiter) recordFailure(client string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	client = l.keyFor(client)
-	attempt := l.attempts[client]
+	l.pruneExpired(now)
+	attempt, exists := l.attempts[client]
+	if !exists && len(l.attempts) >= l.maxEntries {
+		l.evictLeastRecentlySeen()
+	}
 	if attempt.firstFailure.IsZero() || now.Sub(attempt.firstFailure) >= loginFailureWindow {
 		attempt = loginAttempt{firstFailure: now}
 	}
 	attempt.failures++
+	attempt.lastSeen = now
 	if attempt.failures >= maxLoginFailures {
 		attempt.blockedUntil = now.Add(loginLockoutDuration)
 	}
@@ -2274,7 +2331,7 @@ func (l *loginRateLimiter) recordFailure(client string, now time.Time) {
 func (l *loginRateLimiter) reset(client string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.attempts, l.keyFor(client))
+	delete(l.attempts, client)
 }
 
 func (a *App) limiter() *loginRateLimiter {
@@ -2359,20 +2416,54 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}) err
 	return nil
 }
 
+func originMatchesRequestHost(origin string, r *http.Request) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+func refererMatchesRequestHost(referer string, r *http.Request) bool {
+	parsed, err := url.Parse(referer)
+	if err != nil || parsed.User != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+func requestHasSameOrigin(r *http.Request) bool {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		return originMatchesRequestHost(origin, r)
+	}
+	return refererMatchesRequestHost(r.Referer(), r)
+}
+
+func stateChangingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
 func cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			parsed, err := url.Parse(origin)
-			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !strings.EqualFold(parsed.Host, r.Host) {
+			if !originMatchesRequestHost(origin, r) {
 				http.Error(w, "cross-origin request denied", http.StatusForbidden)
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Add("Vary", "Origin")
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -2430,16 +2521,69 @@ func (a *App) jsonErr(w http.ResponseWriter, status int, msg string) {
 	a.jsonResponse(w, status, map[string]string{"error": msg})
 }
 
-func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+func requestIsHTTPS(r *http.Request, trustedProxies []*net.IPNet) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !isTrustedProxy(remoteAddressIP(r.RemoteAddr), trustedProxies) {
+		return false
+	}
+	forwardedProto := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]
+	return strings.EqualFold(strings.TrimSpace(forwardedProto), "https")
+}
+
+func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		Expires:  time.Now().Add(sessionDuration),
+		MaxAge:   int(sessionDuration.Seconds()),
+		Secure:   requestIsHTTPS(r, a.trustedProxies),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (a *App) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(1, 0),
+		MaxAge:   -1,
+		Secure:   requestIsHTTPS(r, a.trustedProxies),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func sessionIdentity(r *http.Request) (int64, string, error) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return 0, "", errors.New("missing session")
+	}
+	return validateToken(cookie.Value)
+}
+
+func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			a.jsonErr(w, 401, "missing bearer token")
+		if stateChangingMethod(r.Method) && !requestHasSameOrigin(r) {
+			a.jsonErr(w, http.StatusForbidden, "same-origin request required")
 			return
 		}
-		_, _, err := validateToken(strings.TrimPrefix(auth, "Bearer "))
-		if err != nil {
-			a.jsonErr(w, 401, "token expired or invalid")
+		next(w, r)
+	}
+}
+
+func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, _, err := sessionIdentity(r); err != nil {
+			a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
+			return
+		}
+		if stateChangingMethod(r.Method) && !requestHasSameOrigin(r) {
+			a.jsonErr(w, http.StatusForbidden, "same-origin request required")
 			return
 		}
 		next(w, r)
@@ -2452,6 +2596,8 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, 405, "method not allowed")
 		return
 	}
+	a.setupTokenMu.Lock()
+	defer a.setupTokenMu.Unlock()
 	userCount, err := a.db.UserCount()
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "setup status unavailable")
@@ -2475,7 +2621,7 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, "username must be 1-64 characters and password must be 12-72 bytes")
 		return
 	}
-	if a.setupToken != "" && !setupTokenMatches(a.setupToken, req.SetupToken) {
+	if a.setupToken == "" || !setupTokenMatches(a.setupToken, req.SetupToken) {
 		a.jsonErr(w, http.StatusForbidden, "invalid setup token")
 		return
 	}
@@ -2493,8 +2639,10 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, 500, err.Error())
 		return
 	}
+	a.setupToken = ""
 	w.Header().Set("Cache-Control", "no-store")
-	a.jsonOK(w, map[string]interface{}{"token": token, "username": req.Username})
+	a.setSessionCookie(w, r, token)
+	a.jsonOK(w, map[string]interface{}{"username": req.Username})
 }
 
 // POST /api/auth/login
@@ -2541,7 +2689,19 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	a.jsonOK(w, map[string]interface{}{"token": token, "username": username})
+	a.setSessionCookie(w, r, token)
+	a.jsonOK(w, map[string]interface{}{"username": username})
+}
+
+// POST /api/auth/logout
+func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	a.clearSessionCookie(w, r)
+	a.jsonOK(w, map[string]bool{"logged_out": true})
 }
 
 // GET /api/auth/check
@@ -2557,11 +2717,21 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	needsSetup := userCount == 0
+	authenticated := false
+	username := ""
+	if !needsSetup {
+		if _, sessionUsername, err := sessionIdentity(r); err == nil {
+			authenticated = true
+			username = sessionUsername
+		}
+	}
 	a.jsonOK(w, map[string]interface{}{
 		"needs_setup":          needsSetup,
 		"mode":                 "single_admin",
 		"jwt_secret_ephemeral": jwtSecretEphemeral,
-		"setup_token_required": needsSetup && a.setupToken != "",
+		"setup_token_required": needsSetup,
+		"authenticated":        authenticated,
+		"username":             username,
 	})
 }
 
@@ -2983,7 +3153,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.1"
+var appVersion = "v1.5.2"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -3127,6 +3297,14 @@ func main() {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer db.Close()
+	userCount, err := db.UserCount()
+	if err != nil {
+		log.Fatalf("failed to count users: %v", err)
+	}
+	setupToken, err := configuredSetupToken(userCount, os.Getenv("SETUP_TOKEN"))
+	if err != nil {
+		log.Fatalf("initial setup unavailable: %v", err)
+	}
 
 	pm := NewProxyManager(db)
 	loadedSiteCount, err := pm.StartAllEnabled()
@@ -3151,22 +3329,6 @@ func main() {
 		}
 	}()
 
-	setupToken := ""
-	userCount, err := db.UserCount()
-	if err != nil {
-		log.Fatalf("failed to count users: %v", err)
-	}
-	if userCount == 0 {
-		setupToken = strings.TrimSpace(os.Getenv("SETUP_TOKEN"))
-		if setupToken == "" {
-			setupToken, err = generateSetupToken()
-			if err != nil {
-				log.Fatalf("failed to generate initial setup token: %v", err)
-			}
-		}
-		log.Printf("Initial setup token: %s", setupToken)
-	}
-
 	trustedProxies, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
 	if err != nil {
 		log.Fatalf("invalid trusted proxy configuration: %v", err)
@@ -3182,8 +3344,9 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Public auth routes
-	mux.HandleFunc("/api/auth/setup", cors(app.handleSetup))
-	mux.HandleFunc("/api/auth/login", cors(app.handleLogin))
+	mux.HandleFunc("/api/auth/setup", cors(app.csrfMiddleware(app.handleSetup)))
+	mux.HandleFunc("/api/auth/login", cors(app.csrfMiddleware(app.handleLogin)))
+	mux.HandleFunc("/api/auth/logout", cors(app.csrfMiddleware(app.handleLogout)))
 	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
 
 	// Protected routes

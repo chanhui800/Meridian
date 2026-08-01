@@ -1,23 +1,34 @@
 // Meridian API Client
 const API = {
-  get token() { return localStorage.getItem('meridian_token'); },
-  set token(v) { v ? localStorage.setItem('meridian_token', v) : localStorage.removeItem('meridian_token'); },
-  get username() { return localStorage.getItem('meridian_user') || ''; },
-  set username(v) { v ? localStorage.setItem('meridian_user', v) : localStorage.removeItem('meridian_user'); },
+  username: '',
+  authenticated: false,
+
+  setSession(data) {
+    this.username = (data && data.username) || '';
+    this.authenticated = true;
+  },
+
+  clearSession() {
+    this.username = '';
+    this.authenticated = false;
+  },
 
   async request(method, path, body) {
     const opts = {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      headers: {},
     };
-    if (this.token) opts.headers['Authorization'] = 'Bearer ' + this.token;
-    if (body) opts.body = JSON.stringify(body);
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
 
     const res = await fetch(path, opts);
     const data = await res.json();
     if (!res.ok) {
       if (res.status === 401 && path !== '/api/auth/login') {
-        this.logout();
+        await this.logout();
         window.location.reload();
       }
       throw new Error(data.error || 'Request failed');
@@ -49,8 +60,15 @@ const API = {
   // UA Profiles
   getProfiles() { return this.request('GET', '/api/ua-profiles'); },
 
-  logout() {
-    this.token = null;
-    this.username = null;
+  async logout() {
+    this.clearSession();
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch (e) {
+      // The local UI can still safely return to its logged-out state.
+    }
   }
 };

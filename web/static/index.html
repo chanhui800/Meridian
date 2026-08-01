@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
-<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.5.1">
-<link rel="stylesheet" href="/css/style.css?v=1.5.1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.5.2">
+<link rel="stylesheet" href="/css/style.css?v=1.5.2">
 </head>
 <body>
 
@@ -28,8 +28,8 @@
       </div>
       <div class="form-group" id="setup-token-group" hidden>
         <label for="inp-setup-token">初始化令牌</label>
-        <input type="password" class="form-input" id="inp-setup-token" autocomplete="off" placeholder="请从 Meridian 启动日志中复制">
-        <div class="form-help">首次创建管理员时需要。令牌只会出现在服务启动日志中。</div>
+        <input type="password" class="form-input" id="inp-setup-token" autocomplete="off" placeholder="请从安装输出或部署配置中复制">
+        <div class="form-help">首次创建管理员时需要。令牌由安装器或部署环境显式设置，不会写入服务日志。</div>
       </div>
       <button type="submit" class="btn-login" id="btn-login">登录</button>
     </form>
@@ -101,13 +101,13 @@
 
 </div>
 
-<script src="/js/api.js?v=1.5.1"></script>
-<script src="/js/toast.js?v=1.5.1"></script>
-<script src="/js/router.js?v=1.5.1"></script>
-<script src="/js/pages/dashboard.js?v=1.5.1"></script>
-<script src="/js/pages/sites.js?v=1.5.1"></script>
-<script src="/js/pages/traffic.js?v=1.5.1"></script>
-<script src="/js/pages/diag.js?v=1.5.1"></script>
-<script src="/js/app.js?v=1.5.1"></script>
+<script src="/js/api.js?v=1.5.2"></script>
+<script src="/js/toast.js?v=1.5.2"></script>
+<script src="/js/router.js?v=1.5.2"></script>
+<script src="/js/pages/dashboard.js?v=1.5.2"></script>
+<script src="/js/pages/sites.js?v=1.5.2"></script>
+<script src="/js/pages/traffic.js?v=1.5.2"></script>
+<script src="/js/pages/diag.js?v=1.5.2"></script>
+<script src="/js/app.js?v=1.5.2"></script>
 </body>
 </html>

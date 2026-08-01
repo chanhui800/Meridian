@@ -140,6 +140,30 @@ find_domain_conflict panel.example.com || { echo 'FAIL: Nginx domain conflict wa
 assert_eq "$conflict_file" "$NGINX_CONFLICT_PATH" 'conflicting Nginx path'
 rm -f -- "$conflict_file"
 
+# Wildcard and regex server names can also claim the requested host. Regexes
+# are deliberately treated as conflicts because reliably evaluating arbitrary
+# Nginx regular expressions in the installer would be unsafe.
+for server_name in '*.example.com' '.example.com' 'panel.*' '~^unrelated\.example\.net$'; do
+    printf 'server { server_name %s; }\n' "$server_name" > "$conflict_file"
+    find_domain_conflict panel.example.com || {
+        printf 'FAIL: Nginx wildcard/regex conflict was not detected: %s\n' "$server_name" >&2
+        exit 1
+    }
+    assert_eq "$conflict_file" "$NGINX_CONFLICT_PATH" "wildcard/regex conflict path: $server_name"
+done
+rm -f -- "$conflict_file"
+
+printf 'server {\n  server_name\n    panel.example.com\n    www.panel.example.com;\n}\n' > "$conflict_file"
+find_domain_conflict panel.example.com || { echo 'FAIL: multiline Nginx server_name conflict was not detected' >&2; exit 1; }
+rm -f -- "$conflict_file"
+
+printf 'server { server_name *.unrelated.example; }\n' > "$conflict_file"
+if find_domain_conflict panel.example.com; then
+    echo 'FAIL: unrelated Nginx wildcard was treated as a conflict' >&2
+    exit 1
+fi
+rm -f -- "$conflict_file"
+
 printf 'server { server_name unrelated.example.com; }\n' > "$NGINX_CONFIG"
 if (
     as_root() { run_test_root_command "$@"; }

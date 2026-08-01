@@ -306,6 +306,20 @@ append_env_default() {
     install_env_file "$tmp_file"
 }
 
+ensure_setup_token() {
+    local tmp_dir="$1" env_file tmp_file
+    env_file=$(env_file_path)
+    [ -n "$(read_env_value SETUP_TOKEN)" ] && return 0
+    INITIAL_SETUP_TOKEN=$(generate_secret)
+    tmp_file="${tmp_dir}/env-setup-token"
+    # $1 is an awk field reference, not a shell variable.
+    # shellcheck disable=SC2016
+    as_root awk -F= '$1 != "SETUP_TOKEN" { print }' "$env_file" > "$tmp_file"
+    printf 'SETUP_TOKEN=%s\n' "$INITIAL_SETUP_TOKEN" >> "$tmp_file"
+    chmod 0600 "$tmp_file"
+    install_env_file "$tmp_file"
+}
+
 set_panel_env() {
     local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" env_file tmp_file
     env_file=$(env_file_path)
@@ -413,6 +427,7 @@ prepare_data_and_config() {
         append_env_default PANEL_BIND_ADDR 0.0.0.0 "$tmp_dir"
         append_env_default PANEL_DOMAIN "" "$tmp_dir"
         append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir"
+        ensure_setup_token "$tmp_dir"
         if is_systemd; then
             as_root chown root:"$SERVICE_GROUP" "$env_file"
             as_root chmod 0640 "$env_file"
@@ -617,15 +632,86 @@ nginx_test_and_reload() {
 
 NGINX_CONFLICT_PATH=""
 find_domain_conflict() {
-    local domain="$1" pattern file
+    local domain="$1" file status
     NGINX_CONFLICT_PATH=""
     [ -d "$NGINX_ROOT" ] || return 1
-    pattern=$(printf '%s' "$domain" | sed 's/[.]/\\./g')
     while IFS= read -r file; do
         [ "$file" = "$NGINX_CONFIG" ] && continue
-        if as_root grep -Eiq "(^|[[:space:];{}])server_name[[:space:]]+([^;]*[[:space:]])?${pattern}([[:space:];]|$)" "$file" 2>/dev/null; then
+        if as_root awk -v domain="$domain" '
+            function matches_server_name(name, suffix, prefix, suffix_len) {
+                gsub(/^"+/, "", name)
+                gsub(/"+$/, "", name)
+                name = tolower(name)
+                if (name == "" || name == "_") {
+                    return 0
+                }
+                # Nginx regex names and variable-based names cannot be evaluated
+                # safely here, so reject them rather than risk an override.
+                if (name ~ /^~/ || index(name, "$") > 0) {
+                    return 1
+                }
+                if (substr(name, 1, 2) == "*.") {
+                    suffix = substr(name, 3)
+                    suffix_len = length(suffix)
+                    return length(domain) > suffix_len && \
+                        substr(domain, length(domain) - suffix_len + 1) == suffix && \
+                        substr(domain, length(domain) - suffix_len, 1) == "."
+                }
+                if (substr(name, length(name) - 1) == ".*") {
+                    prefix = substr(name, 1, length(name) - 2)
+                    return substr(domain, 1, length(prefix) + 1) == prefix "."
+                }
+                if (substr(name, 1, 1) == ".") {
+                    suffix = substr(name, 2)
+                    suffix_len = length(suffix)
+                    return domain == suffix || (length(domain) > suffix_len && \
+                        substr(domain, length(domain) - suffix_len + 1) == suffix && \
+                        substr(domain, length(domain) - suffix_len, 1) == ".")
+                }
+                # Any other wildcard form is invalid or ambiguous in Nginx; keep
+                # the installer conservative when one is encountered.
+                if (index(name, "*") > 0) {
+                    return 1
+                }
+                return name == domain
+            }
+            {
+                line = $0
+                sub(/[[:space:]]*#.*/, "", line)
+                if (!collecting) {
+                    if (match(line, /(^|[[:space:]])server_name([[:space:]]+|$)/)) {
+                        values = substr(line, RSTART + RLENGTH)
+                        collecting = 1
+                    } else {
+                        next
+                    }
+                } else {
+                    values = values " " line
+                }
+                semicolon = index(values, ";")
+                if (!semicolon) {
+                    next
+                }
+                directive = substr(values, 1, semicolon - 1)
+                collecting = 0
+                count = split(directive, names, /[[:space:]]+/)
+                for (name_index = 1; name_index <= count; name_index++) {
+                    if (matches_server_name(names[name_index])) {
+                        conflict = 1
+                        exit
+                    }
+                }
+            }
+            END { exit(conflict ? 0 : 1) }
+        ' "$file" 2>/dev/null; then
             NGINX_CONFLICT_PATH="$file"
             return 0
+        else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+                NGINX_CONFLICT_PATH="$file"
+                return 0
+            fi
         fi
     done < <(as_root find "$NGINX_ROOT" -type f -print 2>/dev/null)
     return 1
@@ -905,6 +991,7 @@ apply_domain_choice() {
 
 do_install() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" tmp_dir version
+    INITIAL_SETUP_TOKEN=""
     need_cmd curl
     need_cmd awk
     need_cmd grep
@@ -921,6 +1008,9 @@ do_install() {
         tmp_dir=$(mktemp -d)
         prepare_data_and_config "$tmp_dir"
         rm -rf -- "$tmp_dir"
+        if [ -n "$INITIAL_SETUP_TOKEN" ]; then
+            printf "  ${YELLOW}初始化令牌（仅在尚未创建管理员时需要，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
+        fi
         apply_domain_choice 1
         return 0
     fi
@@ -963,6 +1053,7 @@ do_install() {
 
 do_update() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
+    INITIAL_SETUP_TOKEN=""
     [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
     need_cmd curl
     need_cmd tar
@@ -1030,6 +1121,9 @@ do_update() {
     trap - EXIT INT TERM
     ok "已更新到最新版本: $latest_version"
     info "现有 .env、面板域名、Nginx 配置和证书均已保留"
+    if [ -n "$INITIAL_SETUP_TOKEN" ]; then
+        printf "  ${YELLOW}初始化令牌（仅在尚未创建管理员时需要，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
+    fi
 }
 
 password_byte_length() {

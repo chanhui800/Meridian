@@ -49,16 +49,16 @@
   });
 
   async function checkAuth() {
-    if (API.token) {
-      enterApp();
-      return;
-    }
-
     try {
       const res = await API.checkSetup();
       authStatus = Object.assign({}, authStatus, res || {});
       if (res.needs_setup) {
         showSetupMode();
+        return;
+      }
+      if (res.authenticated) {
+        API.setSession(res);
+        enterApp();
         return;
       }
     } catch (e) {
@@ -140,7 +140,7 @@
     }
 
     if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {
-      Toast.error('请填写启动日志中的初始化令牌');
+      Toast.error('请填写安装时显示或部署环境中设置的初始化令牌');
       return;
     }
 
@@ -156,8 +156,7 @@
         res = await API.login(username, password);
         Toast.success('欢迎回来, ' + res.username + '!');
       }
-      API.token = res.token;
-      API.username = res.username;
+      API.setSession(res);
       enterApp();
     } catch (err) {
       Toast.error(err.message);
@@ -203,11 +202,11 @@
     startDashboardRefresh();
   }
 
-  document.getElementById('avatar-btn').addEventListener('click', function() {
+  document.getElementById('avatar-btn').addEventListener('click', async function() {
     if (!confirm('确认退出登录？')) return;
 
     teardownAppRuntime();
-    API.logout();
+    await API.logout();
     loginEl.classList.remove('hidden');
     shellEl.classList.remove('active');
     showLoginMode();

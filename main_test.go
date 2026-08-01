@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -712,7 +713,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.5.1", "/js/pages/sites.js?v=1.5.1", "/js/app.js?v=1.5.1"} {
+	for _, asset := range []string{"/css/style.css?v=1.5.2", "/js/pages/sites.js?v=1.5.2", "/js/app.js?v=1.5.2"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -743,15 +744,20 @@ func TestStaticHandlerDisablesCaching(t *testing.T) {
 	}
 }
 
-func TestAPIClientClearsRejectedStoredToken(t *testing.T) {
+func TestAPIClientUsesHttpOnlyCookieSessions(t *testing.T) {
 	apiJS, err := web.StaticFiles.ReadFile("static/js/api.js")
 	if err != nil {
 		t.Fatalf("read embedded API JavaScript: %v", err)
 	}
 	source := string(apiJS)
-	for _, expected := range []string{"res.status === 401", "this.logout()", "window.location.reload()"} {
+	for _, expected := range []string{"credentials: 'same-origin'", "res.status === 401", "await this.logout()", "window.location.reload()", "/api/auth/logout"} {
 		if !strings.Contains(source, expected) {
 			t.Errorf("API client missing %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"localStorage", "Authorization", "Bearer "} {
+		if strings.Contains(source, forbidden) {
+			t.Errorf("API client must not retain browser-accessible bearer state: found %q", forbidden)
 		}
 	}
 }
@@ -778,6 +784,26 @@ func TestRequestClientKeyUsesOnlyConfiguredTrustedProxy(t *testing.T) {
 
 	if _, err := parseTrustedProxyCIDRs("not-a-network"); err == nil {
 		t.Fatal("invalid trusted proxy CIDR unexpectedly accepted")
+	}
+}
+
+func TestSessionCookieSecureFlagTrustsOnlyConfiguredProxy(t *testing.T) {
+	trusted, err := parseTrustedProxyCIDRs("127.0.0.1/32")
+	if err != nil {
+		t.Fatalf("parse trusted proxies: %v", err)
+	}
+	trustedRequest := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
+	trustedRequest.RemoteAddr = "127.0.0.1:12345"
+	trustedRequest.Header.Set("X-Forwarded-Proto", "https")
+	if !requestIsHTTPS(trustedRequest, trusted) {
+		t.Fatal("trusted proxy HTTPS indication was ignored")
+	}
+
+	untrustedRequest := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
+	untrustedRequest.RemoteAddr = "198.51.100.10:12345"
+	untrustedRequest.Header.Set("X-Forwarded-Proto", "https")
+	if requestIsHTTPS(untrustedRequest, trusted) {
+		t.Fatal("untrusted proxy forged the HTTPS indication")
 	}
 }
 
@@ -823,6 +849,21 @@ func TestHandleAuthCheckExposesSingleAdminModeBeforeSetup(t *testing.T) {
 	if got := mustBoolValue(t, body, "jwt_secret_ephemeral"); !got {
 		t.Fatalf("jwt_secret_ephemeral = %v, want true", got)
 	}
+	if got := mustBoolValue(t, body, "setup_token_required"); !got {
+		t.Fatalf("setup_token_required = %v, want true", got)
+	}
+}
+
+func TestConfiguredSetupTokenRequiresExplicitValue(t *testing.T) {
+	if _, err := configuredSetupToken(0, " \t "); err == nil {
+		t.Fatal("empty initial setup token unexpectedly accepted")
+	}
+	if got, err := configuredSetupToken(0, " setup-token "); err != nil || got != "setup-token" {
+		t.Fatalf("configured setup token = %q, %v", got, err)
+	}
+	if got, err := configuredSetupToken(1, "unused-token"); err != nil || got != "" {
+		t.Fatalf("configured setup token after initialization = %q, %v", got, err)
+	}
 }
 
 func TestSetupRequiresTokenAndCreatesOnlyOneAdmin(t *testing.T) {
@@ -851,6 +892,105 @@ func TestSetupRequiresTokenAndCreatesOnlyOneAdmin(t *testing.T) {
 	}
 	if got := mustUserCount(t, app.db); got != 1 {
 		t.Fatalf("user count after setup = %d, want 1", got)
+	}
+	if app.setupToken != "" {
+		t.Fatal("setup token remained in application memory after successful setup")
+	}
+	if _, ok := decodeBody(t, ok)["token"]; ok {
+		t.Fatal("setup response exposed a bearer token")
+	}
+	cookies := ok.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != sessionCookieName || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("unexpected setup session cookie: %#v", cookies)
+	}
+}
+
+func TestLoginCookieAuthAndCSRFProtection(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+
+	login := httptest.NewRecorder()
+	loginRequest := httptest.NewRequest(http.MethodPost, "https://panel.example/api/auth/login", strings.NewReader(`{"username":"admin","password":"correct horse battery staple"}`))
+	loginRequest.TLS = &tls.ConnectionState{}
+	app.handleLogin(login, loginRequest)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
+	}
+	if _, ok := decodeBody(t, login)["token"]; ok {
+		t.Fatal("login response exposed a bearer token")
+	}
+	cookies := login.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login cookies=%#v", cookies)
+	}
+	cookie := cookies[0]
+	if cookie.Name != sessionCookieName || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode || cookie.MaxAge <= 0 {
+		t.Fatalf("unsafe login cookie: %#v", cookie)
+	}
+
+	protected := app.authMiddleware(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	get := httptest.NewRecorder()
+	getRequest := httptest.NewRequest(http.MethodGet, "https://panel.example/api/sites", nil)
+	getRequest.AddCookie(cookie)
+	protected(get, getRequest)
+	if get.Code != http.StatusNoContent {
+		t.Fatalf("cookie-authenticated GET status=%d body=%s", get.Code, get.Body.String())
+	}
+
+	bearer := httptest.NewRecorder()
+	bearerRequest := httptest.NewRequest(http.MethodGet, "https://panel.example/api/sites", nil)
+	bearerRequest.Header.Set("Authorization", "Bearer should-not-be-accepted")
+	protected(bearer, bearerRequest)
+	if bearer.Code != http.StatusUnauthorized {
+		t.Fatalf("bearer-only request status=%d, want 401", bearer.Code)
+	}
+
+	missingOrigin := httptest.NewRecorder()
+	missingOriginRequest := httptest.NewRequest(http.MethodPost, "https://panel.example/api/sites", nil)
+	missingOriginRequest.AddCookie(cookie)
+	protected(missingOrigin, missingOriginRequest)
+	if missingOrigin.Code != http.StatusForbidden {
+		t.Fatalf("state change without origin status=%d, want 403", missingOrigin.Code)
+	}
+
+	sameOrigin := httptest.NewRecorder()
+	sameOriginRequest := httptest.NewRequest(http.MethodPost, "https://panel.example/api/sites", nil)
+	sameOriginRequest.Header.Set("Origin", "https://panel.example")
+	sameOriginRequest.AddCookie(cookie)
+	protected(sameOrigin, sameOriginRequest)
+	if sameOrigin.Code != http.StatusNoContent {
+		t.Fatalf("same-origin state change status=%d body=%s", sameOrigin.Code, sameOrigin.Body.String())
+	}
+
+	crossOrigin := httptest.NewRecorder()
+	crossOriginRequest := httptest.NewRequest(http.MethodPost, "https://panel.example/api/sites", nil)
+	crossOriginRequest.Header.Set("Origin", "https://evil.example")
+	crossOriginRequest.AddCookie(cookie)
+	protected(crossOrigin, crossOriginRequest)
+	if crossOrigin.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin state change status=%d, want 403", crossOrigin.Code)
+	}
+}
+
+func TestLogoutClearsSessionCookie(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.csrfMiddleware(app.handleLogout)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://panel.example/api/auth/logout", nil)
+	req.TLS = &tls.ConnectionState{}
+	req.Header.Set("Origin", "https://panel.example")
+	handler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("logout status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	cookies := rr.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != sessionCookieName || cookies[0].MaxAge >= 0 || !cookies[0].HttpOnly || !cookies[0].Secure {
+		t.Fatalf("logout did not clear protected session cookie: %#v", cookies)
 	}
 }
 
@@ -1123,6 +1263,46 @@ func TestLoginUsesGenericErrorsAndRateLimit(t *testing.T) {
 	}
 	if blocked.Header().Get("Retry-After") == "" {
 		t.Fatal("blocked login is missing Retry-After")
+	}
+}
+
+func TestLoginRateLimiterExpiresAndEvictsWithoutSharedOverflow(t *testing.T) {
+	limiter := newLoginRateLimiterWithLimit(1)
+	now := time.Now()
+	for range maxLoginFailures {
+		limiter.recordFailure("198.51.100.1", now)
+	}
+	if allowed, _ := limiter.allow("198.51.100.1", now); allowed {
+		t.Fatal("locked client was unexpectedly allowed")
+	}
+
+	// A new client gets its own entry after LRU eviction instead of sharing a
+	// global overflow bucket and inheriting the first client's lockout.
+	limiter.recordFailure("198.51.100.2", now.Add(time.Second))
+	if allowed, _ := limiter.allow("198.51.100.2", now.Add(time.Second)); !allowed {
+		t.Fatal("new client inherited another client's rate-limit state")
+	}
+	if _, exists := limiter.attempts["__overflow__"]; exists {
+		t.Fatal("rate limiter retained a shared overflow bucket")
+	}
+	if len(limiter.attempts) > 1 {
+		t.Fatalf("rate limiter entries=%d, want bounded to 1", len(limiter.attempts))
+	}
+
+	limiter.recordFailure("198.51.100.3", now)
+	limiter.allow("198.51.100.3", now.Add(loginFailureWindow))
+	if _, exists := limiter.attempts["198.51.100.3"]; exists {
+		t.Fatal("expired login rate-limit entry was retained")
+	}
+}
+
+func TestRedactUpstreamURLRemovesCredentialsPathsAndQueries(t *testing.T) {
+	target, err := url.Parse("https://user:secret@media.example:8443/stream?token=signed-value&expires=123")
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	if got := redactUpstreamURL(target); got != "https://media.example:8443" {
+		t.Fatalf("redacted upstream URL=%q", got)
 	}
 }
 
@@ -2097,38 +2277,63 @@ func TestCleanDatabaseInitializationAPIFlow(t *testing.T) {
 	app.setupToken = "clean-database-setup-token"
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
-	mux.HandleFunc("/api/auth/setup", cors(app.handleSetup))
-	mux.HandleFunc("/api/auth/login", cors(app.handleLogin))
+	mux.HandleFunc("/api/auth/setup", cors(app.csrfMiddleware(app.handleSetup)))
+	mux.HandleFunc("/api/auth/login", cors(app.csrfMiddleware(app.handleLogin)))
+	mux.HandleFunc("/api/auth/logout", cors(app.csrfMiddleware(app.handleLogout)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
+	request := func(method, path string, body io.Reader) *http.Request {
+		req := httptest.NewRequest(method, "https://panel.example"+path, body)
+		if stateChangingMethod(method) {
+			req.Header.Set("Origin", "https://panel.example")
+		}
+		return req
+	}
 
 	check := httptest.NewRecorder()
-	mux.ServeHTTP(check, httptest.NewRequest(http.MethodGet, "/api/auth/check", nil))
+	mux.ServeHTTP(check, request(http.MethodGet, "/api/auth/check", nil))
 	if check.Code != http.StatusOK || !mustBoolValue(t, decodeBody(t, check), "needs_setup") {
 		t.Fatalf("initial auth check = status %d body=%s", check.Code, check.Body.String())
 	}
 
 	setupBody := strings.NewReader("{\"username\":\"admin\",\"password\":\"correct horse battery staple\",\"setup_token\":\"clean-database-setup-token\"}")
 	setup := httptest.NewRecorder()
-	mux.ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", setupBody))
+	mux.ServeHTTP(setup, request(http.MethodPost, "/api/auth/setup", setupBody))
 	if setup.Code != http.StatusOK {
 		t.Fatalf("setup status=%d body=%s", setup.Code, setup.Body.String())
 	}
+	if len(setup.Result().Cookies()) != 1 {
+		t.Fatalf("setup did not return a session cookie: %#v", setup.Result().Cookies())
+	}
 
 	login := httptest.NewRecorder()
-	mux.ServeHTTP(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader("{\"username\":\"admin\",\"password\":\"correct horse battery staple\"}")))
+	mux.ServeHTTP(login, request(http.MethodPost, "/api/auth/login", strings.NewReader("{\"username\":\"admin\",\"password\":\"correct horse battery staple\"}")))
 	if login.Code != http.StatusOK {
 		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
 	}
-	token := mustStringValue(t, decodeBody(t, login), "token")
+	if _, ok := decodeBody(t, login)["token"]; ok {
+		t.Fatal("login response exposed a bearer token")
+	}
+	loginCookies := login.Result().Cookies()
+	if len(loginCookies) != 1 {
+		t.Fatalf("login did not return a session cookie: %#v", loginCookies)
+	}
+
+	authenticatedCheck := httptest.NewRecorder()
+	authenticatedRequest := request(http.MethodGet, "/api/auth/check", nil)
+	authenticatedRequest.AddCookie(loginCookies[0])
+	mux.ServeHTTP(authenticatedCheck, authenticatedRequest)
+	if authenticatedCheck.Code != http.StatusOK || !mustBoolValue(t, decodeBody(t, authenticatedCheck), "authenticated") {
+		t.Fatalf("authenticated check = status %d body=%s", authenticatedCheck.Code, authenticatedCheck.Body.String())
+	}
 
 	secondSetup := httptest.NewRecorder()
-	mux.ServeHTTP(secondSetup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", strings.NewReader("{\"username\":\"other\",\"password\":\"correct horse battery staple\",\"setup_token\":\"clean-database-setup-token\"}")))
+	mux.ServeHTTP(secondSetup, request(http.MethodPost, "/api/auth/setup", strings.NewReader("{\"username\":\"other\",\"password\":\"correct horse battery staple\",\"setup_token\":\"clean-database-setup-token\"}")))
 	if secondSetup.Code != http.StatusBadRequest {
 		t.Fatalf("second setup status=%d body=%s", secondSetup.Code, secondSetup.Body.String())
 	}
 
-	sitesRequest := httptest.NewRequest(http.MethodGet, "/api/sites", nil)
-	sitesRequest.Header.Set("Authorization", "Bearer "+token)
+	sitesRequest := request(http.MethodGet, "/api/sites", nil)
+	sitesRequest.AddCookie(loginCookies[0])
 	sites := httptest.NewRecorder()
 	mux.ServeHTTP(sites, sitesRequest)
 	if sites.Code != http.StatusOK {

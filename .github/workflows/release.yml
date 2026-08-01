@@ -10,9 +10,22 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.value }}
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate release tag
+        id: release_tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH or a safe prerelease suffix." >&2
+            exit 1
+          fi
+          printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -79,7 +92,8 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${{ github.ref_name }}" -o meridian-${{ matrix.suffix }} .
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" -o meridian-${{ matrix.suffix }} .
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -111,7 +125,7 @@ jobs:
           generate_release_notes: true
 
   docker:
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/')
@@ -120,6 +134,7 @@ jobs:
       contents: read
     env:
       IMAGE_NAME: ghcr.io/snnabb/meridian
+      RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -134,7 +149,7 @@ jobs:
         with:
           push: true
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ env.RELEASE_TAG }}
           tags: |
             ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
