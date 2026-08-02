@@ -36,6 +36,8 @@ UPDATE_TMP_DIR=""
 UPDATE_WAS_ACTIVE=0
 UPDATE_BINARY_CHANGED=0
 UPDATE_TRANSACTION=0
+UPDATE_SNAPSHOT_DIR=""
+UPDATE_SNAPSHOT_RESTORED=0
 PASSWORD_TMP_DIR=""
 PASSWORD_SNAPSHOT_DIR=""
 PASSWORD_DB_PATH=""
@@ -139,6 +141,131 @@ validate_db_path() {
 
 valid_version() {
     [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+}
+
+version_gt() {
+    # Returns 0 (true) when $1 (vA.B.C[-suffix]) is newer than $2. The numeric
+    # major.minor.patch triple decides; pre-release/build suffixes ("-rc1",
+    # "+build") are stripped before parsing so v1.5.6-rc1 compares as 1.5.6,
+    # not as a patch of 61.
+    # shellcheck disable=SC2016
+    printf '%s\n%s\n' "${1#v}" "${2#v}" | awk -F. '
+        function num(s) { sub(/[-+].*$/, "", s); gsub(/[^0-9]/, "", s); return s+0 }
+        NR == 1 { a1=num($1); a2=num($2); a3=num($3) }
+        NR == 2 { b1=num($1); b2=num($2); b3=num($3) }
+        END {
+            if (a1 != b1) exit (a1 > b1) ? 0 : 1
+            if (a2 != b2) exit (a2 > b2) ? 0 : 1
+            exit (a3 > b3) ? 0 : 1
+        }'
+}
+
+snapshot_data_dir() {
+    # Byte-level copy of the data directory for automatic rollback. The update
+    # flow stops the service first, so the database, WAL/SHM, and .env are
+    # quiescent when this runs.
+    local snapshot_dir="$1"
+    validate_data_dir
+    as_root test -d "$DATA_DIR" || return 1
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$snapshot_dir"
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "${snapshot_dir}/data"
+    as_root cp -a -- "$DATA_DIR"/. "${snapshot_dir}/data/"
+}
+
+restore_data_snapshot() {
+    # Restores the exact pre-update data directory without ever deleting the
+    # live DATA_DIR unless the replacement is already staged and verified. The
+    # snapshot is first copied to a staging directory next to DATA_DIR (same
+    # filesystem), checked for the configuration and database, and only then
+    # swapped in with two renames. Any failure leaves the original DATA_DIR
+    # untouched and returns non-zero; a partially staged copy is removed so no
+    # sensitive residue survives the attempt. Post-swap cleanup (permission
+    # normalization, removal of the displaced directory) is part of the
+    # contract too: if either cannot be completed, the function still returns
+    # non-zero so the caller keeps the transaction unrecovered for a retry or
+    # manual intervention.
+    local snapshot_dir="$1" staging_dir old_dir db_path data_base data_parent
+    validate_data_dir
+    as_root test -d "${snapshot_dir}/data" || return 1
+    data_parent=$(dirname -- "$DATA_DIR")
+    data_base=$(basename -- "$DATA_DIR")
+    staging_dir="${data_parent}/.${data_base}.restore.$$"
+    old_dir="${data_parent}/.${data_base}.pre-restore.$$"
+    as_root rm -rf -- "$staging_dir" 2>/dev/null || true
+    as_root rm -rf -- "$old_dir" 2>/dev/null || true
+    if ! as_root cp -a -- "${snapshot_dir}/data" "$staging_dir"; then
+        as_root rm -rf -- "$staging_dir" 2>/dev/null || true
+        return 1
+    fi
+    # Verify the staged copy actually carries the configuration and database
+    # before the live directory is touched.
+    if ! as_root test -f "${staging_dir}/.env"; then
+        as_root rm -rf -- "$staging_dir" 2>/dev/null || true
+        return 1
+    fi
+    db_path=$(read_env_value DB_PATH)
+    case "$db_path" in
+        "$DATA_DIR"/*)
+            if ! as_root test -f "${staging_dir}/${db_path#"$DATA_DIR"/}"; then
+                as_root rm -rf -- "$staging_dir" 2>/dev/null || true
+                return 1
+            fi
+            ;;
+    esac
+    if ! as_root mv -f -- "$DATA_DIR" "$old_dir"; then
+        as_root rm -rf -- "$staging_dir" 2>/dev/null || true
+        return 1
+    fi
+    if ! as_root mv -f -- "$staging_dir" "$DATA_DIR"; then
+        if ! as_root mv -f -- "$old_dir" "$DATA_DIR" 2>/dev/null; then
+            warn "数据目录切换失败，原数据保留在: $old_dir，请手动恢复"
+        fi
+        if ! as_root rm -rf -- "$staging_dir" 2>/dev/null; then
+            warn "无法清理恢复暂存目录（可能含敏感数据），请手动删除: $staging_dir"
+        fi
+        return 1
+    fi
+    # Only the verified replacement is live now. The displaced directory may
+    # contain secrets; failing to remove it must not read as a complete
+    # restore, so this path returns non-zero and names the residue.
+    if ! as_root rm -rf -- "$old_dir" 2>/dev/null; then
+        warn "数据已恢复，但旧数据目录残留（可能含敏感数据），请手动删除: $old_dir"
+        return 1
+    fi
+    # Permission normalization is part of the restore contract: a staged copy
+    # arrives root:0700, and a restore that leaves the service user locked out
+    # is not a successful restore. Its non-zero status propagates.
+    restore_data_permissions
+}
+
+restore_data_permissions() {
+    # Reapplies the ownership/mode contract of prepare_data_and_config after a
+    # snapshot restore: the staged copy arrives as root:0700, which the
+    # systemd service user cannot even traverse. The service user must be able
+    # to walk DATA_DIR and write the database (WAL/SHM), while .env stays
+    # root:SERVICE_GROUP 0640. Non-systemd installs keep the calling user's
+    # ownership so the restored directory remains fully usable. Every required
+    # step is attempted; returns non-zero when any of them failed.
+    local db_path failed=0
+    db_path=$(read_env_value DB_PATH)
+    if is_systemd; then
+        as_root chown "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR" \
+            || { warn "恢复后无法设置数据目录属主 ${SERVICE_USER}:${SERVICE_GROUP}（$DATA_DIR），请手动修复"; failed=1; }
+        as_root chmod 0750 "$DATA_DIR" \
+            || { warn "恢复后无法设置数据目录权限 0750（$DATA_DIR），请手动修复"; failed=1; }
+        as_root chown root:"$SERVICE_GROUP" "$(env_file_path)" \
+            || { warn "恢复后无法设置 .env 属主 root:${SERVICE_GROUP}，请手动修复"; failed=1; }
+        as_root chmod 0640 "$(env_file_path)" \
+            || { warn "恢复后无法设置 .env 权限 0640，请手动修复"; failed=1; }
+        fix_database_permissions "$db_path" \
+            || { warn "恢复后无法设置数据库文件权限，请手动修复"; failed=1; }
+    else
+        as_root chown "$(id -u):$(id -g)" "$DATA_DIR" \
+            || { warn "恢复后无法设置数据目录属主（$DATA_DIR），请手动修复"; failed=1; }
+        as_root chmod 0750 "$DATA_DIR" \
+            || { warn "恢复后无法设置数据目录权限 0750（$DATA_DIR），请手动修复"; failed=1; }
+    fi
+    return "$failed"
 }
 
 normalize_domain() {
@@ -524,9 +651,17 @@ restore_previous_binary() {
 cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
-        warn "更新中断，正在恢复更新前的二进制和服务状态..."
+        warn "更新中断，正在恢复更新前的二进制和数据状态..."
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
+        fi
+        if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
+            && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
+            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
+                UPDATE_SNAPSHOT_RESTORED=1
+            else
+                warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+            fi
         fi
         if is_systemd; then
             if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
@@ -539,7 +674,9 @@ cleanup_update_transaction() {
         UPDATE_BINARY_CHANGED=0
     fi
     if [ -n "$UPDATE_TMP_DIR" ] && [ -d "$UPDATE_TMP_DIR" ] && [ "$UPDATE_TMP_DIR" != "/" ]; then
-        rm -rf -- "$UPDATE_TMP_DIR"
+        if ! as_root rm -rf -- "$UPDATE_TMP_DIR"; then
+            warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $UPDATE_TMP_DIR"
+        fi
     fi
     return "$exit_code"
 }
@@ -1069,12 +1206,14 @@ do_update() {
         ok "当前已是最新版本: $latest_version"
         return 0
     fi
+    if valid_version "$current_version" && version_gt "$current_version" "$latest_version"; then
+        fail "已安装版本 ${current_version} 高于最新 Release ${latest_version}；拒绝降级"
+    fi
 
     tmp_dir=$(mktemp -d)
     chmod 0700 "$tmp_dir"
     UPDATE_TMP_DIR="$tmp_dir"
     download_release_binary "$latest_version" "$tmp_dir"
-    prepare_data_and_config "$tmp_dir"
 
     UPDATE_TRANSACTION=1
     trap cleanup_update_transaction EXIT
@@ -1095,6 +1234,15 @@ do_update() {
     fi
     ok "升级前备份已创建: $LAST_BACKUP_PATH"
 
+    # Byte-level snapshot for automatic rollback, taken while the service is
+    # stopped and before any configuration key is added.
+    UPDATE_SNAPSHOT_DIR="${tmp_dir}/data-snapshot"
+    if ! snapshot_data_dir "$UPDATE_SNAPSHOT_DIR"; then
+        fail "升级前数据快照失败，现有程序未被替换"
+    fi
+
+    prepare_data_and_config "$tmp_dir"
+
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new"
     as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
@@ -1105,21 +1253,43 @@ do_update() {
         as_root systemctl restart "$SERVICE_NAME"
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
-            restore_previous_binary
+            restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             UPDATE_BINARY_CHANGED=0
+            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
+                UPDATE_SNAPSHOT_RESTORED=1
+            else
+                warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
+            fi
             as_root systemctl restart "$SERVICE_NAME"
             wait_for_health 20 || fail "新版本与回滚版本均未通过健康检查"
-            fail "新版本启动失败，已恢复上一版本"
+            fail "新版本启动失败，已恢复上一版本及原数据配置"
         fi
         if [ "$should_stop_after" = "1" ]; then
             as_root systemctl stop "$SERVICE_NAME"
         fi
+    else
+        if ! "$current_binary" --version >/dev/null 2>&1; then
+            warn "新版本二进制无法执行，正在自动回滚..."
+            restore_previous_binary || true
+            UPDATE_BINARY_CHANGED=0
+            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
+                UPDATE_SNAPSHOT_RESTORED=1
+            else
+                warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
+            fi
+            fail "新版本无法执行，已恢复上一版本及原数据配置"
+        fi
+        warn "未检测到 systemd：已跳过自动健康检查，请手动加载 ${DATA_DIR}/.env 后启动"
     fi
 
     UPDATE_TRANSACTION=0
     UPDATE_BINARY_CHANGED=0
     UPDATE_TMP_DIR=""
-    rm -rf -- "$tmp_dir"
+    UPDATE_SNAPSHOT_DIR=""
+    UPDATE_SNAPSHOT_RESTORED=0
+    if ! as_root rm -rf -- "$tmp_dir"; then
+        warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $tmp_dir"
+    fi
     trap - EXIT INT TERM
     ok "已更新到最新版本: $latest_version"
     info "现有 .env、面板域名、Nginx 配置和证书均已保留"
@@ -1172,14 +1342,15 @@ restore_auth_snapshot() {
 }
 
 fix_database_permissions() {
-    local db_path="$1" suffix file
+    local db_path="$1" suffix file failed=0
     for suffix in "" "-wal" "-shm" "-journal"; do
         file="${db_path}${suffix}"
         if as_root test -e "$file"; then
-            as_root chown "$SERVICE_USER:$SERVICE_GROUP" "$file"
-            as_root chmod 0600 "$file"
+            as_root chown "$SERVICE_USER:$SERVICE_GROUP" "$file" || failed=1
+            as_root chmod 0600 "$file" || failed=1
         fi
     done
+    return "$failed"
 }
 
 cleanup_password_transaction() {

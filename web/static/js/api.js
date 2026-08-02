@@ -25,12 +25,22 @@ const API = {
     }
 
     const res = await fetch(path, opts);
-    const data = await res.json();
+    if (res.status === 401 && path !== '/api/auth/login') {
+      await this.logout();
+      window.location.reload();
+      // The session is gone and the page is navigating to the login screen:
+      // stop this request's control flow right here. Parsing or rejecting the
+      // stale 401 body would only let callers keep handling a response that
+      // is no longer valid (same convention as the dashboard SSE handler).
+      return;
+    }
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      throw new Error(res.statusText || 'Request failed');
+    }
     if (!res.ok) {
-      if (res.status === 401 && path !== '/api/auth/login') {
-        await this.logout();
-        window.location.reload();
-      }
       throw new Error(data.error || 'Request failed');
     }
     return data;

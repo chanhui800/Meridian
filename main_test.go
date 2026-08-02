@@ -46,16 +46,37 @@ func newTestApp(t *testing.T) *App {
 	}
 }
 
+// reservedPorts keeps ephemeral ports out of the kernel's free pool between
+// allocation and the moment a test actually binds them. Without the
+// reservation, the OS could reissue the port to an unrelated outgoing
+// connection in that window, producing flaky "address already in use" site
+// starts. Callers that bind the port (a site start, or an API call that
+// starts a site) must call releasePort immediately beforehand.
+var reservedPorts sync.Map // int -> net.Listener
+
 func freePort(t *testing.T) int {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("free port listen: %v", err)
 	}
-	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	reservedPorts.Store(port, ln)
+	t.Cleanup(func() {
+		if v, ok := reservedPorts.LoadAndDelete(port); ok {
+			_ = v.(net.Listener).Close()
+		}
+	})
+	return port
+}
 
-	return ln.Addr().(*net.TCPAddr).Port
+// releasePort closes the reservation created by freePort. Call it as the last
+// step before the code under test binds the port.
+func releasePort(port int) {
+	if v, ok := reservedPorts.LoadAndDelete(port); ok {
+		_ = v.(net.Listener).Close()
+	}
 }
 
 func decodeBody(t *testing.T, rr *httptest.ResponseRecorder) map[string]interface{} {
@@ -288,6 +309,8 @@ func TestMigrateSerializesConcurrentLegacyDatabaseOpens(t *testing.T) {
 }
 
 func TestGenerateTokenPreservesSpecialCharacters(t *testing.T) {
+	originalSecret := jwtSecret
+	t.Cleanup(func() { jwtSecret = originalSecret })
 	jwtSecret = []byte("test-secret")
 
 	token, err := generateToken(7, `bad"name\user`)
@@ -756,7 +779,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.5.3", "/js/pages/sites.js?v=1.5.3", "/js/app.js?v=1.5.3"} {
+	for _, asset := range []string{"/css/style.css?v=1.5.6", "/js/pages/sites.js?v=1.5.6", "/js/app.js?v=1.5.6"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -952,10 +975,11 @@ func TestHandleAuthCheckExposesSingleAdminModeBeforeSetup(t *testing.T) {
 }
 
 func TestConfiguredSetupTokenRequiresExplicitValue(t *testing.T) {
+	longToken := "setup-token-with-more-than-thirty-two-bytes"
 	if _, err := configuredSetupToken(0, " \t "); err == nil {
 		t.Fatal("empty initial setup token unexpectedly accepted")
 	}
-	if got, err := configuredSetupToken(0, " setup-token "); err != nil || got != "setup-token" {
+	if got, err := configuredSetupToken(0, " "+longToken+" "); err != nil || got != longToken {
 		t.Fatalf("configured setup token = %q, %v", got, err)
 	}
 	if got, err := configuredSetupToken(1, "unused-token"); err != nil || got != "" {
@@ -1180,11 +1204,14 @@ func TestResetAdminPasswordRejectsInvalidDatabaseStateAndLength(t *testing.T) {
 	if err := app.db.ResetAdminPassword("long enough password"); !errors.Is(err, errAdminNotConfigured) {
 		t.Fatalf("empty database error = %v, want administrator not configured", err)
 	}
-	if _, err := app.db.CreateUser("admin-one", "correct horse battery staple"); err != nil {
-		t.Fatalf("CreateUser one: %v", err)
+	// The single-administrator invariant is enforced by ResetAdminPassword;
+	// fabricate the second row directly because the public API must never be
+	// able to create a second admin.
+	if _, err := app.db.db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", "admin-one", "hash-one"); err != nil {
+		t.Fatalf("insert user one: %v", err)
 	}
-	if _, err := app.db.CreateUser("admin-two", "correct horse battery staple"); err != nil {
-		t.Fatalf("CreateUser two: %v", err)
+	if _, err := app.db.db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", "admin-two", "hash-two"); err != nil {
+		t.Fatalf("insert user two: %v", err)
 	}
 	if err := app.db.ResetAdminPassword("another valid password"); !errors.Is(err, errMultipleAdmins) {
 		t.Fatalf("multiple users error = %v, want multiple administrators", err)
@@ -1425,10 +1452,12 @@ func TestCORSAllowsSameOriginAndRejectsCrossOrigin(t *testing.T) {
 
 func TestHandleAuthCheckExposesConfiguredSingleAdminMode(t *testing.T) {
 	app := newTestApp(t)
+	originalEphemeral := jwtSecretEphemeral
+	t.Cleanup(func() { jwtSecretEphemeral = originalEphemeral })
 	jwtSecretEphemeral = false
 
-	if _, err := app.db.CreateUser("admin", "admin123"); err != nil {
-		t.Fatalf("CreateUser: %v", err)
+	if _, err := app.db.db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", "admin", "hash"); err != nil {
+		t.Fatalf("insert admin: %v", err)
 	}
 
 	rr := httptest.NewRecorder()
@@ -1934,6 +1963,385 @@ func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T
 	})
 }
 
+func TestRedirectFollowStripsSensitiveHeadersCrossOrigin(t *testing.T) {
+	target, err := normalizeTargetURL("https://media.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	profile := UAProfile{Name: "Custom", UserAgent: "Meridian Test/1.0", Client: "Meridian Test", Version: "1.0.0"}
+	var followedHeaders http.Header
+	calls := 0
+	transport := &redirectFollowTransport{
+		playbackHosts: map[string]bool{redirectHostKey(target): true},
+		profile:       profile,
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    request,
+				}, nil
+			}
+			followedHeaders = request.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    request,
+			}, nil
+		}),
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
+	request.Header.Set("Cookie", "session=secret-cookie")
+	request.Header.Set("Authorization", "Bearer opaque-bearer")
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Device="TV", DeviceId="device-1", Token="emby-access-token", Client="old", Version="old"`)
+	request.Header.Set("X-Emby-Token", "emby-access-token")
+	request.Header.Set("X-MediaBrowser-Token", "emby-access-token")
+	applyUAProfileHeaders(request.Header, profile)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("follow redirect: %v", err)
+	}
+	response.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if got := followedHeaders.Get("Cookie"); got != "" {
+		t.Fatalf("Cookie forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("X-Emby-Token"); got != "" {
+		t.Fatalf("X-Emby-Token forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("X-MediaBrowser-Token"); got != "" {
+		t.Fatalf("X-MediaBrowser-Token forwarded across origin: %q", got)
+	}
+	emby := followedHeaders.Get("X-Emby-Authorization")
+	if strings.Contains(emby, "emby-access-token") {
+		t.Fatalf("Emby access token forwarded across origin: %q", emby)
+	}
+	for _, want := range []string{`Client="Meridian Test"`, `Version="1.0.0"`, `Device="TV"`, `DeviceId="device-1"`} {
+		if !strings.Contains(emby, want) {
+			t.Fatalf("authorization = %q, missing %q", emby, want)
+		}
+	}
+	if got := followedHeaders.Get("User-Agent"); got != profile.UserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
+	}
+}
+
+func TestRedirectFollowKeepsHeadersSameOrigin(t *testing.T) {
+	target, err := normalizeTargetURL("https://media.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	profile := UAProfile{Name: "Custom", UserAgent: "Meridian Test/1.0", Client: "Meridian Test", Version: "1.0.0"}
+	var followedHeaders http.Header
+	calls := 0
+	transport := &redirectFollowTransport{
+		playbackHosts: map[string]bool{redirectHostKey(target): true},
+		profile:       profile,
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    request,
+				}, nil
+			}
+			followedHeaders = request.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    request,
+			}, nil
+		}),
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://media.example.com/Videos/1/stream", nil)
+	request.Header.Set("Cookie", "session=secret-cookie")
+	request.Header.Set("Authorization", "Bearer opaque-bearer")
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Device="TV", Token="emby-access-token", Client="old", Version="old"`)
+	applyUAProfileHeaders(request.Header, profile)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("follow redirect: %v", err)
+	}
+	response.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if got := followedHeaders.Get("Cookie"); got != "session=secret-cookie" {
+		t.Fatalf("Cookie dropped on same-origin redirect: %q", got)
+	}
+	if got := followedHeaders.Get("Authorization"); got != "Bearer opaque-bearer" {
+		t.Fatalf("Authorization dropped on same-origin redirect: %q", got)
+	}
+	emby := followedHeaders.Get("X-Emby-Authorization")
+	if !strings.Contains(emby, "emby-access-token") {
+		t.Fatalf("Emby token lost on same-origin redirect: %q", emby)
+	}
+}
+
+func TestStripEmbyAuthorizationToken(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		want     string
+		wantSafe bool
+	}{
+		{
+			name:     "removes token and keeps identity",
+			value:    `MediaBrowser Client="App", Device="TV", DeviceId="d1", Token="secret", Version="1"`,
+			want:     `MediaBrowser Client="App", Device="TV", DeviceId="d1", Token="", Version="1"`,
+			wantSafe: true,
+		},
+		{
+			name:     "emby scheme is stripped like mediabrowser",
+			value:    `Emby Device="TV", Token="secret"`,
+			want:     `Emby Device="TV", Token=""`,
+			wantSafe: true,
+		},
+		{
+			name:     "leading whitespace is preserved",
+			value:    `  MediaBrowser Token="secret"`,
+			want:     `  MediaBrowser Token=""`,
+			wantSafe: true,
+		},
+		{
+			name:     "value without token is unchanged",
+			value:    `MediaBrowser Client="App"`,
+			want:     `MediaBrowser Client="App"`,
+			wantSafe: true,
+		},
+		{
+			name:     "bare scheme has no token",
+			value:    `MediaBrowser`,
+			want:     `MediaBrowser`,
+			wantSafe: true,
+		},
+		{
+			name:     "empty value has no token",
+			value:    "",
+			want:     "",
+			wantSafe: true,
+		},
+		{
+			name:     "duplicate token fails closed",
+			value:    `MediaBrowser Token="a", Token="b"`,
+			want:     `MediaBrowser Token="a", Token="b"`,
+			wantSafe: false,
+		},
+		{
+			name:     "unterminated attribute fails closed",
+			value:    `MediaBrowser Client="unterminated`,
+			want:     `MediaBrowser Client="unterminated`,
+			wantSafe: false,
+		},
+		{
+			name:     "unknown scheme fails closed",
+			value:    `Bearer opaque-bearer`,
+			want:     `Bearer opaque-bearer`,
+			wantSafe: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, safe := stripEmbyAuthorizationToken(tt.value)
+			if got != tt.want {
+				t.Fatalf("stripped = %q, want %q", got, tt.want)
+			}
+			if safe != tt.wantSafe {
+				t.Fatalf("safe = %v, want %v", safe, tt.wantSafe)
+			}
+		})
+	}
+}
+
+func TestStripSensitiveRedirectHeadersRemovesDedicatedTokenHeaders(t *testing.T) {
+	header := http.Header{
+		"X-Emby-Authorization": []string{`MediaBrowser Device="TV", Token="emby-access-token", Client="old"`},
+		"X-Emby-Token":         []string{"emby-access-token"},
+		"X-MediaBrowser-Token": []string{"emby-access-token"},
+		"Authorization":        []string{"Bearer opaque-bearer"},
+		"Cookie":               []string{"session=secret"},
+		"X-Forwarded-For":      []string{"10.0.0.1"},
+	}
+	stripSensitiveRedirectHeaders(header)
+	if got := header.Get("X-Emby-Token"); got != "" {
+		t.Fatalf("X-Emby-Token forwarded: %q", got)
+	}
+	if got := header.Get("X-MediaBrowser-Token"); got != "" {
+		t.Fatalf("X-MediaBrowser-Token forwarded: %q", got)
+	}
+	if got := header.Get("Cookie"); got != "" {
+		t.Fatalf("Cookie forwarded: %q", got)
+	}
+	if got := header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization forwarded: %q", got)
+	}
+	emby := header.Get("X-Emby-Authorization")
+	if strings.Contains(emby, "emby-access-token") {
+		t.Fatalf("Emby access token forwarded: %q", emby)
+	}
+	if !strings.Contains(emby, `Device="TV"`) {
+		t.Fatalf("identity fields lost: %q", emby)
+	}
+	if got := header.Get("X-Forwarded-For"); got != "10.0.0.1" {
+		t.Fatalf("non-sensitive header dropped: %q", got)
+	}
+}
+
+func TestStripSensitiveRedirectHeadersDropsUnsafeEmbyAuthorization(t *testing.T) {
+	header := http.Header{
+		"X-Emby-Authorization": []string{`MediaBrowser Token="a", Token="b", Device="TV"`},
+	}
+	stripSensitiveRedirectHeaders(header)
+	if got := header.Values("X-Emby-Authorization"); len(got) != 0 {
+		t.Fatalf("unsafe authorization value forwarded: %q", got)
+	}
+}
+
+func TestRedirectFollowDropsUnsafeEmbyAuthorizationCrossOrigin(t *testing.T) {
+	// A value with a duplicate Token cannot be stripped safely, so the whole
+	// header must be dropped on a cross-authority hop instead of being
+	// forwarded with a token intact.
+	target, err := normalizeTargetURL("https://media.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	profile := UAProfile{Name: "Custom", UserAgent: "Meridian Test/1.0", Client: "Meridian Test", Version: "1.0.0"}
+	var followedHeaders http.Header
+	calls := 0
+	transport := &redirectFollowTransport{
+		playbackHosts: map[string]bool{redirectHostKey(target): true},
+		profile:       profile,
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    request,
+				}, nil
+			}
+			followedHeaders = request.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    request,
+			}, nil
+		}),
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Token="first", Token="second", Device="TV"`)
+	applyUAProfileHeaders(request.Header, profile)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("follow redirect: %v", err)
+	}
+	response.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if got := followedHeaders.Values("X-Emby-Authorization"); len(got) != 0 {
+		t.Fatalf("unsafe X-Emby-Authorization forwarded across origin: %q", got)
+	}
+}
+
+func TestProbeClientRejectsCrossHostRedirect(t *testing.T) {
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/private", http.StatusFound)
+	}))
+	defer redirected.Close()
+
+	health := probeTargetHealth(diagProbePlan{
+		BaseURL:       redirected.URL,
+		Kind:          "metadata_api",
+		Method:        http.MethodGet,
+		CandidateURLs: []string{redirected.URL + "/System/Info/Public"},
+		ParseVersion:  true,
+	})
+	if health.Status != "offline" {
+		t.Fatalf("status = %q, want offline", health.Status)
+	}
+	if !strings.Contains(health.Error, "different host") {
+		t.Fatalf("error = %q, want cross-host redirect rejection", health.Error)
+	}
+}
+
+func TestProbeClientFollowsSameHostRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/System/Info/Public", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"Version":"1.2.3"}`))
+	})
+	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/System/Info/Public", http.StatusFound)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	health := probeTargetHealth(diagProbePlan{
+		BaseURL:       server.URL,
+		Kind:          "metadata_api",
+		Method:        http.MethodGet,
+		CandidateURLs: []string{server.URL + "/redirect"},
+		ParseVersion:  true,
+	})
+	if health.Status != "online" {
+		t.Fatalf("status = %q error=%q, want online", health.Status, health.Error)
+	}
+	if health.EmbyVer != "1.2.3" {
+		t.Fatalf("emby version = %q, want 1.2.3", health.EmbyVer)
+	}
+}
+
+func TestConfiguredSetupTokenRejectsShortToken(t *testing.T) {
+	if _, err := configuredSetupToken(0, strings.Repeat("x", 31)); !strings.Contains(err.Error(), "at least 32") {
+		t.Fatalf("short token error = %v", err)
+	}
+	token, err := configuredSetupToken(0, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("32-byte token rejected: %v", err)
+	}
+	if token != strings.Repeat("x", 32) {
+		t.Fatalf("token = %q", token)
+	}
+}
+
+func TestSetupIsRateLimited(t *testing.T) {
+	app := newTestApp(t)
+	app.setupToken = strings.Repeat("x", 32)
+
+	post := func() int {
+		body := strings.NewReader(`{"username":"admin","password":"correct horse battery staple","setup_token":"wrong-token"}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", body)
+		req.RemoteAddr = "192.0.2.10:1234"
+		rr := httptest.NewRecorder()
+		app.handleSetup(rr, req)
+		return rr.Code
+	}
+	for i := 0; i < maxLoginFailures; i++ {
+		if code := post(); code != http.StatusForbidden {
+			t.Fatalf("attempt %d status = %d, want 403", i+1, code)
+		}
+	}
+	if code := post(); code != http.StatusTooManyRequests {
+		t.Fatalf("blocked attempt status = %d, want 429", code)
+	}
+}
+
 func TestHandleSiteDiagReturnsSpoofedVersionField(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/System/Info/Public" {
@@ -2048,6 +2456,7 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
+	releasePort(initialPort)
 	if err := app.pm.StartSite(*site); err != nil {
 		t.Fatalf("StartSite: %v", err)
 	}
@@ -2093,6 +2502,7 @@ func TestHandleSiteUpdateFailureRestoresCustomUAFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSiteWithCustomUA: %v", err)
 	}
+	releasePort(initialPort)
 	if err := app.pm.StartSite(*site); err != nil {
 		t.Fatalf("StartSite: %v", err)
 	}
@@ -2281,7 +2691,9 @@ func TestAddTrafficAggregatesSameHour(t *testing.T) {
 func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 	app := newTestApp(t)
 
-	body := strings.NewReader(`{"name":"split","listen_port":` + jsonNumber(freePort(t)) + `,"target_url":"http://127.0.0.1:8096","playback_target_url":"https://media.example.com","ua_mode":"infuse"}`)
+	port := freePort(t)
+	releasePort(port)
+	body := strings.NewReader(`{"name":"split","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","playback_target_url":"https://media.example.com","ua_mode":"infuse"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/sites", body)
 	rr := httptest.NewRecorder()
 
@@ -2313,9 +2725,11 @@ func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 
 func TestHandleSitesCreatesCustomUAAndPresetUpdateClearsIt(t *testing.T) {
 	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
 	createPayload, err := json.Marshal(map[string]interface{}{
 		"name":              "custom-identity",
-		"listen_port":       freePort(t),
+		"listen_port":       port,
 		"target_url":        "http://127.0.0.1:8096",
 		"ua_mode":           "custom",
 		"custom_user_agent": "Meridian Custom/1.0",
@@ -2551,6 +2965,7 @@ func TestProxyRoutesPlaybackRequestsToPlaybackTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
+	releasePort(site.ListenPort)
 	if err := app.pm.StartSite(*site); err != nil {
 		t.Fatalf("StartSite: %v", err)
 	}
@@ -2601,6 +3016,7 @@ func TestProxyPreservesConfiguredUpstreamBasePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
+	releasePort(site.ListenPort)
 	if err := app.pm.StartSite(*site); err != nil {
 		t.Fatalf("StartSite: %v", err)
 	}
@@ -2637,6 +3053,7 @@ func TestProxyPlaybackRequestsFallBackToMainTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
+	releasePort(site.ListenPort)
 	if err := app.pm.StartSite(*site); err != nil {
 		t.Fatalf("StartSite: %v", err)
 	}
