@@ -238,6 +238,39 @@ restore_data_snapshot() {
     restore_data_permissions
 }
 
+restore_env_from_snapshot() {
+    # A failed full-directory restore must not leave pre-start configuration
+    # backfills (for example a newly generated encryption key) in the live
+    # environment. Restore just the exact pre-update .env atomically while the
+    # full snapshot remains pending for the exit-trap retry/manual recovery.
+    # This deliberately does not mark UPDATE_SNAPSHOT_RESTORED: database and
+    # other data files may still require the complete snapshot.
+    local snapshot_dir="$1" snapshot_env env_file
+    snapshot_env="${snapshot_dir}/data/.env"
+    env_file=$(env_file_path)
+    as_root test -f "$snapshot_env" || return 1
+    if as_root test -L "$snapshot_env"; then
+        return 1
+    fi
+    as_root test -d "$DATA_DIR" || return 1
+    if as_root test -L "$env_file"; then
+        return 1
+    fi
+    install_env_file "$snapshot_env"
+}
+
+restore_update_snapshot() {
+    local snapshot_dir="$1"
+    if restore_data_snapshot "$snapshot_dir"; then
+        UPDATE_SNAPSHOT_RESTORED=1
+        return 0
+    fi
+    if ! restore_env_from_snapshot "$snapshot_dir"; then
+        warn "完整数据快照恢复失败，且无法单独恢复更新前的 .env，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+    fi
+    return 1
+}
+
 restore_data_permissions() {
     # Reapplies the ownership/mode contract of prepare_data_and_config after a
     # snapshot restore: the staged copy arrives as root:0700, which the
@@ -447,6 +480,40 @@ ensure_setup_token() {
     install_env_file "$tmp_file"
 }
 
+ensure_upstream_header_key() {
+    local tmp_dir="$1" env_file tmp_file key_value key_count key_length new_key
+    env_file=$(env_file_path)
+    # Reject duplicate definitions rather than guessing which key systemd or a
+    # shell loader will honor. Rotating the wrong value would make every stored
+    # encrypted upstream Header unreadable.
+    # $1 is an awk field reference, not a shell variable.
+    # shellcheck disable=SC2016
+    key_count=$(as_root awk -F= '$1 == "UPSTREAM_HEADER_KEY" { count++ } END { print count + 0 }' "$env_file")
+    [ "$key_count" -le 1 ] || fail "UPSTREAM_HEADER_KEY 存在重复定义，请人工保留唯一的正确密钥后重试"
+
+    key_value=$(read_env_value UPSTREAM_HEADER_KEY)
+    if [ "$key_count" -eq 1 ] && [ -n "$key_value" ]; then
+        printf '%s' "$key_value" | grep -q '[^[:space:]]' \
+            || fail "UPSTREAM_HEADER_KEY 不能只包含空白字符"
+        if printf '%s' "$key_value" | grep -q '[[:space:]]'; then
+            fail "UPSTREAM_HEADER_KEY 不能包含空白字符；为避免 systemd 解析差异，安装器不会自动修改现有密钥"
+        fi
+        key_length=$(printf '%s' "$key_value" | LC_ALL=C wc -c | tr -d '[:space:]')
+        [ "$key_length" -ge 32 ] \
+            || fail "现有 UPSTREAM_HEADER_KEY 少于 32 字节；为避免破坏已加密数据，安装器不会自动替换"
+        return 0
+    fi
+
+    new_key=$(generate_secret)
+    tmp_file="${tmp_dir}/env-upstream-header-key"
+    # $1 is an awk field reference, not a shell variable.
+    # shellcheck disable=SC2016
+    as_root awk -F= '$1 != "UPSTREAM_HEADER_KEY" { print }' "$env_file" > "$tmp_file"
+    printf 'UPSTREAM_HEADER_KEY=%s\n' "$new_key" >> "$tmp_file"
+    chmod 0600 "$tmp_file"
+    install_env_file "$tmp_file"
+}
+
 set_panel_env() {
     local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" env_file tmp_file
     env_file=$(env_file_path)
@@ -530,7 +597,7 @@ ensure_service_user() {
 }
 
 prepare_data_and_config() {
-    local tmp_dir="$1" env_file secret env_tmp
+    local tmp_dir="$1" env_file secret upstream_header_key env_tmp
     validate_data_dir
     env_file=$(env_file_path)
     if is_systemd; then
@@ -542,10 +609,11 @@ prepare_data_and_config() {
 
     if ! as_root test -f "$env_file"; then
         secret=$(generate_secret)
+        upstream_header_key=$(generate_secret)
         INITIAL_SETUP_TOKEN=$(generate_secret)
         env_tmp="${tmp_dir}/meridian.env"
-        printf 'JWT_SECRET=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
-            "$secret" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp"
+        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+            "$secret" "$upstream_header_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp"
         chmod 0600 "$env_tmp"
         install_env_file "$env_tmp"
         ok "已创建安全配置: $env_file"
@@ -554,6 +622,7 @@ prepare_data_and_config() {
         append_env_default PANEL_BIND_ADDR 0.0.0.0 "$tmp_dir"
         append_env_default PANEL_DOMAIN "" "$tmp_dir"
         append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir"
+        ensure_upstream_header_key "$tmp_dir"
         ensure_setup_token "$tmp_dir"
         if is_systemd; then
             as_root chown root:"$SERVICE_GROUP" "$env_file"
@@ -657,9 +726,7 @@ cleanup_update_transaction() {
         fi
         if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
             && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
-            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                UPDATE_SNAPSHOT_RESTORED=1
-            else
+            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             fi
         fi
@@ -877,7 +944,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$meridian_connection_upgrade;
@@ -1255,9 +1322,7 @@ do_update() {
             warn "新版本健康检查失败，正在自动回滚..."
             restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             UPDATE_BINARY_CHANGED=0
-            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                UPDATE_SNAPSHOT_RESTORED=1
-            else
+            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
             as_root systemctl restart "$SERVICE_NAME"
@@ -1272,9 +1337,7 @@ do_update() {
             warn "新版本二进制无法执行，正在自动回滚..."
             restore_previous_binary || true
             UPDATE_BINARY_CHANGED=0
-            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                UPDATE_SNAPSHOT_RESTORED=1
-            else
+            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
             fail "新版本无法执行，已恢复上一版本及原数据配置"
