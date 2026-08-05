@@ -501,7 +501,9 @@ systemd_calls="${TEST_ROOT}/systemd-migration.calls"
 write_legacy_systemd_service
 cp "$SERVICE_FILE" "${TEST_ROOT}/legacy-systemd.before"
 (
-    as_root() { "$@"; }
+    as_root() {
+        if [ "$1" = install ]; then run_test_root_command "$@"; else "$@"; fi
+    }
     is_systemd() { return 0; }
     systemctl() { printf '%s\n' "$*" >> "$systemd_calls"; }
     migrate_update_systemd_service "$systemd_migration_tmp"
@@ -515,7 +517,9 @@ cp "$SERVICE_FILE" "${TEST_ROOT}/legacy-systemd.before"
 cmp -s "$SERVICE_FILE" "${TEST_ROOT}/legacy-systemd.before" \
     || { echo 'FAIL: systemd rollback did not restore exact prior unit' >&2; exit 1; }
 (
-    as_root() { "$@"; }
+    as_root() {
+        if [ "$1" = install ]; then run_test_root_command "$@"; else "$@"; fi
+    }
     is_systemd() { return 0; }
     systemctl() { return 0; }
     migrate_update_systemd_service "$systemd_migration_tmp"
