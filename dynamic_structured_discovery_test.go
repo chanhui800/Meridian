@@ -182,6 +182,33 @@ func TestPlaybackInfoRemotePathWithRequiredHeadersFailsClosed(t *testing.T) {
 		t.Fatal("credential-bearing remote Path was accepted")
 	}
 }
+
+func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", want: "none"},
+		{name: "invalid json", err: errors.New("invalid PlaybackInfo JSON"), want: "invalid_json"},
+		{name: "media sources", err: errors.New("PlaybackInfo MediaSources has an invalid type"), want: "media_sources_invalid"},
+		{name: "required headers", err: errors.New("PlaybackInfo RequiredHttpHeaders has an invalid value"), want: "required_headers_invalid"},
+		{name: "origin headers", err: errors.New("external subtitle URL requires unsupported origin headers"), want: "origin_headers_unsupported"},
+		{name: "capability", err: newDynamicProxyError(dynamicObservationReasonDomainDenied), want: "capability_domain_denied"},
+		{name: "unknown does not echo secret", err: errors.New("unexpected upstream value bearer-secret"), want: "unclassified"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := playbackInfoRewriteDiagnosticCode(test.err); got != test.want {
+				t.Fatalf("diagnostic code = %q, want %q", got, test.want)
+			}
+			if strings.Contains(playbackInfoRewriteDiagnosticCode(test.err), "secret") {
+				t.Fatal("diagnostic code exposed error content")
+			}
+		})
+	}
+}
+
 func TestPlaybackInfoPathProtocolAndURLFormsFailClosed(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "https://api.example.com/Items/abc/PlaybackInfo")

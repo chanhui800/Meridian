@@ -4794,6 +4794,9 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 	}
 	if err != nil {
 		session.rollback()
+		if source == dynamicDiscoverySourcePlaybackInfo {
+			log.Printf("[%s] PlaybackInfo rewrite rejected: diagnostic=%s profile=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err), issuer.policy.profile)
+		}
 		return recordFailure(dynamicStructuredRewriteDeniedReason(source))
 	}
 	if int64(len(rewritten)) > outputLimit {
@@ -5241,6 +5244,60 @@ func playbackInfoExtremeRequiredHeaders(object map[string]any, hasRequiredHeader
 		return nil, fmt.Errorf("PlaybackInfo RequiredHttpHeaders has an invalid type")
 	}
 	return normalizeExtremeRequiredHeaderClaims(headers, session.issuer.upstreamHeaderPolicy)
+}
+
+func playbackInfoRewriteDiagnosticCode(err error) string {
+	if err == nil {
+		return "none"
+	}
+	var discoveryErr *dynamicProxyError
+	if errors.As(err, &discoveryErr) {
+		switch discoveryErr.reasonCode {
+		case dynamicObservationReasonSchemeDenied,
+			dynamicObservationReasonPortDenied,
+			dynamicObservationReasonDomainDenied,
+			dynamicObservationReasonHTTPSDowngradeDenied,
+			dynamicObservationReasonSelfTarget,
+			dynamicObservationReasonDNSFailure,
+			dynamicObservationReasonAddressDenied,
+			dynamicObservationReasonDialFailure,
+			dynamicObservationReasonTLSFailure,
+			dynamicObservationReasonCapacityLimit,
+			dynamicObservationReasonRateLimit:
+			return "capability_" + discoveryErr.reasonCode
+		default:
+			return "capability_denied"
+		}
+	}
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "parsing deadline exceeded"):
+		return "parsing_deadline"
+	case strings.Contains(message, "structural limits"), strings.Contains(message, "token limit"), strings.Contains(message, "nesting exceeds"):
+		return "structural_limit"
+	case strings.Contains(message, "invalid PlaybackInfo JSON"), strings.Contains(message, "invalid PlaybackInfo object"):
+		return "invalid_json"
+	case strings.Contains(message, "missing or duplicates MediaSources"):
+		return "media_sources_missing_or_duplicate"
+	case strings.Contains(message, "MediaSources has an invalid type"), strings.Contains(message, "MediaSources contains an invalid entry"):
+		return "media_sources_invalid"
+	case strings.Contains(message, "stringified JSON"):
+		return "stringified_collection_invalid"
+	case strings.Contains(message, "RequiredHttpHeaders"):
+		return "required_headers_invalid"
+	case strings.Contains(message, "requires unsupported origin headers"):
+		return "origin_headers_unsupported"
+	case strings.Contains(message, "MediaStreams has an invalid type"), strings.Contains(message, "MediaStreams contains an invalid entry"):
+		return "media_streams_invalid"
+	case strings.Contains(message, "DeliveryUrl"):
+		return "delivery_url_invalid"
+	case strings.Contains(message, "unsupported protocol"), strings.Contains(message, "manifest source is unavailable"):
+		return "protocol_or_manifest_unsupported"
+	case strings.Contains(message, "invalid URL"), strings.Contains(message, "fallback URL is invalid"):
+		return "url_invalid"
+	default:
+		return "unclassified"
+	}
 }
 
 func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
