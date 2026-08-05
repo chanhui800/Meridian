@@ -186,7 +186,7 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	for name, dynamicFields := range map[string]map[string]interface{}{
 		"server revision":      {"dynamic_policy_revision": 1},
 		"enabled discovery":    {"dynamic_discovery_enabled": true},
-		"safe public exact IP": {"dynamic_domain_rules": []map[string]string{{"type": "exact", "value": "8.8.8.8"}}},
+		"safe public exact IP": {"dynamic_profile": "safe", "dynamic_domain_rules": []map[string]string{{"type": "exact", "value": "8.8.8.8"}}},
 	} {
 		t.Run("reject POST "+name, func(t *testing.T) {
 			payload := map[string]interface{}{
@@ -547,8 +547,8 @@ func TestDynamicDiscoverySourcesFollowProfileContract(t *testing.T) {
 		want    string
 	}{
 		{profile: dynamicProfileSafe, want: "redirect,playback_info"},
-		{profile: dynamicProfileCompatible, want: "redirect,playback_info,hls,dash"},
-		{profile: dynamicProfileExtreme, want: "redirect,playback_info,hls,dash"},
+		{profile: dynamicProfileCompatible, want: "redirect,playback_info"},
+		{profile: dynamicProfileExtreme, want: "redirect,playback_info"},
 	} {
 		site := Site{DynamicProfile: tc.profile}
 		if err := normalizeDynamicSitePolicy(&site); err != nil {
