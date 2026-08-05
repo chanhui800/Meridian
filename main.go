@@ -8422,6 +8422,7 @@ func (t *redirectFollowTransport) newExtremeCompatibleDynamicRedirectRequest(ctx
 			}
 		}
 	}
+	// #nosec G704 -- callers restrict target to an administrator-configured authority or a normalized, policy-checked, DNS-pinned dynamic URL before this request is sent.
 	newRequest, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 	if err != nil {
 		if body != nil {
