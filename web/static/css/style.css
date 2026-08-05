@@ -153,9 +153,9 @@ input, select { font-family: inherit; }
 
 .form-help {
   margin-top: 8px;
-  font-size: .75rem;
+  font-size: .8rem;
   line-height: 1.5;
-  color: var(--white-38);
+  color: var(--white-60);
 }
 
 .form-group label {

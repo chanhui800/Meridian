@@ -16,8 +16,10 @@ NGINX_ROOT="${MERIDIAN_NGINX_ROOT:-/etc/nginx}"
 BIN_NAME="meridian"
 SERVICE_USER="meridian"
 SERVICE_GROUP="meridian"
+SYSTEMD_RESTRICT_ADDRESS_FAMILIES="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 ROOT_GROUP="${MERIDIAN_ROOT_GROUP:-$(id -gn 0 2>/dev/null || printf 'root')}"
 NGINX_MARKER="# Managed by Meridian installer - panel only"
+NGINX_REDACTION_MARKER="# Meridian redacted URI access log"
 
 while [ "$INSTALL_DIR" != "/" ] && [[ "$INSTALL_DIR" == */ ]]; do INSTALL_DIR="${INSTALL_DIR%/}"; done
 while [ "$DATA_DIR" != "/" ] && [[ "$DATA_DIR" == */ ]]; do DATA_DIR="${DATA_DIR%/}"; done
@@ -38,6 +40,8 @@ UPDATE_BINARY_CHANGED=0
 UPDATE_TRANSACTION=0
 UPDATE_SNAPSHOT_DIR=""
 UPDATE_SNAPSHOT_RESTORED=0
+UPDATE_SERVICE_SNAPSHOT=""
+UPDATE_SERVICE_CHANGED=0
 PASSWORD_TMP_DIR=""
 PASSWORD_SNAPSHOT_DIR=""
 PASSWORD_DB_PATH=""
@@ -359,6 +363,38 @@ generate_secret() {
     fi
 }
 
+valid_portable_secret_token() {
+    local value="$1"
+    local LC_ALL=C
+    [ -n "$value" ] || return 1
+    [[ "$value" =~ ^[[:graph:]]+$ ]] || return 1
+    case "$value" in
+        *\'*|*\"*|*\\*) return 1 ;;
+    esac
+    return 0
+}
+
+generate_distinct_secret() {
+    local candidate forbidden collision attempt
+    for ((attempt = 1; attempt <= 32; attempt++)); do
+        candidate=$(generate_secret)
+        valid_portable_secret_token "$candidate" || continue
+        [ "${#candidate}" -ge 32 ] || continue
+        collision=0
+        for forbidden in "$@"; do
+            if [ -n "$forbidden" ] && [ "$candidate" = "$forbidden" ]; then
+                collision=1
+                break
+            fi
+        done
+        if [ "$collision" = "0" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    fail "无法生成互不相同的安全密钥；现有配置未修改"
+}
+
 detect_platform() {
     local os arch
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -436,6 +472,99 @@ read_env_value() {
     printf '%s\n' "$value"
 }
 
+read_unique_env_secret_assignment() {
+    local key="$1" env_file raw_value status
+    env_file=$(env_file_path)
+    # shellcheck disable=SC2016
+    if raw_value=$(LC_ALL=C as_root awk -v wanted="$key" '
+        {
+            candidate=$0
+            sub(/^[[:space:]]+/, "", candidate)
+            if (candidate ~ /^export[[:space:]]+/) {
+                sub(/^export[[:space:]]+/, "", candidate)
+            }
+            if (substr(candidate, 1, length(wanted)) != wanted) next
+            remainder=substr(candidate, length(wanted) + 1)
+            if (remainder != "" && substr(remainder, 1, 1) != "=" \
+                    && remainder !~ /^[[:space:]]/) next
+            count++
+            if (substr($0, 1, length(wanted) + 1) != wanted "=") malformed=1
+            if (count == 1) value=substr($0, length(wanted) + 2)
+        }
+        END {
+            if (count == 0) exit 1
+            if (count != 1 || malformed) exit 2
+            print value
+        }
+    ' "$env_file" 2>/dev/null); then
+        :
+    else
+        status=$?
+        if [ "$status" -eq 1 ]; then
+            printf '\n'
+            return 0
+        fi
+        fail "${key} 的 EnvironmentFile 定义重复或含歧义；请保留唯一的 KEY=value 定义后重试"
+    fi
+    printf '%s\n' "$raw_value"
+}
+
+read_legacy_env_secret() {
+    local key="$1" raw_value effective_value
+    raw_value=$(read_unique_env_secret_assignment "$key") || return 1
+    if [ -z "$raw_value" ]; then
+        printf '\n'
+        return 0
+    fi
+
+    case "$raw_value" in
+        \'*\') effective_value=${raw_value:1:${#raw_value}-2} ;;
+        \"*\") effective_value=${raw_value:1:${#raw_value}-2} ;;
+        *\'*|*\"*)
+            fail "${key} 的引号形式不完整或含歧义；现有配置未修改"
+            ;;
+        *) effective_value="$raw_value" ;;
+    esac
+    if [ -n "$effective_value" ] && ! valid_portable_secret_token "$effective_value"; then
+        fail "${key} 必须是 ASCII token，或仅用一对匹配的单引号/双引号包裹该 token；现有配置未修改"
+    fi
+    printf '%s\n' "$effective_value"
+}
+
+read_strict_dynamic_route_key() {
+    local raw_value
+    raw_value=$(read_unique_env_secret_assignment DYNAMIC_ROUTE_KEY) || return 1
+    if [ -n "$raw_value" ] && ! valid_portable_secret_token "$raw_value"; then
+        fail "DYNAMIC_ROUTE_KEY 必须使用不带引号、反斜杠、空白或非 ASCII 字节的单行值；现有配置未修改"
+    fi
+    printf '%s\n' "$raw_value"
+}
+
+validate_existing_secret_configuration() {
+    local jwt_secret upstream_header_key dynamic_route_key
+    jwt_secret=$(read_legacy_env_secret JWT_SECRET) || return 1
+    upstream_header_key=$(read_legacy_env_secret UPSTREAM_HEADER_KEY) || return 1
+    dynamic_route_key=$(read_strict_dynamic_route_key) || return 1
+
+    if [ -n "$jwt_secret" ] && [ "${#jwt_secret}" -lt 32 ]; then
+        fail "现有 JWT_SECRET 少于 32 字节；现有配置未修改"
+    fi
+    if [ -n "$upstream_header_key" ] && [ "${#upstream_header_key}" -lt 32 ]; then
+        fail "现有 UPSTREAM_HEADER_KEY 少于 32 字节；现有配置未修改"
+    fi
+    if [ -n "$dynamic_route_key" ] && [ "${#dynamic_route_key}" -lt 32 ]; then
+        fail "现有 DYNAMIC_ROUTE_KEY 少于 32 字节；现有配置未修改"
+    fi
+    if [ -n "$jwt_secret" ] && [ -n "$upstream_header_key" ] \
+        && [ "$jwt_secret" = "$upstream_header_key" ]; then
+        fail "UPSTREAM_HEADER_KEY 必须与 JWT_SECRET 使用不同的值；现有配置未修改"
+    fi
+    if [ -n "$dynamic_route_key" ] && { [ "$dynamic_route_key" = "$jwt_secret" ] \
+        || [ "$dynamic_route_key" = "$upstream_header_key" ]; }; then
+        fail "DYNAMIC_ROUTE_KEY 必须与 JWT_SECRET 和 UPSTREAM_HEADER_KEY 使用不同的值；现有配置未修改"
+    fi
+}
+
 env_has_key() {
     local key="$1" env_file
     env_file=$(env_file_path)
@@ -446,95 +575,127 @@ env_has_key() {
 
 install_env_file() {
     local source_file="$1" env_file
-    env_file=$(env_file_path)
+    env_file=$(env_file_path) || return 1
     if is_systemd; then
-        as_root install -o root -g "$SERVICE_GROUP" -m 0640 "$source_file" "${env_file}.new"
+        as_root install -o root -g "$SERVICE_GROUP" -m 0640 "$source_file" "${env_file}.new" || return 1
     else
-        as_root install -o "$(id -u)" -g "$(id -g)" -m 0600 "$source_file" "${env_file}.new"
+        as_root install -o "$(id -u)" -g "$(id -g)" -m 0600 "$source_file" "${env_file}.new" || return 1
     fi
-    as_root mv -f "${env_file}.new" "$env_file"
+    as_root mv -f "${env_file}.new" "$env_file" || return 1
 }
 
 append_env_default() {
-    local key="$1" value="$2" tmp_dir="$3" env_file tmp_file
-    env_file=$(env_file_path)
-    env_has_key "$key" && return 0
+    local key="$1" value="$2" tmp_dir="$3" env_file tmp_file status
+    env_file=$(env_file_path) || return 1
+    if env_has_key "$key"; then
+        return 0
+    else
+        status=$?
+        [ "$status" -eq 1 ] || return 1
+    fi
     tmp_file="${tmp_dir}/env-default-${key}"
-    as_root cat "$env_file" > "$tmp_file"
-    printf '%s=%s\n' "$key" "$value" >> "$tmp_file"
-    chmod 0600 "$tmp_file"
-    install_env_file "$tmp_file"
+    as_root cat "$env_file" > "$tmp_file" || return 1
+    printf '%s=%s\n' "$key" "$value" >> "$tmp_file" || return 1
+    chmod 0600 "$tmp_file" || return 1
+    install_env_file "$tmp_file" || return 1
 }
 
 ensure_setup_token() {
-    local tmp_dir="$1" env_file tmp_file
-    env_file=$(env_file_path)
-    [ -n "$(read_env_value SETUP_TOKEN)" ] && return 0
-    INITIAL_SETUP_TOKEN=$(generate_secret)
+    local tmp_dir="$1" env_file tmp_file existing_token
+    env_file=$(env_file_path) || return 1
+    existing_token=$(read_env_value SETUP_TOKEN) || return 1
+    [ -z "$existing_token" ] || return 0
+    INITIAL_SETUP_TOKEN=$(generate_secret) || return 1
     tmp_file="${tmp_dir}/env-setup-token"
     # $1 is an awk field reference, not a shell variable.
     # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "SETUP_TOKEN" { print }' "$env_file" > "$tmp_file"
-    printf 'SETUP_TOKEN=%s\n' "$INITIAL_SETUP_TOKEN" >> "$tmp_file"
-    chmod 0600 "$tmp_file"
-    install_env_file "$tmp_file"
+    as_root awk -F= '$1 != "SETUP_TOKEN" { print }' "$env_file" > "$tmp_file" || return 1
+    printf 'SETUP_TOKEN=%s\n' "$INITIAL_SETUP_TOKEN" >> "$tmp_file" || return 1
+    chmod 0600 "$tmp_file" || return 1
+    install_env_file "$tmp_file" || return 1
 }
 
 ensure_upstream_header_key() {
-    local tmp_dir="$1" env_file tmp_file key_value key_count key_length new_key
-    env_file=$(env_file_path)
-    # Reject duplicate definitions rather than guessing which key systemd or a
-    # shell loader will honor. Rotating the wrong value would make every stored
-    # encrypted upstream Header unreadable.
-    # $1 is an awk field reference, not a shell variable.
-    # shellcheck disable=SC2016
-    key_count=$(as_root awk -F= '$1 == "UPSTREAM_HEADER_KEY" { count++ } END { print count + 0 }' "$env_file")
-    [ "$key_count" -le 1 ] || fail "UPSTREAM_HEADER_KEY 存在重复定义，请人工保留唯一的正确密钥后重试"
+    local tmp_dir="$1" env_file tmp_file key_value key_length new_key jwt_secret dynamic_route_key
+    env_file=$(env_file_path) || return 1
+    key_value=$(read_legacy_env_secret UPSTREAM_HEADER_KEY) || return 1
+    jwt_secret=$(read_legacy_env_secret JWT_SECRET) || return 1
+    dynamic_route_key=$(read_strict_dynamic_route_key) || return 1
 
-    key_value=$(read_env_value UPSTREAM_HEADER_KEY)
-    if [ "$key_count" -eq 1 ] && [ -n "$key_value" ]; then
-        printf '%s' "$key_value" | grep -q '[^[:space:]]' \
-            || fail "UPSTREAM_HEADER_KEY 不能只包含空白字符"
-        if printf '%s' "$key_value" | grep -q '[[:space:]]'; then
-            fail "UPSTREAM_HEADER_KEY 不能包含空白字符；为避免 systemd 解析差异，安装器不会自动修改现有密钥"
-        fi
-        key_length=$(printf '%s' "$key_value" | LC_ALL=C wc -c | tr -d '[:space:]')
+    if [ -n "$key_value" ]; then
+        key_length=${#key_value}
         [ "$key_length" -ge 32 ] \
             || fail "现有 UPSTREAM_HEADER_KEY 少于 32 字节；为避免破坏已加密数据，安装器不会自动替换"
+        if { [ -n "$jwt_secret" ] && [ "$key_value" = "$jwt_secret" ]; } \
+            || { [ -n "$dynamic_route_key" ] && [ "$key_value" = "$dynamic_route_key" ]; }; then
+            fail "UPSTREAM_HEADER_KEY 必须与 JWT_SECRET 和 DYNAMIC_ROUTE_KEY 使用不同的值；现有配置未修改"
+        fi
         return 0
     fi
 
-    new_key=$(generate_secret)
+    new_key=$(generate_distinct_secret "$jwt_secret" "$dynamic_route_key") || return 1
     tmp_file="${tmp_dir}/env-upstream-header-key"
     # $1 is an awk field reference, not a shell variable.
     # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "UPSTREAM_HEADER_KEY" { print }' "$env_file" > "$tmp_file"
-    printf 'UPSTREAM_HEADER_KEY=%s\n' "$new_key" >> "$tmp_file"
-    chmod 0600 "$tmp_file"
-    install_env_file "$tmp_file"
+    as_root awk -F= '$1 != "UPSTREAM_HEADER_KEY" { print }' "$env_file" > "$tmp_file" || return 1
+    printf 'UPSTREAM_HEADER_KEY=%s\n' "$new_key" >> "$tmp_file" || return 1
+    chmod 0600 "$tmp_file" || return 1
+    install_env_file "$tmp_file" || return 1
 }
+
+ensure_dynamic_route_key() {
+    local tmp_dir="$1" env_file tmp_file key_value new_key jwt_secret upstream_header_key last_byte status
+    env_file=$(env_file_path) || return 1
+    validate_existing_secret_configuration || return 1
+    key_value=$(read_strict_dynamic_route_key) || return 1
+    [ -z "$key_value" ] || return 0
+
+    jwt_secret=$(read_legacy_env_secret JWT_SECRET) || return 1
+    upstream_header_key=$(read_legacy_env_secret UPSTREAM_HEADER_KEY) || return 1
+    new_key=$(generate_distinct_secret "$jwt_secret" "$upstream_header_key") || return 1
+    tmp_file="${tmp_dir}/env-dynamic-route-key"
+    if env_has_key DYNAMIC_ROUTE_KEY; then
+        # $1 is an awk field reference, not a shell variable.
+        # shellcheck disable=SC2016
+        as_root awk -F= '$1 != "DYNAMIC_ROUTE_KEY" { print }' "$env_file" > "$tmp_file" || return 1
+    else
+        status=$?
+        [ "$status" -eq 1 ] || return 1
+        # Missing-key migration is append-only: retain every existing byte and
+        # add a record separator only when the final record lacked one.
+        as_root cat "$env_file" > "$tmp_file" || return 1
+        if as_root test -s "$env_file"; then
+            last_byte=$(as_root tail -c 1 "$env_file") || return 1
+            [ -z "$last_byte" ] || printf '\n' >> "$tmp_file" || return 1
+        fi
+    fi
+    printf 'DYNAMIC_ROUTE_KEY=%s\n' "$new_key" >> "$tmp_file" || return 1
+    chmod 0600 "$tmp_file" || return 1
+    install_env_file "$tmp_file" || return 1
+}
+
 
 set_panel_env() {
     local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" env_file tmp_file
-    env_file=$(env_file_path)
+    env_file=$(env_file_path) || return 1
     tmp_file="${tmp_dir}/panel.env"
     # $1 is an awk field reference, not a shell variable.
     # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "PANEL_BIND_ADDR" && $1 != "PANEL_DOMAIN" && $1 != "TRUSTED_PROXY_CIDRS" { print }' "$env_file" > "$tmp_file"
+    as_root awk -F= '$1 != "PANEL_BIND_ADDR" && $1 != "PANEL_DOMAIN" && $1 != "TRUSTED_PROXY_CIDRS" { print }' "$env_file" > "$tmp_file" || return 1
     printf 'PANEL_BIND_ADDR=%s\nPANEL_DOMAIN=%s\nTRUSTED_PROXY_CIDRS=%s\n' \
-        "$bind_addr" "$domain" "$proxies" >> "$tmp_file"
-    chmod 0600 "$tmp_file"
-    install_env_file "$tmp_file"
+        "$bind_addr" "$domain" "$proxies" >> "$tmp_file" || return 1
+    chmod 0600 "$tmp_file" || return 1
+    install_env_file "$tmp_file" || return 1
 }
 
 write_rotated_env() {
     local secret="$1" output="$2" env_file
-    env_file=$(env_file_path)
+    env_file=$(env_file_path) || return 1
     # $1 is an awk field reference, not a shell variable.
     # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "JWT_SECRET" { print }' "$env_file" > "$output"
-    printf 'JWT_SECRET=%s\n' "$secret" >> "$output"
-    chmod 0600 "$output"
+    as_root awk -F= '$1 != "JWT_SECRET" { print }' "$env_file" > "$output" || return 1
+    printf 'JWT_SECRET=%s\n' "$secret" >> "$output" || return 1
+    chmod 0600 "$output" || return 1
 }
 
 remove_loopback_proxies() {
@@ -597,36 +758,46 @@ ensure_service_user() {
 }
 
 prepare_data_and_config() {
-    local tmp_dir="$1" env_file secret upstream_header_key env_tmp
-    validate_data_dir
-    env_file=$(env_file_path)
+    local tmp_dir="$1" env_file secret upstream_header_key dynamic_route_key env_tmp
+    validate_data_dir || return 1
+    env_file=$(env_file_path) || return 1
+    if as_root test -L "$env_file"; then
+        fail "拒绝修改符号链接形式的配置文件: $env_file"
+    fi
+    if as_root test -e "$env_file"; then
+        if ! as_root test -f "$env_file"; then
+            fail "配置路径不是普通文件: $env_file"
+        fi
+        validate_existing_secret_configuration || return 1
+    fi
     if is_systemd; then
-        ensure_service_user
-        as_root install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$DATA_DIR"
+        ensure_service_user || return 1
+        as_root install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$DATA_DIR" || return 1
     else
-        as_root install -d -o "$(id -u)" -g "$(id -g)" -m 0750 "$DATA_DIR"
+        as_root install -d -o "$(id -u)" -g "$(id -g)" -m 0750 "$DATA_DIR" || return 1
     fi
 
     if ! as_root test -f "$env_file"; then
-        secret=$(generate_secret)
-        upstream_header_key=$(generate_secret)
-        INITIAL_SETUP_TOKEN=$(generate_secret)
+        secret=$(generate_distinct_secret) || return 1
+        upstream_header_key=$(generate_distinct_secret "$secret") || return 1
+        dynamic_route_key=$(generate_distinct_secret "$secret" "$upstream_header_key") || return 1
+        INITIAL_SETUP_TOKEN=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key") || return 1
         env_tmp="${tmp_dir}/meridian.env"
-        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
-            "$secret" "$upstream_header_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp"
-        chmod 0600 "$env_tmp"
-        install_env_file "$env_tmp"
+        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+            "$secret" "$upstream_header_key" "$dynamic_route_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
+        chmod 0600 "$env_tmp" || return 1
+        install_env_file "$env_tmp" || return 1
         ok "已创建安全配置: $env_file"
     else
-        as_root test -L "$env_file" && fail "拒绝修改符号链接形式的配置文件: $env_file"
-        append_env_default PANEL_BIND_ADDR 0.0.0.0 "$tmp_dir"
-        append_env_default PANEL_DOMAIN "" "$tmp_dir"
-        append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir"
-        ensure_upstream_header_key "$tmp_dir"
-        ensure_setup_token "$tmp_dir"
+        ensure_dynamic_route_key "$tmp_dir" || return 1
+        append_env_default PANEL_BIND_ADDR 0.0.0.0 "$tmp_dir" || return 1
+        append_env_default PANEL_DOMAIN "" "$tmp_dir" || return 1
+        append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir" || return 1
+        ensure_upstream_header_key "$tmp_dir" || return 1
+        ensure_setup_token "$tmp_dir" || return 1
         if is_systemd; then
-            as_root chown root:"$SERVICE_GROUP" "$env_file"
-            as_root chmod 0640 "$env_file"
+            as_root chown root:"$SERVICE_GROUP" "$env_file" || return 1
+            as_root chmod 0640 "$env_file" || return 1
         fi
         info "保留现有配置: $env_file"
     fi
@@ -667,7 +838,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ReadWritePaths=${DATA_DIR}
@@ -679,6 +850,41 @@ SVCEOF
     as_root install -o root -g root -m 0644 "$service_tmp" "$SERVICE_FILE"
     as_root systemctl daemon-reload
     as_root systemctl enable "$SERVICE_NAME" >/dev/null
+}
+
+migrate_update_systemd_service() {
+    local tmp_dir="$1" service_copy service_new legacy_line current_line configured_line
+    is_systemd || return 0
+    service_copy="${tmp_dir}/meridian.service.current"
+    service_new="${tmp_dir}/meridian.service.new"
+    UPDATE_SERVICE_SNAPSHOT="${tmp_dir}/meridian.service.before"
+    as_root cp -p -- "$SERVICE_FILE" "$UPDATE_SERVICE_SNAPSHOT"
+    as_root cp -p -- "$SERVICE_FILE" "$service_copy"
+    configured_line=$(grep '^RestrictAddressFamilies=' "$service_copy" || true)
+    legacy_line='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'
+    current_line="RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}"
+    if [ "$configured_line" = "$current_line" ]; then
+        return 0
+    fi
+    if [ "$configured_line" != "$legacy_line" ]; then
+        warn "现有 systemd 网络族配置不是安装器管理的旧格式；拒绝自动覆盖: $SERVICE_FILE"
+        return 1
+    fi
+    sed "s/^RestrictAddressFamilies=.*/${current_line}/" "$service_copy" > "$service_new"
+    UPDATE_SERVICE_CHANGED=1
+    as_root install -o root -g root -m 0644 "$service_new" "$SERVICE_FILE"
+    as_root systemctl daemon-reload
+}
+
+restore_update_systemd_service() {
+    if [ "$UPDATE_SERVICE_CHANGED" != "1" ]; then
+        return 0
+    fi
+    [ -n "$UPDATE_SERVICE_SNAPSHOT" ] && [ -f "$UPDATE_SERVICE_SNAPSHOT" ] || return 1
+    as_root cp -p -- "$UPDATE_SERVICE_SNAPSHOT" "${SERVICE_FILE}.restore"
+    as_root mv -f -- "${SERVICE_FILE}.restore" "$SERVICE_FILE"
+    as_root systemctl daemon-reload
+    UPDATE_SERVICE_CHANGED=0
 }
 
 ensure_no_manual_process() {
@@ -730,6 +936,9 @@ cleanup_update_transaction() {
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             fi
         fi
+        if ! restore_update_systemd_service; then
+            warn "systemd 服务文件恢复失败，请在重启前手动恢复: $SERVICE_FILE"
+        fi
         if is_systemd; then
             if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
                 as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -740,6 +949,8 @@ cleanup_update_transaction() {
         UPDATE_TRANSACTION=0
         UPDATE_BINARY_CHANGED=0
     fi
+    UPDATE_SERVICE_CHANGED=0
+    UPDATE_SERVICE_SNAPSHOT=""
     if [ -n "$UPDATE_TMP_DIR" ] && [ -d "$UPDATE_TMP_DIR" ] && [ "$UPDATE_TMP_DIR" != "/" ]; then
         if ! as_root rm -rf -- "$UPDATE_TMP_DIR"; then
             warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $UPDATE_TMP_DIR"
@@ -923,14 +1134,110 @@ find_domain_conflict() {
     return 1
 }
 
+canonical_nginx_redacted_log_format() {
+    printf '%s\n' "log_format meridian_redacted '\$remote_addr - \$remote_user [\$time_local] \"\$request_method \$meridian_log_path \$server_protocol\" \$status \$body_bytes_sent';"
+}
+
+validate_managed_nginx_redaction_components() {
+    local log_line
+    log_line=$(canonical_nginx_redacted_log_format)
+    # Nginx variables in the validator are literal, not Shell expressions.
+    # shellcheck disable=SC2016
+    LC_ALL=C as_root awk -v redaction_marker="$NGINX_REDACTION_MARKER" \
+        -v log_line="$log_line" '
+        function trim(value) {
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        function normalize(value) {
+            value=trim(value)
+            gsub(/[[:space:]]+/, " ", value)
+            return value
+        }
+        BEGIN {
+            access_line="access_log /var/log/nginx/meridian_access.log meridian_redacted;"
+        }
+        {
+            raw=$0
+            line=trim(raw)
+            normalized=normalize(raw)
+            if (index(raw, "$meridian_log_path") \
+                    || index(raw, "meridian_redacted") \
+                    || index(raw, "~^/_meridian/d/") \
+                    || index(raw, "/_meridian/d/[REDACTED]") \
+                    || line == redaction_marker) {
+                component_seen=1
+            }
+
+            if (map_state != 0) {
+                if (line == "" || line ~ /^#/) next
+                if (map_state == 1 && normalized == "default $uri;") {
+                    map_state=2
+                    next
+                }
+                if (map_state == 2 \
+                        && normalized == "~^/_meridian/d/ /_meridian/d/[REDACTED];") {
+                    map_state=3
+                    next
+                }
+                if (map_state == 3 && line == "}") {
+                    complete_maps++
+                    map_state=0
+                    next
+                }
+                invalid=1
+                next
+            }
+
+            if (normalized == "map $uri $meridian_log_path {") {
+                maps++
+                map_state=1
+                next
+            }
+            if (line == log_line) {
+                safe_logs++
+                next
+            }
+            if (line == access_line) next
+            if (line == redaction_marker) {
+                if (raw == redaction_marker) markers++
+                else invalid=1
+                next
+            }
+            if (index(raw, "$meridian_log_path") \
+                    || index(raw, "meridian_redacted") \
+                    || index(raw, "~^/_meridian/d/") \
+                    || index(raw, "/_meridian/d/[REDACTED]")) {
+                invalid=1
+            }
+        }
+        END {
+            if (!component_seen) exit 10
+            if (map_state != 0 || maps != 1 || complete_maps != 1 \
+                    || safe_logs != 1 || markers > 1 || invalid) exit 1
+            exit 0
+        }
+    ' "$NGINX_CONFIG" 2>/dev/null
+}
+
 write_panel_nginx_config() {
-    local domain="$1" port="$2" output="$3"
+    local domain="$1" port="$2" output="$3" log_line
+    log_line=$(canonical_nginx_redacted_log_format)
     cat > "$output" <<NGINXEOF
 ${NGINX_MARKER}
+${NGINX_REDACTION_MARKER}
 map \$http_upgrade \$meridian_connection_upgrade {
     default upgrade;
     '' close;
 }
+
+map \$uri \$meridian_log_path {
+    default \$uri;
+    ~^/_meridian/d/ /_meridian/d/[REDACTED];
+}
+
+${log_line}
 
 server {
     listen 80;
@@ -938,6 +1245,8 @@ server {
     server_name ${domain};
 
     client_max_body_size 1m;
+    large_client_header_buffers 4 32k;
+    access_log /var/log/nginx/meridian_access.log meridian_redacted;
 
     location / {
         proxy_pass http://127.0.0.1:${port};
@@ -956,6 +1265,157 @@ server {
     }
 }
 NGINXEOF
+}
+
+migrate_managed_nginx_redaction() {
+    local work_dir backup migrated log_line redaction_state insert_definitions=0 preserve_backup=0
+    log_line=$(canonical_nginx_redacted_log_format)
+    validate_nginx_config_path
+    as_root test -e "$NGINX_CONFIG" || return 0
+    if as_root test -L "$NGINX_CONFIG" \
+        || ! as_root grep -Fqx "$NGINX_MARKER" "$NGINX_CONFIG"; then
+        info "Nginx 配置不由 Meridian 安装器管理，已原样保留: $NGINX_CONFIG"
+        return 0
+    fi
+
+    # Only the installer-owned v1.7 panel template is eligible; the marker by
+    # itself is not permission to rewrite an unrelated file.
+    # shellcheck disable=SC2016
+    if { ! as_root grep -Fq 'map $http_upgrade $meridian_connection_upgrade {' "$NGINX_CONFIG" \
+            && ! as_root grep -Fq 'map $http_upgrade $connection_upgrade {' "$NGINX_CONFIG"; } \
+        || ! as_root grep -Fq 'proxy_pass http://127.0.0.1:' "$NGINX_CONFIG" \
+        || ! as_root grep -Fq 'proxy_set_header Host $host;' "$NGINX_CONFIG"; then
+        warn "Nginx 配置不匹配可识别的 Meridian v1.7 面板模板，已原样保留"
+        return 1
+    fi
+
+    # Existing redaction is trusted only when its active map has exactly the
+    # canonical ordered rules and its log_format is the exact safe definition.
+    # Status 10 means that this recognizable v1.7 file has no redaction state
+    # at all and is therefore eligible for a canonical one-time migration.
+    if validate_managed_nginx_redaction_components; then
+        :
+    else
+        redaction_state=$?
+        if [ "$redaction_state" -eq 10 ]; then
+            insert_definitions=1
+        else
+            warn "Nginx URI 脱敏日志定义不完整、冲突或不安全，已原样保留"
+            return 1
+        fi
+    fi
+
+    # shellcheck disable=SC2016
+    if as_root awk '
+        /^[[:space:]]*access_log[[:space:]]/ {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line != "access_log /var/log/nginx/meridian_access.log meridian_redacted;") found=1
+        }
+        END { exit !found }
+    ' "$NGINX_CONFIG"; then
+        warn "Nginx 配置含自定义 access_log，无法保证 URI 脱敏且不会覆盖，已原样保留"
+        return 1
+    fi
+
+    if as_root awk '
+        /^[[:space:]]*large_client_header_buffers[[:space:]]/ {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line != "large_client_header_buffers 4 32k;") found=1
+        }
+        END { exit !found }
+    ' "$NGINX_CONFIG"; then
+        warn "Nginx 配置含自定义 large_client_header_buffers，无法安全覆盖，已原样保留"
+        return 1
+    fi
+
+    work_dir=$(mktemp -d)
+    chmod 0700 "$work_dir"
+    backup="${work_dir}/nginx.before"
+    migrated="${work_dir}/nginx.migrated"
+    # log_line was also used for exact validation above; migration and trust
+    # therefore share a single canonical definition.
+    # shellcheck disable=SC2016
+    if ! as_root cp -p -- "$NGINX_CONFIG" "$backup" \
+        || ! LC_ALL=C as_root awk -v marker="$NGINX_MARKER" \
+            -v redaction_marker="$NGINX_REDACTION_MARKER" \
+            -v insert_definitions="$insert_definitions" -v log_line="$log_line" '
+            BEGIN {
+                access_line="access_log /var/log/nginx/meridian_access.log meridian_redacted;"
+                capability_line="large_client_header_buffers 4 32k;"
+            }
+            {
+                trimmed=$0
+                sub(/^[[:space:]]*/, "", trimmed)
+                sub(/[[:space:]]*$/, "", trimmed)
+                if (trimmed == access_line) next
+                if (trimmed == capability_line) next
+                if ($0 == redaction_marker) next
+
+                print
+                if ($0 == marker) {
+                    print redaction_marker
+                    if (insert_definitions == 1) {
+                        print "map $uri $meridian_log_path {"
+                        print "    default $uri;"
+                        print "    ~^/_meridian/d/ /_meridian/d/[REDACTED];"
+                        print "}"
+                        print ""
+                        print log_line
+                        print ""
+                    }
+                    saw_marker=1
+                }
+                if ($0 ~ /^[[:space:]]*server[[:space:]]*\{[[:space:]]*(#.*)?$/) {
+                    match($0, /^[[:space:]]*/)
+                    indent=substr($0, RSTART, RLENGTH) "    "
+                    print indent access_line
+                    print indent capability_line
+                    servers++
+                }
+            }
+            END { if (!saw_marker || servers == 0) exit 42 }
+        ' "$NGINX_CONFIG" > "$migrated"; then
+        as_root rm -rf -- "$work_dir"
+        warn "Nginx 配置不是可识别的 Meridian v1.7 面板模板，已原样保留"
+        return 1
+    fi
+
+    if as_root cmp -s -- "$NGINX_CONFIG" "$migrated"; then
+        as_root rm -rf -- "$work_dir"
+        return 0
+    fi
+    if ! as_root cp -p -- "$NGINX_CONFIG" "${NGINX_CONFIG}.new" \
+        || ! as_root cp -- "$migrated" "${NGINX_CONFIG}.new" \
+        || ! as_root mv -f -- "${NGINX_CONFIG}.new" "$NGINX_CONFIG"; then
+        as_root rm -f -- "${NGINX_CONFIG}.new"
+        as_root rm -rf -- "$work_dir"
+        warn "无法原子写入 Nginx URI 脱敏配置，原配置未修改"
+        return 1
+    fi
+
+    if ! nginx_test_and_reload; then
+        warn "Nginx 配置检查或重载失败，正在恢复原配置"
+        if ! as_root cp -p -- "$backup" "${NGINX_CONFIG}.restore" \
+            || ! as_root mv -f -- "${NGINX_CONFIG}.restore" "$NGINX_CONFIG"; then
+            warn "Nginx 原配置自动恢复失败，请立即从 $backup 手动恢复"
+            preserve_backup=1
+        else
+            nginx_test_and_reload >/dev/null 2>&1 \
+                || warn "Nginx 原配置已恢复，但自动重载失败"
+        fi
+        as_root rm -f -- "${NGINX_CONFIG}.new" "${NGINX_CONFIG}.restore"
+        if [ "$preserve_backup" = "0" ]; then
+            as_root rm -rf -- "$work_dir"
+        fi
+        return 1
+    fi
+
+    as_root rm -rf -- "$work_dir"
+    ok "已将安装器管理的 Nginx 配置迁移为 URI 脱敏日志格式"
 }
 
 snapshot_panel_state() {
@@ -1093,7 +1553,8 @@ configure_panel_domain() {
     else
         certbot_args+=(--register-unsafely-without-email)
     fi
-    if ! as_root certbot "${certbot_args[@]}" || ! nginx_test_and_reload; then
+    if ! as_root certbot "${certbot_args[@]}" || ! nginx_test_and_reload \
+        || ! migrate_managed_nginx_redaction; then
         warn "HTTPS 证书申请或 Nginx 重载失败，正在恢复原配置"
         rollback_panel_transaction
         return 1
@@ -1189,6 +1650,8 @@ apply_domain_choice() {
             fi
             ;;
         preserve)
+            migrate_managed_nginx_redaction \
+                || fail "Nginx URI 脱敏日志迁移失败；原配置已恢复"
             info "未指定域名操作，保留现有面板域名与证书配置"
             ;;
         *) fail "未知域名操作模式" ;;
@@ -1201,6 +1664,7 @@ do_install() {
     need_cmd curl
     need_cmd awk
     need_cmd grep
+    need_cmd cmp
     need_cmd install
     need_cmd mktemp
     need_cmd sed
@@ -1212,7 +1676,10 @@ do_install() {
     if [ -x "$current_binary" ]; then
         info "检测到已安装的 Meridian $(get_current_version)；install 不会执行更新"
         tmp_dir=$(mktemp -d)
-        prepare_data_and_config "$tmp_dir"
+        if ! prepare_data_and_config "$tmp_dir"; then
+            rm -rf -- "$tmp_dir"
+            return 1
+        fi
         rm -rf -- "$tmp_dir"
         if [ -n "$INITIAL_SETUP_TOKEN" ]; then
             printf "  ${YELLOW}初始化令牌（仅在尚未创建管理员时需要，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
@@ -1225,7 +1692,10 @@ do_install() {
     tmp_dir=$(mktemp -d)
     chmod 0700 "$tmp_dir"
     download_release_binary "$version" "$tmp_dir"
-    prepare_data_and_config "$tmp_dir"
+    if ! prepare_data_and_config "$tmp_dir"; then
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
     write_systemd_service "$tmp_dir"
     as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$INSTALL_DIR"
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
@@ -1260,13 +1730,24 @@ do_install() {
 do_update() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
     INITIAL_SETUP_TOKEN=""
+    UPDATE_SERVICE_SNAPSHOT=""
+    UPDATE_SERVICE_CHANGED=0
     [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
     need_cmd curl
     need_cmd tar
     need_cmd mktemp
+    need_cmd awk
+    need_cmd grep
+    need_cmd sed
+    need_cmd cmp
     init_privilege
     is_systemd && [ ! -f "$SERVICE_FILE" ] \
         && fail "找不到 Meridian systemd 服务，请重新运行 install 修复安装"
+    as_root test -L "$(env_file_path)" \
+        && fail "拒绝修改符号链接形式的配置文件: $(env_file_path)"
+    validate_existing_secret_configuration || return 1
+    migrate_managed_nginx_redaction \
+        || fail "Nginx URI 脱敏日志迁移失败；原配置已恢复"
     current_version=$(get_current_version)
     latest_version=$(resolve_latest_version)
     if [ "$current_version" = "$latest_version" ]; then
@@ -1308,7 +1789,10 @@ do_update() {
         fail "升级前数据快照失败，现有程序未被替换"
     fi
 
-    prepare_data_and_config "$tmp_dir"
+    prepare_data_and_config "$tmp_dir" || return 1
+    if is_systemd; then
+        migrate_update_systemd_service "$tmp_dir" || return 1
+    fi
 
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new"
     as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"
@@ -1325,6 +1809,7 @@ do_update() {
             if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
+            restore_update_systemd_service || fail "systemd 服务文件回滚失败，请手动恢复 ${UPDATE_SERVICE_SNAPSHOT:-原服务文件快照}"
             as_root systemctl restart "$SERVICE_NAME"
             wait_for_health 20 || fail "新版本与回滚版本均未通过健康检查"
             fail "新版本启动失败，已恢复上一版本及原数据配置"
@@ -1347,6 +1832,8 @@ do_update() {
 
     UPDATE_TRANSACTION=0
     UPDATE_BINARY_CHANGED=0
+    UPDATE_SERVICE_CHANGED=0
+    UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_TMP_DIR=""
     UPDATE_SNAPSHOT_DIR=""
     UPDATE_SNAPSHOT_RESTORED=0
@@ -1355,7 +1842,7 @@ do_update() {
     fi
     trap - EXIT INT TERM
     ok "已更新到最新版本: $latest_version"
-    info "现有 .env、面板域名、Nginx 配置和证书均已保留"
+    info "现有 .env、面板域名和证书均已保留；安装器管理的 Nginx 配置已按需完成 URI 日志脱敏迁移"
     if [ -n "$INITIAL_SETUP_TOKEN" ]; then
         printf "  ${YELLOW}初始化令牌（仅在尚未创建管理员时需要，请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
     fi

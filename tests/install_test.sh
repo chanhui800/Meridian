@@ -59,6 +59,15 @@ assert_not_contains() {
     fi
 }
 
+write_legacy_systemd_service() {
+    cat > "$SERVICE_FILE" <<'UNIT'
+[Unit]
+Description=Meridian test service
+[Service]
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UNIT
+}
+
 run_test_root_command() {
     local command_name="$1" arg
     shift
@@ -89,6 +98,12 @@ run_as_test_root() {
         sudo "$@"
     fi
 }
+
+# Dynamic self-target protection snapshots local interface addresses at startup.
+# Go uses a netlink route socket for that enumeration on Linux, so the hardened
+# service must permit AF_NETLINK in addition to its proxy socket families.
+assert_eq 'AF_UNIX AF_INET AF_INET6 AF_NETLINK' "$SYSTEMD_RESTRICT_ADDRESS_FAMILIES" \
+    'systemd address families support interface discovery'
 
 for valid in example.com panel.example.com xn--fsqu00a.xn--0zwm56d; do
     valid_domain "$valid" || { printf 'FAIL: valid domain rejected: %s\n' "$valid" >&2; exit 1; }
@@ -162,10 +177,199 @@ assert_contains "$generated_nginx" 'proxy_pass http://127.0.0.1:19090;'
 # shellcheck disable=SC2016
 assert_contains "$generated_nginx" 'proxy_set_header Upgrade $http_upgrade;'
 assert_contains "$generated_nginx" 'proxy_buffering off;'
+# shellcheck disable=SC2016
+assert_contains "$generated_nginx" 'map $uri $meridian_log_path {'
+assert_contains "$generated_nginx" '~^/_meridian/d/ /_meridian/d/[REDACTED];'
+# shellcheck disable=SC2016
+assert_contains "$generated_nginx" '"$request_method $meridian_log_path $server_protocol"'
+# shellcheck disable=SC2016
+assert_not_contains "$generated_nginx" '$request_uri'
+# shellcheck disable=SC2016
+assert_not_contains "$generated_nginx" '$http_referer'
 for forbidden in 50001 target_url playback '/emby' '/Items/' 'System/Info'; do
     assert_not_contains "$generated_nginx" "$forbidden"
 done
 
+
+write_legacy_managed_nginx() {
+    mkdir -p "$(dirname -- "$NGINX_CONFIG")"
+    printf '%s\n' "$NGINX_MARKER" > "$NGINX_CONFIG"
+    cat >> "$NGINX_CONFIG" <<'LEGACYNGINX'
+map $http_upgrade $meridian_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 443 ssl; # managed by Certbot
+    server_name panel.example.com;
+    ssl_certificate /etc/letsencrypt/live/panel.example.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/panel.example.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Strict-Transport-Security "max-age=63072000" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:9090;
+        proxy_set_header Host $host;
+    }
+}
+
+server {
+    if ($host = panel.example.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+    listen 80;
+    server_name panel.example.com;
+    return 404; # managed by Certbot
+}
+LEGACYNGINX
+}
+
+# A marker-owned v1.7/Certbot configuration is migrated in place. TLS and
+# arbitrary Certbot-owned directives survive, every server gets the redacted
+# access log, and running maintenance again is byte-for-byte idempotent.
+nginx_migration_log="${TEST_ROOT}/nginx-migration-validation.log"
+: > "$nginx_migration_log"
+write_legacy_managed_nginx
+if ! (
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() { printf 'validate\n' >> "$nginx_migration_log"; }
+    migrate_managed_nginx_redaction
+); then
+    echo 'FAIL: managed v1.7 Nginx migration failed' >&2
+    exit 1
+fi
+assert_contains "$NGINX_CONFIG" "$NGINX_REDACTION_MARKER"
+# The dollar signs below are literal Nginx syntax.
+# shellcheck disable=SC2016
+assert_contains "$NGINX_CONFIG" 'map $uri $meridian_log_path {'
+assert_contains "$NGINX_CONFIG" '~^/_meridian/d/ /_meridian/d/[REDACTED];'
+# shellcheck disable=SC2016
+assert_contains "$NGINX_CONFIG" '"$request_method $meridian_log_path $server_protocol"'
+assert_contains "$NGINX_CONFIG" 'large_client_header_buffers 4 32k;'
+assert_eq '2' "$(grep -Fc 'access_log /var/log/nginx/meridian_access.log meridian_redacted;' "$NGINX_CONFIG")" \
+    'redacted access log count'
+assert_contains "$NGINX_CONFIG" 'ssl_certificate /etc/letsencrypt/live/panel.example.com/fullchain.pem; # managed by Certbot'
+assert_contains "$NGINX_CONFIG" 'ssl_certificate_key /etc/letsencrypt/live/panel.example.com/privkey.pem; # managed by Certbot'
+assert_contains "$NGINX_CONFIG" 'include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot'
+assert_contains "$NGINX_CONFIG" 'ssl_protocols TLSv1.2 TLSv1.3;'
+assert_contains "$NGINX_CONFIG" 'add_header Strict-Transport-Security "max-age=63072000" always;'
+assert_eq '1' "$(grep -c '^validate$' "$nginx_migration_log")" 'migration validation count'
+migrated_nginx_hash=$(sha256_file "$NGINX_CONFIG")
+(
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() { printf 'validate\n' >> "$nginx_migration_log"; }
+    migrate_managed_nginx_redaction
+)
+assert_eq "$migrated_nginx_hash" "$(sha256_file "$NGINX_CONFIG")" 'idempotent Nginx migration'
+assert_eq '1' "$(grep -c '^validate$' "$nginx_migration_log")" 'idempotent migration skips reload'
+
+# Complete-looking redaction components are still rejected before any rewrite
+# or reload unless the map is semantically canonical and the log_format is the
+# exact safe definition. These fixtures all satisfied the former substring
+# component counter.
+canonical_redacted_nginx="${TEST_ROOT}/nginx-redaction-canonical.conf"
+cp "$NGINX_CONFIG" "$canonical_redacted_nginx"
+
+assert_nginx_migration_rejected_unchanged() {
+    local label="$1"
+    local expected="${TEST_ROOT}/nginx-${label}.expected"
+    local reload_log="${TEST_ROOT}/nginx-${label}.reload"
+    cp "$NGINX_CONFIG" "$expected"
+    : > "$reload_log"
+    if (
+        as_root() { run_test_root_command "$@"; }
+        nginx_test_and_reload() { printf 'unexpected\n' >> "$reload_log"; }
+        migrate_managed_nginx_redaction
+    ); then
+        printf 'FAIL: unsafe Nginx redaction fixture was accepted: %s\n' "$label" >&2
+        exit 1
+    fi
+    cmp -s "$NGINX_CONFIG" "$expected" \
+        || { printf 'FAIL: rejected Nginx fixture changed bytes: %s\n' "$label" >&2; exit 1; }
+    [ ! -s "$reload_log" ] \
+        || { printf 'FAIL: rejected Nginx fixture triggered reload: %s\n' "$label" >&2; exit 1; }
+    if [ -e "${NGINX_CONFIG}.new" ] || [ -e "${NGINX_CONFIG}.restore" ]; then
+        printf 'FAIL: rejected Nginx fixture left staging files: %s\n' "$label" >&2
+        exit 1
+    fi
+}
+
+unsafe_log_format="log_format meridian_redacted '\$remote_addr \"\$request_uri\"';"
+awk -v unsafe="$unsafe_log_format" '
+    /^log_format meridian_redacted / { print unsafe; next }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged unsafe-request-uri-log
+
+# shellcheck disable=SC2016
+awk '
+    $0 == "    ~^/_meridian/d/ /_meridian/d/[REDACTED];" {
+        print "    ~^/_meridian/d/ $uri;"
+    }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged unsafe-earlier-map-rule
+
+cat "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+cat >> "$NGINX_CONFIG" <<'AMBIGUOUSMAP'
+
+map $request_uri $meridian_log_path {
+    default $request_uri;
+}
+AMBIGUOUSMAP
+assert_nginx_migration_rejected_unchanged extra-same-name-map
+
+# shellcheck disable=SC2016
+awk '
+    $0 == "    default $uri;" { next }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged incomplete-map
+
+# Validation/reload failure restores the exact original bytes and validates the
+# restored configuration once; no partly migrated file is left behind.
+write_legacy_managed_nginx
+cp "$NGINX_CONFIG" "${TEST_ROOT}/nginx-migration.expected"
+nginx_failure_attempt="${TEST_ROOT}/nginx-failure-attempt"
+printf '0\n' > "$nginx_failure_attempt"
+if (
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() {
+        local attempt
+        attempt=$(cat "$nginx_failure_attempt")
+        attempt=$((attempt + 1))
+        printf '%s\n' "$attempt" > "$nginx_failure_attempt"
+        [ "$attempt" -ne 1 ]
+    }
+    migrate_managed_nginx_redaction
+); then
+    echo 'FAIL: Nginx validation failure unexpectedly succeeded' >&2
+    exit 1
+fi
+cmp -s "$NGINX_CONFIG" "${TEST_ROOT}/nginx-migration.expected" \
+    || { echo 'FAIL: Nginx migration rollback was not byte-exact' >&2; exit 1; }
+assert_eq '2' "$(cat "$nginx_failure_attempt")" 'failed migration rollback validation count'
+if [ -e "${NGINX_CONFIG}.new" ] || [ -e "${NGINX_CONFIG}.restore" ]; then
+    echo 'FAIL: failed Nginx migration left staging files' >&2
+    exit 1
+fi
+
+# An unowned target is never rewritten or passed to the Nginx reload path.
+printf 'server { listen 443 ssl; server_name unrelated.example.com; }\n' > "$NGINX_CONFIG"
+cp "$NGINX_CONFIG" "${TEST_ROOT}/nginx-unowned.expected"
+: > "$nginx_migration_log"
+(
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() { printf 'unexpected\n' >> "$nginx_migration_log"; }
+    migrate_managed_nginx_redaction
+)
+cmp -s "$NGINX_CONFIG" "${TEST_ROOT}/nginx-unowned.expected" \
+    || { echo 'FAIL: unowned Nginx config was modified by migration' >&2; exit 1; }
+[ ! -s "$nginx_migration_log" ] \
+    || { echo 'FAIL: unowned Nginx config triggered validation/reload' >&2; exit 1; }
 conflict_file="${NGINX_ROOT}/sites-enabled/existing-panel"
 mkdir -p "$(dirname -- "$conflict_file")"
 printf 'server { server_name panel.example.com; }\n' > "$conflict_file"
@@ -288,8 +492,41 @@ BINARY
     chmod 0755 "${TEST_ROOT}/release-binary"
     cp "${TEST_ROOT}/release-binary" "$output"
 }
+
+# v1.8 needs AF_NETLINK to enumerate local interfaces for self-target
+# protection. Update the installer-managed v1.7 unit transactionally without
+# enabling a previously disabled service, and restore it byte-for-byte on rollback.
+systemd_migration_tmp=$(mktemp -d "${TEST_ROOT}/systemd-migration.XXXXXX")
+systemd_calls="${TEST_ROOT}/systemd-migration.calls"
+write_legacy_systemd_service
+cp "$SERVICE_FILE" "${TEST_ROOT}/legacy-systemd.before"
+(
+    as_root() { "$@"; }
+    is_systemd() { return 0; }
+    systemctl() { printf '%s\n' "$*" >> "$systemd_calls"; }
+    migrate_update_systemd_service "$systemd_migration_tmp"
+    assert_contains "$SERVICE_FILE" 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK'
+    if grep -Fq 'enable' "$systemd_calls"; then
+        echo 'FAIL: update systemd migration changed enablement state' >&2
+        exit 1
+    fi
+    restore_update_systemd_service
+)
+cmp -s "$SERVICE_FILE" "${TEST_ROOT}/legacy-systemd.before" \
+    || { echo 'FAIL: systemd rollback did not restore exact prior unit' >&2; exit 1; }
+(
+    as_root() { "$@"; }
+    is_systemd() { return 0; }
+    systemctl() { return 0; }
+    migrate_update_systemd_service "$systemd_migration_tmp"
+)
+assert_contains "$SERVICE_FILE" 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK'
+rm -rf -- "$systemd_migration_tmp"
+
 is_systemd() { return 1; }
 service_is_active() { return 1; }
+update_nginx_validation_log="${TEST_ROOT}/update-nginx-validation.log"
+nginx_test_and_reload() { printf 'validate\n' >> "$update_nginx_validation_log"; }
 DOMAIN_MODE='ask'
 REQUESTED_DOMAIN=''
 CERTBOT_EMAIL=''
@@ -307,6 +544,24 @@ if [ "${#upstream_header_key}" -lt 32 ]; then
     echo 'FAIL: fresh install must generate UPSTREAM_HEADER_KEY' >&2
     exit 1
 fi
+jwt_secret=$(read_env_value JWT_SECRET)
+dynamic_route_key=$(read_env_value DYNAMIC_ROUTE_KEY)
+if [ "${#jwt_secret}" -lt 32 ] || [ "${#dynamic_route_key}" -lt 32 ]; then
+    echo 'FAIL: fresh install must generate JWT_SECRET and DYNAMIC_ROUTE_KEY' >&2
+    exit 1
+fi
+if [ "$jwt_secret" = "$upstream_header_key" ] \
+    || [ "$jwt_secret" = "$dynamic_route_key" ] \
+    || [ "$upstream_header_key" = "$dynamic_route_key" ]; then
+    echo 'FAIL: fresh install reused a long-term secret' >&2
+    exit 1
+fi
+for hidden_secret in "$jwt_secret" "$upstream_header_key" "$dynamic_route_key"; do
+    if grep -Fq -- "$hidden_secret" "${TEST_ROOT}/install-first.log"; then
+        echo 'FAIL: fresh install printed a long-term secret' >&2
+        exit 1
+    fi
+done
 
 # Existing valid encryption keys are immutable; an explicitly empty legacy key
 # is repaired, while ambiguous or weak non-empty values fail without rewriting
@@ -347,6 +602,19 @@ awk -F= -v key="$repaired_key" '
 ' "${DATA_DIR}/.env" > "${key_test_tmp}/restored.env"
 mv "${key_test_tmp}/restored.env" "${DATA_DIR}/.env"
 
+# prepare_data_and_config is called from if/|| contexts where Bash suppresses
+# implicit errexit inside the function; every required key step must therefore
+# propagate failure explicitly instead of falling through to a later success.
+prepare_failure_hash=$(sha256_file "${DATA_DIR}/.env")
+if (
+    ensure_dynamic_route_key() { return 1; }
+    prepare_data_and_config "$key_test_tmp"
+) >"${TEST_ROOT}/prepare-key-failure.log" 2>&1; then
+    echo 'FAIL: prepare_data_and_config swallowed DYNAMIC_ROUTE_KEY failure' >&2
+    exit 1
+fi
+assert_eq "$prepare_failure_hash" "$(sha256_file "${DATA_DIR}/.env")" 'failed config preparation preserves .env'
+
 MOCK_LATEST='v9.9.10'
 DOMAIN_MODE='ask'
 if ! (do_install) >"${TEST_ROOT}/install-existing.log" 2>&1; then
@@ -355,6 +623,8 @@ if ! (do_install) >"${TEST_ROOT}/install-existing.log" 2>&1; then
 fi
 assert_eq 'v9.9.9' "$(get_current_version)" 'install must not update existing installation'
 
+write_legacy_managed_nginx
+: > "$update_nginx_validation_log"
 domain_env_before=$(sha256_file "${DATA_DIR}/.env")
 if ! (do_update) >"${TEST_ROOT}/update.log" 2>&1; then
     cat "${TEST_ROOT}/update.log" >&2
@@ -364,6 +634,11 @@ assert_eq 'v9.9.10' "$(get_current_version)" 'updated latest version'
 assert_eq 'v9.9.9' "$($PREVIOUS_BIN --version)" 'retained previous version'
 assert_eq "$domain_env_before" "$(sha256_file "${DATA_DIR}/.env")" 'update preserves .env'
 assert_dir "$BACKUP_DIR"
+assert_contains "$NGINX_CONFIG" "$NGINX_REDACTION_MARKER"
+assert_contains "$NGINX_CONFIG" 'ssl_protocols TLSv1.2 TLSv1.3;'
+assert_eq '2' "$(grep -Fc 'access_log /var/log/nginx/meridian_access.log meridian_redacted;' "$NGINX_CONFIG")" \
+    'update migration redacted access log count'
+assert_eq '1' "$(grep -c '^validate$' "$update_nginx_validation_log")" 'update migration validation count'
 
 backup_count_before=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 if ! (do_update) >"${TEST_ROOT}/update-current.log" 2>&1; then
@@ -372,6 +647,7 @@ if ! (do_update) >"${TEST_ROOT}/update-current.log" 2>&1; then
 fi
 backup_count_after=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 assert_eq "$backup_count_before" "$backup_count_after" 'latest update is a no-op'
+assert_eq '1' "$(grep -c '^validate$' "$update_nginx_validation_log")" 'current update keeps migration idempotent'
 
 # Older uninitialized installations did not have SETUP_TOKEN in .env. Updating
 # one must backfill a fresh token and tell the operator that it is required.
@@ -402,7 +678,8 @@ printf 'JWT_SECRET=rollback-jwt-secret-00000000000000000000000000\nPORT=9090\nDB
 printf 'pre-update-db-state\n' > "${DATA_DIR}/meridian.db"
 cp "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before"
 cp "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before"
-touch "$SERVICE_FILE"
+write_legacy_systemd_service
+cp "$SERVICE_FILE" "${TEST_ROOT}/rollback-service-before"
 # MOCK_DB_PATH must reach the mock binaries inside every subshell. Exporting
 # it once at top level (instead of inside each subshell) keeps the assignment
 # in the parent scope (SC2030/SC2031) and is inherited by all subshells.
@@ -450,6 +727,8 @@ run_as_test_root cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-befo
 run_as_test_root cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before" \
     || { echo 'FAIL: configuration was not restored after failed update' >&2; exit 1; }
 assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
+cmp -s "$SERVICE_FILE" "${TEST_ROOT}/rollback-service-before" \
+    || { echo 'FAIL: systemd unit was not restored after failed update' >&2; exit 1; }
 
 # A missing snapshot must fail the restore without touching the live data.
 # DATA_DIR is still service-user-owned (0750) after the systemd rollback
@@ -730,7 +1009,7 @@ printf 'JWT_SECRET=retry-jwt-secret-0000000000000000000000000000\nPORT=9090\nDB_
 printf 'pre-update-db-state\n' > "${DATA_DIR}/meridian.db"
 cp "${DATA_DIR}/.env" "${TEST_ROOT}/restore-retry-env-before"
 cp "${DATA_DIR}/meridian.db" "${TEST_ROOT}/restore-retry-db-before"
-touch "$SERVICE_FILE"
+write_legacy_systemd_service
 restore_attempt_file="${TEST_ROOT}/restore-attempts"
 printf '0\n' > "$restore_attempt_file"
 retry_failing_binary="${TEST_ROOT}/retry-failing-meridian"

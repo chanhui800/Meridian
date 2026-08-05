@@ -73,6 +73,15 @@ const API = {
   // UA Profiles
   getProfiles() { return this.request('GET', '/api/ua-profiles'); },
 
+  // Dynamic discovery
+  getDynamicProfiles() { return this.request('GET', '/api/dynamic-profiles'); },
+  getDynamicObservations(siteId) {
+    return this.request('GET', '/api/sites/' + encodeURIComponent(siteId) + '/dynamic-observations');
+  },
+  deleteDynamicObservations(siteId) {
+    return this.request('DELETE', '/api/sites/' + encodeURIComponent(siteId) + '/dynamic-observations');
+  },
+
   async logout() {
     this.clearSession();
     try {

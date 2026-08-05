@@ -1064,7 +1064,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.7.0", "/js/pages/sites.js?v=1.7.0", "/js/app.js?v=1.7.0"} {
+	for _, asset := range []string{"/css/style.css?v=1.8.0", "/js/pages/sites.js?v=1.8.0", "/js/app.js?v=1.8.0"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -2175,7 +2175,7 @@ func TestApplyCustomUAProfileHeadersSafelyRewritesOnlyValidEmbyValues(t *testing
 	}
 }
 
-func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T) {
+func TestCustomUAProfileAppliesAcrossHTTPWebSocketAndStripsRedirectIdentity(t *testing.T) {
 	policy := UAHeaderPolicy{Rewrite: true, Profile: UAProfile{
 		Name:      "Custom",
 		UserAgent: "Meridian Test/1.0",
@@ -2257,7 +2257,12 @@ func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T
 		if calls != 2 {
 			t.Fatalf("calls = %d, want 2", calls)
 		}
-		assertIdentity(t, followedHeaders)
+		if got := followedHeaders.Get("User-Agent"); got != policy.Profile.UserAgent {
+			t.Fatalf("redirect User-Agent = %q, want %q", got, policy.Profile.UserAgent)
+		}
+		if got := followedHeaders.Get("X-Emby-Authorization"); got != "" {
+			t.Fatalf("cross-authority redirect retained Emby identity: %q", got)
+		}
 	})
 }
 
@@ -2319,15 +2324,8 @@ func TestRedirectFollowStripsSensitiveHeadersCrossOrigin(t *testing.T) {
 	if got := followedHeaders.Get("X-MediaBrowser-Token"); got != "" {
 		t.Fatalf("X-MediaBrowser-Token forwarded across origin: %q", got)
 	}
-	emby := followedHeaders.Get("X-Emby-Authorization")
-	if strings.Contains(emby, "emby-access-token") {
-		t.Fatalf("Emby access token forwarded across origin: %q", emby)
-	}
-	if strings.Contains(strings.ToLower(emby), "token=") {
-		t.Fatalf("Token attribute survives cross-origin hop: %q", emby)
-	}
-	if emby != `MediaBrowser Device="TV", DeviceId="device-1", Client="Meridian Test", Version="1.0.0"` {
-		t.Fatalf("identity fields altered: %q", emby)
+	if got := followedHeaders.Get("X-Emby-Authorization"); got != "" {
+		t.Fatalf("X-Emby-Authorization forwarded across origin: %q", got)
 	}
 	if got := followedHeaders.Get("User-Agent"); got != profile.UserAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
@@ -2619,7 +2617,7 @@ func TestRedirectFollowDropsUnsafeEmbyAuthorizationCrossOrigin(t *testing.T) {
 	}
 }
 
-func TestRedirectFollowPassthroughCrossOriginPreservesIdentityStripsSecrets(t *testing.T) {
+func TestRedirectFollowPassthroughCrossOriginStripsIdentityAndSecrets(t *testing.T) {
 	target, err := normalizeTargetURL("https://media.example.com")
 	if err != nil {
 		t.Fatalf("normalize target: %v", err)
@@ -2672,17 +2670,10 @@ func TestRedirectFollowPassthroughCrossOriginPreservesIdentityStripsSecrets(t *t
 	if got := followedHeaders.Get("X-Emby-Token"); got != "" {
 		t.Fatalf("X-Emby-Token forwarded across origin: %q", got)
 	}
-	emby := followedHeaders.Get("X-Emby-Authorization")
-	if strings.Contains(emby, "emby-access-token") {
-		t.Fatalf("Emby access token forwarded across origin: %q", emby)
+	if got := followedHeaders.Get("X-Emby-Authorization"); got != "" {
+		t.Fatalf("X-Emby-Authorization forwarded across origin: %q", got)
 	}
-	if strings.Contains(strings.ToLower(emby), "token=") {
-		t.Fatalf("Token attribute survives cross-origin hop: %q", emby)
-	}
-	if emby != `MediaBrowser Client="Client", Device="TV", DeviceId="d1", Version="1"` {
-		t.Fatalf("identity fields altered: %q", emby)
-	}
-	// Passthrough keeps the client's own non-secret identity and UA.
+	// Passthrough preserves only the non-secret User-Agent across authorities.
 	if got := followedHeaders.Get("User-Agent"); got != "ClientUA/9.9" {
 		t.Fatalf("User-Agent = %q, want the client value preserved", got)
 	}
@@ -3025,7 +3016,7 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	}
 	defer occupied.Close()
 
-	body := strings.NewReader(`{"name":"stable","listen_port":` + jsonNumber(conflictPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	body := strings.NewReader(`{"name":"stable","listen_port":` + jsonNumber(conflictPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse","dynamic_profile":"compatible","dynamic_domain_rules":[{"type":"exact","value":"8.8.8.8"}],"dynamic_allow_https_downgrade":true}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
 	rr := httptest.NewRecorder()
 
@@ -3040,6 +3031,9 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	}
 	if reloaded.ListenPort != initialPort {
 		t.Fatalf("listen_port = %d, want %d", reloaded.ListenPort, initialPort)
+	}
+	if reloaded.DynamicDiscoveryEnabled != site.DynamicDiscoveryEnabled || reloaded.DynamicProfile != site.DynamicProfile || reloaded.StoredDynamicDomainRules != site.StoredDynamicDomainRules || reloaded.DynamicAllowHTTPSDowngrade != site.DynamicAllowHTTPSDowngrade || reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
+		t.Fatalf("rolled-back dynamic policy = %#v, want original %#v", reloaded, site)
 	}
 	if !app.pm.IsRunning(site.ID) {
 		t.Fatalf("expected original site to keep running")
@@ -4259,6 +4253,10 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
 		"updated_at": true, "running": true,
+		"dynamic_discovery_enabled": true, "dynamic_profile": true,
+		"dynamic_discovery_sources": true,
+		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
+		"dynamic_policy_revision": true,
 	}
 	if len(raw) != 2 {
 		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())
@@ -5708,7 +5706,7 @@ func TestPublicHostRouterRejectsUnknownHostsWhenPanelDomainConfigured(t *testing
 	}
 }
 
-func TestReservedDynamicRouteReturnsGoneWithoutProxying(t *testing.T) {
+func TestReservedDynamicRouteReturnsNotFoundWithoutProxying(t *testing.T) {
 	app := newTestApp(t)
 	var upstreamCalls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -5729,8 +5727,8 @@ func TestReservedDynamicRouteReturnsGoneWithoutProxying(t *testing.T) {
 	for _, requestPath := range []string{"/_meridian/d", "/_meridian/d/stale-token"} {
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, requestPath, nil))
-		if rr.Code != http.StatusGone {
-			t.Fatalf("reserved path %s status=%d, want 410", requestPath, rr.Code)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("reserved path %s status=%d, want 404", requestPath, rr.Code)
 		}
 	}
 	if got := upstreamCalls.Load(); got != 0 {

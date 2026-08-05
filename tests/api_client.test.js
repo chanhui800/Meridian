@@ -68,3 +68,43 @@ test('401 on the login endpoint is an ordinary failure the caller can report', a
   );
   assert.equal(reloads, 0, 'a failed login must not reload the page');
 });
+
+test('dynamic discovery API calls use the exact authenticated paths and verbs', async () => {
+  const sandbox = loadAPIClient();
+  const requests = [];
+  sandbox.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      status: 200,
+      ok: true,
+      json: async () => ({ observations: [], dropped_observations: 0 }),
+    };
+  };
+
+  await vm.runInContext('API.getDynamicProfiles()', sandbox);
+  await vm.runInContext('API.getDynamicObservations("site/42 ?")', sandbox);
+  await vm.runInContext('API.deleteDynamicObservations("site/42 ?")', sandbox);
+
+  assert.deepEqual(requests.map(request => [request.options.method, request.url]), [
+    ['GET', '/api/dynamic-profiles'],
+    ['GET', '/api/sites/site%2F42%20%3F/dynamic-observations'],
+    ['DELETE', '/api/sites/site%2F42%20%3F/dynamic-observations'],
+  ]);
+  for (const request of requests) {
+    assert.equal(request.options.credentials, 'same-origin');
+    assert.equal(request.options.body, undefined, 'read/clear calls must not send a request body');
+    assert.equal(Object.keys(request.options.headers).length, 0);
+  }
+});
+
+test('mobile credential inputs disable keyboard text transformations', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'index.html'), 'utf8');
+
+  for (const id of ['inp-username', 'inp-password', 'inp-setup-token']) {
+    const input = html.match(new RegExp(`<input\\b(?=[^>]*\\bid="${id}")[^>]*>`));
+    assert.ok(input, `missing ${id} input`);
+    assert.match(input[0], /\bautocapitalize="none"/);
+    assert.match(input[0], /\bautocorrect="off"/);
+    assert.match(input[0], /\bspellcheck="false"/);
+  }
+});

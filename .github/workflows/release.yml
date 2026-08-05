@@ -47,7 +47,9 @@ jobs:
           bash -n install.sh
           bash -n tests/install_test.sh
           bash -n tests/upstream_header_key_test.sh
-          shellcheck install.sh tests/install_test.sh tests/upstream_header_key_test.sh
+          bash -n tests/dynamic_route_key_test.sh
+          shellcheck install.sh tests/install_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
+          bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
 

@@ -212,7 +212,7 @@ func TestSecurityRegressionLoopbackHealthExceptionRejectsForwardedRequests(t *te
 	}
 }
 
-func TestSecurityRegressionReservedDynamicRouteIsGoneAndNotCacheable(t *testing.T) {
+func TestSecurityRegressionReservedDynamicRouteIsNotFoundAndNotCacheable(t *testing.T) {
 	app := newTestApp(t)
 	var upstreamCalls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -249,8 +249,8 @@ func TestSecurityRegressionReservedDynamicRouteIsGoneAndNotCacheable(t *testing.
 	}
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/_meridian/d/stale-token", nil))
-	if rr.Code != http.StatusGone {
-		t.Fatalf("reserved route status=%d, want 410", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("reserved route status=%d, want 404", rr.Code)
 	}
 	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("reserved route Cache-Control=%q, want no-store", got)
