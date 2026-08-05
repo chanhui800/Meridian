@@ -70,6 +70,17 @@ const API = {
   // Live-merged traffic page payload: { snapshot: SiteTraffic, logs: TrafficLog[] }.
   getTrafficSnapshot(siteId, hours) { return this.request('GET', '/api/traffic/' + siteId + '/snapshot?hours=' + (hours || 24)); },
 
+  // Request logs
+  getRequestLogs(filters) {
+    const params = new URLSearchParams();
+    Object.entries(filters || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+    });
+    const query = params.toString();
+    return this.request('GET', '/api/request-logs' + (query ? '?' + query : ''));
+  },
+  clearRequestLogs() { return this.request('DELETE', '/api/request-logs'); },
+
   // UA Profiles
   getProfiles() { return this.request('GET', '/api/ua-profiles'); },
 

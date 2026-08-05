@@ -41,6 +41,7 @@ Meridian 把这些事情打包成一个单二进制程序，带管理界面，�
 | **UA 伪装** | 预设（Infuse / Web / 客户端）、自定义固定身份或透传保留客户端身份；HTTP、WebSocket 与受限播放重定向统一改写或透传 |
 | **加密上游请求头** | 为主回源添加固定自定义 Header；值加密存储、只写不回显，且不会转发到独立播放/CDN 域名 |
 | **流量管控** | 按站点统计流量、设置限速、设置配额 |
+| **请求日志** | 按日期、资源类别、状态码、节点、客户端 IP、UA 与无查询参数路径筛选请求记录；支持刷新和清空 |
 | **WebSocket 代理** | 完整支持 Emby 的 WebSocket 通信 |
 | **SSE 实时推送** | 仪表盘数据通过 Server-Sent Events 实时更新 |
 | **故障诊断** | 回源健康检测、上游 TLS 证书检查、请求头预览 |
@@ -320,7 +321,7 @@ Meridian/
 
 **Header、正文与失败边界。** 普通跨 authority 请求只重建 `Accept`、`Accept-Encoding`、`Range`、`If-Range` 和固定 Meridian UA；Extreme 在确实重放请求体时可再携带 Content-Type/Encoding/Language/MD5/Digest。Cookie、Authorization、Emby token Header、固定上游 Header、转发头、hop-by-hop 和任意其他自定义 Header 不会跨域。PlaybackInfo RequiredHttpHeaders 是独立的 AEAD 精确-target 绑定，不会并入 redirect Header 或传播到不同 authority。动态响应只保留 Content/Range 白名单，强制 `private, no-store`、`no-referrer`、`nosniff`，删除 `Set-Cookie` 与 trailer。被改写的 JSON/manifest 会删除失效的压缩、长度、Range 和 validator Header；解析失败返回清洗后的 502，绝不部分改写或原文回退。上游 manifest 的 4xx/5xx 保留原状态码，但正文会替换为固定 manifest 错误对象；动态 resource/redirect 的上游错误正文也会替换为固定动态错误对象，所有路径都只保留经过界限验证的 `Retry-After`。二进制 resource 是否与 manifest 混淆按 capability 的认证 resource kind 与正向结构化 Content-Type 判断；key/segment 即使使用 `.m3u8`/`.mpd` 后缀和 `application/octet-stream` 也不会被误当成 manifest，真正的 HLS/DASH MIME 或 active content 仍失败关闭。私网目标、自定义 CA 和 raw fallback 仍明确不可用。
 
-**观察与日志。** 观察记录只聚合站点、规范化 `scheme://host:port`、来源（redirect/playback_info/hls/dash）、允许/拒绝、有限原因、时间和次数，不保存 path、query、capability、DNS 回答、Header 或正文。除通用 DNS/TLS/capacity 代码外，协议边界会区分 `request_unclassified`、`structured_body_limit`、`playback_info_denied`、`hls_feature_denied`、`dash_feature_denied` 和 `redirect_body_replay_denied`，便于确认实际卡在请求分类、正文预算、具体 parser 还是 body replay。写入使用 2,048 项有界异步队列，失败只增加 dropped 计数；记录保留 30 天且全库最多 10,000 行。Meridian 的错误日志只输出有限原因代码，不输出目标。官方 Nginx 配置把 capability 路径记为 `/_meridian/d/[REDACTED]`，但第三方 CDN、负载均衡器或既有代理必须另行配置同等脱敏、最短保留期和访问控制。
+**观察与日志。** 自动发现观察记录只聚合站点、规范化 `scheme://host:port`、来源（redirect/playback_info/hls/dash）、允许/拒绝、有限原因、时间和次数，不保存 path、query、capability、DNS 回答、Header 或正文。除通用 DNS/TLS/capacity 代码外，协议边界会区分 `request_unclassified`、`structured_body_limit`、`playback_info_denied`、`hls_feature_denied`、`dash_feature_denied` 和 `redirect_body_replay_denied`，便于确认实际卡在请求分类、正文预算、具体 parser 还是 body replay。观察记录使用 2,048 项有界异步队列，保留 30 天且全库最多 10,000 行。管理页面的请求日志另外保存站点、资源类别、状态码、可信客户端 IP、经清洗的 UA、方法和不含 query 的路径，使用总容量 6,144 的共享有界遥测队列，保留 30 天且全库最多 20,000 行；不保存 Cookie、令牌、请求/响应 Header 或正文。队列繁忙或可选写入失败只增加 dropped 计数，不阻塞媒体请求。Meridian 的错误日志只输出有限原因代码，不输出动态目标。官方 Nginx 配置把 capability 路径记为 `/_meridian/d/[REDACTED]`，但第三方 CDN、负载均衡器或既有代理必须另行配置同等脱敏、最短保留期和访问控制。
 
 ### 共享域名入口
 

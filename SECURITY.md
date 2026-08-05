@@ -61,7 +61,7 @@
 - Meridian 管理会话 Cookie 会在所有站点 HTTP 与 WebSocket 请求出站前单独剥离，其他上游业务 Cookie 保留；畸形 Cookie Header 按失败关闭策略整头删除
 - 上游 HTTP 响应和 WebSocket 101 中名称精确为 `meridian_session` 的 `Set-Cookie` 会被删除，合法的 Emby/业务 Cookie 原样保留；无法安全解析的单条 `Set-Cookie` 按失败关闭策略丢弃
 - 直连客户端提供的转发头会全部重建；只有 peer 命中 `TRUSTED_PROXY_CIDRS` 时才采纳单一、合法的 `X-Real-IP` 与 `http`/`https` 协议值，不会把任意 `X-Forwarded-For` 链传给上游
-- 运行日志只保留上游的 scheme、主机和端口，不记录路径、查询参数或 URL 凭据
+- 进程运行日志只保留上游的 scheme、主机和端口，不记录路径、查询参数或 URL 凭据。管理页面的请求日志会保存站点、资源类别、状态码、可信客户端 IP、清洗后的 UA、方法和不含 query 的路径；不保存 Cookie、令牌、任意 Header 或正文，保留 30 天且全库最多 20,000 条
 
 ### 自动播放后端发现
 

@@ -186,6 +186,7 @@
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
       Router.register('traffic', renderTraffic);
+      Router.register('request-logs', renderRequestLogs);
       if (typeof renderDiag === 'function') {
         Router.register('diagnostics', renderDiag);
       } else {
