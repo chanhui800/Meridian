@@ -1267,6 +1267,14 @@ const (
 	dynamicObservationReasonDASHFeatureDenied        = "dash_feature_denied"
 	dynamicObservationReasonRedirectBodyReplayDenied = "redirect_body_replay_denied"
 	dynamicObservationMaxAuthorityBytes              = 512
+	requestLogQueueCapacity                          = 4096
+	requestLogBatchSize                              = 128
+	requestLogGlobalRowLimit                         = 20000
+	requestLogRetention                              = 30 * 24 * time.Hour
+	requestLogMaxSiteNameBytes                       = 100
+	requestLogMaxClientIPBytes                       = 64
+	requestLogMaxUserAgentBytes                      = 512
+	requestLogMaxPathBytes                           = 1024
 )
 
 var errDynamicObservationWriterClosed = errors.New("dynamic observation writer is closed")
@@ -1298,6 +1306,63 @@ type DynamicObservation struct {
 type DynamicObservationsResponse struct {
 	Observations        []DynamicObservation `json:"observations"`
 	DroppedObservations uint64               `json:"dropped_observations"`
+}
+
+const (
+	requestLogCategoryPlayback = "playback"
+	requestLogCategoryImage    = "image"
+	requestLogCategoryAPI      = "api"
+	requestLogCategoryAuth     = "auth"
+)
+
+// requestLogEvent is the bounded hot-path payload accepted from a site proxy.
+// Query strings, request/response headers other than the sanitized User-Agent,
+// cookies, tokens and bodies are deliberately excluded.
+type requestLogEvent struct {
+	SiteID           int64
+	SiteName         string
+	ResourceCategory string
+	StatusCode       int
+	ClientIP         string
+	UserAgent        string
+	Method           string
+	Path             string
+}
+
+type RequestLog struct {
+	ID               int64  `json:"id"`
+	SiteID           int64  `json:"site_id"`
+	SiteName         string `json:"site_name"`
+	ResourceCategory string `json:"resource_category"`
+	StatusCode       int    `json:"status_code"`
+	ClientIP         string `json:"client_ip"`
+	UserAgent        string `json:"user_agent"`
+	Method           string `json:"method"`
+	Path             string `json:"path"`
+	RecordedAtMS     int64  `json:"recorded_at_ms"`
+}
+
+type RequestLogFilter struct {
+	FromMS      int64
+	ToMS        int64
+	Category    string
+	StatusGroup string
+	Query       string
+	Limit       int
+}
+
+type RequestLogsResponse struct {
+	Logs        []RequestLog `json:"logs"`
+	DroppedLogs uint64       `json:"dropped_logs"`
+}
+
+func validRequestLogCategory(category string) bool {
+	switch category {
+	case requestLogCategoryPlayback, requestLogCategoryImage, requestLogCategoryAPI, requestLogCategoryAuth:
+		return true
+	default:
+		return false
+	}
 }
 
 func validDynamicObservationEnums(source, decision, reasonCode string) bool {
@@ -1377,20 +1442,28 @@ type queuedDynamicObservation struct {
 	observedAtMS int64
 }
 
+type queuedRequestLog struct {
+	event        requestLogEvent
+	recordedAtMS int64
+}
+
 type dynamicObservationCommandKind uint8
 
 const (
 	dynamicObservationCommandWrite dynamicObservationCommandKind = iota
+	dynamicObservationCommandRequestLogWrite
 	dynamicObservationCommandFlush
 	dynamicObservationCommandClear
+	dynamicObservationCommandRequestLogClear
 	dynamicObservationCommandStop
 )
 
 type dynamicObservationCommand struct {
-	kind   dynamicObservationCommandKind
-	event  queuedDynamicObservation
-	siteID int64
-	result chan error
+	kind       dynamicObservationCommandKind
+	event      queuedDynamicObservation
+	requestLog queuedRequestLog
+	siteID     int64
+	result     chan error
 }
 
 type DB struct {
@@ -1402,6 +1475,7 @@ type DB struct {
 	dynamicObservationCloseOnce sync.Once
 	dynamicObservationClosed    atomic.Bool
 	droppedDynamicObservations  atomic.Uint64
+	droppedRequestLogs          atomic.Uint64
 }
 
 func openDB(path string) (*DB, error) {
@@ -1424,7 +1498,7 @@ func openDB(path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("validate stored dynamic policies: %w", err)
 	}
-	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity)
+	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity+requestLogQueueCapacity)
 	d.dynamicObservationDone = make(chan struct{})
 	go d.runDynamicObservationWriter()
 	return d, nil
@@ -1533,6 +1607,48 @@ func (d *DB) DroppedDynamicObservations() uint64 {
 	return d.droppedDynamicObservations.Load()
 }
 
+// EnqueueRequestLog never waits for SQLite. Request logging is optional
+// operator telemetry and must not add latency or backpressure to media traffic.
+func (d *DB) EnqueueRequestLog(event requestLogEvent) {
+	if d == nil {
+		return
+	}
+	if event.SiteID <= 0 || !validRequestLogCategory(event.ResourceCategory) || event.StatusCode < 100 || event.StatusCode > 599 ||
+		event.SiteName == "" || len(event.SiteName) > requestLogMaxSiteNameBytes || event.ClientIP == "" || len(event.ClientIP) > requestLogMaxClientIPBytes ||
+		len(event.UserAgent) > requestLogMaxUserAgentBytes || event.Method == "" || len(event.Method) > 16 || event.Path == "" || len(event.Path) > requestLogMaxPathBytes {
+		d.droppedRequestLogs.Add(1)
+		return
+	}
+	command := dynamicObservationCommand{
+		kind: dynamicObservationCommandRequestLogWrite,
+		requestLog: queuedRequestLog{
+			event:        event,
+			recordedAtMS: time.Now().UnixMilli(),
+		},
+	}
+	if !d.dynamicObservationGate.TryRLock() {
+		d.droppedRequestLogs.Add(1)
+		return
+	}
+	defer d.dynamicObservationGate.RUnlock()
+	if d.dynamicObservationClosed.Load() || d.dynamicObservationQueue == nil {
+		d.droppedRequestLogs.Add(1)
+		return
+	}
+	select {
+	case d.dynamicObservationQueue <- command:
+	default:
+		d.droppedRequestLogs.Add(1)
+	}
+}
+
+func (d *DB) DroppedRequestLogs() uint64 {
+	if d == nil {
+		return 0
+	}
+	return d.droppedRequestLogs.Load()
+}
+
 func (d *DB) sendDynamicObservationControl(kind dynamicObservationCommandKind, siteID int64) error {
 	if d == nil {
 		return errDynamicObservationWriterClosed
@@ -1558,6 +1674,87 @@ func (d *DB) ClearDynamicObservations(siteID int64) error {
 		return fmt.Errorf("invalid dynamic observation site id")
 	}
 	return d.sendDynamicObservationControl(dynamicObservationCommandClear, siteID)
+}
+
+func (d *DB) ClearRequestLogs() error {
+	return d.sendDynamicObservationControl(dynamicObservationCommandRequestLogClear, 0)
+}
+
+func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
+	if filter.FromMS < 0 || filter.ToMS < 0 || filter.FromMS > 0 && filter.ToMS > 0 && filter.FromMS > filter.ToMS {
+		return nil, fmt.Errorf("invalid request log time range")
+	}
+	if filter.Category != "" && filter.Category != "all" && !validRequestLogCategory(filter.Category) {
+		return nil, fmt.Errorf("invalid request log category")
+	}
+	switch filter.StatusGroup {
+	case "", "all", "4xx", "5xx":
+	default:
+		return nil, fmt.Errorf("invalid request log status filter")
+	}
+	filter.Query = strings.TrimSpace(filter.Query)
+	if len(filter.Query) > 200 {
+		return nil, fmt.Errorf("request log search must not exceed 200 bytes")
+	}
+	if filter.Limit == 0 {
+		filter.Limit = 200
+	}
+	if filter.Limit < 1 || filter.Limit > 500 {
+		return nil, fmt.Errorf("request log limit must be between 1 and 500")
+	}
+	if err := d.flushDynamicObservations(); err != nil {
+		return nil, err
+	}
+
+	conditions := make([]string, 0, 6)
+	args := make([]interface{}, 0, 12)
+	if filter.FromMS > 0 {
+		conditions = append(conditions, "recorded_at_ms>=?")
+		args = append(args, filter.FromMS)
+	}
+	if filter.ToMS > 0 {
+		conditions = append(conditions, "recorded_at_ms<=?")
+		args = append(args, filter.ToMS)
+	}
+	if filter.Category != "" && filter.Category != "all" {
+		conditions = append(conditions, "resource_category=?")
+		args = append(args, filter.Category)
+	}
+	switch filter.StatusGroup {
+	case "4xx":
+		conditions = append(conditions, "status_code BETWEEN 400 AND 499")
+	case "5xx":
+		conditions = append(conditions, "status_code BETWEEN 500 AND 599")
+	}
+	if filter.Query != "" {
+		conditions = append(conditions, `(instr(lower(site_name), lower(?))>0 OR instr(lower(client_ip), lower(?))>0 OR instr(lower(user_agent), lower(?))>0 OR instr(lower(path), lower(?))>0 OR CAST(status_code AS TEXT)=?)`)
+		for range 5 {
+			args = append(args, filter.Query)
+		}
+	}
+	query := `SELECT id, site_id, site_name, resource_category, status_code, client_ip, user_agent, method, path, recorded_at_ms FROM request_logs`
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY recorded_at_ms DESC, id DESC LIMIT ?"
+	args = append(args, filter.Limit)
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	logs := make([]RequestLog, 0)
+	for rows.Next() {
+		var entry RequestLog
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.Method, &entry.Path, &entry.RecordedAtMS); err != nil {
+			return nil, err
+		}
+		logs = append(logs, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return logs, nil
 }
 
 func (d *DB) ListDynamicObservations(siteID int64) ([]DynamicObservation, error) {
@@ -1610,6 +1807,7 @@ func (d *DB) runDynamicObservationWriter() {
 	defer ticker.Stop()
 
 	batch := make([]queuedDynamicObservation, 0, dynamicObservationBatchSize)
+	requestBatch := make([]queuedRequestLog, 0, requestLogBatchSize)
 	var pending dynamicObservationCommand
 	hasPending := false
 	for {
@@ -1624,6 +1822,10 @@ func (d *DB) runDynamicObservationWriter() {
 				if err := d.pruneDynamicObservations(); err != nil {
 					d.droppedDynamicObservations.Add(1)
 					log.Printf("[dynamic-observations] optional retention write failed: %v", err)
+				}
+				if err := d.pruneRequestLogs(); err != nil {
+					d.droppedRequestLogs.Add(1)
+					log.Printf("[request-logs] optional retention write failed: %v", err)
 				}
 				continue
 			}
@@ -1655,12 +1857,41 @@ func (d *DB) runDynamicObservationWriter() {
 			}
 			continue
 		}
+		if command.kind == dynamicObservationCommandRequestLogWrite {
+			requestBatch = requestBatch[:0]
+			requestBatch = append(requestBatch, command.requestLog)
+		drainRequestBatch:
+			for len(requestBatch) < requestLogBatchSize {
+				select {
+				case next := <-d.dynamicObservationQueue:
+					if next.kind != dynamicObservationCommandRequestLogWrite {
+						pending = next
+						hasPending = true
+						break drainRequestBatch
+					}
+					requestBatch = append(requestBatch, next.requestLog)
+				default:
+					break drainRequestBatch
+				}
+			}
+			skipped, err := d.writeRequestLogBatch(requestBatch)
+			if err != nil {
+				d.droppedRequestLogs.Add(uint64(len(requestBatch)))
+				log.Printf("[request-logs] optional batch write failed: %v", err)
+			} else if skipped > 0 {
+				d.droppedRequestLogs.Add(uint64(skipped))
+			}
+			continue
+		}
 
 		switch command.kind {
 		case dynamicObservationCommandFlush:
 			command.result <- nil
 		case dynamicObservationCommandClear:
 			_, err := d.db.Exec("DELETE FROM dynamic_observations WHERE site_id=?", command.siteID)
+			command.result <- err
+		case dynamicObservationCommandRequestLogClear:
+			_, err := d.db.Exec("DELETE FROM request_logs")
 			command.result <- err
 		case dynamicObservationCommandStop:
 			command.result <- nil
@@ -1797,6 +2028,83 @@ func (d *DB) pruneDynamicObservations() error {
 	return tx.Commit()
 }
 
+func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	statement, err := tx.Prepare(`
+		INSERT INTO request_logs
+			(site_id, site_name, resource_category, status_code, client_ip, user_agent, method, path, recorded_at_ms)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM sites WHERE id=?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer statement.Close()
+	skipped := 0
+	for _, queued := range batch {
+		event := queued.event
+		result, err := statement.Exec(
+			event.SiteID,
+			event.SiteName,
+			event.ResourceCategory,
+			event.StatusCode,
+			event.ClientIP,
+			event.UserAgent,
+			event.Method,
+			event.Path,
+			queued.recordedAtMS,
+			event.SiteID,
+		)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if rows == 0 {
+			skipped++
+		}
+	}
+	if err := pruneRequestLogsTx(tx, time.Now()); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return skipped, nil
+}
+
+func pruneRequestLogsTx(tx *sql.Tx, now time.Time) error {
+	cutoffMS := now.Add(-requestLogRetention).UnixMilli()
+	if _, err := tx.Exec("DELETE FROM request_logs WHERE recorded_at_ms<?", cutoffMS); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`
+		DELETE FROM request_logs
+		WHERE id IN (
+			SELECT id FROM request_logs
+			ORDER BY recorded_at_ms DESC, id DESC
+			LIMIT -1 OFFSET ?
+		)`, requestLogGlobalRowLimit)
+	return err
+}
+
+func (d *DB) pruneRequestLogs() error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := pruneRequestLogsTx(tx, time.Now()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 const (
 	migrationRetryDelay    = 25 * time.Millisecond
 	migrationRetryDeadline = 5 * time.Second
@@ -1901,6 +2209,20 @@ func (d *DB) migrateOnce() error {
 		recorded_at DATETIME NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_traffic_site_time ON traffic_logs(site_id, recorded_at);
+	CREATE TABLE IF NOT EXISTS request_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		site_name TEXT NOT NULL,
+		resource_category TEXT NOT NULL,
+		status_code INTEGER NOT NULL,
+		client_ip TEXT NOT NULL,
+		user_agent TEXT NOT NULL,
+		method TEXT NOT NULL,
+		path TEXT NOT NULL,
+		recorded_at_ms INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(recorded_at_ms DESC, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_request_logs_category_status ON request_logs(resource_category, status_code, recorded_at_ms DESC);
 	`); err != nil {
 		return err
 	}
@@ -2679,6 +3001,9 @@ func (d *DB) DeleteSite(id int64) error {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM dynamic_observations WHERE site_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM request_logs WHERE site_id=?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM sites WHERE id=?", id); err != nil {
@@ -9541,6 +9866,130 @@ func (pm *ProxyManager) PublicHostSiteID(host string) (int64, bool) {
 	return id, ok
 }
 
+func requestLogSafeText(value string, maxBytes int) string {
+	value = strings.ToValidUTF8(value, "")
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, value)
+	value = strings.TrimSpace(value)
+	for len(value) > maxBytes {
+		_, size := utf8.DecodeLastRuneInString(value)
+		if size <= 0 {
+			return ""
+		}
+		value = value[:len(value)-size]
+	}
+	return value
+}
+
+func classifyRequestLogResource(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return requestLogCategoryAPI
+	}
+	path := strings.ToLower(r.URL.Path)
+	switch {
+	case strings.Contains(path, "/authenticate"), strings.Contains(path, "/quickconnect"):
+		return requestLogCategoryAuth
+	case strings.Contains(path, "/images/"), strings.HasSuffix(path, "/images"), strings.Contains(path, "/image/"):
+		return requestLogCategoryImage
+	case isPlaybackRequest(path), isPlaybackInfoRequest(path), dynamicStructuredRequestSource(path) != "", isReservedDynamicRoute(path):
+		return requestLogCategoryPlayback
+	default:
+		return requestLogCategoryAPI
+	}
+}
+
+func newRequestLogEvent(site Site, r *http.Request, trustedProxies []*net.IPNet) requestLogEvent {
+	path := "/"
+	method := http.MethodGet
+	userAgent := ""
+	clientIP := "unknown"
+	if r != nil {
+		method = strings.ToUpper(strings.TrimSpace(r.Method))
+		userAgent = r.Header.Get("User-Agent")
+		if r.URL != nil && r.URL.EscapedPath() != "" {
+			path = r.URL.EscapedPath()
+		}
+		if ip := net.ParseIP(requestClientKey(r, trustedProxies)); ip != nil {
+			clientIP = ip.String()
+		}
+	}
+	if method == "" {
+		method = http.MethodGet
+	}
+	return requestLogEvent{
+		SiteID:           site.ID,
+		SiteName:         requestLogSafeText(site.Name, requestLogMaxSiteNameBytes),
+		ResourceCategory: classifyRequestLogResource(r),
+		ClientIP:         clientIP,
+		UserAgent:        requestLogSafeText(userAgent, requestLogMaxUserAgentBytes),
+		Method:           requestLogSafeText(method, 16),
+		Path:             requestLogSafeText(path, requestLogMaxPathBytes),
+	}
+}
+
+type requestLogResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *requestLogResponseWriter) WriteHeader(statusCode int) {
+	if w.statusCode != 0 {
+		return
+	}
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *requestLogResponseWriter) Write(payload []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+func (w *requestLogResponseWriter) StatusCode() int {
+	if w.statusCode == 0 {
+		return http.StatusOK
+	}
+	return w.statusCode
+}
+
+func (w *requestLogResponseWriter) Flush() {
+	if w.statusCode == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *requestLogResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("hijack not supported")
+	}
+	conn, buffer, err := hijacker.Hijack()
+	if err == nil && w.statusCode == 0 {
+		w.statusCode = http.StatusSwitchingProtocols
+	}
+	return conn, buffer, err
+}
+
+func (w *requestLogResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *requestLogResponseWriter) Push(target string, options *http.PushOptions) error {
+	if pusher, ok := w.ResponseWriter.(http.Pusher); ok {
+		return pusher.Push(target, options)
+	}
+	return http.ErrNotSupported
+}
+
 // metered response writer
 type meteredWriter struct {
 	http.ResponseWriter
@@ -11223,6 +11672,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return
 		}
 		defer inst.endRequest()
+		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
+		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies)
+		defer func() {
+			requestLogEntry.StatusCode = requestLogWriter.StatusCode()
+			pm.database.EnqueueRequestLog(requestLogEntry)
+		}()
+		w = requestLogWriter
 		requestCtx, requestCancel := context.WithCancel(r.Context())
 		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
 		defer func() {
@@ -13716,6 +14172,52 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	a.jsonOK(w, history.Logs)
 }
 
+// GET/DELETE /api/request-logs
+func (a *App) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.Method {
+	case http.MethodGet:
+		query := r.URL.Query()
+		filter := RequestLogFilter{
+			Category:    strings.ToLower(strings.TrimSpace(query.Get("category"))),
+			StatusGroup: strings.ToLower(strings.TrimSpace(query.Get("status"))),
+			Query:       query.Get("q"),
+		}
+		for name, target := range map[string]*int64{"from_ms": &filter.FromMS, "to_ms": &filter.ToMS} {
+			if raw := strings.TrimSpace(query.Get(name)); raw != "" {
+				value, err := strconv.ParseInt(raw, 10, 64)
+				if err != nil || value < 0 {
+					a.jsonErr(w, http.StatusBadRequest, name+" must be a non-negative Unix millisecond timestamp")
+					return
+				}
+				*target = value
+			}
+		}
+		if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, "limit must be an integer")
+				return
+			}
+			filter.Limit = value
+		}
+		logs, err := a.db.ListRequestLogs(filter)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.jsonOK(w, RequestLogsResponse{Logs: logs, DroppedLogs: a.db.DroppedRequestLogs()})
+	case http.MethodDelete:
+		if err := a.db.ClearRequestLogs(); err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "clear request logs failed")
+			return
+		}
+		a.jsonOK(w, map[string]string{"status": "cleared"})
+	default:
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
 // GET /api/ua-profiles
 func (a *App) handleUAProfiles(w http.ResponseWriter, r *http.Request) {
 	profiles := make([]UAProfile, 0, len(uaProfiles))
@@ -14039,6 +14541,7 @@ func main() {
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
+	mux.HandleFunc("/api/request-logs", cors(app.authMiddleware(app.handleRequestLogs)))
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
 	mux.HandleFunc("/api/dynamic-profiles", cors(app.authMiddleware(app.handleDynamicProfiles)))
 	mux.HandleFunc("/api/events", cors(app.authMiddleware(app.handleSSE)))

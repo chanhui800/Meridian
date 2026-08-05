@@ -6,7 +6,7 @@
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.8.0">
-<link rel="stylesheet" href="/css/style.css?v=1.8.0">
+<link rel="stylesheet" href="/css/style.css?v=1.8.1">
 </head>
 <body>
 
@@ -48,6 +48,7 @@
       <a href="#sites" class="topnav-link" data-page="sites">站点管理</a>
       <a href="#traffic" class="topnav-link" data-page="traffic">流量统计</a>
       <a href="#diagnostics" class="topnav-link" data-page="diagnostics">故障诊断</a>
+      <a href="#request-logs" class="topnav-link" data-page="request-logs">日志记录</a>
     </div>
     <div class="topnav-right">
       <button class="avatar-btn" id="avatar-btn">A</button>
@@ -60,6 +61,7 @@
     <div id="page-sites" class="page"></div>
     <div id="page-traffic" class="page"></div>
     <div id="page-diagnostics" class="page"></div>
+    <div id="page-request-logs" class="page"></div>
   </div>
 
   <!-- Mobile Bottom Bar -->
@@ -81,6 +83,10 @@
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
         诊断
       </a>
+      <a href="#request-logs" class="mobile-tab" data-page="request-logs">
+        <svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><line x1="7" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="7" y1="16" x2="14" y2="16"/></svg>
+        日志
+      </a>
     </div>
   </nav>
 
@@ -101,13 +107,14 @@
 
 </div>
 
-<script src="/js/api.js?v=1.8.0"></script>
-<script src="/js/toast.js?v=1.8.0"></script>
-<script src="/js/router.js?v=1.8.0"></script>
-<script src="/js/pages/dashboard.js?v=1.8.0"></script>
-<script src="/js/pages/sites.js?v=1.8.0"></script>
-<script src="/js/pages/traffic.js?v=1.8.0"></script>
-<script src="/js/pages/diag.js?v=1.8.0"></script>
-<script src="/js/app.js?v=1.8.0"></script>
+<script src="/js/api.js?v=1.8.1"></script>
+<script src="/js/toast.js?v=1.8.1"></script>
+<script src="/js/router.js?v=1.8.1"></script>
+<script src="/js/pages/dashboard.js?v=1.8.1"></script>
+<script src="/js/pages/sites.js?v=1.8.1"></script>
+<script src="/js/pages/traffic.js?v=1.8.1"></script>
+<script src="/js/pages/diag.js?v=1.8.1"></script>
+<script src="/js/pages/request-logs.js?v=1.8.1"></script>
+<script src="/js/app.js?v=1.8.1"></script>
 </body>
 </html>
