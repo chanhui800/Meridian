@@ -121,7 +121,6 @@ func TestStoredDynamicPolicyCorruptionFailsStartupAndReopen(t *testing.T) {
 		{name: "null rules", column: "dynamic_domain_rules", value: "null"},
 		{name: "non-array rules", column: "dynamic_domain_rules", value: `{}`},
 		{name: "noncanonical rules", column: "dynamic_domain_rules", value: `[{"type":"EXACT","value":"CDN.Example.COM."}]`},
-		{name: "enabled discovery", column: "dynamic_discovery_enabled", value: 1},
 		{name: "invalid discovery boolean", column: "dynamic_discovery_enabled", value: 2},
 		{name: "invalid downgrade boolean", column: "dynamic_allow_https_downgrade", value: -1},
 		{name: "revision below one", column: "dynamic_policy_revision", value: 0},
@@ -244,8 +243,8 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	if len(site.DynamicDomainRules) != 2 || site.DynamicDomainRules[0] != (DynamicDomainRule{Type: "exact", Value: "cdn.example.com"}) || site.DynamicDomainRules[1] != (DynamicDomainRule{Type: "suffix", Value: "xn--bcher-kva.de"}) {
 		t.Fatalf("created normalized rules = %#v", site.DynamicDomainRules)
 	}
-	if got := strings.Join(site.DynamicDiscoverySources, ","); got != strings.Join(allDynamicDiscoverySources(), ",") {
-		t.Fatalf("created discovery sources = %#v, want %#v", site.DynamicDiscoverySources, allDynamicDiscoverySources())
+	if got := strings.Join(site.DynamicDiscoverySources, ","); got != strings.Join(defaultDynamicDiscoverySources(), ",") {
+		t.Fatalf("created discovery sources = %#v, want %#v", site.DynamicDiscoverySources, defaultDynamicDiscoverySources())
 	}
 
 	update := func(overrides map[string]interface{}, wantStatus int) *httptest.ResponseRecorder {
@@ -404,6 +403,9 @@ func TestDynamicProfilesEndpointIsAuthenticatedAndDoesNotDiscloseKey(t *testing.
 		wantFeatures := DynamicFeatureFlags{RedirectDiscovery: true, PlaybackInfo: true, HLS: profile.ID != dynamicProfileSafe, DASH: profile.ID != dynamicProfileSafe}
 		if profile.Features != wantFeatures {
 			t.Fatalf("profile %s feature flags = %#v, want %#v", profile.ID, profile.Features, wantFeatures)
+		}
+		if profile.Recommended != (profile.ID == dynamicProfileCompatible) {
+			t.Fatalf("profile %s recommended=%t", profile.ID, profile.Recommended)
 		}
 	}
 }

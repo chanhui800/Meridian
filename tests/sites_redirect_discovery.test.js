@@ -48,7 +48,7 @@ function discoveryProfile(id, overrides = {}) {
   return {
     id,
     label: id[0].toUpperCase() + id.slice(1),
-    recommended: id === 'safe',
+    recommended: id === 'compatible',
     limits: {
       allowed_schemes: anyPort ? ['http', 'https'] : ['https'],
       allowed_ports: anyPort ? [] : [443],
@@ -193,6 +193,8 @@ function loadModalHarness() {
     confirmations: [],
     observationGets: [],
     observationDeletes: [],
+    creates: [],
+    updates: [],
     successes: [],
     errors: [],
     opened: 0,
@@ -232,6 +234,8 @@ function loadModalHarness() {
         state.observationDeletes.push(siteId);
         return { observations: [], dropped_observations: 0 };
       },
+      createSite: async payload => { state.creates.push(clone(payload)); },
+      updateSite: async (siteId, payload) => { state.updates.push({ siteId, payload: clone(payload) }); },
     },
     Toast: {
       success(message) { state.successes.push(message); },
@@ -344,8 +348,7 @@ test('availability and key status gate enablement without hiding legacy editing'
   const disabledControl = sandbox.renderDynamicEnableControl(unavailable, policy);
   assert.doesNotMatch(disabledControl, /id="m-dynamic-enabled"[^>]*disabled/);
   assert.match(disabledControl, /id="m-dynamic-enabled"[^>]*checked/);
-  assert.match(disabledControl, /id="m-dynamic-source-redirect"[^>]*checked/);
-	assert.match(disabledControl, /id="m-dynamic-source-redirect"[^>]*disabled/);
+  assert.doesNotMatch(disabledControl, /m-dynamic-source-/);
 
   const unavailablePayload = sandbox.buildDynamicPolicyPayload(policy, unavailable);
   assert.equal(unavailablePayload.dynamic_discovery_enabled, true);
@@ -357,7 +360,7 @@ test('availability and key status gate enablement without hiding legacy editing'
   assert.equal(sandbox.buildDynamicPolicyPayload({}, unavailable).dynamic_discovery_enabled, false);
 	const unrecognizedControl = sandbox.renderDynamicEnableControl({ stage: 'redirect-discovery' }, policy);
 	assert.match(unrecognizedControl, /id="m-dynamic-enabled"[^>]*disabled/);
-	assert.match(unrecognizedControl, /id="m-dynamic-source-redirect"[^>]*disabled/);
+  assert.doesNotMatch(unrecognizedControl, /m-dynamic-source-/);
   assert.deepEqual(plain(sandbox.buildDynamicPolicyPayload(policy, { stage: 'redirect-discovery' })), {});
 });
 
@@ -369,16 +372,11 @@ test('structured-discovery status reports delivered sources and only unavailable
   });
   const status = sandbox.renderDynamicStatus(capabilities);
 
-  assert.match(status, /自动播放后端发现/);
-  assert.match(status, /安全 HTTP 30x、PlaybackInfo、HLS 和 DASH/);
-  assert.match(status, /不扫描任意正文/);
+  assert.match(status, /自动发现/);
+  assert.match(status, /默认处理 HTTP 30x 和 PlaybackInfo/);
+  assert.match(status, /高级选项中开启 HLS、DASH/);
+  assert.match(status, /Extreme 扩展兼容模式/);
   assert.match(status, /DYNAMIC_ROUTE_KEY：已配置/);
-  for (const label of ['安全 30x 重定向发现', 'PlaybackInfo 改写', 'HLS 解析', 'DASH 解析']) {
-    assert.doesNotMatch(status, new RegExp(label + '：不可用'));
-  }
-  for (const label of ['私网目标', '自定义 CA', '原始响应回退']) {
-    assert.match(status, new RegExp(label + '：不可用'));
-  }
   assert.ok(!status.includes('raw-secret-must-not-render'));
   assert.ok(!status.includes('target-must-not-render'));
 });
@@ -393,8 +391,8 @@ test('profile risk notices and transition confirmations match the approved produ
   assert.match(safe, /data-profile-risk="safe"/);
   assert.match(safe, /推荐/);
   assert.match(compatible, /data-profile-risk="compatible"/);
-  assert.match(compatible, /黄色确认/);
-  assert.match(compatible, /任意公网域名和 1–65535 端口/);
+  assert.match(compatible, /默认/);
+  assert.match(compatible, /适合大多数后端/);
   assert.match(extreme, /data-profile-risk="extreme"/);
   assert.match(extreme, /高风险/);
   assert.match(extreme, /输入站点名称/);
@@ -403,8 +401,8 @@ test('profile risk notices and transition confirmations match the approved produ
   const enabledSafe = { dynamic_discovery_enabled: true, dynamic_profile: 'safe' };
   const enabledCompatible = { dynamic_discovery_enabled: true, dynamic_profile: 'compatible' };
   const enabledExtreme = { dynamic_discovery_enabled: true, dynamic_profile: 'extreme' };
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(disabledSafe, enabledCompatible), 'compatible');
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledSafe, enabledCompatible), 'compatible');
+  assert.equal(sandbox.dynamicProfileConfirmationRequirement(disabledSafe, enabledCompatible), 'none');
+  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledSafe, enabledCompatible), 'none');
   assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledCompatible, enabledCompatible), 'none');
   assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledExtreme, enabledCompatible), 'none');
   assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledSafe, enabledExtreme), 'extreme');
@@ -417,8 +415,8 @@ test('profile risk notices and transition confirmations match the approved produ
   };
   const compatibleAccepted = sandbox.confirmDynamicProfileChange(enabledSafe, enabledCompatible, 'media-site', false, '');
   assert.equal(compatibleAccepted.ok, true);
-  assert.equal(compatibleAccepted.requirement, 'compatible');
-  assert.match(prompts.at(-1), /任意公网域名和 1–65535 端口/);
+  assert.equal(compatibleAccepted.requirement, 'none');
+  assert.equal(prompts.length, 0);
 
   const missingAcknowledgement = sandbox.confirmDynamicProfileChange(enabledSafe, enabledExtreme, 'media-site', false, 'media-site');
   assert.equal(missingAcknowledgement.ok, false);
@@ -436,7 +434,7 @@ test('profile risk notices and transition confirmations match the approved produ
   assert.equal(unchangedExtreme.requirement, 'none');
 });
 
-test('site modal keeps risk badges visible and reveals Extreme acknowledgements on transition', async () => {
+test('new site defaults to Compatible core discovery and keeps Extreme in advanced options', async () => {
   const { sandbox, document } = loadModalHarness();
   await sandbox.showSiteModal(null);
   const enabled = document.getElementById('m-dynamic-enabled');
@@ -444,16 +442,13 @@ test('site modal keeps risk badges visible and reveals Extreme acknowledgements 
   const risk = document.getElementById('m-dynamic-profile-risk');
   const extremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
 
-  assert.match(risk.innerHTML, /data-profile-risk="safe"/);
-  assert.equal(document.getElementById('m-dynamic-source-hls').disabled, true);
-  assert.equal(document.getElementById('m-dynamic-source-dash').disabled, true);
-  enabled.checked = true;
-  enabled.onchange();
-  profile.value = 'compatible';
-  profile.onchange();
   assert.match(risk.innerHTML, /data-profile-risk="compatible"/);
-  assert.equal(document.getElementById('m-dynamic-source-hls').disabled, false);
-  assert.equal(document.getElementById('m-dynamic-source-dash').disabled, false);
+  assert.equal(enabled.checked, true);
+  assert.equal(profile.value, 'compatible');
+  assert.equal(document.getElementById('m-dynamic-source-hls').checked, false);
+  assert.equal(document.getElementById('m-dynamic-source-dash').checked, false);
+  assert.equal(document.getElementById('m-playback-list'), null);
+  assert.doesNotMatch(document.getElementById('modal-body').innerHTML, /value="safe"/);
   assert.equal(extremeConfirmation.hidden, true);
 
   profile.value = 'extreme';
@@ -464,6 +459,26 @@ test('site modal keeps risk badges visible and reveals Extreme acknowledgements 
   enabled.checked = false;
   enabled.onchange();
   assert.equal(extremeConfirmation.hidden, true);
+});
+
+test('new site submission uses core discovery and no manual playback origins', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  document.getElementById('m-name').value = 'Media';
+  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-ingress-mode').value = 'port';
+  document.getElementById('m-ingress-mode').onchange();
+  document.getElementById('m-port').value = '8096';
+
+  await document.getElementById('m-submit').onclick();
+
+  assert.equal(state.creates.length, 1);
+  assert.equal(state.creates[0].playback_target_url, '');
+  assert.equal(state.creates[0].playback_mode, 'direct');
+  assert.deepEqual(state.creates[0].stream_hosts, []);
+  assert.equal(state.creates[0].dynamic_discovery_enabled, true);
+  assert.equal(state.creates[0].dynamic_profile, 'compatible');
+  assert.deepEqual(state.creates[0].dynamic_discovery_sources, ['redirect', 'playback_info']);
 });
 
 test('enabled discovery policy normalizes sources and rules and omits the response-only revision', () => {
@@ -482,12 +497,12 @@ test('enabled discovery policy normalizes sources and rules and omits the respon
   });
 
   assert.equal(hydrated.dynamic_policy_revision, 9);
-  assert.deepEqual(plain(hydrated.dynamic_discovery_sources), ['redirect', 'playback_info', 'hls', 'dash']);
+  assert.deepEqual(plain(hydrated.dynamic_discovery_sources), ['redirect', 'playback_info']);
   const payload = sandbox.buildDynamicPolicyPayload(hydrated, structuredDiscoveryResponse());
   assert.deepEqual(plain(payload), {
     dynamic_discovery_enabled: true,
     dynamic_profile: 'compatible',
-    dynamic_discovery_sources: ['redirect', 'playback_info', 'hls', 'dash'],
+    dynamic_discovery_sources: ['redirect', 'playback_info'],
     dynamic_domain_rules: [
       { type: 'exact', value: 'media.example.com' },
       { type: 'suffix', value: 'cdn.example.com' },
@@ -499,10 +514,10 @@ test('enabled discovery policy normalizes sources and rules and omits the respon
   const partial = sandbox.normalizeDynamicSitePolicy({
     dynamic_discovery_sources: ['HLS', 'dash', 'redirect', 'REDIRECT', 'unknown', null],
   });
-  assert.deepEqual(plain(partial.dynamic_discovery_sources), ['redirect']);
+  assert.deepEqual(plain(partial.dynamic_discovery_sources), ['redirect', 'hls', 'dash']);
   assert.deepEqual(
     plain(sandbox.buildDynamicPolicyPayload(partial, structuredDiscoveryResponse()).dynamic_discovery_sources),
-    ['redirect'],
+    ['redirect', 'hls', 'dash'],
   );
 });
 
@@ -654,8 +669,8 @@ test('dynamic rendering escapes values and never renders sensitive observation d
   const sandbox = loadScripts('api.js', 'pages/sites.js');
   const capabilities = structuredDiscoveryResponse({
     profiles: [
-      discoveryProfile('safe', { label: ATTACK }),
-      discoveryProfile('compatible'),
+      discoveryProfile('safe'),
+      discoveryProfile('compatible', { label: ATTACK }),
       discoveryProfile('extreme'),
     ],
   });

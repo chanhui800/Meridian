@@ -325,7 +325,7 @@ func dynamicProfilesCatalog() []DynamicProfile {
 		{
 			ID:          dynamicProfileSafe,
 			Label:       "Safe",
-			Recommended: true,
+			Recommended: false,
 			Limits: DynamicProfileLimits{
 				AllowedSchemes:             []string{"https"},
 				AllowedPorts:               []int{443},
@@ -346,7 +346,7 @@ func dynamicProfilesCatalog() []DynamicProfile {
 		{
 			ID:          dynamicProfileCompatible,
 			Label:       "Compatible",
-			Recommended: false,
+			Recommended: true,
 			Limits: DynamicProfileLimits{
 				AllowedSchemes:             []string{"http", "https"},
 				AllowedPorts:               []int{},
@@ -457,7 +457,7 @@ func validateDynamicRouteKeySeparation(dynamicKey, effectiveJWTSecret, effective
 func normalizeDynamicProfile(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
-		return dynamicProfileSafe, nil
+		return dynamicProfileCompatible, nil
 	}
 	switch value {
 	case dynamicProfileSafe, dynamicProfileCompatible, dynamicProfileExtreme:
@@ -559,6 +559,13 @@ func allDynamicDiscoverySources() []string {
 		dynamicDiscoverySourcePlaybackInfo,
 		dynamicDiscoverySourceHLS,
 		dynamicDiscoverySourceDASH,
+	}
+}
+
+func defaultDynamicDiscoverySources() []string {
+	return []string{
+		dynamicDiscoverySourceRedirect,
+		dynamicDiscoverySourcePlaybackInfo,
 	}
 }
 func dynamicDiscoverySourcesForProfile(profile string) ([]string, bool) {
@@ -756,7 +763,7 @@ func normalizeDynamicSitePolicy(site *Site) error {
 		}
 	}
 	if sources == nil {
-		sources, _ = dynamicDiscoverySourcesForProfile(profile)
+		sources = defaultDynamicDiscoverySources()
 	}
 	sources, err = normalizeDynamicDiscoverySources(sources)
 	if err != nil {
@@ -1873,9 +1880,9 @@ func (d *DB) migrateOnce() error {
 		custom_client TEXT NOT NULL DEFAULT '',
 		custom_version TEXT NOT NULL DEFAULT '',
 		upstream_headers TEXT NOT NULL DEFAULT '[]',
-		dynamic_discovery_enabled INTEGER NOT NULL DEFAULT 0,
-		dynamic_profile TEXT NOT NULL DEFAULT 'safe',
-		dynamic_discovery_sources TEXT NOT NULL DEFAULT '["redirect"]',
+		dynamic_discovery_enabled INTEGER NOT NULL DEFAULT 1,
+		dynamic_profile TEXT NOT NULL DEFAULT 'compatible',
+		dynamic_discovery_sources TEXT NOT NULL DEFAULT '["redirect","playback_info"]',
 		dynamic_domain_rules TEXT NOT NULL DEFAULT '[]',
 		dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 0,
 		dynamic_policy_revision INTEGER NOT NULL DEFAULT 1,

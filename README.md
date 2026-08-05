@@ -282,7 +282,7 @@ Meridian/
 | **回源地址**（`target_url`） | 网页、API、元数据 | `https://emby.example.com` |
 | **播放地址**（`playback_target_url`） | 播放、转码、直链下载 | `https://cdn.example.com` |
 
-播放地址为可选项。不设置时所有请求走同一上游。当前可手工填写最多 128 个播放 authority：第一个地址在 `direct` 模式中是实际播放回源；`redirect` 模式仍先请求主回源，并把列表中的所有地址作为管理员显式信任的 30x 目标。该列表不用于轮询、负载均衡或自动故障转移；未知 authority 的自动发现是下面单独、可关闭的策略。
+播放地址为可选项。不设置时所有请求走同一上游。为降低新手配置成本，管理界面不再提供播放回源列表，新站点直接依赖主回源与自动发现；升级前已保存的播放回源配置会继续保留并生效，API 也仍兼容这些字段。手工播放列表不用于轮询、负载均衡或自动故障转移；未知 authority 由下面的自动发现策略处理。
 
 地址没有写协议时，Meridian 会把 `域名:443`（也兼容中文全角冒号 `：443`）识别为 HTTPS；其他端口仍默认按 HTTP 处理。HTTPS 使用非 443 端口时请明确写成 `https://域名:端口`。重定向模式会把 `https://域名:443` 和省略默认端口的 `https://域名` 视为同一播放回源。
 
@@ -295,7 +295,7 @@ Meridian/
 
 ### 自动播放后端发现（30x + PlaybackInfo + HLS + DASH）
 
-这项功能按站点显式启用，并要求部署配置 `DYNAMIC_ROUTE_KEY`。Safe 只允许 `HTTP 30x` 与 `PlaybackInfo`；Compatible/Extreme 可再选择 `HLS` 和 `DASH`。新站点采用 Safe 的两种默认来源；从旧版数据库迁移的站点只保留原来的 `redirect` 来源，管理员可在编辑站点时按档位开启其余来源。它只解析下述结构化协议，不扫描 HTML、JavaScript 或任意 JSON 字符串，也不允许客户端指定任意目标，因此不是开放代理。
+这项功能要求部署配置 `DYNAMIC_ROUTE_KEY`。新建站点时默认开启，使用 `Compatible` 模式并只启用 `HTTP 30x` 与 `PlaybackInfo`；如果播放失败，可展开高级选项开启 `HLS`、`DASH`，少数后端仍无法发现时再切换到 `Extreme`。管理界面不再提供 `Safe`，但后端继续识别旧数据库和 API 中的 Safe 策略，避免升级破坏已有站点。它只解析下述结构化协议，不扫描 HTML、JavaScript 或任意 JSON 字符串，也不允许客户端指定任意目标，因此不是开放代理。
 
 **发现与改写范围：**
 
@@ -314,7 +314,7 @@ Meridian/
 
 全进程还共享 16,384 个 authority、131,072 个 active capability、256 MiB capability registry 内存、1,024 条动态流、每分钟 2,400 个新 authority、32 个 DNS worker、8 个并发正文解析、256 MiB 解析内存；每站 capability registry 和解析内存分别最多 64 MiB、同时最多解析 2 个响应。表内正文上限是各 profile 的协议上限；结构化解析还取更严格的 8 MiB 输入、16 MiB 输出硬上限与实际 profile 上限中的最小值，并按已知长度或最坏情况预留输入、对象树和输出的完整工作集。解析同时执行读取时限、异常压缩比、JSON token/深度/字符串、HLS 行、XML 节点和 URL 数量限制。队列或容量满时失败关闭，不阻塞其他媒体流。
 
-**Safe 域名规则与 HTTPS 降级。** Safe 是默认推荐档，启用时至少需要一条 `exact` 或 `suffix` DNS 规则，不接受 IP literal；规则经 IDNA 和公共后缀规范化，suffix 只在 DNS 标签边界匹配。Compatible/Extreme 允许任意公网域名和有效端口，UI 会要求额外风险确认。HTTPS 到 HTTP 默认拒绝；Safe 永远只允许 HTTPS:443，Compatible/Extreme 也只有显式开启站点降级开关后才能通过。
+**兼容模式与 HTTPS 降级。** Compatible 是管理界面的默认推荐档，允许通过完整 DNS/SSRF/固定拨号校验的公网 HTTP/HTTPS 域名和有效端口。Extreme 只放在高级选项中，启用时仍要求额外风险确认。Safe 作为旧数据库/API 兼容档继续存在：启用时至少需要一条 `exact` 或 `suffix` DNS 规则，不接受 IP literal。HTTPS 到 HTTP 默认拒绝；Safe 永远只允许 HTTPS:443，Compatible/Extreme 也只有策略显式允许时才能通过。
 
 **URL、DNS、SSRF 与固定拨号。** 动态 URL 最长 4096 字节，仅接受无 userinfo、fragment、空白或控制字符的绝对 HTTP(S) URL。DNS 的全部 A/AAAA 都必须是允许的全球单播地址；混入私网、回环、链路本地、CGNAT、metadata、文档、保留、组播、转换地址即整组拒绝，同时拒绝已知面板/站点目标和本机接口。本机 interface IP 除配置快照外，还会在 DNS 结果校验、transport 构造和每次 pinned dial 前重新枚举；枚举失败会失败关闭，运行时新分配的公网 IP 也不能成为动态目标。校验后的 IP 固定到本次直拨 transport，不使用环境代理或二次 DNS；HTTPS 保留原 Host/SNI、验证系统证书链并要求 TLS 1.2 以上。NAT hairpin、公网别名和外部负载均衡回流仍需部署侧防火墙阻断。
 
