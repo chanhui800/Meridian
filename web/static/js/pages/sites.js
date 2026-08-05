@@ -215,6 +215,8 @@ function normalizeSiteCapabilities(value) {
 
 const DYNAMIC_PROFILE_IDS = ['safe', 'compatible', 'extreme'];
 const DYNAMIC_SOURCE_IDS = ['redirect', 'playback_info', 'hls', 'dash'];
+const DEFAULT_DYNAMIC_SOURCE_IDS = ['redirect', 'playback_info'];
+const ADVANCED_DYNAMIC_SOURCE_IDS = ['hls', 'dash'];
 const DYNAMIC_SOURCE_LABELS = {
 	redirect: 'HTTP 30x',
 	playback_info: 'PlaybackInfo',
@@ -353,7 +355,7 @@ function normalizeDynamicProfiles(value) {
 			return {
 				id,
 				label: profile ? profile.label : DYNAMIC_PROFILE_LABELS[id],
-				recommended: profile ? profile.recommended : id === 'safe',
+				recommended: profile ? profile.recommended : id === 'compatible',
 				limits: profile ? profile.limits : DYNAMIC_PROFILE_NETWORK_DEFAULTS[id],
 				features: profile ? profile.features : {},
 			};
@@ -372,16 +374,16 @@ async function loadDynamicProfiles() {
 
 function normalizeDynamicProfile(value) {
 	const profile = String(value || '').trim().toLowerCase();
-	return DYNAMIC_PROFILE_IDS.includes(profile) ? profile : 'safe';
+	return DYNAMIC_PROFILE_IDS.includes(profile) ? profile : 'compatible';
 }
 function dynamicSourcesForProfile(value) {
 	return [...DYNAMIC_PROFILE_SOURCE_IDS[normalizeDynamicProfile(value)]];
 }
 
 
-function normalizeDynamicDiscoverySources(value, profile = 'safe') {
+function normalizeDynamicDiscoverySources(value, profile = 'compatible') {
 	const allowed = new Set(dynamicSourcesForProfile(profile));
-	if (!Array.isArray(value)) return dynamicSourcesForProfile(profile);
+	if (!Array.isArray(value)) return DEFAULT_DYNAMIC_SOURCE_IDS.filter(source => allowed.has(source));
 	const selected = new Set(value.map(source => String(source || '').trim().toLowerCase()));
 	return DYNAMIC_SOURCE_IDS.filter(source => allowed.has(source) && selected.has(source));
 }
@@ -449,8 +451,9 @@ function buildDynamicPolicyPayload(policy, capabilities) {
 
 function renderDynamicProfileOptions(capabilities, selectedProfile) {
 	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
-	const selected = normalizeDynamicProfile(selectedProfile);
-	return dynamicCapabilities.profiles.map(profile => `
+	const normalizedSelected = normalizeDynamicProfile(selectedProfile);
+	const selected = normalizedSelected === 'extreme' ? 'extreme' : 'compatible';
+	return dynamicCapabilities.profiles.filter(profile => profile.id !== 'safe').map(profile => `
 		<option value="${esc(profile.id)}" ${profile.id === selected ? 'selected' : ''}>${esc(profile.label)}${profile.recommended ? '（推荐）' : ''}</option>
 	`).join('');
 }
@@ -496,15 +499,11 @@ function renderDynamicStatus(capabilities) {
 		? ''
 		: '<div class="form-help" style="color:var(--orange)">动态能力数据缺失、格式异常或版本过旧，已按不可用处理。</div>';
 	const keyStatus = !dynamicCapabilities.recognized ? '未知' : dynamicCapabilities.key_configured ? '已配置' : '未配置';
-	const unavailableFeatures = DYNAMIC_FEATURES
-		.filter(([, , available]) => !available)
-		.map(([, label]) => `${esc(label)}：不可用`)
-		.join('；');
 	return `
-		<div class="form-help"><strong>自动播放后端发现</strong>：支持安全 HTTP 30x、PlaybackInfo、HLS 和 DASH；Safe/Compatible 仅处理严格协议字段，Extreme 另启用有界扩展兼容，但仍不扫描任意正文；任何目标都须通过 capability、DNS/SSRF/TLS 与 Header 清洗。</div>
+		<div class="form-help"><strong>自动发现</strong>默认处理 HTTP 30x 和 PlaybackInfo，无需手工维护播放回源列表。</div>
 		${contractWarning}
-		<div class="form-help">部署状态：${dynamicCapabilities.available ? '可用' : '不可用'}；DYNAMIC_ROUTE_KEY：${keyStatus}（仅显示配置状态，不显示密钥）</div>
-		<div class="form-help">仍明确不可用：${unavailableFeatures}</div>
+		<div class="form-help">播放失败时，可在高级选项中开启 HLS、DASH，或切换到 Extreme 扩展兼容模式。</div>
+		<div class="form-help">部署状态：${dynamicCapabilities.available ? '可用' : '不可用'}；DYNAMIC_ROUTE_KEY：${keyStatus}</div>
 	`;
 }
 
@@ -514,10 +513,10 @@ function dynamicProfileRiskNotice(profile) {
 	case 'compatible':
 		return {
 			level: 'compatible',
-			badge: '黄色确认',
+			badge: '默认',
 			color: 'var(--orange)',
 			background: 'var(--orange-dim)',
-			message: '可访问任意公网域名和 1–65535 端口；不开放私网、自定义 CA 或原始地址回退。首次启用必须确认。',
+			message: '适合大多数后端，支持严格 HTTP 30x、PlaybackInfo、HLS 和 DASH；仍拒绝私网、特殊地址和未验证拨号。',
 		};
 	case 'extreme':
 		return {
@@ -549,16 +548,11 @@ function dynamicProfileConfirmationRequirement(initialPolicy, nextPolicy) {
 	const next = normalizeDynamicSitePolicy(nextPolicy);
 	if (!next.dynamic_discovery_enabled) return 'none';
 	if (next.dynamic_profile === 'extreme' && (!initial.dynamic_discovery_enabled || initial.dynamic_profile !== 'extreme')) return 'extreme';
-	if (next.dynamic_profile === 'compatible' && (!initial.dynamic_discovery_enabled || initial.dynamic_profile === 'safe')) return 'compatible';
 	return 'none';
 }
 
 function confirmDynamicProfileChange(initialPolicy, nextPolicy, siteName, extremeAcknowledged, extremeTypedName) {
 	const requirement = dynamicProfileConfirmationRequirement(initialPolicy, nextPolicy);
-	if (requirement === 'compatible') {
-		const accepted = window.confirm('Compatible（兼容）可访问任意公网域名和 1–65535 端口。仍会拒绝私网、特殊地址和未验证拨号。确定启用吗？');
-		return { ok: accepted, requirement, error: '' };
-	}
 	if (requirement === 'extreme') {
 		if (!extremeAcknowledged) return { ok: false, requirement, error: '启用 Extreme 前必须勾选高风险确认' };
 		if (String(extremeTypedName || '').trim() !== String(siteName || '').trim()) return { ok: false, requirement, error: '启用 Extreme 时必须准确输入站点名称' };
@@ -571,19 +565,12 @@ function confirmDynamicProfileChange(initialPolicy, nextPolicy, siteName, extrem
 function renderDynamicEnableControl(capabilities, policy) {
 	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
 	const dynamicPolicy = normalizeDynamicSitePolicy(policy);
-	const sources = new Set(dynamicPolicy.dynamic_discovery_sources);
-	const allowedSources = new Set(dynamicSourcesForProfile(dynamicPolicy.dynamic_profile));
-	const policyEditable = dynamicCapabilities.recognized && dynamicCapabilities.available;
 	const enableEditable = dynamicCapabilities.recognized && (dynamicCapabilities.available || dynamicPolicy.dynamic_discovery_enabled);
 	return `
 		<label style="display:flex;gap:8px;align-items:center;margin-top:10px">
           <input type="checkbox" id="m-dynamic-enabled" ${dynamicPolicy.dynamic_discovery_enabled ? 'checked' : ''} ${enableEditable ? '' : 'disabled'}>
-		  启用自动播放后端发现
+		  启用自动发现（推荐）
 		</label>
-		<div class="form-help">Safe 仅启用严格 HTTP 30x 与 PlaybackInfo；Compatible 可增加严格 HLS/DASH；Extreme 额外支持全数据面重定向、受限请求体重放及有界协议扩展，但不扫描 HTML/JavaScript 或 prose 子串。</div>
-		<div id="m-dynamic-sources" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:10px">
-		  ${DYNAMIC_SOURCE_IDS.map(source => `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="m-dynamic-source-${esc(source)}" data-dynamic-source="${esc(source)}" ${sources.has(source) ? 'checked' : ''} ${policyEditable && allowedSources.has(source) ? '' : 'disabled'}>${esc(DYNAMIC_SOURCE_LABELS[source])}</label>`).join('')}
-		</div>
 	`;
 }
 
@@ -780,10 +767,16 @@ async function showSiteModal(site) {
 	}
 	const hostOnlyAvailable = siteCapabilities.host_only_available;
 	const upstreamHeadersAvailable = siteCapabilities.upstream_headers_available;
-	const maxPlaybackAddresses = siteCapabilities.max_playback_addresses;
 	const dynamicCapabilities = await loadDynamicProfiles();
-	const dynamicPolicy = normalizeDynamicSitePolicy(site);
-	const dynamicPolicyEditable = dynamicCapabilities.recognized && dynamicCapabilities.available;
+	const dynamicPolicy = normalizeDynamicSitePolicy(isEdit ? site : {
+		dynamic_discovery_enabled: dynamicCapabilities.available,
+		dynamic_profile: 'compatible',
+		dynamic_discovery_sources: DEFAULT_DYNAMIC_SOURCE_IDS,
+		dynamic_domain_rules: [],
+		dynamic_allow_https_downgrade: false,
+	});
+	const initialDynamicProfile = dynamicPolicy.dynamic_profile === 'extreme' ? 'extreme' : 'compatible';
+	const selectedDynamicSources = new Set(dynamicPolicy.dynamic_discovery_sources);
 
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
@@ -795,20 +788,6 @@ async function showSiteModal(site) {
       <label>主回源地址</label>
       <input type="text" class="form-input" id="m-target" value="${isEdit ? esc(site.target_url) : ''}" placeholder="如：192.168.1.10:8096 或 https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required>
       <div class="form-help">网页、API 和默认回源都走这里。未写协议时，:443 自动使用 HTTPS，其他端口默认 HTTP。</div>
-    </div>
-    <div class="form-group">
-      <label>播放回源列表（可选，留空跟随主回源）</label>
-      <div id="m-playback-list"></div>
-      <button type="button" class="btn-ghost" id="m-add-playback" style="margin-top:6px;font-size:13px">+ 添加播放回源</button>
-      <div class="form-help">第一个地址是实际播放回源；额外地址仅作为重定向模式的允许列表，不会自动探测、轮询或故障转移（最多 ${maxPlaybackAddresses} 个）。未写协议时，:443 自动使用 HTTPS。</div>
-    </div>
-    <div class="form-group" id="playback-mode-group" style="display:none">
-      <label>播放模式</label>
-      <select class="form-select modal-select" id="m-playback-mode">
-        <option value="direct" ${(!isEdit || site.playback_mode !== 'redirect') ? 'selected' : ''}>直连分流</option>
-        <option value="redirect" ${isEdit && site.playback_mode === 'redirect' ? 'selected' : ''}>重定向跟随</option>
-      </select>
-      <div class="form-help">直连分流：播放请求直接发送到首个播放回源（适合完整 Emby 实例）。重定向跟随：所有请求经主回源，自动跟随重定向到任一播放回源（适合多节点 CDN）。</div>
     </div>
 	<div class="form-group">
 	  <label>入口模式</label>
@@ -854,35 +833,30 @@ async function showSiteModal(site) {
       <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
     </div>
     <div class="form-group">
-      <label>自动播放后端发现策略</label>
+      <label>自动发现</label>
       ${renderDynamicStatus(dynamicCapabilities)}
       ${renderDynamicEnableControl(dynamicCapabilities, dynamicPolicy)}
-      <fieldset id="m-dynamic-policy-fields" ${dynamicPolicyEditable ? '' : 'disabled'} style="border:0;padding:0;margin:0;min-width:0">
-      <label for="m-dynamic-profile" style="display:block;margin-top:12px">安全配置</label>
-      <select class="form-select modal-select" id="m-dynamic-profile">
-        ${renderDynamicProfileOptions(dynamicCapabilities, dynamicPolicy.dynamic_profile)}
-      </select>
-      <div id="m-dynamic-profile-risk" style="margin-top:8px">${renderDynamicProfileRisk(dynamicPolicy.dynamic_profile)}</div>
-      <div id="m-dynamic-extreme-confirm" hidden style="margin-top:10px;padding:10px;border:1px solid var(--red);border-radius:8px;background:var(--red-dim)">
-        <label style="display:flex;gap:8px;align-items:flex-start;color:var(--red)">
-          <input type="checkbox" id="m-dynamic-extreme-ack">
-          我理解 Extreme 会扩大协议兼容与公网发现边界，并可能按 30x 将有界请求体重放到经校验的公网目标
-        </label>
-        <input type="text" class="form-input" id="m-dynamic-extreme-name" placeholder="输入站点名称以确认" maxlength="100" autocomplete="off" style="margin-top:8px">
-      </div>
-      ${renderDynamicProfileSummaries(dynamicCapabilities)}
-      <label style="display:block;margin-top:12px">允许域名规则</label>
-      <div id="m-dynamic-rules"></div>
-      <button type="button" class="btn-ghost" id="m-add-dynamic-rule" style="margin-top:6px;font-size:13px">+ 添加域名规则</button>
-      <div class="form-help">精确规则只允许该域名；后缀规则允许该域名及其子域名。请分开选择类型，不要填写通配符、协议、端口、路径或目标 URL。</div>
-      <div class="form-help">前端检查仅用于提前发现误配；所有规则仍由服务器重新规范化、校验并执行，界面不是安全策略边界。</div>
-      <label style="display:flex;gap:8px;align-items:center;margin-top:12px">
-        <input type="checkbox" id="m-dynamic-downgrade" ${dynamicPolicy.dynamic_allow_https_downgrade ? 'checked' : ''}>
-        允许动态目标从 HTTPS 降级到 HTTP
-      </label>
-      <div class="form-help">此项控制所有发现来源中的 HTTPS 到 HTTP 降级；目标仍须通过服务器的完整安全策略。</div>
-      <div class="form-help">策略修订：${esc(dynamicPolicy.dynamic_policy_revision)}（由服务器管理，仅在策略实际变化时递增）</div>
-      </fieldset>
+      <div class="form-help">默认来源：HTTP 30x、PlaybackInfo</div>
+      <details style="margin-top:12px;padding:10px 12px;border:1px solid var(--glass-border);border-radius:8px;background:var(--surface-hover)">
+        <summary style="cursor:pointer;font-weight:700">高级选项（播放失败时再开启）</summary>
+        <fieldset ${dynamicCapabilities.recognized ? '' : 'disabled'} style="border:0;padding:0;margin:12px 0 0;min-width:0">
+          <div style="display:flex;flex-wrap:wrap;gap:12px">
+            ${ADVANCED_DYNAMIC_SOURCE_IDS.map(source => `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="m-dynamic-source-${esc(source)}" ${selectedDynamicSources.has(source) ? 'checked' : ''}>启用 ${esc(DYNAMIC_SOURCE_LABELS[source])} 解析</label>`).join('')}
+          </div>
+          <label for="m-dynamic-profile" style="display:block;margin-top:12px">兼容模式</label>
+          <select class="form-select modal-select" id="m-dynamic-profile">
+            ${renderDynamicProfileOptions(dynamicCapabilities, initialDynamicProfile)}
+          </select>
+          <div id="m-dynamic-profile-risk" style="margin-top:8px">${renderDynamicProfileRisk(initialDynamicProfile)}</div>
+          <div id="m-dynamic-extreme-confirm" hidden style="margin-top:10px;padding:10px;border:1px solid var(--red);border-radius:8px;background:var(--red-dim)">
+            <label style="display:flex;gap:8px;align-items:flex-start;color:var(--red)">
+              <input type="checkbox" id="m-dynamic-extreme-ack">
+              我理解 Extreme 会扩大协议兼容与公网发现边界，并可能按 30x 将有界请求体重放到经校验的公网目标
+            </label>
+            <input type="text" class="form-input" id="m-dynamic-extreme-name" placeholder="输入站点名称以确认" maxlength="100" autocomplete="off" style="margin-top:8px">
+          </div>
+        </fieldset>
+      </details>
       ${isEdit ? renderDynamicObservationsPanel(dynamicCapabilities.recognized) : ''}
     </div>
 
@@ -945,26 +919,12 @@ async function showSiteModal(site) {
 
 	const dynamicEnabledInput = document.getElementById('m-dynamic-enabled');
 	const dynamicProfileSelect = document.getElementById('m-dynamic-profile');
-	const dynamicDowngradeInput = document.getElementById('m-dynamic-downgrade');
-	const dynamicSourceInputs = DYNAMIC_SOURCE_IDS.map(source => document.getElementById(`m-dynamic-source-${source}`));
-	const dynamicRulesContainer = document.getElementById('m-dynamic-rules');
+	dynamicProfileSelect.value = initialDynamicProfile;
+	const dynamicAdvancedSourceInputs = ADVANCED_DYNAMIC_SOURCE_IDS.map(source => document.getElementById(`m-dynamic-source-${source}`));
 	const dynamicProfileRiskContainer = document.getElementById('m-dynamic-profile-risk');
 	const dynamicExtremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
 	const dynamicExtremeAcknowledged = document.getElementById('m-dynamic-extreme-ack');
 	const dynamicExtremeTypedName = document.getElementById('m-dynamic-extreme-name');
-	function updateDynamicSourceAvailability() {
-		if (!dynamicPolicyEditable) {
-			dynamicSourceInputs.forEach(input => { input.disabled = true; });
-			return;
-		}
-		const allowed = new Set(dynamicSourcesForProfile(dynamicProfileSelect.value));
-		dynamicSourceInputs.forEach((input, index) => {
-			const sourceAllowed = allowed.has(DYNAMIC_SOURCE_IDS[index]);
-			input.disabled = !sourceAllowed;
-			if (!sourceAllowed) input.checked = false;
-		});
-	}
-
 
 	function updateDynamicProfileRisk() {
 		dynamicProfileRiskContainer.innerHTML = renderDynamicProfileRisk(dynamicProfileSelect.value);
@@ -981,38 +941,10 @@ async function showSiteModal(site) {
 	dynamicProfileSelect.addEventListener('change', () => {
 		dynamicExtremeAcknowledged.checked = false;
 		dynamicExtremeTypedName.value = '';
-		updateDynamicSourceAvailability();
 		updateDynamicProfileRisk();
 	});
 	dynamicEnabledInput.addEventListener('change', updateDynamicProfileRisk);
-	updateDynamicSourceAvailability();
 	updateDynamicProfileRisk();
-	let dynamicRules = dynamicPolicy.dynamic_domain_rules.map(rule => ({ ...rule }));
-	if (dynamicRules.length === 0) dynamicRules.push({ type: 'exact', value: '' });
-
-	function renderDynamicRules() {
-		dynamicRulesContainer.innerHTML = renderDynamicRuleRows(dynamicRules);
-		dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-type').forEach(input => {
-			input.onchange = () => { dynamicRules[Number(input.dataset.idx)].type = input.value; };
-		});
-		dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-value').forEach(input => {
-			input.oninput = () => { dynamicRules[Number(input.dataset.idx)].value = input.value; };
-		});
-		dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-remove').forEach(button => {
-			button.onclick = () => {
-				dynamicRules.splice(Number(button.dataset.idx), 1);
-				renderDynamicRules();
-			};
-		});
-	}
-	renderDynamicRules();
-
-	document.getElementById('m-add-dynamic-rule').onclick = () => {
-		dynamicRules.push({ type: 'exact', value: '' });
-		renderDynamicRules();
-		const inputs = dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-value');
-		if (inputs.length) inputs[inputs.length - 1].focus();
-	};
 
 	const dynamicObservationsContainer = isEdit ? document.getElementById('m-dynamic-observations') : null;
 	const refreshDynamicObservationsButton = isEdit ? document.getElementById('m-refresh-dynamic-observations') : null;
@@ -1064,61 +996,6 @@ async function showSiteModal(site) {
 		};
 	}
 
-  // Build initial playback list from existing data
-  const listContainer = document.getElementById('m-playback-list');
-  const modeGroup = document.getElementById('playback-mode-group');
-  const addPlaybackButton = document.getElementById('m-add-playback');
-  let existingHosts = [];
-  if (isEdit) {
-    if ((site.playback_target_url || '').trim()) existingHosts.push(site.playback_target_url.trim());
-    for (const host of normalizeStreamHosts(site.stream_hosts)) existingHosts.push(host);
-  }
-  if (existingHosts.length === 0) existingHosts = [''];
-
-  function updatePlaybackAddState() {
-    const canAdd = canAddPlaybackAddress(existingHosts.length, maxPlaybackAddresses);
-    addPlaybackButton.disabled = !canAdd;
-    addPlaybackButton.title = canAdd ? '' : `每个站点最多配置 ${maxPlaybackAddresses} 个播放回源`;
-  }
-
-  function renderPlaybackInputs() {
-    listContainer.innerHTML = existingHosts.map((val, idx) => `
-      <div style="display:flex;gap:6px;margin-bottom:6px;align-items:center">
-        <input type="text" class="form-input m-pb-input" value="${esc(val)}" placeholder="${idx === 0 ? '主播放回源地址' : '额外播放回源地址'}" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" style="flex:1">
-        ${existingHosts.length > 1 ? `<button type="button" class="btn-ghost danger m-pb-remove" data-idx="${idx}" style="padding:4px 8px;font-size:13px;flex-shrink:0">删除</button>` : ''}
-      </div>
-    `).join('');
-    listContainer.querySelectorAll('.m-pb-remove').forEach(btn => {
-      btn.onclick = () => {
-        existingHosts.splice(parseInt(btn.dataset.idx), 1);
-        renderPlaybackInputs();
-        toggleModeGroup();
-      };
-    });
-    listContainer.querySelectorAll('.m-pb-input').forEach((inp, idx) => {
-      inp.oninput = () => { existingHosts[idx] = inp.value; toggleModeGroup(); };
-    });
-    updatePlaybackAddState();
-  }
-  renderPlaybackInputs();
-
-  addPlaybackButton.onclick = () => {
-    if (!canAddPlaybackAddress(existingHosts.length, maxPlaybackAddresses)) {
-      Toast.error(`每个站点最多配置 ${maxPlaybackAddresses} 个播放回源`);
-      return;
-    }
-    existingHosts.push('');
-    renderPlaybackInputs();
-    const inputs = listContainer.querySelectorAll('.m-pb-input');
-    if (inputs.length) inputs[inputs.length - 1].focus();
-  };
-
-  function toggleModeGroup() {
-    const hasAny = existingHosts.some(h => h.trim());
-    modeGroup.style.display = hasAny ? '' : 'none';
-  }
-  toggleModeGroup();
-
   const upstreamHeadersContainer = document.getElementById('m-upstream-headers');
   let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers)
     ? site.upstream_headers.map(header => ({ name: header.name || '', value: '', configured: !!header.configured }))
@@ -1158,11 +1035,6 @@ async function showSiteModal(site) {
   };
 
   document.getElementById('m-submit').onclick = async () => {
-    const allHosts = existingHosts.map(h => h.trim()).filter(Boolean);
-    if (allHosts.length > maxPlaybackAddresses) {
-      Toast.error(`每个站点最多配置 ${maxPlaybackAddresses} 个播放回源`);
-      return;
-    }
     const uaMode = uaSelect.value;
     const customUAPayload = buildCustomUAPayload(
       uaMode,
@@ -1178,9 +1050,9 @@ async function showSiteModal(site) {
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
 	      target_url: document.getElementById('m-target').value.trim(),
-      playback_target_url: allHosts.length > 0 ? allHosts[0] : '',
-      playback_mode: document.getElementById('m-playback-mode').value,
-		stream_hosts: allHosts.length > 1 ? allHosts.slice(1) : [],
+      playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
+      playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
+		stream_hosts: isEdit ? normalizeStreamHosts(site.stream_hosts) : [],
 			...ingressPayload,
 		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),
       ua_mode: uaMode,
@@ -1188,9 +1060,12 @@ async function showSiteModal(site) {
       ...buildDynamicPolicyPayload({
         dynamic_discovery_enabled: dynamicEnabledInput.checked,
         dynamic_profile: dynamicProfileSelect.value,
-		  dynamic_discovery_sources: DYNAMIC_SOURCE_IDS.filter((source, index) => dynamicSourceInputs[index].checked),
-        dynamic_domain_rules: dynamicRules,
-        dynamic_allow_https_downgrade: dynamicDowngradeInput.checked,
+		  dynamic_discovery_sources: [
+			...DEFAULT_DYNAMIC_SOURCE_IDS,
+			...ADVANCED_DYNAMIC_SOURCE_IDS.filter((source, index) => dynamicAdvancedSourceInputs[index].checked),
+		  ],
+        dynamic_domain_rules: dynamicPolicy.dynamic_domain_rules,
+        dynamic_allow_https_downgrade: dynamicPolicy.dynamic_allow_https_downgrade,
       }, dynamicCapabilities),
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
@@ -1200,14 +1075,6 @@ async function showSiteModal(site) {
 	      Toast.error('请填写所有必填项');
 	      return;
 	    }
-	  if (data.dynamic_discovery_enabled && data.dynamic_discovery_sources.length === 0) {
-		Toast.error('启用自动播放后端发现时，至少选择一种发现来源');
-		return;
-	  }
-	  if (data.dynamic_discovery_enabled && !hasRequiredSafeDynamicRules(data.dynamic_profile, data.dynamic_domain_rules)) {
-		Toast.error('启用 Safe 安全配置时，至少需要一条有效的精确或后缀 DNS 域名规则');
-		return;
-	  }
 	  const profileConfirmation = confirmDynamicProfileChange(
 		dynamicPolicy,
 		data,
