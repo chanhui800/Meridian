@@ -1319,6 +1319,7 @@ migrate_managed_nginx_redaction() {
         return 1
     fi
 
+    # shellcheck disable=SC2016
     if as_root awk '
         /^[[:space:]]*large_client_header_buffers[[:space:]]/ {
             line=$0
