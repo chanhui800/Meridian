@@ -1884,7 +1884,7 @@ func (d *DB) migrateOnce() error {
 		dynamic_profile TEXT NOT NULL DEFAULT 'compatible',
 		dynamic_discovery_sources TEXT NOT NULL DEFAULT '["redirect","playback_info"]',
 		dynamic_domain_rules TEXT NOT NULL DEFAULT '[]',
-		dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 0,
+		dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 1,
 		dynamic_policy_revision INTEGER NOT NULL DEFAULT 1,
 		enabled INTEGER DEFAULT 1,
 		traffic_quota BIGINT DEFAULT 0,
@@ -1928,7 +1928,7 @@ func (d *DB) migrateOnce() error {
 		{"dynamic_profile", "ALTER TABLE sites ADD COLUMN dynamic_profile TEXT NOT NULL DEFAULT 'safe'"},
 		{"dynamic_discovery_sources", "ALTER TABLE sites ADD COLUMN dynamic_discovery_sources TEXT NOT NULL DEFAULT '[\"redirect\"]'"},
 		{"dynamic_domain_rules", "ALTER TABLE sites ADD COLUMN dynamic_domain_rules TEXT NOT NULL DEFAULT '[]'"},
-		{"dynamic_allow_https_downgrade", "ALTER TABLE sites ADD COLUMN dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 0"},
+		{"dynamic_allow_https_downgrade", "ALTER TABLE sites ADD COLUMN dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 1"},
 		{"dynamic_policy_revision", "ALTER TABLE sites ADD COLUMN dynamic_policy_revision INTEGER NOT NULL DEFAULT 1"},
 	} {
 		exists, err := sqliteColumnExists(ctx, conn, migration.column)
