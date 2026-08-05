@@ -479,6 +479,7 @@ test('new site submission uses core discovery and no manual playback origins', a
   assert.equal(state.creates[0].dynamic_discovery_enabled, true);
   assert.equal(state.creates[0].dynamic_profile, 'compatible');
   assert.deepEqual(state.creates[0].dynamic_discovery_sources, ['redirect', 'playback_info']);
+  assert.equal(state.creates[0].dynamic_allow_https_downgrade, true);
 });
 
 test('enabled discovery policy normalizes sources and rules and omits the response-only revision', () => {

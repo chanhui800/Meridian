@@ -314,7 +314,7 @@ Meridian/
 
 全进程还共享 16,384 个 authority、131,072 个 active capability、256 MiB capability registry 内存、1,024 条动态流、每分钟 2,400 个新 authority、32 个 DNS worker、8 个并发正文解析、256 MiB 解析内存；每站 capability registry 和解析内存分别最多 64 MiB、同时最多解析 2 个响应。表内正文上限是各 profile 的协议上限；结构化解析还取更严格的 8 MiB 输入、16 MiB 输出硬上限与实际 profile 上限中的最小值，并按已知长度或最坏情况预留输入、对象树和输出的完整工作集。解析同时执行读取时限、异常压缩比、JSON token/深度/字符串、HLS 行、XML 节点和 URL 数量限制。队列或容量满时失败关闭，不阻塞其他媒体流。
 
-**兼容模式与 HTTPS 降级。** Compatible 是管理界面的默认推荐档，允许通过完整 DNS/SSRF/固定拨号校验的公网 HTTP/HTTPS 域名和有效端口。Extreme 只放在高级选项中，启用时仍要求额外风险确认。Safe 作为旧数据库/API 兼容档继续存在：启用时至少需要一条 `exact` 或 `suffix` DNS 规则，不接受 IP literal。HTTPS 到 HTTP 默认拒绝；Safe 永远只允许 HTTPS:443，Compatible/Extreme 也只有策略显式允许时才能通过。
+**兼容模式与 HTTPS 降级。** Compatible 是管理界面的默认推荐档，允许通过完整 DNS/SSRF/固定拨号校验的公网 HTTP/HTTPS 域名和有效端口。Extreme 只放在高级选项中，启用时仍要求额外风险确认。Safe 作为旧数据库/API 兼容档继续存在：启用时至少需要一条 `exact` 或 `suffix` DNS 规则，不接受 IP literal。新建站点默认允许 HTTPS 到 HTTP 降级，以兼容只提供 HTTP 播放地址的后端；Safe 永远只允许 HTTPS:443。
 
 **URL、DNS、SSRF 与固定拨号。** 动态 URL 最长 4096 字节，仅接受无 userinfo、fragment、空白或控制字符的绝对 HTTP(S) URL。DNS 的全部 A/AAAA 都必须是允许的全球单播地址；混入私网、回环、链路本地、CGNAT、metadata、文档、保留、组播、转换地址即整组拒绝，同时拒绝已知面板/站点目标和本机接口。本机 interface IP 除配置快照外，还会在 DNS 结果校验、transport 构造和每次 pinned dial 前重新枚举；枚举失败会失败关闭，运行时新分配的公网 IP 也不能成为动态目标。校验后的 IP 固定到本次直拨 transport，不使用环境代理或二次 DNS；HTTPS 保留原 Host/SNI、验证系统证书链并要求 TLS 1.2 以上。NAT hairpin、公网别名和外部负载均衡回流仍需部署侧防火墙阻断。
 

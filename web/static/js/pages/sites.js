@@ -773,7 +773,7 @@ async function showSiteModal(site) {
 		dynamic_profile: 'compatible',
 		dynamic_discovery_sources: DEFAULT_DYNAMIC_SOURCE_IDS,
 		dynamic_domain_rules: [],
-		dynamic_allow_https_downgrade: false,
+		dynamic_allow_https_downgrade: true,
 	});
 	const initialDynamicProfile = dynamicPolicy.dynamic_profile === 'extreme' ? 'extreme' : 'compatible';
 	const selectedDynamicSources = new Set(dynamicPolicy.dynamic_discovery_sources);
