@@ -1150,6 +1150,14 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
+	for _, snippet := range []string{`id="mobile-version"`, `id="mobile-logout"`} {
+		if !strings.Contains(string(indexHTML), snippet) {
+			t.Errorf("mobile header is missing %q", snippet)
+		}
+	}
+	if !strings.Contains(string(appJS), "document.getElementById('mobile-logout').addEventListener('click', logoutApp)") {
+		t.Error("mobile logout must share the authenticated logout flow")
+	}
 	for _, asset := range []string{"/js/theme.js?v=1.8.4", "/css/style.css?v=1.8.4", "/js/pages/sites.js?v=1.8.4", "/js/pages/request-logs.js?v=1.8.4", "/js/app.js?v=1.8.4"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
@@ -4386,7 +4394,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
 		"dynamic_policy_revision": true,
 		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
-		"asset_cache_max_bytes": true, "asset_cache_rules": true,
+		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,
 	}
 	if len(raw) != 2 {
 		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())

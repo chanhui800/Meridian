@@ -172,6 +172,92 @@ func (c *assetCache) openRoot(create bool) (*os.Root, error) {
 	return os.OpenRoot(c.dir)
 }
 
+// sizeBySite reports the bytes occupied by cached response bodies. Metadata
+// files are intentionally excluded so the panel matches the configured cache
+// budget, which is also enforced against response body sizes.
+func (c *assetCache) sizeBySite() (map[int64]int64, int64, error) {
+	sizes := make(map[int64]int64)
+	if c == nil {
+		return sizes, 0, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	root, err := c.openRoot(false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return sizes, 0, nil
+		}
+		return nil, 0, err
+	}
+	defer root.Close()
+
+	var total int64
+	err = fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".body") {
+			return nil
+		}
+		parts := strings.SplitN(filepath.ToSlash(path), "/", 2)
+		if len(parts) != 2 {
+			return nil
+		}
+		siteID, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || siteID <= 0 {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() < 0 {
+			return fmt.Errorf("cache file %q has an invalid size", path)
+		}
+		sizes[siteID] += info.Size()
+		total += info.Size()
+		return nil
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, 0, err
+	}
+	return sizes, total, nil
+}
+
+// clear removes only entries beneath the configured asset-cache root. The
+// root directory itself remains available for subsequent cache writes.
+func (c *assetCache) clear() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	root, err := c.openRoot(false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer root.Close()
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit, error) {
 	if c == nil || req == nil {
 		return nil, nil

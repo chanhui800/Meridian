@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,87 @@ func TestAssetCacheEvictsLeastRecentlyUsedEntryPerSite(t *testing.T) {
 	}
 	if _, err := os.Stat(newest.bodyPath); err != nil {
 		t.Fatalf("newest body should remain: %v", err)
+	}
+}
+
+func TestAssetCacheSizeBySiteAndClear(t *testing.T) {
+	cache := newAssetCache(t.TempDir())
+	response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/jpeg"}}}
+	now := time.Now()
+
+	write := func(siteID int64, name, body string) {
+		t.Helper()
+		site := Site{ID: siteID, AssetCacheEnabled: true, AssetCacheTTLSec: 3600, AssetCacheMaxBytes: 16 << 20, AssetCacheRules: "*/file/*"}
+		target, _ := url.Parse("https://media.example/file/" + name + ".jpg")
+		request := httptest.NewRequest(http.MethodGet, "https://proxy.example/file/"+name+".jpg", nil)
+		if err := cache.write(site, cache.request(site, request, target), response, []byte(body), now); err != nil {
+			t.Fatalf("write site %d: %v", siteID, err)
+		}
+	}
+
+	write(11, "one", "12345")
+	write(11, "two", "123")
+	write(12, "three", "1234567")
+	sizes, total, err := cache.sizeBySite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizes[11] != 8 || sizes[12] != 7 || total != 15 {
+		t.Fatalf("sizes=%v total=%d, want site 11=8 site 12=7 total=15", sizes, total)
+	}
+	if err := cache.clear(); err != nil {
+		t.Fatal(err)
+	}
+	sizes, total, err = cache.sizeBySite()
+	if err != nil || len(sizes) != 0 || total != 0 {
+		t.Fatalf("after clear sizes=%v total=%d err=%v", sizes, total, err)
+	}
+
+	missing := newAssetCache(filepath.Join(t.TempDir(), "missing"))
+	if _, total, err := missing.sizeBySite(); err != nil || total != 0 {
+		t.Fatalf("missing cache statistics total=%d err=%v", total, err)
+	}
+	if err := missing.clear(); err != nil {
+		t.Fatalf("clear missing cache: %v", err)
+	}
+}
+
+func TestHandleAssetCacheReportsAndClearsCache(t *testing.T) {
+	app := newTestApp(t)
+	cache := newAssetCache(t.TempDir())
+	app.pm.SetAssetCache(cache)
+	site := Site{ID: 21, AssetCacheEnabled: true, AssetCacheTTLSec: 3600, AssetCacheMaxBytes: 16 << 20, AssetCacheRules: "*/file/*"}
+	target, _ := url.Parse("https://media.example/file/poster.jpg")
+	request := httptest.NewRequest(http.MethodGet, "https://proxy.example/file/poster.jpg", nil)
+	response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/jpeg"}}}
+	if err := cache.write(site, cache.request(site, request, target), response, []byte("poster"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	get := httptest.NewRecorder()
+	app.handleAssetCache(get, httptest.NewRequest(http.MethodGet, "/api/asset-cache", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s", get.Code, get.Body.String())
+	}
+	var stats struct {
+		TotalBytes int64            `json:"total_bytes"`
+		Sites      map[string]int64 `json:"sites"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalBytes != 6 || stats.Sites["21"] != 6 {
+		t.Fatalf("stats=%+v, want total/site=6", stats)
+	}
+
+	deleted := httptest.NewRecorder()
+	app.handleAssetCache(deleted, httptest.NewRequest(http.MethodDelete, "/api/asset-cache", nil))
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("DELETE status=%d body=%s", deleted.Code, deleted.Body.String())
+	}
+	_, total, err := cache.sizeBySite()
+	if err != nil || total != 0 {
+		t.Fatalf("cache after DELETE total=%d err=%v", total, err)
 	}
 }
 

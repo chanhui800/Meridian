@@ -10402,6 +10402,26 @@ func (pm *ProxyManager) SetAssetCache(cache *assetCache) {
 	pm.mu.Unlock()
 }
 
+func (pm *ProxyManager) AssetCacheSizes() (map[int64]int64, int64, error) {
+	pm.mu.RLock()
+	cache := pm.assetCache
+	pm.mu.RUnlock()
+	if cache == nil {
+		return map[int64]int64{}, 0, nil
+	}
+	return cache.sizeBySite()
+}
+
+func (pm *ProxyManager) ClearAssetCache() error {
+	pm.mu.RLock()
+	cache := pm.assetCache
+	pm.mu.RUnlock()
+	if cache == nil {
+		return nil
+	}
+	return cache.clear()
+}
+
 func (pm *ProxyManager) DynamicDiscoveryAvailable() bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -14286,15 +14306,21 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		// non-traffic field keeps its DB value. One pm.mu read lock covers the
 		// whole map, so there is no N+1 lock handoff per site.
 		live := a.pm.LiveSiteTraffic(sites)
+		cacheSizes, _, err := a.pm.AssetCacheSizes()
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "cache statistics unavailable")
+			return
+		}
 		// Add running status
 		type SiteWithStatus struct {
 			Site
-			Running bool `json:"running"`
+			Running        bool  `json:"running"`
+			CacheSizeBytes int64 `json:"cache_size_bytes"`
 		}
 		result := make([]SiteWithStatus, len(sites))
 		for i, s := range sites {
 			st := live[s.ID]
-			result[i] = SiteWithStatus{Site: s, Running: st.Running}
+			result[i] = SiteWithStatus{Site: s, Running: st.Running, CacheSizeBytes: cacheSizes[s.ID]}
 			result[i].TrafficUsed = st.TrafficUsed
 		}
 		a.jsonOK(w, result)
@@ -14997,6 +15023,28 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	a.jsonOK(w, history.Logs)
 }
 
+// GET/DELETE /api/asset-cache
+func (a *App) handleAssetCache(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.Method {
+	case http.MethodGet:
+		sites, total, err := a.pm.AssetCacheSizes()
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "cache statistics unavailable")
+			return
+		}
+		a.jsonOK(w, map[string]interface{}{"total_bytes": total, "sites": sites})
+	case http.MethodDelete:
+		if err := a.pm.ClearAssetCache(); err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "clear asset cache failed")
+			return
+		}
+		a.jsonOK(w, map[string]string{"status": "cleared"})
+	default:
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
 // GET/DELETE /api/request-logs
 func (a *App) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -15371,6 +15419,7 @@ func main() {
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
+	mux.HandleFunc("/api/asset-cache", cors(app.authMiddleware(app.handleAssetCache)))
 	mux.HandleFunc("/api/request-logs", cors(app.authMiddleware(app.handleRequestLogs)))
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
 	mux.HandleFunc("/api/dynamic-profiles", cors(app.authMiddleware(app.handleDynamicProfiles)))

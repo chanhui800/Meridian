@@ -307,7 +307,7 @@ test('logout tears down the traffic refresh timer', async () => {
   const elementIds = [
     'page-login', 'app-shell', 'login-footer', 'btn-login', 'setup-token-group',
     'setup-token-input', 'inp-setup-token', 'modal-overlay', 'modal-close',
-    'loginForm', 'avatar-btn', 'avatar-initial', 'sidebar-username', 'sidebar-version', 'inp-username', 'inp-password',
+    'loginForm', 'avatar-btn', 'mobile-logout', 'avatar-initial', 'sidebar-username', 'sidebar-version', 'mobile-version', 'inp-username', 'inp-password',
   ];
   const elements = {};
   const listeners = {};
@@ -415,6 +415,7 @@ test('site list populates the select and auto-loads the chart for the first site
 test('dashboard table paints live traffic_used and the running badge from one /api/sites request', async () => {
   const elements = {
     'dash-table': makeElement('dash-table'),
+    's-cache': makeElement('s-cache'),
   };
   const calls = [];
   const sandbox = {
@@ -425,8 +426,8 @@ test('dashboard table paints live traffic_used and the running badge from one /a
     fetch: async (url) => {
       calls.push(String(url));
       return okJson([
-        { id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 1048576 },
-        { id: 2, name: 'Beta', target_url: 'http://b.example', ua_mode: 'web', listen_port: 8002, running: false, traffic_used: 0 },
+        { id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 1048576, cache_size_bytes: 2048 },
+        { id: 2, name: 'Beta', target_url: 'http://b.example', ua_mode: 'web', listen_port: 8002, running: false, traffic_used: 0, cache_size_bytes: 1024 },
       ]);
     },
     Router: { current: 'dashboard' },
@@ -444,5 +445,7 @@ test('dashboard table paints live traffic_used and the running badge from one /a
   const html = elements['dash-table'].innerHTML;
   assert.ok(html.includes('Alpha') && html.includes('Beta'), 'every site must be rendered');
   assert.ok(html.includes(sandbox.formatBytes(1048576)), 'the authoritative traffic_used must be formatted into the row');
+  assert.ok(html.includes(sandbox.formatBytes(2048)), 'each site cache size must be formatted into the row');
+  assert.equal(elements['s-cache'].textContent, sandbox.formatBytes(3072), 'the dashboard cache card must sum every site');
   assert.ok(html.includes('运行中') && html.includes('已停止'), 'the running flag must drive the status badge');
 });

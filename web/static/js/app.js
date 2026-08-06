@@ -223,8 +223,11 @@
     const username = document.getElementById('sidebar-username');
     if (username) username.textContent = API.username || '管理员';
     API.ingressCapabilities().then(capabilities => {
-      const version = document.getElementById('sidebar-version');
-      if (version && capabilities && capabilities.app_version) version.textContent = capabilities.app_version;
+      if (!capabilities || !capabilities.app_version) return;
+      ['sidebar-version', 'mobile-version'].forEach(id => {
+        const version = document.getElementById(id);
+        if (version) version.textContent = capabilities.app_version;
+      });
     }).catch(() => {});
 
     if (!appBootstrapped) {
@@ -252,7 +255,7 @@
     document.body.classList.remove('auth-checking');
   }
 
-  document.getElementById('avatar-btn').addEventListener('click', async function() {
+  async function logoutApp() {
     if (!confirm('确认退出登录？')) return;
 
     teardownAppRuntime();
@@ -262,7 +265,10 @@
     showLoginMode();
     document.getElementById('inp-password').value = '';
     Toast.info('已退出登录');
-  });
+  }
+
+  document.getElementById('avatar-btn').addEventListener('click', logoutApp);
+  document.getElementById('mobile-logout').addEventListener('click', logoutApp);
 
   checkAuth();
 })();
