@@ -8820,7 +8820,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			dynamicPolicy:           i.policy,
 			dynamicTransportFactory: i.transportFactory,
 			dynamicState:            i.state,
-			capabilityIssuer:         i,
+			capabilityIssuer:        i,
 			streamLeaseHeld:         true,
 			database:                i.database,
 			siteID:                  i.siteID,
@@ -8953,7 +8953,7 @@ type redirectFollowTransport struct {
 	dynamicTransportFactory dynamicTransportFactory
 	dynamicPolicy           dynamicRedirectPolicy
 	dynamicState            *dynamicSiteState
-	capabilityIssuer         *dynamicCapabilityIssuer
+	capabilityIssuer        *dynamicCapabilityIssuer
 	streamLeaseHeld         bool
 	database                *DB
 	siteID                  int64
@@ -11953,7 +11953,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			dynamicPolicy:           redirectPolicy,
 			dynamicTransportFactory: pm.dynamicTransportFactory,
 			dynamicState:            dynamicState,
-			capabilityIssuer:         dynamicIssuer,
+			capabilityIssuer:        dynamicIssuer,
 			database:                pm.database,
 			siteID:                  site.ID,
 		}
