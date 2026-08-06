@@ -807,7 +807,8 @@ async function showSiteModal(site) {
     <div class="form-group">
       <label>UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
-        <option value="infuse" ${(!isEdit || site.ua_mode === 'infuse') ? 'selected' : ''}>Infuse</option>
+        <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
+        <option value="infuse" ${isEdit && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
         <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
         <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
         <option value="custom">自定义</option>
@@ -868,8 +869,8 @@ async function showSiteModal(site) {
     document.getElementById('m-custom-client'),
     document.getElementById('m-custom-version'),
   ];
-  const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'infuse', site);
-  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'infuse';
+  const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'passthrough', site);
+  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'passthrough';
   customUAInputs[0].value = initialUAState.customUserAgent;
   customUAInputs[1].value = initialUAState.customClient;
   customUAInputs[2].value = initialUAState.customVersion;

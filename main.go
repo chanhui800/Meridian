@@ -1310,6 +1310,7 @@ type DynamicObservationsResponse struct {
 
 const (
 	requestLogCategoryPlayback = "playback"
+	requestLogCategoryVideo    = "video"
 	requestLogCategoryImage    = "image"
 	requestLogCategoryAPI      = "api"
 	requestLogCategoryAuth     = "auth"
@@ -1358,7 +1359,7 @@ type RequestLogsResponse struct {
 
 func validRequestLogCategory(category string) bool {
 	switch category {
-	case requestLogCategoryPlayback, requestLogCategoryImage, requestLogCategoryAPI, requestLogCategoryAuth:
+	case requestLogCategoryPlayback, requestLogCategoryVideo, requestLogCategoryImage, requestLogCategoryAPI, requestLogCategoryAuth:
 		return true
 	default:
 		return false
@@ -2183,7 +2184,7 @@ func (d *DB) migrateOnce() error {
 		playback_target_url TEXT NOT NULL DEFAULT '',
 		playback_mode TEXT NOT NULL DEFAULT 'direct',
 		stream_hosts TEXT NOT NULL DEFAULT '[]',
-		ua_mode TEXT DEFAULT 'infuse',
+		ua_mode TEXT DEFAULT 'passthrough',
 		custom_user_agent TEXT NOT NULL DEFAULT '',
 		custom_client TEXT NOT NULL DEFAULT '',
 		custom_version TEXT NOT NULL DEFAULT '',
@@ -2849,6 +2850,9 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	}
 	if site.StoredUpstreamHeaders == "" {
 		site.StoredUpstreamHeaders = "[]"
+	}
+	if strings.TrimSpace(site.UAMode) == "" {
+		site.UAMode = passthroughUAMode
 	}
 	publicHost, err := normalizePublicHost(site.PublicHost)
 	if err != nil {
@@ -10496,8 +10500,10 @@ func classifyRequestLogResource(r *http.Request) string {
 		return requestLogCategoryAuth
 	case strings.Contains(path, "/images/"), strings.HasSuffix(path, "/images"), strings.Contains(path, "/image/"):
 		return requestLogCategoryImage
-	case isPlaybackRequest(path), isPlaybackRedirectEndpoint(path), isPlaybackInfoRequest(path), dynamicStructuredRequestSource(path) != "", isReservedDynamicRoute(path):
+	case isPlaybackInfoRequest(path):
 		return requestLogCategoryPlayback
+	case isPlaybackRequest(path), isPlaybackRedirectEndpoint(path), dynamicStructuredRequestSource(path) != "", isReservedDynamicRoute(path):
+		return requestLogCategoryVideo
 	default:
 		return requestLogCategoryAPI
 	}
@@ -14184,7 +14190,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if req.UAMode == "" {
-			req.UAMode = "infuse"
+			req.UAMode = passthroughUAMode
 		}
 		if req.PlaybackMode == "" {
 			req.PlaybackMode = "direct"
