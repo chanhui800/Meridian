@@ -78,25 +78,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            suffix: linux-amd64
-          - goos: linux
-            goarch: arm64
-            suffix: linux-arm64
-          - goos: windows
-            goarch: amd64
-            suffix: windows-amd64.exe
-          - goos: darwin
-            goarch: amd64
-            suffix: darwin-amd64
-          - goos: darwin
-            goarch: arm64
-            suffix: darwin-arm64
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -104,18 +85,29 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
+      - name: Build release binaries
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" -o meridian-${{ matrix.suffix }} .
+        run: |
+          set -euo pipefail
+          build() {
+            local goos="$1" goarch="$2" suffix="$3"
+            echo "Building ${goos}/${goarch} -> meridian-${suffix}"
+            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -buildvcs=false \
+              -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" \
+              -o "meridian-${suffix}" .
+          }
+          build linux amd64 linux-amd64
+          build linux arm64 linux-arm64
+          build windows amd64 windows-amd64.exe
+          build darwin amd64 darwin-amd64
+          build darwin arm64 darwin-arm64
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: meridian-${{ matrix.suffix }}
-          path: meridian-${{ matrix.suffix }}
+          name: meridian-release-binaries
+          path: meridian-*
 
   release:
     needs: build
