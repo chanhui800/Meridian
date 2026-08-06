@@ -1064,7 +1064,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.2", "/css/style.css?v=1.8.2", "/js/pages/sites.js?v=1.8.1", "/js/pages/request-logs.js?v=1.8.1", "/js/app.js?v=1.8.1"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.2", "/css/style.css?v=1.8.2", "/js/pages/sites.js?v=1.8.2", "/js/pages/request-logs.js?v=1.8.1", "/js/app.js?v=1.8.1"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}

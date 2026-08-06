@@ -767,17 +767,6 @@ async function showSiteModal(site) {
 	}
 	const hostOnlyAvailable = siteCapabilities.host_only_available;
 	const upstreamHeadersAvailable = siteCapabilities.upstream_headers_available;
-	const dynamicCapabilities = await loadDynamicProfiles();
-	const dynamicPolicy = normalizeDynamicSitePolicy(isEdit ? site : {
-		dynamic_discovery_enabled: dynamicCapabilities.available,
-		dynamic_profile: 'compatible',
-		dynamic_discovery_sources: DEFAULT_DYNAMIC_SOURCE_IDS,
-		dynamic_domain_rules: [],
-		dynamic_allow_https_downgrade: true,
-	});
-	const initialDynamicProfile = dynamicPolicy.dynamic_profile === 'extreme' ? 'extreme' : 'compatible';
-	const selectedDynamicSources = new Set(dynamicPolicy.dynamic_discovery_sources);
-
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
     <div class="form-group">
@@ -833,31 +822,9 @@ async function showSiteModal(site) {
       <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
     </div>
     <div class="form-group">
-      <label>自动发现</label>
-      ${renderDynamicStatus(dynamicCapabilities)}
-      ${renderDynamicEnableControl(dynamicCapabilities, dynamicPolicy)}
-      <div class="form-help">默认来源：HTTP 30x、PlaybackInfo</div>
-      <details style="margin-top:12px;padding:10px 12px;border:1px solid var(--glass-border);border-radius:8px;background:var(--surface-hover)">
-        <summary style="cursor:pointer;font-weight:700">高级选项（播放失败时再开启）</summary>
-        <fieldset ${dynamicCapabilities.recognized ? '' : 'disabled'} style="border:0;padding:0;margin:12px 0 0;min-width:0">
-          <div style="display:flex;flex-wrap:wrap;gap:12px">
-            ${ADVANCED_DYNAMIC_SOURCE_IDS.map(source => `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="m-dynamic-source-${esc(source)}" ${selectedDynamicSources.has(source) ? 'checked' : ''}>启用 ${esc(DYNAMIC_SOURCE_LABELS[source])} 解析</label>`).join('')}
-          </div>
-          <label for="m-dynamic-profile" style="display:block;margin-top:12px">兼容模式</label>
-          <select class="form-select modal-select" id="m-dynamic-profile">
-            ${renderDynamicProfileOptions(dynamicCapabilities, initialDynamicProfile)}
-          </select>
-          <div id="m-dynamic-profile-risk" style="margin-top:8px">${renderDynamicProfileRisk(initialDynamicProfile)}</div>
-          <div id="m-dynamic-extreme-confirm" hidden style="margin-top:10px;padding:10px;border:1px solid var(--red);border-radius:8px;background:var(--red-dim)">
-            <label style="display:flex;gap:8px;align-items:flex-start;color:var(--red)">
-              <input type="checkbox" id="m-dynamic-extreme-ack">
-              我理解 Extreme 会扩大协议兼容与公网发现边界，并可能按 30x 将有界请求体重放到经校验的公网目标
-            </label>
-            <input type="text" class="form-input" id="m-dynamic-extreme-name" placeholder="输入站点名称以确认" maxlength="100" autocomplete="off" style="margin-top:8px">
-          </div>
-        </fieldset>
-      </details>
-      ${isEdit ? renderDynamicObservationsPanel(dynamicCapabilities.recognized) : ''}
+      <label>自动反代</label>
+      <div class="form-help" style="padding:10px 12px;border:1px solid var(--green);border-radius:8px;background:var(--green-dim)"><strong style="color:var(--green)">已自动启用</strong>：无需选择模式、来源、域名规则或播放回源。</div>
+      <div class="form-help">Meridian 会自动改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址，使后端切换后仍继续经过本站点代理；localhost、私网、链路本地及回环目标始终拒绝。</div>
     </div>
 
     <div class="form-group">
@@ -916,85 +883,6 @@ async function showSiteModal(site) {
   }
   toggleCustomUAFields();
   uaSelect.addEventListener('change', toggleCustomUAFields);
-
-	const dynamicEnabledInput = document.getElementById('m-dynamic-enabled');
-	const dynamicProfileSelect = document.getElementById('m-dynamic-profile');
-	dynamicProfileSelect.value = initialDynamicProfile;
-	const dynamicAdvancedSourceInputs = ADVANCED_DYNAMIC_SOURCE_IDS.map(source => document.getElementById(`m-dynamic-source-${source}`));
-	const dynamicProfileRiskContainer = document.getElementById('m-dynamic-profile-risk');
-	const dynamicExtremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
-	const dynamicExtremeAcknowledged = document.getElementById('m-dynamic-extreme-ack');
-	const dynamicExtremeTypedName = document.getElementById('m-dynamic-extreme-name');
-
-	function updateDynamicProfileRisk() {
-		dynamicProfileRiskContainer.innerHTML = renderDynamicProfileRisk(dynamicProfileSelect.value);
-		const requirement = dynamicProfileConfirmationRequirement(dynamicPolicy, {
-			dynamic_discovery_enabled: dynamicEnabledInput.checked,
-			dynamic_profile: dynamicProfileSelect.value,
-		});
-		dynamicExtremeConfirmation.hidden = requirement !== 'extreme';
-		if (dynamicExtremeConfirmation.hidden) {
-			dynamicExtremeAcknowledged.checked = false;
-			dynamicExtremeTypedName.value = '';
-		}
-	}
-	dynamicProfileSelect.addEventListener('change', () => {
-		dynamicExtremeAcknowledged.checked = false;
-		dynamicExtremeTypedName.value = '';
-		updateDynamicProfileRisk();
-	});
-	dynamicEnabledInput.addEventListener('change', updateDynamicProfileRisk);
-	updateDynamicProfileRisk();
-
-	const dynamicObservationsContainer = isEdit ? document.getElementById('m-dynamic-observations') : null;
-	const refreshDynamicObservationsButton = isEdit ? document.getElementById('m-refresh-dynamic-observations') : null;
-	const clearDynamicObservationsButton = isEdit ? document.getElementById('m-clear-dynamic-observations') : null;
-	let dynamicObservationRequest = 0;
-
-	function dynamicObservationsPanelIsCurrent() {
-		return dynamicObservationsContainer && document.getElementById('m-dynamic-observations') === dynamicObservationsContainer;
-	}
-
-	function setDynamicObservationButtonsDisabled(disabled) {
-		if (refreshDynamicObservationsButton) refreshDynamicObservationsButton.disabled = disabled;
-		if (clearDynamicObservationsButton) clearDynamicObservationsButton.disabled = disabled;
-	}
-
-	async function refreshDynamicObservations() {
-		if (!isEdit || !dynamicCapabilities.recognized || !dynamicObservationsContainer) return;
-		const request = ++dynamicObservationRequest;
-		setDynamicObservationButtonsDisabled(true);
-		dynamicObservationsContainer.innerHTML = '<div class="form-help">正在读取观察记录…</div>';
-		try {
-			const response = await API.getDynamicObservations(site.id);
-			if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-			dynamicObservationsContainer.innerHTML = renderDynamicObservations(response);
-		} catch (_) {
-			if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-			dynamicObservationsContainer.innerHTML = '<div class="form-help" style="color:var(--orange)">无法读取观察记录；未显示任何后端返回值。</div>';
-		} finally {
-			if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) setDynamicObservationButtonsDisabled(false);
-		}
-	}
-
-	if (isEdit && dynamicCapabilities.recognized) {
-		refreshDynamicObservationsButton.onclick = refreshDynamicObservations;
-		clearDynamicObservationsButton.onclick = async () => {
-			if (!window.confirm('确定清空本站点的全部动态观察记录吗？此操作不可撤销。')) return;
-			const request = ++dynamicObservationRequest;
-			setDynamicObservationButtonsDisabled(true);
-			try {
-				const response = await API.deleteDynamicObservations(site.id);
-				if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-				dynamicObservationsContainer.innerHTML = renderDynamicObservations(response);
-				Toast.success('观察记录已清空');
-			} catch (_) {
-				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) Toast.error('无法清空观察记录');
-			} finally {
-				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) setDynamicObservationButtonsDisabled(false);
-			}
-		};
-	}
 
   const upstreamHeadersContainer = document.getElementById('m-upstream-headers');
   let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers)
@@ -1057,16 +945,11 @@ async function showSiteModal(site) {
 		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),
       ua_mode: uaMode,
       ...customUAPayload,
-      ...buildDynamicPolicyPayload({
-        dynamic_discovery_enabled: dynamicEnabledInput.checked,
-        dynamic_profile: dynamicProfileSelect.value,
-		  dynamic_discovery_sources: [
-			...DEFAULT_DYNAMIC_SOURCE_IDS,
-			...ADVANCED_DYNAMIC_SOURCE_IDS.filter((source, index) => dynamicAdvancedSourceInputs[index].checked),
-		  ],
-        dynamic_domain_rules: dynamicPolicy.dynamic_domain_rules,
-        dynamic_allow_https_downgrade: dynamicPolicy.dynamic_allow_https_downgrade,
-      }, dynamicCapabilities),
+		dynamic_discovery_enabled: true,
+		dynamic_profile: 'compatible',
+		dynamic_discovery_sources: [...DEFAULT_DYNAMIC_SOURCE_IDS, ...ADVANCED_DYNAMIC_SOURCE_IDS],
+		dynamic_domain_rules: [],
+		dynamic_allow_https_downgrade: true,
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
@@ -1075,17 +958,6 @@ async function showSiteModal(site) {
 	      Toast.error('请填写所有必填项');
 	      return;
 	    }
-	  const profileConfirmation = confirmDynamicProfileChange(
-		dynamicPolicy,
-		data,
-		data.name,
-		dynamicExtremeAcknowledged.checked,
-		dynamicExtremeTypedName.value,
-	  );
-	  if (!profileConfirmation.ok) {
-		if (profileConfirmation.error) Toast.error(profileConfirmation.error);
-		return;
-	  }
 	  if (uaMode === 'custom' && (!data.custom_user_agent || !data.custom_client || !data.custom_version)) {
       Toast.error('请完整填写自定义 User-Agent、Client 和 Version');
 		return;
@@ -1124,7 +996,6 @@ async function showSiteModal(site) {
   };
 
   openModal({ closeOnBackdrop: false });
-	if (isEdit && dynamicCapabilities.recognized) refreshDynamicObservations();
 }
 
 // Global actions
