@@ -101,10 +101,10 @@ Linux 安装脚本从 GitHub Releases 下载对应架构的二进制和 `SHA256S
 
 ### 一键安装
 
-脚本默认从 `snnabb/Meridian` 获取 Release。使用其他仓库时，通过 `MERIDIAN_REPO` 指定 `owner/repository`：
+脚本默认从 `chanhui800/Meridian` 获取 Release。使用其他仓库时，通过 `MERIDIAN_REPO` 指定 `owner/repository`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/main/install.sh \
   -o /tmp/meridian-install.sh
 
 bash /tmp/meridian-install.sh install
@@ -157,7 +157,7 @@ bash /tmp/meridian-install.sh uninstall --purge -y
 ### 从源码运行
 
 ```bash
-git clone https://github.com/snnabb/Meridian.git
+git clone https://github.com/chanhui800/Meridian.git
 cd Meridian
 
 go test ./...
@@ -205,7 +205,7 @@ EOF
 ```yaml
 services:
   meridian:
-    image: ghcr.io/<owner>/meridian:latest
+    image: ghcr.io/chanhui800/meridian:latest
     container_name: meridian
     restart: unless-stopped
     read_only: true
@@ -255,7 +255,7 @@ http://服务器IP:9090
 生产环境建议使用固定标签，而不是 `latest`：
 
 ```yaml
-image: ghcr.io/<owner>/meridian:vX.Y.Z
+image: ghcr.io/chanhui800/meridian:vX.Y.Z
 ```
 
 升级步骤：
