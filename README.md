@@ -294,16 +294,31 @@ docker compose logs --tail=100 meridian
 http://服务器IP:9090
 ```
 
-需要由面板直接终止 TLS 时，可让同一个端口监听 HTTPS。配置基础域名后，可在站点管理页的“TLS 证书”窗口通过 Cloudflare DNS-01 申请通配符证书；DNS API Token 只用于当前申请，不会保存。也可以挂载外部 ACME 生成的 PEM 文件：
+需要由面板直接终止 TLS 时，可让同一个端口监听 HTTPS。建议先准备一个专用的面板域名和一个泛域名，例如：
+
+```text
+面板域名：panel.abc.com
+站点泛域名：*.abc.com
+```
+
+在 `.env` 中配置基础域名、面板域名和 TLS：
 
 ```env
 PANEL_TLS_ENABLED=true
-PANEL_TLS_CERT_FILE=/data/tls/fullchain.pem
-PANEL_TLS_KEY_FILE=/data/tls/privkey.pem
+PANEL_DOMAIN=panel.abc.com
 PANEL_ROUTE_DOMAIN=abc.com
 ```
 
-配置 `PANEL_ROUTE_DOMAIN` 后，站点管理中的“域名前缀”入口会把 `123` 生成并绑定为 `123.abc.com:9090`。DNS 需要将 `*.abc.com` 指向面板服务器；TLS 证书校验与端口无关，因此不要求占用 `443`。如果使用 Cloudflare 橙云代理，请改用 Cloudflare 支持的 HTTPS 端口或 Tunnel，`9090` 通常应使用 DNS-only。
+证书路径默认位于数据目录：`/app/data/tls/fullchain.pem` 和 `/app/data/tls/privkey.pem`。Docker Compose 中的 `meridian-data:/app/data` 必须保持可写；如果使用外部 ACME 证书，也可以通过 `PANEL_TLS_CERT_FILE` 和 `PANEL_TLS_KEY_FILE` 指向挂载进容器的 PEM 文件。
+
+域名前缀配置步骤：
+
+1. 在 DNS 中将 `panel.abc.com` 和 `*.abc.com` 指向面板服务器。Cloudflare 使用橙云代理时，9090 不是通用 HTTPS 代理端口，建议使用 DNS-only、Cloudflare Tunnel 或受支持的 HTTPS 端口。
+2. 在站点管理页打开“TLS 证书”，使用 Cloudflare DNS-01 申请通配符证书。DNS API Token 只用于当前申请，不会保存。
+3. 证书申请成功后设置 `PANEL_TLS_ENABLED=true` 并重启容器。不要在证书文件尚未生成时启用 TLS，否则面板无法启动。
+4. 新增或编辑站点时选择“域名前缀”，填写 `123` 等前缀，面板会生成 `https://123.abc.com:9090`。面板自身通过 `https://panel.abc.com:9090` 访问，未配置的前缀会被拒绝。
+
+站点管理卡片中的“访问地址”默认隐藏。点击眼睛按钮显示地址，点击复制按钮即可复制完整地址；复制不需要先显示地址。
 
 首次启动时，使用 `SETUP_TOKEN` 创建唯一管理员。数据保存在 `meridian-data` 卷中，升级时不要删除该卷。
 
