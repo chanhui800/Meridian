@@ -13694,6 +13694,7 @@ type App struct {
 	panelHost         string
 	routeDomain       string
 	panelTLSEnabled   bool
+	panelCertificates *panelCertificateManager
 	panelBindLoopback bool
 	panelListenPort   int
 	dynamicRouteKey   []byte
@@ -14371,6 +14372,53 @@ func (a *App) handleIngressCapabilities(w http.ResponseWriter, r *http.Request) 
 		"upstream_headers_available": a.pm.UpstreamHeadersAvailable(),
 		"max_playback_addresses":     maxPlaybackAddresses,
 	})
+}
+
+func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
+	if a.panelCertificates == nil {
+		a.jsonErr(w, http.StatusServiceUnavailable, "certificate management is unavailable")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Cache-Control", "no-store")
+		a.jsonOK(w, a.panelCertificates.status(a.panelTLSEnabled))
+	case http.MethodPost:
+		var req struct {
+			Email      string `json:"email"`
+			Provider   string `json:"dns_provider"`
+			APIToken   string `json:"dns_api_token"`
+			UseStaging bool   `json:"staging"`
+		}
+		if err := decodeJSONBody(w, r, &req); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, "invalid request")
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(req.Provider)) != "cloudflare" {
+			a.jsonErr(w, http.StatusBadRequest, "only Cloudflare DNS is currently supported")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+		if _, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, req.UseStaging); err != nil {
+			status := http.StatusBadGateway
+			if errors.Is(err, errCertificateIssuanceBusy) {
+				status = http.StatusConflict
+			} else if validateErr := validatePanelCertificateRequest(req.Email, req.APIToken); validateErr != nil {
+				status = http.StatusBadRequest
+			} else if a.routeDomain == "" {
+				status = http.StatusBadRequest
+			}
+			log.Printf("panel certificate request failed for %s: %v", a.routeDomain, err)
+			a.jsonErr(w, status, err.Error())
+			return
+		}
+		status := a.panelCertificates.status(a.panelTLSEnabled)
+		status.RestartRequired = !a.panelTLSEnabled
+		a.jsonOK(w, status)
+	default:
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 // GET/POST /api/sites
@@ -15398,12 +15446,11 @@ func envBool(name string) bool {
 	}
 }
 
-func panelTLSConfigFromEnv() (*tls.Config, bool, error) {
+func panelTLSConfigFromEnv(dbPath string) (*tls.Config, bool, error) {
 	if !envBool("PANEL_TLS_ENABLED") {
 		return nil, false, nil
 	}
-	certFile := strings.TrimSpace(os.Getenv("PANEL_TLS_CERT_FILE"))
-	keyFile := strings.TrimSpace(os.Getenv("PANEL_TLS_KEY_FILE"))
+	certFile, keyFile := panelTLSPaths(dbPath)
 	if certFile == "" || keyFile == "" {
 		return nil, false, errors.New("PANEL_TLS_CERT_FILE and PANEL_TLS_KEY_FILE are required when PANEL_TLS_ENABLED is enabled")
 	}
@@ -15476,7 +15523,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid PANEL_ROUTE_DOMAIN: %v", err)
 	}
-	panelTLSConfig, panelTLSEnabled, err := panelTLSConfigFromEnv()
+	panelTLSConfig, panelTLSEnabled, err := panelTLSConfigFromEnv(dbPath)
 	if err != nil {
 		log.Fatalf("invalid panel TLS configuration: %v", err)
 	}
@@ -15561,6 +15608,7 @@ func main() {
 		panelHost:         panelHost,
 		routeDomain:       routeDomain,
 		panelTLSEnabled:   panelTLSEnabled,
+		panelCertificates: newPanelCertificateManager(dbPath, routeDomain, nil),
 		panelBindLoopback: panelBindIP != nil && panelBindIP.IsLoopback(),
 		panelListenPort:   port,
 		dynamicRouteKey:   dynamicRouteKey,
@@ -15577,6 +15625,7 @@ func main() {
 	// Protected routes
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
 	mux.HandleFunc("/api/ingress-capabilities", cors(app.authMiddleware(app.handleIngressCapabilities)))
+	mux.HandleFunc("/api/panel-certificate", cors(app.authMiddleware(app.handlePanelCertificate)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))

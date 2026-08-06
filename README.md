@@ -294,7 +294,7 @@ docker compose logs --tail=100 meridian
 http://服务器IP:9090
 ```
 
-需要由面板直接终止 TLS 时，可让同一个端口监听 HTTPS。证书文件可以由外部 ACME DNS-01（推荐通配符证书）申请后挂载到面板：
+需要由面板直接终止 TLS 时，可让同一个端口监听 HTTPS。配置基础域名后，可在站点管理页的“TLS 证书”窗口通过 Cloudflare DNS-01 申请通配符证书；DNS API Token 只用于当前申请，不会保存。也可以挂载外部 ACME 生成的 PEM 文件：
 
 ```env
 PANEL_TLS_ENABLED=true
@@ -333,8 +333,8 @@ docker compose ps
 | `PANEL_DOMAIN` | 空 | 管理面板允许的公共域名 |
 | `PANEL_ROUTE_DOMAIN` | 空 | 域名前缀入口的基础域名，例如 `abc.com` |
 | `PANEL_TLS_ENABLED` | `false` | 是否让面板端口直接监听 HTTPS |
-| `PANEL_TLS_CERT_FILE` | 空 | 面板 TLS 证书或证书链 PEM 文件 |
-| `PANEL_TLS_KEY_FILE` | 空 | 面板 TLS 私钥 PEM 文件 |
+| `PANEL_TLS_CERT_FILE` | 数据库目录下 `tls/fullchain.pem` | 面板 TLS 证书或证书链 PEM 文件 |
+| `PANEL_TLS_KEY_FILE` | 数据库目录下 `tls/privkey.pem` | 面板 TLS 私钥 PEM 文件 |
 | `JWT_SECRET` | 启动时临时生成 | JWT 签名密钥；生产环境应固定设置 |
 | `UPSTREAM_HEADER_KEY` | 空 | 上游固定请求头加密密钥 |
 | `DYNAMIC_ROUTE_KEY` | 空 | 动态播放 capability 密钥 |

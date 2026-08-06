@@ -13,12 +13,14 @@ function renderSites() {
       </button>
       <label class="sites-search"><span class="sr-only">搜索站点</span><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16" y1="16" x2="21" y2="21"/></svg><input id="sites-search" type="search" placeholder="搜索站点名称或回源地址"></label>
       <button class="btn-ghost btn-test-all" id="btn-test-all-sites"><span aria-hidden="true">⌁</span> 全部测速</button>
+	  <button class="btn-ghost" id="btn-panel-certificate">TLS 证书</button>
     </div>
     <div class="sites-grid" id="sites-grid"></div>
   `;
 
   document.getElementById('btn-add-site').onclick = () => showSiteModal();
   document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
+  document.getElementById('btn-panel-certificate').onclick = showPanelCertificateModal;
   document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
   loadSites();
 }
@@ -795,6 +797,84 @@ function normalizedTargetAuthority(value) {
 	} catch (_) {
 		return '';
 	}
+}
+
+function renderPanelCertificateStatus(status) {
+	if (!status || status.available === false) {
+		return '<div class="form-help" style="color:var(--orange)">请先配置 PANEL_ROUTE_DOMAIN 和可写的数据目录。</div>';
+	}
+	if (!status.configured) {
+		return `<div class="form-help">当前基础域名：${esc(status.route_domain || '—')}，尚未申请证书。</div>`;
+	}
+	return `
+	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
+	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
+	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.tls_enabled ? 'good' : 'warn'}">${status.tls_enabled ? '已启用' : '需重启启用'}</span></div>
+	`;
+}
+
+async function showPanelCertificateModal() {
+	let status;
+	try {
+		status = await API.panelCertificate();
+	} catch (error) {
+		Toast.error(`无法读取证书状态：${error.message}`);
+		return;
+	}
+	document.getElementById('modal-title').textContent = 'TLS 证书';
+	document.getElementById('modal-body').innerHTML = `
+	  <div id="m-panel-certificate-status">${renderPanelCertificateStatus(status)}</div>
+	  <div class="form-group" style="margin-top:18px">
+	    <label>ACME 邮箱</label>
+	    <input type="email" class="form-input" id="m-acme-email" autocomplete="email" maxlength="254" placeholder="admin@example.com">
+	  </div>
+	  <div class="form-group">
+	    <label>DNS 服务商</label>
+	    <select class="form-select modal-select" id="m-acme-provider"><option value="cloudflare">Cloudflare DNS</option></select>
+	  </div>
+	  <div class="form-group">
+	    <label>DNS API Token</label>
+	    <input type="password" class="form-input" id="m-acme-token" autocomplete="new-password" maxlength="512" placeholder="仅本次申请使用">
+	    <div class="form-help">Token 只发送到当前 Meridian 进程，不写入数据库、证书文件或日志。</div>
+	  </div>
+	  <label style="display:flex;align-items:center;gap:8px;margin-top:10px;color:var(--white-60);font-size:.82rem">
+	    <input type="checkbox" id="m-acme-staging">
+	    <span>ACME 测试环境</span>
+	  </label>
+	`;
+	document.getElementById('modal-footer').innerHTML = `
+	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
+	  <button class="btn-modal primary" id="m-cert-submit" ${status.available === false || status.issuing ? 'disabled' : ''}>${status.configured ? '续期证书' : '申请证书'}</button>
+	`;
+	document.getElementById('m-cert-cancel').onclick = closeModal;
+	document.getElementById('m-cert-submit').onclick = async () => {
+		const button = document.getElementById('m-cert-submit');
+		const tokenInput = document.getElementById('m-acme-token');
+		const payload = {
+			email: document.getElementById('m-acme-email').value.trim(),
+			dns_provider: document.getElementById('m-acme-provider').value,
+			dns_api_token: tokenInput.value.trim(),
+			staging: document.getElementById('m-acme-staging').checked,
+		};
+		if (!payload.email || !payload.dns_api_token) {
+			Toast.error('请填写 ACME 邮箱和 DNS API Token');
+			return;
+		}
+		button.disabled = true;
+		button.textContent = '申请中…';
+		try {
+			const updated = await API.requestPanelCertificate(payload);
+			tokenInput.value = '';
+			document.getElementById('m-panel-certificate-status').innerHTML = renderPanelCertificateStatus(updated);
+			button.textContent = '续期证书';
+			Toast.success(updated.restart_required ? '证书已签发，请启用 PANEL_TLS_ENABLED 并重启' : '证书已签发并热加载');
+		} catch (error) {
+			button.disabled = false;
+			button.textContent = status.configured ? '续期证书' : '申请证书';
+			Toast.error(error.message);
+		}
+	};
+	openModal({ closeOnBackdrop: false });
 }
 
 async function showSiteModal(site) {
