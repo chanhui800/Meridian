@@ -230,7 +230,7 @@ function renderRequestLogRows(logs) {
         <td><span class="request-log-node" title="${esc(entry.site_name || '')}">${esc(entry.site_name || '—')}</span></td>
         <td><span class="request-log-category" title="${esc(requestTitle)}">${esc(requestLogCategoryLabel(entry.resource_category))}</span></td>
         <td><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
-        <td><span class="request-log-ip mono">${esc(entry.client_ip || 'unknown')}</span></td>
+        <td><span class="request-log-ip mono" title="${esc(entry.client_ip || 'unknown')}">${esc(entry.client_ip || 'unknown')}</span></td>
         <td><span class="request-log-ua" title="${esc(entry.user_agent || '未提供 UA')}">${esc(entry.user_agent || '未提供 UA')}</span></td>
         <td><time class="request-log-time" datetime="${new Date(Number(entry.recorded_at_ms || 0)).toISOString()}" title="${esc(exactTime)}">${esc(requestLogRelativeTime(entry.recorded_at_ms))}</time></td>
       </tr>

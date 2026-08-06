@@ -1006,8 +1006,10 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
 .request-log-table th:nth-child(6) { width: 15%; }
 
 .request-log-node,
+.request-log-ip,
 .request-log-ua {
   display: block;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
