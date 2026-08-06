@@ -228,6 +228,16 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 	}
 }
 
+func TestPlaybackInfoRelativeExternalDeliveryURLWithRequiredHeadersFailsClosed(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	base := mustStructuredURL(t, "https://api.example.com/Items/abc/PlaybackInfo")
+	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+	payload := []byte(`{"MediaSources":[{"RequiredHttpHeaders":{"Authorization":"secret"},"MediaStreams":[{"DeliveryUrl":"/Videos/abc/Subtitles/1/Stream.ass","IsExternalUrl":true}]}]}`)
+	if _, err := rewritePlaybackInfoResponse(payload, session); err == nil {
+		t.Fatal("credential-bearing relative subtitle was accepted")
+	}
+}
+
 func TestCompatibleAndExtremePlaybackInfoAcceptSchemelessHostPortURLs(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -338,14 +348,68 @@ func TestPlaybackInfoPathProtocolAndURLFormsFailClosed(t *testing.T) {
 	}
 
 	for name, payload := range map[string]string{
-		"unsupported remote protocol": `{"MediaSources":[{"Protocol":"Rtsp","Path":"rtsp://camera.example.com/live"}]}`,
-		"relative external subtitle":  `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"subtitle.vtt","IsExternalUrl":true}]}]}`,
-		"backslash direct stream":     `{"MediaSources":[{"DirectStreamUrl":"\\\\evil.example.com\\video.mp4"}]}`,
+		"unsupported remote protocol":         `{"MediaSources":[{"Protocol":"Rtsp","Path":"rtsp://camera.example.com/live"}]}`,
+		"backslash direct stream":             `{"MediaSources":[{"DirectStreamUrl":"\\\\evil.example.com\\video.mp4"}]}`,
+		"relative subtitle dot path":          `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"../subtitle.vtt","IsExternalUrl":true}]}]}`,
+		"relative subtitle encoded dot path":  `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"%2e%2e/subtitle.vtt","IsExternalUrl":true}]}]}`,
+		"relative subtitle fragment":          `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"subtitle.vtt#part","IsExternalUrl":true}]}]}`,
+		"relative subtitle backslash":         `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"Subtitles\\subtitle.vtt","IsExternalUrl":true}]}]}`,
+		"relative subtitle ambiguous slashes": `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"///evil.example/subtitle.vtt","IsExternalUrl":true}]}]}`,
 	} {
-		t.Run(name, func(t *testing.T) {
+		for _, rewriteRelative := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rewrite-relative-%t", name, rewriteRelative), func(t *testing.T) {
+				session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo, rewriteRelative: rewriteRelative}
+				defer session.rollback()
+				if _, err := rewritePlaybackInfoResponse([]byte(payload), session); err == nil {
+					t.Fatal("ambiguous or unsupported PlaybackInfo URL was accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestPlaybackInfoRelativeExternalDeliveryURLStaysOnProxy(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	base := mustStructuredURL(t, "https://video.emos.best/emby/Items/ve-173940/PlaybackInfo")
+	for _, test := range []struct {
+		name     string
+		delivery string
+		want     string
+	}{
+		{name: "root relative", delivery: "/emby/Videos/ve-173940/34o70dwlzpq7_null/Subtitles/8298/Stream.ass", want: "/emby/Videos/ve-173940/34o70dwlzpq7_null/Subtitles/8298/Stream.ass"},
+		{name: "path relative", delivery: "Subtitles/8298/Stream.vtt", want: "/emby/Items/ve-173940/Subtitles/8298/Stream.vtt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-			if _, err := rewritePlaybackInfoResponse([]byte(payload), session); err == nil {
-				t.Fatal("ambiguous or unsupported PlaybackInfo URL was accepted")
+			defer session.rollback()
+			payload := structuredTestJSON(t, map[string]any{"MediaSources": []any{map[string]any{
+				"DirectStreamUrl": "https://video.emos.best/emby/emya/video?server=emos&media_id=34o70dwlzpq7",
+				"MediaStreams":    []any{map[string]any{"DeliveryUrl": test.delivery, "IsExternalUrl": true}},
+			}}})
+			rewritten, err := rewritePlaybackInfoResponse(payload, session)
+			if err != nil {
+				t.Fatalf("rewrite PlaybackInfo with relative external subtitle: %v", err)
+			}
+
+			var result struct {
+				MediaSources []struct {
+					DirectStreamURL string `json:"DirectStreamUrl"`
+					MediaStreams    []struct {
+						DeliveryURL string `json:"DeliveryUrl"`
+					} `json:"MediaStreams"`
+				} `json:"MediaSources"`
+			}
+			if err := json.Unmarshal(rewritten, &result); err != nil || len(result.MediaSources) != 1 || len(result.MediaSources[0].MediaStreams) != 1 {
+				t.Fatalf("decode rewritten PlaybackInfo: result=%#v err=%v", result, err)
+			}
+			if got := result.MediaSources[0].DirectStreamURL; got != "/emby/emya/video?server=emos&media_id=34o70dwlzpq7" {
+				t.Fatalf("DirectStreamUrl = %q", got)
+			}
+			if got := result.MediaSources[0].MediaStreams[0].DeliveryURL; got != test.want {
+				t.Fatalf("relative DeliveryUrl = %q, want %q", got, test.want)
+			}
+			if len(issuer.state.capabilities) != 0 || issuer.state.capabilityMemory != 0 {
+				t.Fatalf("relative subtitle minted a capability: entries=%d bytes=%d", len(issuer.state.capabilities), issuer.state.capabilityMemory)
 			}
 		})
 	}
@@ -697,7 +761,7 @@ func TestStructuredDiscoveryProxyLifecycleEndToEnd(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"MediaSources":[{"DirectStreamUrl":"https://cdn.example.com/movie.mp4?sig=e2e-secret"}]}`)
+		_, _ = io.WriteString(w, `{"MediaSources":[{"DirectStreamUrl":"https://cdn.example.com/movie.mp4?sig=e2e-secret","MediaStreams":[{"DeliveryUrl":"/Videos/1/Subtitles/2/Stream.ass","IsExternalUrl":true}]}]}`)
 	}))
 	defer upstream.Close()
 
@@ -748,6 +812,9 @@ func TestStructuredDiscoveryProxyLifecycleEndToEnd(t *testing.T) {
 	text := string(payload)
 	if strings.Contains(text, "cdn.example.com") || strings.Contains(text, "e2e-secret") {
 		t.Fatalf("e2e PlaybackInfo leaked target: %s", text)
+	}
+	if !strings.Contains(text, `"DeliveryUrl":"/Videos/1/Subtitles/2/Stream.ass"`) {
+		t.Fatalf("e2e PlaybackInfo lost relative external subtitle: %s", text)
 	}
 	start := strings.Index(text, dynamicRoutePrefix)
 	if start < 0 {

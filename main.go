@@ -5206,6 +5206,19 @@ func playbackInfoURLCandidate(value string) bool {
 	return parsed.IsAbs() || parsed.Host != ""
 }
 
+func playbackInfoSafeRelativeURL(value string) bool {
+	if value == "" || len(value) > maxDynamicTargetURLBytes || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) || strings.Contains(value, "#") || strings.HasPrefix(value, "//") {
+		return false
+	}
+	reference, err := url.Parse(value)
+	if err != nil || reference.IsAbs() || reference.Opaque != "" || reference.Host != "" || reference.User != nil || reference.Fragment != "" || reference.RawFragment != "" {
+		return false
+	}
+	return dynamicURLDecodedComponentIsSafe(reference.EscapedPath(), false) &&
+		dynamicURLDecodedComponentIsSafe(reference.RawQuery, true) &&
+		!dynamicURLPathHasDotSegments(reference.EscapedPath())
+}
+
 func playbackInfoShouldRewriteURL(value string, session *dynamicRewriteSession) bool {
 	return playbackInfoURLCandidate(value) || session != nil && session.rewriteRelative && value != ""
 }
@@ -5655,7 +5668,7 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 				if err != nil {
 					return nil, err
 				}
-				_, deliveryValue, deliveryExists, err := playbackInfoField(stream, "DeliveryUrl")
+				deliveryKey, deliveryValue, deliveryExists, err := playbackInfoField(stream, "DeliveryUrl")
 				if err != nil {
 					return nil, err
 				}
@@ -5663,18 +5676,29 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 				if deliveryExists && !deliveryIsString && deliveryValue != nil {
 					return nil, fmt.Errorf("PlaybackInfo DeliveryUrl has an invalid type")
 				}
-				if deliveryIsString && isExternalURL && !playbackInfoURLCandidate(deliveryText) {
-					return nil, fmt.Errorf("external PlaybackInfo DeliveryUrl is not an absolute network URL")
+				shouldRewriteDelivery := deliveryIsString && playbackInfoShouldRewriteURL(deliveryText, session)
+				relativeExternalDelivery := deliveryIsString && isExternalURL && !playbackInfoURLCandidate(deliveryText)
+				if relativeExternalDelivery && !playbackInfoSafeRelativeURL(deliveryText) {
+					return nil, fmt.Errorf("external PlaybackInfo DeliveryUrl is not a safe relative URL")
 				}
-				if deliveryIsString && (isExternalURL || playbackInfoShouldRewriteURL(deliveryText, session)) {
-					if playbackInfoRequiredHeadersUnsupported(deliveryText, hasRequiredHeaders, session) {
+				if deliveryIsString && (isExternalURL || shouldRewriteDelivery) {
+					if (relativeExternalDelivery && hasRequiredHeaders && !extreme) || playbackInfoRequiredHeadersUnsupported(deliveryText, hasRequiredHeaders, session) {
 						return nil, fmt.Errorf("external subtitle URL requires unsupported origin headers")
 					}
 					capabilitySource, kind, err := playbackInfoCapabilityType(stream, "DeliveryUrl", deliveryText, session)
 					if err != nil {
 						return nil, err
 					}
-					if err := rewritePlaybackInfoFieldAsWithRequiredHeaders(stream, "DeliveryUrl", session, capabilitySource, kind, requiredHeaders); err != nil {
+					if relativeExternalDelivery {
+						// Some Emby-compatible servers mark relative subtitle DeliveryUrl
+						// values as external. Resolve them against the real upstream
+						// PlaybackInfo URL so the optional subtitle cannot reject the video.
+						rewritten, err := session.rewriteAgainstSourceKindWithRequiredHeaders(deliveryText, session.base, capabilitySource, kind, requiredHeaders)
+						if err != nil {
+							return nil, err
+						}
+						stream[deliveryKey] = rewritten
+					} else if err := rewritePlaybackInfoFieldAsWithRequiredHeaders(stream, "DeliveryUrl", session, capabilitySource, kind, requiredHeaders); err != nil {
 						return nil, err
 					}
 				}
