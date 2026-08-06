@@ -1,204 +1,125 @@
 <div align="center">
 
-# Meridian（修改版）
+# Meridian
 
-轻量级 Emby 反向代理管理面板（面向小白用户优化）
-单文件 Go 后端 + 嵌入式 SPA 前端，开箱即用
+面向 Emby 多站点场景的反向代理管理面板
 
-[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![SQLite](https://img.shields.io/badge/SQLite-embedded-003B57?logo=sqlite&logoColor=white)](https://pkg.go.dev/modernc.org/sqlite)
-[![CI](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml/badge.svg)](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/chanhui800/Meridian/pkgs/container/meridian)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+自动识别播放后端 · 分钟级流量统计 · 请求日志 · 静态资源缓存
+
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Docker](https://img.shields.io/badge/Docker-GHCR-2496ED?logo=docker&logoColor=white)](https://github.com/chanhui800/Meridian/pkgs/container/meridian)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
-## 界面预览
+## 项目介绍
 
-| 仪表盘 | 站点管理 | 故障诊断 |
-|:---:|:---:|:---:|
-| ![仪表盘](docs/dashboard.png) | ![站点管理](docs/sites.png) | ![故障诊断](docs/diagnostics.png) |
+Meridian 是一个使用 Go 和原生 Web 技术开发的 Emby 反向代理管理面板。它将站点配置、自动播放后端发现、代理转发、流量统计、请求日志、静态资源缓存和运行诊断集中在同一个界面中，适合在一台服务器上管理多个 Emby 站点。
 
-## 这是什么
+本仓库是在原 Meridian 基础上持续修改的易用版，主要目标是降低配置门槛：添加站点后尽量自动识别播放地址和后端类型，让普通用户不需要理解复杂的安全规则和反向代理配置也能开始使用。
 
-Meridian 是一个专为 Emby 媒体服务器设计的反向代理管理面板（Emby reverse proxy management panel）。它解决的核心问题是：**当你需要在一台机器上管理多个 Emby 反代站点时，不想手写 Nginx 配置，不想逐个维护 UA 伪装规则，也不想自己实现流量计量和限速。**
+## 修改版特点
 
-Meridian 把这些事情打包成一个单二进制程序，带管理界面，带实时监控，开箱可用。
+### 自动反代
 
-### 本修改版新增与优化
+- 新建站点默认开启自动发现。
+- 默认启用 HTTP 30x 和 PlaybackInfo 发现。
+- HLS、DASH 等较激进的发现方式放在高级选项中，可在播放失败时按需开启。
+- 默认使用 `Compatible` 兼容模式，不再要求普通用户先理解 `Safe`、`Extreme` 等安全配置。
+- 默认允许 HTTPS 上游跳转到 HTTP 播放后端。
+- 对动态发现的公网媒体地址生成受保护的内部路由，客户端仍通过 Meridian 播放，不直接暴露内部实现。
+- 保留手动播放回源能力，方便处理无法自动识别的特殊服务端。
 
-- 更紧凑的管理界面：左侧导航可展开/折叠，并支持黑白主题切换。
-- 添加站点默认使用 UA 透传、Compatible 安全策略，并默认允许 HTTPS → HTTP 降级。
-- 自动播放后端发现开箱启用，支持安全 30x、PlaybackInfo、HLS/DASH 等常见 Emby 返回类型；高级发现选项可按需开启。
-- 请求日志增加视频流分类、节点名称搜索和实时刷新；日志页面支持稳定滚动，不会因刷新跳回顶部。
-- 流量统计支持最近 1 小时、6 小时、24 小时、7 天的分钟级聚合，展示入站、出站和请求数。
-- 站点管理支持单个或批量延迟测试；缓存支持按节点容量上限和真实目标路径规则自动淘汰旧文件。
+### 站点管理
 
-本仓库是基于上游 Meridian 的兼容性与易用性修改版，核心代理、安全边界和数据格式仍遵循原项目设计。
+- 支持 `host`、`port` 和 `both` 三种入口方式。
+- 新建站点的 User-Agent 默认透传，保留客户端真实身份。
+- 支持单个站点测速和全部站点统一测速。
+- 新增站点后立即启动代理和日志记录，不需要重启容器。
+- 支持主回源请求头、流量配额、限速和静态资源缓存规则。
 
-## 友链
+### 管理界面
 
-- [NodeSeek](https://www.nodeseek.com/)
-- [Linux.do](https://linux.do/)
+- 按照现代媒体面板样式重构 UI，桌面端采用左侧功能导航。
+- 左侧导航支持展开和折叠，并记住用户选择。
+- 支持明暗主题切换。
+- 页面、卡片和筛选控件使用紧凑布局，适配桌面与移动设备。
+- 左上角展示项目标识和版本号。
 
-## 核心特性
+### 流量统计
 
-| 功能 | 说明 |
-|------|------|
-| **多站点反代** | 每个站点可选择 `host`、`port` 或 `both` 入口模式，并独立配置主回源与播放回源 |
-| **共享域名入口** | 可为站点配置一个精确域名，通过面板入口按 Host 分流，兼容 Nginx/CDN 的标准 443 入口 |
-| **双上游分流** | 网页/API 和播放/转码流量可分别指向不同上游 |
-| **自动播放后端发现** | 可按站点解析安全 30x、PlaybackInfo、HLS 与 DASH，并用同源加密 capability 代理未知公网媒体后端 |
-| **UA 伪装** | 预设（Infuse / Web / 客户端）、自定义固定身份或透传保留客户端身份；HTTP、WebSocket 与受限播放重定向统一改写或透传 |
-| **加密上游请求头** | 为主回源添加固定自定义 Header；值加密存储、只写不回显，且不会转发到独立播放/CDN 域名 |
-| **流量管控** | 按站点统计流量、设置限速、设置配额 |
-| **请求日志** | 按日期、资源类别、状态码、节点、客户端 IP、UA 与无查询参数路径筛选请求记录；支持刷新和清空 |
-| **WebSocket 代理** | 完整支持 Emby 的 WebSocket 通信 |
-| **SSE 实时推送** | 仪表盘数据通过 Server-Sent Events 实时更新 |
-| **故障诊断** | 回源健康检测、上游 TLS 证书检查、请求头预览 |
-| **JWT 认证** | HttpOnly 会话 Cookie 认证，密码 bcrypt 存储 |
-| **单二进制部署** | 前端嵌入二进制，SQLite 持久化，无外部依赖 |
+- 按分钟记录每个站点的入站、出站和请求数。
+- 支持最近 1 小时、6 小时、24 小时和 7 天查看。
+- 7 天图表会压缩显示点数，但统计总量不会丢失。
+- 旧数据库会自动迁移并保留已有小时流量记录。
 
----
+### 面板请求日志
 
-## 快速部署
+- 记录状态码、节点、客户端 IP、User-Agent、资源类型和请求路径。
+- 资源分类包含页面、API、图片、字幕、视频流等类型。
+- 支持按节点名称搜索；节点改名后仍可检索历史日志。
+- 自动刷新不会把正在浏览的日志列表强制拉回顶部。
+- IPv6、长路径和长 User-Agent 会自动换行或截断，不再遮挡页面。
 
-### Linux / macOS — 一键安装（适用于已发布版本）
+### 静态资源缓存
 
-一行命令进入精简菜单：安装、更新到最新版、修改管理员密码、卸载。
+- 缓存按真实目标域名与路径规则匹配。
+- 默认规则可用于 `/file/` 和 Emby 图片资源。
+- 每个节点可设置独立缓存容量上限；超出后按最久未使用顺序自动清理。
+- 视频、音频、HLS、DASH 和常见媒体扩展名始终不会写入本地缓存。
+- 缓存会结合响应扩展名、`Content-Type`、`Cache-Control`、`Vary` 和身份信息判断，避免缓存不应共享的内容。
+
+## 工作原理
+
+```text
+客户端
+  │
+  ▼
+Meridian 入口（域名或独立端口）
+  ├─ 普通网页/API ──────────────► 主回源
+  ├─ 30x / PlaybackInfo ─┐
+  ├─ HLS / DASH（高级）──┤ 自动发现并校验播放后端
+  │                      ▼
+  ├─ 动态受保护路由 ────────────► 实际媒体后端
+  ├─ 请求日志 ──────────────────► SQLite
+  ├─ 分钟流量统计 ──────────────► SQLite
+  └─ 可缓存静态资源 ────────────► 本地缓存目录
+```
+
+后端由单个 Go 程序提供 HTTP/WebSocket 代理、管理 API、SSE、站点生命周期和 SQLite 持久化；前端为嵌入二进制的 SPA，因此运行时不需要 Node.js、独立数据库或额外 Web 服务。
+
+## Docker Compose 安装
+
+### 1. 准备目录和密钥
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh)
+mkdir -p /opt/meridian
+cd /opt/meridian
+
+openssl rand -hex 32
+openssl rand -hex 32
+openssl rand -hex 32
+openssl rand -hex 32
 ```
 
-> 首次安装从 GitHub Releases 下载最新二进制，并使用同一 Release 中的 `SHA256SUMS` 强制校验。systemd 部署默认使用独立的 `meridian` 非 root 用户。重复运行 `install` 不会更新程序，只用于补充或重新配置面板域名。
->
-> 首次创建管理员需要安装结束时显示的初始化令牌。Linux 一键安装会将其保存在受保护的 `/opt/meridian/.env`；若在尚未创建管理员前遗失安装输出，可由服务器 root 用户从该文件恢复。重复运行 `install` 或 `update` 只会为旧配置补齐缺失令牌，不会轮换已有令牌。令牌等同于首次管理员创建权限，请勿贴到 Issue、日志或截图中。
+保存四个不同的随机值，分别用于 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY` 和 `SETUP_TOKEN`。这些值不能相同，部署后不要随意更换。
 
-也可以直接指定四个动作：
+### 2. 创建 `.env`
 
-```bash
-# 首次安装最新版；过程中可选择是否配置面板 HTTPS 域名
-bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) install
-
-# 非交互配置面板域名（邮箱可省略）
-bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) install \
-  --domain panel.example.com --email admin@example.com -y
-
-# 更新：自动创建数据备份与一致性快照，保留上一版本；systemd 环境启动后健康检查，失败则自动回滚二进制和数据
-bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) update
-
-# 隐藏输入两次新密码；同时轮换 JWT_SECRET，使全部旧令牌失效
-bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) password
-
-# 卸载默认保留数据；只有显式添加 --purge 才删除数据
-bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) uninstall
+```dotenv
+JWT_SECRET=替换为第一个随机值
+UPSTREAM_HEADER_KEY=替换为第二个随机值
+DYNAMIC_ROUTE_KEY=替换为第三个随机值
+SETUP_TOKEN=替换为第四个随机值
 ```
 
-选择配置域名时，脚本会安装或复用 Nginx、Certbot（支持 apt、dnf/yum、apk、pacman），申请证书并启用 HTTP→HTTPS。生成的配置只代理管理面板 `127.0.0.1:9090`（或自定义 `PORT`），不会读取或修改站点回源、播放地址、50001 或其他站点监听端口。macOS 可安装 Meridian，但不支持自动域名配置。
-
-更新和改密会在内部自动创建一致性备份。在 systemd 环境中，更新还会执行健康检查，并在失败时自动回滚到上一版本二进制与升级前数据配置；非 systemd 环境会校验新二进制能否执行，但不会自动做完整健康检查。这些内部操作不再作为公开菜单命令。备份默认保存在 `/opt/meridian-backups`，权限为 `0600`，其中包含数据库和密钥，请按敏感文件保管。卸载默认保留数据和备份；`--purge` 才删除数据，并且不会删除 Nginx、Certbot 或证书。
-
-### Docker
-
-```bash
-export MERIDIAN_SETUP_TOKEN="$(openssl rand -hex 32)"  # 保存此值，首次登录时需要输入
-docker run -d --name meridian \
-  --restart unless-stopped \
-  --read-only \
-  --cap-drop ALL \
-  --security-opt no-new-privileges:true \
-  --ulimit nofile=65536:65536 \
-  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-  -p 127.0.0.1:9090:9090 -p 8001-8010:8001-8010 \
-	-v meridian-data:/app/data \
-	-e JWT_SECRET=$(openssl rand -hex 32) \
-	-e UPSTREAM_HEADER_KEY=$(openssl rand -hex 32) \
-	-e DYNAMIC_ROUTE_KEY=$(openssl rand -hex 32) \
-	-e SETUP_TOKEN="$MERIDIAN_SETUP_TOKEN" \
-  ghcr.io/chanhui800/meridian:latest
-```
-
-> `8001-8010` 是反代站点监听端口范围，按实际需要调整。
->
-> 管理面板默认只映射到宿主机 `127.0.0.1:9090`，建议再通过 HTTPS 反向代理访问。如果确实需要直接通过公网 IP 访问，可改成 `-p 9090:9090`，并同时配置防火墙白名单。
->
-> 首次创建管理员前必须设置并妥善保存 `SETUP_TOKEN`；服务不会把它写入启动日志。上面的命令把随机值保存在 `MERIDIAN_SETUP_TOKEN` 中，请在关闭当前 shell 前记入密码管理器，以便在面板中输入。
->
-> 官方镜像会在推送 `v*` 标签时由 GitHub Actions 构建并推送到 GHCR。若仓库尚未发布版本，或 GHCR 中暂时没有可用镜像，请改用源码构建。
-
-### Windows
-
-```powershell
-Invoke-WebRequest -Uri "https://github.com/chanhui800/Meridian/releases/latest/download/meridian-windows-amd64.exe" -OutFile "meridian.exe"
-function New-MeridianSecret {
-    $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    -join ($bytes | ForEach-Object { $_.ToString('x2') })
-}
-$env:JWT_SECRET = New-MeridianSecret
-$env:UPSTREAM_HEADER_KEY = New-MeridianSecret
-$env:DYNAMIC_ROUTE_KEY = New-MeridianSecret
-$env:SETUP_TOKEN = New-MeridianSecret
-.\meridian.exe
-```
-
-> 密钥必须用密码学安全随机数生成。`Get-Random` 不够安全，不要用它生成 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY` 或 `SETUP_TOKEN`。若以前按旧命令生成过密钥，请重新生成并轮换 `JWT_SECRET`；已经保存固定上游 Header 后不要直接轮换 `UPSTREAM_HEADER_KEY`，否则旧密文无法解密，必须为所有相关站点重新配置 Header 值。`DYNAMIC_ROUTE_KEY` 必须长期保留；轮换或丢失后，尚在播放中的 `/_meridian/d/<capability>` 会立即失效。
->
-> Windows 二进制下载同样依赖 GitHub Releases。没有已发布版本时，请使用源码构建。
-
-
-### 从源码构建
-
-```bash
-git clone https://github.com/chanhui800/Meridian.git && cd Meridian
-go build -o meridian .
-JWT_SECRET=$(openssl rand -hex 32) UPSTREAM_HEADER_KEY=$(openssl rand -hex 32) DYNAMIC_ROUTE_KEY=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) ./meridian
-```
-
-未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。源码、Docker 和 Windows 部署必须在首次启动前显式设置 `SETUP_TOKEN`；服务本身不会自动生成或记录该值。
-
----
-
-## 配置
-
-### 命令行参数
-
-```bash
-./meridian                          # 默认 :9090，数据库在当前目录
-./meridian --port 8080              # 自定义端口
-./meridian --db /data/meridian.db   # 自定义数据库路径
-read -r -s -p '新密码: ' ADMIN_PASSWORD; echo
-printf '%s\n' "$ADMIN_PASSWORD" | ./meridian admin reset-password --db /data/meridian.db --password-stdin
-unset ADMIN_PASSWORD
-```
-
-最后一个命令是供自动化使用的离线改密接口：密码只能从标准输入传入，数据库必须恰好有一个管理员。生产环境优先使用一键脚本的 `password` 操作，因为脚本还会停止服务、备份数据库、原子轮换 `JWT_SECRET`、重启并健康检查。
-
-### 环境变量
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PORT` | `9090` | 管理面板监听端口 |
-| `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
-| `PANEL_BIND_ADDR` | `0.0.0.0` | 控制管理面板及共享 Host 入口的绑定地址；严格 `host` 模式要求回环地址，或配合非空 `TRUSTED_PROXY_CIDRS` 做入口来源白名单 |
-| `PANEL_DOMAIN` | 空 | 管理面板的唯一允许域名；设置后未知 Host 返回 `421`，不再回退到面板 |
-| `JWT_SECRET` | 进程启动时随机生成 | 至少 32 字节的 JWT 签名密钥。**生产环境必须显式设置**，否则每次重启后会话全部失效 |
-| `UPSTREAM_HEADER_KEY` | 空 | 至少 32 字节的独立加密密钥；配置固定上游请求头时必需。丢失或轮换后，已有请求头无法解密；一键安装器会自动生成 |
-| `DYNAMIC_ROUTE_KEY` | 空 | 至少 32 字节的独立动态路由主密钥；一键安装器会自动生成。自动播放后端发现使用它加密并认证 capability；缺失时旧代理和未启用该功能的站点仍可启动，但管理 API 拒绝新开启自动发现。必须与数据库一起备份且不得与其他密钥共用 |
-| `SETUP_TOKEN` | 无 | 数据库中没有管理员时必须设置的初始化令牌；首次创建成功后仅从进程内存清除，服务不会记录其值 |
-| `TRUSTED_PROXY_CIDRS` | 空 | 可信入口代理 CIDR，多个值用逗号分隔。Meridian 只采纳其规范化的 `X-Real-IP`/`X-Forwarded-Proto`，并在面板非回环绑定时把它同时作为严格 `host` 入口来源白名单；不要填写客户端网段或 `0.0.0.0/0` |
-
-使用一键安装器的 systemd 部署时，`DYNAMIC_ROUTE_KEY` 必须使用唯一一行严格的 `KEY=value`：值为至少 32 字节的未加引号 ASCII token，不能使用 `export`、引号、反斜杠转义、等号两侧空白、ASCII/Unicode 空白或重复定义。为兼容既有 v1.7 配置，`JWT_SECRET` 和 `UPSTREAM_HEADER_KEY` 还可保留原来的简单 `KEY='ASCII-token'` 或 `KEY="ASCII-token"` 形式；安装器按去掉这一对外层引号后的有效值检查长度与密钥复用，并保持有效旧行原字节不变。三个长期密钥的有效值必须两两不同；任何不完整引号、重复定义、读取/暂存/权限/安装失败或其他歧义都会让安装器立即中止，且不会用部分临时文件覆盖 `.env`。
-
-当前运行阶段为 `structured-discovery`：安全 30x、PlaybackInfo、HLS、DASH 和加密 capability 路由均已接入代理热路径。`DYNAMIC_ROUTE_KEY` 为空不会阻止旧代理启动，但管理 API 会拒绝把新策略从关闭改为启用；数据库中已有的启用策略可以加载，动态目标会因运行能力不可用而失败关闭。
-
-### Docker Compose
+### 3. 创建 `compose.yaml`
 
 ```yaml
 services:
   meridian:
     image: ghcr.io/chanhui800/meridian:latest
+    container_name: meridian
     restart: unless-stopped
     read_only: true
     cap_drop:
@@ -212,344 +133,144 @@ services:
         soft: 65536
         hard: 65536
     ports:
-      - "127.0.0.1:9090:9090"
+      - "9090:9090"
       - "8001-8010:8001-8010"
     volumes:
       - meridian-data:/app/data
     environment:
-      - JWT_SECRET=your-secret-here    # 替换为一个固定随机字符串
-      - UPSTREAM_HEADER_KEY=your-other-secret-here # 与 JWT_SECRET 不同的固定随机字符串
-      - DYNAMIC_ROUTE_KEY=your-dynamic-route-secret # 与其他密钥不同的固定随机字符串
-      - SETUP_TOKEN=your-setup-token   # 首次启动前设置并妥善保存
+      JWT_SECRET: ${JWT_SECRET}
+      UPSTREAM_HEADER_KEY: ${UPSTREAM_HEADER_KEY}
+      DYNAMIC_ROUTE_KEY: ${DYNAMIC_ROUTE_KEY}
+      SETUP_TOKEN: ${SETUP_TOKEN}
 
 volumes:
   meridian-data:
 ```
 
----
+`9090` 是管理面板和共享域名入口，`8001-8010` 是示例站点端口范围，可按实际配置调整。若管理面板直接暴露公网，请配置防火墙和 HTTPS 反向代理。
 
-## 技术架构
-
-```
-                 Nginx / CDN :443
-                         │ 保留原始 Host
-┌────────────────────────▼─────────────────────────┐
-│                    Meridian                      │
-│                                                 │
-│  ┌───────────────────────────────────────────┐  │
-│  │       共享入口 / 管理面板 :9090            │  │
-│  │  PANEL_DOMAIN ──► REST API / SSE / 静态文件 │  │
-│  │  public_host  ──► 站点反代引擎 (host/both)  │  │
-│  └───────────────────────────────────────────┘  │
-│                         │                       │
-│  :8001 / :8002 / :800N ─┤ 可选独立入口          │
-│       (port/both)        │                       │
-│                         ▼                       │
-│  ┌───────────────────────────────────────────┐  │
-│  │              每站点代理与策略              │  │
-│  │  HTTP / WebSocket ──► target_url          │  │
-│  │  播放流量         ──► playback_target_url │  │
-│  └───────────────────────────────────────────┘  │
-│                         │                       │
-│  ┌──────────────────────▼────────────────────┐  │
-│  │              SQLite（嵌入式）              │  │
-│  └───────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────┘
-```
-
-| 组件 | 技术选型 |
-|------|---------|
-| 后端 | 单文件 Go（`main.go`），标准库 `net/http` |
-| 前端 | 原生 HTML/CSS/JS SPA，hash 路由，`embed.FS` 嵌入 |
-| 数据库 | `modernc.org/sqlite`（纯 Go，无 CGO） |
-| 认证 | 自实现 HMAC-SHA256 JWT |
-
-### 项目结构
-
-```
-Meridian/
-├── main.go              # 全部后端逻辑（API、反代引擎、诊断、认证）
-├── main_test.go
-├── web/
-│   ├── embed.go          # Go embed 入口
-│   └── static/
-│       ├── index.html    # SPA 入口
-│       ├── css/          # 样式
-│       └── js/           # 前端逻辑（按页面拆分）
-├── Dockerfile            # 多阶段构建
-├── go.mod / go.sum
-└── .github/workflows/
-    ├── ci.yml            # Push / PR 校验：测试 + 编译
-    └── release.yml       # Tag 发布：多平台构建 + Docker 推送 + Release
-```
-
----
-
-## 双上游配置
-
-每个站点可以配置两个上游地址：
-
-| 字段 | 用途 | 示例 |
-|------|------|------|
-| **回源地址**（`target_url`） | 网页、API、元数据 | `https://emby.example.com` |
-| **播放地址**（`playback_target_url`） | 播放、转码、直链下载 | `https://cdn.example.com` |
-
-播放地址为可选项。不设置时所有请求走同一上游。为降低新手配置成本，管理界面不再提供播放回源列表，新站点直接依赖主回源与自动发现；升级前已保存的播放回源配置会继续保留并生效，API 也仍兼容这些字段。手工播放列表不用于轮询、负载均衡或自动故障转移；未知 authority 由下面的自动发现策略处理。
-
-地址没有写协议时，Meridian 会把 `域名:443`（也兼容中文全角冒号 `：443`）识别为 HTTPS；其他端口仍默认按 HTTP 处理。HTTPS 使用非 443 端口时请明确写成 `https://域名:端口`。重定向模式会把 `https://域名:443` 和省略默认端口的 `https://域名` 视为同一播放回源。
-
-如果上游实际部署在子路径下，可以直接填写完整基础路径，例如 `https://emby.example.com/emby`；Meridian 会把客户端请求路径安全地拼接到该基础路径。原有的手工 `redirect` 模式会对 GET/HEAD 响应最多跟随 3 次 301/302/307/308，目标必须精确命中已配置播放地址的 scheme、主机和有效端口；管理员显式配置的 HTTP 地址属于既有信任边界，不受自动发现的“未知目标 HTTPS 降级”开关控制。
-
-设置后以下路径会路由到播放上游：
-`/Videos/`、`/emby/Videos/`、`/Audio/`、`/emby/Audio/`、`/LiveTV/`、`/emby/LiveTV/`、`/Items/.../Download`
-
-**典型场景**：Emby 主服务器负责 API 和元数据，CDN 或专用媒体服务器负责大文件分发。
-
-### 自动播放后端发现（30x + PlaybackInfo + HLS + DASH）
-
-这项功能要求部署配置 `DYNAMIC_ROUTE_KEY`。新建站点时默认开启，使用 `Compatible` 模式并只启用 `HTTP 30x` 与 `PlaybackInfo`；如果播放失败，可展开高级选项开启 `HLS`、`DASH`，少数后端仍无法发现时再切换到 `Extreme`。管理界面不再提供 `Safe`，但后端继续识别旧数据库和 API 中的 Safe 策略，避免升级破坏已有站点。它只解析下述结构化协议，不扫描 HTML、JavaScript 或任意 JSON 字符串，也不允许客户端指定任意目标，因此不是开放代理。
-
-**发现与改写范围：**
-
-- HTTP 30x：Safe/Compatible 仍只对已知播放 GET/HEAD 路径处理 301、302、307、308。Extreme 才把除 CONNECT、WebSocket/Upgrade 与保留 capability 路径外的全部数据面方法和路径纳入自动跟随，并增加 303：303（HEAD 除外）转 GET，301/302 的 POST 转 GET，307/308 与其他需保留语义的方法重放原方法。需要保留正文时，只接受有明确正长度、未使用 chunked/trailer、且不超过 profile 正文上限的请求；Meridian 在全局/每站内存和并发预算内建立 `GetBody` 副本，无法安全重放就失败关闭。跨 authority 重放只保留媒体协商头与 Content-Type/Encoding/Language/MD5/Digest，不携带 Cookie、Authorization、Emby token、固定上游 Header、转发头或 hop-by-hop Header。每一跳仍检查单一 `Location`、循环、hop、scheme、端口、域名、DNS、SSRF、TLS 与固定拨号；Extreme 因此可能把请求正文发送到上游指定且通过这些校验的公网目标，启用前必须按 UI 高风险流程确认。
-- PlaybackInfo：Safe/Compatible 仍只检查 `MediaSources[].TranscodingUrl`、Emby `DirectStreamUrl`、`Protocol=Http` 的远程 `Path` 与 `MediaStreams[].DeliveryUrl`，并对需要外部 `RequiredHttpHeaders` 的目标失败关闭。Extreme 额外接受 MediaSources/MediaStreams/MediaAttachments 的 JSON 字符串化 array 或 object；完整绝对 HTTP(S) `Path` 优先于缺失、`File` 或冲突的 Protocol；还会递归改写 PlaybackInfo 根和 MediaSource 子树中“整个字符串就是绝对 HTTP(S) URL”的值，但不扫描 key、prose 子串、HTML/JavaScript 或 `RequiredHttpHeaders` 的值。Extreme 的 `RequiredHttpHeaders` 仅允许 Accept、Accept-Language、Origin、Referer、User-Agent，最多 8 项/4 KiB，规范化后写入 AES-GCM capability 并绑定精确 target；不与管理员固定 Header 冲突，不用于 suffix/query/template，不跟随重定向或跨 authority 传播，只会为同 authority 的清单子资源重新签发精确 target capability。Cookie、Authorization、Host、Emby token、转发头、hop-by-hop 与任意其他名称始终拒绝。
-- HLS：Safe/Compatible 改写 playlist URI 行及已审核标签的 URI 属性；playlist capability 绑定资源类型并最多递归 3 层，segment/key/map 等二进制 capability 不会被当成清单再次解析。Extreme 额外支持按出现顺序生效的本地 `EXT-X-DEFINE` NAME/VALUE（IMPORT 只允许引用同一清单已经存在的本地定义），在 URI 行和 URI 属性中先做有界变量替换，并保留语法有效、无主动网络语义的未知 `EXT-X-*` 标签；未知标签中带引号的 `URI`/`*-URI` 会先 capability 化，无法识别的 URL 属性、未定义/嵌套变量、敏感 DRM/key/license URI 仍失败关闭。DEFINE 原值不会输出给客户端。所有档位都继续拒绝 Content Steering、需要绝对 public capability base 的 interstitial asset、FairPlay/Widevine 等未处理 DRM 结构及非 HTTP(S) key URI。低延迟 `_HLS_*` delivery directive、canonical query、RENDITION-REPORT 浅层 capability 复用和深度/行/属性/输出预算仍按原安全边界执行。
-- DASH：所有档位都解析 UTF-8、无 DTD/外部实体的 MPD，并 capability 化 BaseURL、继承的 SegmentTemplate/List/Base、SegmentURL、Initialization/RepresentationIndex/BitstreamSwitching `sourceURL`、受支持的 UTCTiming/Event callback 与 Location；模板继续绑定 RepresentationID/Bandwidth/Number/Time/SubNumber 的结构和整数语义。Safe/Compatible 仍拒绝 DRM 与外来 namespace。Extreme 额外保留通过筛查的惰性 foreign-namespace element/attribute/wrapper，并继续遍历其中的标准 DASH URL 结构；可保留无主动网络语义的 `ContentProtection`、`cenc:default_KID`、有界解码且不含 license/certificate/server URL 的 `cenc:pssh`、`mspr:pro` 等元数据。所有档位仍拒绝 DTD/entity、xlink、`xml:base`、PatchLocation、ImportedMPD、Metrics/Reporting、Content Steering、DVB font download、Laurl/licenseUrl/Certurl、foreign href/src/url/uri 等主动网络结构，以及在编码 DRM metadata 中发现的外部 license/certificate/server URL。
-
-外部目标会改写为同源 `/_meridian/d/<capability>`；HLS/DASH 即使仍指向管理员配置的主回源，也会使用绑定该配置 authority、复用现有 transport/UA/Header 规则的 capability，避免清单子请求绕过改写。PlaybackInfo 中指向带基础路径的已配置 authority 的绝对 URL 也使用 trusted capability，避免客户端路径再次拼接基础路径。capability 使用 AES-GCM 认证加密，绑定站点、策略修订、来源、资源类型、清单深度、完整目标 path/query、签发/绝对过期时间、DASH 模板，以及 Extreme 中规范化后的安全 RequiredHttpHeaders；Header claim 只适用于精确 target，既不明文持久化也不进入日志。capability 只接受 GET/HEAD。一次改写中产生或复用的 capability 先以引用计数的 provisional 状态保留，只有完整解析、改写和父 capability 复核都成功后才统一发布；失败会统一回滚 capability 与 provisional authority。篡改、过期、跨站点、旧策略、错误资源类型、错误路径或不合法 Header 绑定统一返回不可缓存的 `404`，不会透露目标或失败细节。相同目标与同一 Header 绑定在有效期内复用稳定 capability；registry 同时受数量和内存字节上限约束，并在每次 lookup 精确执行 idle/绝对过期判断；站点停止或策略重载会撤销该实例内全部 token。
-
-| 配置 | 可选发现来源 | 未知目标 scheme / 端口 | 30x 跳数 | authority | URL/响应 | 正文上限 | active capability | idle / 绝对寿命 | 动态流 |
-|------|--------------|------------------------|---------:|----------:|---------:|---------:|------------------:|------------------:|-------:|
-| **Safe** | 30x + PlaybackInfo | 仅 HTTPS / 443 | 3 | 256 | 256 | 4 MiB | 4,096 | 30 分钟 / 8 小时 | 32 |
-| **Compatible** | 30x + PlaybackInfo + HLS + DASH | HTTP/HTTPS / 任意有效端口 | 5 | 1,024 | 1,024 | 16 MiB | 16,384 | 2 小时 / 24 小时 | 128 |
-| **Extreme** | 30x + PlaybackInfo + HLS + DASH（扩展兼容） | HTTP/HTTPS / 任意有效端口 | 10 | 4,096 | 4,096 | 64 MiB | 65,536 | 24 小时 / 7 天 | 512 |
-
-全进程还共享 16,384 个 authority、131,072 个 active capability、256 MiB capability registry 内存、1,024 条动态流、每分钟 2,400 个新 authority、32 个 DNS worker、8 个并发正文解析、256 MiB 解析内存；每站 capability registry 和解析内存分别最多 64 MiB、同时最多解析 2 个响应。表内正文上限是各 profile 的协议上限；结构化解析还取更严格的 8 MiB 输入、16 MiB 输出硬上限与实际 profile 上限中的最小值，并按已知长度或最坏情况预留输入、对象树和输出的完整工作集。解析同时执行读取时限、异常压缩比、JSON token/深度/字符串、HLS 行、XML 节点和 URL 数量限制。队列或容量满时失败关闭，不阻塞其他媒体流。
-
-**兼容模式与 HTTPS 降级。** Compatible 是管理界面的默认推荐档，允许通过完整 DNS/SSRF/固定拨号校验的公网 HTTP/HTTPS 域名和有效端口。Extreme 只放在高级选项中，启用时仍要求额外风险确认。Safe 作为旧数据库/API 兼容档继续存在：启用时至少需要一条 `exact` 或 `suffix` DNS 规则，不接受 IP literal。新建站点默认允许 HTTPS 到 HTTP 降级，以兼容只提供 HTTP 播放地址的后端；Safe 永远只允许 HTTPS:443。
-
-**URL、DNS、SSRF 与固定拨号。** 动态 URL 最长 4096 字节，仅接受无 userinfo、fragment、空白或控制字符的绝对 HTTP(S) URL。DNS 的全部 A/AAAA 都必须是允许的全球单播地址；混入私网、回环、链路本地、CGNAT、metadata、文档、保留、组播、转换地址即整组拒绝，同时拒绝已知面板/站点目标和本机接口。本机 interface IP 除配置快照外，还会在 DNS 结果校验、transport 构造和每次 pinned dial 前重新枚举；枚举失败会失败关闭，运行时新分配的公网 IP 也不能成为动态目标。校验后的 IP 固定到本次直拨 transport，不使用环境代理或二次 DNS；HTTPS 保留原 Host/SNI、验证系统证书链并要求 TLS 1.2 以上。NAT hairpin、公网别名和外部负载均衡回流仍需部署侧防火墙阻断。
-
-**Header、正文与失败边界。** 普通跨 authority 请求只重建 `Accept`、`Accept-Encoding`、`Range`、`If-Range` 和固定 Meridian UA；Extreme 在确实重放请求体时可再携带 Content-Type/Encoding/Language/MD5/Digest。Cookie、Authorization、Emby token Header、固定上游 Header、转发头、hop-by-hop 和任意其他自定义 Header 不会跨域。PlaybackInfo RequiredHttpHeaders 是独立的 AEAD 精确-target 绑定，不会并入 redirect Header 或传播到不同 authority。动态响应只保留 Content/Range 白名单，强制 `private, no-store`、`no-referrer`、`nosniff`，删除 `Set-Cookie` 与 trailer。被改写的 JSON/manifest 会删除失效的压缩、长度、Range 和 validator Header；解析失败返回清洗后的 502，绝不部分改写或原文回退。上游 manifest 的 4xx/5xx 保留原状态码，但正文会替换为固定 manifest 错误对象；动态 resource/redirect 的上游错误正文也会替换为固定动态错误对象，所有路径都只保留经过界限验证的 `Retry-After`。二进制 resource 是否与 manifest 混淆按 capability 的认证 resource kind 与正向结构化 Content-Type 判断；key/segment 即使使用 `.m3u8`/`.mpd` 后缀和 `application/octet-stream` 也不会被误当成 manifest，真正的 HLS/DASH MIME 或 active content 仍失败关闭。私网目标、自定义 CA 和 raw fallback 仍明确不可用。
-
-**观察与日志。** 自动发现观察记录只聚合站点、规范化 `scheme://host:port`、来源（redirect/playback_info/hls/dash）、允许/拒绝、有限原因、时间和次数，不保存 path、query、capability、DNS 回答、Header 或正文。除通用 DNS/TLS/capacity 代码外，协议边界会区分 `request_unclassified`、`structured_body_limit`、`playback_info_denied`、`hls_feature_denied`、`dash_feature_denied` 和 `redirect_body_replay_denied`，便于确认实际卡在请求分类、正文预算、具体 parser 还是 body replay。观察记录使用 2,048 项有界异步队列，保留 30 天且全库最多 10,000 行。管理页面的请求日志另外保存站点、资源类别、状态码、可信客户端 IP、经清洗的 UA、方法和不含 query 的路径，使用总容量 6,144 的共享有界遥测队列，保留 30 天且全库最多 20,000 行；不保存 Cookie、令牌、请求/响应 Header 或正文。队列繁忙或可选写入失败只增加 dropped 计数，不阻塞媒体请求。Meridian 的错误日志只输出有限原因代码，不输出动态目标。官方 Nginx 配置把 capability 路径记为 `/_meridian/d/[REDACTED]`，但第三方 CDN、负载均衡器或既有代理必须另行配置同等脱敏、最短保留期和访问控制。
-
-### 共享域名入口
-
-每个站点有三种入口模式：`host`（仅共享域名，推荐）、`port`（仅独立端口）和 `both`（共享域名与独立端口同时启用）。`host` 模式只在面板监听地址上按 `public_host` 分流，不会绑定站点的保留端口；`both` 才会额外监听该高端口。当 Nginx、Cloudflare Tunnel 或其他可信入口保留原始 `Host` 时，Meridian 会把这个域名除下述保留命名空间外的路径转给对应站点。
-
-严格 `host` 模式必须满足以下一项：`PANEL_BIND_ADDR` 是回环地址（推荐，同机 Nginx），或配置非空 `TRUSTED_PROXY_CIDRS`。后一种适用于 Docker 网络/外置入口：共享站点只接受这些 peer CIDR 的请求，直接访问源站 IP 并伪造 `Host` 会返回 `403`。不要把公网客户端网段、容器默认大网段或 `0.0.0.0/0` 当作可信代理；否则等同于取消这层防绕过保护。`both` 是显式高风险兼容模式，独立端口仍需防火墙保护。
-
-设置 `PANEL_DOMAIN` 后，只有精确的面板域名能够进入管理界面，未知域名或 IP Host 返回 `421 Misdirected Request`；已配置但停用的站点返回 `503`，都不会回退并暴露管理面板。未设置 `PANEL_DOMAIN` 时继续支持直接 IP 访问，方便初始部署。
-
-`public_host` 使用精确、大小写不敏感的 DNS 名称匹配。它不接受协议、端口、路径、IP 或通配符，也不能与 `PANEL_DOMAIN` 相同。当前版本不支持路径前缀部署，因为 Emby 的绝对路径、播放 URL 和 WebSocket 端点需要完整的 base-path 协议设计，不能只做字符串裁剪。
-
-`/_meridian/d/<capability>` 是自动播放后端发现的同源 bearer 路由；`/_meridian/d`、畸形、篡改、过期或不属于当前站点/策略的 capability 都返回不可缓存的 `404`，绝不转发到普通上游。若现有 Emby 插件或自定义接口使用这个保留命名空间，升级前必须迁移。
-
-反向代理必须保留 Host，并把普通 HTTP 与 WebSocket 都转到同一个 Meridian 面板端口。同机 Nginx 建议同时设置 `PANEL_BIND_ADDR=127.0.0.1` 和 `TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128`；前者关闭公网直连，后者让 Meridian 只从本机代理采纳规范化的 `X-Real-IP`。若缺少后者，所有远程登录会共用 Nginx 的回环地址作为限流身份，任一来源都可能触发共享锁定。例如：
-
-```nginx
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-
-map $uri $meridian_log_path {
-    default $uri;
-    ~^/_meridian/d/ /_meridian/d/[REDACTED];
-}
-
-log_format meridian_redacted '$remote_addr - $remote_user [$time_local] "$request_method $meridian_log_path $server_protocol" $status $body_bytes_sent';
-
-server {
-    listen 443 ssl;
-    server_name emby.example.com;
-    access_log /var/log/nginx/meridian_access.log meridian_redacted;
-    large_client_header_buffers 4 32k; # 容纳 16 KiB Extreme capability 加路径与请求行开销
-
-    location / {
-        proxy_pass http://127.0.0.1:9090;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        client_max_body_size 0; # 或改成符合你上传策略的明确上限
-    }
-}
-```
-
-`map` 和 `log_format` 必须放在 Nginx 的 `http` 上下文（常见的 `conf.d/*.conf` 文件即位于该上下文），并在 Certbot 创建的每个 `server` 块中保留上面的 `access_log`。不要为这些虚拟主机同时启用默认 `combined` 日志，也不要在其他 `access_log` 格式中记录 `$request`、未脱敏的 `$request_uri` / `$uri` 或 `$http_referer`；Nginx 会同时写入同一层级声明的多个日志，任一未脱敏日志都可能把后续 `/_meridian/d/<bearer>` 路径原样落盘。修改后应先执行 `nginx -t`，验证成功再重载；一键安装器只会自动迁移带 Meridian 管理标记的面板配置，不会改写手工维护的 Nginx 文件。对于已有的同名脱敏组件，安装器只信任上例中规则顺序与内容均规范、且没有额外规则的 `map`，以及内容完全一致的安全 `log_format`；发现同名不安全、重复、歧义或不完整定义时会保持配置原字节不变并在重载前中止。
-
-Extreme 的 capability 可能同时携带 4096 字节目标和最多 4 KiB 的加密安全 Header claim，编码后的 token 上限为 16 KiB；请求行还包含 capability 前缀、方法和协议，因此 Nginx 应给单个请求行留出 32 KiB buffer。新生成的官方配置已加入 `large_client_header_buffers 4 32k`。手工维护或旧版第三方入口不会被自动改写，启用 Extreme RequiredHttpHeaders 前必须补上等价限制，并核对 CDN/负载均衡器自己的 URL 长度上限。
-
-Meridian 只接受可信代理提供的单值 `X-Real-IP`，不会从可能包含客户端伪造内容的 `X-Forwarded-For` 链选择身份。Docker、Cloudflare Tunnel 或外置 Nginx 应把 `TRUSTED_PROXY_CIDRS` 精确设为实际代理 peer 网段，不能使用 `0.0.0.0/0`。Meridian 不负责为站点域名申请证书或修改 CDN DNS；证书、Cloudflare SSL 模式、防火墙和源站只允许可信入口访问等设置仍由入口层管理。上例的长超时、关闭缓冲和上传上限是流媒体/长连接所需；如果已有全局策略，可以按等价配置调整。
-
-> 新建共享域名站点默认使用 `host`，这是避免绕过 CDN 的推荐配置；程序会拒绝在“非回环绑定且没有可信代理来源”的条件下启用它。只有确实需要兼容直接端口访问时才选择 `both`，并用防火墙限制来源；`port` 和 `both` 的独立端口都会绑定所有网络接口。
-
-### 固定上游请求头
-
-每个站点可以为主回源配置最多 16 个固定 Header。所有新值都使用 `UPSTREAM_HEADER_KEY` 通过 AES-GCM v2 加密后写入 SQLite，认证数据同时绑定 Header 名称与目标 scheme/主机/有效端口；管理 API 和浏览器只返回 Header 名称与“已配置”状态，不会回显明文或密文。同一主回源 authority 内编辑时值留空表示保留，删除整行才会移除；一旦修改协议、域名或有效端口，旧值会自动清空，必须重新输入，避免把源站秘密带到新主机。
-
-这些 Header 只会发送给 `target_url` 的精确协议、域名和有效端口。独立播放回源、WebSocket 播放目标和跨 authority 重定向都会主动删除它们，避免把源站秘密带给 CDN。`Authorization`、`Cookie`、`Host`、`User-Agent`、`X-Forwarded-*`、常见供应商客户端 IP Header、Emby 授权头和 WebSocket/hop-by-hop Header 由 Meridian 管理，不能在这里覆盖。
-
-> `UPSTREAM_HEADER_KEY` 必须与数据库一起备份并保持不变。不要与 `JWT_SECRET` 共用同一个值；丢失该密钥后，包含加密 Header 的站点会拒绝启动，而不是静默发送空值。
-
-### UA 身份模式
-
-每个站点可选 Infuse、Web、客户端三个预设，或选择“自定义”固定身份，或选择“透传”保留客户端身份。
-
-- **自定义（固定身份）**：填写 `User-Agent`、Emby `Client`、`Version`，Meridian 会在普通 HTTP、WebSocket 以及受配置白名单约束的播放重定向请求中统一改写成这套固定值，所有请求保持一致；`Device` 与 `DeviceId` 会原样保留。为避免请求头注入和 Emby 授权头格式损坏，自定义值只接受受限长度的可打印 ASCII 字符，`Client` 和 `Version` 不接受引号或反斜杠。
-- **透传（每请求真实身份）**：Meridian 不生成也不改写任何 UA 身份，每个请求原样保留客户端自带的 `User-Agent` 与 Emby `Client`、`Version`、`Device`、`DeviceId` 后转发，适合多用户共用一个反代站点、需要按客户端区分身份的部署。
-
-两种模式的凭据安全边界一致：站点请求出站前始终删除 Meridian 管理会话 `meridian_session`，但保留 Emby 自己的 Cookie；跨 authority 转发时 `Cookie`、`Authorization` 等凭据仍会被剥离，`X-Forwarded-*` 与 hop-by-hop 请求头清洗保持不变，透传不会绕过任何凭据清洗。
-
----
-
-## 诊断功能说明
-
-| 检测项 | 检测对象 | 含义 | 不代表什么 |
-|--------|---------|------|-----------|
-| **主回源健康** | 上游 `target_url` | 网络层可达性与探针结果（多探针路径，401/403/404 仍算在线；元数据接口不可用时会回退到目标根路径探针） | 不是端到端的完整业务可用性证明 |
-| **播放回源健康** | `playback_target_url` 的实际生效上游 | 基于播放类路径的轻量探针结果（默认使用轻量请求，不做完整媒体拉流） | 不代表媒体链路一定可正常播放 |
-| **主回源 TLS** | 主回源 HTTPS 站点证书 | 证书有效期、颁发机构展示 | 不是 Meridian 自己监听端口的证书 |
-| **播放回源 TLS** | 播放回源 HTTPS 站点证书 | 仅在播放回源为独立 HTTPS 上游时单独展示 | 不负责自动签发或续期 |
-| **请求头配置** | 本地 UA 配置 | 代理将发送给上游的 UA / Client / Version 值 | 不是远端回显验证 |
-| **代理状态** | 本地反代进程 | 是否运行、监听端口 | — |
-
-当 `playback_target_url` 为空时，诊断页会明确标记“播放回源回退到主回源”；当它与 `target_url` 相同时，诊断页会复用主回源结果而不重复展示完全相同的诊断块。
-播放回源健康会额外展示当前轻量探针的方法、目标 URL 和返回状态，帮助区分“播放路径可达”与“完整播放成功”这两个不同概念。
-
----
-
-## 运维要点
-
-- **JWT 密钥**：未设置 `JWT_SECRET` 时每次启动生成随机密钥，重启后会话全部失效
-- **上游 Header 密钥**：使用固定请求头时必须长期保留 `UPSTREAM_HEADER_KEY`；它应与 JWT 密钥分开生成和备份
-- **首次初始化**：数据库中没有管理员时必须预先配置 `SETUP_TOKEN`，创建操作在数据库中原子执行，服务不会记录令牌
-- **登录保护**：同一来源在 15 分钟内连续失败 5 次后会被暂时限制 15 分钟；限流记录会过期并在容量达到上限时按最近使用情况淘汰
-- **浏览器边界**：管理 API 使用 `HttpOnly`、`SameSite=Strict` 会话 Cookie，只允许同源的状态变更请求，并发送 CSP、防嵌入和 MIME 嗅探保护头
-- **流量持久化**：每 60 秒刷入 SQLite，异常退出可能丢失最近一分钟计量
-- **操作原子性**：站点创建/启停/更新如反代绑定失败，会回滚数据库并返回错误
-- **优雅关闭**：收到 `SIGINT`/`SIGTERM` 后先 flush 流量再退出
-
----
-
-## 验证 & CI/CD
+### 4. 启动
 
 ```bash
-go test -race ./...                                  # 运行测试和竞态检测
-go vet ./...                                          # Go 静态检查
-govulncheck ./...                                     # 已知漏洞检查
-gosec -severity medium -confidence medium ./...       # 安全规则检查
-go build -trimpath -buildvcs=false -o meridian .      # 编译
+docker compose pull
+docker compose up -d
+docker compose ps
 ```
 
-日常 push / pull request 会自动触发：
+浏览器打开：
 
-- 模块校验、竞态测试、`go vet`
-- `govulncheck`、`gosec`、CodeQL
-- 前端 JavaScript 与安装脚本语法检查
-- 可复现路径裁剪构建
+```text
+http://服务器IP:9090
+```
 
-推送 `v*` 标签时自动触发：
-- 多平台构建（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
-- 创建 GitHub Release 并上传二进制
-- 生成并上传 `SHA256SUMS`
-- 构建并推送 linux/amd64、linux/arm64 多架构 Docker 镜像到 `ghcr.io`
+首次进入时使用 `.env` 中的 `SETUP_TOKEN` 创建管理员。初始化完成后仍应保留原有密钥和数据卷，不要因升级而重新生成。
 
----
+## 添加第一个站点
 
-## V1 定位
+1. 进入“站点管理”，选择“添加站点”。
+2. 填写节点名称和 Emby 面板地址。
+3. 选择域名入口或独立端口入口。
+4. 保持默认 UA 透传、自动发现和 HTTPS → HTTP 降级。
+5. 保存后先执行站点测速，再使用客户端登录并播放。
+6. 如果个别服务无法发现播放后端，再到高级选项中开启 HLS/DASH 或更宽松的发现来源。
 
-Meridian `v1` 明确定位为一个**单管理员、轻量、可直接落地**的 Emby reverse proxy management panel。
+普通站点不需要填写独立播放回源地址。只有自动发现确实无法覆盖的特殊服务，才建议手动配置播放回源。
 
-- 保留：登录、站点 CRUD、启停、UA 改写、流量统计、双上游、结构化诊断
-- 不做：多用户、角色权限、审计日志、Telegram / Webhook 通知
-- 目标：先把单文件 Go + 嵌入式 SPA 的简单面板体验收口，而不是提前引入更重的管理系统
+## 缓存配置
 
-## 升级现有实例
+缓存规则按真实目标路径匹配，也可以在规则前限制域名。默认示例：
 
-升级时建议优先保持这些内容不变：
+```text
+*/file/*
+*/emby/Items/*/Images/*
+```
 
-- `JWT_SECRET`
-- `UPSTREAM_HEADER_KEY`
-- `DYNAMIC_ROUTE_KEY`
-- SQLite 数据库文件及其同目录的 `-wal` / `-shm`
+即使规则命中，下列媒体内容也不会缓存：
 
-使用一键脚本执行 `update` 时，下列步骤会自动完成；手动部署时推荐：
+```text
+m3u8, mpd, ts, m4s, mp4, m4v, mkv, webm, mov, avi, flv,
+mp3, aac, m4a, flac, ogg, opus, wav,
+video/*, audio/*, application/*mpegurl*, application/dash+xml
+```
 
-1. 停止正在运行的 Meridian 服务。
-2. 备份当前二进制、数据库文件以及保存 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY` 的环境配置。
-3. 替换为新版本二进制或新镜像。
-4. 用原来的 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY` 和数据库重新启动。
-5. 登录面板后检查站点列表、端口监听和诊断页。
+“缓存大小上限（MB）”是单节点上限。写入后如果超过限制，程序会删除最久未使用的缓存文件，直到容量回到上限以内。
 
-如果升级后临时忘记保留 `JWT_SECRET`，历史 JWT 会全部失效，表现为所有登录状态需要重新建立。
+## 升级
 
-## 备份与恢复
+升级前先备份 Compose 配置、`.env` 和数据卷。不要只备份数据库而丢失长期密钥。
 
-一键脚本不再公开单独的备份命令。执行 `update` 或 `password` 时会自动短暂停止 systemd 服务并在 `/opt/meridian-backups` 创建一致性备份；如需自定义备份策略，请在停止 Meridian 后备份下列最小文件集。
+```bash
+cd /opt/meridian
+docker compose pull
+docker compose up -d
+docker compose ps
+docker compose logs --tail=100 meridian
+```
 
-最小备份集：
+数据库结构会在启动时自动迁移。升级过程中不要删除 `meridian-data` 数据卷。
 
-- `meridian.db`
-- `meridian.db-wal`
-- `meridian.db-shm`
-- 保存 `JWT_SECRET`、`UPSTREAM_HEADER_KEY` 和 `DYNAMIC_ROUTE_KEY` 的 `.env`、systemd 环境文件或容器环境配置
+## 备份与回滚
 
-恢复步骤：
+备份数据卷示例：
 
-1. 停止 Meridian。
-2. 还原数据库文件到原路径。
-3. 还原原来的 `JWT_SECRET`、`UPSTREAM_HEADER_KEY` 和 `DYNAMIC_ROUTE_KEY`。
-4. 启动 Meridian。
-5. 验证管理员登录、站点配置和关键代理端口。
+```bash
+docker run --rm \
+  -v meridian_meridian-data:/data:ro \
+  -v "$PWD":/backup \
+  alpine:3.24 \
+  tar czf /backup/meridian-data-backup.tar.gz -C /data .
+```
 
-如果你使用 Docker，恢复时同样要保留挂载卷里的数据库文件，并继续使用原来的 `JWT_SECRET`、`UPSTREAM_HEADER_KEY` 和 `DYNAMIC_ROUTE_KEY`。
+回滚时把 `compose.yaml` 中的镜像标签改为之前使用的固定版本，然后重新创建容器：
 
----
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+```
 
-## Roadmap
+旧版本可能无法读取新版本迁移后的数据库，因此重要升级应同时保留升级前的数据卷备份。
 
-以下功能尚未实现，列在这里作为未来方向：
+## 从源码构建
 
-- [ ] 多用户 + 角色权限
-- [ ] 审计日志
-- [ ] Telegram / Webhook 通知
+```bash
+git clone https://github.com/chanhui800/Meridian.git
+cd Meridian
+go test ./...
+go build -trimpath -o meridian .
+```
 
-## 限制与注意事项
+Docker 构建：
 
-- 当前只支持单管理员，不支持多用户或角色划分
-- 没有审计日志，操作不可追溯
-- 没有内置通知能力（无 Telegram / Webhook 集成）
-- 管理面板本身不终止 TLS，公网部署必须放在 HTTPS 反向代理之后
-- 共享入口仅支持精确 Host，不支持通配符或 URL 路径前缀
-- TLS 诊断会验证上游证书，但不负责证书签发和续期
-- UA 诊断是本地配置预览，不验证远端实际收到的请求头
+```bash
+docker build --build-arg VERSION=dev -t meridian:dev .
+```
 
-## 开发须知
+## 主要技术实现
 
-- 后端代码保持在 `main.go`，不拆分文件
-- 前端使用 hash 路由（`#/dashboard`、`#/sites`、`#/diagnostics`）
-- API 认证使用 HttpOnly JWT 会话 Cookie
-- SQLite 驱动名为 `sqlite`（不是 `sqlite3`）
-- 静态资源通过 `go:embed` 嵌入二进制
+- 后端：Go 标准库 HTTP 服务器与反向代理。
+- 数据：SQLite，自动执行兼容迁移。
+- 前端：原生 HTML、CSS、JavaScript SPA，使用 Go `embed` 打包。
+- 实时数据：Server-Sent Events 与定时 API 刷新。
+- 播放代理：结构化解析 30x、PlaybackInfo、HLS、DASH，并通过加密 capability 路由转发动态目标。
+- 安全：HttpOnly 会话 Cookie、bcrypt 密码、长期密钥分离、受信代理网段和上游地址校验。
+- 容器：非 root 用户、只读根文件系统、移除 Linux capabilities，并提供健康检查。
 
-## 参与贡献
+## 使用注意
 
-请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+- `JWT_SECRET` 变化会让所有现有登录失效。
+- `UPSTREAM_HEADER_KEY` 丢失后，已保存的加密上游请求头无法恢复。
+- `DYNAMIC_ROUTE_KEY` 变化后，已生成的动态播放路由会失效。
+- 真实客户端 IP 只应从明确配置的受信反向代理读取；不要将任意公网网段设为可信代理。
+- 自动发现会尽量兼容不同 Emby 面板，但无法保证第三方服务端的所有私有实现都能识别。
+- 请确保你有权访问并反向代理所配置的媒体服务。
 
-## 安全问题
+## 致谢
 
-请参阅 [SECURITY.md](SECURITY.md)。
+- 原项目：[snnabb/Meridian](https://github.com/snnabb/Meridian)
+- 自动反代思路参考：[Gsy-allen/emby-reverse-proxy-go](https://github.com/Gsy-allen/emby-reverse-proxy-go)
+- UI 参考：[axuitomo/CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)
+- 缓存功能参考：[zxcll/emby-proxy-panel](https://github.com/zxcll/emby-proxy-panel)
 
 ## License
 
-MIT
+本项目遵循 [MIT License](LICENSE)。
