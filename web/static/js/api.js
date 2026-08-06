@@ -58,6 +58,8 @@ const API = {
 
   // Sites
   ingressCapabilities() { return this.request('GET', '/api/ingress-capabilities'); },
+  panelCertificate() { return this.request('GET', '/api/panel-certificate'); },
+  requestPanelCertificate(data) { return this.request('POST', '/api/panel-certificate', data); },
   listSites() { return this.request('GET', '/api/sites'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },
   updateSite(id, data) { return this.request('PUT', '/api/sites/' + id, data); },

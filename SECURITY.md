@@ -36,6 +36,7 @@
 
 - 未配置域名时管理面板默认监听 `0.0.0.0`；一键脚本启用面板域名后会改为 `127.0.0.1`，只信任回环代理并由 Nginx 提供 HTTPS
 - 面板可通过 `PANEL_TLS_ENABLED`、`PANEL_TLS_CERT_FILE` 和 `PANEL_TLS_KEY_FILE` 在自身监听端口终止 HTTPS；证书私钥必须限制为服务进程可读，证书续期后替换文件即可在新的 TLS 握手中热加载
+- 面板的 ACME 入口目前只支持 Cloudflare DNS-01。DNS API Token 仅保存在单次请求内存中，不写入数据库、证书目录或日志；应使用只允许编辑目标 DNS 区域的最小权限 Token。账户密钥和签发私钥以 `0600` 写入 TLS 目录
 - 站点界面提供 `port`（独立端口）和 `host`（域名前缀）两种入口；旧数据库中的 `both` 仍仅作兼容读取，不再出现在新增站点选项。配置 `PANEL_ROUTE_DOMAIN` 后，前缀会绑定为 `prefix.PANEL_ROUTE_DOMAIN` 并通过面板端口转发。启用面板 TLS 时，路由器同时校验 SNI 与 Host；未知前缀返回 `421`，避免通过 Host 头越权访问其他站点
 - 设置 `PANEL_DOMAIN` 后，未知 Host 返回 `421` 而不是管理面板；未设置时保留直接 IP/任意 Host 的初始部署兼容行为
 - 安装器生成的 Nginx 配置只代理管理端口，不读取或代理站点回源、播放地址或站点监听端口

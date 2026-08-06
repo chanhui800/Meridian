@@ -51,8 +51,36 @@ func TestPanelTLSConfigFromEnvRequiresFiles(t *testing.T) {
 	t.Setenv("PANEL_TLS_ENABLED", "true")
 	t.Setenv("PANEL_TLS_CERT_FILE", "")
 	t.Setenv("PANEL_TLS_KEY_FILE", "")
-	if _, enabled, err := panelTLSConfigFromEnv(); err == nil || enabled {
+	if _, enabled, err := panelTLSConfigFromEnv(":memory:"); err == nil || enabled {
 		t.Fatalf("missing TLS files returned enabled=%v err=%v", enabled, err)
+	}
+}
+
+func TestPanelCertificateRequestValidation(t *testing.T) {
+	if err := validatePanelCertificateRequest("admin@example.com", strings.Repeat("a", 32)); err != nil {
+		t.Fatalf("valid certificate request rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		email string
+		token string
+	}{
+		{"bad", strings.Repeat("a", 32)},
+		{"admin@example.com", "short"},
+		{"admin@example.com", strings.Repeat("a", 10) + "\n" + strings.Repeat("a", 10)},
+	} {
+		if err := validatePanelCertificateRequest(tc.email, tc.token); err == nil {
+			t.Fatalf("invalid request email=%q token_len=%d accepted", tc.email, len(tc.token))
+		}
+	}
+}
+
+func TestPanelTLSPathsDefaultBesideDatabase(t *testing.T) {
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	databasePath := filepath.Join(t.TempDir(), "meridian.db")
+	certFile, keyFile := panelTLSPaths(databasePath)
+	if certFile != filepath.Join(filepath.Dir(databasePath), "tls", "fullchain.pem") || keyFile != filepath.Join(filepath.Dir(databasePath), "tls", "privkey.pem") {
+		t.Fatalf("panelTLSPaths = %q, %q", certFile, keyFile)
 	}
 }
 
