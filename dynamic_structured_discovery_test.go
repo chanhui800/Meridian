@@ -217,31 +217,45 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 }
 
 func TestExtremePlaybackInfoAcceptsSchemelessHostPortURLs(t *testing.T) {
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
-	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	payload := []byte(`{"MediaSources":[{"DirectStreamUrl":"cflocal.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"}]}`)
+	for _, test := range []struct {
+		name   string
+		input  string
+		target string
+	}{
+		{name: "bare authority", input: "cflocal.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://cflocal.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
+		{name: "http missing slashes", input: "http:gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
+		{name: "http single slash", input: "http:/gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
+			base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
+			session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+			payload, err := json.Marshal(map[string]any{"MediaSources": []any{map[string]any{"DirectStreamUrl": test.input}}})
+			if err != nil {
+				t.Fatalf("marshal PlaybackInfo: %v", err)
+			}
+			rewritten, err := rewritePlaybackInfoResponse(payload, session)
+			if err != nil {
+				t.Fatalf("rewrite Extreme PlaybackInfo URL: %v", err)
+			}
+			routes := structuredCapabilityRoutes(string(rewritten))
+			if len(routes) != 1 || strings.Contains(string(rewritten), "xxlb.net") || strings.Contains(string(rewritten), "origin-secret") {
+				t.Fatalf("URL was not protected by one capability route: %s", rewritten)
+			}
+			claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
+			if err != nil {
+				t.Fatalf("open URL capability: %v", err)
+			}
+			if claims.Target != test.target {
+				t.Fatalf("capability target = %q, want %q", claims.Target, test.target)
+			}
 
-	rewritten, err := rewritePlaybackInfoResponse(payload, session)
-	if err != nil {
-		t.Fatalf("rewrite schemeless Extreme PlaybackInfo URL: %v", err)
-	}
-	routes := structuredCapabilityRoutes(string(rewritten))
-	if len(routes) != 1 || strings.Contains(string(rewritten), "cflocal.xxlb.net") || strings.Contains(string(rewritten), "origin-secret") {
-		t.Fatalf("schemeless URL was not protected by one capability route: %s", rewritten)
-	}
-	claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-	if err != nil {
-		t.Fatalf("open schemeless URL capability: %v", err)
-	}
-	if claims.Target != "http://cflocal.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret" {
-		t.Fatalf("capability target = %q", claims.Target)
-	}
-
-	compatible := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileCompatible)
-	compatibleSession := &dynamicRewriteSession{ctx: context.Background(), issuer: compatible, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	if _, err := rewritePlaybackInfoResponse(payload, compatibleSession); err == nil {
-		t.Fatal("Compatible unexpectedly accepted a schemeless host:port URL")
+			compatible := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileCompatible)
+			compatibleSession := &dynamicRewriteSession{ctx: context.Background(), issuer: compatible, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+			if _, err := rewritePlaybackInfoResponse(payload, compatibleSession); err == nil {
+				t.Fatal("Compatible unexpectedly accepted a malformed host:port URL")
+			}
+		})
 	}
 }
 
