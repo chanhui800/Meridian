@@ -21,6 +21,9 @@ const Router = {
     if (previous === 'traffic' && hash !== 'traffic' && typeof stopTrafficRefresh === 'function') {
       stopTrafficRefresh();
     }
+    if (previous === 'request-logs' && hash !== 'request-logs' && typeof stopRequestLogRefresh === 'function') {
+      stopRequestLogRefresh();
+    }
 
     this.current = hash;
 

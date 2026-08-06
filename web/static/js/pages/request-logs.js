@@ -1,6 +1,7 @@
 let requestLogCategoryFilter = 'all';
 let requestLogStatusFilter = 'all';
 let requestLogSearchTimer = null;
+let requestLogRefreshTimer = null;
 let requestLogLoadGeneration = 0;
 
 function requestLogDateInputValue(date) {
@@ -22,6 +23,7 @@ function requestLogRangeMilliseconds(fromValue, toValue) {
 function requestLogCategoryLabel(category) {
   return ({
     playback: '播放信息',
+    video: '视频流',
     image: '图片海报',
     api: '常规 API',
     auth: '用户认证',
@@ -83,6 +85,7 @@ function renderRequestLogs() {
         <div class="request-log-pills" id="request-log-category-pills">
           <button type="button" class="request-log-pill active" data-category="all">全部模式</button>
           <button type="button" class="request-log-pill" data-category="playback">只看播放信息</button>
+          <button type="button" class="request-log-pill" data-category="video">只看视频流</button>
           <button type="button" class="request-log-pill" data-category="image">只看图片海报</button>
           <button type="button" class="request-log-pill" data-category="api">只看常规 API</button>
           <button type="button" class="request-log-pill" data-category="auth">用户认证</button>
@@ -155,6 +158,21 @@ function renderRequestLogs() {
   document.getElementById('request-log-refresh').onclick = loadRequestLogs;
   document.getElementById('request-log-clear').onclick = clearRequestLogs;
   loadRequestLogs();
+  if (requestLogRefreshTimer) clearInterval(requestLogRefreshTimer);
+  requestLogRefreshTimer = setInterval(() => {
+    if (Router.current === 'request-logs') loadRequestLogs();
+  }, 5000);
+}
+
+function stopRequestLogRefresh() {
+  if (requestLogRefreshTimer) {
+    clearInterval(requestLogRefreshTimer);
+    requestLogRefreshTimer = null;
+  }
+  if (requestLogSearchTimer) {
+    clearTimeout(requestLogSearchTimer);
+    requestLogSearchTimer = null;
+  }
 }
 
 function setRequestLogActivePill(containerId, activeButton) {

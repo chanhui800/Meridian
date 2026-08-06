@@ -28,12 +28,23 @@ test('request log table keeps the requested six columns without COLO fields', ()
 test('request log helpers map categories and status colors', () => {
   const sandbox = loadRequestLogHelpers();
   assert.equal(sandbox.requestLogCategoryLabel('playback'), '播放信息');
+  assert.equal(sandbox.requestLogCategoryLabel('video'), '视频流');
   assert.equal(sandbox.requestLogCategoryLabel('image'), '图片海报');
   assert.equal(sandbox.requestLogCategoryLabel('api'), '常规 API');
   assert.equal(sandbox.requestLogCategoryLabel('auth'), '用户认证');
   assert.equal(sandbox.requestLogStatusClass(200), 'request-log-status-ok');
   assert.equal(sandbox.requestLogStatusClass(404), 'request-log-status-client');
   assert.equal(sandbox.requestLogStatusClass(503), 'request-log-status-server');
+});
+
+test('request log panel exposes video stream filtering and live refresh', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
+    'utf8',
+  );
+  assert.match(source, /data-category="video">只看视频流/);
+  assert.match(source, /requestLogRefreshTimer = setInterval/);
+  assert.match(source, /Router\.current === 'request-logs'/);
 });
 
 test('request log date range covers the selected local days', () => {

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -22,6 +24,7 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 
 	for _, event := range []requestLogEvent{
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryPlayback, StatusCode: 200, ClientIP: "203.0.113.10", UserAgent: "CapyPlayer/1.1.3", Method: http.MethodPost, Path: "/Items/abc/PlaybackInfo"},
+		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryVideo, StatusCode: 206, ClientIP: "203.0.113.14", UserAgent: "CapyPlayer/1.1.3", Method: http.MethodGet, Path: "/Videos/abc/stream"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryImage, StatusCode: 404, ClientIP: "203.0.113.11", UserAgent: "Hills/1.8", Method: http.MethodGet, Path: "/Items/abc/Images/Primary"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAuth, StatusCode: 401, ClientIP: "203.0.113.12", UserAgent: "Hills/1.8", Method: http.MethodPost, Path: "/Users/AuthenticateByName"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAPI, StatusCode: 503, ClientIP: "203.0.113.13", UserAgent: "Browser/1.0", Method: http.MethodGet, Path: "/System/Info"},
@@ -33,12 +36,16 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 4 {
-		t.Fatalf("logs=%d, want 4: %#v", len(all), all)
+	if len(all) != 5 {
+		t.Fatalf("logs=%d, want 5: %#v", len(all), all)
 	}
 	playback, err := db.ListRequestLogs(RequestLogFilter{Category: requestLogCategoryPlayback})
 	if err != nil || len(playback) != 1 || playback[0].Path != "/Items/abc/PlaybackInfo" {
 		t.Fatalf("playback logs=%#v err=%v", playback, err)
+	}
+	video, err := db.ListRequestLogs(RequestLogFilter{Category: requestLogCategoryVideo})
+	if err != nil || len(video) != 1 || video[0].Path != "/Videos/abc/stream" {
+		t.Fatalf("video logs=%#v err=%v", video, err)
 	}
 	clientErrors, err := db.ListRequestLogs(RequestLogFilter{StatusGroup: "4xx"})
 	if err != nil || len(clientErrors) != 2 {
@@ -54,7 +61,7 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	}
 	now := time.Now().UnixMilli()
 	ranged, err := db.ListRequestLogs(RequestLogFilter{FromMS: now - int64(time.Minute/time.Millisecond), ToMS: now + int64(time.Minute/time.Millisecond)})
-	if err != nil || len(ranged) != 4 {
+	if err != nil || len(ranged) != 5 {
 		t.Fatalf("ranged logs=%#v err=%v", ranged, err)
 	}
 
@@ -78,6 +85,9 @@ func TestRequestLogClassificationAndSanitization(t *testing.T) {
 		want string
 	}{
 		{path: "/Items/abc/PlaybackInfo", want: requestLogCategoryPlayback},
+		{path: "/Videos/abc/stream", want: requestLogCategoryVideo},
+		{path: "/_meridian/d/capability", want: requestLogCategoryVideo},
+		{path: "/Items/abc/PlaybackInfo.m3u8", want: requestLogCategoryVideo},
 		{path: "/Items/abc/Images/Primary", want: requestLogCategoryImage},
 		{path: "/Users/AuthenticateByName", want: requestLogCategoryAuth},
 		{path: "/System/Info", want: requestLogCategoryAPI},
@@ -128,4 +138,56 @@ func TestRequestLogResponseWriterAndAPI(t *testing.T) {
 	if cleared.Code != http.StatusOK {
 		t.Fatalf("DELETE status=%d body=%s", cleared.Code, cleared.Body.String())
 	}
+}
+
+func TestNewSiteLogsImmediatelyAndDefaultsToPassthrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+	}))
+	defer upstream.Close()
+
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":        "live-log-site",
+		"listen_port": port,
+		"target_url":  upstream.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := httptest.NewRecorder()
+	app.handleSites(created, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var site Site
+	if err := json.Unmarshal(created.Body.Bytes(), &site); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	if site.UAMode != passthroughUAMode {
+		t.Fatalf("new site ua_mode=%q want %q", site.UAMode, passthroughUAMode)
+	}
+
+	response, err := (&http.Client{Timeout: 3 * time.Second}).Get("http://127.0.0.1:" + strconv.Itoa(port) + "/Videos/item/stream")
+	if err != nil {
+		t.Fatalf("request new site without restart: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusPartialContent {
+		t.Fatalf("new site response status=%d want %d", response.StatusCode, http.StatusPartialContent)
+	}
+
+	logs, err := app.db.ListRequestLogs(RequestLogFilter{Category: requestLogCategoryVideo, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range logs {
+		if entry.SiteID == site.ID && entry.StatusCode == http.StatusPartialContent && entry.Path == "/Videos/item/stream" {
+			return
+		}
+	}
+	t.Fatalf("new site request was not logged immediately: %#v", logs)
 }

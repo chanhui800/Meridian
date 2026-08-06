@@ -94,6 +94,12 @@ test('passthrough payload clears the custom triplet', () => {
   assert.equal(payload.custom_version, '');
 });
 
+test('new site form defaults UA mode to passthrough', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /option value="passthrough" \$\{\(!isEdit \|\| site\.ua_mode === 'passthrough'\)/);
+  assert.match(source, /uaSelect\.value = isEdit && site\.ua_mode \? site\.ua_mode : 'passthrough'/);
+});
+
 test('upstream header payload keeps configured rows write-only', () => {
 	const { buildUpstreamHeaderPayload } = loadSiteHelpers();
 	const payload = buildUpstreamHeaderPayload([
