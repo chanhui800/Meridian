@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -70,7 +71,35 @@ const (
 	maxCustomUserAgentLen = 1024
 	maxCustomClientLen    = 128
 	maxCustomVersionLen   = 64
+	defaultAssetCacheTTL  = 24 * time.Hour
+	defaultAssetCacheMax  = int64(512 << 20)
+	maxAssetCacheObject   = int64(16 << 20)
+	minAssetCacheTTLSec   = 60
+	maxAssetCacheTTLSec   = 30 * 24 * 60 * 60
+	maxAssetCacheMaxBytes = int64(20 << 30)
 )
+
+func normalizeAssetCacheConfig(site *Site) error {
+	if site.AssetCacheTTLSec == 0 {
+		site.AssetCacheTTLSec = int(defaultAssetCacheTTL / time.Second)
+	}
+	if site.AssetCacheMaxBytes == 0 {
+		site.AssetCacheMaxBytes = defaultAssetCacheMax
+	}
+	if strings.TrimSpace(site.AssetCacheRules) == "" {
+		site.AssetCacheRules = "*/file/*\n*/emby/Items/*/Images/*"
+	}
+	if site.AssetCacheTTLSec < minAssetCacheTTLSec || site.AssetCacheTTLSec > maxAssetCacheTTLSec {
+		return fmt.Errorf("asset_cache_ttl_sec must be between %d and %d", minAssetCacheTTLSec, maxAssetCacheTTLSec)
+	}
+	if site.AssetCacheMaxBytes < 1<<20 || site.AssetCacheMaxBytes > maxAssetCacheMaxBytes {
+		return fmt.Errorf("asset_cache_max_bytes must be between %d and %d", 1<<20, maxAssetCacheMaxBytes)
+	}
+	if len(site.AssetCacheRules) > 4096 {
+		return fmt.Errorf("asset_cache_rules must not exceed 4096 bytes")
+	}
+	return nil
+}
 
 var errUnsafeHostOnlyIngress = errors.New("host-only ingress requires loopback PANEL_BIND_ADDR or a non-empty TRUSTED_PROXY_CIDRS source allowlist; use port/both only with the documented risk controls")
 var errProxyManagerShuttingDown = errors.New("proxy manager is shutting down")
@@ -2195,6 +2224,10 @@ func (d *DB) migrateOnce() error {
 		dynamic_domain_rules TEXT NOT NULL DEFAULT '[]',
 		dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 1,
 		dynamic_policy_revision INTEGER NOT NULL DEFAULT 1,
+		asset_cache_enabled INTEGER NOT NULL DEFAULT 0,
+		asset_cache_ttl_sec INTEGER NOT NULL DEFAULT 86400,
+		asset_cache_max_bytes BIGINT NOT NULL DEFAULT 536870912,
+		asset_cache_rules TEXT NOT NULL DEFAULT '*/file/*\n*/emby/Items/*/Images/*',
 		enabled INTEGER DEFAULT 1,
 		traffic_quota BIGINT DEFAULT 0,
 		traffic_used BIGINT DEFAULT 0,
@@ -2253,6 +2286,10 @@ func (d *DB) migrateOnce() error {
 		{"dynamic_domain_rules", "ALTER TABLE sites ADD COLUMN dynamic_domain_rules TEXT NOT NULL DEFAULT '[]'"},
 		{"dynamic_allow_https_downgrade", "ALTER TABLE sites ADD COLUMN dynamic_allow_https_downgrade INTEGER NOT NULL DEFAULT 0"},
 		{"dynamic_policy_revision", "ALTER TABLE sites ADD COLUMN dynamic_policy_revision INTEGER NOT NULL DEFAULT 1"},
+		{"asset_cache_enabled", "ALTER TABLE sites ADD COLUMN asset_cache_enabled INTEGER NOT NULL DEFAULT 0"},
+		{"asset_cache_ttl_sec", "ALTER TABLE sites ADD COLUMN asset_cache_ttl_sec INTEGER NOT NULL DEFAULT 86400"},
+		{"asset_cache_max_bytes", "ALTER TABLE sites ADD COLUMN asset_cache_max_bytes BIGINT NOT NULL DEFAULT 536870912"},
+		{"asset_cache_rules", "ALTER TABLE sites ADD COLUMN asset_cache_rules TEXT NOT NULL DEFAULT '*/file/*\n*/emby/Items/*/Images/*'"},
 	} {
 		exists, err := sqliteColumnExists(ctx, conn, migration.column)
 		if err != nil {
@@ -2585,6 +2622,10 @@ type Site struct {
 	DynamicDomainRules            []DynamicDomainRule  `json:"dynamic_domain_rules"`
 	DynamicAllowHTTPSDowngrade    bool                 `json:"dynamic_allow_https_downgrade"`
 	DynamicPolicyRevision         int64                `json:"dynamic_policy_revision"`
+	AssetCacheEnabled             bool                 `json:"asset_cache_enabled"`
+	AssetCacheTTLSec              int                  `json:"asset_cache_ttl_sec"`
+	AssetCacheMaxBytes            int64                `json:"asset_cache_max_bytes"`
+	AssetCacheRules               string               `json:"asset_cache_rules"`
 	Enabled                       bool                 `json:"enabled"`
 	TrafficQuota                  int64                `json:"traffic_quota"`
 	TrafficUsed                   int64                `json:"traffic_used"`
@@ -2600,7 +2641,7 @@ func sqliteBool(value bool) int {
 	return 0
 }
 
-func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade int) error {
+func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int) error {
 	publicHost, err := normalizePublicHost(site.PublicHost)
 	if err != nil {
 		return err
@@ -2623,6 +2664,10 @@ func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade int) 
 	}
 	site.UpstreamHeaders = views
 	if err := hydrateStoredDynamicSitePolicy(site, dynamicEnabled, dynamicDowngrade); err != nil {
+		return err
+	}
+	site.AssetCacheEnabled = assetCacheEnabled == 1
+	if err := normalizeAssetCacheConfig(site); err != nil {
 		return err
 	}
 	return nil
@@ -2781,7 +2826,7 @@ func (d *DB) ResetAdminPassword(password string) error {
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
+	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -2789,12 +2834,12 @@ func (d *DB) ListSites() ([]Site, error) {
 	var sites []Site
 	for rows.Next() {
 		var s Site
-		var enabled, dynamicEnabled, dynamicDowngrade int
-		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int
+		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Enabled = enabled == 1
-		if err := hydrateSiteConfiguration(&s, dynamicEnabled, dynamicDowngrade); err != nil {
+		if err := hydrateSiteConfiguration(&s, dynamicEnabled, dynamicDowngrade, assetCacheEnabled); err != nil {
 			return nil, fmt.Errorf("site %d: %w", s.ID, err)
 		}
 		sites = append(sites, s)
@@ -2810,14 +2855,14 @@ func (d *DB) ListSites() ([]Site, error) {
 
 func (d *DB) GetSite(id int64) (*Site, error) {
 	var s Site
-	var enabled, dynamicEnabled, dynamicDowngrade int
-	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int
+	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
+		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	s.Enabled = enabled == 1
-	if err := hydrateSiteConfiguration(&s, dynamicEnabled, dynamicDowngrade); err != nil {
+	if err := hydrateSiteConfiguration(&s, dynamicEnabled, dynamicDowngrade, assetCacheEnabled); err != nil {
 		return nil, fmt.Errorf("site %d: %w", s.ID, err)
 	}
 	return &s, nil
@@ -2854,6 +2899,9 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	if strings.TrimSpace(site.UAMode) == "" {
 		site.UAMode = passthroughUAMode
 	}
+	if err := normalizeAssetCacheConfig(&site); err != nil {
+		return nil, err
+	}
 	publicHost, err := normalizePublicHost(site.PublicHost)
 	if err != nil {
 		return nil, err
@@ -2868,8 +2916,8 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	}
 	site.DynamicPolicyRevision = 1
 	res, err := d.db.Exec(
-		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, site.TrafficQuota, site.SpeedLimit,
+		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -2935,6 +2983,9 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	if err := normalizeDynamicSitePolicy(&site); err != nil {
 		return err
 	}
+	if err := normalizeAssetCacheConfig(&site); err != nil {
+		return err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -2977,9 +3028,9 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	} else {
 		args = append(args, dynamicEnabled, site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, dynamicDowngrade)
 	}
-	args = append(args, site.TrafficQuota, site.SpeedLimit, site.ID)
+	args = append(args, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, site.TrafficQuota, site.SpeedLimit, site.ID)
 	_, err = tx.Exec(
-		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, dynamic_discovery_enabled=?, dynamic_profile=?, dynamic_discovery_sources=?, dynamic_domain_rules=?, dynamic_allow_https_downgrade=?, "+revisionExpression+", traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, dynamic_discovery_enabled=?, dynamic_profile=?, dynamic_discovery_sources=?, dynamic_domain_rules=?, dynamic_allow_https_downgrade=?, "+revisionExpression+", asset_cache_enabled=?, asset_cache_ttl_sec=?, asset_cache_max_bytes=?, asset_cache_rules=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
 		args...,
 	)
 	if err != nil {
@@ -10146,6 +10197,7 @@ type ProxyManager struct {
 	dynamicPanelHost        string
 	dynamicPanelPort        int
 	dynamicInterfaceAddrs   dynamicInterfaceAddrsFunc
+	assetCache              *assetCache
 }
 
 // siteIngressClosedError means StopSite passed the irreversible boundary: new
@@ -10275,6 +10327,12 @@ func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 	}
 	pm.upstreamHeaderKey = append([]byte(nil), upstreamHeaderKey...)
 	return pm
+}
+
+func (pm *ProxyManager) SetAssetCache(cache *assetCache) {
+	pm.mu.Lock()
+	pm.assetCache = cache
+	pm.mu.Unlock()
 }
 
 func (pm *ProxyManager) DynamicDiscoveryAvailable() bool {
@@ -12259,6 +12317,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return nil
 			}
 			stripPanelSessionSetCookies(resp.Header)
+			if err := prepareAssetCacheResponse(resp, pm.assetCache, site); err != nil {
+				return err
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -12361,6 +12422,24 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, configuredHeaders)
 			return
+		}
+
+		cacheTarget := upstreamTargetForRequest(r, target, playbackTarget)
+		if isRedirectMode {
+			cacheTarget = target
+		}
+		if cacheReq := pm.assetCache.request(site, r, assetCacheTargetURL(r, cacheTarget)); cacheReq != nil {
+			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
+				var cacheWriter http.ResponseWriter
+				if speedLimitBytes > 0 {
+					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, start: time.Now()}
+				} else {
+					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
+				}
+				serveAssetCacheHit(cacheWriter, r, hit)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), assetCacheContextKey{}, cacheReq))
 		}
 
 		if r.Body != nil {
@@ -14103,6 +14182,7 @@ func (a *App) handleIngressCapabilities(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	a.jsonOK(w, map[string]interface{}{
+		"app_version":                appVersion,
 		"host_only_available":        a.pm.HostOnlyIngressSafe(),
 		"panel_bind_loopback":        a.panelBindLoopback,
 		"trusted_proxy_configured":   len(a.trustedProxies) > 0,
@@ -14158,6 +14238,10 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			DynamicDiscoverySources    json.RawMessage       `json:"dynamic_discovery_sources"`
 			DynamicDomainRules         []DynamicDomainRule   `json:"dynamic_domain_rules"`
 			DynamicAllowHTTPSDowngrade bool                  `json:"dynamic_allow_https_downgrade"`
+			AssetCacheEnabled          bool                  `json:"asset_cache_enabled"`
+			AssetCacheTTLSec           int                   `json:"asset_cache_ttl_sec"`
+			AssetCacheMaxBytes         int64                 `json:"asset_cache_max_bytes"`
+			AssetCacheRules            string                `json:"asset_cache_rules"`
 			Quota                      int64                 `json:"traffic_quota"`
 			SpeedLimit                 int                   `json:"speed_limit"`
 		}
@@ -14194,6 +14278,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.PlaybackMode == "" {
 			req.PlaybackMode = "direct"
+		}
+		assetCacheConfig := Site{AssetCacheEnabled: req.AssetCacheEnabled, AssetCacheTTLSec: req.AssetCacheTTLSec, AssetCacheMaxBytes: req.AssetCacheMaxBytes, AssetCacheRules: req.AssetCacheRules}
+		if err := normalizeAssetCacheConfig(&assetCacheConfig); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
 		}
 		req.Name = strings.TrimSpace(req.Name)
 		req.PlaybackMode = strings.ToLower(strings.TrimSpace(req.PlaybackMode))
@@ -14267,6 +14356,10 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			StoredDynamicDomainRules:      dynamicPolicy.StoredDynamicDomainRules,
 			DynamicDomainRules:            dynamicPolicy.DynamicDomainRules,
 			DynamicAllowHTTPSDowngrade:    dynamicPolicy.DynamicAllowHTTPSDowngrade,
+			AssetCacheEnabled:             assetCacheConfig.AssetCacheEnabled,
+			AssetCacheTTLSec:              assetCacheConfig.AssetCacheTTLSec,
+			AssetCacheMaxBytes:            assetCacheConfig.AssetCacheMaxBytes,
+			AssetCacheRules:               assetCacheConfig.AssetCacheRules,
 			TrafficQuota:                  req.Quota,
 			SpeedLimit:                    req.SpeedLimit,
 		})
@@ -14447,6 +14540,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			DynamicDiscoverySources    json.RawMessage        `json:"dynamic_discovery_sources"`
 			DynamicDomainRules         *[]DynamicDomainRule   `json:"dynamic_domain_rules"`
 			DynamicAllowHTTPSDowngrade *bool                  `json:"dynamic_allow_https_downgrade"`
+			AssetCacheEnabled          *bool                  `json:"asset_cache_enabled"`
+			AssetCacheTTLSec           *int                   `json:"asset_cache_ttl_sec"`
+			AssetCacheMaxBytes         *int64                 `json:"asset_cache_max_bytes"`
+			AssetCacheRules            *string                `json:"asset_cache_rules"`
 			Quota                      *int64                 `json:"traffic_quota"`
 			SpeedLimit                 *int                   `json:"speed_limit"`
 		}
@@ -14579,6 +14676,22 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.DynamicAllowHTTPSDowngrade != nil {
 			candidate.DynamicAllowHTTPSDowngrade = *req.DynamicAllowHTTPSDowngrade
+		}
+		if req.AssetCacheEnabled != nil {
+			candidate.AssetCacheEnabled = *req.AssetCacheEnabled
+		}
+		if req.AssetCacheTTLSec != nil {
+			candidate.AssetCacheTTLSec = *req.AssetCacheTTLSec
+		}
+		if req.AssetCacheMaxBytes != nil {
+			candidate.AssetCacheMaxBytes = *req.AssetCacheMaxBytes
+		}
+		if req.AssetCacheRules != nil {
+			candidate.AssetCacheRules = *req.AssetCacheRules
+		}
+		if err := normalizeAssetCacheConfig(&candidate); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
 		}
 		if err := normalizeDynamicSitePolicy(&candidate); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
@@ -15114,6 +15227,11 @@ func main() {
 		log.Fatalf("invalid PANEL_DOMAIN: %v", err)
 	}
 	pm := NewProxyManager(db, upstreamHeaderKey)
+	assetCacheDir := strings.TrimSpace(os.Getenv("ASSET_CACHE_DIR"))
+	if assetCacheDir == "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		assetCacheDir = filepath.Join(filepath.Dir(dbPath), "asset-cache")
+	}
+	pm.SetAssetCache(newAssetCache(assetCacheDir))
 	pm.SetTrustedProxies(trustedProxies)
 	pm.SetHostOnlyIngressSafe((panelBindIP != nil && panelBindIP.IsLoopback()) || len(trustedProxies) > 0)
 	if err := pm.ConfigureDynamicDiscovery(dynamicRouteKey, panelHost, port, nil); err != nil {

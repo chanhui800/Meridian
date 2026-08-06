@@ -260,7 +260,7 @@ test('logout tears down the traffic refresh timer', async () => {
   const elementIds = [
     'page-login', 'app-shell', 'login-footer', 'btn-login', 'setup-token-group',
     'setup-token-input', 'inp-setup-token', 'modal-overlay', 'modal-close',
-    'loginForm', 'avatar-btn', 'inp-username', 'inp-password',
+    'loginForm', 'avatar-btn', 'avatar-initial', 'sidebar-username', 'sidebar-version', 'inp-username', 'inp-password',
   ];
   const elements = {};
   const listeners = {};
@@ -284,7 +284,7 @@ test('logout tears down the traffic refresh timer', async () => {
     // app.js assigns window.closeModal but reads the bare global at load time
     // (modal-close click handler), which this sandbox must provide up front.
     closeModal() {},
-    fetch: async (url) => { calls.push(String(url)); return okJson({}); },
+    fetch: async (url) => { calls.push(String(url)); return okJson({ app_version: 'v1.8.3' }); },
     setInterval() { return nextTimerId++; },
     clearInterval(id) { cleared.push(id); },
     setTimeout() { return 0; },

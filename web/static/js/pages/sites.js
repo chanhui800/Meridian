@@ -2,19 +2,24 @@
 function renderSites() {
   const page = document.getElementById('page-sites');
   page.innerHTML = `
-    <h1 class="section-title fade-up">站点管理</h1>
-    <p class="section-sub fade-up stagger-1">管理所有 Emby 反代站点与双上游配置</p>
-    <div class="page-toolbar fade-up stagger-1">
+    <div class="sites-page-head fade-up">
+      <div><h1 class="section-title">站点管理</h1><p class="section-sub">管理所有 Emby 反代站点与回源配置</p></div>
       <div class="toolbar-info" id="sites-count"></div>
+    </div>
+    <div class="page-toolbar sites-toolbar fade-up stagger-1">
       <button class="btn-add" id="btn-add-site">
         <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         添加站点
       </button>
+      <label class="sites-search"><span class="sr-only">搜索站点</span><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16" y1="16" x2="21" y2="21"/></svg><input id="sites-search" type="search" placeholder="搜索站点名称或回源地址"></label>
+      <button class="btn-ghost btn-test-all" id="btn-test-all-sites"><span aria-hidden="true">⌁</span> 全部测速</button>
     </div>
     <div class="sites-grid" id="sites-grid"></div>
   `;
 
   document.getElementById('btn-add-site').onclick = () => showSiteModal();
+  document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
+  document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
   loadSites();
 }
 
@@ -37,14 +42,15 @@ async function loadSites() {
 		const ingressRows = renderIngressSummary(s);
 
       return `
-      <div class="site-card fade-up stagger-${Math.min(i + 1, 6)}">
+      <div class="site-card fade-up stagger-${Math.min(i + 1, 6)}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
         <div class="site-top">
-          <div class="site-name">${esc(s.name)}</div>
-          <span class="status-badge">
+          <div class="site-heading"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
+          <span class="status-badge site-status">
             <span class="status-led ${s.running ? 'on' : 'off'}"></span>
             ${s.running ? '运行中' : '已停止'}
           </span>
         </div>
+        <div class="site-latency-line"><span class="status-led ${s.running ? 'on' : 'off'}"></span><span>回源延迟：</span><strong class="site-latency" id="site-latency-${s.id}">未测试</strong></div>
         <div class="site-rows">
           <div class="site-row">
             <span class="site-row-label">主回源地址</span>
@@ -57,10 +63,6 @@ async function loadSites() {
 			<span class="site-row-label">上游请求头</span>
 			<span>${upstreamHeaderCount} 个（加密）</span>
 		  </div>` : ''}
-          <div class="site-row">
-            <span class="site-row-label">UA 模式</span>
-            <span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span>
-          </div>
           ${s.traffic_quota > 0 ? `
           <div class="progress-wrap">
             <div class="progress-labels">
@@ -79,6 +81,7 @@ async function loadSites() {
           `}
         </div>
         <div class="site-actions">
+          <button class="btn-ghost site-action-test" data-site-action="latency" data-site-id="${s.id}">测速</button>
           <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}">${s.enabled ? '停用' : '启用'}</button>
           <button class="btn-ghost" data-site-action="edit" data-site-id="${s.id}">编辑</button>
           <button class="btn-ghost danger" data-site-action="delete" data-site-id="${s.id}">删除</button>
@@ -92,6 +95,7 @@ async function loadSites() {
         const id = Number(button.dataset.siteId);
         const site = sitesById.get(id);
         if (!site) return;
+        if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
         if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
         if (button.dataset.siteAction === 'edit') showSiteModal(site);
         if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
@@ -100,6 +104,53 @@ async function loadSites() {
   } catch (e) {
     Toast.error('加载站点失败: ' + e.message);
   }
+}
+
+function filterSiteCards(query) {
+  const needle = String(query || '').trim().toLowerCase();
+  document.querySelectorAll('#sites-grid .site-card').forEach(card => {
+    card.hidden = !!needle && !String(card.dataset.siteSearch || '').includes(needle);
+  });
+}
+
+async function testSiteLatency(id, button) {
+  const value = document.getElementById(`site-latency-${id}`);
+  if (button) button.disabled = true;
+  if (value) value.textContent = '测速中…';
+  try {
+    const result = await API.diagSite(id);
+    const health = result && result.upstreams && result.upstreams.primary
+      ? result.upstreams.primary.health || {}
+      : (result && result.health) || {};
+    if (health.status === 'online' && Number.isFinite(Number(health.latency_ms))) {
+      const latency = Number(health.latency_ms);
+      if (value) {
+        value.textContent = `${latency} ms`;
+        value.className = `site-latency ${latency < 200 ? 'good' : latency < 800 ? 'warn' : 'bad'}`;
+      }
+    } else {
+      throw new Error(health.error || '回源不可用');
+    }
+  } catch (error) {
+    if (value) {
+      value.textContent = '测速失败';
+      value.className = 'site-latency bad';
+      value.title = error.message || '测速失败';
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function testAllSitesLatency() {
+  const button = document.getElementById('btn-test-all-sites');
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  button.textContent = '全部测速中…';
+  const buttons = [...document.querySelectorAll('[data-site-action="latency"]')];
+  await Promise.all(buttons.map(siteButton => testSiteLatency(Number(siteButton.dataset.siteId), siteButton)));
+  button.disabled = false;
+  button.textContent = '全部测速';
 }
 
 function renderPlaybackRow(site) {
@@ -812,7 +863,6 @@ async function showSiteModal(site) {
         <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
         <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
         <option value="custom">自定义</option>
-        <option value="passthrough" ${isEdit && site.ua_mode === 'passthrough' ? 'selected' : ''}>透传（保留客户端身份）</option>
       </select>
     </div>
     <div class="form-group" id="m-custom-ua-group" hidden>
@@ -826,6 +876,16 @@ async function showSiteModal(site) {
       <label>自动反代</label>
       <div class="form-help" style="padding:10px 12px;border:1px solid var(--green);border-radius:8px;background:var(--green-dim)"><strong style="color:var(--green)">已自动启用</strong>：无需选择模式、来源、域名规则或播放回源。</div>
       <div class="form-help">Meridian 会自动改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址，使后端切换后仍继续经过本站点代理；localhost、私网、链路本地及回环目标始终拒绝。</div>
+    </div>
+    <div class="form-group">
+      <label class="switch-row"><input type="checkbox" id="m-asset-cache" ${isEdit && site.asset_cache_enabled ? 'checked' : ''}><span>缓存图片与静态资源</span></label>
+      <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
+      <label style="display:block;margin-top:10px">缓存规则（每行一条，支持 * 通配）</label>
+      <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+        <label>缓存时间（小时）<input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}"></label>
+        <label>容量上限（MB）<input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}"></label>
+      </div>
     </div>
 
     <div class="form-group">
@@ -951,6 +1011,10 @@ async function showSiteModal(site) {
 		dynamic_discovery_sources: [...DEFAULT_DYNAMIC_SOURCE_IDS, ...ADVANCED_DYNAMIC_SOURCE_IDS],
 		dynamic_domain_rules: [],
 		dynamic_allow_https_downgrade: true,
+      asset_cache_enabled: document.getElementById('m-asset-cache').checked,
+      asset_cache_ttl_sec: parseInt(document.getElementById('m-cache-ttl').value || 24) * 3600,
+      asset_cache_max_bytes: parseInt(document.getElementById('m-cache-max').value || 512) * 1048576,
+      asset_cache_rules: document.getElementById('m-cache-rules').value.trim(),
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };

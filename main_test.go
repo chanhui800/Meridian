@@ -1064,7 +1064,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.2", "/css/style.css?v=1.8.2", "/js/pages/sites.js?v=1.8.2", "/js/pages/request-logs.js?v=1.8.1", "/js/app.js?v=1.8.1"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.3", "/css/style.css?v=1.8.3", "/js/pages/sites.js?v=1.8.3", "/js/pages/request-logs.js?v=1.8.3", "/js/app.js?v=1.8.3"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4257,6 +4257,8 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"dynamic_discovery_sources": true,
 		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
 		"dynamic_policy_revision": true,
+		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
+		"asset_cache_max_bytes": true, "asset_cache_rules": true,
 	}
 	if len(raw) != 2 {
 		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())

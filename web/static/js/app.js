@@ -179,8 +179,14 @@
     loginEl.classList.add('hidden');
     shellEl.classList.add('active');
 
-    const avatar = document.getElementById('avatar-btn');
-    avatar.textContent = (API.username || 'A')[0].toUpperCase();
+    const avatar = document.getElementById('avatar-initial');
+    if (avatar) avatar.textContent = (API.username || 'A')[0].toUpperCase();
+    const username = document.getElementById('sidebar-username');
+    if (username) username.textContent = API.username || '管理员';
+    API.ingressCapabilities().then(capabilities => {
+      const version = document.getElementById('sidebar-version');
+      if (version && capabilities && capabilities.app_version) version.textContent = capabilities.app_version;
+    }).catch(() => {});
 
     if (!appBootstrapped) {
       Router.register('dashboard', renderDashboard);

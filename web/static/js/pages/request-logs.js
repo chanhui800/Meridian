@@ -3,6 +3,7 @@ let requestLogStatusFilter = 'all';
 let requestLogSearchTimer = null;
 let requestLogRefreshTimer = null;
 let requestLogLoadGeneration = 0;
+let requestLogLoading = false;
 
 function requestLogDateInputValue(date) {
   const year = date.getFullYear();
@@ -157,10 +158,10 @@ function renderRequestLogs() {
   };
   document.getElementById('request-log-refresh').onclick = loadRequestLogs;
   document.getElementById('request-log-clear').onclick = clearRequestLogs;
-  loadRequestLogs();
+  loadRequestLogs({ showLoading: true });
   if (requestLogRefreshTimer) clearInterval(requestLogRefreshTimer);
   requestLogRefreshTimer = setInterval(() => {
-    if (Router.current === 'request-logs') loadRequestLogs();
+    if (Router.current === 'request-logs') loadRequestLogs({ showLoading: false });
   }, 5000);
 }
 
@@ -181,9 +182,10 @@ function setRequestLogActivePill(containerId, activeButton) {
   });
 }
 
-async function loadRequestLogs() {
+async function loadRequestLogs(options = {}) {
   const body = document.getElementById('request-log-body');
   if (!body) return;
+  if (requestLogLoading) return;
   const from = document.getElementById('request-log-from').value;
   const to = document.getElementById('request-log-to').value;
   const range = requestLogRangeMilliseconds(from, to);
@@ -192,7 +194,14 @@ async function loadRequestLogs() {
     return;
   }
   const generation = ++requestLogLoadGeneration;
-  body.innerHTML = '<tr><td colspan="6" class="request-log-empty">正在加载…</td></tr>';
+  const scroller = body.closest('.request-log-table-scroll');
+  const previousScrollTop = scroller ? scroller.scrollTop : 0;
+  const previousScrollHeight = scroller ? scroller.scrollHeight : 0;
+  const preserveViewport = previousScrollTop > 0;
+  requestLogLoading = true;
+  if (options.showLoading === true && !body.querySelector('tr[data-log-id]')) {
+    body.innerHTML = '<tr><td colspan="6" class="request-log-empty">正在加载…</td></tr>';
+  }
   try {
     const response = await API.getRequestLogs({
       ...range,
@@ -203,14 +212,22 @@ async function loadRequestLogs() {
     });
     if (generation !== requestLogLoadGeneration || Router.current !== 'request-logs' || !response) return;
     renderRequestLogRows(response.logs || []);
+    if (scroller && preserveViewport) {
+      const addedHeight = Math.max(0, scroller.scrollHeight - previousScrollHeight);
+      scroller.scrollTop = previousScrollTop + addedHeight;
+    }
     const dropped = Number(response.dropped_logs || 0);
     document.getElementById('request-log-summary').textContent = dropped > 0
       ? `显示 ${response.logs.length} 条，繁忙时已丢弃 ${dropped} 条`
       : `显示 ${response.logs.length} 条（最多 500 条）`;
   } catch (error) {
     if (generation !== requestLogLoadGeneration) return;
-    body.innerHTML = '<tr><td colspan="6" class="request-log-empty request-log-error">日志读取失败</td></tr>';
+    if (!body.querySelector('tr[data-log-id]')) {
+      body.innerHTML = '<tr><td colspan="6" class="request-log-empty request-log-error">日志读取失败</td></tr>';
+    }
     Toast.error(error.message);
+  } finally {
+    requestLogLoading = false;
   }
 }
 
@@ -226,7 +243,7 @@ function renderRequestLogRows(logs) {
     const exactTime = new Date(Number(entry.recorded_at_ms || 0)).toLocaleString('zh-CN', { hour12: false });
     const requestTitle = `${String(entry.method || 'GET')} ${String(entry.path || '/')}`;
     return `
-      <tr>
+      <tr data-log-id="${esc(entry.id || '')}">
         <td><span class="request-log-node" title="${esc(entry.site_name || '')}">${esc(entry.site_name || '—')}</span></td>
         <td><span class="request-log-category" title="${esc(requestTitle)}">${esc(requestLogCategoryLabel(entry.resource_category))}</span></td>
         <td><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
