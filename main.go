@@ -4382,7 +4382,7 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 	}
 	target, err := normalizeDynamicURL(resolved.String())
 	if err != nil {
-		return "", fmt.Errorf("invalid discovered URL: target normalization")
+		return "", fmt.Errorf("invalid discovered URL: target normalization %s", dynamicURLNormalizationDiagnosticCode(err))
 	}
 	seenKey := "dynamic\x00" + source + "\x00" + kind + "\x00" + strconv.Itoa(depth) + "\x00" + target.String() + headerKey
 	if route, exists := s.seen[seenKey]; exists {
@@ -4969,15 +4969,60 @@ func normalizeExtremePlaybackInfoCollectionField(object map[string]any, field st
 	return nil
 }
 
+func dynamicURLNormalizationDiagnosticCode(err error) string {
+	if err == nil {
+		return "none"
+	}
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "scheme must be http or https"):
+		return "scheme"
+	case strings.Contains(message, "absolute hierarchical URL"):
+		return "hierarchy"
+	case strings.Contains(message, "userinfo"):
+		return "userinfo"
+	case strings.Contains(message, "fragment"):
+		return "fragment"
+	case strings.Contains(message, "invalid port"):
+		return "port"
+	case strings.Contains(message, "invalid dynamic URL host"):
+		return "host"
+	case strings.Contains(message, "dot path segments"):
+		return "dot_segments"
+	case strings.Contains(message, "escaped whitespace or control"):
+		return "escaped_component"
+	default:
+		return "other"
+	}
+}
+
 func normalizeExtremePlaybackInfoSchemelessURL(value string, base *url.URL) (string, bool) {
-	if base == nil || value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) || strings.Contains(value, "://") {
+	if base == nil || value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) {
 		return "", false
 	}
-	authorityEnd := len(value)
-	if index := strings.IndexAny(value, "/?#"); index >= 0 {
+	tail := value
+	explicitScheme := ""
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+		return "", false
+	case strings.HasPrefix(lower, "http:"):
+		explicitScheme = "http"
+		tail = strings.TrimLeft(value[len("http:"):], "/")
+	case strings.HasPrefix(lower, "https:"):
+		explicitScheme = "https"
+		tail = strings.TrimLeft(value[len("https:"):], "/")
+	case strings.Contains(value, "://"):
+		return "", false
+	}
+	if tail == "" {
+		return "", false
+	}
+	authorityEnd := len(tail)
+	if index := strings.IndexAny(tail, "/?#"); index >= 0 {
 		authorityEnd = index
 	}
-	authority := value[:authorityEnd]
+	authority := tail[:authorityEnd]
 	host, portText, err := net.SplitHostPort(authority)
 	if err != nil || host == "" || portText == "" || strings.Contains(authority, "@") {
 		return "", false
@@ -4989,18 +5034,21 @@ func normalizeExtremePlaybackInfoSchemelessURL(value string, base *url.URL) (str
 	if err != nil || port < 1 || port > 65535 {
 		return "", false
 	}
-	scheme := strings.ToLower(base.Scheme)
-	switch port {
-	case 80:
-		scheme = "http"
-	case 443:
-		scheme = "https"
-	default:
-		if scheme != "http" && scheme != "https" {
-			return "", false
+	scheme := explicitScheme
+	if scheme == "" {
+		scheme = strings.ToLower(base.Scheme)
+		switch port {
+		case 80:
+			scheme = "http"
+		case 443:
+			scheme = "https"
+		default:
+			if scheme != "http" && scheme != "https" {
+				return "", false
+			}
 		}
 	}
-	candidate := scheme + "://" + value
+	candidate := scheme + "://" + tail
 	parsed, err := url.Parse(candidate)
 	if err != nil || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" {
 		return "", false
@@ -5397,6 +5445,22 @@ func playbackInfoRewriteDiagnosticCode(err error) string {
 		return "url_userinfo"
 	case strings.Contains(message, "invalid discovered URL: fragment"):
 		return "url_fragment"
+	case strings.Contains(message, "target normalization scheme"):
+		return "url_target_scheme"
+	case strings.Contains(message, "target normalization hierarchy"):
+		return "url_target_hierarchy"
+	case strings.Contains(message, "target normalization userinfo"):
+		return "url_target_userinfo"
+	case strings.Contains(message, "target normalization fragment"):
+		return "url_target_fragment"
+	case strings.Contains(message, "target normalization port"):
+		return "url_target_port"
+	case strings.Contains(message, "target normalization host"):
+		return "url_target_host"
+	case strings.Contains(message, "target normalization dot_segments"):
+		return "url_target_dot_segments"
+	case strings.Contains(message, "target normalization escaped_component"):
+		return "url_target_escaped_component"
 	case strings.Contains(message, "invalid discovered URL: target normalization"):
 		return "url_target_normalization"
 	case strings.Contains(message, "invalid discovered URL"), strings.Contains(message, "invalid configured structured URL"), strings.Contains(message, "invalid same-authority structured URL"), strings.Contains(message, "invalid trusted capability URL"), strings.Contains(message, "invalid URL"), strings.Contains(message, "fallback URL is invalid"):
