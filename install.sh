@@ -5,7 +5,7 @@ set -euo pipefail
 # Public operations are intentionally limited to install, update, password,
 # and uninstall. Backups and rollback remain internal safety mechanisms.
 
-REPO="${MERIDIAN_REPO:-snnabb/Meridian}"
+REPO="${MERIDIAN_REPO:-chanhui800/Meridian}"
 INSTALL_DIR="${MERIDIAN_INSTALL_DIR:-/usr/local/bin}"
 DATA_DIR="${MERIDIAN_DATA_DIR:-/opt/meridian}"
 BACKUP_DIR="${MERIDIAN_BACKUP_DIR:-/opt/meridian-backups}"
