@@ -315,6 +315,54 @@ func TestAutomaticPlaybackInfoFallbackRewritesValidURLsAndPreservesInvalidOnes(t
 	}
 }
 
+func TestAutomaticPlaybackInfoFallbackPreservesAndLearnsRelativeStreamURL(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	base := mustStructuredURL(t, "https://origin.example.com/Items/1/PlaybackInfo")
+	clientBase := mustStructuredURL(t, "https://public.example.com/Items/1/PlaybackInfo")
+	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, learningBase: clientBase, source: dynamicDiscoverySourcePlaybackInfo}
+	payload := []byte(`{"MediaSources":[{"DirectStreamUrl":"/vendor/playback-entry?media_id=panel-secret","TranscodingUrl":"video.m3u8?token=manifest-secret"}]}`)
+	rewritten, err := rewriteAutomaticPlaybackInfoResponse(payload, session)
+	if err != nil {
+		t.Fatalf("automatic relative PlaybackInfo fallback: %v", err)
+	}
+	if !strings.Contains(string(rewritten), "/vendor/playback-entry?media_id=panel-secret") || !strings.Contains(string(rewritten), "video.m3u8?token=manifest-secret") || strings.Contains(string(rewritten), dynamicRoutePrefix) {
+		t.Fatalf("automatic relative stream changed: %s", rewritten)
+	}
+	if !session.commit() {
+		t.Fatal("commit relative PlaybackInfo rewrite")
+	}
+	session.publishLearnedPlaybackPaths()
+	now := time.Now()
+	for _, pathValue := range []string{"/vendor/playback-entry", "/Items/1/video.m3u8"} {
+		if !issuer.state.hasLearnedPlaybackPath(pathValue, now) {
+			t.Fatalf("relative PlaybackInfo path %q was not learned", pathValue)
+		}
+	}
+}
+
+func TestPlaybackInfoRelativeManifestDoesNotRequireAdvancedSource(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	issuer.policy.sources = []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}
+	base := mustStructuredURL(t, "https://origin.example.com/Items/1/PlaybackInfo")
+	clientBase := mustStructuredURL(t, "https://public.example.com/Items/1/PlaybackInfo")
+	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, learningBase: clientBase, source: dynamicDiscoverySourcePlaybackInfo}
+	payload := []byte(`{"MediaSources":[{"TranscodingUrl":"/Videos/1/master.m3u8?api_key=relative-client","TranscodingSubProtocol":"hls"}]}`)
+	rewritten, err := rewritePlaybackInfoResponse(payload, session)
+	if err != nil {
+		t.Fatalf("rewrite relative manifest with advanced source disabled: %v", err)
+	}
+	if !strings.Contains(string(rewritten), "/Videos/1/master.m3u8?api_key=relative-client") || strings.Contains(string(rewritten), dynamicRoutePrefix) {
+		t.Fatalf("relative manifest changed with advanced source disabled: %s", rewritten)
+	}
+	if !session.commit() {
+		t.Fatal("commit relative manifest PlaybackInfo rewrite")
+	}
+	session.publishLearnedPlaybackPaths()
+	if !issuer.state.hasLearnedPlaybackPath("/Videos/1/master.m3u8", time.Now()) {
+		t.Fatal("relative manifest path was not learned")
+	}
+}
+
 func TestAutomaticProxyPolicyIgnoresLegacyPerSiteDiscoverySettings(t *testing.T) {
 	policy, err := newDynamicRedirectPolicy(Site{
 		DynamicDiscoveryEnabled:    false,
@@ -350,6 +398,10 @@ func TestPlaybackInfoPathProtocolAndURLFormsFailClosed(t *testing.T) {
 	for name, payload := range map[string]string{
 		"unsupported remote protocol":         `{"MediaSources":[{"Protocol":"Rtsp","Path":"rtsp://camera.example.com/live"}]}`,
 		"backslash direct stream":             `{"MediaSources":[{"DirectStreamUrl":"\\\\evil.example.com\\video.mp4"}]}`,
+		"relative direct stream dot path":     `{"MediaSources":[{"DirectStreamUrl":"../video.mkv"}]}`,
+		"relative direct stream fragment":     `{"MediaSources":[{"DirectStreamUrl":"video.mkv#part"}]}`,
+		"relative direct stream query only":   `{"MediaSources":[{"DirectStreamUrl":"?media_id=1"}]}`,
+		"relative direct ambiguous slashes":   `{"MediaSources":[{"DirectStreamUrl":"///evil.example/video.mkv"}]}`,
 		"relative subtitle dot path":          `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"../subtitle.vtt","IsExternalUrl":true}]}]}`,
 		"relative subtitle encoded dot path":  `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"%2e%2e/subtitle.vtt","IsExternalUrl":true}]}]}`,
 		"relative subtitle fragment":          `{"MediaSources":[{"MediaStreams":[{"DeliveryUrl":"subtitle.vtt#part","IsExternalUrl":true}]}]}`,
@@ -853,6 +905,148 @@ func TestStructuredDiscoveryProxyLifecycleEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRelativePlaybackInfoVendorRedirectStaysOnProxyEndToEnd(t *testing.T) {
+	app := newTestApp(t)
+	apiRouteHits := make(chan struct{}, 1)
+	apiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items/ve-173940/PlaybackInfo":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"MediaSources":[{"DirectStreamUrl":"/vendor/playback-entry?server=emos&media_id=panel-secret"}]}`)
+		case "/vendor/playback-entry":
+			if r.URL.Query().Get("server") != "emos" || r.URL.Query().Get("media_id") != "panel-secret" {
+				http.Error(w, "unexpected vendor query", http.StatusBadRequest)
+				return
+			}
+			select {
+			case apiRouteHits <- struct{}{}:
+			default:
+			}
+			w.Header().Set("Location", "https://media.vendor.com/movie.mkv?sig=backend-secret")
+			w.WriteHeader(http.StatusPermanentRedirect)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer apiUpstream.Close()
+	playbackRouteHits := make(chan struct{}, 1)
+	playbackUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case playbackRouteHits <- struct{}{}:
+		default:
+		}
+		http.Error(w, "control endpoint reached playback target", http.StatusBadGateway)
+	}))
+	defer playbackUpstream.Close()
+
+	port := freePort(t)
+	site, err := app.db.CreateSiteRecord(Site{
+		Name:                    "relative-vendor-redirect-e2e",
+		ListenPort:              port,
+		IngressMode:             ingressModePort,
+		TargetURL:               apiUpstream.URL,
+		PlaybackTargetURL:       playbackUpstream.URL,
+		PlaybackMode:            "direct",
+		StreamHosts:             "[]",
+		UAMode:                  "infuse",
+		DynamicDiscoveryEnabled: true,
+		DynamicProfile:          dynamicProfileCompatible,
+		DynamicDiscoverySources: allDynamicDiscoverySources(),
+	})
+	if err != nil {
+		t.Fatalf("create relative vendor redirect site: %v", err)
+	}
+	key := bytes.Repeat([]byte{0x5a}, 32)
+	if err := app.pm.ConfigureDynamicDiscovery(key, "panel.example.com", 9090, func() ([]net.Addr, error) { return nil, nil }); err != nil {
+		t.Fatalf("configure relative vendor discovery: %v", err)
+	}
+	app.dynamicRouteKey = append([]byte(nil), key...)
+	app.pm.dynamicRuntime.resolver = dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "media.vendor.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	})
+	captures := make(chan redirectRuntimeDialCapture, 1)
+	app.pm.dynamicTransportFactory = redirectRuntimeFactory(captures, func(*http.Request) string {
+		return "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 8\r\n\r\nmovie-ok"
+	})
+	releasePort(port)
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("start relative vendor redirect site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	response, err := client.Get(baseURL + "/Items/ve-173940/PlaybackInfo")
+	if err != nil {
+		t.Fatalf("fetch relative vendor PlaybackInfo: %v", err)
+	}
+	payload, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("relative vendor PlaybackInfo status=%d read=%v body=%s", response.StatusCode, readErr, payload)
+	}
+	var playbackInfo struct {
+		MediaSources []struct {
+			DirectStreamURL string `json:"DirectStreamUrl"`
+		} `json:"MediaSources"`
+	}
+	if err := json.Unmarshal(payload, &playbackInfo); err != nil || len(playbackInfo.MediaSources) != 1 {
+		t.Fatalf("decode relative vendor PlaybackInfo: payload=%s err=%v", payload, err)
+	}
+	panelRoute := playbackInfo.MediaSources[0].DirectStreamURL
+	if panelRoute != "/vendor/playback-entry?server=emos&media_id=panel-secret" {
+		t.Fatalf("relative vendor URL changed: %s", payload)
+	}
+
+	panelResponse, err := client.Get(baseURL + panelRoute)
+	if err != nil {
+		t.Fatalf("request learned vendor endpoint: %v", err)
+	}
+	panelBody, panelReadErr := io.ReadAll(panelResponse.Body)
+	_ = panelResponse.Body.Close()
+	backendRoute := panelResponse.Header.Get("Location")
+	if panelReadErr != nil || panelResponse.StatusCode != http.StatusPermanentRedirect || !strings.HasPrefix(backendRoute, dynamicRoutePrefix) || strings.Contains(backendRoute, "vendor.com") || strings.Contains(backendRoute, "backend-secret") {
+		t.Fatalf("vendor redirect status=%d read=%v Location=%q body=%s", panelResponse.StatusCode, panelReadErr, backendRoute, panelBody)
+	}
+	select {
+	case <-apiRouteHits:
+	default:
+		t.Fatal("learned playback control endpoint did not reach the API target")
+	}
+	select {
+	case <-playbackRouteHits:
+		t.Fatal("learned playback control endpoint was sent to playback_target_url")
+	default:
+	}
+
+	mediaRequest, err := http.NewRequest(http.MethodGet, baseURL+backendRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mediaRequest.Header.Set("Cookie", "meridian_session=must-not-cross; application=must-not-cross")
+	mediaRequest.Header.Set("Authorization", "Bearer must-not-cross")
+	mediaResponse, err := client.Do(mediaRequest)
+	if err != nil {
+		t.Fatalf("consume discovered backend capability: %v", err)
+	}
+	mediaBody, readErr := io.ReadAll(mediaResponse.Body)
+	_ = mediaResponse.Body.Close()
+	if readErr != nil || mediaResponse.StatusCode != http.StatusOK || string(mediaBody) != "movie-ok" {
+		t.Fatalf("discovered backend status=%d read=%v body=%q", mediaResponse.StatusCode, readErr, mediaBody)
+	}
+	select {
+	case capture := <-captures:
+		if capture.err != nil || capture.address != "1.1.1.1:443" || capture.request.URL.RequestURI() != "/movie.mkv?sig=backend-secret" || capture.request.Header.Get("Cookie") != "" || capture.request.Header.Get("Authorization") != "" {
+			t.Fatalf("discovered backend request = %#v", capture)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("discovered backend capability did not reach the pinned transport")
+	}
+}
+
 func TestFailedDynamicSiteStartClosesRuntimeState(t *testing.T) {
 	app := newTestApp(t)
 	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -1159,6 +1353,8 @@ func TestConfiguredPrefixPlaybackInfoUsesExpectedSourceAndTrustedAbsoluteCapabil
 	})
 	request := httptest.NewRequest(http.MethodGet, upstreamBase.String(), nil)
 	request = request.WithContext(context.WithValue(request.Context(), dynamicExpectedStructuredSourceContextKey{}, dynamicDiscoverySourcePlaybackInfo))
+	clientBase := mustStructuredURL(t, "https://public.example.com/Items/1/PlaybackInfo")
+	request = request.WithContext(context.WithValue(request.Context(), dynamicPlaybackInfoBaseContextKey{}, clientBase))
 	body := `{"MediaSources":[{"DirectStreamUrl":"https://origin.example.com/jellyfin/Videos/1/stream.mp4?api_key=absolute-secret","TranscodingUrl":"/Videos/1/master.m3u8?api_key=relative-client"}]}`
 	header := make(http.Header)
 	header.Set("Content-Type", "application/json")
@@ -1194,8 +1390,11 @@ func TestConfiguredPrefixPlaybackInfoUsesExpectedSourceAndTrustedAbsoluteCapabil
 	if !claims.Trusted || claims.Source != dynamicDiscoverySourcePlaybackInfo || claims.Target != "https://origin.example.com:443/jellyfin/Videos/1/stream.mp4?api_key=absolute-secret" || strings.Count(claims.Target, "/jellyfin/") != 1 {
 		t.Fatalf("configured absolute PlaybackInfo claims = %#v", claims)
 	}
-	if strings.Contains(string(rewritten), "absolute-secret") {
-		t.Fatalf("configured absolute target leaked in PlaybackInfo: %s", rewritten)
+	if !issuer.state.hasLearnedPlaybackPath("/Videos/1/master.m3u8", time.Now()) {
+		t.Fatal("relative PlaybackInfo URL was not learned through the client-facing path")
+	}
+	if strings.Contains(string(rewritten), "absolute-secret") || strings.Contains(string(rewritten), "origin.example.com") {
+		t.Fatalf("configured PlaybackInfo target leaked in response: %s", rewritten)
 	}
 
 	requiredBody := `{"MediaSources":[{"DirectStreamUrl":"https://origin.example.com/jellyfin/Videos/1/stream.mp4","RequiredHttpHeaders":{"X-Required":"secret"}}]}`

@@ -3104,15 +3104,18 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 }
 
 const (
-	dynamicRedirectUserAgent     = "Meridian-Redirect/1.0"
-	dynamicDNSResolutionTimeout  = 30 * time.Second
-	dynamicPinnedDialTimeout     = 30 * time.Second
-	dynamicStructuredBodyTimeout = 20 * time.Second
+	dynamicRedirectUserAgent        = "Meridian-Redirect/1.0"
+	dynamicDNSResolutionTimeout     = 30 * time.Second
+	dynamicPinnedDialTimeout        = 30 * time.Second
+	dynamicStructuredBodyTimeout    = 20 * time.Second
+	dynamicLearnedPlaybackPathTTL   = 15 * time.Minute
+	dynamicLearnedPlaybackPathLimit = 128
 )
 
 type dynamicRequestEligibleContextKey struct{}
 type dynamicResponseContextKey struct{}
 type dynamicExpectedStructuredSourceContextKey struct{}
+type dynamicPlaybackInfoBaseContextKey struct{}
 
 // dynamicOutboundContext keeps request cancellation and deadlines while
 // dropping ReverseProxy's outbound httptrace and every other caller value.
@@ -3122,7 +3125,12 @@ type dynamicOutboundContext struct {
 	context.Context
 }
 
-func (dynamicOutboundContext) Value(any) any {
+func (outbound dynamicOutboundContext) Value(key any) any {
+	// Preserve only Meridian's internal PlaybackInfo learning base across a
+	// dynamic hop. All caller-provided context values remain isolated.
+	if _, ok := key.(dynamicPlaybackInfoBaseContextKey); ok {
+		return outbound.Context.Value(key)
+	}
 	return nil
 }
 
@@ -3275,6 +3283,11 @@ type dynamicCapabilityEntry struct {
 	reservation *dynamicAuthorityReservation
 }
 
+type dynamicLearnedPlaybackPath struct {
+	lastSeen  time.Time
+	expiresAt time.Time
+}
+
 type dynamicRuntime struct {
 	dnsWorkers  chan struct{}
 	streams     chan struct{}
@@ -3309,14 +3322,15 @@ type dynamicSiteState struct {
 	streams chan struct{}
 	parses  chan struct{}
 
-	mu                 sync.Mutex
-	authorities        map[string]*dynamicAuthorityEntry
-	capabilities       map[[sha256.Size]byte]dynamicCapabilityEntry
-	capabilityByTarget map[string]string
-	capabilityMemory   int64
-	newAuthorities     []time.Time
-	parseMemory        int64
-	closeOnce          sync.Once
+	mu                   sync.Mutex
+	authorities          map[string]*dynamicAuthorityEntry
+	capabilities         map[[sha256.Size]byte]dynamicCapabilityEntry
+	capabilityByTarget   map[string]string
+	capabilityMemory     int64
+	learnedPlaybackPaths map[string]dynamicLearnedPlaybackPath
+	newAuthorities       []time.Time
+	parseMemory          int64
+	closeOnce            sync.Once
 }
 
 func newDynamicSiteState(runtime *dynamicRuntime, limits DynamicProfileLimits) *dynamicSiteState {
@@ -3324,18 +3338,93 @@ func newDynamicSiteState(runtime *dynamicRuntime, limits DynamicProfileLimits) *
 		return nil
 	}
 	state := &dynamicSiteState{
-		runtime:            runtime,
-		limits:             limits,
-		streams:            make(chan struct{}, limits.MaxStreams),
-		parses:             make(chan struct{}, globalDynamicMaxSiteConcurrentParses),
-		authorities:        make(map[string]*dynamicAuthorityEntry),
-		capabilities:       make(map[[sha256.Size]byte]dynamicCapabilityEntry),
-		capabilityByTarget: make(map[string]string),
+		runtime:              runtime,
+		limits:               limits,
+		streams:              make(chan struct{}, limits.MaxStreams),
+		parses:               make(chan struct{}, globalDynamicMaxSiteConcurrentParses),
+		authorities:          make(map[string]*dynamicAuthorityEntry),
+		capabilities:         make(map[[sha256.Size]byte]dynamicCapabilityEntry),
+		capabilityByTarget:   make(map[string]string),
+		learnedPlaybackPaths: make(map[string]dynamicLearnedPlaybackPath),
 	}
 	runtime.mu.Lock()
 	runtime.states[state] = struct{}{}
 	runtime.mu.Unlock()
 	return state
+}
+
+func canonicalDynamicPlaybackPath(pathValue string) string {
+	if pathValue == "" || len(pathValue) > maxDynamicTargetURLBytes || !strings.HasPrefix(pathValue, "/") || strings.ContainsAny(pathValue, "?#\\") || containsDynamicUnsafeRune(pathValue) {
+		return ""
+	}
+	canonical := (&url.URL{Path: pathValue}).EscapedPath()
+	if canonical == "" || !strings.HasPrefix(canonical, "/") || len(canonical) > maxDynamicTargetURLBytes || !dynamicURLDecodedComponentIsSafe(canonical, false) || dynamicURLPathHasDotSegments(canonical) {
+		return ""
+	}
+	return canonical
+}
+
+func (s *dynamicSiteState) pruneLearnedPlaybackPathsLocked(now time.Time) {
+	if s == nil || len(s.learnedPlaybackPaths) == 0 {
+		return
+	}
+	for path, entry := range s.learnedPlaybackPaths {
+		if !now.Before(entry.expiresAt) {
+			delete(s.learnedPlaybackPaths, path)
+		}
+	}
+}
+
+func (s *dynamicSiteState) learnPlaybackPath(pathValue string, now time.Time) {
+	if s == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	pathValue = canonicalDynamicPlaybackPath(pathValue)
+	if pathValue == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.learnedPlaybackPaths == nil {
+		s.learnedPlaybackPaths = make(map[string]dynamicLearnedPlaybackPath)
+	}
+	s.pruneLearnedPlaybackPathsLocked(now)
+	entry := dynamicLearnedPlaybackPath{lastSeen: now, expiresAt: now.Add(dynamicLearnedPlaybackPathTTL)}
+	if _, exists := s.learnedPlaybackPaths[pathValue]; !exists && len(s.learnedPlaybackPaths) >= dynamicLearnedPlaybackPathLimit {
+		oldestPath := ""
+		var oldest time.Time
+		for candidate, candidateEntry := range s.learnedPlaybackPaths {
+			if oldestPath == "" || candidateEntry.lastSeen.Before(oldest) {
+				oldestPath = candidate
+				oldest = candidateEntry.lastSeen
+			}
+		}
+		if oldestPath != "" {
+			delete(s.learnedPlaybackPaths, oldestPath)
+		}
+	}
+	s.learnedPlaybackPaths[pathValue] = entry
+}
+
+func (s *dynamicSiteState) hasLearnedPlaybackPath(pathValue string, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	pathValue = canonicalDynamicPlaybackPath(pathValue)
+	if pathValue == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLearnedPlaybackPathsLocked(now)
+	entry, exists := s.learnedPlaybackPaths[pathValue]
+	return exists && now.Before(entry.expiresAt)
 }
 
 func (s *dynamicSiteState) acquireParse(memory int64) (func(), bool) {
@@ -4099,17 +4188,52 @@ func (i *dynamicCapabilityIssuer) mintTrustedValidatedWithRequiredHeadersTracked
 }
 
 type dynamicRewriteSession struct {
-	ctx              context.Context
-	issuer           *dynamicCapabilityIssuer
-	base             *url.URL
-	source           string
-	depth            int
-	outputLimit      int64
-	rewriteRelative  bool
-	inheritedHeaders []dynamicCapabilityHeaderClaim
-	seen             map[string]string
-	minted           []string
-	urlCount         int
+	ctx                  context.Context
+	issuer               *dynamicCapabilityIssuer
+	base                 *url.URL
+	learningBase         *url.URL
+	source               string
+	depth                int
+	outputLimit          int64
+	rewriteRelative      bool
+	inheritedHeaders     []dynamicCapabilityHeaderClaim
+	seen                 map[string]string
+	minted               []string
+	urlCount             int
+	learnedPlaybackPaths []string
+}
+
+func (s *dynamicRewriteSession) rememberRelativePlaybackPath(value string) {
+	if s == nil || s.learningBase == nil || !playbackInfoSafeRelativeURL(value) {
+		return
+	}
+	reference, err := url.Parse(value)
+	if err != nil || reference.Path == "" {
+		return
+	}
+	resolved := s.learningBase.ResolveReference(reference)
+	pathValue := canonicalDynamicPlaybackPath(resolved.Path)
+	if pathValue == "" {
+		return
+	}
+	for _, existing := range s.learnedPlaybackPaths {
+		if existing == pathValue {
+			return
+		}
+	}
+	s.learnedPlaybackPaths = append(s.learnedPlaybackPaths, pathValue)
+}
+
+func (s *dynamicRewriteSession) publishLearnedPlaybackPaths() {
+	if s == nil || s.issuer == nil || s.issuer.state == nil || len(s.learnedPlaybackPaths) == 0 {
+		return
+	}
+	paths := s.learnedPlaybackPaths
+	s.learnedPlaybackPaths = nil
+	now := time.Now()
+	for _, pathValue := range paths {
+		s.issuer.state.learnPlaybackPath(pathValue, now)
+	}
 }
 
 func (s *dynamicRewriteSession) rememberCapability(seenKey, token string) string {
@@ -4421,6 +4545,7 @@ func (s *dynamicRewriteSession) rollback() {
 	}
 	tokens := s.minted
 	s.minted = nil
+	s.learnedPlaybackPaths = nil
 	_ = s.issuer.state.settleCapabilities(tokens, false, time.Now())
 }
 
@@ -4797,7 +4922,14 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 	if err != nil {
 		return recordFailure(dynamicObservationReasonStructuredBodyLimit)
 	}
-	session := &dynamicRewriteSession{ctx: parseContext, issuer: issuer, base: resp.Request.URL, source: source, depth: depth, outputLimit: outputLimit, rewriteRelative: rewriteRelative, inheritedHeaders: inheritedHeaders}
+	var learningBase *url.URL
+	if resp.Request != nil {
+		if stored, ok := resp.Request.Context().Value(dynamicPlaybackInfoBaseContextKey{}).(*url.URL); ok && stored != nil {
+			clone := *stored
+			learningBase = &clone
+		}
+	}
+	session := &dynamicRewriteSession{ctx: parseContext, issuer: issuer, base: resp.Request.URL, learningBase: learningBase, source: source, depth: depth, outputLimit: outputLimit, rewriteRelative: rewriteRelative, inheritedHeaders: inheritedHeaders}
 	var rewritten []byte
 	switch source {
 	case dynamicDiscoverySourcePlaybackInfo:
@@ -4813,6 +4945,7 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 			ctx:              parseContext,
 			issuer:           issuer,
 			base:             resp.Request.URL,
+			learningBase:     learningBase,
 			source:           source,
 			depth:            depth,
 			outputLimit:      outputLimit,
@@ -4854,6 +4987,7 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		issuer.observe(source, dynamicObservationDecisionDenied, dynamicObservationReasonCapacityLimit, authority)
 		return newDynamicProxyError(dynamicObservationReasonCapacityLimit)
 	}
+	session.publishLearnedPlaybackPaths()
 	installDynamicStructuredBody(resp, rewritten)
 	return nil
 }
@@ -5591,16 +5725,36 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 			if err != nil {
 				return nil, err
 			}
-			if text, ok := value.(string); exists && ok && playbackInfoRequiredHeadersUnsupported(text, hasRequiredHeaders, session) {
+			text, isString := value.(string)
+			if exists && value != nil && !isString {
+				return nil, fmt.Errorf("PlaybackInfo field %s has an invalid type", field)
+			}
+			relativeMainURL := exists && isString && text != "" && !playbackInfoURLCandidate(text)
+			if relativeMainURL {
+				reference, parseErr := url.Parse(text)
+				if !playbackInfoSafeRelativeURL(text) || parseErr != nil || reference.Path == "" {
+					return nil, fmt.Errorf("PlaybackInfo field %s is not a safe relative URL", field)
+				}
+				if hasRequiredHeaders && session.rewriteRelative && !playbackInfoIsExtreme(session) {
+					return nil, fmt.Errorf("external PlaybackInfo URL requires unsupported origin headers")
+				}
+				// Preserve the same-origin URL exactly as the server returned it. The
+				// client will request it through Meridian, while the short-lived learned
+				// path only enables safe 30x backend discovery for that later request.
+				session.rememberRelativePlaybackPath(text)
+			}
+			shouldRewrite := exists && isString && !relativeMainURL && playbackInfoShouldRewriteURL(text, session)
+			if shouldRewrite && playbackInfoRequiredHeadersUnsupported(text, hasRequiredHeaders, session) {
 				return nil, fmt.Errorf("external PlaybackInfo URL requires unsupported origin headers")
+			}
+			if !shouldRewrite {
+				continue
 			}
 			capabilitySource := dynamicDiscoverySourcePlaybackInfo
 			kind := dynamicCapabilityKindResource
-			if text, ok := value.(string); exists && ok && playbackInfoShouldRewriteURL(text, session) {
-				capabilitySource, kind, err = playbackInfoCapabilityType(source, field, text, session)
-				if err != nil {
-					return nil, err
-				}
+			capabilitySource, kind, err = playbackInfoCapabilityType(source, field, text, session)
+			if err != nil {
+				return nil, err
 			}
 			if err := rewritePlaybackInfoFieldAsWithRequiredHeaders(source, field, session, capabilitySource, kind, requiredHeaders); err != nil {
 				return nil, err
@@ -5762,6 +5916,9 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 	switch typed := value.(type) {
 	case string:
 		candidate, ok := automaticPlaybackInfoURLCandidate(typed, session.base)
+		if !ok && (strings.EqualFold(field, "DirectStreamUrl") || strings.EqualFold(field, "TranscodingUrl")) {
+			session.rememberRelativePlaybackPath(typed)
+		}
 		if !ok {
 			return typed
 		}
@@ -8240,6 +8397,7 @@ func (s *dynamicSiteState) close() {
 		s.capabilityMemory = 0
 		s.capabilities = nil
 		s.capabilityByTarget = nil
+		s.learnedPlaybackPaths = nil
 		s.authorities = nil
 	})
 }
@@ -10338,7 +10496,7 @@ func classifyRequestLogResource(r *http.Request) string {
 		return requestLogCategoryAuth
 	case strings.Contains(path, "/images/"), strings.HasSuffix(path, "/images"), strings.Contains(path, "/image/"):
 		return requestLogCategoryImage
-	case isPlaybackRequest(path), isPlaybackInfoRequest(path), dynamicStructuredRequestSource(path) != "", isReservedDynamicRoute(path):
+	case isPlaybackRequest(path), isPlaybackRedirectEndpoint(path), isPlaybackInfoRequest(path), dynamicStructuredRequestSource(path) != "", isReservedDynamicRoute(path):
 		return requestLogCategoryPlayback
 	default:
 		return requestLogCategoryAPI
@@ -11463,6 +11621,11 @@ func isPlaybackRequest(path string) bool {
 	}
 }
 
+func isPlaybackRedirectEndpoint(pathValue string) bool {
+	pathValue = strings.ToLower(pathValue)
+	return pathValue == "/emya/video" || pathValue == "/emby/emya/video"
+}
+
 func isPlaybackInfoRequest(path string) bool {
 	parts := strings.Split(strings.ToLower(path), "/")
 	if len(parts) == 4 {
@@ -11497,10 +11660,17 @@ func dynamicStructuredRequestIdentity(r *http.Request) string {
 }
 
 func isDynamicRedirectEligibleRequest(r *http.Request) bool {
-	if r == nil || r.Method != http.MethodGet && r.Method != http.MethodHead || hasUpgradeIntent(r) {
+	if r == nil || r.URL == nil || r.Method != http.MethodGet && r.Method != http.MethodHead || hasUpgradeIntent(r) {
 		return false
 	}
-	return isPlaybackRequest(r.URL.Path) || isPlaybackInfoRequest(r.URL.Path) || dynamicStructuredRequestSource(r.URL.Path) != ""
+	return isPlaybackRequest(r.URL.Path) || isPlaybackRedirectEndpoint(r.URL.Path) || isPlaybackInfoRequest(r.URL.Path) || dynamicStructuredRequestSource(r.URL.Path) != ""
+}
+
+func isDynamicRedirectEligibleRequestForState(r *http.Request, state *dynamicSiteState) bool {
+	if isDynamicRedirectEligibleRequest(r) {
+		return true
+	}
+	return r != nil && r.URL != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && !hasUpgradeIntent(r) && state != nil && state.hasLearnedPlaybackPath(r.URL.Path, time.Now())
 }
 
 func isExtremeDynamicRedirectEligibleRequest(r *http.Request) bool {
@@ -12015,7 +12185,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		Transport: proxyTransport,
 		Rewrite: func(proxyReq *httputil.ProxyRequest) {
 			if redirectPolicy.configured {
-				eligible := isDynamicRedirectEligibleRequest(proxyReq.In)
+				eligible := isDynamicRedirectEligibleRequestForState(proxyReq.In, dynamicState)
 				if redirectPolicy.profile == dynamicProfileExtreme {
 					eligible = isExtremeDynamicRedirectEligibleRequest(proxyReq.In)
 				}
@@ -12043,6 +12213,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			configuredHeaders.apply(proxyReq.Out.Header, upstream)
 			if source := dynamicStructuredRequestIdentity(proxyReq.In); source != "" {
 				ctx := context.WithValue(proxyReq.Out.Context(), dynamicExpectedStructuredSourceContextKey{}, source)
+				if source == dynamicDiscoverySourcePlaybackInfo && proxyReq.In != nil && proxyReq.In.URL != nil {
+					clientBase := *proxyReq.In.URL
+					clientBase.Scheme = ""
+					clientBase.Host = ""
+					clientBase.User = nil
+					clientBase.RawQuery = ""
+					clientBase.ForceQuery = false
+					clientBase.Fragment = ""
+					clientBase.RawFragment = ""
+					ctx = context.WithValue(ctx, dynamicPlaybackInfoBaseContextKey{}, &clientBase)
+				}
 				proxyReq.Out = proxyReq.Out.WithContext(ctx)
 				if redirectPolicy.sourceEnabled(source) {
 					proxyReq.Out.Header.Set("Accept-Encoding", "identity")
