@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: '镜像/发布版本标签（例如 v1.8.4-ui.26caf6e）'
+        description: '发布版本号（例如 v1.8.5）'
         required: true
         type: string
 
@@ -27,8 +27,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "Release tags must use vMAJOR.MINOR.PATCH or a safe prerelease suffix." >&2
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use exactly vMAJOR.MINOR.PATCH without a suffix." >&2
             exit 1
           fi
           printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"

@@ -1102,8 +1102,11 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	}
 	for _, rule := range []string{
 		"max-height: calc(100dvh - 48px)",
+		"align-items: flex-start",
 		"overflow-y: auto",
 		"-webkit-overflow-scrolling: touch",
+		".form-select:not(.modal-select)",
+		".form-select.modal-select",
 		".btn-modal { flex: 1; min-height: 44px",
 	} {
 		if !strings.Contains(string(css), rule) {
@@ -1141,7 +1144,13 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.3", "/css/style.css?v=1.8.3", "/js/pages/sites.js?v=1.8.3", "/js/pages/request-logs.js?v=1.8.3", "/js/app.js?v=1.8.3"} {
+	if !strings.Contains(string(indexHTML), `<body class="auth-checking">`) {
+		t.Error("index must hide the login page until session restoration finishes")
+	}
+	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
+		t.Error("app must reveal the authenticated shell or login form after the auth check")
+	}
+	for _, asset := range []string{"/js/theme.js?v=1.8.4", "/css/style.css?v=1.8.4", "/js/pages/sites.js?v=1.8.4", "/js/pages/request-logs.js?v=1.8.4", "/js/app.js?v=1.8.4"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}

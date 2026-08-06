@@ -58,6 +58,7 @@
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
     modalPreviousFocus = document.activeElement;
     const overlay = document.getElementById('modal-overlay');
+    overlay.scrollTop = 0;
     document.getElementById('modal-body').scrollTop = 0;
     overlay.classList.add('active');
     overlay.setAttribute('aria-hidden', 'false');
@@ -130,6 +131,7 @@
     loginEl._isSetup = true;
     setupTokenGroupEl.hidden = !authStatus.setup_token_required;
     setupTokenInputEl.required = !!authStatus.setup_token_required;
+    document.body.classList.remove('auth-checking');
   }
 
   function showLoginMode() {
@@ -139,6 +141,7 @@
     loginEl._isSetup = false;
     setupTokenGroupEl.hidden = true;
     setupTokenInputEl.required = false;
+    document.body.classList.remove('auth-checking');
   }
 
   function startDashboardRefresh() {
@@ -246,6 +249,7 @@
 
     Router.resolve();
     startDashboardRefresh();
+    document.body.classList.remove('auth-checking');
   }
 
   document.getElementById('avatar-btn').addEventListener('click', async function() {
