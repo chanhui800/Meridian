@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"net/url"
@@ -69,6 +70,8 @@ type assetCacheContextKey struct{}
 
 type assetCacheRequest struct {
 	key      string
+	metaName string
+	bodyName string
 	metaPath string
 	bodyPath string
 	method   string
@@ -135,13 +138,26 @@ func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *asset
 	}, "\n")
 	digest := sha256.Sum256([]byte(raw))
 	key := fmt.Sprintf("%x", digest[:])
-	dir := filepath.Join(c.dir, strconv.FormatInt(site.ID, 10), key[:2])
+	relDir := filepath.Join(strconv.FormatInt(site.ID, 10), key[:2])
+	metaName := filepath.Join(relDir, key+".json")
+	bodyName := filepath.Join(relDir, key+".body")
 	return &assetCacheRequest{
 		key:      key,
 		method:   r.Method,
-		metaPath: filepath.Join(dir, key+".json"),
-		bodyPath: filepath.Join(dir, key+".body"),
+		metaName: metaName,
+		bodyName: bodyName,
+		metaPath: filepath.Join(c.dir, metaName),
+		bodyPath: filepath.Join(c.dir, bodyName),
 	}
+}
+
+func (c *assetCache) openRoot(create bool) (*os.Root, error) {
+	if create {
+		if err := os.MkdirAll(c.dir, 0700); err != nil {
+			return nil, err
+		}
+	}
+	return os.OpenRoot(c.dir)
 }
 
 func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit, error) {
@@ -150,7 +166,15 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	metaBytes, err := os.ReadFile(req.metaPath) // #nosec G304 -- cache paths are generated from an internal SHA-256 key under the configured cache root.
+	root, err := c.openRoot(false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer root.Close()
+	metaBytes, err := root.ReadFile(req.metaName)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -159,19 +183,19 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 	}
 	var meta assetCacheMeta
 	if json.Unmarshal(metaBytes, &meta) != nil || meta.ExpiresAtMS <= now.UnixMilli() || meta.Size < 0 || meta.Size > maxAssetCacheObject {
-		_ = os.Remove(req.metaPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
-		_ = os.Remove(req.bodyPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
+		_ = root.Remove(req.metaName)
+		_ = root.Remove(req.bodyName)
 		return nil, nil
 	}
-	body, err := os.ReadFile(req.bodyPath) // #nosec G304 -- cache paths are generated from an internal SHA-256 key under the configured cache root.
+	body, err := root.ReadFile(req.bodyName)
 	if err != nil || int64(len(body)) != meta.Size {
-		_ = os.Remove(req.metaPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
-		_ = os.Remove(req.bodyPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
+		_ = root.Remove(req.metaName)
+		_ = root.Remove(req.bodyName)
 		return nil, nil
 	}
 	meta.AccessedAtMS = now.UnixMilli()
 	if updated, err := json.Marshal(meta); err == nil {
-		_ = os.WriteFile(req.metaPath, updated, 0600) // #nosec G703 -- metadata path is generated from the internal cache key.
+		_ = root.WriteFile(req.metaName, updated, 0600)
 	}
 	return &assetCacheHit{meta: meta, body: body}, nil
 }
@@ -227,46 +251,51 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(req.bodyPath), 0700); err != nil {
+	root, err := c.openRoot(true)
+	if err != nil {
 		return err
 	}
-	bodyTmp := req.bodyPath + ".tmp"
-	metaTmp := req.metaPath + ".tmp"
-	if err := os.WriteFile(bodyTmp, body, 0600); err != nil {
+	defer root.Close()
+	if err := root.MkdirAll(filepath.Dir(req.bodyName), 0700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(metaTmp, metaBytes, 0600); err != nil {
-		_ = os.Remove(bodyTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
+	bodyTmp := req.bodyName + ".tmp"
+	metaTmp := req.metaName + ".tmp"
+	if err := root.WriteFile(bodyTmp, body, 0600); err != nil {
 		return err
 	}
-	if err := os.Rename(bodyTmp, req.bodyPath); err != nil {
-		_ = os.Remove(bodyTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
-		_ = os.Remove(metaTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
+	if err := root.WriteFile(metaTmp, metaBytes, 0600); err != nil {
+		_ = root.Remove(bodyTmp)
 		return err
 	}
-	if err := os.Rename(metaTmp, req.metaPath); err != nil {
-		_ = os.Remove(metaTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
+	if err := root.Rename(bodyTmp, req.bodyName); err != nil {
+		_ = root.Remove(bodyTmp)
+		_ = root.Remove(metaTmp)
 		return err
 	}
-	return c.enforceBudgetLocked(site)
+	if err := root.Rename(metaTmp, req.metaName); err != nil {
+		_ = root.Remove(metaTmp)
+		return err
+	}
+	return c.enforceBudgetLocked(root, site)
 }
 
 type assetCacheFile struct {
-	metaPath string
-	bodyPath string
+	metaName string
+	bodyName string
 	accessed int64
 	size     int64
 }
 
-func (c *assetCache) enforceBudgetLocked(site Site) error {
-	root := filepath.Join(c.dir, strconv.FormatInt(site.ID, 10))
+func (c *assetCache) enforceBudgetLocked(root *os.Root, site Site) error {
+	siteDir := strconv.FormatInt(site.ID, 10)
 	files := make([]assetCacheFile, 0)
 	var total int64
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error { // #nosec G122 -- root is the application-owned per-site cache directory.
+	err := fs.WalkDir(root.FS(), siteDir, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			return nil
 		}
-		data, err := os.ReadFile(path) // #nosec G304 -- WalkDir only visits generated metadata below the application-owned cache root.
+		data, err := root.ReadFile(path)
 		if err != nil {
 			return nil
 		}
@@ -274,8 +303,8 @@ func (c *assetCache) enforceBudgetLocked(site Site) error {
 		if json.Unmarshal(data, &meta) != nil {
 			return nil
 		}
-		bodyPath := strings.TrimSuffix(path, ".json") + ".body"
-		files = append(files, assetCacheFile{metaPath: path, bodyPath: bodyPath, accessed: meta.AccessedAtMS, size: meta.Size})
+		bodyName := strings.TrimSuffix(path, ".json") + ".body"
+		files = append(files, assetCacheFile{metaName: path, bodyName: bodyName, accessed: meta.AccessedAtMS, size: meta.Size})
 		total += meta.Size
 		return nil
 	})
@@ -287,8 +316,8 @@ func (c *assetCache) enforceBudgetLocked(site Site) error {
 		if total <= site.AssetCacheMaxBytes {
 			break
 		}
-		_ = os.Remove(file.metaPath) // #nosec G703 -- paths originate from WalkDir below the application-owned cache root.
-		_ = os.Remove(file.bodyPath) // #nosec G703 -- paths originate from WalkDir below the application-owned cache root.
+		_ = root.Remove(file.metaName)
+		_ = root.Remove(file.bodyName)
 		total -= file.size
 	}
 	return nil
