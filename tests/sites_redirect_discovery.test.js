@@ -434,34 +434,23 @@ test('profile risk notices and transition confirmations match the approved produ
   assert.equal(unchangedExtreme.requirement, 'none');
 });
 
-test('new site defaults to Compatible core discovery and keeps Extreme in advanced options', async () => {
+test('site modal presents automatic proxying without discovery or security controls', async () => {
   const { sandbox, document } = loadModalHarness();
   await sandbox.showSiteModal(null);
-  const enabled = document.getElementById('m-dynamic-enabled');
-  const profile = document.getElementById('m-dynamic-profile');
-  const risk = document.getElementById('m-dynamic-profile-risk');
-  const extremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
+  const body = document.getElementById('modal-body').innerHTML;
 
-  assert.match(risk.innerHTML, /data-profile-risk="compatible"/);
-  assert.equal(enabled.checked, true);
-  assert.equal(profile.value, 'compatible');
-  assert.equal(document.getElementById('m-dynamic-source-hls').checked, false);
-  assert.equal(document.getElementById('m-dynamic-source-dash').checked, false);
+  assert.match(body, /自动反代/);
+  assert.match(body, /已自动启用/);
+  assert.match(body, /无需选择模式、来源、域名规则或播放回源/);
+  assert.equal(document.getElementById('m-dynamic-enabled'), null);
+  assert.equal(document.getElementById('m-dynamic-profile'), null);
+  assert.equal(document.getElementById('m-dynamic-source-hls'), null);
+  assert.equal(document.getElementById('m-dynamic-source-dash'), null);
   assert.equal(document.getElementById('m-playback-list'), null);
-  assert.doesNotMatch(document.getElementById('modal-body').innerHTML, /value="safe"/);
-  assert.equal(extremeConfirmation.hidden, true);
-
-  profile.value = 'extreme';
-  profile.onchange();
-  assert.match(risk.innerHTML, /data-profile-risk="extreme"/);
-  assert.equal(extremeConfirmation.hidden, false);
-
-  enabled.checked = false;
-  enabled.onchange();
-  assert.equal(extremeConfirmation.hidden, true);
+  assert.doesNotMatch(body, /Safe|Compatible|Extreme|高级选项/);
 });
 
-test('new site submission uses core discovery and no manual playback origins', async () => {
+test('new site submission enables every automatic proxy source without manual playback origins', async () => {
   const { sandbox, document, state } = loadModalHarness();
   await sandbox.showSiteModal(null);
   document.getElementById('m-name').value = 'Media';
@@ -478,7 +467,7 @@ test('new site submission uses core discovery and no manual playback origins', a
   assert.deepEqual(state.creates[0].stream_hosts, []);
   assert.equal(state.creates[0].dynamic_discovery_enabled, true);
   assert.equal(state.creates[0].dynamic_profile, 'compatible');
-  assert.deepEqual(state.creates[0].dynamic_discovery_sources, ['redirect', 'playback_info']);
+  assert.deepEqual(state.creates[0].dynamic_discovery_sources, ['redirect', 'playback_info', 'hls', 'dash']);
   assert.equal(state.creates[0].dynamic_allow_https_downgrade, true);
 });
 
@@ -753,7 +742,7 @@ test('dynamic rendering escapes values and never renders sensitive observation d
   }
 });
 
-test('edit modal refreshes observations and confirms before clearing them', async () => {
+test('edit modal hides legacy dynamic observations and configuration controls', async () => {
   const { sandbox, document, state } = loadModalHarness();
   const site = {
     id: 17,
@@ -775,33 +764,12 @@ test('edit modal refreshes observations and confirms before clearing them', asyn
   };
 
   await sandbox.showSiteModal(site);
-  await Promise.resolve();
-  await Promise.resolve();
-
-  const refresh = document.getElementById('m-refresh-dynamic-observations');
-  const clear = document.getElementById('m-clear-dynamic-observations');
-  const observations = document.getElementById('m-dynamic-observations');
   assert.equal(state.opened, 1);
-  assert.deepEqual(state.observationGets, [17], 'opening an edit modal must perform the initial refresh');
-  assert.match(observations.innerHTML, /https:\/\/media\.example:443/);
-  assert.match(observations.innerHTML, /已丢弃观察记录：3/);
-
-  await refresh.onclick();
-  assert.deepEqual(state.observationGets, [17, 17]);
-  assert.equal(state.confirmations.length, 0, 'refresh must not prompt for destructive confirmation');
-
-  await clear.onclick();
-  assert.deepEqual(state.observationDeletes, [], 'cancelled confirmation must not clear observations');
-  assert.equal(state.confirmations.length, 1);
-  assert.match(state.confirmations[0], /不可撤销/);
-
-  state.confirmationResult = true;
-  await clear.onclick();
-  assert.deepEqual(state.observationDeletes, [17]);
-  assert.deepEqual(state.successes, ['观察记录已清空']);
-  assert.match(observations.innerHTML, /已丢弃观察记录：0/);
-  assert.match(observations.innerHTML, /暂无观察记录/);
-  assert.equal(refresh.disabled, false);
-  assert.equal(clear.disabled, false);
+  assert.equal(document.getElementById('m-refresh-dynamic-observations'), null);
+  assert.equal(document.getElementById('m-clear-dynamic-observations'), null);
+  assert.equal(document.getElementById('m-dynamic-observations'), null);
+  assert.deepEqual(state.observationGets, []);
+  assert.deepEqual(state.observationDeletes, []);
+  assert.deepEqual(state.confirmations, []);
   assert.deepEqual(state.errors, []);
 });

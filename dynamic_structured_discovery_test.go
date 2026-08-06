@@ -268,6 +268,52 @@ func TestCompatibleAndExtremePlaybackInfoAcceptSchemelessHostPortURLs(t *testing
 	}
 }
 
+func TestAutomaticPlaybackInfoFallbackRewritesValidURLsAndPreservesInvalidOnes(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
+	payload := []byte(`{"MediaSources":[{"DirectStreamUrl":"http://line.example.com/Videos/1/original.mkv?token=origin-secret","MediaStreams":[{"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt","IsExternalUrl":true}]}]}`)
+
+	strictSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+	if _, err := rewritePlaybackInfoResponse(payload, strictSession); err == nil {
+		t.Fatal("strict PlaybackInfo rewrite unexpectedly accepted the invalid optional URL")
+	}
+	strictSession.rollback()
+
+	fallbackSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+	rewritten, err := rewriteAutomaticPlaybackInfoResponse(payload, fallbackSession)
+	if err != nil {
+		t.Fatalf("automatic PlaybackInfo fallback: %v", err)
+	}
+	text := string(rewritten)
+	if !strings.Contains(text, `"DirectStreamUrl":"/Videos/1/original.mkv?token=origin-secret"`) {
+		t.Fatalf("same-authority playback URL was not kept on the proxy: %s", text)
+	}
+	if !strings.Contains(text, `"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt"`) {
+		t.Fatalf("invalid optional URL was not preserved: %s", text)
+	}
+}
+
+func TestAutomaticProxyPolicyIgnoresLegacyPerSiteDiscoverySettings(t *testing.T) {
+	policy, err := newDynamicRedirectPolicy(Site{
+		DynamicDiscoveryEnabled:    false,
+		DynamicProfile:             dynamicProfileSafe,
+		DynamicDiscoverySources:    []string{},
+		DynamicDomainRules:         []DynamicDomainRule{},
+		DynamicAllowHTTPSDowngrade: false,
+	}, true)
+	if err != nil {
+		t.Fatalf("automatic proxy policy: %v", err)
+	}
+	if !policy.configured || !policy.available || policy.profile != dynamicProfileCompatible || !policy.allowHTTPSDowngrade {
+		t.Fatalf("automatic proxy policy = %#v", policy)
+	}
+	for _, source := range allDynamicDiscoverySources() {
+		if !policy.sourceEnabled(source) {
+			t.Fatalf("automatic proxy source %q is disabled", source)
+		}
+	}
+}
+
 func TestPlaybackInfoPathProtocolAndURLFormsFailClosed(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "https://api.example.com/Items/abc/PlaybackInfo")

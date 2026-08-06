@@ -3180,25 +3180,19 @@ type dynamicRedirectPolicy struct {
 }
 
 func newDynamicRedirectPolicy(site Site, available bool) (dynamicRedirectPolicy, error) {
-	if !site.DynamicDiscoveryEnabled {
-		return dynamicRedirectPolicy{}, nil
-	}
-	candidate := site
-	if err := normalizeDynamicSitePolicy(&candidate); err != nil {
-		return dynamicRedirectPolicy{}, fmt.Errorf("invalid dynamic discovery policy: %w", err)
-	}
-	limits, ok := dynamicLimitsForProfile(candidate.DynamicProfile)
+	_ = site
+	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
 	if !ok {
-		return dynamicRedirectPolicy{}, fmt.Errorf("invalid dynamic discovery profile")
+		return dynamicRedirectPolicy{}, fmt.Errorf("automatic proxy policy is unavailable")
 	}
 	return dynamicRedirectPolicy{
 		configured:          true,
 		available:           available,
-		profile:             candidate.DynamicProfile,
+		profile:             dynamicProfileCompatible,
 		limits:              limits,
-		sources:             append([]string(nil), candidate.DynamicDiscoverySources...),
-		domainRules:         append([]DynamicDomainRule(nil), candidate.DynamicDomainRules...),
-		allowHTTPSDowngrade: candidate.DynamicAllowHTTPSDowngrade,
+		sources:             allDynamicDiscoverySources(),
+		domainRules:         nil,
+		allowHTTPSDowngrade: true,
 	}, nil
 }
 func (p dynamicRedirectPolicy) sourceEnabled(source string) bool {
@@ -4813,6 +4807,34 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 	case dynamicDiscoverySourceDASH:
 		rewritten, err = rewriteDASHResponse(payload, session)
 	}
+	if err != nil && source == dynamicDiscoverySourcePlaybackInfo {
+		session.rollback()
+		fallbackSession := &dynamicRewriteSession{
+			ctx:              parseContext,
+			issuer:           issuer,
+			base:             resp.Request.URL,
+			source:           source,
+			depth:            depth,
+			outputLimit:      outputLimit,
+			rewriteRelative:  false,
+			inheritedHeaders: inheritedHeaders,
+		}
+		fallback, fallbackErr := rewriteAutomaticPlaybackInfoResponse(payload, fallbackSession)
+		if fallbackErr == nil {
+			log.Printf("[%s] PlaybackInfo switched to automatic URL proxy fallback: diagnostic=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err))
+			session = fallbackSession
+			rewritten = fallback
+			err = nil
+		} else {
+			fallbackSession.rollback()
+			if accept != nil && !accept() {
+				return errDynamicCapabilityExpiredDuringUse
+			}
+			log.Printf("[%s] PlaybackInfo automatic URL proxy fallback preserved the upstream response", issuer.site.Name)
+			installDynamicStructuredBody(resp, payload)
+			return nil
+		}
+	}
 	if err != nil {
 		session.rollback()
 		if source == dynamicDiscoverySourcePlaybackInfo {
@@ -5672,6 +5694,102 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		return nil, err
 	}
 	return bytes.TrimSuffix(output.Bytes(), []byte("\n")), nil
+}
+
+// rewriteAutomaticPlaybackInfoResponse follows the response-rewrite model used
+// by simple Emby reverse proxies: every complete HTTP(S) URL in the JSON value
+// tree is routed back through Meridian. Invalid or unsupported URL candidates
+// are preserved instead of rejecting the entire PlaybackInfo response.
+func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
+	if session == nil || session.issuer == nil || session.base == nil {
+		return nil, fmt.Errorf("automatic PlaybackInfo rewrite session is unavailable")
+	}
+	maxTokens := min(session.issuer.policy.limits.MaxURLsPerResponse*64+8192, globalDynamicMaxJSONTokens)
+	if _, err := validateDynamicJSONStructureWithin(session.ctx, payload, maxTokens, globalDynamicMaxParseDepth); err != nil {
+		return nil, fmt.Errorf("invalid automatic PlaybackInfo JSON")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var root any
+	if err := decoder.Decode(&root); err != nil {
+		return nil, fmt.Errorf("invalid automatic PlaybackInfo JSON")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("invalid automatic PlaybackInfo JSON")
+	}
+	rewritten := rewriteAutomaticPlaybackInfoValue(root, session, 0, "")
+	output := dynamicBoundedBuffer{limit: session.structuredOutputLimit()}
+	encoder := json.NewEncoder(&output)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(rewritten); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(output.Bytes(), []byte("\n")), nil
+}
+
+func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession, depth int, field string) any {
+	if session == nil || depth > globalDynamicMaxParseDepth || session.ctx.Err() != nil {
+		return value
+	}
+	switch typed := value.(type) {
+	case string:
+		candidate, ok := automaticPlaybackInfoURLCandidate(typed, session.base)
+		if !ok {
+			return typed
+		}
+		source, kind, err := playbackInfoExtremeCapabilityType(candidate, session)
+		if err != nil {
+			return typed
+		}
+		route, err := session.rewriteAgainstSourceKindWithRequiredHeaders(candidate, session.base, source, kind, nil)
+		if err != nil {
+			return typed
+		}
+		return route
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if strings.EqualFold(key, "RequiredHttpHeaders") {
+				continue
+			}
+			typed[key] = rewriteAutomaticPlaybackInfoValue(typed[key], session, depth+1, key)
+		}
+		return typed
+	case []any:
+		for index := range typed {
+			typed[index] = rewriteAutomaticPlaybackInfoValue(typed[index], session, depth+1, field)
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func automaticPlaybackInfoURLCandidate(value string, base *url.URL) (string, bool) {
+	if base == nil || value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) {
+		return "", false
+	}
+	if normalized, ok := normalizePlaybackInfoSchemelessURL(value, base); ok {
+		value = normalized
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return "", false
+	}
+	if !parsed.IsAbs() && parsed.Host != "" {
+		parsed = base.ResolveReference(parsed)
+	}
+	if !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
+		return "", false
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return "", false
+	}
+	return parsed.String(), true
 }
 
 const (
