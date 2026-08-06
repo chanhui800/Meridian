@@ -24,7 +24,7 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 
 	for _, event := range []requestLogEvent{
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryPlayback, StatusCode: 200, ClientIP: "203.0.113.10", UserAgent: "CapyPlayer/1.1.3", Method: http.MethodPost, Path: "/Items/abc/PlaybackInfo"},
-		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryVideo, StatusCode: 206, ClientIP: "203.0.113.14", UserAgent: "CapyPlayer/1.1.3", Method: http.MethodGet, Path: "/Videos/abc/stream"},
+		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryVideo, StatusCode: 206, ClientIP: "203.0.113.14", UserAgent: "StreamPlayer/1.0", Method: http.MethodGet, Path: "/Videos/abc/stream"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryImage, StatusCode: 404, ClientIP: "203.0.113.11", UserAgent: "Hills/1.8", Method: http.MethodGet, Path: "/Items/abc/Images/Primary"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAuth, StatusCode: 401, ClientIP: "203.0.113.12", UserAgent: "Hills/1.8", Method: http.MethodPost, Path: "/Users/AuthenticateByName"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAPI, StatusCode: 503, ClientIP: "203.0.113.13", UserAgent: "Browser/1.0", Method: http.MethodGet, Path: "/System/Info"},
