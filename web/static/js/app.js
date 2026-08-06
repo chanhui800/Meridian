@@ -7,6 +7,8 @@
   const loginButtonEl = document.getElementById('btn-login');
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
+  const sidebarToggleEl = document.getElementById('sidebar-toggle');
+  const sidebarStorageKey = 'meridian-sidebar-expanded';
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
@@ -17,6 +19,40 @@
     jwt_secret_ephemeral: false,
     setup_token_required: false,
   };
+
+  function storedSidebarExpanded() {
+    try {
+      return !!(window.localStorage && window.localStorage.getItem(sidebarStorageKey) === 'true');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function setSidebarExpanded(expanded, persist) {
+    expanded = !!expanded;
+    shellEl.classList.toggle('sidebar-expanded', expanded);
+    if (sidebarToggleEl) {
+      const label = expanded ? '折叠导航栏' : '展开导航栏';
+      sidebarToggleEl.setAttribute('aria-expanded', String(expanded));
+      sidebarToggleEl.setAttribute('aria-label', label);
+      sidebarToggleEl.title = label;
+    }
+    if (persist) {
+      try {
+        if (window.localStorage) window.localStorage.setItem(sidebarStorageKey, String(expanded));
+      } catch (_) {}
+      if (typeof loadTrafficChart === 'function' && typeof Router !== 'undefined' && Router.current === 'traffic') {
+        setTimeout(loadTrafficChart, 240);
+      }
+    }
+  }
+
+  setSidebarExpanded(storedSidebarExpanded(), false);
+  if (sidebarToggleEl) {
+    sidebarToggleEl.addEventListener('click', function() {
+      setSidebarExpanded(!shellEl.classList.contains('sidebar-expanded'), true);
+    });
+  }
 
   window.openModal = function(options) {
     modalBackdropClosable = !!(options && options.closeOnBackdrop);

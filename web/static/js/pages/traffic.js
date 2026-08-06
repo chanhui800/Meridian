@@ -3,23 +3,26 @@ function renderTraffic() {
   const page = document.getElementById('page-traffic');
   page.innerHTML = `
     <h1 class="section-title fade-up">流量统计</h1>
-    <p class="section-sub fade-up stagger-1">查看各站点流量使用情况</p>
-    <div class="controls-row fade-up stagger-1">
-      <select class="form-select" id="traffic-site-select">
+    <p class="section-sub fade-up stagger-1">按分钟查看各站点的入站、出站流量与请求数量。</p>
+    <div class="controls-row traffic-controls fade-up stagger-1">
+      <select class="form-select" id="traffic-site-select" aria-label="选择站点">
         <option value="">加载中...</option>
       </select>
-      <select class="form-select" id="traffic-hours-select">
-        <option value="24">最近 24 小时</option>
+      <select class="form-select" id="traffic-hours-select" aria-label="选择统计时间范围">
+        <option value="1">最近 1 小时</option>
+        <option value="6">最近 6 小时</option>
+        <option value="24" selected>最近 24 小时</option>
         <option value="168">最近 7 天</option>
-        <option value="720">最近 30 天</option>
       </select>
+      <span class="traffic-range-note" id="traffic-range-note">分钟级聚合 · 最近 24 小时</span>
     </div>
     <div class="chart-wrap fade-up stagger-2">
       <div class="chart-head">
-        <h3>流量趋势</h3>
-        <div class="chart-legend">
+        <h3>分时流量</h3>
+        <div class="chart-legend" aria-label="图表图例">
           <div class="legend-item"><div class="legend-dot in"></div>入站流量</div>
           <div class="legend-item"><div class="legend-dot out"></div>出站流量</div>
+          <div class="legend-item"><div class="legend-dot requests"></div>请求数</div>
         </div>
       </div>
       <canvas id="trafficChart"></canvas>
@@ -54,33 +57,54 @@ async function loadTrafficSites() {
   }
 }
 
+function trafficRangeLabel(hours) {
+  switch (Number(hours)) {
+  case 1: return '最近 1 小时';
+  case 6: return '最近 6 小时';
+  case 168: return '最近 7 天';
+  default: return '最近 24 小时';
+  }
+}
+
+function formatTrafficCount(value) {
+  return Math.max(0, Number(value) || 0).toLocaleString('zh-CN');
+}
+
 async function loadTrafficChart() {
-  const siteId = document.getElementById('traffic-site-select').value;
-  const hours = parseInt(document.getElementById('traffic-hours-select').value);
+  const siteSelect = document.getElementById('traffic-site-select');
+  const hoursSelect = document.getElementById('traffic-hours-select');
+  if (!siteSelect || !hoursSelect) return;
+  const siteId = siteSelect.value;
+  const hours = parseInt(hoursSelect.value, 10) || 24;
   if (!siteId) return;
 
   try {
-    // Single {snapshot, logs} request: snapshot carries the live total
-    // (persisted + pending) for the totals cards, logs already include the
-    // current hour's pending bytes merged in, so the chart is live too.
+    // Single {snapshot, logs} request: snapshot carries the live cumulative
+    // total; minute logs include the current pending bucket for a live chart.
     const data = await API.getTrafficSnapshot(siteId, hours);
     if (!data || !trafficChartStillCurrent(siteId, hours)) return;
 
     const snapshot = data.snapshot || {};
     const logs = data.logs || [];
-
-    // Update totals
-    const totalIn = logs.reduce((a, l) => a + (l.bytes_in || 0), 0);
-    const totalOut = logs.reduce((a, l) => a + (l.bytes_out || 0), 0);
+    const totalIn = logs.reduce((sum, log) => sum + Math.max(0, Number(log.bytes_in) || 0), 0);
+    const totalOut = logs.reduce((sum, log) => sum + Math.max(0, Number(log.bytes_out) || 0), 0);
+    const totalRequests = logs.reduce((sum, log) => sum + Math.max(0, Number(log.requests) || 0), 0);
+    const rangeLabel = trafficRangeLabel(hours);
+    const rangeNote = document.getElementById('traffic-range-note');
+    if (rangeNote) rangeNote.textContent = `分钟级聚合 · ${rangeLabel}`;
 
     document.getElementById('traffic-totals').innerHTML = `
-      <div class="total-card fade-up stagger-3">
-        <div class="total-label">入站流量</div>
+      <div class="total-card fade-up stagger-2">
+        <div class="total-label">${rangeLabel}入站</div>
         <div class="total-value">${formatBytes(totalIn)}</div>
       </div>
-      <div class="total-card fade-up stagger-4">
-        <div class="total-label">出站流量</div>
+      <div class="total-card fade-up stagger-3">
+        <div class="total-label">${rangeLabel}出站</div>
         <div class="total-value">${formatBytes(totalOut)}</div>
+      </div>
+      <div class="total-card fade-up stagger-4">
+        <div class="total-label">${rangeLabel}请求数</div>
+        <div class="total-value">${formatTrafficCount(totalRequests)}</div>
       </div>
       <div class="total-card fade-up stagger-5">
         <div class="total-label">累计使用</div>
@@ -101,7 +125,7 @@ function trafficChartStillCurrent(siteId, hours) {
   if (Router.current !== 'traffic') return false;
   const sel = document.getElementById('traffic-site-select');
   const hoursSel = document.getElementById('traffic-hours-select');
-  return !!sel && !!hoursSel && sel.value === siteId && parseInt(hoursSel.value) === hours;
+  return !!sel && !!hoursSel && sel.value === siteId && parseInt(hoursSel.value, 10) === hours;
 }
 
 let trafficRefreshTimer = null;
@@ -119,107 +143,170 @@ function stopTrafficRefresh() {
   trafficRefreshTimer = null;
 }
 
+// traffic_logs stores a server-local wall-clock minute. Newer API responses
+// include recorded_at_ms so the browser can place that bucket on the same
+// timeline regardless of its own timezone. Keep a wall-clock parser for
+// older servers and legacy responses instead of treating SQLite's trailing Z
+// as a real UTC instant.
+function trafficLogTimestamp(log) {
+  const epoch = Number(log && log.recorded_at_ms);
+  if (Number.isFinite(epoch) && epoch > 0) return epoch;
+  const value = String(log && log.recorded_at || '').trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?/.exec(value);
+  if (match) {
+    const milliseconds = match[7] ? Number(`0.${match[7]}`) * 1000 : 0;
+    return new Date(
+      Number(match[1]), Number(match[2]) - 1, Number(match[3]),
+      Number(match[4]), Number(match[5]), Number(match[6] || 0), milliseconds,
+    ).getTime();
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function buildMinuteTrafficSeries(logs, hours, nowMilliseconds) {
+  const minuteCount = Math.max(1, Math.round((Number(hours) || 24) * 60));
+  const end = Math.floor((nowMilliseconds || Date.now()) / 60000) * 60000;
+  const start = end - (minuteCount - 1) * 60000;
+  const inbound = new Array(minuteCount).fill(0);
+  const outbound = new Array(minuteCount).fill(0);
+  const requests = new Array(minuteCount).fill(0);
+
+  (logs || []).forEach(log => {
+    const timestamp = trafficLogTimestamp(log);
+    if (!Number.isFinite(timestamp)) return;
+    const index = Math.floor((timestamp - start) / 60000);
+    if (index < 0 || index >= minuteCount) return;
+    inbound[index] += Math.max(0, Number(log.bytes_in) || 0);
+    outbound[index] += Math.max(0, Number(log.bytes_out) || 0);
+    requests[index] += Math.max(0, Number(log.requests) || 0);
+  });
+
+  return { start, end, minuteCount, inbound, outbound, requests };
+}
+
+function compactTrafficSeries(series, maxPoints) {
+  const groupSize = Math.max(1, Math.ceil(series.minuteCount / Math.max(1, maxPoints)));
+  const result = { timestamps: [], inbound: [], outbound: [], requests: [] };
+  for (let offset = 0; offset < series.minuteCount; offset += groupSize) {
+    const limit = Math.min(series.minuteCount, offset + groupSize);
+    let bytesIn = 0;
+    let bytesOut = 0;
+    let requestCount = 0;
+    for (let index = offset; index < limit; index++) {
+      bytesIn += series.inbound[index];
+      bytesOut += series.outbound[index];
+      requestCount += series.requests[index];
+    }
+    result.timestamps.push(series.start + (limit - 1) * 60000);
+    result.inbound.push(bytesIn);
+    result.outbound.push(bytesOut);
+    result.requests.push(requestCount);
+  }
+  return result;
+}
+
 function drawTrafficChart(logs, hours) {
   const canvas = document.getElementById('trafficChart');
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
-  const w = canvas.parentElement.clientWidth;
-  const h = 280;
-  canvas.width = w * dpr;
-  canvas.height = h * dpr;
+  const w = Math.max(260, Number(canvas.parentElement && canvas.parentElement.clientWidth) || 800);
+  const h = 260;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
   canvas.style.width = w + 'px';
   canvas.style.height = h + 'px';
   ctx.scale(dpr, dpr);
 
-  const pad = { top: 24, right: 24, bottom: 40, left: 54 };
-  const cw = w - pad.left - pad.right;
-  const ch = h - pad.top - pad.bottom;
+  const pad = { top: 20, right: 54, bottom: 38, left: 62 };
+  const chartWidth = Math.max(1, w - pad.left - pad.right);
+  const chartHeight = Math.max(1, h - pad.top - pad.bottom);
   const lightTheme = document.documentElement && document.documentElement.getAttribute('data-theme') === 'light';
-  const gridColor = lightTheme ? 'rgba(15,23,42,.08)' : 'rgba(255,255,255,.04)';
-  const labelColor = lightTheme ? 'rgba(15,23,42,.48)' : 'rgba(255,255,255,.2)';
+  const gridColor = lightTheme ? 'rgba(15,23,42,.09)' : 'rgba(255,255,255,.07)';
+  const labelColor = lightTheme ? 'rgba(71,85,105,.88)' : 'rgba(203,213,225,.72)';
+  const inboundColor = lightTheme ? '#2563eb' : '#60a5fa';
+  const outboundColor = lightTheme ? '#0891b2' : '#22d3ee';
+  const requestColor = lightTheme ? '#9333ea' : '#c084fc';
+  const minuteSeries = buildMinuteTrafficSeries(logs, hours, Date.now());
+  const maxPoints = Math.max(48, Math.min(360, Math.floor(chartWidth / 3)));
+  const series = compactTrafficSeries(minuteSeries, maxPoints);
+  const pointCount = series.timestamps.length;
+  const maxBytes = Math.max(1, ...series.inbound, ...series.outbound) * 1.15;
+  const maxRequests = Math.max(1, ...series.requests) * 1.15;
+  const x = index => pad.left + (index / Math.max(1, pointCount - 1)) * chartWidth;
+  const byteY = value => pad.top + (1 - value / maxBytes) * chartHeight;
+  const requestY = value => pad.top + (1 - value / maxRequests) * chartHeight;
 
-  // Prepare data arrays
-  const numPoints = Math.min(hours, 24);
-  const inbound = new Array(numPoints).fill(0);
-  const outbound = new Array(numPoints).fill(0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = '10px system-ui, sans-serif';
+  for (let index = 0; index <= 4; index++) {
+    const yy = pad.top + (index / 4) * chartHeight;
+    ctx.strokeStyle = gridColor;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, yy);
+    ctx.lineTo(w - pad.right, yy);
+    ctx.stroke();
 
-  if (logs.length > 0) {
-    // Map logs to chart points
-    const now = Date.now();
-    logs.forEach(l => {
-      const t = new Date(l.recorded_at).getTime();
-      const hoursAgo = (now - t) / 3600000;
-      const idx = numPoints - 1 - Math.floor(hoursAgo * numPoints / hours);
-      if (idx >= 0 && idx < numPoints) {
-        inbound[idx] += l.bytes_in / (1024 * 1024); // Convert to MB
-        outbound[idx] += l.bytes_out / (1024 * 1024);
-      }
-    });
-  }
-
-  const maxV = Math.max(1, ...inbound, ...outbound) * 1.2;
-  const x = i => pad.left + (i / (numPoints - 1 || 1)) * cw;
-  const y = v => pad.top + (1 - v / maxV) * ch;
-
-  // Clear
-  ctx.clearRect(0, 0, w * dpr, h * dpr);
-
-  // Grid lines
-  ctx.strokeStyle = gridColor;
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const yy = pad.top + (i / 4) * ch;
-    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(w - pad.right, yy); ctx.stroke();
     ctx.fillStyle = labelColor;
-    ctx.font = '11px Inter, system-ui';
     ctx.textAlign = 'right';
-    const label = ((4 - i) / 4 * maxV).toFixed(0);
-    ctx.fillText(label + ' MB', pad.left - 12, yy + 4);
+    ctx.fillText(formatBytes((4 - index) / 4 * maxBytes), pad.left - 9, yy + 4);
+    ctx.textAlign = 'left';
+    ctx.fillText(String(Math.round((4 - index) / 4 * maxRequests)), w - pad.right + 9, yy + 4);
   }
 
-  // Empty state
-  if (logs.length === 0) {
+  const hasData = series.inbound.some(Boolean) || series.outbound.some(Boolean) || series.requests.some(Boolean);
+  if (!hasData) {
     ctx.fillStyle = labelColor;
-    ctx.font = '14px Inter, system-ui';
+    ctx.font = '13px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('暂无流量数据', w / 2, h / 2);
+    ctx.fillText('当前范围暂无流量数据', w / 2, h / 2);
     return;
   }
 
-  // Draw lines
-  function smoothLine(data, color, glowColor) {
+  const labelIndexes = [0, .25, .5, .75, 1].map(ratio => Math.round((pointCount - 1) * ratio));
+  ctx.fillStyle = labelColor;
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  labelIndexes.forEach(index => {
+    const date = new Date(series.timestamps[index]);
+    const label = Number(hours) >= 168
+      ? date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+      : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    ctx.fillText(label, x(index), h - 12);
+  });
+
+  function drawSeries(values, color, yForValue, fillAlpha) {
     ctx.save();
     ctx.beginPath();
-    ctx.moveTo(x(0), y(data[0]));
-    for (let i = 1; i < data.length; i++) {
-      const xc = (x(i - 1) + x(i)) / 2;
-      const yc = (y(data[i - 1]) + y(data[i])) / 2;
-      ctx.quadraticCurveTo(x(i - 1), y(data[i - 1]), xc, yc);
-    }
-    ctx.lineTo(x(data.length - 1), y(data[data.length - 1]));
-
-    ctx.shadowColor = glowColor;
-    ctx.shadowBlur = 16;
+    values.forEach((value, index) => {
+      const xx = x(index);
+      const yy = yForValue(value);
+      if (index === 0) ctx.moveTo(xx, yy);
+      else ctx.lineTo(xx, yy);
+    });
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
     ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // Area fill
-    ctx.lineTo(x(data.length - 1), pad.top + ch);
-    ctx.lineTo(x(0), pad.top + ch);
-    ctx.closePath();
-    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
-    grad.addColorStop(0, color.replace(')', ',.12)').replace('rgb', 'rgba'));
-    grad.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = grad;
-    ctx.fill();
+    if (fillAlpha !== '00') {
+      ctx.lineTo(x(values.length - 1), pad.top + chartHeight);
+      ctx.lineTo(x(0), pad.top + chartHeight);
+      ctx.closePath();
+      const gradient = ctx.createLinearGradient(0, pad.top, 0, pad.top + chartHeight);
+      gradient.addColorStop(0, color + fillAlpha);
+      gradient.addColorStop(1, color + '00');
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
     ctx.restore();
   }
 
-  smoothLine(outbound, 'rgb(100,210,255)', 'rgba(100,210,255,.4)');
-  smoothLine(inbound, 'rgb(10,132,255)', 'rgba(10,132,255,.4)');
+  drawSeries(series.outbound, outboundColor, byteY, '1f');
+  drawSeries(series.inbound, inboundColor, byteY, '24');
+  drawSeries(series.requests, requestColor, requestY, '00');
 }
 
 window.addEventListener('resize', () => {

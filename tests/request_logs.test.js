@@ -52,6 +52,80 @@ test('request log panel exposes video stream filtering and live refresh', () => 
   assert.doesNotMatch(source, /if \(Router\.current === 'request-logs'\) loadRequestLogs\(\);/);
 });
 
+test('node-name search is retried with the latest value after an automatic refresh is in flight', async () => {
+  const page = { innerHTML: '' };
+  const body = {
+    innerHTML: '',
+    closest() { return scroller; },
+    querySelector() { return null; },
+  };
+  const scroller = { scrollTop: 0, scrollHeight: 0 };
+  const elements = {
+    'page-request-logs': page,
+    'request-log-from': { value: '2026-08-05' },
+    'request-log-to': { value: '2026-08-06' },
+    'request-log-search': { value: '', oninput: null },
+    'request-log-body': body,
+    'request-log-summary': { textContent: '' },
+    'request-log-refresh': { onclick: null },
+    'request-log-clear': { onclick: null },
+  };
+  const timers = [];
+  const calls = [];
+  let resolveInitial;
+  const initial = new Promise(resolve => { resolveInitial = resolve; });
+  let callCount = 0;
+  const sandbox = {
+    console,
+    Date,
+    Number,
+    String,
+    Math,
+    document: {
+      getElementById(id) { return elements[id] || null; },
+      querySelectorAll() { return []; },
+    },
+    Router: { current: 'request-logs' },
+    API: {
+      getRequestLogs(filters) {
+        calls.push({ ...filters });
+        callCount += 1;
+        return callCount === 1 ? initial : Promise.resolve({ logs: [], dropped_logs: 0 });
+      },
+      clearRequestLogs() { return Promise.resolve(); },
+    },
+    Toast: { error() {}, success() {} },
+    esc(value) { return String(value); },
+    confirm() { return true; },
+    setTimeout(callback) { timers.push(callback); return timers.length; },
+    clearTimeout() {},
+    setInterval() { return 1; },
+    clearInterval() {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'), 'utf8'),
+    sandbox,
+  );
+
+  vm.runInContext('renderRequestLogs()', sandbox);
+  await Promise.resolve();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, '');
+
+  elements['request-log-search'].value = 'edge-renamed';
+  elements['request-log-search'].oninput();
+  assert.equal(timers.length, 1);
+  timers.shift()();
+
+  resolveInitial({ logs: [], dropped_logs: 0 });
+  await new Promise(resolve => setImmediate(resolve));
+  await Promise.resolve();
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].q, 'edge-renamed');
+});
+
 test('request log date range covers the selected local days', () => {
   const sandbox = loadRequestLogHelpers();
   const range = sandbox.requestLogRangeMilliseconds('2026-08-04', '2026-08-05');

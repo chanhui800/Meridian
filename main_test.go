@@ -498,6 +498,83 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 	}
 }
 
+func TestMigrateTrafficLogsAddsRequestsAndPreservesHourlyRows(t *testing.T) {
+	for _, withHourlyIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hourly index=%v", withHourlyIndex), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "legacy-traffic.db")
+			createLegacySiteDatabase(t, dbPath, withHourlyIndex)
+
+			legacy, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("reopen legacy database: %v", err)
+			}
+			rows := []struct {
+				in, out int64
+				at      string
+			}{
+				{10, 20, "2026-08-06 08:00:00"},
+				{30, 40, "2026-08-06 09:00:00"},
+			}
+			for _, row := range rows {
+				if _, err := legacy.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at) VALUES (1,?,?,?)", row.in, row.out, row.at); err != nil {
+					legacy.Close()
+					t.Fatalf("insert legacy hourly row: %v", err)
+				}
+			}
+			if err := legacy.Close(); err != nil {
+				t.Fatalf("close populated legacy database: %v", err)
+			}
+
+			db, err := openDB(dbPath)
+			if err != nil {
+				t.Fatalf("migrate legacy traffic database: %v", err)
+			}
+			defer db.Close()
+
+			var requestsColumn int
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('traffic_logs') WHERE name='requests'").Scan(&requestsColumn); err != nil {
+				t.Fatalf("inspect requests column: %v", err)
+			}
+			if requestsColumn != 1 {
+				t.Fatalf("requests column count=%d, want 1", requestsColumn)
+			}
+			var minuteIndex, hourlyIndex int
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_minute'").Scan(&minuteIndex); err != nil {
+				t.Fatalf("inspect minute index: %v", err)
+			}
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_hour'").Scan(&hourlyIndex); err != nil {
+				t.Fatalf("inspect legacy hourly index: %v", err)
+			}
+			if minuteIndex != 1 || hourlyIndex != 0 {
+				t.Fatalf("traffic bucket indexes minute=%d hourly=%d, want 1/0", minuteIndex, hourlyIndex)
+			}
+
+			queryRows, err := db.db.Query("SELECT bytes_in, bytes_out, requests, recorded_at FROM traffic_logs WHERE site_id=1 ORDER BY recorded_at")
+			if err != nil {
+				t.Fatalf("query migrated traffic rows: %v", err)
+			}
+			defer queryRows.Close()
+			var got []TrafficLog
+			for queryRows.Next() {
+				var row TrafficLog
+				if err := queryRows.Scan(&row.BytesIn, &row.BytesOut, &row.Requests, &row.RecordedAt); err != nil {
+					t.Fatalf("scan migrated traffic row: %v", err)
+				}
+				got = append(got, row)
+			}
+			if err := queryRows.Err(); err != nil {
+				t.Fatalf("iterate migrated traffic rows: %v", err)
+			}
+			if len(got) != 2 || got[0].BytesIn != 10 || got[0].BytesOut != 20 || got[1].BytesIn != 30 || got[1].BytesOut != 40 {
+				t.Fatalf("migrated hourly rows = %+v, want both rows and original byte totals", got)
+			}
+			if got[0].Requests != 0 || got[1].Requests != 0 {
+				t.Fatalf("legacy request counts = %+v, want zero defaults", got)
+			}
+		})
+	}
+}
+
 func TestMigrateSerializesConcurrentLegacyDatabaseOpens(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "concurrent-legacy.db")
 	createLegacySiteDatabase(t, dbPath, false)
@@ -3211,15 +3288,20 @@ func TestFlushTrafficUpdatesBaselineAndStopPersistsPendingUsage(t *testing.T) {
 	}
 }
 
-func TestAddTrafficAggregatesSameHour(t *testing.T) {
+func TestAddTrafficAggregatesSameMinuteWithRequests(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("aggregate", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
 
-	app.db.AddTraffic(site.ID, 10, 20)
-	app.db.AddTraffic(site.ID, 5, 7)
+	bucketTime := time.Now()
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 10, 20, 2, bucketTime); err != nil {
+		t.Fatalf("first addTrafficWithRequests: %v", err)
+	}
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 5, 7, 3, bucketTime.Add(3*time.Second)); err != nil {
+		t.Fatalf("second addTrafficWithRequests: %v", err)
+	}
 
 	logs, err := app.db.GetTrafficLogs(site.ID, 1)
 	if err != nil {
@@ -3228,8 +3310,15 @@ func TestAddTrafficAggregatesSameHour(t *testing.T) {
 	if len(logs) != 1 {
 		t.Fatalf("len(logs) = %d, want 1", len(logs))
 	}
-	if logs[0].BytesIn != 15 || logs[0].BytesOut != 27 {
-		t.Fatalf("aggregated log = in:%d out:%d", logs[0].BytesIn, logs[0].BytesOut)
+	if logs[0].BytesIn != 15 || logs[0].BytesOut != 27 || logs[0].Requests != 5 {
+		t.Fatalf("aggregated log = in:%d out:%d requests:%d", logs[0].BytesIn, logs[0].BytesOut, logs[0].Requests)
+	}
+	recordedAt, err := time.Parse(time.RFC3339Nano, logs[0].RecordedAt)
+	if err != nil {
+		t.Fatalf("parse minute bucket %q: %v", logs[0].RecordedAt, err)
+	}
+	if recordedAt.Second() != 0 || recordedAt.Nanosecond() != 0 {
+		t.Fatalf("recorded_at = %q, want a minute-aligned bucket", logs[0].RecordedAt)
 	}
 }
 
@@ -3269,9 +3358,9 @@ func findLiveSite(t *testing.T, snap *TrafficSnapshot, id int64) SiteTraffic {
 	return SiteTraffic{}
 }
 
-// Pending bytes are flushed to the DB exactly once, the authoritative total
+// Pending bytes and requests are flushed to the DB exactly once, the authoritative total
 // traffic_used = persisted + pending is conserved across flushes, and the
-// current-hour log bucket aggregates without double counting.
+// current-minute log bucket aggregates without double counting.
 func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("conservation", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
@@ -3282,6 +3371,8 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.reqCount.Store(5)
+	inst.pendingRequests.Store(5)
 	app.pm.proxies[site.ID] = inst
 
 	// Before any flush the live total already includes the pending bytes.
@@ -3306,6 +3397,9 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	if got := inst.bytesOut.Load(); got != 0 {
 		t.Fatalf("bytesOut after flush = %d, want 0", got)
 	}
+	if got := inst.pendingRequests.Load(); got != 0 {
+		t.Fatalf("pendingRequests after flush = %d, want 0", got)
+	}
 	reloaded, err := app.db.GetSite(site.ID)
 	if err != nil {
 		t.Fatalf("GetSite: %v", err)
@@ -3317,13 +3411,15 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTrafficLogs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 {
-		t.Fatalf("logs after flush = %+v, want one row with 120/80", logs)
+	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 || logs[0].Requests != 5 {
+		t.Fatalf("logs after flush = %+v, want one row with 120/80 and 5 requests", logs)
 	}
 
 	// A second flush with fresh pending accumulates; nothing is double counted.
 	inst.bytesIn.Store(30)
 	inst.bytesOut.Store(10)
+	inst.reqCount.Add(3)
+	inst.pendingRequests.Store(3)
 	app.pm.FlushTraffic()
 	if got := inst.persistedTraffic.Load(); got != 240 {
 		t.Fatalf("persistedTraffic after second flush = %d, want 240", got)
@@ -3332,16 +3428,16 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTrafficLogs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].BytesIn != 150 || logs[0].BytesOut != 90 {
-		t.Fatalf("logs after second flush = %+v, want one aggregated row 150/90", logs)
+	if len(logs) != 1 || logs[0].BytesIn != 150 || logs[0].BytesOut != 90 || logs[0].Requests != 8 {
+		t.Fatalf("logs after second flush = %+v, want one aggregated row 150/90 with 8 requests", logs)
 	}
 	snap, err = app.pm.TrafficSnapshot()
 	if err != nil {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
 	live = findLiveSite(t, snap, site.ID)
-	if live.TrafficUsed != 240 || snap.TotalTraffic != 240 {
-		t.Fatalf("post-flush total = site:%d snapshot:%d, want 240/240", live.TrafficUsed, snap.TotalTraffic)
+	if live.TrafficUsed != 240 || snap.TotalTraffic != 240 || live.Requests != 8 || snap.TotalRequests != 8 {
+		t.Fatalf("post-flush totals = site:%d snapshot:%d requests:%d/%d, want 240/240 and 8/8", live.TrafficUsed, snap.TotalTraffic, live.Requests, snap.TotalRequests)
 	}
 }
 
@@ -3357,6 +3453,8 @@ func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.reqCount.Store(5)
+	inst.pendingRequests.Store(5)
 	app.pm.proxies[site.ID] = inst
 
 	setDBReadonly(t, app, true)
@@ -3369,6 +3467,9 @@ func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
 	}
 	if got := inst.bytesOut.Load(); got != 80 {
 		t.Fatalf("bytesOut after failed flush = %d, want 80 restored", got)
+	}
+	if got := inst.pendingRequests.Load(); got != 5 {
+		t.Fatalf("pendingRequests after failed flush = %d, want 5 restored", got)
 	}
 	if got := inst.persistedTraffic.Load(); got != 0 {
 		t.Fatalf("persistedTraffic after failed flush = %d, want 0", got)
@@ -3400,22 +3501,23 @@ func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTrafficLogs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 {
-		t.Fatalf("logs after retry = %+v, want one row 120/80", logs)
+	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 || logs[0].Requests != 5 {
+		t.Fatalf("logs after retry = %+v, want one row 120/80 with 5 requests", logs)
 	}
 }
 
 // The single-site history snapshot reads DB logs, persisted baseline and
-// pending under one lock: pending bytes land in the current-hour bucket of the
-// returned copy (synthetic ID=0 bucket when absent, no-op when pending is 0).
-func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
+// pending under one lock: pending bytes and requests land in the current-minute
+// bucket of the returned copy (synthetic ID=0 bucket when absent, no-op when all
+// pending values are zero).
+func TestSiteTrafficHistoryMergesPendingIntoCurrentMinuteBucket(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("merge", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
 	pastHour := time.Now().Add(-2 * time.Hour).Truncate(time.Hour).Format("2006-01-02 15:04:05")
-	if _, err := app.db.db.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at) VALUES (?,?,?,?)", site.ID, 100, 50, pastHour); err != nil {
+	if _, err := app.db.db.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at) VALUES (?,?,?,?,?)", site.ID, 100, 50, 2, pastHour); err != nil {
 		t.Fatalf("insert past log: %v", err)
 	}
 	if _, err := app.db.db.Exec("UPDATE sites SET traffic_used=150 WHERE id=?", site.ID); err != nil {
@@ -3426,6 +3528,8 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 	inst.persistedTraffic.Store(150)
 	inst.bytesIn.Store(30)
 	inst.bytesOut.Store(20)
+	inst.reqCount.Store(9)
+	inst.pendingRequests.Store(4)
 	app.pm.proxies[site.ID] = inst
 
 	history, err := app.pm.SiteTrafficHistory(*site, 24)
@@ -3433,27 +3537,28 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		t.Fatalf("SiteTrafficHistory: %v", err)
 	}
 	if len(history.Logs) != 2 {
-		t.Fatalf("logs = %+v, want past row plus synthetic current-hour bucket", history.Logs)
+		t.Fatalf("logs = %+v, want past row plus synthetic current-minute bucket", history.Logs)
 	}
-	if history.Logs[0].ID == 0 || history.Logs[0].BytesIn != 100 || history.Logs[0].BytesOut != 50 {
-		t.Fatalf("past bucket mutated = %+v, want 100/50 untouched", history.Logs[0])
+	if history.Logs[0].ID == 0 || history.Logs[0].BytesIn != 100 || history.Logs[0].BytesOut != 50 || history.Logs[0].Requests != 2 {
+		t.Fatalf("past bucket mutated = %+v, want 100/50 and 2 requests untouched", history.Logs[0])
 	}
 	current := history.Logs[1]
-	hourBefore := time.Now()
+	minuteBefore := time.Now()
 	if _, err := time.Parse(time.RFC3339, current.RecordedAt); err != nil {
 		t.Fatalf("synthetic recorded_at %q is not RFC3339: %v", current.RecordedAt, err)
 	}
-	hourAfter := time.Now()
-	if current.ID != 0 || current.BytesIn != 30 || current.BytesOut != 20 || !(sameTrafficHour(current.RecordedAt, hourBefore) || sameTrafficHour(current.RecordedAt, hourAfter)) {
-		t.Fatalf("synthetic current bucket = %+v, want ID=0 30/20 at the current hour", current)
+	minuteAfter := time.Now()
+	if current.ID != 0 || current.BytesIn != 30 || current.BytesOut != 20 || current.Requests != 4 || !(sameTrafficMinute(current.RecordedAt, minuteBefore) || sameTrafficMinute(current.RecordedAt, minuteAfter)) {
+		t.Fatalf("synthetic current bucket = %+v, want ID=0 30/20 and 4 requests at the current minute", current)
 	}
-	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 150 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 200 {
-		t.Fatalf("snapshot = %+v, want running persisted=150 in=30 out=20 used=200", history.Snapshot)
+	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 150 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 200 || history.Snapshot.Requests != 9 {
+		t.Fatalf("snapshot = %+v, want running persisted=150 in=30 out=20 used=200 requests=9", history.Snapshot)
 	}
 
-	// pending = 0 is a no-op: no synthetic bucket is appended.
+	// All pending values at zero is a no-op: no synthetic bucket is appended.
 	inst.bytesIn.Store(0)
 	inst.bytesOut.Store(0)
+	inst.pendingRequests.Store(0)
 	history, err = app.pm.SiteTrafficHistory(*site, 24)
 	if err != nil {
 		t.Fatalf("SiteTrafficHistory: %v", err)
@@ -3462,23 +3567,24 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		t.Fatalf("logs with zero pending = %+v, want only the past row", history.Logs)
 	}
 
-	// When the current hour already has a bucket, pending merges into it.
+	// When the current minute already has a bucket, pending merges into it.
 	// Use the synchronous addTraffic so the bucket is committed before the
 	// immediate read below (AddTraffic only logs errors and races the read).
 	// The bucket is identified by its bytes and real ID, never by a recorded_at
 	// string layout: the SQLite driver re-serializes DATETIME columns as
 	// RFC3339, so the persisted value must be matched by time semantics.
-	if err := app.db.addTraffic(site.ID, 10, 5); err != nil {
+	if err := app.db.addTrafficWithRequests(site.ID, 10, 5, 2); err != nil {
 		t.Fatalf("addTraffic: %v", err)
 	}
 	inst.bytesIn.Store(7)
 	inst.bytesOut.Store(3)
+	inst.pendingRequests.Store(3)
 	history, err = app.pm.SiteTrafficHistory(*site, 24)
 	if err != nil {
 		t.Fatalf("SiteTrafficHistory: %v", err)
 	}
 	if len(history.Logs) != 2 {
-		t.Fatalf("logs after merge = %+v, want past row plus one current-hour bucket, no synthetic duplicate", history.Logs)
+		t.Fatalf("logs after merge = %+v, want past row plus one current-minute bucket, no synthetic duplicate", history.Logs)
 	}
 	var merged *TrafficLog
 	for i := range history.Logs {
@@ -3486,7 +3592,7 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		if l.ID == 0 {
 			t.Fatalf("synthetic ID=0 bucket present although the real row exists: %+v", l)
 		}
-		if l.BytesIn == 17 && l.BytesOut == 8 {
+		if l.BytesIn == 17 && l.BytesOut == 8 && l.Requests == 5 {
 			if merged != nil {
 				t.Fatalf("two buckets carry 17/8: %+v and %+v", *merged, *l)
 			}
@@ -3494,68 +3600,71 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		}
 	}
 	if merged == nil {
-		t.Fatalf("no 17/8 bucket in %+v; pending must merge into the real addTraffic row", history.Logs)
+		t.Fatalf("no 17/8 and 5-request bucket in %+v; pending must merge into the real addTraffic row", history.Logs)
 	}
 }
 
-// The merge identifies the current hour by time semantics, across every
+// The merge identifies the current minute by time semantics, across every
 // format persisted rows carry: RFC3339 / RFC3339Nano (what the modernc
 // SQLite driver re-serializes DATETIME columns as) and the legacy
-// "2006-01-02 15:04:05" SQL layout. Rows from other hours and values that
-// parse as neither never absorb pending bytes; zero pending is a no-op.
-func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
+// "2006-01-02 15:04:05" SQL layout. Rows from other minutes and values that
+// parse as neither never absorb pending values; all-zero pending is a no-op.
+func TestMergePendingIntoLogsMinuteRecognition(t *testing.T) {
 	tests := []struct {
-		name       string
-		recordedAt string
-		pendingIn  int64
-		pendingOut int64
-		wantMerge  bool // pending lands in the existing bucket
-		wantAppend bool // synthetic ID=0 bucket is appended
+		name            string
+		recordedAt      string
+		pendingIn       int64
+		pendingOut      int64
+		pendingRequests int64
+		wantMerge       bool // pending lands in the existing bucket
+		wantAppend      bool // synthetic ID=0 bucket is appended
 	}{
-		{"RFC3339 current hour", "", 8, 4, true, false},
-		{"RFC3339Nano current hour", "", 8, 4, true, false},
-		{"RFC3339Nano current hour with fraction", "", 8, 4, true, false},
-		{"legacy SQL layout current hour", "", 8, 4, true, false},
-		{"RFC3339 other hour", "", 8, 4, false, true},
-		{"legacy SQL layout other hour", "", 8, 4, false, true},
-		{"unparseable value", "not-a-timestamp", 8, 4, false, true},
-		{"empty value", "", 8, 4, false, true},
-		{"zero pending no-op", "", 0, 0, false, false},
+		{"RFC3339 current minute", "", 8, 4, 3, true, false},
+		{"RFC3339Nano current minute", "", 8, 4, 3, true, false},
+		{"RFC3339Nano current minute with fraction", "", 8, 4, 3, true, false},
+		{"legacy SQL layout current minute", "", 8, 4, 3, true, false},
+		{"RFC3339 other minute in same hour", "", 8, 4, 3, false, true},
+		{"legacy SQL layout other minute", "", 8, 4, 3, false, true},
+		{"unparseable value", "not-a-timestamp", 8, 4, 3, false, true},
+		{"empty value", "", 8, 4, 3, false, true},
+		{"requests-only pending appends", "", 0, 0, 3, false, true},
+		{"zero pending no-op", "", 0, 0, 0, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			now := time.Now()
+			now := time.Date(2026, time.August, 6, 12, 34, 45, 0, time.Local)
 			nowLocal := now.In(time.Local)
-			// wallHour is the current local wall hour stamped as UTC, the exact
-			// shape the SQLite driver returns for a stored local-hour row.
-			wallHour := func(h int) time.Time {
-				return time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), h, 0, 0, 0, time.UTC)
+			// wallMinute is the local wall minute stamped as UTC, the exact shape
+			// the SQLite driver returns for a stored local-minute row.
+			wallMinute := func(offset time.Duration) time.Time {
+				wall := nowLocal.Add(offset)
+				return time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, time.UTC)
 			}
 			recordedAt := tt.recordedAt
 			switch tt.name {
-			case "RFC3339 current hour":
-				recordedAt = wallHour(nowLocal.Hour()).Format(time.RFC3339)
-			case "RFC3339Nano current hour":
-				recordedAt = wallHour(nowLocal.Hour()).Format(time.RFC3339Nano)
-			case "RFC3339Nano current hour with fraction":
-				recordedAt = wallHour(nowLocal.Hour()).Add(250 * time.Millisecond).Format(time.RFC3339Nano)
-			case "legacy SQL layout current hour":
+			case "RFC3339 current minute":
+				recordedAt = wallMinute(0).Format(time.RFC3339)
+			case "RFC3339Nano current minute":
+				recordedAt = wallMinute(0).Format(time.RFC3339Nano)
+			case "RFC3339Nano current minute with fraction":
+				recordedAt = wallMinute(0).Add(250 * time.Millisecond).Format(time.RFC3339Nano)
+			case "legacy SQL layout current minute":
 				recordedAt = nowLocal.Format("2006-01-02 15:04:05")
-			case "RFC3339 other hour":
-				recordedAt = wallHour(nowLocal.Hour() - 1).Format(time.RFC3339)
-			case "legacy SQL layout other hour":
-				recordedAt = nowLocal.Add(-time.Hour).Format("2006-01-02 15:04:05")
+			case "RFC3339 other minute in same hour":
+				recordedAt = wallMinute(-time.Minute).Format(time.RFC3339)
+			case "legacy SQL layout other minute":
+				recordedAt = nowLocal.Add(-time.Minute).Format("2006-01-02 15:04:05")
 			}
 
-			in := []TrafficLog{{ID: 7, SiteID: 3, BytesIn: 10, BytesOut: 5, RecordedAt: recordedAt}}
-			out := mergePendingIntoLogs(in, 3, tt.pendingIn, tt.pendingOut)
+			in := []TrafficLog{{ID: 7, SiteID: 3, BytesIn: 10, BytesOut: 5, Requests: 2, RecordedAt: recordedAt}}
+			out := mergePendingIntoLogsAt(in, 3, tt.pendingIn, tt.pendingOut, tt.pendingRequests, now)
 
 			if tt.wantMerge {
 				if len(out) != 1 {
 					t.Fatalf("len(out) = %d, want the existing bucket merged; got %+v", len(out), out)
 				}
-				if out[0].ID != 7 || out[0].BytesIn != 18 || out[0].BytesOut != 9 {
-					t.Fatalf("merged bucket = %+v, want ID=7 18/9", out[0])
+				if out[0].ID != 7 || out[0].BytesIn != 18 || out[0].BytesOut != 9 || out[0].Requests != 5 {
+					t.Fatalf("merged bucket = %+v, want ID=7 18/9 with 5 requests", out[0])
 				}
 				return
 			}
@@ -3563,18 +3672,18 @@ func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
 				if len(out) != 2 {
 					t.Fatalf("len(out) = %d, want original plus synthetic bucket; got %+v", len(out), out)
 				}
-				if out[0].ID != 7 || out[0].BytesIn != 10 || out[0].BytesOut != 5 {
-					t.Fatalf("existing bucket mutated = %+v, want 10/5 untouched", out[0])
+				if out[0].ID != 7 || out[0].BytesIn != 10 || out[0].BytesOut != 5 || out[0].Requests != 2 {
+					t.Fatalf("existing bucket mutated = %+v, want 10/5 and 2 requests untouched", out[0])
 				}
 				syn := out[1]
-				if syn.ID != 0 || syn.SiteID != 3 || syn.BytesIn != 8 || syn.BytesOut != 4 {
-					t.Fatalf("synthetic bucket = %+v, want ID=0 site=3 8/4", syn)
+				if syn.ID != 0 || syn.SiteID != 3 || syn.BytesIn != tt.pendingIn || syn.BytesOut != tt.pendingOut || syn.Requests != tt.pendingRequests {
+					t.Fatalf("synthetic bucket = %+v, want ID=0 site=3 pending values %d/%d/%d", syn, tt.pendingIn, tt.pendingOut, tt.pendingRequests)
 				}
 				if _, err := time.Parse(time.RFC3339, syn.RecordedAt); err != nil {
 					t.Fatalf("synthetic recorded_at %q is not RFC3339: %v", syn.RecordedAt, err)
 				}
-				if !sameTrafficHour(syn.RecordedAt, time.Now()) {
-					t.Fatalf("synthetic recorded_at %q is not the current hour", syn.RecordedAt)
+				if !sameTrafficMinute(syn.RecordedAt, now) {
+					t.Fatalf("synthetic recorded_at %q is not the current minute", syn.RecordedAt)
 				}
 				return
 			}
@@ -3591,72 +3700,74 @@ func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
 func TestMergePendingIntoLogsOnlyMutatesPrivateCopy(t *testing.T) {
 	now := time.Now()
 	nowLocal := now.In(time.Local)
-	wallHour := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), 0, 0, 0, time.UTC)
+	wallMinute := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), nowLocal.Minute(), 0, 0, time.UTC)
 	src := []TrafficLog{
-		{ID: 1, SiteID: 3, BytesIn: 10, BytesOut: 5, RecordedAt: wallHour.Format(time.RFC3339)},
-		{ID: 2, SiteID: 3, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour.Add(-3 * time.Hour).Format(time.RFC3339)},
+		{ID: 1, SiteID: 3, BytesIn: 10, BytesOut: 5, Requests: 2, RecordedAt: wallMinute.Format(time.RFC3339)},
+		{ID: 2, SiteID: 3, BytesIn: 1, BytesOut: 1, Requests: 1, RecordedAt: wallMinute.Add(-3 * time.Minute).Format(time.RFC3339)},
 	}
 	work := append([]TrafficLog(nil), src...)
-	out := mergePendingIntoLogs(work, 3, 8, 4)
-	// Pending lands in the current-hour element of the returned copy.
-	if len(out) != 2 || out[0].BytesIn != 18 || out[0].BytesOut != 9 {
-		t.Fatalf("merged result = %+v, want current-hour bucket 18/9", out)
+	out := mergePendingIntoLogsAt(work, 3, 8, 4, 3, now)
+	// Pending lands in the current-minute element of the returned copy.
+	if len(out) != 2 || out[0].BytesIn != 18 || out[0].BytesOut != 9 || out[0].Requests != 5 {
+		t.Fatalf("merged result = %+v, want current-minute bucket 18/9 with 5 requests", out)
 	}
 	// Caller-side mutation of the result must not touch the caller's original.
 	out[0].BytesIn = 999
 	out[0].BytesOut = 999
-	if src[0].BytesIn != 10 || src[0].BytesOut != 5 || src[1].BytesIn != 1 {
+	out[0].Requests = 999
+	if src[0].BytesIn != 10 || src[0].BytesOut != 5 || src[0].Requests != 2 || src[1].BytesIn != 1 {
 		t.Fatalf("source slice mutated through the result: %+v", src)
 	}
 }
 
-// In a non-UTC deployment the DB stores local wall-clock hours and the driver
+// In a non-UTC deployment the DB stores local wall-clock minutes and the driver
 // stamps them as UTC on read, so matching must compare wall-clock components
-// and the synthetic bucket must carry the current local wall hour as Z. This
+// and the synthetic bucket must carry the current local wall minute as Z. This
 // pins that behavior with the process zone fixed to UTC+8: an RFC3339 row
-// whose hour reads 08:00Z matches a now of 08:30+08, a different wall hour
-// does not, and the synthetic bucket is exactly the local 08:00Z row the next
+// whose time reads 08:30Z matches a now of 08:30+08, a different wall minute
+// does not, and the synthetic bucket is exactly the local 08:30Z row the next
 // addTraffic will persist.
 func TestMergePendingIntoLogsFixedZoneUTC8(t *testing.T) {
 	savedLocal := time.Local
 	time.Local = time.FixedZone("UTC+8", 8*3600)
 	defer func() { time.Local = savedLocal }()
 
-	now := time.Now().In(time.Local)
-	wallHour := func(h int) time.Time {
-		return time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 6, 8, 30, 45, 0, time.Local)
+	wallMinute := func(offset time.Duration) time.Time {
+		wall := now.Add(offset)
+		return time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, time.UTC)
 	}
-	// RFC3339 08:00Z matches a now of 08:30+08: the stored local hour 08 read
+	// RFC3339 08:30Z matches a now of 08:30+08: the stored local minute read
 	// back as Z is the same wall clock, even though the instants differ.
-	if !sameTrafficHour(wallHour(now.Hour()).Format(time.RFC3339), now) {
-		t.Fatalf("RFC3339 %q must match local wall hour %s", wallHour(now.Hour()).Format(time.RFC3339), now.Format(time.RFC3339))
+	if !sameTrafficMinute(wallMinute(0).Format(time.RFC3339), now) {
+		t.Fatalf("RFC3339 %q must match local wall minute %s", wallMinute(0).Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 	// The legacy local wall-clock row matches by the same wall-clock rule.
-	if !sameTrafficHour(now.Format("2006-01-02 15:04:05"), now) {
-		t.Fatalf("legacy %q must match local wall hour %s", now.Format("2006-01-02 15:04:05"), now.Format(time.RFC3339))
+	if !sameTrafficMinute(now.Format("2006-01-02 15:04:05"), now) {
+		t.Fatalf("legacy %q must match local wall minute %s", now.Format("2006-01-02 15:04:05"), now.Format(time.RFC3339))
 	}
-	// A different wall hour never matches, regardless of instant proximity.
-	if sameTrafficHour(wallHour(now.Hour()-1).Format(time.RFC3339), now) {
-		t.Fatalf("RFC3339 %q must not match local wall hour %s", wallHour(now.Hour()-1).Format(time.RFC3339), now.Format(time.RFC3339))
-	}
-
-	// A real current-hour RFC3339 row absorbs pending bytes.
-	in := []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour(now.Hour()).Format(time.RFC3339)}}
-	out := mergePendingIntoLogs(in, 2, 9, 3)
-	if len(out) != 1 || out[0].ID != 5 || out[0].BytesIn != 10 || out[0].BytesOut != 4 {
-		t.Fatalf("merged bucket = %+v, want ID=5 10/4", out)
+	// A different wall minute never matches, regardless of instant proximity.
+	if sameTrafficMinute(wallMinute(-time.Minute).Format(time.RFC3339), now) {
+		t.Fatalf("RFC3339 %q must not match local wall minute %s", wallMinute(-time.Minute).Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 
-	// The synthetic bucket is the current local wall hour stamped as UTC,
+	// A real current-minute RFC3339 row absorbs pending values.
+	in := []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, Requests: 2, RecordedAt: wallMinute(0).Format(time.RFC3339)}}
+	out := mergePendingIntoLogsAt(in, 2, 9, 3, 4, now)
+	if len(out) != 1 || out[0].ID != 5 || out[0].BytesIn != 10 || out[0].BytesOut != 4 || out[0].Requests != 6 {
+		t.Fatalf("merged bucket = %+v, want ID=5 10/4 with 6 requests", out)
+	}
+
+	// The synthetic bucket is the current local wall minute stamped as UTC,
 	// byte-identical to the row the next addTraffic will persist and read back.
-	in = []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour(now.Hour() - 1).Format(time.RFC3339)}}
-	out = mergePendingIntoLogs(in, 2, 9, 3)
+	in = []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, Requests: 2, RecordedAt: wallMinute(-time.Minute).Format(time.RFC3339)}}
+	out = mergePendingIntoLogsAt(in, 2, 9, 3, 4, now)
 	if len(out) != 2 {
 		t.Fatalf("len(out) = %d, want original plus synthetic bucket; got %+v", len(out), out)
 	}
-	want := wallHour(now.Hour()).Format(time.RFC3339)
+	want := wallMinute(0).Format(time.RFC3339)
 	if out[1].RecordedAt != want {
-		t.Fatalf("synthetic recorded_at = %q, want %q (local wall hour as Z)", out[1].RecordedAt, want)
+		t.Fatalf("synthetic recorded_at = %q, want %q (local wall minute as Z)", out[1].RecordedAt, want)
 	}
 }
 
@@ -3701,7 +3812,7 @@ func TestTrafficSnapshotUnifiedPayloadAndTotals(t *testing.T) {
 }
 
 // The legacy endpoint keeps the plain TrafficLog[] shape (with live-merged
-// current hour) and returns [] for unknown sites; the /snapshot endpoint
+// current minute) and returns [] for unknown sites; the /snapshot endpoint
 // returns the {snapshot, logs} envelope and 404 for unknown sites.
 func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	app := newTestApp(t)
@@ -3712,9 +3823,11 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(40)
 	inst.bytesOut.Store(10)
+	inst.reqCount.Store(6)
+	inst.pendingRequests.Store(6)
 	app.pm.proxies[site.ID] = inst
 
-	// Legacy: plain array, live-merged current hour.
+	// Legacy: plain array, live-merged current minute.
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/traffic/"+jsonNumber64(site.ID)+"?hours=24", nil)
 	app.handleTraffic(rr, req)
@@ -3725,8 +3838,8 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &logs); err != nil {
 		t.Fatalf("legacy body is not a TrafficLog array: %v body=%s", err, rr.Body.String())
 	}
-	if len(logs) != 1 || logs[0].ID != 0 || logs[0].BytesIn != 40 || logs[0].BytesOut != 10 {
-		t.Fatalf("legacy logs = %+v, want synthetic current-hour bucket 40/10", logs)
+	if len(logs) != 1 || logs[0].ID != 0 || logs[0].BytesIn != 40 || logs[0].BytesOut != 10 || logs[0].Requests != 6 {
+		t.Fatalf("legacy logs = %+v, want synthetic current-minute bucket 40/10 with 6 requests", logs)
 	}
 
 	// Envelope: {snapshot, logs} with the same live state.
@@ -3738,8 +3851,8 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	}
 	body := decodeBody(t, rr)
 	snap := mustMapValue(t, body, "snapshot")
-	if mustNumberValue(t, snap, "traffic_used") != 50 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 {
-		t.Fatalf("envelope snapshot = %v, want used=50 persisted=0 in=40 out=10", snap)
+	if mustNumberValue(t, snap, "traffic_used") != 50 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 || mustNumberValue(t, snap, "requests") != 6 {
+		t.Fatalf("envelope snapshot = %v, want used=50 persisted=0 in=40 out=10 requests=6", snap)
 	}
 	if !mustBoolValue(t, snap, "running") {
 		t.Fatal("envelope snapshot must report the site as running")
@@ -3747,6 +3860,10 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	envLogs, ok := body["logs"].([]interface{})
 	if !ok || len(envLogs) != 1 {
 		t.Fatalf("envelope logs = %v, want one merged bucket", body["logs"])
+	}
+	envLog, ok := envLogs[0].(map[string]interface{})
+	if !ok || mustNumberValue(t, envLog, "requests") != 6 {
+		t.Fatalf("envelope log = %v, want requests=6", envLogs[0])
 	}
 
 	// Legacy unknown site: empty array, not an error.

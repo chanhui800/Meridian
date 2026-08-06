@@ -59,6 +59,13 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	if err != nil || len(pathSearch) != 1 {
 		t.Fatalf("path logs=%#v err=%v", pathSearch, err)
 	}
+	if _, err := db.db.Exec("UPDATE sites SET name=? WHERE id=?", "edge-renamed", site.ID); err != nil {
+		t.Fatal(err)
+	}
+	renamedSiteSearch, err := db.ListRequestLogs(RequestLogFilter{Query: "edge-renamed"})
+	if err != nil || len(renamedSiteSearch) != 5 {
+		t.Fatalf("current node-name search logs=%#v err=%v, want all historical rows", renamedSiteSearch, err)
+	}
 	now := time.Now().UnixMilli()
 	ranged, err := db.ListRequestLogs(RequestLogFilter{FromMS: now - int64(time.Minute/time.Millisecond), ToMS: now + int64(time.Minute/time.Millisecond)})
 	if err != nil || len(ranged) != 5 {

@@ -4,6 +4,7 @@ let requestLogSearchTimer = null;
 let requestLogRefreshTimer = null;
 let requestLogLoadGeneration = 0;
 let requestLogLoading = false;
+let requestLogReloadQueued = false;
 
 function requestLogDateInputValue(date) {
   const year = date.getFullYear();
@@ -166,6 +167,7 @@ function renderRequestLogs() {
 }
 
 function stopRequestLogRefresh() {
+  requestLogLoadGeneration += 1;
   if (requestLogRefreshTimer) {
     clearInterval(requestLogRefreshTimer);
     requestLogRefreshTimer = null;
@@ -174,6 +176,7 @@ function stopRequestLogRefresh() {
     clearTimeout(requestLogSearchTimer);
     requestLogSearchTimer = null;
   }
+  requestLogReloadQueued = false;
 }
 
 function setRequestLogActivePill(containerId, activeButton) {
@@ -185,7 +188,11 @@ function setRequestLogActivePill(containerId, activeButton) {
 async function loadRequestLogs(options = {}) {
   const body = document.getElementById('request-log-body');
   if (!body) return;
-  if (requestLogLoading) return;
+  if (requestLogLoading) {
+    requestLogReloadQueued = true;
+    return;
+  }
+  requestLogReloadQueued = false;
   const from = document.getElementById('request-log-from').value;
   const to = document.getElementById('request-log-to').value;
   const range = requestLogRangeMilliseconds(from, to);
@@ -228,6 +235,10 @@ async function loadRequestLogs(options = {}) {
     Toast.error(error.message);
   } finally {
     requestLogLoading = false;
+    if (requestLogReloadQueued && Router.current === 'request-logs') {
+      requestLogReloadQueued = false;
+      loadRequestLogs({ showLoading: false });
+    }
   }
 }
 
