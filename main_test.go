@@ -3295,7 +3295,9 @@ func TestAddTrafficAggregatesSameMinuteWithRequests(t *testing.T) {
 		t.Fatalf("CreateSite: %v", err)
 	}
 
-	bucketTime := time.Now()
+	// Use a fixed wall-clock value so the test cannot cross a minute boundary
+	// while it is running in CI.
+	bucketTime := time.Date(2026, 1, 2, 3, 4, 10, 0, time.Local)
 	if err := app.db.addTrafficWithRequestsAt(site.ID, 10, 20, 2, bucketTime); err != nil {
 		t.Fatalf("first addTrafficWithRequests: %v", err)
 	}
