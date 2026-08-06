@@ -8133,7 +8133,11 @@ func dynamicRedirectHeaders(source http.Header) http.Header {
 			header[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
 		}
 	}
-	header.Set("User-Agent", dynamicRedirectUserAgent)
+	if userAgent := strings.TrimSpace(source.Get("User-Agent")); userAgent != "" {
+		header.Set("User-Agent", userAgent)
+	} else {
+		header.Set("User-Agent", dynamicRedirectUserAgent)
+	}
 	return header
 }
 
@@ -8159,6 +8163,7 @@ func rebuildDynamicResponseHeaders(resp *http.Response) {
 	if resp == nil {
 		return
 	}
+	redirectLocation := dynamicCapabilityRedirectLocation(resp)
 	allowed := []string{
 		"Accept-Ranges", "Content-Disposition", "Content-Encoding", "Content-Language",
 		"Content-Length", "Content-Range", "Content-Type", "Date", "ETag", "Last-Modified",
@@ -8173,6 +8178,9 @@ func rebuildDynamicResponseHeaders(resp *http.Response) {
 	if retryAfter != "" {
 		header.Set("Retry-After", retryAfter)
 	}
+	if redirectLocation != "" {
+		header.Set("Location", redirectLocation)
+	}
 	if resp.ContentLength >= 0 && header.Get("Content-Length") == "" {
 		header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
@@ -8183,6 +8191,26 @@ func rebuildDynamicResponseHeaders(resp *http.Response) {
 	header.Set("X-Content-Type-Options", "nosniff")
 	resp.Trailer = nil
 	resp.Header = header
+}
+
+func dynamicCapabilityRedirectLocation(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+	default:
+		return ""
+	}
+	location, ok := singleDynamicLocation(resp)
+	if !ok {
+		return ""
+	}
+	parsed, err := url.ParseRequestURI(location)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" || parsed.RawPath != "" || parsed.RawQuery != "" || !isReservedDynamicRoute(parsed.Path) {
+		return ""
+	}
+	return location
 }
 
 type dynamicAuthorityLeaseContextKey struct{}
@@ -8739,6 +8767,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		i.upstreamHeaderPolicy.apply(outbound.Header, target)
 	} else {
 		outbound.Header = dynamicRedirectHeaders(r.Header)
+		applyUAHeaderPolicy(outbound.Header, i.uaPolicy)
 	}
 	outbound.Header.Set("Accept-Encoding", "identity")
 	if claims.Kind == dynamicCapabilityKindManifest {
@@ -8791,6 +8820,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			dynamicPolicy:           i.policy,
 			dynamicTransportFactory: i.transportFactory,
 			dynamicState:            i.state,
+			capabilityIssuer:         i,
 			streamLeaseHeld:         true,
 			database:                i.database,
 			siteID:                  i.siteID,
@@ -8923,6 +8953,7 @@ type redirectFollowTransport struct {
 	dynamicTransportFactory dynamicTransportFactory
 	dynamicPolicy           dynamicRedirectPolicy
 	dynamicState            *dynamicSiteState
+	capabilityIssuer         *dynamicCapabilityIssuer
 	streamLeaseHeld         bool
 	database                *DB
 	siteID                  int64
@@ -9373,6 +9404,26 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 		if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
 			return fail(dynamicObservationReasonHopLimit, authority)
+		}
+		if t.capabilityIssuer != nil && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
+			route, discoveryErr := t.capabilityIssuer.mint(req.Context(), req.URL, normalized, dynamicDiscoverySourceRedirect)
+			if discoveryErr != nil {
+				return fail(discoveryErr.reasonCode, authority)
+			}
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			resp.Body = http.NoBody
+			resp.ContentLength = 0
+			resp.Trailer = nil
+			for _, name := range []string{"Content-Encoding", "Content-Language", "Content-MD5", "Content-Range", "Content-Type", "Digest", "ETag", "Last-Modified", "Trailer", "Transfer-Encoding"} {
+				resp.Header.Del(name)
+			}
+			resp.Header.Set("Content-Length", "0")
+			resp.Header.Set("Location", route)
+			t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
+			markDynamicResponse(resp, nil, expectedStructuredSource)
+			return resp, nil
 		}
 		if reasonCode := t.dynamicPolicy.validateTarget(req.URL, normalized, selfTargets); reasonCode != "" {
 			return fail(reasonCode, authority)
@@ -11902,6 +11953,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			dynamicPolicy:           redirectPolicy,
 			dynamicTransportFactory: pm.dynamicTransportFactory,
 			dynamicState:            dynamicState,
+			capabilityIssuer:         dynamicIssuer,
 			database:                pm.database,
 			siteID:                  site.ID,
 		}
