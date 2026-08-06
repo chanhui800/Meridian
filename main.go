@@ -4795,7 +4795,7 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 	if err != nil {
 		session.rollback()
 		if source == dynamicDiscoverySourcePlaybackInfo {
-			log.Printf("[%s] PlaybackInfo rewrite rejected: diagnostic=%s profile=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err), issuer.policy.profile)
+			log.Printf("[%s] PlaybackInfo rewrite rejected: diagnostic=%s fingerprint=%s profile=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err), playbackInfoRewriteDiagnosticFingerprint(err), issuer.policy.profile)
 		}
 		return recordFailure(dynamicStructuredRewriteDeniedReason(source))
 	}
@@ -5271,7 +5271,7 @@ func playbackInfoRewriteDiagnosticCode(err error) string {
 	}
 	message := err.Error()
 	switch {
-	case strings.Contains(message, "parsing deadline exceeded"):
+	case strings.Contains(message, "parsing deadline exceeded"), strings.Contains(message, "structured response deadline exceeded"):
 		return "parsing_deadline"
 	case strings.Contains(message, "structural limits"), strings.Contains(message, "token limit"), strings.Contains(message, "nesting exceeds"):
 		return "structural_limit"
@@ -5281,9 +5281,9 @@ func playbackInfoRewriteDiagnosticCode(err error) string {
 		return "media_sources_missing_or_duplicate"
 	case strings.Contains(message, "MediaSources has an invalid type"), strings.Contains(message, "MediaSources contains an invalid entry"):
 		return "media_sources_invalid"
-	case strings.Contains(message, "stringified JSON"):
+	case strings.Contains(message, "stringified JSON"), strings.Contains(message, "must stringify an array or object"):
 		return "stringified_collection_invalid"
-	case strings.Contains(message, "RequiredHttpHeaders"):
+	case strings.Contains(message, "RequiredHttpHeaders"), strings.Contains(message, "capability required headers"), strings.Contains(message, "invalid discovered URL required headers"):
 		return "required_headers_invalid"
 	case strings.Contains(message, "requires unsupported origin headers"):
 		return "origin_headers_unsupported"
@@ -5291,13 +5291,47 @@ func playbackInfoRewriteDiagnosticCode(err error) string {
 		return "media_streams_invalid"
 	case strings.Contains(message, "DeliveryUrl"):
 		return "delivery_url_invalid"
+	case strings.Contains(message, "PlaybackInfo Path has an invalid type"):
+		return "path_invalid"
+	case strings.Contains(message, "PlaybackInfo field Protocol has an invalid type"):
+		return "protocol_invalid"
+	case strings.Contains(message, "PlaybackInfo field TranscodingSubProtocol has an invalid type"):
+		return "transcoding_subprotocol_invalid"
+	case strings.Contains(message, "PlaybackInfo field DeliveryMethod has an invalid type"):
+		return "delivery_method_invalid"
+	case strings.Contains(message, "PlaybackInfo field IsExternalUrl has an invalid type"):
+		return "external_url_flag_invalid"
+	case strings.Contains(message, "PlaybackInfo field TranscodingUrl has an invalid type"):
+		return "transcoding_url_invalid"
+	case strings.Contains(message, "PlaybackInfo field DirectStreamUrl has an invalid type"):
+		return "direct_stream_url_invalid"
+	case strings.Contains(message, "duplicate casing"):
+		return "field_case_duplicate"
 	case strings.Contains(message, "unsupported protocol"), strings.Contains(message, "manifest source is unavailable"):
 		return "protocol_or_manifest_unsupported"
-	case strings.Contains(message, "invalid URL"), strings.Contains(message, "fallback URL is invalid"):
+	case strings.Contains(message, "invalid discovered URL"), strings.Contains(message, "invalid configured structured URL"), strings.Contains(message, "invalid same-authority structured URL"), strings.Contains(message, "invalid trusted capability URL"), strings.Contains(message, "invalid URL"), strings.Contains(message, "fallback URL is invalid"):
 		return "url_invalid"
+	case strings.Contains(message, "discovered URL count exceeds"):
+		return "url_count_limit"
+	case strings.Contains(message, "manifest nesting exceeds"):
+		return "manifest_depth_limit"
+	case strings.Contains(message, "structured response output exceeds"):
+		return "output_limit"
+	case strings.Contains(message, "invalid structured resource kind or depth"):
+		return "resource_shape_invalid"
+	case strings.Contains(message, "rewrite session is unavailable"):
+		return "rewrite_session_unavailable"
 	default:
 		return "unclassified"
 	}
+}
+
+func playbackInfoRewriteDiagnosticFingerprint(err error) string {
+	if err == nil {
+		return "00000000"
+	}
+	sum := sha256.Sum256([]byte(err.Error()))
+	return fmt.Sprintf("%x", sum[:4])
 }
 
 func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {

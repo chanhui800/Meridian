@@ -194,6 +194,8 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 		{name: "media sources", err: errors.New("PlaybackInfo MediaSources has an invalid type"), want: "media_sources_invalid"},
 		{name: "required headers", err: errors.New("PlaybackInfo RequiredHttpHeaders has an invalid value"), want: "required_headers_invalid"},
 		{name: "origin headers", err: errors.New("external subtitle URL requires unsupported origin headers"), want: "origin_headers_unsupported"},
+		{name: "invalid discovered URL", err: errors.New("invalid discovered URL"), want: "url_invalid"},
+		{name: "protocol type", err: errors.New("PlaybackInfo field Protocol has an invalid type"), want: "protocol_invalid"},
 		{name: "capability", err: newDynamicProxyError(dynamicObservationReasonDomainDenied), want: "capability_domain_denied"},
 		{name: "unknown does not echo secret", err: errors.New("unexpected upstream value bearer-secret"), want: "unclassified"},
 	}
@@ -206,6 +208,9 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 				t.Fatal("diagnostic code exposed error content")
 			}
 		})
+	}
+	if got := playbackInfoRewriteDiagnosticFingerprint(errors.New("unexpected upstream value bearer-secret")); len(got) != 8 || strings.Contains(got, "secret") {
+		t.Fatalf("diagnostic fingerprint is unsafe: %q", got)
 	}
 }
 
