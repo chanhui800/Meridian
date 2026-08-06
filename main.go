@@ -1764,7 +1764,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	}
 	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.method, request_logs.path, request_logs.recorded_at_ms FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
-		query += " WHERE " + strings.Join(conditions, " AND ")
+		query += " WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- conditions are fixed SQL fragments selected from validated filters; values remain parameters.
 	}
 	query += " ORDER BY request_logs.recorded_at_ms DESC, request_logs.id DESC LIMIT ?"
 	args = append(args, filter.Limit)

@@ -150,7 +150,7 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	metaBytes, err := os.ReadFile(req.metaPath)
+	metaBytes, err := os.ReadFile(req.metaPath) // #nosec G304 -- cache paths are generated from an internal SHA-256 key under the configured cache root.
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -159,19 +159,19 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 	}
 	var meta assetCacheMeta
 	if json.Unmarshal(metaBytes, &meta) != nil || meta.ExpiresAtMS <= now.UnixMilli() || meta.Size < 0 || meta.Size > maxAssetCacheObject {
-		_ = os.Remove(req.metaPath)
-		_ = os.Remove(req.bodyPath)
+		_ = os.Remove(req.metaPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
+		_ = os.Remove(req.bodyPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
 		return nil, nil
 	}
-	body, err := os.ReadFile(req.bodyPath)
+	body, err := os.ReadFile(req.bodyPath) // #nosec G304 -- cache paths are generated from an internal SHA-256 key under the configured cache root.
 	if err != nil || int64(len(body)) != meta.Size {
-		_ = os.Remove(req.metaPath)
-		_ = os.Remove(req.bodyPath)
+		_ = os.Remove(req.metaPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
+		_ = os.Remove(req.bodyPath) // #nosec G703 -- both paths are generated cache files, never user-supplied paths.
 		return nil, nil
 	}
 	meta.AccessedAtMS = now.UnixMilli()
 	if updated, err := json.Marshal(meta); err == nil {
-		_ = os.WriteFile(req.metaPath, updated, 0600)
+		_ = os.WriteFile(req.metaPath, updated, 0600) // #nosec G703 -- metadata path is generated from the internal cache key.
 	}
 	return &assetCacheHit{meta: meta, body: body}, nil
 }
@@ -236,16 +236,16 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 		return err
 	}
 	if err := os.WriteFile(metaTmp, metaBytes, 0600); err != nil {
-		_ = os.Remove(bodyTmp)
+		_ = os.Remove(bodyTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
 		return err
 	}
 	if err := os.Rename(bodyTmp, req.bodyPath); err != nil {
-		_ = os.Remove(bodyTmp)
-		_ = os.Remove(metaTmp)
+		_ = os.Remove(bodyTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
+		_ = os.Remove(metaTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
 		return err
 	}
 	if err := os.Rename(metaTmp, req.metaPath); err != nil {
-		_ = os.Remove(metaTmp)
+		_ = os.Remove(metaTmp) // #nosec G703 -- temporary path is derived from the generated cache path.
 		return err
 	}
 	return c.enforceBudgetLocked(site)
@@ -262,11 +262,11 @@ func (c *assetCache) enforceBudgetLocked(site Site) error {
 	root := filepath.Join(c.dir, strconv.FormatInt(site.ID, 10))
 	files := make([]assetCacheFile, 0)
 	var total int64
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error { // #nosec G122 -- root is the application-owned per-site cache directory.
 		if walkErr != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) // #nosec G304 -- WalkDir only visits generated metadata below the application-owned cache root.
 		if err != nil {
 			return nil
 		}
@@ -287,8 +287,8 @@ func (c *assetCache) enforceBudgetLocked(site Site) error {
 		if total <= site.AssetCacheMaxBytes {
 			break
 		}
-		_ = os.Remove(file.metaPath)
-		_ = os.Remove(file.bodyPath)
+		_ = os.Remove(file.metaPath) // #nosec G703 -- paths originate from WalkDir below the application-owned cache root.
+		_ = os.Remove(file.bodyPath) // #nosec G703 -- paths originate from WalkDir below the application-owned cache root.
 		total -= file.size
 	}
 	return nil
@@ -332,6 +332,6 @@ func serveAssetCacheHit(w http.ResponseWriter, r *http.Request, hit *assetCacheH
 	w.Header().Set("Content-Length", strconv.Itoa(len(hit.body)))
 	w.WriteHeader(hit.meta.Status)
 	if r.Method != http.MethodHead {
-		_, _ = w.Write(hit.body)
+		_, _ = w.Write(hit.body) // #nosec G705 -- bytes are served only after cache metadata/content-type eligibility checks.
 	}
 }
