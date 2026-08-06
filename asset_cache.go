@@ -153,7 +153,19 @@ func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *asset
 
 func (c *assetCache) openRoot(create bool) (*os.Root, error) {
 	if create {
-		if err := os.MkdirAll(c.dir, 0700); err != nil {
+		cleanDir, err := filepath.Abs(filepath.Clean(c.dir))
+		if err != nil {
+			return nil, err
+		}
+		parent := filepath.Dir(cleanDir)
+		base := filepath.Base(cleanDir)
+		parentRoot, err := os.OpenRoot(parent)
+		if err != nil {
+			return nil, err
+		}
+		err = parentRoot.Mkdir(base, 0700)
+		_ = parentRoot.Close()
+		if err != nil && !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
 	}
