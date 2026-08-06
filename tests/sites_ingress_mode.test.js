@@ -64,10 +64,28 @@ test('site cards place ingress mode above running status and omit playback rows'
   assert.match(cardSource, /siteIngressModeLabel\(s\)/);
   assert.match(cardSource, /data-access-address/);
   assert.match(cardSource, /toggleSiteAccessAddress/);
+  assert.match(cardSource, /data-site-action="copy"/);
+  assert.match(cardSource, /copySiteAccessAddress/);
   assert.match(cardSource, /class="status-badge site-status"/);
   assert.doesNotMatch(cardSource, /renderPlaybackRow\(s\)/);
   assert.doesNotMatch(cardSource, /renderIngressSummary\(s\)/);
   assert.doesNotMatch(cardSource, /播放回源/);
+});
+
+test('copySiteAccessAddress copies the raw address even while it is hidden', async () => {
+  const sandbox = loadHelpers();
+  let copied = '';
+  let success = '';
+  sandbox.navigator = { clipboard: { writeText: async value => { copied = value; } } };
+  sandbox.Toast = { success: value => { success = value; }, error: () => {} };
+  const value = { dataset: { accessAddress: 'https://123.divine.de5.net:9090' } };
+  const row = { querySelector: selector => selector === '[data-access-address]' ? value : null };
+  const button = { closest: () => row };
+
+  await sandbox.copySiteAccessAddress(button);
+
+  assert.equal(copied, 'https://123.divine.de5.net:9090');
+  assert.equal(success, '访问地址已复制');
 });
 
 test('target authority comparison ignores path and explicit default ports', () => {

@@ -59,7 +59,7 @@ async function loadSites() {
 		<div class="site-rows">
 		  <div class="site-row site-access-row">
 		    <span class="site-row-label">访问地址</span>
-		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" title="显示访问地址">◉</button></span>
+		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" title="显示访问地址">◉</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path></svg></button></span>
 		  </div>
           <div class="site-row">
             <span class="site-row-label">主回源地址</span>
@@ -104,6 +104,7 @@ async function loadSites() {
         if (!site) return;
 		if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
 		if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
+		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
 		if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
         if (button.dataset.siteAction === 'edit') showSiteModal(site);
         if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
@@ -763,6 +764,37 @@ function toggleSiteAccessAddress(button) {
 	value.textContent = hidden ? '********' : value.dataset.accessAddress;
 	button.setAttribute('aria-label', hidden ? '显示访问地址' : '隐藏访问地址');
 	button.setAttribute('title', hidden ? '显示访问地址' : '隐藏访问地址');
+}
+
+async function copySiteAccessAddress(button) {
+	const row = button.closest('.site-access-row');
+	const value = row && row.querySelector('[data-access-address]');
+	const address = String(value && value.dataset.accessAddress || '').trim();
+	if (!address) {
+		Toast.error('当前站点没有可复制的访问地址');
+		return;
+	}
+
+	try {
+		if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+			await navigator.clipboard.writeText(address);
+		} else {
+			if (typeof document === 'undefined' || typeof document.execCommand !== 'function') throw new Error('clipboard unavailable');
+			const input = document.createElement('textarea');
+			input.value = address;
+			input.setAttribute('readonly', '');
+			input.style.position = 'fixed';
+			input.style.opacity = '0';
+			document.body.appendChild(input);
+			input.select();
+			const copied = document.execCommand('copy');
+			input.remove();
+			if (!copied) throw new Error('copy failed');
+		}
+		Toast.success('访问地址已复制');
+	} catch (_) {
+		Toast.error('复制失败，请手动复制访问地址');
+	}
 }
 
 let siteIngressCapabilities = normalizeSiteCapabilities({});
