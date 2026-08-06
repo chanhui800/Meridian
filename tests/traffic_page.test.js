@@ -133,6 +133,53 @@ test('getTrafficSnapshot calls the additive snapshot endpoint; getTraffic is kep
   assert.equal(calls[2], '/api/traffic/3/snapshot?hours=24', 'hours must default to 24');
 });
 
+test('minute series fills missing buckets, aggregates requests, and preserves totals when compacted', () => {
+  const sandbox = {
+    window: { addEventListener() {} },
+    document: {},
+    console,
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'pages/traffic.js');
+
+  const now = Date.UTC(2026, 7, 6, 12, 34, 45);
+  const series = sandbox.buildMinuteTrafficSeries([
+    { recorded_at_ms: now - 60_000, bytes_in: 100, bytes_out: 20, requests: 2 },
+    { recorded_at_ms: now, bytes_in: 300, bytes_out: 40, requests: 4 },
+  ], 1, now);
+
+  assert.equal(series.minuteCount, 60);
+  assert.equal(series.inbound.reduce((sum, value) => sum + value, 0), 400);
+  assert.equal(series.outbound.reduce((sum, value) => sum + value, 0), 60);
+  assert.equal(series.requests.reduce((sum, value) => sum + value, 0), 6);
+  assert.equal(series.inbound[58], 100);
+  assert.equal(series.inbound[59], 300);
+  assert.equal(series.inbound.slice(0, 58).every(value => value === 0), true);
+
+  const compacted = sandbox.compactTrafficSeries(series, 20);
+  assert.equal(compacted.inbound.reduce((sum, value) => sum + value, 0), 400);
+  assert.equal(compacted.outbound.reduce((sum, value) => sum + value, 0), 60);
+  assert.equal(compacted.requests.reduce((sum, value) => sum + value, 0), 6);
+  assert.equal(compacted.timestamps[0], series.start + 2 * 60_000);
+  assert.equal(compacted.timestamps.at(-1), series.end);
+});
+
+test('traffic wall-clock fallback does not interpret a stored Z as a UTC instant', () => {
+  const sandbox = {
+    window: { addEventListener() {} },
+    document: {},
+    console,
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'pages/traffic.js');
+
+  const expectedLocal = new Date(2026, 7, 6, 12, 34, 0).getTime();
+  assert.equal(
+    sandbox.trafficLogTimestamp({ recorded_at: '2026-08-06T12:34:00Z' }),
+    expectedLocal,
+  );
+});
+
 test('traffic page paints totals from the snapshot and the chart from merged logs in one request', async () => {
   const recordedAt = new Date(Date.now() - 3600000).toISOString();
   const h = makeTrafficHarness({

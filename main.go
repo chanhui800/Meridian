@@ -1757,16 +1757,16 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		conditions = append(conditions, "status_code BETWEEN 500 AND 599")
 	}
 	if filter.Query != "" {
-		conditions = append(conditions, `(instr(lower(site_name), lower(?))>0 OR instr(lower(client_ip), lower(?))>0 OR instr(lower(user_agent), lower(?))>0 OR instr(lower(path), lower(?))>0 OR CAST(status_code AS TEXT)=?)`)
-		for range 5 {
+		conditions = append(conditions, `(instr(lower(request_logs.site_name), lower(?))>0 OR instr(lower(COALESCE(sites.name, '')), lower(?))>0 OR instr(lower(request_logs.client_ip), lower(?))>0 OR instr(lower(request_logs.user_agent), lower(?))>0 OR instr(lower(request_logs.path), lower(?))>0 OR CAST(request_logs.status_code AS TEXT)=?)`)
+		for range 6 {
 			args = append(args, filter.Query)
 		}
 	}
-	query := `SELECT id, site_id, site_name, resource_category, status_code, client_ip, user_agent, method, path, recorded_at_ms FROM request_logs`
+	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.method, request_logs.path, request_logs.recorded_at_ms FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
-	query += " ORDER BY recorded_at_ms DESC, id DESC LIMIT ?"
+	query += " ORDER BY request_logs.recorded_at_ms DESC, request_logs.id DESC LIMIT ?"
 	args = append(args, filter.Limit)
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
@@ -2240,6 +2240,7 @@ func (d *DB) migrateOnce() error {
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 		bytes_in BIGINT DEFAULT 0,
 		bytes_out BIGINT DEFAULT 0,
+		requests BIGINT NOT NULL DEFAULT 0,
 		recorded_at DATETIME NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_traffic_site_time ON traffic_logs(site_id, recorded_at);
@@ -2311,32 +2312,53 @@ func (d *DB) migrateOnce() error {
 		return err
 	}
 
-	var hasHourlyIndex int
-	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_hour'").Scan(&hasHourlyIndex); err != nil {
+	var hasRequestsColumn int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('traffic_logs') WHERE name='requests'").Scan(&hasRequestsColumn); err != nil {
 		return err
 	}
-	if hasHourlyIndex == 0 {
+	if hasRequestsColumn == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE traffic_logs ADD COLUMN requests BIGINT NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+
+	// idx_traffic_site_hour and idx_traffic_site_minute enforce the same
+	// physical uniqueness (site_id, recorded_at); only the bucket timestamp
+	// written by addTrafficWithRequests changes from HH:00 to HH:MM. Preserve
+	// every legacy hourly row, and only collapse exact duplicate timestamps on
+	// very old databases that predate the unique index.
+	var hasTrafficBucketIndex int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_traffic_site_hour','idx_traffic_site_minute')").Scan(&hasTrafficBucketIndex); err != nil {
+		return err
+	}
+	if hasTrafficBucketIndex == 0 {
 		if _, err := conn.ExecContext(ctx, `
 			CREATE TABLE traffic_logs_dedup (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 				bytes_in BIGINT DEFAULT 0,
 				bytes_out BIGINT DEFAULT 0,
+				requests BIGINT NOT NULL DEFAULT 0,
 				recorded_at DATETIME NOT NULL
 			);
-			INSERT INTO traffic_logs_dedup (site_id, bytes_in, bytes_out, recorded_at)
-			SELECT site_id, SUM(bytes_in), SUM(bytes_out), recorded_at
+			INSERT INTO traffic_logs_dedup (site_id, bytes_in, bytes_out, requests, recorded_at)
+			SELECT site_id, SUM(bytes_in), SUM(bytes_out), SUM(requests), recorded_at
 			FROM traffic_logs
 			GROUP BY site_id, recorded_at;
 			DELETE FROM traffic_logs;
-			INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at)
-			SELECT site_id, bytes_in, bytes_out, recorded_at
+			INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at)
+			SELECT site_id, bytes_in, bytes_out, requests, recorded_at
 			FROM traffic_logs_dedup;
 			DROP TABLE traffic_logs_dedup;
-			CREATE UNIQUE INDEX idx_traffic_site_hour ON traffic_logs(site_id, recorded_at);
 		`); err != nil {
 			return err
 		}
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_traffic_site_minute ON traffic_logs(site_id, recorded_at)"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "DROP INDEX IF EXISTS idx_traffic_site_hour"); err != nil {
+		return err
 	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
@@ -2678,7 +2700,13 @@ type TrafficLog struct {
 	SiteID     int64  `json:"site_id"`
 	BytesIn    int64  `json:"bytes_in"`
 	BytesOut   int64  `json:"bytes_out"`
+	Requests   int64  `json:"requests"`
 	RecordedAt string `json:"recorded_at"`
+	// RecordedAtMS is the local wall-clock bucket represented as an epoch in
+	// the server's local timezone. traffic_logs intentionally stores wall-clock
+	// text for backwards compatibility, so clients must not interpret the
+	// driver's RFC3339/Z rendering as a UTC instant.
+	RecordedAtMS int64 `json:"recorded_at_ms,omitempty"`
 }
 
 // SiteTraffic is the authoritative per-site traffic state: the persisted
@@ -2710,7 +2738,7 @@ type TrafficSnapshot struct {
 
 // TrafficHistory is the single-site envelope returned by
 // /api/traffic/{id}/snapshot: an atomically captured live snapshot plus the
-// log window with pending bytes merged into the current-hour bucket.
+// log window with pending bytes and requests merged into the current-minute bucket.
 type TrafficHistory struct {
 	Snapshot SiteTraffic  `json:"snapshot"`
 	Logs     []TrafficLog `json:"logs"`
@@ -3103,7 +3131,37 @@ func (d *DB) AddTraffic(siteID, bytesIn, bytesOut int64) {
 }
 
 func (d *DB) addTraffic(siteID, bytesIn, bytesOut int64) error {
-	hour := time.Now().Truncate(time.Hour).Format("2006-01-02 15:04:05")
+	return d.addTrafficWithRequests(siteID, bytesIn, bytesOut, 0)
+}
+
+func trafficMinuteBucket(now time.Time) string {
+	nowLocal := now.In(time.Local)
+	return time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), nowLocal.Minute(), 0, 0, time.Local).Format("2006-01-02 15:04:05")
+}
+
+// trafficWallClockMillis converts the wall-clock bucket text stored in
+// traffic_logs into an epoch using the server's local timezone. The SQLite
+// driver may render the same text as RFC3339 with a trailing Z, but that Z is
+// not the original instant; it is only the driver's representation of a
+// timezone-less DATETIME value.
+func trafficWallClockMillis(recordedAt string) int64 {
+	t, err := time.Parse(time.RFC3339Nano, recordedAt)
+	if err != nil {
+		t, err = time.ParseInLocation("2006-01-02 15:04:05", recordedAt, time.Local)
+	}
+	if err != nil {
+		return 0
+	}
+	wall := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
+	return wall.UnixMilli()
+}
+
+func (d *DB) addTrafficWithRequests(siteID, bytesIn, bytesOut, requests int64) error {
+	return d.addTrafficWithRequestsAt(siteID, bytesIn, bytesOut, requests, time.Now())
+}
+
+func (d *DB) addTrafficWithRequestsAt(siteID, bytesIn, bytesOut, requests int64, now time.Time) error {
+	minute := trafficMinuteBucket(now)
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -3111,21 +3169,28 @@ func (d *DB) addTraffic(siteID, bytesIn, bytesOut int64) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(
-		`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at)
-		 VALUES (?,?,?,?)
+		`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at)
+		 VALUES (?,?,?,?,?)
 		 ON CONFLICT(site_id, recorded_at) DO UPDATE SET
 		 	bytes_in = traffic_logs.bytes_in + excluded.bytes_in,
-		 	bytes_out = traffic_logs.bytes_out + excluded.bytes_out`,
-		siteID, bytesIn, bytesOut, hour,
+			bytes_out = traffic_logs.bytes_out + excluded.bytes_out,
+			requests = traffic_logs.requests + excluded.requests`,
+		siteID, bytesIn, bytesOut, requests, minute,
 	); err != nil {
 		return err
 	}
 
-	if _, err := tx.Exec(
-		"UPDATE sites SET traffic_used=traffic_used+?+?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		bytesIn, bytesOut, siteID,
-	); err != nil {
-		return err
+	// Request-only checkpoints must not issue a no-op traffic_used update. In
+	// addition to avoiding unnecessary writes, lifecycle shutdown relies on the
+	// pre-close request-count checkpoint remaining independent from a later
+	// byte-persistence failure after ingress has irreversibly closed.
+	if bytesIn != 0 || bytesOut != 0 {
+		if _, err := tx.Exec(
+			"UPDATE sites SET traffic_used=traffic_used+?+?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+			bytesIn, bytesOut, siteID,
+		); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit()
@@ -3134,7 +3199,7 @@ func (d *DB) addTraffic(siteID, bytesIn, bytesOut int64) error {
 func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	since := time.Now().Add(-time.Duration(hours) * time.Hour).Format("2006-01-02 15:04:05")
 	rows, err := d.db.Query(
-		"SELECT id, site_id, bytes_in, bytes_out, recorded_at FROM traffic_logs WHERE site_id=? AND recorded_at>=? ORDER BY recorded_at",
+		"SELECT id, site_id, bytes_in, bytes_out, requests, recorded_at FROM traffic_logs WHERE site_id=? AND recorded_at>=? ORDER BY recorded_at",
 		siteID, since,
 	)
 	if err != nil {
@@ -3144,9 +3209,10 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	var logs []TrafficLog
 	for rows.Next() {
 		var l TrafficLog
-		if err := rows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.RecordedAt); err != nil {
+		if err := rows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAt); err != nil {
 			return nil, err
 		}
+		l.RecordedAtMS = trafficWallClockMillis(l.RecordedAt)
 		logs = append(logs, l)
 	}
 	if err := rows.Err(); err != nil {
@@ -10174,6 +10240,7 @@ type ProxyInstance struct {
 	bytesIn          atomic.Int64
 	bytesOut         atomic.Int64
 	reqCount         atomic.Int64
+	pendingRequests  atomic.Int64
 	persistedTraffic atomic.Int64
 	trustedProxies   []*net.IPNet
 	dynamicState     *dynamicSiteState
@@ -12379,6 +12446,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}()
 		r = r.WithContext(requestCtx)
 		inst.reqCount.Add(1)
+		inst.pendingRequests.Add(1)
 
 		if site.TrafficQuota > 0 {
 			currentUsed := inst.persistedTraffic.Load() + inst.bytesIn.Load() + inst.bytesOut.Load()
@@ -12670,9 +12738,10 @@ func (pm *ProxyManager) StartAllEnabled() (int, error) {
 	return len(sites), nil
 }
 
-// FlushTraffic flushes every running instance's pending traffic to the DB. It
-// is driven by the periodic ticker: a failed flush restores the pending
-// counters and is logged here, so the next tick retries the same bytes.
+// FlushTraffic flushes every running instance's pending traffic and request
+// count to the DB. It is driven by the periodic ticker: a failed flush restores
+// the pending counters and is logged here, so the next tick retries the same
+// values.
 func (pm *ProxyManager) FlushTraffic() {
 	pm.mu.RLock()
 	instances := make([]*ProxyInstance, 0, len(pm.proxies))
@@ -12687,11 +12756,12 @@ func (pm *ProxyManager) FlushTraffic() {
 	}
 }
 
-// flushProxyTraffic persists inst's pending bytes into the DB and moves them
-// into the persisted baseline. The caller must pin inst through lifecycleMu, a
-// pm.mu snapshot, or another stable reference; inst.trafficMu is acquired here.
-// On failure the pending counters are fully restored so the next flush retries
-// the same bytes. Never call this while already holding inst.trafficMu.
+// flushProxyTraffic persists inst's pending bytes and requests into the DB and
+// moves the bytes into the persisted baseline. The caller must pin inst through
+// lifecycleMu, a pm.mu snapshot, or another stable reference; inst.trafficMu is
+// acquired here. On failure the pending counters are fully restored so the next
+// flush retries the same values. Never call this while already holding
+// inst.trafficMu.
 func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) error {
 	inst.trafficMu.Lock()
 	defer inst.trafficMu.Unlock()
@@ -12701,16 +12771,18 @@ func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) error {
 // flushProxyTrafficLocked is the body of flushProxyTraffic and assumes
 // inst.trafficMu is held. Order is swap -> DB -> persisted baseline: the
 // pending counters are zeroed first, the baseline moves only after the DB
-// transaction commits, and the counters are restored verbatim on any error.
+// transaction commits, and all counters are restored verbatim on any error.
 func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	in := inst.bytesIn.Swap(0)
 	out := inst.bytesOut.Swap(0)
-	if in == 0 && out == 0 {
+	requests := inst.pendingRequests.Swap(0)
+	if in == 0 && out == 0 && requests == 0 {
 		return nil
 	}
-	if err := pm.database.addTraffic(inst.Site.ID, in, out); err != nil {
+	if err := pm.database.addTrafficWithRequests(inst.Site.ID, in, out, requests); err != nil {
 		inst.bytesIn.Add(in)
 		inst.bytesOut.Add(out)
+		inst.pendingRequests.Add(requests)
 		return err
 	}
 	delta := in + out
@@ -12719,17 +12791,17 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	return nil
 }
 
-// sameTrafficHour reports whether a persisted recorded_at value falls in the
-// same wall-clock hour as now. Stored rows are wall-clock values: legacy
+// sameTrafficMinute reports whether a persisted recorded_at value falls in the
+// same wall-clock minute as now. Stored rows are wall-clock values: legacy
 // "2006-01-02 15:04:05" rows carry the writer's local time, and the modernc
 // SQLite driver re-serializes DATETIME columns as RFC3339 with the stored
 // wall clock in UTC (it attaches Z to whatever text was written). The
-// year/month/day/hour components of the stored value are therefore compared
+// year/month/day/hour/minute components of the stored value are therefore compared
 // against the current local wall clock, never the instants: an instant-based
 // comparison would shift the bucket by the zone offset in non-UTC
 // deployments. Values that parse as neither format never match, so a corrupt
 // or foreign string cannot swallow pending bytes.
-func sameTrafficHour(recordedAt string, now time.Time) bool {
+func sameTrafficMinute(recordedAt string, now time.Time) bool {
 	t, err := time.Parse(time.RFC3339Nano, recordedAt)
 	if err != nil {
 		if t, err = time.ParseInLocation("2006-01-02 15:04:05", recordedAt, time.Local); err != nil {
@@ -12739,44 +12811,53 @@ func sameTrafficHour(recordedAt string, now time.Time) bool {
 	nowLocal := now.In(time.Local)
 	y, m, d := t.Date()
 	ny, nm, nd := nowLocal.Date()
-	return y == ny && m == nm && d == nd && t.Hour() == nowLocal.Hour()
+	return y == ny && m == nm && d == nd && t.Hour() == nowLocal.Hour() && t.Minute() == nowLocal.Minute()
 }
 
-// mergePendingIntoLogs merges live pending bytes into the current-hour bucket
-// of the returned log copy: it adds to the existing bucket when present, or
-// appends a synthetic bucket with ID 0 when the hour has no bucket yet and
-// pending bytes are non-zero. A zero pending pair is a no-op. The input slice
-// must be a private copy (GetTrafficLogs always returns one). The current
-// hour is matched by wall-clock semantics via sameTrafficHour, so rows
+// mergePendingIntoLogs merges live pending bytes and requests into the current-
+// minute bucket of the returned log copy: it adds to the existing bucket when
+// present, or appends a synthetic bucket with ID 0 when the minute has no bucket
+// yet and any pending value is non-zero. All-zero pending values are a no-op.
+// The input slice must be a private copy (GetTrafficLogs always returns one).
+// The current minute is matched by wall-clock semantics via sameTrafficMinute, so rows
 // persisted in either the RFC3339 form the SQLite driver returns or the
 // legacy SQL layout merge correctly. The synthetic bucket is built from the
-// current local wall hour stamped as UTC, exactly the representation the next
+// current local wall minute stamped as UTC, exactly the representation the next
 // addTraffic row will carry after the driver re-serializes it, with ID 0.
-func mergePendingIntoLogs(logs []TrafficLog, siteID, pendingIn, pendingOut int64) []TrafficLog {
-	if pendingIn == 0 && pendingOut == 0 {
+func mergePendingIntoLogs(logs []TrafficLog, siteID, pendingIn, pendingOut, pendingRequests int64) []TrafficLog {
+	return mergePendingIntoLogsAt(logs, siteID, pendingIn, pendingOut, pendingRequests, time.Now())
+}
+
+func mergePendingIntoLogsAt(logs []TrafficLog, siteID, pendingIn, pendingOut, pendingRequests int64, now time.Time) []TrafficLog {
+	if pendingIn == 0 && pendingOut == 0 && pendingRequests == 0 {
 		return logs
 	}
-	now := time.Now()
 	for i := range logs {
-		if sameTrafficHour(logs[i].RecordedAt, now) {
+		if sameTrafficMinute(logs[i].RecordedAt, now) {
 			logs[i].BytesIn += pendingIn
 			logs[i].BytesOut += pendingOut
+			logs[i].Requests += pendingRequests
+			if logs[i].RecordedAtMS <= 0 {
+				logs[i].RecordedAtMS = trafficWallClockMillis(logs[i].RecordedAt)
+			}
 			return logs
 		}
 	}
 	nowLocal := now.In(time.Local)
 	return append(logs, TrafficLog{
-		ID:         0,
-		SiteID:     siteID,
-		BytesIn:    pendingIn,
-		BytesOut:   pendingOut,
-		RecordedAt: time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), 0, 0, 0, time.UTC).Format(time.RFC3339),
+		ID:           0,
+		SiteID:       siteID,
+		BytesIn:      pendingIn,
+		BytesOut:     pendingOut,
+		Requests:     pendingRequests,
+		RecordedAt:   time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), nowLocal.Minute(), 0, 0, time.UTC).Format(time.RFC3339),
+		RecordedAtMS: time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), nowLocal.Minute(), 0, 0, time.Local).UnixMilli(),
 	})
 }
 
 // SiteTrafficHistory captures a single site's traffic history as a consistent
-// point-in-time view: the DB log window plus live pending bytes merged into
-// the returned copy's current-hour bucket, alongside the authoritative live
+// point-in-time view: the DB log window plus live pending bytes and requests
+// merged into the returned copy's current-minute bucket, alongside the authoritative live
 // state. For a running site the DB read and the live counters happen under
 // inst.trafficMu (with pm.mu held read-only to pin the instance), so the view
 // never interleaves with a concurrent flush.
@@ -12815,7 +12896,7 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 	snap.BytesOut = inst.bytesOut.Load()
 	snap.TrafficUsed = snap.PersistedTraffic + snap.BytesIn + snap.BytesOut
 	snap.Requests = inst.reqCount.Load()
-	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut)
+	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut, inst.pendingRequests.Load())
 	return &TrafficHistory{Snapshot: snap, Logs: logs}, nil
 }
 

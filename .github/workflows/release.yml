@@ -144,7 +144,7 @@ jobs:
       packages: write
       contents: read
     env:
-      IMAGE_NAME: ghcr.io/snnabb/meridian
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/meridian
       RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
 
     steps:

@@ -1,14 +1,14 @@
 <div align="center">
 
-# Meridian
+# Meridian（修改版）
 
-轻量级 Emby 反向代理管理面板
+轻量级 Emby 反向代理管理面板（面向小白用户优化）
 单文件 Go 后端 + 嵌入式 SPA 前端，开箱即用
 
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![SQLite](https://img.shields.io/badge/SQLite-embedded-003B57?logo=sqlite&logoColor=white)](https://pkg.go.dev/modernc.org/sqlite)
-[![CI](https://github.com/snnabb/Meridian/actions/workflows/ci.yml/badge.svg)](https://github.com/snnabb/Meridian/actions/workflows/ci.yml)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/snnabb/Meridian/pkgs/container/meridian)
+[![CI](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml/badge.svg)](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/chanhui800/Meridian/pkgs/container/meridian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
@@ -24,6 +24,17 @@
 Meridian 是一个专为 Emby 媒体服务器设计的反向代理管理面板（Emby reverse proxy management panel）。它解决的核心问题是：**当你需要在一台机器上管理多个 Emby 反代站点时，不想手写 Nginx 配置，不想逐个维护 UA 伪装规则，也不想自己实现流量计量和限速。**
 
 Meridian 把这些事情打包成一个单二进制程序，带管理界面，带实时监控，开箱可用。
+
+### 本修改版新增与优化
+
+- 更紧凑的管理界面：左侧导航可展开/折叠，并支持黑白主题切换。
+- 添加站点默认使用 UA 透传、Compatible 安全策略，并默认允许 HTTPS → HTTP 降级。
+- 自动播放后端发现开箱启用，支持安全 30x、PlaybackInfo、HLS/DASH 等常见 Emby 返回类型；高级发现选项可按需开启。
+- 请求日志增加视频流分类、节点名称搜索和实时刷新；日志页面支持稳定滚动，不会因刷新跳回顶部。
+- 流量统计支持最近 1 小时、6 小时、24 小时、7 天的分钟级聚合，展示入站、出站和请求数。
+- 站点管理支持单个或批量延迟测试；缓存支持按节点容量上限和真实目标路径规则自动淘汰旧文件。
+
+本仓库是基于上游 Meridian 的兼容性与易用性修改版，核心代理、安全边界和数据格式仍遵循原项目设计。
 
 ## 友链
 
@@ -57,7 +68,7 @@ Meridian 把这些事情打包成一个单二进制程序，带管理界面，�
 一行命令进入精简菜单：安装、更新到最新版、修改管理员密码、卸载。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh)
 ```
 
 > 首次安装从 GitHub Releases 下载最新二进制，并使用同一 Release 中的 `SHA256SUMS` 强制校验。systemd 部署默认使用独立的 `meridian` 非 root 用户。重复运行 `install` 不会更新程序，只用于补充或重新配置面板域名。
@@ -68,20 +79,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 
 ```bash
 # 首次安装最新版；过程中可选择是否配置面板 HTTPS 域名
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) install
 
 # 非交互配置面板域名（邮箱可省略）
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) install \
   --domain panel.example.com --email admin@example.com -y
 
 # 更新：自动创建数据备份与一致性快照，保留上一版本；systemd 环境启动后健康检查，失败则自动回滚二进制和数据
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) update
+bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) update
 
 # 隐藏输入两次新密码；同时轮换 JWT_SECRET，使全部旧令牌失效
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) password
+bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) password
 
 # 卸载默认保留数据；只有显式添加 --purge 才删除数据
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/master/install.sh) uninstall
 ```
 
 选择配置域名时，脚本会安装或复用 Nginx、Certbot（支持 apt、dnf/yum、apk、pacman），申请证书并启用 HTTP→HTTPS。生成的配置只代理管理面板 `127.0.0.1:9090`（或自定义 `PORT`），不会读取或修改站点回源、播放地址、50001 或其他站点监听端口。macOS 可安装 Meridian，但不支持自动域名配置。
@@ -105,7 +116,7 @@ docker run -d --name meridian \
 	-e UPSTREAM_HEADER_KEY=$(openssl rand -hex 32) \
 	-e DYNAMIC_ROUTE_KEY=$(openssl rand -hex 32) \
 	-e SETUP_TOKEN="$MERIDIAN_SETUP_TOKEN" \
-	ghcr.io/snnabb/meridian:latest
+  ghcr.io/chanhui800/meridian:latest
 ```
 
 > `8001-8010` 是反代站点监听端口范围，按实际需要调整。
@@ -119,7 +130,7 @@ docker run -d --name meridian \
 ### Windows
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/snnabb/Meridian/releases/latest/download/meridian-windows-amd64.exe" -OutFile "meridian.exe"
+Invoke-WebRequest -Uri "https://github.com/chanhui800/Meridian/releases/latest/download/meridian-windows-amd64.exe" -OutFile "meridian.exe"
 function New-MeridianSecret {
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
@@ -140,7 +151,7 @@ $env:SETUP_TOKEN = New-MeridianSecret
 ### 从源码构建
 
 ```bash
-git clone https://github.com/snnabb/Meridian.git && cd Meridian
+git clone https://github.com/chanhui800/Meridian.git && cd Meridian
 go build -o meridian .
 JWT_SECRET=$(openssl rand -hex 32) UPSTREAM_HEADER_KEY=$(openssl rand -hex 32) DYNAMIC_ROUTE_KEY=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) ./meridian
 ```
@@ -187,7 +198,7 @@ unset ADMIN_PASSWORD
 ```yaml
 services:
   meridian:
-    image: ghcr.io/snnabb/meridian:latest
+    image: ghcr.io/chanhui800/meridian:latest
     restart: unless-stopped
     read_only: true
     cap_drop:
