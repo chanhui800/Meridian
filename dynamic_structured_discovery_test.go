@@ -216,7 +216,7 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 	}
 }
 
-func TestExtremePlaybackInfoAcceptsSchemelessHostPortURLs(t *testing.T) {
+func TestCompatibleAndExtremePlaybackInfoAcceptSchemelessHostPortURLs(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		input  string
@@ -226,34 +226,43 @@ func TestExtremePlaybackInfoAcceptsSchemelessHostPortURLs(t *testing.T) {
 		{name: "http missing slashes", input: "http:gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
 		{name: "http single slash", input: "http:/gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
+		for _, profile := range []string{dynamicProfileCompatible, dynamicProfileExtreme} {
+			t.Run(test.name+"/"+profile, func(t *testing.T) {
+				issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
+				base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
+				session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+				payload, err := json.Marshal(map[string]any{"MediaSources": []any{map[string]any{"DirectStreamUrl": test.input}}})
+				if err != nil {
+					t.Fatalf("marshal PlaybackInfo: %v", err)
+				}
+				rewritten, err := rewritePlaybackInfoResponse(payload, session)
+				if err != nil {
+					t.Fatalf("rewrite %s PlaybackInfo URL: %v", profile, err)
+				}
+				routes := structuredCapabilityRoutes(string(rewritten))
+				if len(routes) != 1 || strings.Contains(string(rewritten), "xxlb.net") || strings.Contains(string(rewritten), "origin-secret") {
+					t.Fatalf("URL was not protected by one capability route: %s", rewritten)
+				}
+				claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
+				if err != nil {
+					t.Fatalf("open URL capability: %v", err)
+				}
+				if claims.Target != test.target {
+					t.Fatalf("capability target = %q, want %q", claims.Target, test.target)
+				}
+			})
+		}
+
+		t.Run(test.name+"/safe", func(t *testing.T) {
+			issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileSafe)
 			base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
 			session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
 			payload, err := json.Marshal(map[string]any{"MediaSources": []any{map[string]any{"DirectStreamUrl": test.input}}})
 			if err != nil {
 				t.Fatalf("marshal PlaybackInfo: %v", err)
 			}
-			rewritten, err := rewritePlaybackInfoResponse(payload, session)
-			if err != nil {
-				t.Fatalf("rewrite Extreme PlaybackInfo URL: %v", err)
-			}
-			routes := structuredCapabilityRoutes(string(rewritten))
-			if len(routes) != 1 || strings.Contains(string(rewritten), "xxlb.net") || strings.Contains(string(rewritten), "origin-secret") {
-				t.Fatalf("URL was not protected by one capability route: %s", rewritten)
-			}
-			claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-			if err != nil {
-				t.Fatalf("open URL capability: %v", err)
-			}
-			if claims.Target != test.target {
-				t.Fatalf("capability target = %q, want %q", claims.Target, test.target)
-			}
-
-			compatible := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileCompatible)
-			compatibleSession := &dynamicRewriteSession{ctx: context.Background(), issuer: compatible, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-			if _, err := rewritePlaybackInfoResponse(payload, compatibleSession); err == nil {
-				t.Fatal("Compatible unexpectedly accepted a malformed host:port URL")
+			if _, err := rewritePlaybackInfoResponse(payload, session); err == nil {
+				t.Fatal("Safe unexpectedly accepted a malformed host:port URL")
 			}
 		})
 	}

@@ -4305,8 +4305,8 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 	case strings.Contains(raw, `\`):
 		return "", fmt.Errorf("invalid discovered URL: backslash")
 	}
-	if source == dynamicDiscoverySourcePlaybackInfo && s.issuer.policy.profile == dynamicProfileExtreme {
-		if normalized, ok := normalizeExtremePlaybackInfoSchemelessURL(raw, base); ok {
+	if source == dynamicDiscoverySourcePlaybackInfo && (s.issuer.policy.profile == dynamicProfileCompatible || s.issuer.policy.profile == dynamicProfileExtreme) {
+		if normalized, ok := normalizePlaybackInfoSchemelessURL(raw, base); ok {
 			raw = normalized
 		}
 	}
@@ -4996,7 +4996,7 @@ func dynamicURLNormalizationDiagnosticCode(err error) string {
 	}
 }
 
-func normalizeExtremePlaybackInfoSchemelessURL(value string, base *url.URL) (string, bool) {
+func normalizePlaybackInfoSchemelessURL(value string, base *url.URL) (string, bool) {
 	if base == nil || value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) {
 		return "", false
 	}
@@ -5058,7 +5058,7 @@ func normalizeExtremePlaybackInfoSchemelessURL(value string, base *url.URL) (str
 
 func playbackInfoExtremeNetworkURL(value string, session *dynamicRewriteSession) (string, bool) {
 	if session != nil {
-		if normalized, ok := normalizeExtremePlaybackInfoSchemelessURL(value, session.base); ok {
+		if normalized, ok := normalizePlaybackInfoSchemelessURL(value, session.base); ok {
 			value = normalized
 		}
 	}
