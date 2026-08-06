@@ -182,12 +182,16 @@ func TestDynamicRedirectRuntimeEligibilityIsNarrow(t *testing.T) {
 		{name: "audio HEAD", method: http.MethodHead, path: "/emby/Audio/42/file.mp3", want: true},
 		{name: "live TV GET", method: http.MethodGet, path: "/LiveTv/LiveStreamFiles/42/stream.ts", want: true},
 		{name: "item download", method: http.MethodGet, path: "/Items/42/Download", want: true},
+		{name: "Emya video GET", method: http.MethodGet, path: "/emby/emya/video?server=emos", want: true},
+		{name: "Emya video HEAD", method: http.MethodHead, path: "/emya/video", want: true},
 		{name: "exact PlaybackInfo", method: http.MethodGet, path: "/Items/42/PlaybackInfo?UserId=7", want: true},
 		{name: "exact emby PlaybackInfo", method: http.MethodHead, path: "/emby/Items/42/PlaybackInfo", want: true},
 		{name: "HLS manifest", method: http.MethodGet, path: "/custom/live.m3u8", want: true},
 		{name: "DASH manifest", method: http.MethodHead, path: "/custom/manifest.mpd", want: true},
 		{name: "ordinary API", method: http.MethodGet, path: "/Users/AuthenticateByName", want: false},
 		{name: "POST media", method: http.MethodPost, path: "/Videos/42/stream", want: false},
+		{name: "POST Emya video", method: http.MethodPost, path: "/emby/emya/video", want: false},
+		{name: "Emya video trailing slash", method: http.MethodGet, path: "/emby/emya/video/", want: false},
 		{name: "PlaybackInfo POST", method: http.MethodPost, path: "/Items/42/PlaybackInfo", want: false},
 		{name: "empty item id", method: http.MethodGet, path: "/Items//PlaybackInfo", want: false},
 		{name: "PlaybackInfo trailing slash", method: http.MethodGet, path: "/Items/42/PlaybackInfo/", want: false},
@@ -209,6 +213,59 @@ func TestDynamicRedirectRuntimeEligibilityIsNarrow(t *testing.T) {
 	}
 	if isDynamicRedirectEligibleRequest(nil) {
 		t.Fatal("nil request was eligible")
+	}
+}
+
+func TestDynamicRedirectRuntimeUsesOnlyLiveLearnedPlaybackPaths(t *testing.T) {
+	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
+	if !ok {
+		t.Fatal("compatible limits are unavailable")
+	}
+	_, state := redirectRuntimeState(t, limits, nil)
+	defer state.close()
+	now := time.Now()
+	state.learnPlaybackPath("/vendor/playback-entry", now)
+
+	for name, test := range map[string]struct {
+		method string
+		path   string
+		want   bool
+	}{
+		"learned GET":   {method: http.MethodGet, path: "/vendor/playback-entry?token=client", want: true},
+		"learned HEAD":  {method: http.MethodHead, path: "/vendor/playback-entry", want: true},
+		"learned POST":  {method: http.MethodPost, path: "/vendor/playback-entry"},
+		"similar path":  {method: http.MethodGet, path: "/vendor/playback-entry/extra"},
+		"unrelated API": {method: http.MethodGet, path: "/Users/AuthenticateByName"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, "https://origin.example.com"+test.path, nil)
+			if got := isDynamicRedirectEligibleRequestForState(req, state); got != test.want {
+				t.Fatalf("learned eligibility for %s %s = %t, want %t", test.method, test.path, got, test.want)
+			}
+		})
+	}
+
+	state.learnPlaybackPath("/vendor/expired", now.Add(-dynamicLearnedPlaybackPathTTL-time.Second))
+	if state.hasLearnedPlaybackPath("/vendor/expired", now) {
+		t.Fatal("expired learned path remained eligible")
+	}
+	for _, unsafe := range []string{"", "vendor/no-leading-slash", "/vendor/../admin", "/vendor/path?query", `/vendor\\path`} {
+		state.learnPlaybackPath(unsafe, now)
+		if state.hasLearnedPlaybackPath(unsafe, now) {
+			t.Fatalf("unsafe learned path %q was accepted", unsafe)
+		}
+	}
+
+	_, bounded := redirectRuntimeState(t, limits, nil)
+	defer bounded.close()
+	for index := 0; index <= dynamicLearnedPlaybackPathLimit; index++ {
+		bounded.learnPlaybackPath(fmt.Sprintf("/vendor/entry-%03d", index), now.Add(time.Duration(index)*time.Millisecond))
+	}
+	bounded.mu.Lock()
+	entryCount := len(bounded.learnedPlaybackPaths)
+	bounded.mu.Unlock()
+	if entryCount != dynamicLearnedPlaybackPathLimit || bounded.hasLearnedPlaybackPath("/vendor/entry-000", now.Add(time.Second)) || !bounded.hasLearnedPlaybackPath(fmt.Sprintf("/vendor/entry-%03d", dynamicLearnedPlaybackPathLimit), now.Add(time.Second)) {
+		t.Fatalf("learned path capacity state count=%d", entryCount)
 	}
 }
 
@@ -1086,6 +1143,8 @@ func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *t
 	}
 	request := redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Items/1/PlaybackInfo")
 	request = request.WithContext(context.WithValue(request.Context(), dynamicExpectedStructuredSourceContextKey{}, dynamicDiscoverySourcePlaybackInfo))
+	clientBase := httptest.NewRequest(http.MethodGet, "https://public.example.com/Items/1/PlaybackInfo", nil).URL
+	request = request.WithContext(context.WithValue(request.Context(), dynamicPlaybackInfoBaseContextKey{}, clientBase))
 	resp, err := transport.RoundTrip(request)
 	if err != nil {
 		t.Fatalf("redirected PlaybackInfo RoundTrip: %v", err)
@@ -1105,23 +1164,11 @@ func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *t
 		t.Fatalf("read redirected PlaybackInfo: %v", err)
 	}
 	text := string(rewritten)
-	if strings.Contains(text, "relative-secret") {
-		t.Fatalf("redirected PlaybackInfo leaked relative target: %s", text)
+	if !strings.Contains(text, "/Videos/1/master.m3u8?api_key=relative-secret") {
+		t.Fatalf("redirected PlaybackInfo changed relative target: %s", text)
 	}
-	start := strings.Index(text, dynamicRoutePrefix)
-	if start < 0 {
-		t.Fatalf("redirected PlaybackInfo has no capability: %s", text)
-	}
-	end := strings.IndexByte(text[start:], '"')
-	if end < 0 {
-		t.Fatalf("redirected PlaybackInfo capability is unterminated: %s", text)
-	}
-	claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, text[start:start+end]))
-	if err != nil {
-		t.Fatalf("open redirected PlaybackInfo capability: %v", err)
-	}
-	if claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || claims.Target != "https://cdn.example.com:443/Videos/1/master.m3u8?api_key=relative-secret" {
-		t.Fatalf("redirected relative claims = %#v", claims)
+	if strings.Contains(text, dynamicRoutePrefix) || !state.hasLearnedPlaybackPath("/Videos/1/master.m3u8", time.Now()) {
+		t.Fatalf("redirected relative target was not learned without minting a capability: %s", text)
 	}
 	commitDynamicResponseAuthorities(resp)
 	_ = resp.Body.Close()
