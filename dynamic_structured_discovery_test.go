@@ -195,6 +195,8 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 		{name: "required headers", err: errors.New("PlaybackInfo RequiredHttpHeaders has an invalid value"), want: "required_headers_invalid"},
 		{name: "origin headers", err: errors.New("external subtitle URL requires unsupported origin headers"), want: "origin_headers_unsupported"},
 		{name: "invalid discovered URL", err: errors.New("invalid discovered URL"), want: "url_invalid"},
+		{name: "discovered URL whitespace", err: errors.New("invalid discovered URL: surrounding whitespace"), want: "url_surrounding_whitespace"},
+		{name: "discovered URL fragment", err: errors.New("invalid discovered URL: fragment"), want: "url_fragment"},
 		{name: "protocol type", err: errors.New("PlaybackInfo field Protocol has an invalid type"), want: "protocol_invalid"},
 		{name: "capability", err: newDynamicProxyError(dynamicObservationReasonDomainDenied), want: "capability_domain_denied"},
 		{name: "unknown does not echo secret", err: errors.New("unexpected upstream value bearer-secret"), want: "unclassified"},

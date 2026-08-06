@@ -4292,8 +4292,18 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepth(raw string, base *
 }
 
 func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders(raw string, base *url.URL, source, kind string, depth int, requiredHeaders []dynamicCapabilityHeaderClaim) (string, error) {
-	if s == nil || s.issuer == nil || base == nil || raw == "" || raw != strings.TrimSpace(raw) || containsDynamicUnsafeRune(raw) || strings.Contains(raw, `\`) {
-		return "", fmt.Errorf("invalid discovered URL")
+	if s == nil || s.issuer == nil || base == nil {
+		return "", fmt.Errorf("invalid discovered URL: context")
+	}
+	switch {
+	case raw == "":
+		return "", fmt.Errorf("invalid discovered URL: empty")
+	case raw != strings.TrimSpace(raw):
+		return "", fmt.Errorf("invalid discovered URL: surrounding whitespace")
+	case containsDynamicUnsafeRune(raw):
+		return "", fmt.Errorf("invalid discovered URL: unsafe character")
+	case strings.Contains(raw, `\`):
+		return "", fmt.Errorf("invalid discovered URL: backslash")
 	}
 	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 && (s.issuer.policy.profile != dynamicProfileExtreme || dynamicRequiredHeadersConflictWithFixedPolicy(requiredHeaders, s.issuer.upstreamHeaderPolicy)) {
 		return "", fmt.Errorf("invalid discovered URL required headers")
@@ -4314,8 +4324,14 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 		return "", fmt.Errorf("discovered URL count exceeds its limit")
 	}
 	reference, err := url.Parse(raw)
-	if err != nil || reference.User != nil || reference.Fragment != "" || reference.RawFragment != "" {
-		return "", fmt.Errorf("invalid discovered URL")
+	if err != nil {
+		return "", fmt.Errorf("invalid discovered URL: parse")
+	}
+	if reference.User != nil {
+		return "", fmt.Errorf("invalid discovered URL: userinfo")
+	}
+	if reference.Fragment != "" || reference.RawFragment != "" {
+		return "", fmt.Errorf("invalid discovered URL: fragment")
 	}
 	resolved := base.ResolveReference(reference)
 	if len(requiredHeaders) == 0 && len(s.inheritedHeaders) > 0 && sameRedirectAuthority(s.base, resolved) {
@@ -4361,7 +4377,7 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 	}
 	target, err := normalizeDynamicURL(resolved.String())
 	if err != nil {
-		return "", fmt.Errorf("invalid discovered URL")
+		return "", fmt.Errorf("invalid discovered URL: target normalization")
 	}
 	seenKey := "dynamic\x00" + source + "\x00" + kind + "\x00" + strconv.Itoa(depth) + "\x00" + target.String() + headerKey
 	if route, exists := s.seen[seenKey]; exists {
@@ -5309,6 +5325,24 @@ func playbackInfoRewriteDiagnosticCode(err error) string {
 		return "field_case_duplicate"
 	case strings.Contains(message, "unsupported protocol"), strings.Contains(message, "manifest source is unavailable"):
 		return "protocol_or_manifest_unsupported"
+	case strings.Contains(message, "invalid discovered URL: context"):
+		return "url_context_invalid"
+	case strings.Contains(message, "invalid discovered URL: empty"):
+		return "url_empty"
+	case strings.Contains(message, "invalid discovered URL: surrounding whitespace"):
+		return "url_surrounding_whitespace"
+	case strings.Contains(message, "invalid discovered URL: unsafe character"):
+		return "url_unsafe_character"
+	case strings.Contains(message, "invalid discovered URL: backslash"):
+		return "url_backslash"
+	case strings.Contains(message, "invalid discovered URL: parse"):
+		return "url_parse_invalid"
+	case strings.Contains(message, "invalid discovered URL: userinfo"):
+		return "url_userinfo"
+	case strings.Contains(message, "invalid discovered URL: fragment"):
+		return "url_fragment"
+	case strings.Contains(message, "invalid discovered URL: target normalization"):
+		return "url_target_normalization"
 	case strings.Contains(message, "invalid discovered URL"), strings.Contains(message, "invalid configured structured URL"), strings.Contains(message, "invalid same-authority structured URL"), strings.Contains(message, "invalid trusted capability URL"), strings.Contains(message, "invalid URL"), strings.Contains(message, "fallback URL is invalid"):
 		return "url_invalid"
 	case strings.Contains(message, "discovered URL count exceeds"):
