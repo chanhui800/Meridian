@@ -181,7 +181,7 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 		directoryURL = letsEncryptStagingDirectory
 		accountName = "acme-account-staging.pem"
 	}
-	accountKey, err := loadOrCreateACMEAccountKey(filepath.Join(m.accountDir, accountName))
+	accountKey, err := loadOrCreateACMEAccountKey(m.accountDir, accountName)
 	if err != nil {
 		return panelCertificateStatus{}, err
 	}
@@ -236,9 +236,32 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	return m.status(false), nil
 }
 
-func loadOrCreateACMEAccountKey(filename string) (crypto.Signer, error) {
-	data, err := os.ReadFile(filename)
+func loadOrCreateACMEAccountKey(directory, filename string) (crypto.Signer, error) {
+	if filename == "" || filename != filepath.Base(filename) {
+		return nil, errors.New("ACME account key filename must be a base name")
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return nil, fmt.Errorf("open ACME account directory: %w", err)
+	}
+	file, err := root.Open(filename)
 	if err == nil {
+		const maxAccountKeyBytes = 64 << 10
+		data, readErr := io.ReadAll(io.LimitReader(file, maxAccountKeyBytes+1))
+		closeErr := file.Close()
+		rootCloseErr := root.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read ACME account key: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close ACME account key: %w", closeErr)
+		}
+		if rootCloseErr != nil {
+			return nil, fmt.Errorf("close ACME account directory: %w", rootCloseErr)
+		}
+		if len(data) > maxAccountKeyBytes {
+			return nil, errors.New("stored ACME account key is too large")
+		}
 		block, _ := pem.Decode(data)
 		if block == nil {
 			return nil, errors.New("stored ACME account key is invalid")
@@ -253,6 +276,9 @@ func loadOrCreateACMEAccountKey(filename string) (crypto.Signer, error) {
 		}
 		return signer, nil
 	}
+	if closeErr := root.Close(); closeErr != nil {
+		return nil, fmt.Errorf("close ACME account directory: %w", closeErr)
+	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read ACME account key: %w", err)
 	}
@@ -264,7 +290,7 @@ func loadOrCreateACMEAccountKey(filename string) (crypto.Signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode ACME account key: %w", err)
 	}
-	if err := writePrivateFileAtomic(filename, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})); err != nil {
+	if err := writePrivateFileAtomic(filepath.Join(directory, filename), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})); err != nil {
 		return nil, fmt.Errorf("write ACME account key: %w", err)
 	}
 	return key, nil
