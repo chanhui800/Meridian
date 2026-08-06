@@ -32,6 +32,6 @@ VOLUME ["/app/data"]
 USER meridian
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -q -O - http://127.0.0.1:9090/api/auth/check >/dev/null || exit 1
+  CMD sh -c 'if [ "$PANEL_TLS_ENABLED" = "true" ] || [ "$PANEL_TLS_ENABLED" = "1" ]; then wget --no-check-certificate -q -O - https://127.0.0.1:9090/api/auth/check >/dev/null; else wget -q -O - http://127.0.0.1:9090/api/auth/check >/dev/null; fi' || exit 1
 
 ENTRYPOINT ["./meridian"]

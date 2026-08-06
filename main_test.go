@@ -32,6 +32,30 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func TestRoutePrefixHostRoundTrip(t *testing.T) {
+	host, err := routeHostForPrefix(" Node-01 ", "ABC.example.com")
+	if err != nil || host != "node-01.abc.example.com" {
+		t.Fatalf("routeHostForPrefix = %q, %v", host, err)
+	}
+	if got := routePrefixFromHost(host, "abc.example.com"); got != "node-01" {
+		t.Fatalf("routePrefixFromHost = %q, want node-01", got)
+	}
+	for _, prefix := range []string{"", "a.b", "-bad", "bad-", "bad_"} {
+		if _, err := routeHostForPrefix(prefix, "abc.example.com"); err == nil {
+			t.Fatalf("route prefix %q unexpectedly accepted", prefix)
+		}
+	}
+}
+
+func TestPanelTLSConfigFromEnvRequiresFiles(t *testing.T) {
+	t.Setenv("PANEL_TLS_ENABLED", "true")
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	if _, enabled, err := panelTLSConfigFromEnv(); err == nil || enabled {
+		t.Fatalf("missing TLS files returned enabled=%v err=%v", enabled, err)
+	}
+}
+
 func newTestApp(t *testing.T) *App {
 	t.Helper()
 

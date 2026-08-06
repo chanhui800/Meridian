@@ -294,6 +294,17 @@ docker compose logs --tail=100 meridian
 http://服务器IP:9090
 ```
 
+需要由面板直接终止 TLS 时，可让同一个端口监听 HTTPS。证书文件可以由外部 ACME DNS-01（推荐通配符证书）申请后挂载到面板：
+
+```env
+PANEL_TLS_ENABLED=true
+PANEL_TLS_CERT_FILE=/data/tls/fullchain.pem
+PANEL_TLS_KEY_FILE=/data/tls/privkey.pem
+PANEL_ROUTE_DOMAIN=abc.com
+```
+
+配置 `PANEL_ROUTE_DOMAIN` 后，站点管理中的“域名前缀”入口会把 `123` 生成并绑定为 `123.abc.com:9090`。DNS 需要将 `*.abc.com` 指向面板服务器；TLS 证书校验与端口无关，因此不要求占用 `443`。如果使用 Cloudflare 橙云代理，请改用 Cloudflare 支持的 HTTPS 端口或 Tunnel，`9090` 通常应使用 DNS-only。
+
 首次启动时，使用 `SETUP_TOKEN` 创建唯一管理员。数据保存在 `meridian-data` 卷中，升级时不要删除该卷。
 
 ### Docker 固定版本
@@ -320,6 +331,10 @@ docker compose ps
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
 | `PANEL_BIND_ADDR` | `0.0.0.0` | 面板监听 IP |
 | `PANEL_DOMAIN` | 空 | 管理面板允许的公共域名 |
+| `PANEL_ROUTE_DOMAIN` | 空 | 域名前缀入口的基础域名，例如 `abc.com` |
+| `PANEL_TLS_ENABLED` | `false` | 是否让面板端口直接监听 HTTPS |
+| `PANEL_TLS_CERT_FILE` | 空 | 面板 TLS 证书或证书链 PEM 文件 |
+| `PANEL_TLS_KEY_FILE` | 空 | 面板 TLS 私钥 PEM 文件 |
 | `JWT_SECRET` | 启动时临时生成 | JWT 签名密钥；生产环境应固定设置 |
 | `UPSTREAM_HEADER_KEY` | 空 | 上游固定请求头加密密钥 |
 | `DYNAMIC_ROUTE_KEY` | 空 | 动态播放 capability 密钥 |

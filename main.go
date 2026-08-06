@@ -11648,6 +11648,71 @@ func normalizePublicHost(value string) (string, error) {
 	return value, nil
 }
 
+// normalizeRoutePrefix validates the single DNS label used by the optional
+// domain-prefix ingress. The full public_host remains the persisted routing
+// key so existing databases and Host routing stay compatible.
+func normalizeRoutePrefix(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ".")
+	if value == "" || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+		return "", fmt.Errorf("route_prefix must be a valid DNS label")
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+			return "", fmt.Errorf("route_prefix must use only ASCII letters, digits, and hyphens")
+		}
+	}
+	return value, nil
+}
+
+func normalizeRouteDomain(value string) (string, error) {
+	return normalizePublicHost(value)
+}
+
+func routeHostForPrefix(prefix, domain string) (string, error) {
+	prefix, err := normalizeRoutePrefix(prefix)
+	if err != nil {
+		return "", err
+	}
+	domain, err = normalizeRouteDomain(domain)
+	if err != nil {
+		return "", fmt.Errorf("invalid route domain: %w", err)
+	}
+	if domain == "" {
+		return "", fmt.Errorf("PANEL_ROUTE_DOMAIN is required for domain-prefix ingress")
+	}
+	host := prefix + "." + domain
+	if len(host) > 253 {
+		return "", fmt.Errorf("route host is too long")
+	}
+	return host, nil
+}
+
+func routePrefixFromHost(host, domain string) string {
+	host, err := normalizePublicHost(host)
+	if err != nil {
+		return ""
+	}
+	domain, err = normalizeRouteDomain(domain)
+	if err != nil || domain == "" {
+		return ""
+	}
+	suffix := "." + domain
+	if !strings.HasSuffix(host, suffix) {
+		return ""
+	}
+	prefix := strings.TrimSuffix(host, suffix)
+	if strings.Contains(prefix, ".") {
+		return ""
+	}
+	prefix, err = normalizeRoutePrefix(prefix)
+	if err != nil {
+		return ""
+	}
+	return prefix
+}
+
 func normalizeIngressMode(value, publicHost string) (string, error) {
 	mode := strings.ToLower(strings.TrimSpace(value))
 	if mode == "" {
@@ -13627,6 +13692,8 @@ type App struct {
 	loginLimiterOnce  sync.Once
 	trustedProxies    []*net.IPNet
 	panelHost         string
+	routeDomain       string
+	panelTLSEnabled   bool
 	panelBindLoopback bool
 	panelListenPort   int
 	dynamicRouteKey   []byte
@@ -13686,10 +13753,21 @@ func isLoopbackHealthProbe(r *http.Request) bool {
 func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := requestPublicHost(r.Host)
+		directTLSHost := ""
+		if a.panelTLSEnabled && r.TLS != nil && !isLoopbackHealthProbe(r) {
+			directTLSHost = requestPublicHost(r.TLS.ServerName)
+			if directTLSHost == "" || host == "" || directTLSHost != host {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusMisdirectedRequest)
+				_, _ = w.Write([]byte(`{"error":"TLS server name does not match Host"}`))
+				return
+			}
+		}
 		if host != "" {
 			handler, configured, mode := a.pm.PublicHostRoute(host)
 			if configured {
-				if mode == ingressModeHost && !a.panelBindLoopback && !isTrustedProxy(remoteAddressIP(r.RemoteAddr), a.trustedProxies) {
+				directTLS := a.panelTLSEnabled && directTLSHost == host
+				if mode == ingressModeHost && !directTLS && !a.panelBindLoopback && !isTrustedProxy(remoteAddressIP(r.RemoteAddr), a.trustedProxies) {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusForbidden)
 					_, _ = w.Write([]byte(`{"error":"host-only ingress requires a configured proxy source"}`))
@@ -14285,6 +14363,9 @@ func (a *App) handleIngressCapabilities(w http.ResponseWriter, r *http.Request) 
 	a.jsonOK(w, map[string]interface{}{
 		"app_version":                appVersion,
 		"host_only_available":        a.pm.HostOnlyIngressSafe(),
+		"route_domain":               a.routeDomain,
+		"domain_prefix_available":    a.routeDomain != "",
+		"panel_tls_enabled":          a.panelTLSEnabled,
 		"panel_bind_loopback":        a.panelBindLoopback,
 		"trusted_proxy_configured":   len(a.trustedProxies) > 0,
 		"upstream_headers_available": a.pm.UpstreamHeadersAvailable(),
@@ -14330,6 +14411,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			Name                       string                `json:"name"`
 			ListenPort                 int                   `json:"listen_port"`
 			PublicHost                 string                `json:"public_host"`
+			RoutePrefix                string                `json:"route_prefix"`
 			IngressMode                string                `json:"ingress_mode"`
 			TargetURL                  string                `json:"target_url"`
 			PlaybackTargetURL          string                `json:"playback_target_url"`
@@ -14393,6 +14475,18 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = strings.TrimSpace(req.Name)
 		req.PlaybackMode = strings.ToLower(strings.TrimSpace(req.PlaybackMode))
+		if strings.TrimSpace(req.RoutePrefix) != "" {
+			prefixHost, prefixErr := routeHostForPrefix(req.RoutePrefix, a.routeDomain)
+			if prefixErr != nil {
+				a.jsonErr(w, http.StatusBadRequest, prefixErr.Error())
+				return
+			}
+			if strings.TrimSpace(req.PublicHost) != "" && !strings.EqualFold(strings.TrimSpace(req.PublicHost), prefixHost) {
+				a.jsonErr(w, http.StatusBadRequest, "route_prefix does not match public_host")
+				return
+			}
+			req.PublicHost = prefixHost
+		}
 		publicHost, err := normalizePublicHost(req.PublicHost)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
@@ -14632,6 +14726,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			Name                       string                 `json:"name"`
 			ListenPort                 int                    `json:"listen_port"`
 			PublicHost                 *string                `json:"public_host"`
+			RoutePrefix                *string                `json:"route_prefix"`
 			IngressMode                *string                `json:"ingress_mode"`
 			TargetURL                  string                 `json:"target_url"`
 			PlaybackTargetURL          *string                `json:"playback_target_url"`
@@ -14685,8 +14780,29 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			quota = *req.Quota
 		}
 		publicHost := oldSite.PublicHost
+		if req.RoutePrefix != nil {
+			prefix := strings.TrimSpace(*req.RoutePrefix)
+			if prefix == "" {
+				publicHost = ""
+			} else {
+				prefixHost, prefixErr := routeHostForPrefix(prefix, a.routeDomain)
+				if prefixErr != nil {
+					a.jsonErr(w, http.StatusBadRequest, prefixErr.Error())
+					return
+				}
+				if req.PublicHost != nil && strings.TrimSpace(*req.PublicHost) != "" && !strings.EqualFold(strings.TrimSpace(*req.PublicHost), prefixHost) {
+					a.jsonErr(w, http.StatusBadRequest, "route_prefix does not match public_host")
+					return
+				}
+				publicHost = prefixHost
+			}
+		}
 		if req.PublicHost != nil {
-			publicHost, err = normalizePublicHost(*req.PublicHost)
+			candidateHost := *req.PublicHost
+			if req.RoutePrefix != nil && strings.TrimSpace(*req.RoutePrefix) != "" {
+				candidateHost = publicHost
+			}
+			publicHost, err = normalizePublicHost(candidateHost)
 			if err != nil {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())
 				return
@@ -15273,6 +15389,41 @@ func panelListenAddress(bindAddress string, port int) (string, error) {
 	return net.JoinHostPort(bindAddress, strconv.Itoa(port)), nil
 }
 
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func panelTLSConfigFromEnv() (*tls.Config, bool, error) {
+	if !envBool("PANEL_TLS_ENABLED") {
+		return nil, false, nil
+	}
+	certFile := strings.TrimSpace(os.Getenv("PANEL_TLS_CERT_FILE"))
+	keyFile := strings.TrimSpace(os.Getenv("PANEL_TLS_KEY_FILE"))
+	if certFile == "" || keyFile == "" {
+		return nil, false, errors.New("PANEL_TLS_CERT_FILE and PANEL_TLS_KEY_FILE are required when PANEL_TLS_ENABLED is enabled")
+	}
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, false, fmt.Errorf("load panel TLS certificate: %w", err)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("load panel TLS certificate: %w", err)
+			}
+			return &certificate, nil
+		},
+		Certificates: []tls.Certificate{certificate},
+	}, true, nil
+}
+
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
 		if err != nil {
@@ -15321,6 +15472,14 @@ func main() {
 		log.Fatalf("invalid panel listen address: %v", err)
 	}
 	panelBindIP := net.ParseIP(panelBindHost)
+	routeDomain, err := normalizeRouteDomain(os.Getenv("PANEL_ROUTE_DOMAIN"))
+	if err != nil {
+		log.Fatalf("invalid PANEL_ROUTE_DOMAIN: %v", err)
+	}
+	panelTLSConfig, panelTLSEnabled, err := panelTLSConfigFromEnv()
+	if err != nil {
+		log.Fatalf("invalid panel TLS configuration: %v", err)
+	}
 	dynamicRouteKey, err := resolveDynamicRouteKey(os.Getenv("DYNAMIC_ROUTE_KEY"))
 	if err != nil {
 		log.Fatalf("invalid dynamic route key: %v", err)
@@ -15362,7 +15521,7 @@ func main() {
 	}
 	pm.SetAssetCache(newAssetCache(assetCacheDir))
 	pm.SetTrustedProxies(trustedProxies)
-	pm.SetHostOnlyIngressSafe((panelBindIP != nil && panelBindIP.IsLoopback()) || len(trustedProxies) > 0)
+	pm.SetHostOnlyIngressSafe(panelTLSEnabled || (panelBindIP != nil && panelBindIP.IsLoopback()) || len(trustedProxies) > 0)
 	if err := pm.ConfigureDynamicDiscovery(dynamicRouteKey, panelHost, port, nil); err != nil {
 		log.Fatalf("initialize dynamic discovery: %v", err)
 	}
@@ -15400,6 +15559,8 @@ func main() {
 		loginLimiter:      newLoginRateLimiter(),
 		trustedProxies:    trustedProxies,
 		panelHost:         panelHost,
+		routeDomain:       routeDomain,
+		panelTLSEnabled:   panelTLSEnabled,
 		panelBindLoopback: panelBindIP != nil && panelBindIP.IsLoopback(),
 		panelListenPort:   port,
 		dynamicRouteKey:   dynamicRouteKey,
@@ -15435,7 +15596,7 @@ func main() {
 	}
 	mux.Handle("/", staticHandler(staticFS))
 
-	// HTTP server with graceful shutdown. Site listeners remain independently
+	// HTTP/HTTPS server with graceful shutdown. Site listeners remain independently
 	// bound by ProxyManager and are not affected by PANEL_BIND_ADDR.
 	srv := &http.Server{
 		Addr:              addr,
@@ -15449,10 +15610,24 @@ func main() {
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 64 << 10,
 	}
+	panelListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen %s: %v", addr, err)
+	}
+	if panelTLSEnabled {
+		panelListener = tls.NewListener(panelListener, panelTLSConfig)
+	}
 
 	log.Println("============================================================")
 	log.Printf("  Meridian - Emby reverse proxy management panel %s", appVersion)
-	log.Printf("  Listening on: http://%s", addr)
+	panelScheme := "http"
+	if panelTLSEnabled {
+		panelScheme = "https"
+	}
+	log.Printf("  Listening on: %s://%s", panelScheme, addr)
+	if routeDomain != "" {
+		log.Printf("  Domain-prefix ingress: *.%s", routeDomain)
+	}
 	log.Printf("  Sites loaded: %d (%d running)", loadedSiteCount, pm.GetRunningCount())
 	log.Println("  Features: WebSocket proxy, structured backend discovery, TLS diagnostics, traffic limits")
 	log.Println("============================================================")
@@ -15462,7 +15637,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(panelListener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server failed: %v", err)
 		}
 	}()

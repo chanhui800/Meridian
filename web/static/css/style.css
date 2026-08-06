@@ -688,6 +688,43 @@ tr:hover td { background: var(--surface); }
 
 .site-row-label { font-size: .78rem; color: var(--white-38); }
 
+.site-access-value {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  max-width: 72%;
+}
+
+.site-access-address {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-access-address.is-hidden {
+  letter-spacing: .08em;
+}
+
+.icon-button {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--white-60);
+  border: 1px solid var(--glass-border);
+  border-radius: 7px;
+  font-size: .78rem;
+  flex: 0 0 auto;
+}
+
+.icon-button:hover {
+  color: var(--white);
+  background: var(--surface-hover);
+}
+
 .progress-wrap { width: 100%; }
 
 .progress-labels {

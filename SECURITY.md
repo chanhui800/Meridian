@@ -35,8 +35,8 @@
 ### 网络
 
 - 未配置域名时管理面板默认监听 `0.0.0.0`；一键脚本启用面板域名后会改为 `127.0.0.1`，只信任回环代理并由 Nginx 提供 HTTPS
-- 管理面板本身不提供 HTTPS，需要外层反代处理 TLS 终止
-- 站点支持 `host`、`port`、`both` 三种入口模式；推荐的 `host` 模式只使用共享 Host 路由，不绑定保留的高端口，并强制要求面板回环绑定或非空 `TRUSTED_PROXY_CIDRS` 来源白名单。面板非回环绑定时，伪造正确 Host 的非可信 peer 仍会被拒绝；`port` 和显式高风险的 `both` 独立端口仍绑定所有接口
+- 面板可通过 `PANEL_TLS_ENABLED`、`PANEL_TLS_CERT_FILE` 和 `PANEL_TLS_KEY_FILE` 在自身监听端口终止 HTTPS；证书私钥必须限制为服务进程可读，证书续期后替换文件即可在新的 TLS 握手中热加载
+- 站点界面提供 `port`（独立端口）和 `host`（域名前缀）两种入口；旧数据库中的 `both` 仍仅作兼容读取，不再出现在新增站点选项。配置 `PANEL_ROUTE_DOMAIN` 后，前缀会绑定为 `prefix.PANEL_ROUTE_DOMAIN` 并通过面板端口转发。启用面板 TLS 时，路由器同时校验 SNI 与 Host；未知前缀返回 `421`，避免通过 Host 头越权访问其他站点
 - 设置 `PANEL_DOMAIN` 后，未知 Host 返回 `421` 而不是管理面板；未设置时保留直接 IP/任意 Host 的初始部署兼容行为
 - 安装器生成的 Nginx 配置只代理管理端口，不读取或代理站点回源、播放地址或站点监听端口
 - 管理 API 默认拒绝跨站浏览器请求；所有状态变更还要求同源 `Origin` 或 `Referer`，并发送 CSP、`X-Frame-Options`、`nosniff` 等响应头

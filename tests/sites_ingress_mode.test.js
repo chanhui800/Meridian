@@ -49,9 +49,9 @@ test('new-site ingress defaults follow backend host-only capability', () => {
 
 test('ingress mode labels remain concise for the site card', () => {
   const { siteIngressModeLabel } = loadHelpers();
-  assert.equal(siteIngressModeLabel({ ingress_mode: 'host' }), '仅共享域名');
-  assert.equal(siteIngressModeLabel({ ingress_mode: 'port' }), '仅独立端口');
-  assert.equal(siteIngressModeLabel({ ingress_mode: 'both' }), '共享域名 + 独立端口');
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'host' }), '域名前缀');
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'port' }), '独立端口');
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'both' }), '域名前缀（兼容）');
 });
 
 test('site cards place ingress mode above running status and omit playback rows', () => {
@@ -62,6 +62,8 @@ test('site cards place ingress mode above running status and omit playback rows'
 
   assert.match(cardSource, /class="site-card-state"/);
   assert.match(cardSource, /siteIngressModeLabel\(s\)/);
+  assert.match(cardSource, /data-access-address/);
+  assert.match(cardSource, /toggleSiteAccessAddress/);
   assert.match(cardSource, /class="status-badge site-status"/);
   assert.doesNotMatch(cardSource, /renderPlaybackRow\(s\)/);
   assert.doesNotMatch(cardSource, /renderIngressSummary\(s\)/);
