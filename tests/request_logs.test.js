@@ -46,6 +46,10 @@ test('request log panel exposes video stream filtering and live refresh', () => 
   assert.match(source, /requestLogRefreshTimer = setInterval/);
   assert.match(source, /Router\.current === 'request-logs'/);
   assert.match(source, /class="request-log-ip mono" title="\$\{esc\(entry\.client_ip/);
+  assert.match(source, /requestLogLoading/);
+  assert.match(source, /previousScrollTop/);
+  assert.match(source, /previousScrollTop \+ addedHeight/);
+  assert.doesNotMatch(source, /if \(Router\.current === 'request-logs'\) loadRequestLogs\(\);/);
 });
 
 test('request log date range covers the selected local days', () => {
