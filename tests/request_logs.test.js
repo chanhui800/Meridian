@@ -50,6 +50,8 @@ test('request log panel exposes video stream filtering and live refresh', () => 
   assert.match(source, /previousScrollTop/);
   assert.match(source, /previousScrollTop \+ addedHeight/);
   assert.doesNotMatch(source, /if \(Router\.current === 'request-logs'\) loadRequestLogs\(\);/);
+  assert.match(source, /id="request-cache-clear"/);
+  assert.match(source, /API\.clearAssetCache\(\)/);
 });
 
 test('node-name search is retried with the latest value after an automatic refresh is in flight', async () => {
@@ -69,6 +71,7 @@ test('node-name search is retried with the latest value after an automatic refre
     'request-log-summary': { textContent: '' },
     'request-log-refresh': { onclick: null },
     'request-log-clear': { onclick: null },
+    'request-cache-clear': { onclick: null },
   };
   const timers = [];
   const calls = [];
@@ -93,6 +96,7 @@ test('node-name search is retried with the latest value after an automatic refre
         return callCount === 1 ? initial : Promise.resolve({ logs: [], dropped_logs: 0 });
       },
       clearRequestLogs() { return Promise.resolve(); },
+      clearAssetCache() { return Promise.resolve(); },
     },
     Toast: { error() {}, success() {} },
     esc(value) { return String(value); },

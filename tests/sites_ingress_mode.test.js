@@ -47,17 +47,25 @@ test('new-site ingress defaults follow backend host-only capability', () => {
   assert.equal(defaultIngressMode(undefined), 'host');
 });
 
-test('ingress summary never presents a host-only reserve port as listening', () => {
-  const { renderIngressSummary } = loadHelpers();
-  const hostOnly = renderIngressSummary({ ingress_mode: 'host', public_host: 'media.example.com', listen_port: 8123 });
-  assert.match(hostOnly, /仅共享域名/);
-  assert.match(hostOnly, /media\.example\.com/);
-	assert.match(hostOnly, /Host:/);
-	assert.ok(!hostOnly.includes('https://'));
-  assert.ok(!hostOnly.includes(':8123'));
+test('ingress mode labels remain concise for the site card', () => {
+  const { siteIngressModeLabel } = loadHelpers();
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'host' }), '仅共享域名');
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'port' }), '仅独立端口');
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'both' }), '共享域名 + 独立端口');
+});
 
-  const both = renderIngressSummary({ ingress_mode: 'both', public_host: 'media.example.com', listen_port: 8123 });
-  assert.match(both, /:8123/);
+test('site cards place ingress mode above running status and omit playback rows', () => {
+  const source = loadSitesSource();
+  const start = source.indexOf('async function loadSites()');
+  const end = source.indexOf('function filterSiteCards', start);
+  const cardSource = source.slice(start, end);
+
+  assert.match(cardSource, /class="site-card-state"/);
+  assert.match(cardSource, /siteIngressModeLabel\(s\)/);
+  assert.match(cardSource, /class="status-badge site-status"/);
+  assert.doesNotMatch(cardSource, /renderPlaybackRow\(s\)/);
+  assert.doesNotMatch(cardSource, /renderIngressSummary\(s\)/);
+  assert.doesNotMatch(cardSource, /播放回源/);
 });
 
 test('target authority comparison ignores path and explicit default ports', () => {
@@ -79,7 +87,7 @@ test('site modal always loads deployment capabilities for create and edit flows'
 });
 
 test('stream host normalization accepts the array API and legacy JSON strings', () => {
-  const { normalizeStreamHosts, renderPlaybackRow } = loadHelpers();
+  const { normalizeStreamHosts } = loadHelpers();
   assert.deepEqual(JSON.parse(JSON.stringify(normalizeStreamHosts([' one.example ', '', 42, 'two.example']))), [
     'one.example',
     'two.example',
@@ -90,12 +98,6 @@ test('stream host normalization accepts the array API and legacy JSON strings', 
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(normalizeStreamHosts('{'))), []);
 
-  const html = renderPlaybackRow({
-    playback_target_url: 'https://primary.example',
-    stream_hosts: ['https://array-extra.example'],
-    playback_mode: 'redirect',
-  });
-  assert.match(html, /array-extra\.example/);
 });
 
 test('playback limit follows backend capabilities and has a safe compatibility default', () => {

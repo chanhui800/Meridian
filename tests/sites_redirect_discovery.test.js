@@ -441,7 +441,8 @@ test('site modal presents automatic proxying without discovery or security contr
 
   assert.match(body, /自动反代/);
   assert.match(body, /已自动启用/);
-  assert.match(body, /无需选择模式、来源、域名规则或播放回源/);
+  assert.match(body, /无需选择模式、来源、域名规则或额外地址/);
+  assert.doesNotMatch(body, /播放回源/);
   assert.equal(document.getElementById('m-dynamic-enabled'), null);
   assert.equal(document.getElementById('m-dynamic-profile'), null);
   assert.equal(document.getElementById('m-dynamic-source-hls'), null);

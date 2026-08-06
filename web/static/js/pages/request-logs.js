@@ -104,6 +104,10 @@ function renderRequestLogs() {
       </div>
 
       <div class="request-log-actions">
+        <button type="button" class="request-log-action danger" id="request-cache-clear">
+          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/><line x1="9" y1="10" x2="15" y2="16"/><line x1="15" y1="10" x2="9" y2="16"/></svg>
+          清除缓存
+        </button>
         <button type="button" class="request-log-action danger" id="request-log-clear">
           <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M8 6V4h8v2"/></svg>
           清空日志
@@ -159,6 +163,7 @@ function renderRequestLogs() {
   };
   document.getElementById('request-log-refresh').onclick = loadRequestLogs;
   document.getElementById('request-log-clear').onclick = clearRequestLogs;
+  document.getElementById('request-cache-clear').onclick = clearAssetCache;
   loadRequestLogs({ showLoading: true });
   if (requestLogRefreshTimer) clearInterval(requestLogRefreshTimer);
   requestLogRefreshTimer = setInterval(() => {
@@ -272,6 +277,16 @@ async function clearRequestLogs() {
     await API.clearRequestLogs();
     Toast.success('请求日志已清空');
     loadRequestLogs();
+  } catch (error) {
+    Toast.error(error.message);
+  }
+}
+
+async function clearAssetCache() {
+  if (!confirm('确认清除所有站点的图片与静态资源缓存？站点配置和请求日志不会受到影响。')) return;
+  try {
+    await API.clearAssetCache();
+    Toast.success('资产缓存已清除');
   } catch (error) {
     Toast.error(error.message);
   }

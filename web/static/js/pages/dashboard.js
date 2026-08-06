@@ -36,6 +36,13 @@ function renderDashboard() {
         <div class="stat-number" id="s-uptime">—</div>
         <div class="stat-title">运行时长</div>
       </div>
+      <div class="stat-card c-purple fade-up stagger-5">
+        <div class="stat-icon-wrap purple">
+          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+        </div>
+        <div class="stat-number" id="s-cache">0 B</div>
+        <div class="stat-title">累计缓存</div>
+      </div>
     </div>
     <div class="glass-card fade-up stagger-4">
       <div class="glass-card-header">
@@ -45,7 +52,7 @@ function renderDashboard() {
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>已用流量</th>
+            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>已用流量</th><th>缓存大小</th>
           </tr></thead>
           <tbody id="dash-table"></tbody>
         </table>
@@ -181,8 +188,12 @@ async function loadDashboardTable() {
     const tbody = document.getElementById('dash-table');
     if (!tbody) return;
 
+    const totalCache = (sites || []).reduce((total, site) => total + Number(site.cache_size_bytes || 0), 0);
+    const cacheEl = document.getElementById('s-cache');
+    if (cacheEl) cacheEl.textContent = formatBytes(totalCache);
+
     if (!sites || sites.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
       return;
     }
 
@@ -192,8 +203,9 @@ async function loadDashboardTable() {
         <td><span class="status-badge"><span class="status-led ${s.running ? 'on' : 'off'}"></span>${s.running ? '运行中' : '已停止'}</span></td>
         <td class="mono">${esc(s.target_url)}</td>
         <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></td>
-		<td class="mono">${dashboardIngressLabel(s)}</td>
+        <td class="mono">${dashboardIngressLabel(s)}</td>
         <td>${formatBytes(s.traffic_used)}</td>
+        <td>${formatBytes(s.cache_size_bytes)}</td>
       </tr>
     `).join('');
   } catch (e) {

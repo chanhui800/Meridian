@@ -37,18 +37,19 @@ async function loadSites() {
 	grid.innerHTML = sites.map((s, i) => {
       const pct = s.traffic_quota > 0 ? (s.traffic_used / s.traffic_quota * 100).toFixed(1) : 0;
       const pctClass = pct > 85 ? 'danger' : pct > 50 ? 'warn' : 'normal';
-		const playbackRow = renderPlaybackRow(s);
 		const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
-		const ingressRows = renderIngressSummary(s);
 
       return `
       <div class="site-card fade-up stagger-${Math.min(i + 1, 6)}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
         <div class="site-top">
           <div class="site-heading"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
-          <span class="status-badge site-status">
-            <span class="status-led ${s.running ? 'on' : 'off'}"></span>
-            ${s.running ? '运行中' : '已停止'}
-          </span>
+          <div class="site-card-state">
+            <span class="site-mode-badge">${siteIngressModeLabel(s)}</span>
+            <span class="status-badge site-status">
+              <span class="status-led ${s.running ? 'on' : 'off'}"></span>
+              ${s.running ? '运行中' : '已停止'}
+            </span>
+          </div>
         </div>
         <div class="site-latency-line"><span class="status-led ${s.running ? 'on' : 'off'}"></span><span>回源延迟：</span><strong class="site-latency" id="site-latency-${s.id}">未测试</strong></div>
         <div class="site-rows">
@@ -56,8 +57,6 @@ async function loadSites() {
             <span class="site-row-label">主回源地址</span>
             <span class="mono">${esc(s.target_url)}</span>
           </div>
-          ${playbackRow}
-		  ${ingressRows}
 		  ${upstreamHeaderCount > 0 ? `
 		  <div class="site-row">
 			<span class="site-row-label">上游请求头</span>
@@ -151,53 +150,6 @@ async function testAllSitesLatency() {
   await Promise.all(buttons.map(siteButton => testSiteLatency(Number(siteButton.dataset.siteId), siteButton)));
   button.disabled = false;
   button.textContent = '全部测速';
-}
-
-function renderPlaybackRow(site) {
-  const playback = (site.playback_target_url || '').trim();
-  const extraHosts = normalizeStreamHosts(site.stream_hosts);
-  const totalHosts = (playback ? 1 : 0) + extraHosts.length;
-
-  if (totalHosts === 0) {
-    return `
-      <div class="site-row">
-        <span class="site-row-label">播放回源</span>
-        <span class="mono mono-subtle">跟随主回源</span>
-      </div>
-    `;
-  }
-
-  if (totalHosts === 1 && playback === (site.target_url || '').trim()) {
-    return `
-      <div class="site-row">
-        <span class="site-row-label">播放回源</span>
-        <span class="mono mono-subtle">与主回源相同</span>
-      </div>
-    `;
-  }
-
-  const modeLabel = site.playback_mode === 'redirect' ? '重定向跟随' : '直连分流';
-  let rows = '';
-  if (playback) {
-    rows += `
-    <div class="site-row">
-      <span class="site-row-label">播放回源</span>
-      <span class="mono">${esc(playback)}</span>
-    </div>`;
-  }
-  for (const h of extraHosts) {
-    rows += `
-    <div class="site-row">
-      <span class="site-row-label">播放回源</span>
-      <span class="mono">${esc(h)}</span>
-    </div>`;
-  }
-  rows += `
-    <div class="site-row">
-      <span class="site-row-label">播放模式</span>
-      <span class="mono">${modeLabel}</span>
-    </div>`;
-  return rows;
 }
 
 function customUAFormState(mode, site) {
@@ -551,7 +503,7 @@ function renderDynamicStatus(capabilities) {
 		: '<div class="form-help" style="color:var(--orange)">动态能力数据缺失、格式异常或版本过旧，已按不可用处理。</div>';
 	const keyStatus = !dynamicCapabilities.recognized ? '未知' : dynamicCapabilities.key_configured ? '已配置' : '未配置';
 	return `
-		<div class="form-help"><strong>自动发现</strong>默认处理 HTTP 30x 和 PlaybackInfo，无需手工维护播放回源列表。</div>
+		<div class="form-help"><strong>自动发现</strong>默认处理 HTTP 30x 和 PlaybackInfo，无需手工维护额外地址。</div>
 		${contractWarning}
 		<div class="form-help">播放失败时，可在高级选项中开启 HLS、DASH，或切换到 Extreme 扩展兼容模式。</div>
 		<div class="form-help">部署状态：${dynamicCapabilities.available ? '可用' : '不可用'}；DYNAMIC_ROUTE_KEY：${keyStatus}</div>
@@ -763,29 +715,9 @@ function defaultIngressMode(capabilities) {
 	return capabilities && capabilities.host_only_available === false ? 'port' : 'host';
 }
 
-function renderIngressSummary(site) {
-	const mode = normalizedIngressMode(site);
+function siteIngressModeLabel(site) {
 	const labels = { port: '仅独立端口', host: '仅共享域名', both: '共享域名 + 独立端口' };
-	let rows = `
-	  <div class="site-row">
-		<span class="site-row-label">入口模式</span>
-		<span>${labels[mode]}</span>
-	  </div>`;
-	if (mode === 'port' || mode === 'both') {
-		rows += `
-	  <div class="site-row">
-		<span class="site-row-label">监听端口</span>
-		<span class="mono">:${site.listen_port}</span>
-	  </div>`;
-	}
-	if (mode === 'host' || mode === 'both') {
-		rows += `
-	  <div class="site-row">
-		<span class="site-row-label">共享入口</span>
-		<span class="mono">Host: ${esc(site.public_host || '')}</span>
-	  </div>`;
-	}
-	return rows;
+	return labels[normalizedIngressMode(site)] || labels.host;
 }
 
 function normalizedTargetAuthority(value) {
@@ -874,7 +806,7 @@ async function showSiteModal(site) {
     </div>
     <div class="form-group">
       <label>自动反代</label>
-      <div class="form-help" style="padding:10px 12px;border:1px solid var(--green);border-radius:8px;background:var(--green-dim)"><strong style="color:var(--green)">已自动启用</strong>：无需选择模式、来源、域名规则或播放回源。</div>
+      <div class="form-help" style="padding:10px 12px;border:1px solid var(--green);border-radius:8px;background:var(--green-dim)"><strong style="color:var(--green)">已自动启用</strong>：无需选择模式、来源、域名规则或额外地址。</div>
       <div class="form-help">Meridian 会自动改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址，使后端切换后仍继续经过本站点代理；localhost、私网、链路本地及回环目标始终拒绝。</div>
     </div>
     <div class="form-group">

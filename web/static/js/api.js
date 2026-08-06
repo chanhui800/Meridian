@@ -81,6 +81,10 @@ const API = {
   },
   clearRequestLogs() { return this.request('DELETE', '/api/request-logs'); },
 
+  // Asset cache
+  getAssetCache() { return this.request('GET', '/api/asset-cache'); },
+  clearAssetCache() { return this.request('DELETE', '/api/asset-cache'); },
+
   // UA Profiles
   getProfiles() { return this.request('GET', '/api/ua-profiles'); },
 
