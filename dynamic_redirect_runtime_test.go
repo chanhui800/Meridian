@@ -513,6 +513,64 @@ func TestDynamicRedirectRuntimeAcceptsPercentEncodedSpaces(t *testing.T) {
 	}
 }
 
+func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	runtime, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "cdn.example.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	}))
+	issuer := &dynamicCapabilityIssuer{
+		key:                   []byte("01234567890123456789012345678901"),
+		siteID:                7,
+		policyRevision:        3,
+		policy:                policy,
+		state:                 state,
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		primaryAuthority:      "https://origin.example.net:443",
+	}
+	redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("upstream redirect")}
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp := redirectRuntimeResponse(req, http.StatusFound, []string{"https://cdn.example.com/media/movie.mkv?sig=secret"}, redirectBody)
+			resp.Header.Set("Set-Cookie", "upstream-secret=yes")
+			return resp, nil
+		}),
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		dynamicPolicy:         policy,
+		dynamicState:          state,
+		capabilityIssuer:      issuer,
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream"))
+	if err != nil {
+		t.Fatalf("rewrite redirect as capability: %v", err)
+	}
+	if resp.StatusCode != http.StatusFound || !responseIsDynamic(resp) || !redirectBody.closed.Load() {
+		t.Fatalf("response status/dynamic/bodyClosed=%d/%t/%t", resp.StatusCode, responseIsDynamic(resp), redirectBody.closed.Load())
+	}
+	location := resp.Header.Get("Location")
+	if !strings.HasPrefix(location, dynamicRoutePrefix) || strings.Contains(location, "cdn.example.com") || strings.Contains(location, "secret") {
+		t.Fatalf("unsafe rewritten Location %q", location)
+	}
+	token := strings.TrimPrefix(location, dynamicRoutePrefix)
+	claims, err := openDynamicCapability(issuer.key, token)
+	if err != nil {
+		t.Fatalf("open redirect capability: %v", err)
+	}
+	if claims.Source != dynamicDiscoverySourceRedirect || claims.Kind != dynamicCapabilityKindResource || claims.Target != "https://cdn.example.com:443/media/movie.mkv?sig=secret" {
+		t.Fatalf("redirect capability claims=%#v", claims)
+	}
+	if !state.hasCapability(token, time.Now()) || runtime.authorities["https://cdn.example.com:443"] != 1 {
+		t.Fatalf("published capability state=%t authorities=%v", state.hasCapability(token, time.Now()), runtime.authorities)
+	}
+	rebuildDynamicResponseHeaders(resp)
+	if resp.Header.Get("Location") != location || resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Content-Length") != "0" {
+		t.Fatalf("sanitized redirect headers=%v", resp.Header)
+	}
+}
+
 func TestDynamicRedirectRuntimeSeeOtherIsExtremeOnly(t *testing.T) {
 	for _, test := range []struct {
 		profile     string
@@ -1245,7 +1303,7 @@ func TestDynamicRedirectRuntimeRebuildsHeadersAndCleansResponse(t *testing.T) {
 		"Accept-Encoding": {"identity"},
 		"Range":           {"bytes=100-199"},
 		"If-Range":        {"strong-etag"},
-		"User-Agent":      {dynamicRedirectUserAgent},
+		"User-Agent":      {"untrusted-client/9"},
 	} {
 		got := capture.request.Header.Values(name)
 		if strings.Join(got, "\x00") != strings.Join(want, "\x00") {

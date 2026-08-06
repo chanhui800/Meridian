@@ -135,6 +135,9 @@ function drawTrafficChart(logs, hours) {
   const pad = { top: 24, right: 24, bottom: 40, left: 54 };
   const cw = w - pad.left - pad.right;
   const ch = h - pad.top - pad.bottom;
+  const lightTheme = document.documentElement && document.documentElement.getAttribute('data-theme') === 'light';
+  const gridColor = lightTheme ? 'rgba(15,23,42,.08)' : 'rgba(255,255,255,.04)';
+  const labelColor = lightTheme ? 'rgba(15,23,42,.48)' : 'rgba(255,255,255,.2)';
 
   // Prepare data arrays
   const numPoints = Math.min(hours, 24);
@@ -163,12 +166,12 @@ function drawTrafficChart(logs, hours) {
   ctx.clearRect(0, 0, w * dpr, h * dpr);
 
   // Grid lines
-  ctx.strokeStyle = 'rgba(255,255,255,.04)';
+  ctx.strokeStyle = gridColor;
   ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
     const yy = pad.top + (i / 4) * ch;
     ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(w - pad.right, yy); ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,.2)';
+    ctx.fillStyle = labelColor;
     ctx.font = '11px Inter, system-ui';
     ctx.textAlign = 'right';
     const label = ((4 - i) / 4 * maxV).toFixed(0);
@@ -177,7 +180,7 @@ function drawTrafficChart(logs, hours) {
 
   // Empty state
   if (logs.length === 0) {
-    ctx.fillStyle = 'rgba(255,255,255,.2)';
+    ctx.fillStyle = labelColor;
     ctx.font = '14px Inter, system-ui';
     ctx.textAlign = 'center';
     ctx.fillText('暂无流量数据', w / 2, h / 2);
@@ -224,4 +227,8 @@ window.addEventListener('resize', () => {
     const canvas = document.getElementById('trafficChart');
     if (canvas) loadTrafficChart();
   }
+});
+
+window.addEventListener('meridian-theme-change', () => {
+  if (Router.current === 'traffic' && document.getElementById('trafficChart')) loadTrafficChart();
 });

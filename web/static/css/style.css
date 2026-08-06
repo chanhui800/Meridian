@@ -32,6 +32,34 @@
   --nav-h: 64px;
 }
 
+html { color-scheme: dark; }
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --black: #f4f6f8;
+  --surface: rgba(15,23,42,.055);
+  --surface-hover: rgba(15,23,42,.09);
+  --surface-active: rgba(15,23,42,.14);
+  --glass: rgba(255,255,255,.82);
+  --glass-border: rgba(15,23,42,.12);
+  --white: #111827;
+  --white-87: rgba(15,23,42,.87);
+  --white-60: rgba(15,23,42,.64);
+  --white-38: rgba(15,23,42,.48);
+  --white-12: rgba(15,23,42,.12);
+  --blue: #0071e3;
+  --blue-glow: rgba(0,113,227,.22);
+  --green: #16853b;
+  --green-dim: rgba(22,133,59,.12);
+  --red: #d92d20;
+  --red-dim: rgba(217,45,32,.11);
+  --orange: #b45309;
+  --orange-dim: rgba(180,83,9,.11);
+  --teal: #087ea4;
+  --teal-dim: rgba(8,126,164,.11);
+  --purple: #8744b8;
+}
+
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 html { font-size: 15px; scroll-behavior: smooth; }
 
@@ -43,6 +71,7 @@ body {
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color .2s ease, color .2s ease;
 }
 
 body.modal-open { overflow: hidden; }
@@ -298,6 +327,53 @@ input, select { font-family: inherit; }
   align-items: center;
   gap: 16px;
 }
+
+.theme-toggle {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--white-60);
+  background: var(--surface);
+  border: 1px solid var(--glass-border);
+  transition: color .2s ease, background .2s ease, transform .2s ease;
+}
+
+.theme-toggle-floating {
+  position: fixed;
+  top: 14px;
+  right: 88px;
+  z-index: 1100;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.theme-toggle:hover {
+  color: var(--white);
+  background: var(--surface-hover);
+  transform: translateY(-1px);
+}
+
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.theme-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.theme-icon-moon { display: none; }
+html[data-theme="light"] .theme-icon-sun { display: none; }
+html[data-theme="light"] .theme-icon-moon { display: block; }
 
 .avatar-btn {
   width: 34px; height: 34px;
@@ -1261,6 +1337,7 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
 
 @media (max-width: 768px) {
   .topnav { display: none; }
+  .theme-toggle-floating { top: 16px; right: 16px; }
   .mobile-bar { display: block; }
   .main { padding: 24px 18px 110px; }
   .stats-row { grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -1304,4 +1381,34 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
 @media (max-width: 480px) {
   .stats-row { grid-template-columns: 1fr; }
   .login-brand h1 { font-size: 2rem; }
+}
+
+html[data-theme="light"] .login-brand h1 {
+  background: linear-gradient(135deg, #111827 60%, rgba(15,23,42,.5));
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+
+html[data-theme="light"] .stat-card:hover,
+html[data-theme="light"] .site-card:hover {
+  border-color: rgba(15,23,42,.18);
+  box-shadow: 0 20px 50px rgba(15,23,42,.12);
+}
+
+html[data-theme="light"] tr + tr td { border-top-color: rgba(15,23,42,.07); }
+html[data-theme="light"] .progress-track { background: rgba(15,23,42,.08); }
+html[data-theme="light"] .form-select option,
+html[data-theme="light"] .modal-select option { background: #ffffff; color: var(--white); }
+html[data-theme="light"] .modal-select,
+html[data-theme="light"] .request-log-date-field input { color-scheme: light; }
+html[data-theme="light"] .request-log-filter,
+html[data-theme="light"] .diag-meta,
+html[data-theme="light"] .diag-row { background: rgba(15,23,42,.035); }
+html[data-theme="light"] .diag-row:hover { background: rgba(15,23,42,.06); }
+html[data-theme="light"] .modal-overlay { background: rgba(15,23,42,.34); }
+html[data-theme="light"] .modal,
+html[data-theme="light"] .modal-footer { background: #ffffff; }
+html[data-theme="light"] .toast {
+  background: rgba(255,255,255,.94);
+  box-shadow: 0 12px 32px rgba(15,23,42,.14);
 }
