@@ -4305,6 +4305,11 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 	case strings.Contains(raw, `\`):
 		return "", fmt.Errorf("invalid discovered URL: backslash")
 	}
+	if source == dynamicDiscoverySourcePlaybackInfo && s.issuer.policy.profile == dynamicProfileExtreme {
+		if normalized, ok := normalizeExtremePlaybackInfoSchemelessURL(raw, base); ok {
+			raw = normalized
+		}
+	}
 	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 && (s.issuer.policy.profile != dynamicProfileExtreme || dynamicRequiredHeadersConflictWithFixedPolicy(requiredHeaders, s.issuer.upstreamHeaderPolicy)) {
 		return "", fmt.Errorf("invalid discovered URL required headers")
 	}
@@ -4964,15 +4969,65 @@ func normalizeExtremePlaybackInfoCollectionField(object map[string]any, field st
 	return nil
 }
 
-func playbackInfoExtremeAbsoluteHTTPURL(value string) bool {
+func normalizeExtremePlaybackInfoSchemelessURL(value string, base *url.URL) (string, bool) {
+	if base == nil || value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) || strings.Contains(value, "://") {
+		return "", false
+	}
+	authorityEnd := len(value)
+	if index := strings.IndexAny(value, "/?#"); index >= 0 {
+		authorityEnd = index
+	}
+	authority := value[:authorityEnd]
+	host, portText, err := net.SplitHostPort(authority)
+	if err != nil || host == "" || portText == "" || strings.Contains(authority, "@") {
+		return "", false
+	}
+	if _, _, err := normalizeDynamicHostSyntax(host); err != nil {
+		return "", false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", false
+	}
+	scheme := strings.ToLower(base.Scheme)
+	switch port {
+	case 80:
+		scheme = "http"
+	case 443:
+		scheme = "https"
+	default:
+		if scheme != "http" && scheme != "https" {
+			return "", false
+		}
+	}
+	candidate := scheme + "://" + value
+	parsed, err := url.Parse(candidate)
+	if err != nil || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return "", false
+	}
+	return candidate, true
+}
+
+func playbackInfoExtremeNetworkURL(value string, session *dynamicRewriteSession) (string, bool) {
+	if session != nil {
+		if normalized, ok := normalizeExtremePlaybackInfoSchemelessURL(value, session.base); ok {
+			value = normalized
+		}
+	}
 	if value == "" || value != strings.TrimSpace(value) || strings.Contains(value, `\`) || containsDynamicUnsafeRune(value) {
-		return false
+		return "", false
 	}
 	parsed, err := url.Parse(value)
-	return err == nil && parsed.IsAbs() && parsed.Opaque == "" && parsed.Host != "" && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https"))
+	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+		return "", false
+	}
+	return value, true
 }
 
 func playbackInfoExtremeCapabilityType(value string, session *dynamicRewriteSession) (string, string, error) {
+	if normalized, ok := playbackInfoExtremeNetworkURL(value, session); ok {
+		value = normalized
+	}
 	parsed, err := url.Parse(value)
 	if err != nil {
 		return "", "", fmt.Errorf("PlaybackInfo fallback URL is invalid")
@@ -5000,14 +5055,15 @@ func rewriteExtremePlaybackInfoValue(value any, session *dynamicRewriteSession, 
 	}
 	switch typed := value.(type) {
 	case string:
-		if !playbackInfoExtremeAbsoluteHTTPURL(typed) {
+		normalized, ok := playbackInfoExtremeNetworkURL(typed, session)
+		if !ok {
 			return typed, nil
 		}
-		source, kind, err := playbackInfoExtremeCapabilityType(typed, session)
+		source, kind, err := playbackInfoExtremeCapabilityType(normalized, session)
 		if err != nil {
 			return nil, err
 		}
-		return session.rewriteAgainstSourceKindWithRequiredHeaders(typed, session.base, source, kind, requiredHeaders)
+		return session.rewriteAgainstSourceKindWithRequiredHeaders(normalized, session.base, source, kind, requiredHeaders)
 	case map[string]any:
 		depth := ancestorDepth + 1
 		if depth > globalDynamicMaxParseDepth {
@@ -5459,7 +5515,8 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		if pathExists && !pathIsString && pathValue != nil {
 			return nil, fmt.Errorf("PlaybackInfo Path has an invalid type")
 		}
-		absoluteHTTPPath := extreme && pathIsString && playbackInfoExtremeAbsoluteHTTPURL(pathText)
+		_, absoluteHTTPPath := playbackInfoExtremeNetworkURL(pathText, session)
+		absoluteHTTPPath = extreme && pathIsString && absoluteHTTPPath
 		if protocolErr != nil && !absoluteHTTPPath {
 			return nil, protocolErr
 		}
