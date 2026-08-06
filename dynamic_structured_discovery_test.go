@@ -214,6 +214,18 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 	if got := playbackInfoRewriteDiagnosticFingerprint(errors.New("unexpected upstream value bearer-secret")); len(got) != 8 || strings.Contains(got, "secret") {
 		t.Fatalf("diagnostic fingerprint is unsafe: %q", got)
 	}
+	if !playbackInfoAutomaticFallbackAllowed(errors.New("invalid discovered URL: target normalization host")) {
+		t.Fatal("URL normalization failure must allow automatic proxy fallback")
+	}
+	for _, err := range []error{
+		errors.New("external subtitle URL requires unsupported origin headers"),
+		errors.New("PlaybackInfo RequiredHttpHeaders has an invalid value"),
+		errors.New("invalid PlaybackInfo JSON"),
+	} {
+		if playbackInfoAutomaticFallbackAllowed(err) {
+			t.Fatalf("security or structure error unexpectedly allowed fallback: %v", err)
+		}
+	}
 }
 
 func TestCompatibleAndExtremePlaybackInfoAcceptSchemelessHostPortURLs(t *testing.T) {

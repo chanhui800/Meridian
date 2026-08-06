@@ -4807,7 +4807,7 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 	case dynamicDiscoverySourceDASH:
 		rewritten, err = rewriteDASHResponse(payload, session)
 	}
-	if err != nil && source == dynamicDiscoverySourcePlaybackInfo {
+	if err != nil && source == dynamicDiscoverySourcePlaybackInfo && playbackInfoAutomaticFallbackAllowed(err) {
 		session.rollback()
 		fallbackSession := &dynamicRewriteSession{
 			ctx:              parseContext,
@@ -5508,6 +5508,10 @@ func playbackInfoRewriteDiagnosticFingerprint(err error) string {
 	}
 	sum := sha256.Sum256([]byte(err.Error()))
 	return fmt.Sprintf("%x", sum[:4])
+}
+
+func playbackInfoAutomaticFallbackAllowed(err error) bool {
+	return strings.HasPrefix(playbackInfoRewriteDiagnosticCode(err), "url_")
 }
 
 func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
