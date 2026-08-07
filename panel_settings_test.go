@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"testing"
 )
 
@@ -52,6 +53,41 @@ func TestBootstrapPanelSettingsImportsEnvironmentOnlyOnce(t *testing.T) {
 	}
 	if first != second || second.PanelDomain != "panel.example.com" || second.RouteDomain != "example.com" || second.TLSEnabled {
 		t.Fatalf("environment settings were not imported once: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestBootstrapPanelSettingsInitializesPortWithoutDomains(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "panel-settings-port.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+
+	first, err := db.BootstrapPanelSettings("", "", false, 9090)
+	if err != nil {
+		t.Fatalf("bootstrap empty settings: %v", err)
+	}
+	if first.Configured || first.PanelDomain != "" || first.RouteDomain != "" || first.TLSEnabled {
+		t.Fatalf("empty bootstrap unexpectedly configured domains or TLS: %#v", first)
+	}
+	if first.ListenPort != 9090 {
+		t.Fatalf("empty bootstrap listen_port=%d, want 9090", first.ListenPort)
+	}
+
+	persisted, err := db.PanelSettings()
+	if err != nil {
+		t.Fatalf("read persisted settings: %v", err)
+	}
+	if persisted.ListenPort != 9090 || persisted.Configured {
+		t.Fatalf("persisted empty bootstrap=%#v, want port-only initialization", persisted)
+	}
+
+	second, err := db.BootstrapPanelSettings("", "", false, 8080)
+	if err != nil {
+		t.Fatalf("second empty bootstrap: %v", err)
+	}
+	if second.ListenPort != 9090 {
+		t.Fatalf("second empty bootstrap overwrote listen_port=%d, want 9090", second.ListenPort)
 	}
 }
 
