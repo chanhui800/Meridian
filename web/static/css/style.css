@@ -703,6 +703,38 @@ tr:hover td { background: var(--surface); }
   white-space: nowrap;
 }
 
+/* Give access addresses the full card width and keep the URL on one line. */
+.site-row.site-access-row {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.site-row.site-access-row > .site-row-label {
+  flex: 0 0 100%;
+}
+
+.site-row.site-access-row > .site-access-value {
+  width: 100%;
+  max-width: 100%;
+  justify-content: flex-start;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.site-row.site-access-row .site-access-address {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+  font-size: clamp(.64rem, 2.6vw, .78rem);
+  scrollbar-width: thin;
+}
+
 .site-access-address.is-hidden {
   letter-spacing: .08em;
 }
@@ -1531,6 +1563,13 @@ html[data-theme="light"] .diag-row { background: rgba(15,23,42,.035); }
 .site-latency-line .site-latency { font-size: .84rem; font-weight: 600; }
 .site-row { gap: 20px; }
 .site-row > :last-child { min-width: 0; max-width: 72%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site-row.site-access-row > :last-child {
+  width: 100%;
+  max-width: 100%;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+}
 .site-actions { display: grid; grid-template-columns: .75fr 1fr 1fr .75fr; }
 .site-actions .btn-ghost { min-width: 0; border-radius: 12px; }
 .site-action-test { color: var(--green); border-color: rgba(48,209,88,.35); }
