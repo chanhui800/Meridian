@@ -10309,6 +10309,7 @@ type ProxyManager struct {
 	dynamicPanelPort        int
 	dynamicInterfaceAddrs   dynamicInterfaceAddrsFunc
 	assetCache              *assetCache
+	siteTLSConfig           *tls.Config
 }
 
 // siteIngressClosedError means StopSite passed the irreversible boundary: new
@@ -10444,6 +10445,29 @@ func (pm *ProxyManager) SetAssetCache(cache *assetCache) {
 	pm.mu.Lock()
 	pm.assetCache = cache
 	pm.mu.Unlock()
+}
+
+// SetSiteTLSConfig enables TLS on dedicated site listeners when the panel TLS
+// certificate is active. Shared-host ingress already uses the panel listener;
+// port/both ingress must wrap its own listener as well so
+// https://panel.example:PORT works consistently.
+func (pm *ProxyManager) SetSiteTLSConfig(config *tls.Config) {
+	pm.mu.Lock()
+	if config == nil {
+		pm.siteTLSConfig = nil
+	} else {
+		pm.siteTLSConfig = config.Clone()
+	}
+	pm.mu.Unlock()
+}
+
+func (pm *ProxyManager) siteTLSConfigSnapshot() *tls.Config {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.siteTLSConfig == nil {
+		return nil
+	}
+	return pm.siteTLSConfig.Clone()
 }
 
 func (pm *ProxyManager) AssetCacheSizes() (map[int64]int64, int64, error) {
@@ -12678,6 +12702,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", listenAddr, err)
 		}
+		if siteTLSConfig := pm.siteTLSConfigSnapshot(); siteTLSConfig != nil {
+			listener = tls.NewListener(listener, siteTLSConfig)
+		}
 		listener = limitListener(listener, 2048)
 		server = &http.Server{
 			Handler:           handler,
@@ -12771,7 +12798,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			log.Printf("[%s] proxy :%d -> %s (playback hosts: %s, mode: %s, UA: %s)", site.Name, site.ListenPort, upstreamLogTarget, strings.Join(hosts, ", "), site.PlaybackMode, site.UAMode)
 		} else {
-			log.Printf("[%s] proxy :%d -> %s (UA: %s)", site.Name, site.ListenPort, upstreamLogTarget, site.UAMode)
+			protocol := "http"
+			if pm.siteTLSConfigSnapshot() != nil {
+				protocol = "https"
+			}
+			log.Printf("[%s] %s :%d -> %s (UA: %s)", site.Name, protocol, site.ListenPort, upstreamLogTarget, site.UAMode)
 		}
 		err := server.Serve(listener)
 		if inst.isAccepting() {
@@ -15549,7 +15580,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.14"
+var appVersion = "v1.8.15"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -15764,6 +15795,9 @@ func main() {
 		log.Fatalf("invalid trusted proxy configuration: %v", err)
 	}
 	pm := NewProxyManager(db, upstreamHeaderKey)
+	if panelTLSEnabled {
+		pm.SetSiteTLSConfig(panelTLSConfig)
+	}
 	assetCacheDir := strings.TrimSpace(os.Getenv("ASSET_CACHE_DIR"))
 	if assetCacheDir == "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
 		assetCacheDir = filepath.Join(filepath.Dir(dbPath), "asset-cache")

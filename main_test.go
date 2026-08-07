@@ -135,6 +135,51 @@ func releasePort(port int) {
 	}
 }
 
+func TestDedicatedPortUsesPanelTLSWhenConfigured(t *testing.T) {
+	app := newTestApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("tls-upstream"))
+	}))
+	defer upstream.Close()
+
+	certificateServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer certificateServer.Close()
+	app.pm.SetSiteTLSConfig(&tls.Config{Certificates: certificateServer.TLS.Certificates})
+
+	port := freePort(t)
+	releasePort(port)
+	site, err := app.db.CreateSiteRecord(Site{
+		Name:         "tls-port",
+		ListenPort:   port,
+		IngressMode:  ingressModePort,
+		TargetURL:    upstream.URL,
+		PlaybackMode: "direct",
+		StreamHosts:  "[]",
+		UAMode:       "infuse",
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	client := certificateServer.Client()
+	resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/System/Info/Public", port))
+	if err != nil {
+		t.Fatalf("dedicated TLS request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read dedicated TLS response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "tls-upstream" {
+		t.Fatalf("dedicated TLS response status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
 func decodeBody(t *testing.T, rr *httptest.ResponseRecorder) map[string]interface{} {
 	t.Helper()
 
