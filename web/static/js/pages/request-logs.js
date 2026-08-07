@@ -129,12 +129,13 @@ function renderRequestLogs() {
               <th>资源类别</th>
               <th>状态</th>
               <th>客户端 IP</th>
+              <th>客户端地区</th>
               <th>UA</th>
               <th>时间线</th>
             </tr>
           </thead>
           <tbody id="request-log-body">
-            <tr><td colspan="6" class="request-log-empty">正在加载…</td></tr>
+            <tr><td colspan="7" class="request-log-empty">正在加载…</td></tr>
           </tbody>
         </table>
       </div>
@@ -212,7 +213,7 @@ async function loadRequestLogs(options = {}) {
   const preserveViewport = previousScrollTop > 0;
   requestLogLoading = true;
   if (options.showLoading === true && !body.querySelector('tr[data-log-id]')) {
-    body.innerHTML = '<tr><td colspan="6" class="request-log-empty">正在加载…</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="request-log-empty">正在加载…</td></tr>';
   }
   try {
     const response = await API.getRequestLogs({
@@ -235,7 +236,7 @@ async function loadRequestLogs(options = {}) {
   } catch (error) {
     if (generation !== requestLogLoadGeneration) return;
     if (!body.querySelector('tr[data-log-id]')) {
-      body.innerHTML = '<tr><td colspan="6" class="request-log-empty request-log-error">日志读取失败</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="request-log-empty request-log-error">日志读取失败</td></tr>';
     }
     Toast.error(error.message);
   } finally {
@@ -251,7 +252,7 @@ function renderRequestLogRows(logs) {
   const body = document.getElementById('request-log-body');
   if (!body) return;
   if (!logs.length) {
-    body.innerHTML = '<tr><td colspan="6" class="request-log-empty">当前条件下暂无日志</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="request-log-empty">当前条件下暂无日志</td></tr>';
     return;
   }
   body.innerHTML = logs.map(entry => {
@@ -264,6 +265,7 @@ function renderRequestLogRows(logs) {
         <td><span class="request-log-category" title="${esc(requestTitle)}">${esc(requestLogCategoryLabel(entry.resource_category))}</span></td>
         <td><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
         <td><span class="request-log-ip mono" title="${esc(entry.client_ip || 'unknown')}">${esc(entry.client_ip || 'unknown')}</span></td>
+        <td><span class="request-log-region" title="${esc(entry.client_region || '未知')}">${esc(entry.client_region || '未知')}</span></td>
         <td><span class="request-log-ua" title="${esc(entry.user_agent || '未提供 UA')}">${esc(entry.user_agent || '未提供 UA')}</span></td>
         <td><time class="request-log-time" datetime="${new Date(Number(entry.recorded_at_ms || 0)).toISOString()}" title="${esc(exactTime)}">${esc(requestLogRelativeTime(entry.recorded_at_ms))}</time></td>
       </tr>

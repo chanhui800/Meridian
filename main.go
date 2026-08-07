@@ -1366,6 +1366,7 @@ type RequestLog struct {
 	ResourceCategory string `json:"resource_category"`
 	StatusCode       int    `json:"status_code"`
 	ClientIP         string `json:"client_ip"`
+	ClientRegion     string `json:"client_region"`
 	UserAgent        string `json:"user_agent"`
 	Method           string `json:"method"`
 	Path             string `json:"path"`
@@ -13879,6 +13880,7 @@ type App struct {
 	loginLimiter      *loginRateLimiter
 	loginLimiterOnce  sync.Once
 	trustedProxies    []*net.IPNet
+	clientIPRegions   *clientIPRegionResolver
 	panelHost         string
 	routeDomain       string
 	panelTLSEnabled   bool
@@ -15633,6 +15635,7 @@ func (a *App) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		a.clientIPRegions.enrich(logs)
 		a.jsonOK(w, RequestLogsResponse{Logs: logs, DroppedLogs: a.db.DroppedRequestLogs()})
 	case http.MethodDelete:
 		if err := a.db.ClearRequestLogs(); err != nil {
@@ -15944,6 +15947,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid trusted proxy configuration: %v", err)
 	}
+	clientIPRegions, err := newClientIPRegionResolver(os.Getenv("CLIENT_IP_REGION_ENDPOINT"), nil)
+	if err != nil {
+		log.Fatalf("invalid client IP region configuration: %v", err)
+	}
 	pm := NewProxyManager(db, upstreamHeaderKey)
 	if panelTLSEnabled {
 		pm.SetSiteTLSConfig(panelTLSConfig)
@@ -15991,6 +15998,7 @@ func main() {
 		setupToken:        setupToken,
 		loginLimiter:      newLoginRateLimiter(),
 		trustedProxies:    trustedProxies,
+		clientIPRegions:   clientIPRegions,
 		panelHost:         panelHost,
 		routeDomain:       routeDomain,
 		panelTLSEnabled:   panelTLSEnabled,
