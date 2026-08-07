@@ -72,6 +72,14 @@ test('site cards place ingress mode above running status and omit playback rows'
   assert.doesNotMatch(cardSource, /播放回源/);
 });
 
+test('access addresses use the full card width without ellipsis wrapping', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
+  assert.match(css, /\.site-row\.site-access-row > \.site-access-value[\s\S]*?width:\s*100%/);
+  assert.match(css, /\.site-row\.site-access-row \.site-access-address[\s\S]*?overflow-x:\s*auto/);
+  assert.match(css, /\.site-row\.site-access-row \.site-access-address[\s\S]*?text-overflow:\s*clip/);
+  assert.match(css, /\.site-row\.site-access-row \.site-access-address[\s\S]*?white-space:\s*nowrap/);
+});
+
 test('copySiteAccessAddress copies the raw address even while it is hidden', async () => {
   const sandbox = loadHelpers();
   let copied = '';
