@@ -1095,7 +1095,7 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
   z-index: 2;
   background: #181818;
 }
-.request-log-table { min-width: 900px; table-layout: fixed; }
+.request-log-table { width: 1180px; min-width: 1180px; table-layout: fixed; }
 .request-log-table th {
   padding: 18px 22px;
   text-transform: none;
@@ -1104,15 +1104,17 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
   color: var(--white-60);
 }
 .request-log-table td { padding: 17px 22px; }
-.request-log-table th:nth-child(1) { width: 14%; }
-.request-log-table th:nth-child(2) { width: 15%; }
-.request-log-table th:nth-child(3) { width: 10%; }
-.request-log-table th:nth-child(4) { width: 17%; }
-.request-log-table th:nth-child(5) { width: 29%; }
-.request-log-table th:nth-child(6) { width: 15%; }
+.request-log-table th:nth-child(1) { width: 120px; }
+.request-log-table th:nth-child(2) { width: 130px; }
+.request-log-table th:nth-child(3) { width: 70px; }
+.request-log-table th:nth-child(4) { width: 350px; }
+.request-log-table th:nth-child(5) { width: 160px; }
+.request-log-table th:nth-child(6) { width: 250px; }
+.request-log-table th:nth-child(7) { width: 100px; }
 
 .request-log-node,
 .request-log-ip,
+.request-log-region,
 .request-log-ua {
   display: block;
   min-width: 0;
@@ -1139,7 +1141,8 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
 .request-log-status-ok { color: var(--green); }
 .request-log-status-client { color: var(--orange); }
 .request-log-status-server { color: var(--red); }
-.request-log-ip { color: var(--white-87); }
+.request-log-ip { color: var(--white-87); overflow: visible; text-overflow: clip; }
+.request-log-region { color: var(--white-60); }
 .request-log-ua { color: var(--white-60); }
 .request-log-time { color: var(--white-38); white-space: nowrap; }
 .request-log-empty {

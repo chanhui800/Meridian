@@ -429,15 +429,24 @@ func prepareAssetCacheResponse(resp *http.Response, cache *assetCache, site Site
 	if cacheReq.method == http.MethodHead {
 		return nil
 	}
-	if resp.ContentLength <= 0 || resp.ContentLength > maxAssetCacheObject {
+	if resp.ContentLength > maxAssetCacheObject {
 		resp.Header.Set("X-Meridian-Cache", "BYPASS")
 		return nil
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAssetCacheObject+1))
+	originalBody := resp.Body
+	body, err := io.ReadAll(io.LimitReader(originalBody, maxAssetCacheObject+1))
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
+	if int64(len(body)) > maxAssetCacheObject {
+		// Unknown-length/chunked responses may still be cacheable. If the body is
+		// larger than the object limit, put the bytes already read back in front
+		// of the unread stream so the proxy never truncates the upstream response.
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), originalBody))
+		resp.Header.Set("X-Meridian-Cache", "BYPASS")
+		return nil
+	}
+	_ = originalBody.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))

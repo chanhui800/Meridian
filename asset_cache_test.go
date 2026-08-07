@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -258,5 +260,35 @@ func TestAssetCacheProxyHitAndMediaBypass(t *testing.T) {
 	get("/file/movie.mp4")
 	if got := mediaRequests.Load(); got != 2 {
 		t.Fatalf("media upstream requests=%d want 2", got)
+	}
+}
+
+func TestPrepareAssetCacheResponseSupportsChunkedBodies(t *testing.T) {
+	cache := newAssetCache(t.TempDir())
+	site := Site{ID: 31, AssetCacheEnabled: true, AssetCacheTTLSec: 3600, AssetCacheMaxBytes: 16 << 20, AssetCacheRules: "*/file/*"}
+	target, _ := url.Parse("https://media.example/file/poster.jpg")
+	inbound := httptest.NewRequest(http.MethodGet, "https://proxy.example/file/poster.jpg", nil)
+	cacheReq := cache.request(site, inbound, target)
+	request := inbound.WithContext(context.WithValue(inbound.Context(), assetCacheContextKey{}, cacheReq))
+	response := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"image/jpeg"}},
+		ContentLength: -1,
+		Body:          io.NopCloser(strings.NewReader("chunked-image")),
+		Request:       request,
+	}
+	if err := prepareAssetCacheResponse(response, cache, site); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "chunked-image" || response.Header.Get("X-Meridian-Cache") != "MISS" || response.ContentLength != int64(len(body)) {
+		t.Fatalf("body=%q cache=%q content_length=%d", body, response.Header.Get("X-Meridian-Cache"), response.ContentLength)
+	}
+	hit, err := cache.read(cacheReq, time.Now())
+	if err != nil || hit == nil || string(hit.body) != "chunked-image" {
+		t.Fatalf("cached hit=%#v err=%v", hit, err)
 	}
 }

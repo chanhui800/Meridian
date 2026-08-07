@@ -14,12 +14,12 @@ function loadRequestLogHelpers() {
   return sandbox;
 }
 
-test('request log table keeps the requested six columns without COLO fields', () => {
+test('request log table keeps the requested seven columns without COLO fields', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
     'utf8',
   );
-  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', 'UA', '时间线']) {
+  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', '客户端地区', 'UA', '时间线']) {
     assert.match(source, new RegExp(`<th>${heading}</th>`));
   }
   assert.doesNotMatch(source, /入站机房|出站机房|COLO/);
@@ -46,6 +46,7 @@ test('request log panel exposes video stream filtering and live refresh', () => 
   assert.match(source, /requestLogRefreshTimer = setInterval/);
   assert.match(source, /Router\.current === 'request-logs'/);
   assert.match(source, /class="request-log-ip mono" title="\$\{esc\(entry\.client_ip/);
+  assert.match(source, /class="request-log-region" title="\$\{esc\(entry\.client_region/);
   assert.match(source, /requestLogLoading/);
   assert.match(source, /previousScrollTop/);
   assert.match(source, /previousScrollTop \+ addedHeight/);

@@ -4,7 +4,7 @@
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
-当前发布版本：`v1.8.19`
+当前发布版本：`v1.8.20`
 
 ## 界面预览
 
@@ -44,7 +44,7 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 - 默认动态发现策略为 `compatible`，默认来源为 HTTP 30x 和 PlaybackInfo；HTTPS → HTTP 降级默认允许。
 - 对 localhost、回环、私网、链路本地和其他特殊目标执行拒绝，防止动态发现绕过目标安全边界。
 - 媒体认证头默认完全透传；UA 默认透传，可按站点覆盖。
-- 面板日志支持站点、资源分类、状态码、客户端 IP、UA、方法和路径检索，并可清理日志与缓存。
+- 面板日志支持站点、资源分类、状态码、客户端 IP、客户端地区、UA、方法和路径检索，并可清理日志与缓存。
 - 每个节点独立配置缓存上限，按真实目标路径匹配并按最旧使用时间淘汰；视频流、音频流、HLS/DASH 清单和分片不会写入静态缓存。
 - TLS 页面直接申请泛域名证书，证书申请后可在页面点击“启用 HTTPS 并重启”。
 - 仪表盘实时显示当前完整面板访问地址。
@@ -57,7 +57,7 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 ```yaml
 services:
   meridian:
-    image: ghcr.io/chanhui800/meridian:v1.8.19
+    image: ghcr.io/chanhui800/meridian:latest
     container_name: meridian
     restart: unless-stopped
     # Linux Docker 使用宿主机网络，面板设置的监听端口直接绑定宿主机
@@ -159,6 +159,7 @@ HLS、DASH、播放地址和重定向中的后端地址会被重新指向当前 
 | `JWT_SECRET` | 无 | 建议设置为长度足够的随机字符串 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 允许读取前级转发身份的 CIDR 列表 |
 | `ASSET_CACHE_DIR` | 数据库目录下 `asset-cache` | 静态缓存目录 |
+| `CLIENT_IP_REGION_ENDPOINT` | `https://ipwho.is/{ip}?lang=zh-CN` | 公网客户端 IP 地区查询地址；每个 IP 在内存中缓存 24 小时，设置为 `off` 可关闭 |
 | `PANEL_TLS_CERT_FILE` | 数据目录 `tls/fullchain.pem` | 可选的外部证书链路径 |
 | `PANEL_TLS_KEY_FILE` | 数据目录 `tls/privkey.pem` | 可选的外部私钥路径 |
 
