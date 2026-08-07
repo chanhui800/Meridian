@@ -833,16 +833,35 @@ function normalizedTargetAuthority(value) {
 
 function renderPanelCertificateStatus(status) {
 	if (!status || status.available === false) {
-		return '<div class="form-help" style="color:var(--orange)">请先配置 PANEL_ROUTE_DOMAIN 和可写的数据目录。</div>';
+		return '<div class="form-help" style="color:var(--orange)">TLS 数据目录不可写，请检查数据库所在数据目录的权限。</div>';
 	}
 	if (!status.configured) {
-		return `<div class="form-help">当前基础域名：${esc(status.route_domain || '—')}，尚未申请证书。</div>`;
+		return '<div class="form-help">尚未申请证书。填写域名和 Cloudflare DNS 凭据后即可由面板完成配置。</div>';
 	}
 	return `
 	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
-	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.tls_enabled ? 'good' : 'warn'}">${status.tls_enabled ? '已启用' : '需重启启用'}</span></div>
+	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.restart_required ? 'warn' : 'good'}">${status.restart_required ? '等待重启应用' : '已启用'}</span></div>
 	`;
+}
+
+function panelHTTPSPreview(panelDomain) {
+	const port = window.location.port;
+	return panelDomain ? `https://${panelDomain}${port && port !== '443' ? `:${port}` : ''}` : '—';
+}
+
+async function waitForPanelRestart(redirectURL) {
+	const deadline = Date.now() + 90000;
+	while (Date.now() < deadline) {
+		try {
+			await fetch(`${redirectURL}/api/auth/check`, { mode: 'no-cors', cache: 'no-store' });
+			window.location.replace(redirectURL);
+			return;
+		} catch (_) {
+			await new Promise(resolve => setTimeout(resolve, 1500));
+		}
+	}
+	Toast.error('服务重启超时，请稍后手动打开新的 HTTPS 地址');
 }
 
 async function showPanelCertificateModal() {
@@ -857,6 +876,20 @@ async function showPanelCertificateModal() {
 	document.getElementById('modal-body').innerHTML = `
 	  <div id="m-panel-certificate-status">${renderPanelCertificateStatus(status)}</div>
 	  <div class="form-group" style="margin-top:18px">
+	    <label>面板访问域名</label>
+	    <input type="text" class="form-input" id="m-panel-domain" maxlength="253" value="${esc(status.panel_domain || '')}" placeholder="panel.example.com" autocomplete="off">
+	    <div class="form-help">用于访问 Meridian 面板，必须是节点基础域名下的一层子域名。</div>
+	  </div>
+	  <div class="form-group">
+	    <label>节点基础域名</label>
+	    <input type="text" class="form-input" id="m-route-domain" maxlength="253" value="${esc(status.route_domain || '')}" placeholder="example.com" autocomplete="off">
+	    <div class="form-help">节点可使用不同前缀访问，例如 movie.example.com；请提前将泛域名解析到本机。</div>
+	  </div>
+	  <div class="form-group">
+	    <label>启用后的面板地址</label>
+	    <div class="form-help" id="m-panel-address-preview">${esc(panelHTTPSPreview(status.panel_domain || ''))}</div>
+	  </div>
+	  <div class="form-group">
 	    <label>ACME 邮箱</label>
 	    <input type="email" class="form-input" id="m-acme-email" autocomplete="email" maxlength="254" placeholder="admin@example.com">
 	  </div>
@@ -876,20 +909,42 @@ async function showPanelCertificateModal() {
 	`;
 	document.getElementById('modal-footer').innerHTML = `
 	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
-	  <button class="btn-modal primary" id="m-cert-submit" ${status.available === false || status.issuing ? 'disabled' : ''}>${status.configured ? '续期证书' : '申请证书'}</button>
+	  ${status.restart_required && status.configured ? '<button class="btn-modal primary" id="m-cert-restart">启用 HTTPS 并重启</button>' : ''}
+	  <button class="btn-modal primary" id="m-cert-submit" ${status.available === false || status.issuing ? 'disabled' : ''}>保存域名并申请证书</button>
 	`;
+	const refreshPreview = () => {
+		document.getElementById('m-panel-address-preview').textContent = panelHTTPSPreview(document.getElementById('m-panel-domain').value.trim());
+	};
+	document.getElementById('m-panel-domain').addEventListener('input', refreshPreview);
 	document.getElementById('m-cert-cancel').onclick = closeModal;
+	const restartButton = document.getElementById('m-cert-restart');
+	if (restartButton) restartButton.onclick = async () => {
+		if (!window.confirm('重启会短暂中断面板和所有站点连接，确定现在启用 HTTPS 并重启吗？')) return;
+		restartButton.disabled = true;
+		restartButton.textContent = '正在重启…';
+		try {
+			const result = await API.restartSystem();
+			Toast.success('重启请求已发送，正在等待 HTTPS 服务恢复');
+			await waitForPanelRestart(result.redirect_url);
+		} catch (error) {
+			restartButton.disabled = false;
+			restartButton.textContent = '启用 HTTPS 并重启';
+			Toast.error(error.message);
+		}
+	};
 	document.getElementById('m-cert-submit').onclick = async () => {
 		const button = document.getElementById('m-cert-submit');
 		const tokenInput = document.getElementById('m-acme-token');
 		const payload = {
+			panel_domain: document.getElementById('m-panel-domain').value.trim(),
+			route_domain: document.getElementById('m-route-domain').value.trim(),
 			email: document.getElementById('m-acme-email').value.trim(),
 			dns_provider: document.getElementById('m-acme-provider').value,
 			dns_api_token: tokenInput.value.trim(),
 			staging: document.getElementById('m-acme-staging').checked,
 		};
-		if (!payload.email || !payload.dns_api_token) {
-			Toast.error('请填写 ACME 邮箱和 DNS API Token');
+		if (!payload.panel_domain || !payload.route_domain || !payload.email || !payload.dns_api_token) {
+			Toast.error('请完整填写域名、ACME 邮箱和 DNS API Token');
 			return;
 		}
 		button.disabled = true;
@@ -897,12 +952,12 @@ async function showPanelCertificateModal() {
 		try {
 			const updated = await API.requestPanelCertificate(payload);
 			tokenInput.value = '';
-			document.getElementById('m-panel-certificate-status').innerHTML = renderPanelCertificateStatus(updated);
-			button.textContent = '续期证书';
-			Toast.success(updated.restart_required ? '证书已签发，请启用 PANEL_TLS_ENABLED 并重启' : '证书已签发并热加载');
+			Toast.success(updated.restart_required ? '证书已签发，请点击“启用 HTTPS 并重启”' : '证书已签发并热加载');
+			closeModal();
+			await showPanelCertificateModal();
 		} catch (error) {
 			button.disabled = false;
-			button.textContent = status.configured ? '续期证书' : '申请证书';
+			button.textContent = '保存域名并申请证书';
 			Toast.error(error.message);
 		}
 	};
