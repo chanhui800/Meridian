@@ -731,7 +731,15 @@ tr:hover td { background: var(--surface); }
   overflow-y: hidden;
   text-overflow: clip;
   white-space: nowrap;
-  font-size: clamp(.64rem, 2.6vw, .78rem);
+  font-family: inherit;
+  font-size: clamp(.66rem, 2.8vw, .82rem);
+  line-height: 1.35;
+  letter-spacing: -.015em;
+  padding: 8px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--white-87);
   scrollbar-width: thin;
 }
 
