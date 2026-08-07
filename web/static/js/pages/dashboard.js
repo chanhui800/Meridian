@@ -134,7 +134,8 @@ async function startFetchSSE() {
 
 function updateDashboardLive(stats) {
 	const panelDomainEl = document.getElementById('s-panel-domain');
-	if (panelDomainEl && stats.panel_access_url) panelDomainEl.textContent = stats.panel_access_url;
+	const currentPanelURL = dashboardCurrentPanelURL(stats.panel_access_url);
+	if (panelDomainEl && currentPanelURL) panelDomainEl.textContent = currentPanelURL;
   animateValue('s-total', stats.total_sites || 0);
   animateValue('s-running', stats.running_sites || 0);
 
@@ -146,6 +147,13 @@ function updateDashboardLive(stats) {
 
   const requestsEl = document.getElementById('s-requests');
   if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
+}
+
+function dashboardCurrentPanelURL(fallback) {
+  if (typeof window !== 'undefined' && window.location && /^https?:$/.test(window.location.protocol) && window.location.host) {
+    return `${window.location.protocol}//${window.location.host}`;
+  }
+  return fallback || '';
 }
 
 function formatUptime(seconds) {

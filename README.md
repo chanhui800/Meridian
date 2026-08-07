@@ -4,7 +4,7 @@
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
-当前发布版本：`v1.8.13`
+当前发布版本：`v1.8.14`
 
 ## 主要特点
 
@@ -27,11 +27,11 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 ```yaml
 services:
   meridian:
-    image: ghcr.io/chanhui800/meridian:v1.8.12
+    image: ghcr.io/chanhui800/meridian:v1.8.14
     container_name: meridian
     restart: unless-stopped
-    ports:
-      - "9090:9090"
+    # Linux Docker 使用宿主机网络，面板设置的监听端口直接绑定宿主机
+    network_mode: host
     volumes:
       - ./data:/app/data
     environment:
@@ -46,7 +46,7 @@ docker compose up -d
 docker compose logs -f meridian
 ```
 
-首次打开 `http://服务器地址:9090` 完成管理员初始化。数据目录必须可写，并应限制为仅运行用户可读。
+首次打开 `http://服务器地址:9090` 完成管理员初始化。之后在 TLS 页面修改监听端口并重启，容器会直接在宿主机的新端口监听。`network_mode: host` 适用于 Linux Docker；它不使用 `ports` 映射，需在宿主机防火墙中放行所选端口。数据目录必须可写，并应限制为仅运行用户可读。
 
 ### Linux 原生 systemd
 
@@ -74,10 +74,11 @@ https://movie.example.com:9090
 
 1. 在 DNS 中将 `panel.example.com` 和 `*.example.com` 解析到 Meridian 服务器。
 2. 先用 HTTP 登录面板，进入“TLS 证书”。
-3. 填写“面板访问域名前缀”（只填 `panel`）和“节点泛域名”（填写 `*.example.com`）。面板完整域名会自动拼接为 `panel.example.com`。
-4. 填写 ACME 邮箱、DNS 服务商和 DNS API Token，点击“保存域名并申请证书”。当前支持 Cloudflare DNS API Token。
-5. 证书签发成功后点击“启用 HTTPS 并重启”。重启会短暂中断面板和节点连接，Docker/systemd 会自动拉起新进程。
-6. 在站点管理中将入口模式设为“域名前缀”，为每个站点填写唯一的公开域名，例如 `movie.example.com`。
+3. 填写“面板访问域名前缀”（只填 `panel`）、“节点泛域名”（填写 `*.example.com`）和面板监听端口（默认 `9090`）。面板完整域名会自动拼接为 `panel.example.com`。
+4. 点击“保存设置”。保存前缀不会申请证书；修改监听端口会记录为待重启。
+5. 首次申请或泛域名发生变化时，填写 ACME 邮箱、DNS 服务商和 DNS API Token，点击“申请证书”。面板前缀变化不会触发证书申请。
+6. 证书签发成功或监听端口改变后，点击 TLS 页面中的重启按钮。重启会短暂中断面板和节点连接，Docker/systemd 会自动拉起新进程。
+7. 在站点管理中将入口模式设为“域名前缀”，为每个站点填写唯一的公开域名，例如 `movie.example.com`。
 
 ACME 证书订单只申请 `*.example.com` 泛域名，不会重复提交 `panel.example.com`；泛域名证书可同时覆盖面板和一层节点域名。面板完整域名由“面板访问域名前缀”与泛域名自动拼接。域名和 TLS 状态保存在数据库中，后续不需要再修改 `.env`。旧版本环境中的 `PANEL_DOMAIN`、`PANEL_ROUTE_DOMAIN`、`PANEL_TLS_ENABLED` 只会在数据库尚未配置时导入一次，之后以面板设置为准。
 
@@ -120,8 +121,8 @@ HLS、DASH、播放地址和重定向中的后端地址会被重新指向当前 
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PORT` | `9090` | 面板和域名前缀入口监听端口 |
 | `PANEL_BIND_ADDR` | `0.0.0.0` | 监听地址 |
+| `PORT` | `9090` | 首次初始化时的默认面板监听端口；之后以 TLS 页面设置为准 |
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
 | `JWT_SECRET` | 无 | 建议设置为长度足够的随机字符串 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 允许读取前级转发身份的 CIDR 列表 |

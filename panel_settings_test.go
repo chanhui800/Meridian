@@ -42,11 +42,11 @@ func TestBootstrapPanelSettingsImportsEnvironmentOnlyOnce(t *testing.T) {
 		t.Fatalf("open database: %v", err)
 	}
 	defer db.Close()
-	first, err := db.BootstrapPanelSettings("panel.example.com", "example.com", false)
+	first, err := db.BootstrapPanelSettings("panel.example.com", "example.com", false, 9090)
 	if err != nil {
 		t.Fatalf("bootstrap settings: %v", err)
 	}
-	second, err := db.BootstrapPanelSettings("other.example.net", "example.net", true)
+	second, err := db.BootstrapPanelSettings("other.example.net", "example.net", true, 8080)
 	if err != nil {
 		t.Fatalf("second bootstrap settings: %v", err)
 	}
@@ -64,10 +64,10 @@ func TestSaveManagedPanelSettingsMigratesPrefixHosts(t *testing.T) {
 	if _, err := db.db.Exec(`INSERT INTO sites (name, listen_port, public_host, target_url) VALUES (?, ?, ?, ?)`, "One", 19001, "one.old.example.com", "http://127.0.0.1:8096"); err != nil {
 		t.Fatalf("insert site: %v", err)
 	}
-	if _, err := db.BootstrapPanelSettings("panel.old.example.com", "old.example.com", false); err != nil {
+	if _, err := db.BootstrapPanelSettings("panel.old.example.com", "old.example.com", false, 9090); err != nil {
 		t.Fatalf("bootstrap old settings: %v", err)
 	}
-	settings, migrated, err := db.SaveManagedPanelSettings("panel.example.com", "example.com")
+	settings, migrated, err := db.SaveManagedPanelSettings("panel.example.com", "example.com", 9090, false)
 	if err != nil {
 		t.Fatalf("save managed settings: %v", err)
 	}
