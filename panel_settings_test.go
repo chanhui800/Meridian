@@ -23,6 +23,19 @@ func TestNormalizeManagedPanelSettings(t *testing.T) {
 	}
 }
 
+func TestNormalizeManagedPanelPrefixAcceptsWildcardForm(t *testing.T) {
+	settings, err := normalizeManagedPanelPrefix("panel", "*.example.com")
+	if err != nil {
+		t.Fatalf("normalize panel prefix: %v", err)
+	}
+	if settings.PanelDomain != "panel.example.com" || settings.RouteDomain != "example.com" {
+		t.Fatalf("unexpected normalized wildcard settings: %+v", settings)
+	}
+	if got := wildcardDomainForSettings(settings); got != "*.example.com" {
+		t.Fatalf("wildcard domain = %q", got)
+	}
+}
+
 func TestBootstrapPanelSettingsImportsEnvironmentOnlyOnce(t *testing.T) {
 	db, err := openDB(":memory:")
 	if err != nil {

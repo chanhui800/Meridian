@@ -7,6 +7,7 @@ function renderDashboard() {
   page.innerHTML = `
     <h1 class="section-title fade-up">仪表盘</h1>
     <p class="section-sub fade-up stagger-1">Emby 反代服务运行概览 <span class="live-indicator" id="sse-status">● 实时</span></p>
+    <div class="form-help fade-up stagger-1" style="margin:-4px 0 18px">当前面板域名：<span class="mono" id="s-panel-domain">—</span></div>
     <div class="stats-row" id="dash-stats">
       <div class="stat-card c-blue fade-up stagger-1">
         <div class="stat-icon-wrap blue">
@@ -132,6 +133,8 @@ async function startFetchSSE() {
 }
 
 function updateDashboardLive(stats) {
+	const panelDomainEl = document.getElementById('s-panel-domain');
+	if (panelDomainEl && stats.panel_access_url) panelDomainEl.textContent = stats.panel_access_url;
   animateValue('s-total', stats.total_sites || 0);
   animateValue('s-running', stats.running_sites || 0);
 
