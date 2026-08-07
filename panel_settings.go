@@ -145,6 +145,12 @@ func (d *DB) BootstrapPanelSettings(panelDomain, routeDomain string, tlsEnabled 
 	}
 	candidate.ListenPort = listenPort
 	if !candidate.Configured {
+		if current.ListenPort == 0 {
+			if _, err := d.db.Exec("UPDATE panel_settings SET listen_port=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND configured=0", listenPort, panelSettingsRowID); err != nil {
+				return PanelSettings{}, err
+			}
+			current.ListenPort = listenPort
+		}
 		return current, nil
 	}
 	_, err = d.db.Exec(`
