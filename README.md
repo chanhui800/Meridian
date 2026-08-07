@@ -338,6 +338,43 @@ docker compose up -d --force-recreate
 docker compose ps
 ```
 
+## 域名前缀 + 独立端口方案
+
+该方案让 Meridian 只监听一个独立端口（默认 `9090`），再通过不同的域名前缀把请求分配给不同站点。面板和节点共用同一个 TLS 监听器，因此不需要占用通常已被其他业务使用的 `443` 端口。
+
+### 访问模型
+
+```text
+面板： https://panel.divine.de5.net:9090
+节点： https://123.divine.de5.net:9090
+       └── 123 是站点管理中填写的域名前缀
+```
+
+请求到达 `9090` 后，Meridian 会先识别 Host：面板域名进入管理界面，节点域名前缀进入对应的站点代理；未配置的前缀会被拒绝。每个前缀必须唯一，建议不要把 `panel` 作为节点前缀使用。
+
+### 配置教程
+
+1. 在 DNS 中添加 `panel.divine.de5.net` 和 `*.divine.de5.net`，都指向 Meridian 所在服务器。若使用 Cloudflare 橙云代理，请确认该端口受代理支持；否则使用 DNS-only、Cloudflare Tunnel 或其他能转发 HTTPS `9090` 的入口。
+2. 在面板的 TLS 设置中申请包含面板域名和泛域名的证书，例如 `panel.divine.de5.net` 与 `*.divine.de5.net`。申请证书需要可写的数据目录，Docker 必须保留 `/app/data` 卷，Linux 安装必须保留 `/opt/meridian` 数据目录。
+3. 在环境变量中配置：
+
+   ```env
+   PORT=9090
+   PANEL_DOMAIN=panel.divine.de5.net
+   PANEL_ROUTE_DOMAIN=divine.de5.net
+   PANEL_TLS_ENABLED=true
+   ```
+
+4. 重启服务后，在“站点管理 → 添加站点”中选择“域名前缀”入口模式，填写 `123` 等前缀并保存。卡片中的访问地址会显示为 `https://123.divine.de5.net:9090`，可直接复制到 Emby 客户端。
+
+### 使用注意
+
+- `PANEL_ROUTE_DOMAIN` 只填写基础域名，不要填写协议、端口或通配符，例如填写 `divine.de5.net`，不要填写 `https://*.divine.de5.net:9090`。
+- 证书必须覆盖节点前缀；推荐使用 DNS-01 申请泛域名证书。证书文件和 ACME 账户密钥都保存在数据目录中，升级或重建容器时不要删除数据卷。
+- `9090` 是 HTTPS 监听端口，客户端地址必须带 `https://` 和 `:9090`。若前面还有反向代理，请让它透传 Host，否则 Meridian 无法判断目标节点。
+- 面板始终使用 `PANEL_DOMAIN` 访问；节点使用“前缀 + `PANEL_ROUTE_DOMAIN`”访问。这样即使服务器的 `443` 已被 Nginx、OpenResty 或其他业务占用，也不会冲突。
+- 修改基础域名、证书或入口模式后，需要重启容器/服务让监听器重新加载配置；站点数据本身不会丢失。
+
 ## 配置项
 
 | 环境变量 | 默认值 | 作用 |
