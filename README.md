@@ -6,6 +6,36 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 
 当前发布版本：`v1.8.16`
 
+## 界面预览
+
+### 仪表盘
+
+![Meridian 仪表盘](docs/images/dashboard.png)
+
+### 站点管理
+
+![Meridian 站点管理](docs/images/sites.png)
+
+### 流量统计
+
+![Meridian 流量统计](docs/images/traffic.png)
+
+### 请求日志
+
+![Meridian 请求日志](docs/images/request-logs.png)
+
+### 运行诊断
+
+![Meridian 运行诊断](docs/images/diagnostics.png)
+
+### 域名前缀入口
+
+![Meridian 域名前缀入口](docs/images/domain-prefix.png)
+
+### TLS 证书
+
+![Meridian TLS 证书](docs/images/tls-certificate.png)
+
 ## 主要特点
 
 - 面板管理多个节点：新增、编辑、启停、延迟测试和运行诊断。
@@ -97,6 +127,8 @@ ACME 证书订单只申请 `*.example.com` 泛域名，不会重复提交 `panel
 HTTP 30x
 PlaybackInfo
 ```
+
+使用“域名前缀”模式时共享面板监听端口，无需填写独立端口；留空时由后端自动分配仅用于数据库兼容的内部端口，不会建立独立监听。“独立端口”和“兼容”模式仍需填写有效端口。
 
 HLS、DASH、播放地址和重定向中的后端地址会被重新指向当前 Meridian 入口。对于只有 Extreme 模式才能正确抓取的上游，可在站点高级选项中切换策略；常规用户保持 `compatible` 即可。
 

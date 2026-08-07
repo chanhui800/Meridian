@@ -11813,6 +11813,26 @@ func ingressUsesHost(mode string) bool {
 	return mode == ingressModeHost || mode == ingressModeBoth
 }
 
+const internalHostOnlyPortStart = 8001
+
+func nextAvailableInternalSitePort(sites []Site, panelPort int) (int, error) {
+	used := make(map[int]struct{}, len(sites)+1)
+	if panelPort >= 1 && panelPort <= 65535 {
+		used[panelPort] = struct{}{}
+	}
+	for _, site := range sites {
+		if site.ListenPort >= 1 && site.ListenPort <= 65535 {
+			used[site.ListenPort] = struct{}{}
+		}
+	}
+	for port := internalHostOnlyPortStart; port <= 65535; port++ {
+		if _, exists := used[port]; !exists {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no internal site port is available")
+}
+
 func isReservedDynamicRoute(requestPath string) bool {
 	return requestPath == strings.TrimSuffix(dynamicRoutePrefix, "/") || strings.HasPrefix(requestPath, dynamicRoutePrefix)
 }
@@ -14731,8 +14751,8 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if req.Name == "" || req.ListenPort == 0 || req.TargetURL == "" {
-			a.jsonErr(w, 400, "name, listen_port, and target_url are required")
+		if req.Name == "" || req.TargetURL == "" {
+			a.jsonErr(w, 400, "name and target_url are required")
 			return
 		}
 		dynamicPolicy := Site{
@@ -14794,6 +14814,24 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		a.siteLifecycleMu.Lock()
+		defer a.siteLifecycleMu.Unlock()
+		if req.ListenPort == 0 {
+			if req.IngressMode != ingressModeHost {
+				a.jsonErr(w, http.StatusBadRequest, "listen_port is required for dedicated-port ingress")
+				return
+			}
+			sites, listErr := a.db.ListSites()
+			if listErr != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "allocate internal site port failed")
+				return
+			}
+			req.ListenPort, err = nextAvailableInternalSitePort(sites, a.panelListenPort)
+			if err != nil {
+				a.jsonErr(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
+		}
 		normalizedMode, customUserAgent, customClient, customVersion, err := normalizeUAConfig(req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
@@ -14816,8 +14854,6 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		a.siteLifecycleMu.Lock()
-		defer a.siteLifecycleMu.Unlock()
 		if req.PublicHost != "" {
 			if _, exists := a.pm.PublicHostSiteID(req.PublicHost); exists {
 				a.jsonErr(w, http.StatusBadRequest, "public_host is already assigned to another site")
@@ -15122,6 +15158,27 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		listenPort := req.ListenPort
+		if listenPort == 0 {
+			if ingressMode != ingressModeHost {
+				a.jsonErr(w, http.StatusBadRequest, "listen_port is required for dedicated-port ingress")
+				return
+			}
+			if oldSite.ListenPort >= 1 && oldSite.ListenPort <= 65535 {
+				listenPort = oldSite.ListenPort
+			} else {
+				sites, listErr := a.db.ListSites()
+				if listErr != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "allocate internal site port failed")
+					return
+				}
+				listenPort, err = nextAvailableInternalSitePort(sites, a.panelListenPort)
+				if err != nil {
+					a.jsonErr(w, http.StatusServiceUnavailable, err.Error())
+					return
+				}
+			}
+		}
 		oldTarget, oldTargetErr := normalizeTargetURL(oldSite.TargetURL)
 		newTarget, newTargetErr := normalizeTargetURL(req.TargetURL)
 		if newTargetErr != nil {
@@ -15161,7 +15218,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		candidate := *oldSite
 		candidate.Name = req.Name
-		candidate.ListenPort = req.ListenPort
+		candidate.ListenPort = listenPort
 		candidate.PublicHost = publicHost
 		candidate.IngressMode = ingressMode
 		candidate.TargetURL = req.TargetURL
