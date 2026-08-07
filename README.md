@@ -9,7 +9,8 @@ Meridian 是一个面向 Emby 多站点场景的 Go 反向代理管理面板。�
 ## 特点
 
 - 多站点独立配置：主回源、入口模式、UA、流量额度、限速和缓存均按站点隔离。
-- 动态播放发现：默认启用 HTTP 30x 与 PlaybackInfo，自动处理 HLS、DASH 和播放地址；默认策略为 `compatible`。
+- 自动播放反代：整合 `emby-reverse-proxy-go` 的播放地址识别方案，
+  自动改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的后端地址。
 - 域名前缀入口：通过一个独立 HTTPS 端口和泛域名把不同前缀路由到不同站点，不依赖 `443`。
 - 透明客户端身份：新站点默认透传 User-Agent、Client 和 Version。
 - TLS 证书管理：面板内通过 Cloudflare DNS-01 申请证书，证书和 ACME 数据保存在数据目录。
@@ -89,19 +90,20 @@ Meridian 是一个面向 Emby 多站点场景的 Go 反向代理管理面板。�
 
 申请成功后设置 `PANEL_TLS_ENABLED=true` 并重启服务。首次启动必须保持 `false`；证书文件尚未生成时启用 TLS 会导致面板无法启动。
 
-## 动态播放发现
+## 自动播放反代
 
-新站点默认配置：
+Meridian 已整合
+[Gsy-allen/emby-reverse-proxy-go](https://github.com/Gsy-allen/emby-reverse-proxy-go)
+的播放地址识别方案。新增站点默认开启自动反代，不需要手工选择发现来源或
+调整安全策略。
 
-| 项目 | 默认值 |
-| --- | --- |
-| 动态发现 | 开启 |
-| 默认来源 | HTTP 30x、PlaybackInfo |
-| 策略 | `compatible` |
-| HTTPS → HTTP 降级 | 允许 |
-| User-Agent | 透传 |
+程序会自动识别并改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址。
+发现到的公网后端会转换为当前站点的动态代理路由；即使真实后端发生切换，
+客户端仍通过本站点入口播放，不会直接暴露或绕过 Meridian。
 
-程序会根据响应结构识别播放后端，并改写到当前站点入口。HLS、DASH、Range 和媒体流请求会遵循后端能力与安全策略；更激进的行为可以在高级配置中调整。
+自动识别不会放宽基础网络安全边界。`localhost`、私网、链路本地和回环目标
+始终拒绝，无法通过站点配置或更宽松的发现行为绕过。新站点的 User-Agent
+默认透传，并允许真实公网播放地址从 HTTPS 降级到 HTTP。
 
 ## Linux 安装
 
@@ -175,7 +177,7 @@ EOF
 ```yaml
 services:
   meridian:
-    image: ghcr.io/chanhui800/meridian:v1.8.10
+    image: ghcr.io/chanhui800/meridian:v1.8.11
     container_name: meridian
     restart: unless-stopped
     read_only: true
@@ -296,7 +298,7 @@ go build -trimpath -buildvcs=false -o meridian .
 docker build --build-arg VERSION=dev -t meridian:dev .
 ```
 
-正式版本使用无后缀标签，例如 `v1.8.10`。Release 工作流会执行测试、
+正式版本使用无后缀标签，例如 `v1.8.11`。Release 工作流会执行测试、
 前端检查、Shell 检查、漏洞扫描和安全检查，然后发布多平台二进制与
 Linux amd64/arm64 GHCR 镜像。
 
