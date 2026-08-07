@@ -711,7 +711,8 @@ function ingressFormState(mode) {
 		mode: normalized,
 		showPublicHost: normalized !== 'port',
 		requirePublicHost: normalized !== 'port',
-		portLabel: normalized === 'host' ? '保留端口（此模式不监听）' : '监听端口',
+		requireListenPort: normalized !== 'host',
+		portLabel: normalized === 'host' ? '独立端口（可选）' : '监听端口',
 		warning: normalized === 'port'
 			? '独立端口会绑定所有网络接口；公网部署时请配置防火墙。'
 			: normalized === 'both'
@@ -722,13 +723,14 @@ function ingressFormState(mode) {
 
 function buildIngressPayload(mode, port, publicHost, routePrefix, routeDomain) {
 	const state = ingressFormState(mode);
+	const parsedPort = parseInt(port, 10);
 	const prefix = String(routePrefix || '').trim().toLowerCase();
 	const generatedHost = state.showPublicHost && prefix && routeDomain
 		? `${prefix}.${String(routeDomain).trim().toLowerCase()}`
 		: String(publicHost || '').trim();
 	return {
 		ingress_mode: state.mode,
-		listen_port: parseInt(port),
+		listen_port: Number.isInteger(parsedPort) ? parsedPort : 0,
 		public_host: state.showPublicHost ? generatedHost : '',
 		...(state.showPublicHost && prefix ? { route_prefix: prefix } : {}),
 	};
@@ -1049,7 +1051,8 @@ async function showSiteModal(site) {
 	</div>
 	<div class="form-group" id="m-port-group">
 	  <label id="m-port-label">监听端口</label>
-	  <input type="number" class="form-input" id="m-port" value="${isEdit ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric" required>
+	  <input type="number" class="form-input" id="m-port" value="${isEdit && normalizedIngressMode(site) !== 'host' ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
+	  <div class="form-help" id="m-port-help"></div>
 	</div>
 	<div class="form-group" id="m-public-host-group">
 	  <label>域名前缀</label>
@@ -1119,7 +1122,9 @@ async function showSiteModal(site) {
 	const publicHostGroup = document.getElementById('m-public-host-group');
 	const publicHostInput = document.getElementById('m-public-host');
 	const routePrefixInput = document.getElementById('m-route-prefix');
+	const portInput = document.getElementById('m-port');
 	const portLabel = document.getElementById('m-port-label');
+	const portHelp = document.getElementById('m-port-help');
 	const ingressWarning = document.getElementById('m-ingress-warning');
 	ingressSelect.value = isEdit ? normalizedIngressMode(site) : defaultIngressMode(siteCapabilities);
 	function updateIngressFields() {
@@ -1128,7 +1133,11 @@ async function showSiteModal(site) {
 		publicHostInput.required = state.requirePublicHost;
 		routePrefixInput.required = state.requirePublicHost && domainPrefixAvailable;
 		routePrefixInput.disabled = !state.showPublicHost;
+		portInput.required = state.requireListenPort;
 		portLabel.textContent = state.portLabel;
+		portHelp.textContent = state.requireListenPort
+			? '独立端口模式需要填写未被占用的监听端口。'
+			: '域名前缀模式共享面板端口，此项可留空，不会另外建立端口监听。';
 		ingressWarning.textContent = state.warning;
 	}
 	updateIngressFields();
@@ -1233,7 +1242,8 @@ async function showSiteModal(site) {
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
 
-		if (!data.name || !data.target_url || !data.listen_port || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host)) {
+		const listenPortRequired = ingressFormState(data.ingress_mode).requireListenPort;
+		if (!data.name || !data.target_url || (listenPortRequired && !data.listen_port) || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host)) {
 	      Toast.error('请填写所有必填项');
 	      return;
 	    }

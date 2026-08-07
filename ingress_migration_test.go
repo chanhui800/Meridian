@@ -238,3 +238,56 @@ func TestCreateSiteReportsReservedPortConflictAsBadRequest(t *testing.T) {
 		t.Fatalf("unsafe or empty conflict response: %q", body)
 	}
 }
+
+func TestCreateHostIngressWithoutListenPortAllocatesInternalPort(t *testing.T) {
+	app := newTestApp(t)
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":          "host-without-port",
+		"public_host":   "no-port.example.test",
+		"ingress_mode":  ingressModeHost,
+		"target_url":    "http://127.0.0.1:8096",
+		"playback_mode": "direct",
+		"ua_mode":       "passthrough",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", rr.Code, rr.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	if created.ListenPort < internalHostOnlyPortStart || created.ListenPort > 65535 {
+		t.Fatalf("allocated listen_port=%d, want internal valid port", created.ListenPort)
+	}
+	app.pm.mu.RLock()
+	instance := app.pm.proxies[created.ID]
+	app.pm.mu.RUnlock()
+	if instance == nil || instance.listener != nil || instance.server != nil {
+		t.Fatalf("host-only runtime=%#v, want handler without dedicated listener", instance)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+}
+
+func TestCreatePortIngressStillRequiresListenPort(t *testing.T) {
+	app := newTestApp(t)
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":          "port-without-listen-port",
+		"ingress_mode":  ingressModePort,
+		"target_url":    "http://127.0.0.1:8096",
+		"playback_mode": "direct",
+		"ua_mode":       "passthrough",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "listen_port") {
+		t.Fatalf("status=%d body=%s, want listen_port validation error", rr.Code, rr.Body.String())
+	}
+}

@@ -23,8 +23,10 @@ test('ingress form exposes the secure host-only mode without a listener', () => 
   const host = ingressFormState('host');
   assert.equal(host.showPublicHost, true);
   assert.equal(host.requirePublicHost, true);
-  assert.match(host.portLabel, /保留端口/);
-  assert.match(host.warning, /不会绑定/);
+	assert.equal(host.requireListenPort, false);
+	assert.match(host.portLabel, /可选/);
+	assert.match(host.warning, /不会绑定/);
+	assert.equal(ingressFormState('port').requireListenPort, true);
 });
 
 test('ingress payload clears stale host for port mode and preserves it otherwise', () => {
@@ -35,6 +37,9 @@ test('ingress payload clears stale host for port mode and preserves it otherwise
   assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('host', '8002', ' media.example.com '))), {
     ingress_mode: 'host', listen_port: 8002, public_host: 'media.example.com',
   });
+	assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('host', '', ' media.example.com '))), {
+		ingress_mode: 'host', listen_port: 0, public_host: 'media.example.com',
+	});
   assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('both', '8003', 'media.example.com'))), {
     ingress_mode: 'both', listen_port: 8003, public_host: 'media.example.com',
   });
@@ -114,6 +119,8 @@ test('site modal always loads deployment capabilities for create and edit flows'
 
   assert.match(modalSource, /normalizeSiteCapabilities\(await API\.ingressCapabilities\(\)\)/);
   assert.doesNotMatch(modalSource, /if \(!isEdit\)[\s\S]{0,200}ingressCapabilities/);
+	assert.doesNotMatch(modalSource, /id="m-port"[^>]*\srequired(?:\s|>)/);
+	assert.match(modalSource, /portInput\.required = state\.requireListenPort/);
 });
 
 test('stream host normalization accepts the array API and legacy JSON strings', () => {
