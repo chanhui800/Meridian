@@ -59,7 +59,8 @@ const API = {
   // Sites
   ingressCapabilities() { return this.request('GET', '/api/ingress-capabilities'); },
   panelCertificate() { return this.request('GET', '/api/panel-certificate'); },
-  requestPanelCertificate(data) { return this.request('POST', '/api/panel-certificate', data); },
+  savePanelSettings(data) { return this.request('POST', '/api/panel-settings', data); },
+  requestPanelCertificate(data) { return this.request('POST', '/api/panel-certificate/issue', data); },
   restartSystem() { return this.request('POST', '/api/system/restart', {}); },
   listSites() { return this.request('GET', '/api/sites'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },

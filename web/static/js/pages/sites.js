@@ -836,11 +836,14 @@ function renderPanelCertificateStatus(status) {
 		return '<div class="form-help" style="color:var(--orange)">TLS 数据目录不可写，请检查数据库所在数据目录的权限。</div>';
 	}
 	if (!status.configured) {
-		return '<div class="form-help">尚未申请证书。填写域名和 Cloudflare DNS 凭据后即可由面板完成配置。</div>';
+		return '<div class="form-help">尚未申请证书。请先保存域名设置，再点击“申请证书”。</div>';
 	}
 	return `
 	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
+	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${status.certificate_current ? 'good' : 'warn'}">${status.certificate_current ? '泛域名一致' : '需要申请或更新'}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
+	  <div class="diag-row"><span class="diag-key">当前监听端口</span><span class="diag-val">${esc(String(status.active_listen_port || '—'))}</span></div>
+	  <div class="diag-row"><span class="diag-key">设置监听端口</span><span class="diag-val ${status.listen_port !== status.active_listen_port ? 'warn' : ''}">${esc(String(status.listen_port || '—'))}</span></div>
 	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.restart_required ? 'warn' : 'good'}">${status.restart_required ? '等待重启应用' : '已启用'}</span></div>
 	`;
 }
@@ -896,6 +899,11 @@ async function showPanelCertificateModal() {
 	    <div class="form-help" id="m-panel-address-preview">${esc(panelHTTPSPreview(status.panel_domain || ''))}</div>
 	  </div>
 	  <div class="form-group">
+	    <label>面板监听端口</label>
+	    <input type="number" class="form-input" id="m-panel-listen-port" min="1" max="65535" step="1" value="${esc(String(status.listen_port || status.active_listen_port || 9090))}">
+	    <div class="form-help">修改端口后需要重启面板；Docker 请使用 host 网络，并在宿主机防火墙中放行新端口。</div>
+	  </div>
+	  <div class="form-group">
 	    <label>ACME 邮箱</label>
 	    <input type="email" class="form-input" id="m-acme-email" autocomplete="email" maxlength="254" placeholder="admin@example.com">
 	  </div>
@@ -915,18 +923,22 @@ async function showPanelCertificateModal() {
 	`;
 	document.getElementById('modal-footer').innerHTML = `
 	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
-	  ${status.restart_required && status.configured ? '<button class="btn-modal primary" id="m-cert-restart">启用 HTTPS 并重启</button>' : ''}
-	  <button class="btn-modal primary" id="m-cert-submit" ${status.available === false || status.issuing ? 'disabled' : ''}>保存域名并申请证书</button>
+	  ${status.restart_required && ((status.configured && status.certificate_current) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="btn-modal primary" id="m-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
+	  <button class="btn-modal" id="m-cert-save">保存设置</button>
+	  <button class="btn-modal primary" id="m-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
 	`;
 	const refreshPreview = () => {
-		document.getElementById('m-panel-address-preview').textContent = panelHTTPSPreview(panelDomainFromForm());
+		const domain = panelDomainFromForm();
+		const port = Number(document.getElementById('m-panel-listen-port').value) || 9090;
+		document.getElementById('m-panel-address-preview').textContent = domain ? `https://${domain}${port === 443 ? '' : `:${port}`}` : '—';
 	};
 	document.getElementById('m-panel-prefix').addEventListener('input', refreshPreview);
 	document.getElementById('m-wildcard-domain').addEventListener('input', refreshPreview);
+	document.getElementById('m-panel-listen-port').addEventListener('input', refreshPreview);
 	document.getElementById('m-cert-cancel').onclick = closeModal;
 	const restartButton = document.getElementById('m-cert-restart');
 	if (restartButton) restartButton.onclick = async () => {
-		if (!window.confirm('重启会短暂中断面板和所有站点连接，确定现在启用 HTTPS 并重启吗？')) return;
+		if (!window.confirm('重启会短暂中断面板和所有站点连接，确定现在重启吗？')) return;
 		restartButton.disabled = true;
 		restartButton.textContent = '正在重启…';
 		try {
@@ -939,19 +951,49 @@ async function showPanelCertificateModal() {
 			Toast.error(error.message);
 		}
 	};
-	document.getElementById('m-cert-submit').onclick = async () => {
-		const button = document.getElementById('m-cert-submit');
+	const settingsPayload = () => ({
+		panel_prefix: document.getElementById('m-panel-prefix').value.trim(),
+		wildcard_domain: document.getElementById('m-wildcard-domain').value.trim(),
+		listen_port: Number(document.getElementById('m-panel-listen-port').value),
+	});
+	document.getElementById('m-cert-save').onclick = async () => {
+		const button = document.getElementById('m-cert-save');
+		const payload = settingsPayload();
+		if (!payload.panel_prefix || !payload.wildcard_domain || !Number.isInteger(payload.listen_port) || payload.listen_port < 1 || payload.listen_port > 65535) {
+			Toast.error('请填写面板前缀、泛域名和有效监听端口');
+			return;
+		}
+		button.disabled = true;
+		button.textContent = '保存中…';
+		try {
+			await API.savePanelSettings(payload);
+			Toast.success('面板设置已保存；证书不会因修改前缀而重新申请');
+			closeModal();
+			await showPanelCertificateModal();
+		} catch (error) {
+			button.disabled = false;
+			button.textContent = '保存设置';
+			Toast.error(error.message);
+		}
+	};
+	document.getElementById('m-cert-issue').onclick = async () => {
+		const button = document.getElementById('m-cert-issue');
 		const tokenInput = document.getElementById('m-acme-token');
+		const settingsPayloadValue = settingsPayload();
+		const savedWildcard = String(status.wildcard_domain || '').toLowerCase().replace(/^\*\./, '');
+		const formWildcard = settingsPayloadValue.wildcard_domain.toLowerCase().replace(/^\*\./, '');
+		if (settingsPayloadValue.panel_prefix !== status.panel_prefix || formWildcard !== savedWildcard || settingsPayloadValue.listen_port !== Number(status.listen_port)) {
+			Toast.error('请先点击“保存设置”，再申请证书');
+			return;
+		}
 		const payload = {
-			panel_prefix: document.getElementById('m-panel-prefix').value.trim(),
-			wildcard_domain: document.getElementById('m-wildcard-domain').value.trim(),
 			email: document.getElementById('m-acme-email').value.trim(),
 			dns_provider: document.getElementById('m-acme-provider').value,
 			dns_api_token: tokenInput.value.trim(),
 			staging: document.getElementById('m-acme-staging').checked,
 		};
-		if (!payload.panel_prefix || !payload.wildcard_domain || !payload.email || !payload.dns_api_token) {
-			Toast.error('请完整填写域名、ACME 邮箱和 DNS API Token');
+		if (!payload.email || !payload.dns_api_token) {
+			Toast.error('请填写 ACME 邮箱和 DNS API Token');
 			return;
 		}
 		button.disabled = true;
@@ -959,12 +1001,12 @@ async function showPanelCertificateModal() {
 		try {
 			const updated = await API.requestPanelCertificate(payload);
 			tokenInput.value = '';
-			Toast.success(updated.restart_required ? '证书已签发，请点击“启用 HTTPS 并重启”' : '证书已签发并热加载');
+			Toast.success(updated.certificate_reused ? '泛域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
 			closeModal();
 			await showPanelCertificateModal();
 		} catch (error) {
 			button.disabled = false;
-			button.textContent = '保存域名并申请证书';
+			button.textContent = '申请证书';
 			Toast.error(error.message);
 		}
 	};

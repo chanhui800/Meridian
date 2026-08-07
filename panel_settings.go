@@ -11,6 +11,7 @@ const panelSettingsRowID = 1
 type PanelSettings struct {
 	PanelDomain string `json:"panel_domain"`
 	RouteDomain string `json:"route_domain"`
+	ListenPort  int    `json:"listen_port"`
 	TLSEnabled  bool   `json:"tls_enabled"`
 	Configured  bool   `json:"-"`
 }
@@ -58,7 +59,7 @@ func wildcardDomainForSettings(settings PanelSettings) string {
 func scanPanelSettings(scanner interface{ Scan(...any) error }) (PanelSettings, error) {
 	var settings PanelSettings
 	var tlsEnabled, configured int
-	err := scanner.Scan(&settings.PanelDomain, &settings.RouteDomain, &tlsEnabled, &configured)
+	err := scanner.Scan(&settings.PanelDomain, &settings.RouteDomain, &settings.ListenPort, &tlsEnabled, &configured)
 	settings.TLSEnabled = tlsEnabled != 0
 	settings.Configured = configured != 0
 	return settings, err
@@ -69,7 +70,7 @@ func (d *DB) PanelSettings() (PanelSettings, error) {
 		return PanelSettings{}, errors.New("panel settings database is unavailable")
 	}
 	return scanPanelSettings(d.db.QueryRow(`
-		SELECT panel_domain, route_domain, tls_enabled, configured
+		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 }
 
@@ -114,26 +115,43 @@ func normalizeManagedPanelSettings(panelDomain, routeDomain string) (PanelSettin
 	return settings, nil
 }
 
-func (d *DB) BootstrapPanelSettings(panelDomain, routeDomain string, tlsEnabled bool) (PanelSettings, error) {
+func validatePanelListenPort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("监听端口必须在 1 到 65535 之间")
+	}
+	return nil
+}
+
+func (d *DB) BootstrapPanelSettings(panelDomain, routeDomain string, tlsEnabled bool, listenPort int) (PanelSettings, error) {
+	if err := validatePanelListenPort(listenPort); err != nil {
+		return PanelSettings{}, err
+	}
 	current, err := d.PanelSettings()
 	if err != nil {
 		return PanelSettings{}, err
 	}
 	if current.Configured {
+		if current.ListenPort == 0 {
+			if _, err := d.db.Exec("UPDATE panel_settings SET listen_port=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", listenPort, panelSettingsRowID); err != nil {
+				return PanelSettings{}, err
+			}
+			current.ListenPort = listenPort
+		}
 		return current, nil
 	}
 	candidate, err := normalizeStoredPanelSettings(panelDomain, routeDomain, tlsEnabled)
 	if err != nil {
 		return PanelSettings{}, err
 	}
+	candidate.ListenPort = listenPort
 	if !candidate.Configured {
 		return current, nil
 	}
 	_, err = d.db.Exec(`
 		UPDATE panel_settings
-		SET panel_domain=?, route_domain=?, tls_enabled=?, configured=1, updated_at=CURRENT_TIMESTAMP
+		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=1, updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND configured=0`,
-		candidate.PanelDomain, candidate.RouteDomain, sqliteBool(candidate.TLSEnabled), panelSettingsRowID)
+		candidate.PanelDomain, candidate.RouteDomain, candidate.ListenPort, sqliteBool(candidate.TLSEnabled), panelSettingsRowID)
 	if err != nil {
 		return PanelSettings{}, err
 	}
@@ -161,11 +179,16 @@ type panelHostMigration struct {
 	Host   string
 }
 
-func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string) (PanelSettings, int, error) {
+func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPort int, tlsEnabled bool) (PanelSettings, int, error) {
+	if err := validatePanelListenPort(listenPort); err != nil {
+		return PanelSettings{}, 0, err
+	}
 	candidate, err := normalizeManagedPanelSettings(panelDomain, routeDomain)
 	if err != nil {
 		return PanelSettings{}, 0, err
 	}
+	candidate.ListenPort = listenPort
+	candidate.TLSEnabled = tlsEnabled
 	tx, err := d.db.Begin()
 	if err != nil {
 		return PanelSettings{}, 0, err
@@ -173,7 +196,7 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string) (PanelSet
 	defer tx.Rollback()
 
 	current, err := scanPanelSettings(tx.QueryRow(`
-		SELECT panel_domain, route_domain, tls_enabled, configured
+		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 	if err != nil {
 		return PanelSettings{}, 0, err
@@ -233,8 +256,8 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string) (PanelSet
 	}
 	if _, err := tx.Exec(`
 		UPDATE panel_settings
-		SET panel_domain=?, route_domain=?, tls_enabled=1, configured=1, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, candidate.PanelDomain, candidate.RouteDomain, panelSettingsRowID); err != nil {
+		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=1, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, candidate.PanelDomain, candidate.RouteDomain, candidate.ListenPort, sqliteBool(candidate.TLSEnabled), panelSettingsRowID); err != nil {
 		return PanelSettings{}, 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -249,7 +272,7 @@ func (d *DB) restorePanelSettings(settings PanelSettings) error {
 	}
 	_, err := d.db.Exec(`
 		UPDATE panel_settings
-		SET panel_domain=?, route_domain=?, tls_enabled=?, configured=?, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, settings.PanelDomain, settings.RouteDomain, sqliteBool(settings.TLSEnabled), sqliteBool(settings.Configured), panelSettingsRowID)
+		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, sqliteBool(settings.TLSEnabled), sqliteBool(settings.Configured), panelSettingsRowID)
 	return err
 }

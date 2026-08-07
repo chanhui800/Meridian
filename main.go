@@ -2262,6 +2262,7 @@ func (d *DB) migrateOnce() error {
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		panel_domain TEXT NOT NULL DEFAULT '',
 		route_domain TEXT NOT NULL DEFAULT '',
+		listen_port INTEGER NOT NULL DEFAULT 0,
 		tls_enabled INTEGER NOT NULL DEFAULT 0,
 		configured INTEGER NOT NULL DEFAULT 0,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -2310,6 +2311,9 @@ func (d *DB) migrateOnce() error {
 				return err
 			}
 		}
+	}
+	if err := ensurePanelSettingsListenPortSchema(ctx, conn); err != nil {
+		return err
 	}
 	// public_host was introduced before ingress_mode on the unreleased Issue #28
 	// branch. Migrate those rows to the secure host-only behavior instead of
@@ -2375,6 +2379,35 @@ func (d *DB) migrateOnce() error {
 	}
 	committed = true
 	return nil
+}
+
+func ensurePanelSettingsListenPortSchema(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, "PRAGMA table_info(panel_settings)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "listen_port" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = conn.ExecContext(ctx, "ALTER TABLE panel_settings ADD COLUMN listen_port INTEGER NOT NULL DEFAULT 0")
+	return err
 }
 
 func sqliteColumnExists(ctx context.Context, conn *sql.Conn, column string) (bool, error) {
@@ -14419,80 +14452,133 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
 			return
 		}
-		a.jsonOK(w, a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled))
+		a.jsonOK(w, a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled))
 	case http.MethodPost:
-		var req struct {
-			PanelPrefix    string `json:"panel_prefix"`
-			WildcardDomain string `json:"wildcard_domain"`
-			// Legacy names are accepted so an already-open older browser can
-			// finish one request while its cached frontend is being refreshed.
-			PanelDomain string `json:"panel_domain"`
-			RouteDomain string `json:"route_domain"`
-			Email       string `json:"email"`
-			Provider    string `json:"dns_provider"`
-			APIToken    string `json:"dns_api_token"`
-			UseStaging  bool   `json:"staging"`
-		}
-		if err := decodeJSONBody(w, r, &req); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, "invalid request")
-			return
-		}
-		if strings.ToLower(strings.TrimSpace(req.Provider)) != "cloudflare" {
-			a.jsonErr(w, http.StatusBadRequest, "only Cloudflare DNS is currently supported")
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-		defer cancel()
-		managedSettings, domainErr := normalizePanelCertificateDomains(req.PanelPrefix, req.WildcardDomain, req.PanelDomain, req.RouteDomain)
-		if domainErr != nil {
-			a.jsonErr(w, http.StatusBadRequest, domainErr.Error())
-			return
-		}
-		issued, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, managedSettings.PanelDomain, managedSettings.RouteDomain, req.UseStaging)
-		if err != nil {
-			status := http.StatusBadGateway
-			if errors.Is(err, errCertificateIssuanceBusy) {
-				status = http.StatusConflict
-			} else if validateErr := validatePanelCertificateRequest(req.Email, req.APIToken); validateErr != nil {
-				status = http.StatusBadRequest
-			} else if _, validateErr := normalizeManagedPanelSettings(managedSettings.PanelDomain, managedSettings.RouteDomain); validateErr != nil {
-				status = http.StatusBadRequest
-			}
-			log.Printf("panel certificate request failed for %s: %v", managedSettings.RouteDomain, err)
-			a.jsonErr(w, status, err.Error())
-			return
-		}
-		backup, err := a.panelCertificates.backupInstalledFiles()
-		if err != nil {
-			a.jsonErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if err := a.panelCertificates.install(issued, false); err != nil {
-			if restoreErr := a.panelCertificates.restoreInstalledFiles(backup); restoreErr != nil {
-				log.Printf("restore panel certificate after installation failure: %v", restoreErr)
-			}
-			a.jsonErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		settings, migrated, err := a.db.SaveManagedPanelSettings(managedSettings.PanelDomain, managedSettings.RouteDomain)
-		if err != nil {
-			if restoreErr := a.panelCertificates.restoreInstalledFiles(backup); restoreErr != nil {
-				log.Printf("restore panel certificate after settings failure: %v", restoreErr)
-			}
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		restartRequired := settings.PanelDomain != a.panelHost || settings.RouteDomain != a.routeDomain || !a.panelTLSEnabled
-		if !restartRequired {
-			a.panelCertificates.activate(issued)
-		}
-		status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled)
-		status.RestartRequired = restartRequired
-		log.Printf("panel certificate installed for %s and *.%s (migrated sites: %d, restart required: %t)", settings.PanelDomain, settings.RouteDomain, migrated, restartRequired)
-		a.jsonOK(w, status)
+		a.handlePanelCertificateIssue(w, r)
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+type panelSettingsRequest struct {
+	PanelPrefix    string `json:"panel_prefix"`
+	WildcardDomain string `json:"wildcard_domain"`
+	ListenPort     int    `json:"listen_port"`
+}
+
+func (a *App) handlePanelSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req panelSettingsRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	managed, err := normalizeManagedPanelPrefix(req.PanelPrefix, req.WildcardDomain)
+	if err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePanelListenPort(req.ListenPort); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	current, err := a.db.PanelSettings()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
+		return
+	}
+	settings, migrated, err := a.db.SaveManagedPanelSettings(managed.PanelDomain, managed.RouteDomain, req.ListenPort, current.TLSEnabled)
+	if err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	log.Printf("panel settings saved for %s and *.%s (migrated sites: %d, restart required: %t)", settings.PanelDomain, settings.RouteDomain, migrated, status.RestartRequired)
+	a.jsonOK(w, status)
+}
+
+func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Provider   string `json:"dns_provider"`
+		Email      string `json:"email"`
+		APIToken   string `json:"dns_api_token"`
+		UseStaging bool   `json:"staging"`
+	}
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(req.Provider)) != "cloudflare" {
+		a.jsonErr(w, http.StatusBadRequest, "only Cloudflare DNS is currently supported")
+		return
+	}
+	settings, err := a.db.PanelSettings()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
+		return
+	}
+	if !settings.Configured || settings.PanelDomain == "" || settings.RouteDomain == "" || settings.ListenPort == 0 {
+		a.jsonErr(w, http.StatusConflict, "请先保存面板前缀、泛域名和监听端口")
+		return
+	}
+	currentStatus := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	if currentStatus.CertificateCurrent {
+		if !settings.TLSEnabled {
+			var err error
+			settings, _, err = a.db.SaveManagedPanelSettings(settings.PanelDomain, settings.RouteDomain, settings.ListenPort, true)
+			if err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			currentStatus = a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+		}
+		currentStatus.CertificateReused = true
+		a.jsonOK(w, currentStatus)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	issued, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, settings.PanelDomain, settings.RouteDomain, req.UseStaging)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errCertificateIssuanceBusy) {
+			status = http.StatusConflict
+		} else if validateErr := validatePanelCertificateRequest(req.Email, req.APIToken); validateErr != nil {
+			status = http.StatusBadRequest
+		}
+		log.Printf("panel certificate request failed for %s: %v", settings.RouteDomain, err)
+		a.jsonErr(w, status, err.Error())
+		return
+	}
+	backup, err := a.panelCertificates.backupInstalledFiles()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := a.panelCertificates.install(issued, false); err != nil {
+		_ = a.panelCertificates.restoreInstalledFiles(backup)
+		a.jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	settings, migrated, err := a.db.SaveManagedPanelSettings(settings.PanelDomain, settings.RouteDomain, settings.ListenPort, true)
+	if err != nil {
+		_ = a.panelCertificates.restoreInstalledFiles(backup)
+		a.jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	if !status.RestartRequired {
+		a.panelCertificates.activate(issued)
+	}
+	log.Printf("panel wildcard certificate installed for *.%s (migrated sites: %d, restart required: %t)", settings.RouteDomain, migrated, status.RestartRequired)
+	a.jsonOK(w, status)
 }
 
 func normalizePanelCertificateDomains(panelPrefix, wildcardDomain, legacyPanelDomain, legacyRouteDomain string) (PanelSettings, error) {
@@ -14512,18 +14598,26 @@ func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
 		return
 	}
-	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled)
-	if !settings.TLSEnabled || !status.Configured || settings.PanelDomain == "" {
-		a.jsonErr(w, http.StatusConflict, "请先保存域名并成功申请 TLS 证书")
+	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	if settings.PanelDomain == "" || settings.ListenPort == 0 {
+		a.jsonErr(w, http.StatusConflict, "请先保存面板域名和监听端口")
+		return
+	}
+	if settings.TLSEnabled && (!status.Configured || !status.CertificateCurrent) {
+		a.jsonErr(w, http.StatusConflict, "泛域名已改变，请先申请匹配的 TLS 证书")
 		return
 	}
 	host := settings.PanelDomain
-	if a.panelListenPort != 443 {
-		host = net.JoinHostPort(host, strconv.Itoa(a.panelListenPort))
+	if settings.ListenPort != 443 {
+		host = net.JoinHostPort(host, strconv.Itoa(settings.ListenPort))
+	}
+	scheme := "http"
+	if settings.TLSEnabled {
+		scheme = "https"
 	}
 	a.jsonOK(w, map[string]interface{}{
 		"restarting":   true,
-		"redirect_url": "https://" + host,
+		"redirect_url": scheme + "://" + host,
 	})
 	if a.restartCh == nil {
 		return
@@ -15455,7 +15549,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.13"
+var appVersion = "v1.8.14"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -15567,6 +15661,13 @@ func panelTLSConfigFromEnv(dbPath string) (*tls.Config, bool, error) {
 	return newPanelCertificateManager(dbPath, nil).tlsConfig(envBool("PANEL_TLS_ENABLED"))
 }
 
+func panelPortMarkerPath(dbPath string) string {
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(dbPath), "panel-port")
+}
+
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
 		if err != nil {
@@ -15606,15 +15707,6 @@ func main() {
 			}
 		}
 	}
-	addr, err := panelListenAddress(os.Getenv("PANEL_BIND_ADDR"), port)
-	if err != nil {
-		log.Fatalf("invalid panel listen address: %v", err)
-	}
-	panelBindHost, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		log.Fatalf("invalid panel listen address: %v", err)
-	}
-	panelBindIP := net.ParseIP(panelBindHost)
 	dynamicRouteKey, err := resolveDynamicRouteKey(os.Getenv("DYNAMIC_ROUTE_KEY"))
 	if err != nil {
 		log.Fatalf("invalid dynamic route key: %v", err)
@@ -15632,10 +15724,25 @@ func main() {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer db.Close()
-	panelSettings, err := db.BootstrapPanelSettings(os.Getenv("PANEL_DOMAIN"), os.Getenv("PANEL_ROUTE_DOMAIN"), envBool("PANEL_TLS_ENABLED"))
+	panelSettings, err := db.BootstrapPanelSettings(os.Getenv("PANEL_DOMAIN"), os.Getenv("PANEL_ROUTE_DOMAIN"), envBool("PANEL_TLS_ENABLED"), port)
 	if err != nil {
 		log.Fatalf("invalid panel settings: %v", err)
 	}
+	port = panelSettings.ListenPort
+	if marker := panelPortMarkerPath(dbPath); marker != "" {
+		if err := writePrivateFileAtomic(marker, []byte(strconv.Itoa(port)+"\n")); err != nil {
+			log.Fatalf("write panel port marker: %v", err)
+		}
+	}
+	addr, err := panelListenAddress(os.Getenv("PANEL_BIND_ADDR"), port)
+	if err != nil {
+		log.Fatalf("invalid panel listen address: %v", err)
+	}
+	panelBindHost, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Fatalf("invalid panel listen address: %v", err)
+	}
+	panelBindIP := net.ParseIP(panelBindHost)
 	panelHost := panelSettings.PanelDomain
 	routeDomain := panelSettings.RouteDomain
 	panelCertificates := newPanelCertificateManager(dbPath, nil)
@@ -15722,6 +15829,8 @@ func main() {
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
 	mux.HandleFunc("/api/ingress-capabilities", cors(app.authMiddleware(app.handleIngressCapabilities)))
 	mux.HandleFunc("/api/panel-certificate", cors(app.authMiddleware(app.handlePanelCertificate)))
+	mux.HandleFunc("/api/panel-settings", cors(app.authMiddleware(app.handlePanelSettings)))
+	mux.HandleFunc("/api/panel-certificate/issue", cors(app.authMiddleware(app.handlePanelCertificateIssue)))
 	mux.HandleFunc("/api/system/restart", cors(app.authMiddleware(app.handleSystemRestart)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))

@@ -36,18 +36,24 @@ const (
 var errCertificateIssuanceBusy = errors.New("a certificate request is already running")
 
 type panelCertificateStatus struct {
-	Available       bool   `json:"available"`
-	TLSEnabled      bool   `json:"tls_enabled"`
-	PanelDomain     string `json:"panel_domain"`
-	PanelPrefix     string `json:"panel_prefix"`
-	RouteDomain     string `json:"route_domain"`
-	WildcardDomain  string `json:"wildcard_domain"`
-	Configured      bool   `json:"configured"`
-	Subject         string `json:"subject,omitempty"`
-	ExpiresAt       string `json:"expires_at,omitempty"`
-	DaysRemaining   int    `json:"days_remaining,omitempty"`
-	RestartRequired bool   `json:"restart_required"`
-	Issuing         bool   `json:"issuing"`
+	Available                 bool   `json:"available"`
+	TLSEnabled                bool   `json:"tls_enabled"`
+	PanelDomain               string `json:"panel_domain"`
+	PanelPrefix               string `json:"panel_prefix"`
+	RouteDomain               string `json:"route_domain"`
+	WildcardDomain            string `json:"wildcard_domain"`
+	CertificateWildcardDomain string `json:"certificate_wildcard_domain,omitempty"`
+	CertificateCurrent        bool   `json:"certificate_current"`
+	CertificateReused         bool   `json:"certificate_reused,omitempty"`
+	ListenPort                int    `json:"listen_port"`
+	ActiveListenPort          int    `json:"active_listen_port"`
+	Configured                bool   `json:"configured"`
+	SettingsConfigured        bool   `json:"settings_configured"`
+	Subject                   string `json:"subject,omitempty"`
+	ExpiresAt                 string `json:"expires_at,omitempty"`
+	DaysRemaining             int    `json:"days_remaining,omitempty"`
+	RestartRequired           bool   `json:"restart_required"`
+	Issuing                   bool   `json:"issuing"`
 }
 
 type panelCertificateManager struct {
@@ -121,15 +127,18 @@ func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCe
 	}
 }
 
-func (m *panelCertificateManager) status(settings PanelSettings, activePanelDomain, activeRouteDomain string, tlsEnabled bool) panelCertificateStatus {
+func (m *panelCertificateManager) status(settings PanelSettings, activePanelDomain, activeRouteDomain string, activeListenPort int, tlsEnabled bool) panelCertificateStatus {
 	status := panelCertificateStatus{
-		Available:       m != nil && m.certFile != "" && m.keyFile != "",
-		TLSEnabled:      tlsEnabled,
-		PanelDomain:     settings.PanelDomain,
-		PanelPrefix:     panelPrefixForSettings(settings),
-		RouteDomain:     settings.RouteDomain,
-		WildcardDomain:  wildcardDomainForSettings(settings),
-		RestartRequired: settings.TLSEnabled != tlsEnabled || settings.PanelDomain != activePanelDomain || settings.RouteDomain != activeRouteDomain,
+		Available:          m != nil && m.certFile != "" && m.keyFile != "",
+		TLSEnabled:         tlsEnabled,
+		PanelDomain:        settings.PanelDomain,
+		PanelPrefix:        panelPrefixForSettings(settings),
+		RouteDomain:        settings.RouteDomain,
+		WildcardDomain:     wildcardDomainForSettings(settings),
+		ListenPort:         settings.ListenPort,
+		ActiveListenPort:   activeListenPort,
+		RestartRequired:    settings.TLSEnabled != tlsEnabled || settings.PanelDomain != activePanelDomain || settings.RouteDomain != activeRouteDomain || settings.ListenPort != activeListenPort,
+		SettingsConfigured: settings.Configured && settings.PanelDomain != "" && settings.RouteDomain != "" && settings.ListenPort != 0,
 	}
 	if m == nil {
 		return status
@@ -150,6 +159,13 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 		return status
 	}
 	status.Configured = true
+	for _, name := range certificate.DNSNames {
+		if strings.HasPrefix(name, "*.") {
+			status.CertificateWildcardDomain = strings.ToLower(name)
+			break
+		}
+	}
+	status.CertificateCurrent = status.CertificateWildcardDomain != "" && status.CertificateWildcardDomain == status.WildcardDomain
 	status.Subject = certificate.Subject.CommonName
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
 	days := int(time.Until(certificate.NotAfter).Hours() / 24)
