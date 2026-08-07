@@ -717,7 +717,7 @@ function ingressFormState(mode) {
 			? '独立端口会绑定所有网络接口；公网部署时请配置防火墙。'
 			: normalized === 'both'
 				? '兼容模式会同时开放独立端口和共享域名，建议迁移到单一入口。'
-				: '域名前缀通过面板端口转发，不会绑定站点端口，例如 https://123.example.com:9090。需要配置 PANEL_ROUTE_DOMAIN。',
+				: '域名前缀通过面板端口转发，不会绑定站点端口，例如 https://123.example.com:9090。请先在 TLS 页配置面板域名、泛域名并申请证书，完成后再启用。',
 	};
 }
 
@@ -739,7 +739,8 @@ function buildIngressPayload(mode, port, publicHost, routePrefix, routeDomain) {
 function defaultIngressMode(capabilities) {
 	if (!capabilities) return 'host';
 	if (capabilities.host_only_available === false) return 'port';
-	if (capabilities.domain_prefix_available === false) return 'port';
+	if (capabilities.domain_prefix_available !== true) return 'port';
+	if (capabilities.panel_tls_enabled !== true) return 'port';
 	return 'host';
 }
 
@@ -1028,7 +1029,15 @@ async function showSiteModal(site) {
 	const hostOnlyAvailable = siteCapabilities.host_only_available;
 	const upstreamHeadersAvailable = siteCapabilities.upstream_headers_available;
 	const domainPrefixAvailable = siteCapabilities.domain_prefix_available === true;
-	const canUseHostIngress = hostOnlyAvailable && (domainPrefixAvailable || (isEdit && String(site.public_host || '').trim() !== ''));
+	const panelTLSReady = siteCapabilities.panel_tls_enabled === true;
+	const canUseHostIngress = hostOnlyAvailable && domainPrefixAvailable && (panelTLSReady || (isEdit && String(site.public_host || '').trim() !== ''));
+	const hostIngressBlockedHint = !hostOnlyAvailable
+		? '当前面板未满足安全的域名前缀转发条件，请先设置 PANEL_BIND_ADDR 或 TRUSTED_PROXY_CIDRS 并重启。'
+		: !domainPrefixAvailable
+			? '域名前缀通过面板端口转发，不会绑定站点端口，例如 https://123.example.com:9090。请配置 PANEL_ROUTE_DOMAIN。'
+			: !panelTLSReady
+				? '请先在 TLS 页配置面板域名、泛域名并申请证书，完成后才能启用域名前缀。'
+				: '';
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
     <div class="form-group">
@@ -1043,11 +1052,11 @@ async function showSiteModal(site) {
 	<div class="form-group">
 	  <label>入口模式</label>
 	  <select class="form-select modal-select" id="m-ingress-mode">
-		<option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需配置 PANEL_ROUTE_DOMAIN'}）</option>
+		<option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
 		<option value="port">独立端口</option>
 	  </select>
 	  <div class="form-help" id="m-ingress-warning"></div>
-	  ${hostOnlyAvailable ? '' : '<div class="form-help">当前面板既未绑定回环地址，也没有可信代理来源白名单；请先设置 PANEL_BIND_ADDR 或 TRUSTED_PROXY_CIDRS 并重启，才能启用域名前缀。</div>'}
+	  ${hostIngressBlockedHint ? `<div class="form-help">${hostIngressBlockedHint}</div>` : ''}
 	</div>
 	<div class="form-group" id="m-port-group">
 	  <label id="m-port-label">监听端口</label>

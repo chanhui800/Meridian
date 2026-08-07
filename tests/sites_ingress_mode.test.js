@@ -26,6 +26,7 @@ test('ingress form exposes the secure host-only mode without a listener', () => 
 	assert.equal(host.requireListenPort, false);
 	assert.match(host.portLabel, /可选/);
 	assert.match(host.warning, /不会绑定/);
+	assert.match(host.warning, /TLS .*\u8bc1\u4e66/);
 	assert.equal(ingressFormState('port').requireListenPort, true);
 });
 
@@ -47,8 +48,10 @@ test('ingress payload clears stale host for port mode and preserves it otherwise
 
 test('new-site ingress defaults follow backend host-only capability', () => {
   const { defaultIngressMode } = loadHelpers();
-  assert.equal(defaultIngressMode({ host_only_available: true }), 'host');
+  assert.equal(defaultIngressMode({ host_only_available: true, domain_prefix_available: true, panel_tls_enabled: true }), 'host');
   assert.equal(defaultIngressMode({ host_only_available: false }), 'port');
+	assert.equal(defaultIngressMode({ host_only_available: true, domain_prefix_available: true, panel_tls_enabled: false }), 'port');
+	assert.equal(defaultIngressMode({ host_only_available: true, domain_prefix_available: false, panel_tls_enabled: true }), 'port');
   assert.equal(defaultIngressMode(undefined), 'host');
 });
 
@@ -121,6 +124,9 @@ test('site modal always loads deployment capabilities for create and edit flows'
   assert.doesNotMatch(modalSource, /if \(!isEdit\)[\s\S]{0,200}ingressCapabilities/);
 	assert.doesNotMatch(modalSource, /id="m-port"[^>]*\srequired(?:\s|>)/);
 	assert.match(modalSource, /portInput\.required = state\.requireListenPort/);
+	assert.match(modalSource, /panelTLSReady = siteCapabilities\.panel_tls_enabled === true/);
+	assert.match(modalSource, /PANEL_ROUTE_DOMAIN/);
+	assert.match(modalSource, /TLS .*\u8bc1\u4e66/);
 });
 
 test('stream host normalization accepts the array API and legacy JSON strings', () => {

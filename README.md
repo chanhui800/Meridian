@@ -4,7 +4,7 @@
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
-当前发布版本：`v1.8.16`
+当前发布版本：`v1.8.18`
 
 ## 界面预览
 
@@ -57,7 +57,7 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 ```yaml
 services:
   meridian:
-    image: ghcr.io/chanhui800/meridian:v1.8.16
+    image: ghcr.io/chanhui800/meridian:v1.8.18
     container_name: meridian
     restart: unless-stopped
     # Linux Docker 使用宿主机网络，面板设置的监听端口直接绑定宿主机
