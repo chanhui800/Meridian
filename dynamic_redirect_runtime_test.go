@@ -628,6 +628,51 @@ func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) 
 	}
 }
 
+func TestDynamicRedirectRuntimeInternallyFollowsMediaRedirects(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "cdn.example.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	}))
+	initialBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
+	captures := make(chan redirectRuntimeDialCapture, 1)
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return redirectRuntimeResponse(req, http.StatusPermanentRedirect, []string{"https://cdn.example.com/media/movie.mkv"}, initialBody), nil
+		}),
+		configuredAuthorities:  map[string]bool{"https://origin.example.net:443": true},
+		followUnknownRedirects: true,
+		dynamicPolicy:          policy,
+		dynamicState:           state,
+		dynamicTransportFactory: redirectRuntimeFactory(captures, func(*http.Request) string {
+			return "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nContent-Length: 8\r\n\r\nmovie-ok"
+		}),
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/emby/emya/video"))
+	if err != nil {
+		t.Fatalf("internally follow media redirect: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read internally followed media response: %v", err)
+	}
+	if resp.StatusCode != http.StatusPartialContent || string(body) != "movie-ok" || !responseIsDynamic(resp) || !initialBody.closed.Load() {
+		t.Fatalf("status/body/dynamic/closed=%d/%q/%t/%t", resp.StatusCode, body, responseIsDynamic(resp), initialBody.closed.Load())
+	}
+	select {
+	case capture := <-captures:
+		if capture.err != nil || capture.request.Host != "cdn.example.com:443" || capture.request.RequestURI != "/media/movie.mkv" {
+			t.Fatalf("dynamic capture=%#v host=%q requestURI=%q", capture, capture.request.Host, capture.request.RequestURI)
+		}
+	default:
+		t.Fatal("internal media redirect did not reach the validated target")
+	}
+}
+
 func TestDynamicRedirectRuntimeSeeOtherIsExtremeOnly(t *testing.T) {
 	for _, test := range []struct {
 		profile     string

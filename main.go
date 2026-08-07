@@ -9284,6 +9284,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			playbackHosts:           playbackHosts,
 			configuredAuthorities:   configuredAuthorities,
 			disableLegacyRedirects:  disableLegacyRedirects,
+			followUnknownRedirects:  true,
 			policy:                  uaPolicy,
 			upstreamHeaderPolicy:    upstreamPolicy,
 			dynamicPolicy:           i.policy,
@@ -9413,10 +9414,15 @@ func singleDynamicLocation(resp *http.Response) (string, bool) {
 type dynamicTransportFactory func(*url.URL, []net.IP, *dynamicSelfTargetPolicy) (*http.Transport, error)
 
 type redirectFollowTransport struct {
-	base                    http.RoundTripper
-	playbackHosts           map[string]bool
-	configuredAuthorities   map[string]bool
-	disableLegacyRedirects  bool
+	base                   http.RoundTripper
+	playbackHosts          map[string]bool
+	configuredAuthorities  map[string]bool
+	disableLegacyRedirects bool
+	// Media requests should not make the client walk an intermediate dynamic
+	// redirect chain.  Following a validated unknown authority inside the
+	// proxy keeps the first byte on the same request and avoids the common
+	// Emby 308 -> capability -> 502/context-canceled startup sequence.
+	followUnknownRedirects  bool
 	policy                  UAHeaderPolicy
 	upstreamHeaderPolicy    upstreamHeaderPolicy
 	dynamicTransportFactory dynamicTransportFactory
@@ -9426,6 +9432,18 @@ type redirectFollowTransport struct {
 	streamLeaseHeld         bool
 	database                *DB
 	siteID                  int64
+}
+
+func shouldInternallyFollowDynamicRedirect(r *http.Request) bool {
+	if r == nil || r.URL == nil || r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	path := r.URL.Path
+	return isPlaybackRequest(path) ||
+		isPlaybackRedirectEndpoint(path) ||
+		isPlaybackInfoRequest(path) ||
+		dynamicStructuredRequestSource(path) != "" ||
+		isReservedDynamicRoute(path)
 }
 
 func (t *redirectFollowTransport) newDynamicTransport(target *url.URL, pinnedIPs []net.IP, selfTargets *dynamicSelfTargetPolicy) (*http.Transport, error) {
@@ -9874,6 +9892,80 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
 			return fail(dynamicObservationReasonHopLimit, authority)
 		}
+		if t.followUnknownRedirects && shouldInternallyFollowDynamicRedirect(req) {
+			if reasonCode := t.dynamicPolicy.validateTarget(req.URL, normalized, selfTargets); reasonCode != "" {
+				return fail(reasonCode, authority)
+			}
+			reservation, reasonCode := t.dynamicState.reserveAuthority(authority, time.Now())
+			if reasonCode != "" {
+				return fail(reasonCode, authority)
+			}
+			pinnedIPs, reasonCode := reservation.resolve(req.Context(), normalized, selfTargets)
+			if reasonCode != "" {
+				reservation.rollback()
+				return fail(reasonCode, authority)
+			}
+			transport, err := t.newDynamicTransport(normalized, pinnedIPs, selfTargets)
+			if err != nil {
+				reservation.rollback()
+				if errors.Is(err, errDynamicSelfTarget) {
+					return fail(dynamicObservationReasonSelfTarget, authority)
+				}
+				return fail(dynamicObservationReasonAddressDenied, authority)
+			}
+			if !streamLeaseHeld {
+				var acquired bool
+				streamRelease, acquired = t.dynamicState.acquireStream()
+				if !acquired {
+					transport.CloseIdleConnections()
+					reservation.rollback()
+					return fail(dynamicObservationReasonCapacityLimit, authority)
+				}
+				streamLeaseHeld = true
+			}
+			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, resp.StatusCode, normalized)
+			if reasonCode != "" {
+				transport.CloseIdleConnections()
+				reservation.rollback()
+				return fail(reasonCode, authority)
+			}
+			newReq.Close = true
+			if newReq.Body != nil {
+				newReq.Header = dynamicRedirectBodyHeaders(req.Header)
+			} else {
+				newReq.Header = dynamicRedirectHeaders(req.Header)
+			}
+			if stripBodyHeaders {
+				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
+			}
+			closeResponse()
+			resp = nil
+			newResp, roundTripErr := transport.RoundTrip(newReq)
+			if roundTripErr != nil {
+				if newResp != nil && newResp.Body != nil {
+					_ = newResp.Body.Close()
+				}
+				transport.CloseIdleConnections()
+				reservation.rollback()
+				return fail(dynamicTransportFailureReason(roundTripErr), authority)
+			}
+			if newResp == nil {
+				transport.CloseIdleConnections()
+				reservation.rollback()
+				return fail(dynamicObservationReasonResponseFailure, authority)
+			}
+			newResp.Request = newReq
+			lease.add(reservation)
+			t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
+			currentTransport = transport
+			resp = newResp
+			req = newReq
+			dynamicActive = true
+			redirectsFollowed++
+			visited[key] = struct{}{}
+			continue
+		}
+
 		if t.capabilityIssuer != nil && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
 			route, discoveryErr := t.capabilityIssuer.mint(req.Context(), req.URL, normalized, dynamicDiscoverySourceRedirect)
 			if discoveryErr != nil {
@@ -12582,6 +12674,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			playbackHosts:           playbackHostsSet,
 			configuredAuthorities:   configuredAuthorities,
 			disableLegacyRedirects:  !isRedirectMode,
+			followUnknownRedirects:  redirectPolicy.configured,
 			policy:                  policy,
 			upstreamHeaderPolicy:    configuredHeaders,
 			dynamicPolicy:           redirectPolicy,
