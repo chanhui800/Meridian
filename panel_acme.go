@@ -318,12 +318,32 @@ func (m *panelCertificateManager) activate(issued *issuedPanelCertificate) {
 }
 
 func readOptionalFile(filename string) ([]byte, bool, error) {
-	data, err := os.ReadFile(filename)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
+	if filename == "" || filepath.Base(filename) == "." || filepath.Base(filename) == string(filepath.Separator) {
+		return nil, false, errors.New("invalid TLS file path")
 	}
+	root, err := os.OpenRoot(filepath.Dir(filename))
 	if err != nil {
 		return nil, false, err
+	}
+	file, err := root.Open(filepath.Base(filename))
+	if err != nil {
+		_ = root.Close()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, 1<<20))
+	closeErr := file.Close()
+	rootErr := root.Close()
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	if closeErr != nil {
+		return nil, false, closeErr
+	}
+	if rootErr != nil {
+		return nil, false, rootErr
 	}
 	return data, true, nil
 }
