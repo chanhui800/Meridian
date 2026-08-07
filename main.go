@@ -2258,6 +2258,15 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(recorded_at_ms DESC, id DESC);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_category_status ON request_logs(resource_category, status_code, recorded_at_ms DESC);
+	CREATE TABLE IF NOT EXISTS panel_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		panel_domain TEXT NOT NULL DEFAULT '',
+		route_domain TEXT NOT NULL DEFAULT '',
+		tls_enabled INTEGER NOT NULL DEFAULT 0,
+		configured INTEGER NOT NULL DEFAULT 0,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	INSERT OR IGNORE INTO panel_settings (id) VALUES (1);
 	`); err != nil {
 		return err
 	}
@@ -13698,6 +13707,8 @@ type App struct {
 	panelBindLoopback bool
 	panelListenPort   int
 	dynamicRouteKey   []byte
+	restartCh         chan struct{}
+	restartOnce       sync.Once
 }
 
 func (pm *ProxyManager) snapshotDynamicSelfTargetPolicy(panelHost string, panelPort int, interfaceAddrs dynamicInterfaceAddrsFunc) (*dynamicSelfTargetPolicy, error) {
@@ -14382,13 +14393,20 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		w.Header().Set("Cache-Control", "no-store")
-		a.jsonOK(w, a.panelCertificates.status(a.panelTLSEnabled))
+		settings, err := a.db.PanelSettings()
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
+			return
+		}
+		a.jsonOK(w, a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled))
 	case http.MethodPost:
 		var req struct {
-			Email      string `json:"email"`
-			Provider   string `json:"dns_provider"`
-			APIToken   string `json:"dns_api_token"`
-			UseStaging bool   `json:"staging"`
+			PanelDomain string `json:"panel_domain"`
+			RouteDomain string `json:"route_domain"`
+			Email       string `json:"email"`
+			Provider    string `json:"dns_provider"`
+			APIToken    string `json:"dns_api_token"`
+			UseStaging  bool   `json:"staging"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, "invalid request")
@@ -14400,25 +14418,85 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
-		if _, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, req.UseStaging); err != nil {
+		issued, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, req.PanelDomain, req.RouteDomain, req.UseStaging)
+		if err != nil {
 			status := http.StatusBadGateway
 			if errors.Is(err, errCertificateIssuanceBusy) {
 				status = http.StatusConflict
 			} else if validateErr := validatePanelCertificateRequest(req.Email, req.APIToken); validateErr != nil {
 				status = http.StatusBadRequest
-			} else if a.routeDomain == "" {
+			} else if _, validateErr := normalizeManagedPanelSettings(req.PanelDomain, req.RouteDomain); validateErr != nil {
 				status = http.StatusBadRequest
 			}
-			log.Printf("panel certificate request failed for %s: %v", a.routeDomain, err)
+			log.Printf("panel certificate request failed for %s: %v", strings.TrimSpace(req.RouteDomain), err)
 			a.jsonErr(w, status, err.Error())
 			return
 		}
-		status := a.panelCertificates.status(a.panelTLSEnabled)
-		status.RestartRequired = !a.panelTLSEnabled
+		backup, err := a.panelCertificates.backupInstalledFiles()
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := a.panelCertificates.install(issued, false); err != nil {
+			if restoreErr := a.panelCertificates.restoreInstalledFiles(backup); restoreErr != nil {
+				log.Printf("restore panel certificate after installation failure: %v", restoreErr)
+			}
+			a.jsonErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		settings, migrated, err := a.db.SaveManagedPanelSettings(req.PanelDomain, req.RouteDomain)
+		if err != nil {
+			if restoreErr := a.panelCertificates.restoreInstalledFiles(backup); restoreErr != nil {
+				log.Printf("restore panel certificate after settings failure: %v", restoreErr)
+			}
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		restartRequired := settings.PanelDomain != a.panelHost || settings.RouteDomain != a.routeDomain || !a.panelTLSEnabled
+		if !restartRequired {
+			a.panelCertificates.activate(issued)
+		}
+		status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled)
+		status.RestartRequired = restartRequired
+		log.Printf("panel certificate installed for %s and *.%s (migrated sites: %d, restart required: %t)", settings.PanelDomain, settings.RouteDomain, migrated, restartRequired)
 		a.jsonOK(w, status)
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	settings, err := a.db.PanelSettings()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
+		return
+	}
+	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled)
+	if !settings.TLSEnabled || !status.Configured || settings.PanelDomain == "" {
+		a.jsonErr(w, http.StatusConflict, "请先保存域名并成功申请 TLS 证书")
+		return
+	}
+	host := settings.PanelDomain
+	if a.panelListenPort != 443 {
+		host = net.JoinHostPort(host, strconv.Itoa(a.panelListenPort))
+	}
+	a.jsonOK(w, map[string]interface{}{
+		"restarting":   true,
+		"redirect_url": "https://" + host,
+	})
+	if a.restartCh == nil {
+		return
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	a.restartOnce.Do(func() {
+		time.AfterFunc(500*time.Millisecond, func() { close(a.restartCh) })
+	})
 }
 
 // GET/POST /api/sites
@@ -15338,7 +15416,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.0"
+var appVersion = "v1.8.12"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -15447,28 +15525,7 @@ func envBool(name string) bool {
 }
 
 func panelTLSConfigFromEnv(dbPath string) (*tls.Config, bool, error) {
-	if !envBool("PANEL_TLS_ENABLED") {
-		return nil, false, nil
-	}
-	certFile, keyFile := panelTLSPaths(dbPath)
-	if certFile == "" || keyFile == "" {
-		return nil, false, errors.New("PANEL_TLS_CERT_FILE and PANEL_TLS_KEY_FILE are required when PANEL_TLS_ENABLED is enabled")
-	}
-	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, false, fmt.Errorf("load panel TLS certificate: %w", err)
-	}
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
-			if err != nil {
-				return nil, fmt.Errorf("load panel TLS certificate: %w", err)
-			}
-			return &certificate, nil
-		},
-		Certificates: []tls.Certificate{certificate},
-	}, true, nil
+	return newPanelCertificateManager(dbPath, nil).tlsConfig(envBool("PANEL_TLS_ENABLED"))
 }
 
 func main() {
@@ -15519,14 +15576,6 @@ func main() {
 		log.Fatalf("invalid panel listen address: %v", err)
 	}
 	panelBindIP := net.ParseIP(panelBindHost)
-	routeDomain, err := normalizeRouteDomain(os.Getenv("PANEL_ROUTE_DOMAIN"))
-	if err != nil {
-		log.Fatalf("invalid PANEL_ROUTE_DOMAIN: %v", err)
-	}
-	panelTLSConfig, panelTLSEnabled, err := panelTLSConfigFromEnv(dbPath)
-	if err != nil {
-		log.Fatalf("invalid panel TLS configuration: %v", err)
-	}
 	dynamicRouteKey, err := resolveDynamicRouteKey(os.Getenv("DYNAMIC_ROUTE_KEY"))
 	if err != nil {
 		log.Fatalf("invalid dynamic route key: %v", err)
@@ -15544,6 +15593,17 @@ func main() {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer db.Close()
+	panelSettings, err := db.BootstrapPanelSettings(os.Getenv("PANEL_DOMAIN"), os.Getenv("PANEL_ROUTE_DOMAIN"), envBool("PANEL_TLS_ENABLED"))
+	if err != nil {
+		log.Fatalf("invalid panel settings: %v", err)
+	}
+	panelHost := panelSettings.PanelDomain
+	routeDomain := panelSettings.RouteDomain
+	panelCertificates := newPanelCertificateManager(dbPath, nil)
+	panelTLSConfig, panelTLSEnabled, err := panelCertificates.tlsConfig(panelSettings.TLSEnabled)
+	if err != nil {
+		log.Fatalf("invalid panel TLS configuration: %v", err)
+	}
 	userCount, err := db.UserCount()
 	if err != nil {
 		log.Fatalf("failed to count users: %v", err)
@@ -15556,10 +15616,6 @@ func main() {
 	trustedProxies, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
 	if err != nil {
 		log.Fatalf("invalid trusted proxy configuration: %v", err)
-	}
-	panelHost, err := normalizePublicHost(os.Getenv("PANEL_DOMAIN"))
-	if err != nil {
-		log.Fatalf("invalid PANEL_DOMAIN: %v", err)
 	}
 	pm := NewProxyManager(db, upstreamHeaderKey)
 	assetCacheDir := strings.TrimSpace(os.Getenv("ASSET_CACHE_DIR"))
@@ -15608,10 +15664,11 @@ func main() {
 		panelHost:         panelHost,
 		routeDomain:       routeDomain,
 		panelTLSEnabled:   panelTLSEnabled,
-		panelCertificates: newPanelCertificateManager(dbPath, routeDomain, nil),
+		panelCertificates: panelCertificates,
 		panelBindLoopback: panelBindIP != nil && panelBindIP.IsLoopback(),
 		panelListenPort:   port,
 		dynamicRouteKey:   dynamicRouteKey,
+		restartCh:         make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -15626,6 +15683,7 @@ func main() {
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
 	mux.HandleFunc("/api/ingress-capabilities", cors(app.authMiddleware(app.handleIngressCapabilities)))
 	mux.HandleFunc("/api/panel-certificate", cors(app.authMiddleware(app.handlePanelCertificate)))
+	mux.HandleFunc("/api/system/restart", cors(app.authMiddleware(app.handleSystemRestart)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
@@ -15691,8 +15749,14 @@ func main() {
 		}
 	}()
 
-	<-sigCh
-	log.Println("\nReceived shutdown signal, stopping Meridian...")
+	restartRequested := false
+	select {
+	case <-sigCh:
+		log.Println("\nReceived shutdown signal, stopping Meridian...")
+	case <-app.restartCh:
+		restartRequested = true
+		log.Println("\nPanel restart requested, stopping Meridian...")
+	}
 
 	// Cancel background goroutines
 	cancel()
@@ -15719,4 +15783,8 @@ func main() {
 	finalProxyCancel()
 
 	log.Println("Meridian stopped cleanly")
+	if restartRequested {
+		db.Close()
+		os.Exit(75)
+	}
 }

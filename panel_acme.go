@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -37,6 +38,7 @@ var errCertificateIssuanceBusy = errors.New("a certificate request is already ru
 type panelCertificateStatus struct {
 	Available       bool   `json:"available"`
 	TLSEnabled      bool   `json:"tls_enabled"`
+	PanelDomain     string `json:"panel_domain"`
 	RouteDomain     string `json:"route_domain"`
 	Configured      bool   `json:"configured"`
 	Subject         string `json:"subject,omitempty"`
@@ -47,14 +49,29 @@ type panelCertificateStatus struct {
 }
 
 type panelCertificateManager struct {
-	routeDomain string
-	certFile    string
-	keyFile     string
-	accountDir  string
-	httpClient  *http.Client
+	certFile   string
+	keyFile    string
+	accountDir string
+	httpClient *http.Client
 
-	mu      sync.Mutex
-	issuing bool
+	mu                 sync.Mutex
+	issuing            bool
+	currentCertificate *tls.Certificate
+}
+
+type issuedPanelCertificate struct {
+	certPEM     []byte
+	keyPEM      []byte
+	certificate tls.Certificate
+}
+
+type installedPanelCertificateBackup struct {
+	certPEM      []byte
+	keyPEM       []byte
+	marker       []byte
+	certExists   bool
+	keyExists    bool
+	markerExists bool
 }
 
 type cloudflareClient struct {
@@ -85,7 +102,7 @@ func panelTLSPaths(dbPath string) (certFile, keyFile string) {
 	return filepath.Join(base, "fullchain.pem"), filepath.Join(base, "privkey.pem")
 }
 
-func newPanelCertificateManager(dbPath, routeDomain string, httpClient *http.Client) *panelCertificateManager {
+func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCertificateManager {
 	certFile, keyFile := panelTLSPaths(dbPath)
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -95,27 +112,27 @@ func newPanelCertificateManager(dbPath, routeDomain string, httpClient *http.Cli
 		accountDir = filepath.Dir(certFile)
 	}
 	return &panelCertificateManager{
-		routeDomain: routeDomain,
-		certFile:    certFile,
-		keyFile:     keyFile,
-		accountDir:  accountDir,
-		httpClient:  httpClient,
+		certFile:   certFile,
+		keyFile:    keyFile,
+		accountDir: accountDir,
+		httpClient: httpClient,
 	}
 }
 
-func (m *panelCertificateManager) status(tlsEnabled bool) panelCertificateStatus {
+func (m *panelCertificateManager) status(settings PanelSettings, activePanelDomain, activeRouteDomain string, tlsEnabled bool) panelCertificateStatus {
 	status := panelCertificateStatus{
-		Available:       m != nil && m.routeDomain != "" && m.certFile != "" && m.keyFile != "",
+		Available:       m != nil && m.certFile != "" && m.keyFile != "",
 		TLSEnabled:      tlsEnabled,
-		RestartRequired: !tlsEnabled,
+		PanelDomain:     settings.PanelDomain,
+		RouteDomain:     settings.RouteDomain,
+		RestartRequired: settings.TLSEnabled != tlsEnabled || settings.PanelDomain != activePanelDomain || settings.RouteDomain != activeRouteDomain,
 	}
 	if m == nil {
 		return status
 	}
-	status.RouteDomain = m.routeDomain
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	status.Issuing = m.issuing
-	m.mu.Unlock()
 	data, err := os.ReadFile(m.certFile)
 	if err != nil {
 		return status
@@ -139,6 +156,36 @@ func (m *panelCertificateManager) status(tlsEnabled bool) panelCertificateStatus
 	return status
 }
 
+func (m *panelCertificateManager) tlsConfig(enabled bool) (*tls.Config, bool, error) {
+	if !enabled {
+		return nil, false, nil
+	}
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return nil, false, errors.New("panel TLS certificate storage is unavailable")
+	}
+	certificate, err := tls.LoadX509KeyPair(m.certFile, m.keyFile)
+	if err != nil {
+		return nil, false, fmt.Errorf("load panel TLS certificate: %w", err)
+	}
+	m.mu.Lock()
+	m.currentCertificate = &certificate
+	m.mu.Unlock()
+	if err := writePrivateFileAtomic(filepath.Join(m.accountDir, "enabled"), []byte("enabled\n")); err != nil {
+		return nil, false, fmt.Errorf("write panel TLS enabled marker: %w", err)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if m.currentCertificate == nil {
+				return nil, errors.New("panel TLS certificate is unavailable")
+			}
+			return m.currentCertificate, nil
+		},
+	}, true, nil
+}
+
 func validatePanelCertificateRequest(email, token string) error {
 	email = strings.TrimSpace(email)
 	address, err := mail.ParseAddress(email)
@@ -152,17 +199,21 @@ func validatePanelCertificateRequest(email, token string) error {
 	return nil
 }
 
-func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, token string, staging bool) (panelCertificateStatus, error) {
-	if m == nil || m.routeDomain == "" || m.certFile == "" || m.keyFile == "" {
-		return panelCertificateStatus{}, errors.New("PANEL_ROUTE_DOMAIN and writable TLS storage are required")
+func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, token, panelDomain, routeDomain string, staging bool) (*issuedPanelCertificate, error) {
+	settings, err := normalizeManagedPanelSettings(panelDomain, routeDomain)
+	if err != nil {
+		return nil, err
+	}
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return nil, errors.New("可写的 TLS 数据目录不可用")
 	}
 	if err := validatePanelCertificateRequest(email, token); err != nil {
-		return panelCertificateStatus{}, err
+		return nil, err
 	}
 	m.mu.Lock()
 	if m.issuing {
 		m.mu.Unlock()
-		return panelCertificateStatus{}, errCertificateIssuanceBusy
+		return nil, errCertificateIssuanceBusy
 	}
 	m.issuing = true
 	m.mu.Unlock()
@@ -173,7 +224,7 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	}()
 
 	if err := os.MkdirAll(m.accountDir, 0o700); err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("create TLS directory: %w", err)
+		return nil, fmt.Errorf("create TLS directory: %w", err)
 	}
 	directoryURL := letsEncryptProductionDirectory
 	accountName := "acme-account.pem"
@@ -183,40 +234,40 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	}
 	accountKey, err := loadOrCreateACMEAccountKey(m.accountDir, accountName)
 	if err != nil {
-		return panelCertificateStatus{}, err
+		return nil, err
 	}
 	client := &acme.Client{Key: accountKey, DirectoryURL: directoryURL, UserAgent: "Meridian/" + appVersion}
 	_, err = client.Register(ctx, &acme.Account{Contact: []string{"mailto:" + strings.TrimSpace(email)}}, acme.AcceptTOS)
 	if err != nil && !errors.Is(err, acme.ErrAccountAlreadyExists) {
-		return panelCertificateStatus{}, fmt.Errorf("register ACME account: %w", err)
+		return nil, fmt.Errorf("register ACME account: %w", err)
 	}
 
-	wildcard := "*." + m.routeDomain
-	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(wildcard))
+	wildcard := "*." + settings.RouteDomain
+	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(wildcard, settings.PanelDomain))
 	if err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("create ACME order: %w", err)
+		return nil, fmt.Errorf("create ACME order: %w", err)
 	}
 	cf := &cloudflareClient{token: strings.TrimSpace(token), httpClient: m.httpClient, apiBase: "https://api.cloudflare.com/client/v4"}
 	for _, authorizationURL := range order.AuthzURLs {
-		if err := fulfillCloudflareDNSAuthorization(ctx, client, cf, authorizationURL, m.routeDomain); err != nil {
-			return panelCertificateStatus{}, err
+		if err := fulfillCloudflareDNSAuthorization(ctx, client, cf, authorizationURL, settings.RouteDomain); err != nil {
+			return nil, err
 		}
 	}
 	readyOrder, err := client.WaitOrder(ctx, order.URI)
 	if err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("wait for ACME order: %w", err)
+		return nil, fmt.Errorf("wait for ACME order: %w", err)
 	}
 	certificateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("generate certificate key: %w", err)
+		return nil, fmt.Errorf("generate certificate key: %w", err)
 	}
-	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{wildcard}}, certificateKey)
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{wildcard, settings.PanelDomain}}, certificateKey)
 	if err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("create certificate request: %w", err)
+		return nil, fmt.Errorf("create certificate request: %w", err)
 	}
 	chain, _, err := client.CreateOrderCert(ctx, readyOrder.FinalizeURL, csr, true)
 	if err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("issue certificate: %w", err)
+		return nil, fmt.Errorf("issue certificate: %w", err)
 	}
 	certPEM := make([]byte, 0, len(chain)*1024)
 	for _, der := range chain {
@@ -224,16 +275,107 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(certificateKey)
 	if err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("encode certificate key: %w", err)
+		return nil, fmt.Errorf("encode certificate key: %w", err)
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := writePrivateFileAtomic(m.keyFile, keyPEM); err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("write certificate key: %w", err)
+	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("validate issued certificate pair: %w", err)
 	}
-	if err := writePrivateFileAtomic(m.certFile, certPEM); err != nil {
-		return panelCertificateStatus{}, fmt.Errorf("write certificate chain: %w", err)
+	return &issuedPanelCertificate{certPEM: certPEM, keyPEM: keyPEM, certificate: certificate}, nil
+}
+
+func (m *panelCertificateManager) install(issued *issuedPanelCertificate, activate bool) error {
+	if m == nil || issued == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return errors.New("issued panel certificate is unavailable")
 	}
-	return m.status(false), nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := writePrivateFileAtomic(m.keyFile, issued.keyPEM); err != nil {
+		return fmt.Errorf("write certificate key: %w", err)
+	}
+	if err := writePrivateFileAtomic(m.certFile, issued.certPEM); err != nil {
+		return fmt.Errorf("write certificate chain: %w", err)
+	}
+	if err := writePrivateFileAtomic(filepath.Join(m.accountDir, "enabled"), []byte("enabled\n")); err != nil {
+		return fmt.Errorf("write panel TLS enabled marker: %w", err)
+	}
+	if activate {
+		certificate := issued.certificate
+		m.currentCertificate = &certificate
+	}
+	return nil
+}
+
+func (m *panelCertificateManager) activate(issued *issuedPanelCertificate) {
+	if m == nil || issued == nil {
+		return
+	}
+	m.mu.Lock()
+	certificate := issued.certificate
+	m.currentCertificate = &certificate
+	m.mu.Unlock()
+}
+
+func readOptionalFile(filename string) ([]byte, bool, error) {
+	data, err := os.ReadFile(filename)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
+}
+
+func (m *panelCertificateManager) backupInstalledFiles() (installedPanelCertificateBackup, error) {
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return installedPanelCertificateBackup{}, errors.New("panel TLS certificate storage is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var backup installedPanelCertificateBackup
+	var err error
+	if backup.certPEM, backup.certExists, err = readOptionalFile(m.certFile); err != nil {
+		return installedPanelCertificateBackup{}, fmt.Errorf("back up certificate chain: %w", err)
+	}
+	if backup.keyPEM, backup.keyExists, err = readOptionalFile(m.keyFile); err != nil {
+		return installedPanelCertificateBackup{}, fmt.Errorf("back up certificate key: %w", err)
+	}
+	markerFile := filepath.Join(m.accountDir, "enabled")
+	if backup.marker, backup.markerExists, err = readOptionalFile(markerFile); err != nil {
+		return installedPanelCertificateBackup{}, fmt.Errorf("back up TLS marker: %w", err)
+	}
+	return backup, nil
+}
+
+func restoreOptionalFile(filename string, data []byte, existed bool) error {
+	if existed {
+		return writePrivateFileAtomic(filename, data)
+	}
+	err := os.Remove(filename)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (m *panelCertificateManager) restoreInstalledFiles(backup installedPanelCertificateBackup) error {
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return errors.New("panel TLS certificate storage is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := restoreOptionalFile(m.keyFile, backup.keyPEM, backup.keyExists); err != nil {
+		return fmt.Errorf("restore certificate key: %w", err)
+	}
+	if err := restoreOptionalFile(m.certFile, backup.certPEM, backup.certExists); err != nil {
+		return fmt.Errorf("restore certificate chain: %w", err)
+	}
+	if err := restoreOptionalFile(filepath.Join(m.accountDir, "enabled"), backup.marker, backup.markerExists); err != nil {
+		return fmt.Errorf("restore TLS marker: %w", err)
+	}
+	return nil
 }
 
 func loadOrCreateACMEAccountKey(directory, filename string) (crypto.Signer, error) {
