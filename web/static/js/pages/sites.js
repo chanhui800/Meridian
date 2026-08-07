@@ -850,6 +850,12 @@ function panelHTTPSPreview(panelDomain) {
 	return panelDomain ? `https://${panelDomain}${port && port !== '443' ? `:${port}` : ''}` : '—';
 }
 
+function panelDomainFromForm() {
+	const prefix = document.getElementById('m-panel-prefix').value.trim().replace(/^\*\./, '');
+	const wildcard = document.getElementById('m-wildcard-domain').value.trim().replace(/^\*\./, '');
+	return prefix && wildcard ? `${prefix}.${wildcard}` : '';
+}
+
 async function waitForPanelRestart(redirectURL) {
 	const deadline = Date.now() + 90000;
 	while (Date.now() < deadline) {
@@ -876,14 +882,14 @@ async function showPanelCertificateModal() {
 	document.getElementById('modal-body').innerHTML = `
 	  <div id="m-panel-certificate-status">${renderPanelCertificateStatus(status)}</div>
 	  <div class="form-group" style="margin-top:18px">
-	    <label>面板访问域名</label>
-	    <input type="text" class="form-input" id="m-panel-domain" maxlength="253" value="${esc(status.panel_domain || '')}" placeholder="panel.example.com" autocomplete="off">
-	    <div class="form-help">用于访问 Meridian 面板，必须是节点基础域名下的一层子域名。</div>
+	    <label>面板访问域名前缀</label>
+	    <input type="text" class="form-input" id="m-panel-prefix" maxlength="63" value="${esc(status.panel_prefix || '')}" placeholder="panel" autocomplete="off" autocapitalize="none" spellcheck="false">
+	    <div class="form-help">只需填写前缀，例如 <code>panel</code>，不要填写完整域名。</div>
 	  </div>
 	  <div class="form-group">
-	    <label>节点基础域名</label>
-	    <input type="text" class="form-input" id="m-route-domain" maxlength="253" value="${esc(status.route_domain || '')}" placeholder="example.com" autocomplete="off">
-	    <div class="form-help">节点可使用不同前缀访问，例如 movie.example.com；请提前将泛域名解析到本机。</div>
+	    <label>节点泛域名</label>
+	    <input type="text" class="form-input" id="m-wildcard-domain" maxlength="255" value="${esc(status.wildcard_domain || (status.route_domain ? `*.${status.route_domain}` : ''))}" placeholder="*.example.com" autocomplete="off" autocapitalize="none" spellcheck="false">
+	    <div class="form-help">仅使用泛域名申请证书，例如 <code>*.example.com</code>；请提前将泛域名解析到本机。</div>
 	  </div>
 	  <div class="form-group">
 	    <label>启用后的面板地址</label>
@@ -913,9 +919,10 @@ async function showPanelCertificateModal() {
 	  <button class="btn-modal primary" id="m-cert-submit" ${status.available === false || status.issuing ? 'disabled' : ''}>保存域名并申请证书</button>
 	`;
 	const refreshPreview = () => {
-		document.getElementById('m-panel-address-preview').textContent = panelHTTPSPreview(document.getElementById('m-panel-domain').value.trim());
+		document.getElementById('m-panel-address-preview').textContent = panelHTTPSPreview(panelDomainFromForm());
 	};
-	document.getElementById('m-panel-domain').addEventListener('input', refreshPreview);
+	document.getElementById('m-panel-prefix').addEventListener('input', refreshPreview);
+	document.getElementById('m-wildcard-domain').addEventListener('input', refreshPreview);
 	document.getElementById('m-cert-cancel').onclick = closeModal;
 	const restartButton = document.getElementById('m-cert-restart');
 	if (restartButton) restartButton.onclick = async () => {
@@ -936,14 +943,14 @@ async function showPanelCertificateModal() {
 		const button = document.getElementById('m-cert-submit');
 		const tokenInput = document.getElementById('m-acme-token');
 		const payload = {
-			panel_domain: document.getElementById('m-panel-domain').value.trim(),
-			route_domain: document.getElementById('m-route-domain').value.trim(),
+			panel_prefix: document.getElementById('m-panel-prefix').value.trim(),
+			wildcard_domain: document.getElementById('m-wildcard-domain').value.trim(),
 			email: document.getElementById('m-acme-email').value.trim(),
 			dns_provider: document.getElementById('m-acme-provider').value,
 			dns_api_token: tokenInput.value.trim(),
 			staging: document.getElementById('m-acme-staging').checked,
 		};
-		if (!payload.panel_domain || !payload.route_domain || !payload.email || !payload.dns_api_token) {
+		if (!payload.panel_prefix || !payload.wildcard_domain || !payload.email || !payload.dns_api_token) {
 			Toast.error('请完整填写域名、ACME 邮箱和 DNS API Token');
 			return;
 		}

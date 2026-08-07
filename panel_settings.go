@@ -15,6 +15,46 @@ type PanelSettings struct {
 	Configured  bool   `json:"-"`
 }
 
+// normalizeWildcardDomain accepts the UI form (*.example.com) and stores the
+// DNS suffix without the wildcard marker so routing code can continue to build
+// concrete hosts such as movie.example.com.
+func normalizeWildcardDomain(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "*.") {
+		value = strings.TrimPrefix(value, "*.")
+	}
+	return normalizeRouteDomain(value)
+}
+
+func normalizeManagedPanelPrefix(panelPrefix, wildcardDomain string) (PanelSettings, error) {
+	if !strings.HasPrefix(strings.TrimSpace(wildcardDomain), "*.") {
+		return PanelSettings{}, errors.New("节点泛域名必须以 *. 开头，例如 *.example.com")
+	}
+	routeDomain, err := normalizeWildcardDomain(wildcardDomain)
+	if err != nil {
+		return PanelSettings{}, fmt.Errorf("节点泛域名无效: %w", err)
+	}
+	prefix, err := normalizeRoutePrefix(panelPrefix)
+	if err != nil {
+		return PanelSettings{}, fmt.Errorf("面板访问域名前缀无效: %w", err)
+	}
+	return normalizeManagedPanelSettings(prefix+"."+routeDomain, routeDomain)
+}
+
+func panelPrefixForSettings(settings PanelSettings) string {
+	if prefix, ok := routePrefixFromConfiguredHost(settings.PanelDomain, settings.RouteDomain); ok {
+		return prefix
+	}
+	return ""
+}
+
+func wildcardDomainForSettings(settings PanelSettings) string {
+	if settings.RouteDomain == "" {
+		return ""
+	}
+	return "*." + settings.RouteDomain
+}
+
 func scanPanelSettings(scanner interface{ Scan(...any) error }) (PanelSettings, error) {
 	var settings PanelSettings
 	var tlsEnabled, configured int

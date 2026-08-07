@@ -39,7 +39,9 @@ type panelCertificateStatus struct {
 	Available       bool   `json:"available"`
 	TLSEnabled      bool   `json:"tls_enabled"`
 	PanelDomain     string `json:"panel_domain"`
+	PanelPrefix     string `json:"panel_prefix"`
 	RouteDomain     string `json:"route_domain"`
+	WildcardDomain  string `json:"wildcard_domain"`
 	Configured      bool   `json:"configured"`
 	Subject         string `json:"subject,omitempty"`
 	ExpiresAt       string `json:"expires_at,omitempty"`
@@ -124,7 +126,9 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 		Available:       m != nil && m.certFile != "" && m.keyFile != "",
 		TLSEnabled:      tlsEnabled,
 		PanelDomain:     settings.PanelDomain,
+		PanelPrefix:     panelPrefixForSettings(settings),
 		RouteDomain:     settings.RouteDomain,
+		WildcardDomain:  wildcardDomainForSettings(settings),
 		RestartRequired: settings.TLSEnabled != tlsEnabled || settings.PanelDomain != activePanelDomain || settings.RouteDomain != activeRouteDomain,
 	}
 	if m == nil {
@@ -243,7 +247,7 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	}
 
 	wildcard := "*." + settings.RouteDomain
-	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(wildcard, settings.PanelDomain))
+	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(wildcard))
 	if err != nil {
 		return nil, fmt.Errorf("create ACME order: %w", err)
 	}
@@ -261,7 +265,7 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	if err != nil {
 		return nil, fmt.Errorf("generate certificate key: %w", err)
 	}
-	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{wildcard, settings.PanelDomain}}, certificateKey)
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{wildcard}}, certificateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create certificate request: %w", err)
 	}

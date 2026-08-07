@@ -2736,13 +2736,15 @@ type SiteTraffic struct {
 // TrafficSnapshot is the single authoritative global traffic payload shared by
 // /api/dashboard, /api/traffic/overview and SSE events.
 type TrafficSnapshot struct {
-	TotalSites    int           `json:"total_sites"`
-	OnlineSites   int           `json:"online_sites"`
-	RunningSites  int           `json:"running_sites"`
-	TotalTraffic  int64         `json:"total_traffic"`
-	TotalRequests int64         `json:"total_requests"`
-	UptimeSeconds int64         `json:"uptime_seconds"`
-	LiveSites     []SiteTraffic `json:"live_sites"`
+	TotalSites     int           `json:"total_sites"`
+	OnlineSites    int           `json:"online_sites"`
+	RunningSites   int           `json:"running_sites"`
+	TotalTraffic   int64         `json:"total_traffic"`
+	TotalRequests  int64         `json:"total_requests"`
+	UptimeSeconds  int64         `json:"uptime_seconds"`
+	PanelDomain    string        `json:"panel_domain,omitempty"`
+	PanelAccessURL string        `json:"panel_access_url,omitempty"`
+	LiveSites      []SiteTraffic `json:"live_sites"`
 }
 
 // TrafficHistory is the single-site envelope returned by
@@ -14362,7 +14364,26 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusInternalServerError, "dashboard unavailable")
 		return
 	}
+	snap.PanelDomain = a.panelHost
+	snap.PanelAccessURL = a.panelAccessURL()
 	a.jsonOK(w, snap)
+}
+
+func (a *App) panelAccessURL() string {
+	if a == nil || a.panelHost == "" {
+		return ""
+	}
+	scheme := "http"
+	defaultPort := 80
+	if a.panelTLSEnabled {
+		scheme = "https"
+		defaultPort = 443
+	}
+	host := a.panelHost
+	if a.panelListenPort != defaultPort {
+		host = net.JoinHostPort(host, strconv.Itoa(a.panelListenPort))
+	}
+	return scheme + "://" + host
 }
 
 // GET /api/ingress-capabilities exposes only coarse deployment state so the
@@ -14401,6 +14422,10 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelTLSEnabled))
 	case http.MethodPost:
 		var req struct {
+			PanelPrefix    string `json:"panel_prefix"`
+			WildcardDomain string `json:"wildcard_domain"`
+			// Legacy names are accepted so an already-open older browser can
+			// finish one request while its cached frontend is being refreshed.
 			PanelDomain string `json:"panel_domain"`
 			RouteDomain string `json:"route_domain"`
 			Email       string `json:"email"`
@@ -14418,17 +14443,22 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
-		issued, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, req.PanelDomain, req.RouteDomain, req.UseStaging)
+		managedSettings, domainErr := normalizePanelCertificateDomains(req.PanelPrefix, req.WildcardDomain, req.PanelDomain, req.RouteDomain)
+		if domainErr != nil {
+			a.jsonErr(w, http.StatusBadRequest, domainErr.Error())
+			return
+		}
+		issued, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, managedSettings.PanelDomain, managedSettings.RouteDomain, req.UseStaging)
 		if err != nil {
 			status := http.StatusBadGateway
 			if errors.Is(err, errCertificateIssuanceBusy) {
 				status = http.StatusConflict
 			} else if validateErr := validatePanelCertificateRequest(req.Email, req.APIToken); validateErr != nil {
 				status = http.StatusBadRequest
-			} else if _, validateErr := normalizeManagedPanelSettings(req.PanelDomain, req.RouteDomain); validateErr != nil {
+			} else if _, validateErr := normalizeManagedPanelSettings(managedSettings.PanelDomain, managedSettings.RouteDomain); validateErr != nil {
 				status = http.StatusBadRequest
 			}
-			log.Printf("panel certificate request failed for %s: %v", strings.TrimSpace(req.RouteDomain), err)
+			log.Printf("panel certificate request failed for %s: %v", managedSettings.RouteDomain, err)
 			a.jsonErr(w, status, err.Error())
 			return
 		}
@@ -14444,7 +14474,7 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		settings, migrated, err := a.db.SaveManagedPanelSettings(req.PanelDomain, req.RouteDomain)
+		settings, migrated, err := a.db.SaveManagedPanelSettings(managedSettings.PanelDomain, managedSettings.RouteDomain)
 		if err != nil {
 			if restoreErr := a.panelCertificates.restoreInstalledFiles(backup); restoreErr != nil {
 				log.Printf("restore panel certificate after settings failure: %v", restoreErr)
@@ -14463,6 +14493,13 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func normalizePanelCertificateDomains(panelPrefix, wildcardDomain, legacyPanelDomain, legacyRouteDomain string) (PanelSettings, error) {
+	if strings.TrimSpace(panelPrefix) != "" || strings.TrimSpace(wildcardDomain) != "" {
+		return normalizeManagedPanelPrefix(panelPrefix, wildcardDomain)
+	}
+	return normalizeManagedPanelSettings(legacyPanelDomain, legacyRouteDomain)
 }
 
 func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
@@ -15401,6 +15438,8 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 	if err != nil {
 		return err
 	}
+	snap.PanelDomain = a.panelHost
+	snap.PanelAccessURL = a.panelAccessURL()
 
 	data, err := json.Marshal(snap)
 	if err != nil {
@@ -15416,7 +15455,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.12"
+var appVersion = "v1.8.13"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {

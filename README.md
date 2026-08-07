@@ -4,12 +4,12 @@
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
-当前发布版本：`v1.8.12`
+当前发布版本：`v1.8.13`
 
 ## 主要特点
 
 - 面板管理多个节点：新增、编辑、启停、延迟测试和运行诊断。
-- 两种入口：独立端口，或 `节点前缀.基础域名:面板端口` 的域名前缀入口。
+- 两种入口：独立端口，或 `节点前缀.泛域名:面板端口` 的域名前缀入口。
 - 自动发现后端并改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址，使后端切换后仍经过本站点代理。
 - 默认动态发现策略为 `compatible`，默认来源为 HTTP 30x 和 PlaybackInfo；HTTPS → HTTP 降级默认允许。
 - 对 localhost、回环、私网、链路本地和其他特殊目标执行拒绝，防止动态发现绕过目标安全边界。
@@ -17,6 +17,7 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 - 面板日志支持站点、资源分类、状态码、客户端 IP、UA、方法和路径检索，并可清理日志与缓存。
 - 每个节点独立配置缓存上限，按真实目标路径匹配并按最旧使用时间淘汰；视频流、音频流、HLS/DASH 清单和分片不会写入静态缓存。
 - TLS 页面直接申请泛域名证书，证书申请后可在页面点击“启用 HTTPS 并重启”。
+- 仪表盘实时显示当前完整面板访问地址。
 - Docker 和 Linux systemd 均支持健康检查、优雅停止和自动重启。
 
 ## 快速开始
@@ -67,24 +68,24 @@ sudo journalctl -u meridian -f
 https://movie.example.com:9090
 ```
 
-其中 `movie` 是节点前缀，`example.com` 是节点基础域名。面板本身使用单独的子域名，例如 `panel.example.com:9090`。
+其中 `movie` 是节点前缀，`*.example.com` 是节点泛域名。面板本身使用单独的子域名前缀，例如 `panel.example.com:9090`。
 
 ### 配置步骤
 
 1. 在 DNS 中将 `panel.example.com` 和 `*.example.com` 解析到 Meridian 服务器。
 2. 先用 HTTP 登录面板，进入“TLS 证书”。
-3. 填写“面板访问域名”（例如 `panel.example.com`）和“节点基础域名”（例如 `example.com`）。面板域名必须是基础域名下的一层子域名。
+3. 填写“面板访问域名前缀”（只填 `panel`）和“节点泛域名”（填写 `*.example.com`）。面板完整域名会自动拼接为 `panel.example.com`。
 4. 填写 ACME 邮箱、DNS 服务商和 DNS API Token，点击“保存域名并申请证书”。当前支持 Cloudflare DNS API Token。
 5. 证书签发成功后点击“启用 HTTPS 并重启”。重启会短暂中断面板和节点连接，Docker/systemd 会自动拉起新进程。
 6. 在站点管理中将入口模式设为“域名前缀”，为每个站点填写唯一的公开域名，例如 `movie.example.com`。
 
-证书包含 `*.example.com` 和 `panel.example.com`。域名和 TLS 状态保存在数据库中，后续不需要再修改 `.env`。旧版本环境中的 `PANEL_DOMAIN`、`PANEL_ROUTE_DOMAIN`、`PANEL_TLS_ENABLED` 只会在数据库尚未配置时导入一次，之后以面板设置为准。
+ACME 证书订单只申请 `*.example.com` 泛域名，不会重复提交 `panel.example.com`；泛域名证书可同时覆盖面板和一层节点域名。面板完整域名由“面板访问域名前缀”与泛域名自动拼接。域名和 TLS 状态保存在数据库中，后续不需要再修改 `.env`。旧版本环境中的 `PANEL_DOMAIN`、`PANEL_ROUTE_DOMAIN`、`PANEL_TLS_ENABLED` 只会在数据库尚未配置时导入一次，之后以面板设置为准。
 
 注意事项：
 
 - 泛域名 DNS 必须指向同一台 Meridian；Cloudflare 代理状态和防火墙规则应允许 9090 端口。
 - DNS API Token 只用于当前申请，不保存到数据库、证书文件或日志。
-- 修改基础域名会自动迁移已有的单层节点前缀；域名冲突会在保存前拒绝。
+- 修改泛域名会自动迁移已有的单层节点前缀；域名冲突会在保存前拒绝。
 - 证书申请需要服务器能够访问 ACME 和 DNS 服务；测试环境证书不应投入生产。
 
 ## 站点与动态发现
