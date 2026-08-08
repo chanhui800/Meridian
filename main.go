@@ -14749,7 +14749,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	client := requestClientKey(r, a.trustedProxies)
 	if allowed, retryAfter := a.limiter().allow(client, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Seconds()+0.5))))
-		a.jsonErr(w, http.StatusTooManyRequests, "登录尝试次数过多，请稍后重试")
+		a.jsonErr(w, http.StatusTooManyRequests, "too many login attempts; try again later")
 		return
 	}
 	if err := decodeJSONBody(w, r, &req); err != nil {
@@ -16075,7 +16075,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.23"
+var appVersion = "v1.8.22"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {

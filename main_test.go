@@ -1247,7 +1247,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.23", "/css/style.css?v=1.8.23", "/js/pages/sites.js?v=1.8.23", "/js/pages/request-logs.js?v=1.8.23", "/js/app.js?v=1.8.23"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.22", "/css/style.css?v=1.8.22", "/js/pages/sites.js?v=1.8.22", "/js/pages/request-logs.js?v=1.8.22", "/js/app.js?v=1.8.22"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -1980,41 +1980,6 @@ func TestLoginUsesGenericErrorsAndRateLimit(t *testing.T) {
 	}
 	if blocked.Header().Get("Retry-After") == "" {
 		t.Fatal("blocked login is missing Retry-After")
-	}
-	if got := mustStringValue(t, decodeBody(t, blocked), "error"); got != "登录尝试次数过多，请稍后重试" {
-		t.Fatalf("blocked login error=%q", got)
-	}
-}
-
-func TestSuccessfulLoginResetsFailureCount(t *testing.T) {
-	app := newTestApp(t)
-	if _, err := app.db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
-		t.Fatalf("CreateInitialUser: %v", err)
-	}
-
-	login := func(password string) *httptest.ResponseRecorder {
-		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(fmt.Sprintf(
-			`{"username":"admin","password":%q}`, password,
-		)))
-		req.RemoteAddr = "203.0.113.20:12345"
-		app.handleLogin(rr, req)
-		return rr
-	}
-
-	if got := login("wrong password").Code; got != http.StatusUnauthorized {
-		t.Fatalf("initial failed login status=%d", got)
-	}
-	if got := login("correct horse battery staple").Code; got != http.StatusOK {
-		t.Fatalf("successful login status=%d", got)
-	}
-	for i := 0; i < maxLoginFailures-1; i++ {
-		if got := login("wrong password").Code; got != http.StatusUnauthorized {
-			t.Fatalf("post-reset failure %d status=%d", i+1, got)
-		}
-	}
-	if got := login("correct horse battery staple").Code; got != http.StatusOK {
-		t.Fatalf("correct credentials were blocked after a reset: status=%d", got)
 	}
 }
 
