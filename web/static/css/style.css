@@ -257,6 +257,14 @@ input, select { font-family: inherit; }
 
 .btn-login:active { transform: scale(.98); }
 
+.login-security-note {
+  margin-top: 12px;
+  color: var(--white-38);
+  font-size: .75rem;
+  line-height: 1.55;
+  text-align: center;
+}
+
 .login-message {
   margin-top: 12px;
   padding: 10px 12px;

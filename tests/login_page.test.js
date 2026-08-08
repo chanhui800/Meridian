@@ -12,7 +12,7 @@ const css = fs.readFileSync(path.join(root, 'web', 'static', 'css', 'style.css')
 
 test('login errors remain visible while the application shell is hidden', () => {
   assert.match(html, /id="login-message"[^>]*role="alert"[^>]*aria-live="assertive"/);
-  assert.doesNotMatch(html, /login-security-note|密码连续输错 5 次将锁定登录 15 分钟；登录成功后会自动清零错误次数/);
+  assert.match(html, /密码连续输错 5 次将锁定登录 15 分钟；登录成功后会自动清零错误次数/);
   assert.match(
     html,
     /<\/div>\s*<!-- Toast must remain outside the hidden application shell so login errors are visible\. -->\s*<div id="toast-container"/,
