@@ -1247,15 +1247,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, snippet := range []string{`id="mobile-version"`, `id="mobile-logout"`} {
-		if !strings.Contains(string(indexHTML), snippet) {
-			t.Errorf("mobile header is missing %q", snippet)
-		}
-	}
-	if !strings.Contains(string(appJS), "document.getElementById('mobile-logout').addEventListener('click', logoutApp)") {
-		t.Error("mobile logout must share the authenticated logout flow")
-	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.4", "/css/style.css?v=1.8.4", "/js/pages/sites.js?v=1.8.4", "/js/pages/request-logs.js?v=1.8.4", "/js/app.js?v=1.8.4"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.21", "/css/style.css?v=1.8.21", "/js/pages/sites.js?v=1.8.21", "/js/pages/request-logs.js?v=1.8.21", "/js/app.js?v=1.8.21"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}

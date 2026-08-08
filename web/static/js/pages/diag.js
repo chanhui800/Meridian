@@ -2,21 +2,27 @@
 function renderDiag() {
   const page = document.getElementById('page-diagnostics');
   page.innerHTML = `
-    <h1 class="section-title fade-up">故障诊断</h1>
-    <p class="section-sub fade-up stagger-1">查看主回源、播放回源、上游证书和代理配置状态</p>
-    <div class="diag-toolbar fade-up stagger-1">
-      <select class="form-select" id="diag-select">
-        <option value="">加载中...</option>
-      </select>
-      <button class="btn-scan" id="btn-scan">开始诊断</button>
-    </div>
-    <div class="diag-grid" id="diag-grid">
-      <div class="diag-card diag-card-wide fade-up stagger-2">
-        <div class="diag-empty">选择站点后开始诊断</div>
-      </div>
+    <div class="settings-layout fade-up">
+      ${globalSettingsNav('diagnostics')}
+      <main class="settings-content">
+        <h1 class="section-title fade-up">故障诊断</h1>
+        <p class="section-sub fade-up stagger-1">查看主回源、播放回源、上游证书和代理配置状态</p>
+        <div class="diag-toolbar fade-up stagger-1">
+          <select class="form-select" id="diag-select">
+            <option value="">加载中...</option>
+          </select>
+          <button class="btn-scan" id="btn-scan">开始诊断</button>
+        </div>
+        <div class="diag-grid" id="diag-grid">
+          <div class="diag-card diag-card-wide fade-up stagger-2">
+            <div class="diag-empty">选择站点后开始诊断</div>
+          </div>
+        </div>
+      </main>
     </div>
   `;
 
+  bindGlobalSettingsNav(page);
   loadDiagSites();
   document.getElementById('btn-scan').onclick = runDiag;
 }

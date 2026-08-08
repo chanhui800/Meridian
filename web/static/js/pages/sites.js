@@ -13,14 +13,12 @@ function renderSites() {
       </button>
       <label class="sites-search"><span class="sr-only">搜索站点</span><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16" y1="16" x2="21" y2="21"/></svg><input id="sites-search" type="search" placeholder="搜索站点名称或回源地址"></label>
       <button class="btn-ghost btn-test-all" id="btn-test-all-sites"><span aria-hidden="true">⌁</span> 全部测速</button>
-	  <button class="btn-ghost" id="btn-panel-certificate">TLS 证书</button>
     </div>
     <div class="sites-grid" id="sites-grid"></div>
   `;
 
   document.getElementById('btn-add-site').onclick = () => showSiteModal();
   document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
-  document.getElementById('btn-panel-certificate').onclick = showPanelCertificateModal;
   document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
   loadSites();
 }

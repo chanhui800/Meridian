@@ -1354,6 +1354,8 @@ type requestLogEvent struct {
 	ResourceCategory string
 	StatusCode       int
 	ClientIP         string
+	InboundColo      string
+	OutboundColo     string
 	UserAgent        string
 	Method           string
 	Path             string
@@ -1367,6 +1369,8 @@ type RequestLog struct {
 	StatusCode       int    `json:"status_code"`
 	ClientIP         string `json:"client_ip"`
 	ClientRegion     string `json:"client_region"`
+	InboundColo      string `json:"inbound_colo"`
+	OutboundColo     string `json:"outbound_colo"`
 	UserAgent        string `json:"user_agent"`
 	Method           string `json:"method"`
 	Path             string `json:"path"`
@@ -1476,6 +1480,7 @@ type queuedDynamicObservation struct {
 type queuedRequestLog struct {
 	event        requestLogEvent
 	recordedAtMS int64
+	timelineAtMS int64
 }
 
 type dynamicObservationCommandKind uint8
@@ -1507,6 +1512,7 @@ type DB struct {
 	dynamicObservationClosed    atomic.Bool
 	droppedDynamicObservations  atomic.Uint64
 	droppedRequestLogs          atomic.Uint64
+	systemSettings              atomic.Pointer[SystemSettings]
 }
 
 func openDB(path string) (*DB, error) {
@@ -1521,6 +1527,13 @@ func openDB(path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
+	settings, err := d.loadSystemSettings()
+	if err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("load system settings: %w", err)
+	}
+	d.systemSettings.Store(&settings)
+	configureProbeClient(time.Duration(settings.ProbeTimeoutMS) * time.Millisecond)
 	if err := hardenDatabaseFilePermissions(path); err != nil {
 		sqlDB.Close()
 		return nil, err
@@ -1644,17 +1657,51 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	if d == nil {
 		return
 	}
-	if event.SiteID <= 0 || !validRequestLogCategory(event.ResourceCategory) || event.StatusCode < 100 || event.StatusCode > 599 ||
-		event.SiteName == "" || len(event.SiteName) > requestLogMaxSiteNameBytes || event.ClientIP == "" || len(event.ClientIP) > requestLogMaxClientIPBytes ||
+	settings := d.currentSystemSettings()
+	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode < 400) ||
+		(!settings.LogWriteImage && event.ResourceCategory == requestLogCategoryImage) ||
+		(!settings.LogWriteMetadata && event.ResourceCategory == requestLogCategoryPlayback) ||
+		(!settings.LogWriteVideo && event.ResourceCategory == requestLogCategoryVideo) ||
+		(!settings.LogWriteAPI && event.ResourceCategory == requestLogCategoryAPI) ||
+		(!settings.LogWriteAuth && event.ResourceCategory == requestLogCategoryAuth) {
+		return
+	}
+	if !settings.LogWriteClientIP {
+		event.ClientIP = ""
+	}
+	if !settings.LogWriteUA {
+		event.UserAgent = ""
+	}
+	if !settings.LogWriteNode {
+		event.SiteName = ""
+	}
+	if !settings.LogWriteCategory {
+		event.ResourceCategory = ""
+	}
+	if !settings.LogWriteStatus {
+		event.StatusCode = 0
+	}
+	if !settings.LogWriteColo {
+		event.InboundColo, event.OutboundColo = "", ""
+	}
+	if event.SiteID <= 0 || event.ResourceCategory != "" && !validRequestLogCategory(event.ResourceCategory) ||
+		event.StatusCode != 0 && (event.StatusCode < 100 || event.StatusCode > 599) ||
+		len(event.SiteName) > requestLogMaxSiteNameBytes || len(event.ClientIP) > requestLogMaxClientIPBytes ||
 		len(event.UserAgent) > requestLogMaxUserAgentBytes || event.Method == "" || len(event.Method) > 16 || event.Path == "" || len(event.Path) > requestLogMaxPathBytes {
 		d.droppedRequestLogs.Add(1)
 		return
+	}
+	nowMS := time.Now().UnixMilli()
+	timelineAtMS := int64(0)
+	if settings.LogWriteTimeline {
+		timelineAtMS = nowMS
 	}
 	command := dynamicObservationCommand{
 		kind: dynamicObservationCommandRequestLogWrite,
 		requestLog: queuedRequestLog{
 			event:        event,
-			recordedAtMS: time.Now().UnixMilli(),
+			recordedAtMS: nowMS,
+			timelineAtMS: timelineAtMS,
 		},
 	}
 	if !d.dynamicObservationGate.TryRLock() {
@@ -1763,7 +1810,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 			args = append(args, filter.Query)
 		}
 	}
-	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.method, request_logs.path, request_logs.recorded_at_ms FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
+	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.method, request_logs.path, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- conditions are fixed SQL fragments selected from validated filters; values remain parameters.
 	}
@@ -1777,10 +1824,22 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	logs := make([]RequestLog, 0)
 	for rows.Next() {
 		var entry RequestLog
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.Method, &entry.Path, &entry.RecordedAtMS); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
 			return nil, err
 		}
 		logs = append(logs, entry)
+	}
+	settings := d.currentSystemSettings()
+	for i := range logs {
+		if !settings.LogDisplayClientIP {
+			logs[i].ClientIP = "hidden"
+		}
+		if !settings.LogDisplayUA {
+			logs[i].UserAgent = "hidden"
+		}
+		if !settings.LogDisplayColo {
+			logs[i].InboundColo, logs[i].OutboundColo = "hidden", "hidden"
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1889,10 +1948,15 @@ func (d *DB) runDynamicObservationWriter() {
 			continue
 		}
 		if command.kind == dynamicObservationCommandRequestLogWrite {
+			requestSettings := d.currentSystemSettings()
+			requestBatchLimit := requestSettings.LogBatchSize
+			if requestBatchLimit < 1 || requestBatchLimit > requestLogBatchSize {
+				requestBatchLimit = requestLogBatchSize
+			}
 			requestBatch = requestBatch[:0]
 			requestBatch = append(requestBatch, command.requestLog)
 		drainRequestBatch:
-			for len(requestBatch) < requestLogBatchSize {
+			for len(requestBatch) < requestBatchLimit {
 				select {
 				case next := <-d.dynamicObservationQueue:
 					if next.kind != dynamicObservationCommandRequestLogWrite {
@@ -1906,6 +1970,10 @@ func (d *DB) runDynamicObservationWriter() {
 				}
 			}
 			skipped, err := d.writeRequestLogBatch(requestBatch)
+			for attempt := 0; err != nil && attempt < requestSettings.LogRetryCount; attempt++ {
+				time.Sleep(time.Duration(requestSettings.LogRetryBackoffMS) * time.Millisecond)
+				skipped, err = d.writeRequestLogBatch(requestBatch)
+			}
 			if err != nil {
 				d.droppedRequestLogs.Add(uint64(len(requestBatch)))
 				log.Printf("[request-logs] optional batch write failed: %v", err)
@@ -2067,8 +2135,8 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 	defer tx.Rollback()
 	statement, err := tx.Prepare(`
 		INSERT INTO request_logs
-			(site_id, site_name, resource_category, status_code, client_ip, user_agent, method, path, recorded_at_ms)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+			(site_id, site_name, resource_category, status_code, client_ip, user_agent, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM sites WHERE id=?)`)
 	if err != nil {
 		return 0, err
@@ -2084,9 +2152,12 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 			event.StatusCode,
 			event.ClientIP,
 			event.UserAgent,
+			event.InboundColo,
+			event.OutboundColo,
 			event.Method,
 			event.Path,
 			queued.recordedAtMS,
+			queued.timelineAtMS,
 			event.SiteID,
 		)
 		if err != nil {
@@ -2100,7 +2171,7 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 			skipped++
 		}
 	}
-	if err := pruneRequestLogsTx(tx, time.Now()); err != nil {
+	if err := pruneRequestLogsTx(tx, time.Now(), time.Duration(d.currentSystemSettings().LogRetentionDays)*24*time.Hour); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -2109,8 +2180,8 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 	return skipped, nil
 }
 
-func pruneRequestLogsTx(tx *sql.Tx, now time.Time) error {
-	cutoffMS := now.Add(-requestLogRetention).UnixMilli()
+func pruneRequestLogsTx(tx *sql.Tx, now time.Time, retention time.Duration) error {
+	cutoffMS := now.Add(-retention).UnixMilli()
 	if _, err := tx.Exec("DELETE FROM request_logs WHERE recorded_at_ms<?", cutoffMS); err != nil {
 		return err
 	}
@@ -2130,7 +2201,7 @@ func (d *DB) pruneRequestLogs() error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := pruneRequestLogsTx(tx, time.Now()); err != nil {
+	if err := pruneRequestLogsTx(tx, time.Now(), time.Duration(d.currentSystemSettings().LogRetentionDays)*24*time.Hour); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2253,9 +2324,12 @@ func (d *DB) migrateOnce() error {
 		status_code INTEGER NOT NULL,
 		client_ip TEXT NOT NULL,
 		user_agent TEXT NOT NULL,
+		inbound_colo TEXT NOT NULL DEFAULT '',
+		outbound_colo TEXT NOT NULL DEFAULT '',
 		method TEXT NOT NULL,
 		path TEXT NOT NULL,
-		recorded_at_ms INTEGER NOT NULL
+		recorded_at_ms INTEGER NOT NULL,
+		timeline_at_ms INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(recorded_at_ms DESC, id DESC);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_category_status ON request_logs(resource_category, status_code, recorded_at_ms DESC);
@@ -2269,6 +2343,39 @@ func (d *DB) migrateOnce() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO panel_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS telegram_report_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		enabled INTEGER NOT NULL DEFAULT 0,
+		bot_token_ciphertext TEXT NOT NULL DEFAULT '',
+		chat_id TEXT NOT NULL DEFAULT '',
+		schedule_time TEXT NOT NULL DEFAULT '20:00',
+		frequency TEXT NOT NULL DEFAULT 'daily',
+		weekday INTEGER NOT NULL DEFAULT 1,
+		last_sent_key TEXT NOT NULL DEFAULT '',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	INSERT OR IGNORE INTO telegram_report_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS system_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		ui_mode TEXT NOT NULL DEFAULT 'novice', ui_radius INTEGER NOT NULL DEFAULT 10,
+		probe_timeout_ms INTEGER NOT NULL DEFAULT 5000, ping_cache_minutes INTEGER NOT NULL DEFAULT 10,
+		schedule_timezone_offset INTEGER NOT NULL DEFAULT 480,
+		log_enabled INTEGER NOT NULL DEFAULT 1, log_level TEXT NOT NULL DEFAULT 'info',
+		log_retention_days INTEGER NOT NULL DEFAULT 30, log_write_delay_minutes INTEGER NOT NULL DEFAULT 0,
+		log_flush_threshold INTEGER NOT NULL DEFAULT 1, log_batch_size INTEGER NOT NULL DEFAULT 50,
+		log_retry_count INTEGER NOT NULL DEFAULT 2, log_retry_backoff_ms INTEGER NOT NULL DEFAULT 75,
+		log_task_lease_ms INTEGER NOT NULL DEFAULT 300000,
+		log_write_image INTEGER NOT NULL DEFAULT 0, log_write_metadata INTEGER NOT NULL DEFAULT 0,
+		log_write_video INTEGER NOT NULL DEFAULT 1, log_write_api INTEGER NOT NULL DEFAULT 1, log_write_auth INTEGER NOT NULL DEFAULT 1,
+		log_write_node INTEGER NOT NULL DEFAULT 1, log_write_category INTEGER NOT NULL DEFAULT 1, log_write_status INTEGER NOT NULL DEFAULT 1,
+		log_write_client_ip INTEGER NOT NULL DEFAULT 1, log_write_colo INTEGER NOT NULL DEFAULT 0,
+		log_write_ua INTEGER NOT NULL DEFAULT 1, log_write_timeline INTEGER NOT NULL DEFAULT 1, log_display_client_ip INTEGER NOT NULL DEFAULT 1,
+		log_display_colo INTEGER NOT NULL DEFAULT 0, log_display_ua INTEGER NOT NULL DEFAULT 1,
+		log_display_node INTEGER NOT NULL DEFAULT 1, log_display_category INTEGER NOT NULL DEFAULT 1,
+		log_display_status INTEGER NOT NULL DEFAULT 1, log_display_timeline INTEGER NOT NULL DEFAULT 1,
+		log_search_mode TEXT NOT NULL DEFAULT 'like', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	INSERT OR IGNORE INTO system_settings (id) VALUES (1);
 	`); err != nil {
 		return err
 	}
@@ -2313,8 +2420,57 @@ func (d *DB) migrateOnce() error {
 			}
 		}
 	}
+	for _, migration := range []struct{ column, sql string }{
+		{"log_write_video", "ALTER TABLE system_settings ADD COLUMN log_write_video INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_api", "ALTER TABLE system_settings ADD COLUMN log_write_api INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_auth", "ALTER TABLE system_settings ADD COLUMN log_write_auth INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_node", "ALTER TABLE system_settings ADD COLUMN log_write_node INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_category", "ALTER TABLE system_settings ADD COLUMN log_write_category INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_status", "ALTER TABLE system_settings ADD COLUMN log_write_status INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_timeline", "ALTER TABLE system_settings ADD COLUMN log_write_timeline INTEGER NOT NULL DEFAULT 1"},
+		{"log_display_node", "ALTER TABLE system_settings ADD COLUMN log_display_node INTEGER NOT NULL DEFAULT 1"},
+		{"log_display_category", "ALTER TABLE system_settings ADD COLUMN log_display_category INTEGER NOT NULL DEFAULT 1"},
+		{"log_display_status", "ALTER TABLE system_settings ADD COLUMN log_display_status INTEGER NOT NULL DEFAULT 1"},
+		{"log_display_timeline", "ALTER TABLE system_settings ADD COLUMN log_display_timeline INTEGER NOT NULL DEFAULT 1"},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('system_settings') WHERE name=?", migration.column).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
 	if err := ensurePanelSettingsListenPortSchema(ctx, conn); err != nil {
 		return err
+	}
+	for _, migration := range []struct{ column, sql string }{
+		{"inbound_colo", "ALTER TABLE request_logs ADD COLUMN inbound_colo TEXT NOT NULL DEFAULT ''"},
+		{"outbound_colo", "ALTER TABLE request_logs ADD COLUMN outbound_colo TEXT NOT NULL DEFAULT ''"},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name=?", migration.column).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	var hasTimelineColumn int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name='timeline_at_ms'").Scan(&hasTimelineColumn); err != nil {
+		return err
+	}
+	if hasTimelineColumn == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE request_logs ADD COLUMN timeline_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "UPDATE request_logs SET timeline_at_ms=recorded_at_ms"); err != nil {
+			return err
+		}
 	}
 	// public_host was introduced before ingress_mode on the unreleased Issue #28
 	// branch. Migrate those rows to the secure host-only behavior instead of
@@ -10820,9 +10976,11 @@ func newRequestLogEvent(site Site, r *http.Request, trustedProxies []*net.IPNet)
 	method := http.MethodGet
 	userAgent := ""
 	clientIP := "unknown"
+	inboundColo := ""
 	if r != nil {
 		method = strings.ToUpper(strings.TrimSpace(r.Method))
 		userAgent = r.Header.Get("User-Agent")
+		inboundColo = requestLogColo(r.Header.Get("CF-Ray"))
 		if r.URL != nil && r.URL.EscapedPath() != "" {
 			path = r.URL.EscapedPath()
 		}
@@ -10838,10 +10996,29 @@ func newRequestLogEvent(site Site, r *http.Request, trustedProxies []*net.IPNet)
 		SiteName:         requestLogSafeText(site.Name, requestLogMaxSiteNameBytes),
 		ResourceCategory: classifyRequestLogResource(r),
 		ClientIP:         clientIP,
+		InboundColo:      inboundColo,
 		UserAgent:        requestLogSafeText(userAgent, requestLogMaxUserAgentBytes),
 		Method:           requestLogSafeText(method, 16),
 		Path:             requestLogSafeText(path, requestLogMaxPathBytes),
 	}
+}
+
+func requestLogColo(cfRay string) string {
+	cfRay = strings.TrimSpace(cfRay)
+	index := strings.LastIndexByte(cfRay, '-')
+	if index < 0 || index == len(cfRay)-1 {
+		return ""
+	}
+	colo := strings.ToUpper(strings.TrimSpace(cfRay[index+1:]))
+	if len(colo) < 3 || len(colo) > 8 {
+		return ""
+	}
+	for _, char := range colo {
+		if char < 'A' || char > 'Z' {
+			return ""
+		}
+	}
+	return colo
 }
 
 type requestLogResponseWriter struct {
@@ -12702,6 +12879,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies)
 		defer func() {
 			requestLogEntry.StatusCode = requestLogWriter.StatusCode()
+			requestLogEntry.OutboundColo = requestLogColo(requestLogWriter.Header().Get("CF-Ray"))
 			pm.database.EnqueueRequestLog(requestLogEntry)
 		}()
 		w = requestLogWriter
@@ -13536,11 +13714,13 @@ func probeStatusRank(status int) int {
 // called, so each run stranded upstream sockets along with their read and write
 // goroutines. DefaultTransport.Clone() brings a 90s IdleConnTimeout, matching
 // what StartSite already does for the proxy transport.
-var probeClient = func() *http.Client {
+var probeClientMu sync.RWMutex
+
+func newProbeClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = secureTLSConfig("")
 	return &http.Client{
-		Timeout:   5 * time.Second,
+		Timeout:   timeout,
 		Transport: transport,
 		// Diagnostics must never become an internal scanner: a configured
 		// upstream that answers with a redirect is only allowed to point back
@@ -13557,10 +13737,29 @@ var probeClient = func() *http.Client {
 			return nil
 		},
 	}
-}()
+}
+
+var probeClient = newProbeClient(5 * time.Second)
+
+func configureProbeClient(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	probeClientMu.Lock()
+	previous := probeClient
+	probeClient = newProbeClient(timeout)
+	probeClientMu.Unlock()
+	if previous != nil && previous.Transport != nil {
+		if transport, ok := previous.Transport.(interface{ CloseIdleConnections() }); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+}
 
 func probeTargetHealth(plan diagProbePlan) DiagHealth {
+	probeClientMu.RLock()
 	client := probeClient
+	probeClientMu.RUnlock()
 	var bestReachable DiagHealth
 	bestReachableRank := 0
 	var serverError DiagHealth
@@ -15733,7 +15932,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.16"
+var appVersion = "v1.8.21"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -15986,6 +16185,7 @@ func main() {
 			}
 		}
 	}()
+	go runTelegramReportScheduler(ctx, db)
 
 	if panelHost != "" {
 		if _, configured := pm.PublicHostHandler(panelHost); configured {
@@ -16019,6 +16219,8 @@ func main() {
 
 	// Protected routes
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
+	mux.HandleFunc("/api/dashboard-insights", cors(app.authMiddleware(app.handleDashboardInsights)))
+	mux.HandleFunc("/api/system-settings", cors(app.authMiddleware(app.handleSystemSettings)))
 	mux.HandleFunc("/api/ingress-capabilities", cors(app.authMiddleware(app.handleIngressCapabilities)))
 	mux.HandleFunc("/api/panel-certificate", cors(app.authMiddleware(app.handlePanelCertificate)))
 	mux.HandleFunc("/api/panel-settings", cors(app.authMiddleware(app.handlePanelSettings)))
@@ -16029,6 +16231,7 @@ func main() {
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
 	mux.HandleFunc("/api/asset-cache", cors(app.authMiddleware(app.handleAssetCache)))
 	mux.HandleFunc("/api/request-logs", cors(app.authMiddleware(app.handleRequestLogs)))
+	mux.HandleFunc("/api/telegram-report", cors(app.authMiddleware(app.handleTelegramReport)))
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
 	mux.HandleFunc("/api/dynamic-profiles", cors(app.authMiddleware(app.handleDynamicProfiles)))
 	mux.HandleFunc("/api/events", cors(app.authMiddleware(app.handleSSE)))

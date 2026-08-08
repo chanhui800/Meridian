@@ -55,6 +55,9 @@ const API = {
 
   // Dashboard
   dashboard() { return this.request('GET', '/api/dashboard'); },
+  dashboardInsights() { return this.request('GET', '/api/dashboard-insights'); },
+  getSystemSettings() { return this.request('GET', '/api/system-settings'); },
+  saveSystemSettings(data) { return this.request('POST', '/api/system-settings', data); },
 
   // Sites
   ingressCapabilities() { return this.request('GET', '/api/ingress-capabilities'); },
@@ -84,6 +87,10 @@ const API = {
     return this.request('GET', '/api/request-logs' + (query ? '?' + query : ''));
   },
   clearRequestLogs() { return this.request('DELETE', '/api/request-logs'); },
+
+  // Telegram daily report
+  getTelegramReportSettings() { return this.request('GET', '/api/telegram-report'); },
+  saveTelegramReportSettings(data) { return this.request('POST', '/api/telegram-report', data); },
 
   // Asset cache
   getAssetCache() { return this.request('GET', '/api/asset-cache'); },

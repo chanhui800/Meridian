@@ -6,15 +6,10 @@
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.8.0">
-<script src="/js/theme.js?v=1.8.4"></script>
-<link rel="stylesheet" href="/css/style.css?v=1.8.4">
+<script src="/js/theme.js?v=1.8.21"></script>
+<link rel="stylesheet" href="/css/style.css?v=1.8.21">
 </head>
 <body class="auth-checking">
-
-<button class="theme-toggle theme-toggle-floating" id="theme-toggle" type="button" aria-label="切换到白色背景" aria-pressed="false" title="切换到白色背景">
-  <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></svg>
-  <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.2A8.5 8.5 0 0 1 8.8 3.8a8.5 8.5 0 1 0 11.4 11.4z"/></svg>
-</button>
 
 <!-- Login Page -->
 <div id="page-login">
@@ -51,7 +46,7 @@
     <div class="sidebar-brand">
       <img src="/favicon.svg" alt="" class="sidebar-logo">
       <span class="sidebar-brand-name">Meridian</span>
-      <span class="sidebar-version" id="sidebar-version">v1.8.0</span>
+      <span class="sidebar-version" id="sidebar-version">v1.8.21</span>
     </div>
     <nav class="sidebar-nav" aria-label="功能菜单">
       <a href="#dashboard" class="topnav-link active" data-page="dashboard" title="仪表盘">
@@ -70,9 +65,9 @@
         <svg viewBox="0 0 24 24"><line x1="5" y1="19" x2="5" y2="10"/><line x1="12" y1="19" x2="12" y2="5"/><line x1="19" y1="19" x2="19" y2="13"/></svg>
         <span>流量统计</span>
       </a>
-      <a href="#diagnostics" class="topnav-link" data-page="diagnostics" title="故障诊断">
-        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
-        <span>故障诊断</span>
+      <a href="#global-settings" class="topnav-link global-settings-link" data-page="global-settings" title="全局设置">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.74v.5a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>
+        <span>全局设置</span>
       </a>
     </nav>
     <button class="sidebar-account" id="avatar-btn" type="button" aria-label="退出登录" title="退出登录">
@@ -99,11 +94,13 @@
         <p id="app-page-subtitle">反代服务运行概览</p>
       </div>
     </div>
-    <div class="mobile-account" aria-label="账户信息">
-      <span class="mobile-version" id="mobile-version">v1.8.0</span>
-      <button class="mobile-logout" id="mobile-logout" type="button" aria-label="退出登录" title="退出登录">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/><path d="M14 4h5a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-5"/></svg>
-        <span>退出</span>
+    <div class="app-header-actions">
+      <a class="github-project-link" href="https://github.com/chanhui800/Meridian" target="_blank" rel="noopener noreferrer" aria-label="打开 Meridian GitHub 项目" title="GitHub 项目">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.86c-2.78.6-3.37-1.18-3.37-1.18-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.64-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02A9.58 9.58 0 0 1 12 6.84a9.6 9.6 0 0 1 2.5.34c1.9-1.29 2.74-1.02 2.74-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.86v2.75c0 .27.18.58.69.48A10 10 0 0 0 12 2z"/></svg>
+      </a>
+      <button class="theme-toggle theme-toggle-header" id="theme-toggle" type="button" aria-label="切换到白色背景" aria-pressed="false" title="切换到白色背景">
+        <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.2A8.5 8.5 0 0 1 8.8 3.8a8.5 8.5 0 1 0 11.4 11.4z"/></svg>
       </button>
     </div>
   </header>
@@ -115,33 +112,10 @@
     <div id="page-traffic" class="page"></div>
     <div id="page-diagnostics" class="page"></div>
     <div id="page-request-logs" class="page"></div>
+    <div id="page-telegram-report" class="page"></div>
+    <div id="page-settings-tls" class="page"></div>
+    <div id="page-global-settings" class="page"></div>
   </div>
-
-  <!-- Mobile Bottom Bar -->
-  <nav class="mobile-bar">
-    <div class="mobile-bar-inner">
-      <a href="#dashboard" class="mobile-tab active" data-page="dashboard">
-        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-        仪表盘
-      </a>
-      <a href="#sites" class="mobile-tab" data-page="sites">
-        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        站点
-      </a>
-      <a href="#traffic" class="mobile-tab" data-page="traffic">
-        <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        流量
-      </a>
-      <a href="#diagnostics" class="mobile-tab" data-page="diagnostics">
-        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        诊断
-      </a>
-      <a href="#request-logs" class="mobile-tab" data-page="request-logs">
-        <svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><line x1="7" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="7" y1="16" x2="14" y2="16"/></svg>
-        日志
-      </a>
-    </div>
-  </nav>
 
   <!-- Modal -->
   <div class="modal-overlay" id="modal-overlay" aria-hidden="true">
@@ -160,14 +134,16 @@
 
 </div>
 
-<script src="/js/api.js?v=1.8.4"></script>
-<script src="/js/toast.js?v=1.8.4"></script>
-<script src="/js/router.js?v=1.8.4"></script>
-<script src="/js/pages/dashboard.js?v=1.8.4"></script>
-<script src="/js/pages/sites.js?v=1.8.4"></script>
-<script src="/js/pages/traffic.js?v=1.8.4"></script>
-<script src="/js/pages/diag.js?v=1.8.4"></script>
-<script src="/js/pages/request-logs.js?v=1.8.4"></script>
-<script src="/js/app.js?v=1.8.4"></script>
+<script src="/js/api.js?v=1.8.21"></script>
+<script src="/js/toast.js?v=1.8.21"></script>
+<script src="/js/router.js?v=1.8.21"></script>
+<script src="/js/pages/dashboard.js?v=1.8.21"></script>
+<script src="/js/pages/sites.js?v=1.8.21"></script>
+<script src="/js/pages/traffic.js?v=1.8.21"></script>
+<script src="/js/pages/diag.js?v=1.8.21"></script>
+<script src="/js/pages/request-logs.js?v=1.8.21"></script>
+<script src="/js/pages/telegram-report.js?v=1.8.21"></script>
+<script src="/js/pages/global-settings.js?v=1.8.21"></script>
+<script src="/js/app.js?v=1.8.21"></script>
 </body>
 </html>
