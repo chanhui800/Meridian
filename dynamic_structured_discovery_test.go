@@ -1049,7 +1049,9 @@ func TestRelativePlaybackInfoVendorRedirectStaysOnProxyEndToEnd(t *testing.T) {
 
 func TestFailedDynamicSiteStartClosesRuntimeState(t *testing.T) {
 	app := newTestApp(t)
-	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	// Match StartSite's wildcard listener exactly. On Windows, occupying only
+	// 127.0.0.1 can still allow a separate ":port" listener to bind.
+	occupied, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("occupy listener: %v", err)
 	}

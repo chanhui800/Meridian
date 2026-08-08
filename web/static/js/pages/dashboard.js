@@ -1,6 +1,8 @@
 let dashSSE = null;
 let dashAbortController = null;
 let dashRetryTimer = null;
+let dashboardTrendValues = [];
+let dashboardTrendResizeObserver = null;
 
 function renderDashboard() {
   const page = document.getElementById('page-dashboard');
@@ -59,10 +61,67 @@ function renderDashboard() {
         </table>
       </div>
     </div>
+    <div class="dashboard-insights-grid fade-up stagger-5">
+      <section class="dashboard-insight-card" id="dashboard-log-health"><div class="dashboard-insight-head"><h2>日志写入</h2><span class="dashboard-health-dot"></span></div><p>正在读取…</p></section>
+      <section class="dashboard-insight-card" id="dashboard-schedule-health"><div class="dashboard-insight-head"><h2>定时任务</h2><span class="dashboard-health-dot"></span></div><p>正在读取…</p></section>
+    </div>
+    <section class="dashboard-trend-card fade-up stagger-5"><div class="glass-card-header"><div class="glass-card-title">请求趋势</div></div><div class="dashboard-trend-wrap"><canvas id="dashboardRequestTrend" height="230"></canvas></div></section>
   `;
 
+  observeDashboardTrendResize();
   startDashSSE();
   loadDashboardTable();
+  loadDashboardInsights();
+}
+
+async function loadDashboardInsights() {
+  try {
+    const insights = await API.dashboardInsights();
+    if (!insights || Router.current !== 'dashboard') return;
+    const log = document.querySelector('#dashboard-log-health p');
+    const schedule = document.querySelector('#dashboard-schedule-health p');
+    if (log) log.textContent = insights.log_healthy ? `最近写入 ${insights.log_count_today || 0} 条，队列丢弃 ${insights.dropped_logs || 0} 条` : '已关闭';
+    if (schedule) schedule.textContent = insights.schedule_enabled ? `${insights.schedule_label || '已启用'}` : '未启用';
+    drawDashboardTrend(insights.hourly_requests || []);
+  } catch (error) {
+    console.warn('Dashboard insights load error', error);
+  }
+}
+
+function drawDashboardTrend(values) {
+  dashboardTrendValues = Array.isArray(values) ? values.map(value => Math.max(0, Number(value) || 0)) : [];
+  const canvas = document.getElementById('dashboardRequestTrend');
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext('2d');
+  const width = canvas.clientWidth || canvas.parentElement?.clientWidth || 800;
+  const height = Math.max(180, Math.round(canvas.clientHeight || 230));
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = width * ratio; canvas.height = height * ratio;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const max = Math.max(1, ...dashboardTrendValues);
+  const left = 36, right = 14, top = 16, bottom = 28;
+  const plotW = width - left - right, plotH = height - top - bottom;
+  ctx.strokeStyle = 'rgba(100,116,139,.18)'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const y = top + plotH * i / 4; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke(); }
+  const points = dashboardTrendValues.map((value, index) => ({ x: left + plotW * index / Math.max(1, dashboardTrendValues.length - 1), y: top + plotH * (1 - value / max) }));
+  ctx.beginPath(); points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+  ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.font = '12px system-ui'; ctx.fillStyle = '#64748b'; ctx.textAlign = 'center';
+  for (let i = 0; i < 24; i += 2) ctx.fillText(`${String(i).padStart(2, '0')}:00`, left + plotW * i / 23, height - 8);
+}
+
+function observeDashboardTrendResize() {
+  if (dashboardTrendResizeObserver) {
+    dashboardTrendResizeObserver.disconnect();
+    dashboardTrendResizeObserver = null;
+  }
+  const wrap = document.querySelector('.dashboard-trend-wrap');
+  if (!wrap || typeof ResizeObserver !== 'function') return;
+  dashboardTrendResizeObserver = new ResizeObserver(() => {
+    if (Router.current === 'dashboard') drawDashboardTrend(dashboardTrendValues);
+  });
+  dashboardTrendResizeObserver.observe(wrap);
 }
 
 function startDashSSE() {
@@ -179,6 +238,10 @@ function animateValue(id, newVal) {
 }
 
 function stopDashSSE() {
+  if (dashboardTrendResizeObserver) {
+    dashboardTrendResizeObserver.disconnect();
+    dashboardTrendResizeObserver = null;
+  }
   if (dashRetryTimer) {
     clearTimeout(dashRetryTimer);
     dashRetryTimer = null;

@@ -17,6 +17,12 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	settings := db.currentSystemSettings()
+	settings.LogWriteImage = true
+	settings.LogWriteMetadata = true
+	if err := db.saveSystemSettings(settings); err != nil {
+		t.Fatal(err)
+	}
 	site, err := db.CreateSite("edge-one", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +89,48 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	empty, err := db.ListRequestLogs(RequestLogFilter{})
 	if err != nil || len(empty) != 0 {
 		t.Fatalf("logs after clear=%#v err=%v", empty, err)
+	}
+}
+
+func TestRequestLogWriteFieldSettingsOmitOnlyNewLogValues(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "request-log-write-fields.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	site, err := db.CreateSite("write-fields-node", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := db.currentSystemSettings()
+	settings.LogWriteNode = false
+	settings.LogWriteCategory = false
+	settings.LogWriteStatus = false
+	settings.LogWriteClientIP = false
+	settings.LogWriteUA = false
+	settings.LogWriteTimeline = false
+	if err := db.saveSystemSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	db.EnqueueRequestLog(requestLogEvent{
+		SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAPI,
+		StatusCode: http.StatusOK, ClientIP: "203.0.113.40", UserAgent: "Test/1",
+		Method: http.MethodGet, Path: "/System/Info",
+	})
+	logs, err := db.ListRequestLogs(RequestLogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("logs=%#v err=%v", logs, err)
+	}
+	entry := logs[0]
+	if entry.SiteName != "" || entry.ResourceCategory != "" || entry.StatusCode != 0 || entry.ClientIP != "" || entry.UserAgent != "" || entry.RecordedAtMS != 0 {
+		t.Fatalf("disabled fields were still written: %#v", entry)
+	}
+	var recordedAtMS, timelineAtMS int64
+	if err := db.db.QueryRow("SELECT recorded_at_ms, timeline_at_ms FROM request_logs WHERE id=?", entry.ID).Scan(&recordedAtMS, &timelineAtMS); err != nil {
+		t.Fatal(err)
+	}
+	if recordedAtMS <= 0 || timelineAtMS != 0 {
+		t.Fatalf("internal time=%d timeline=%d", recordedAtMS, timelineAtMS)
 	}
 }
 

@@ -8,6 +8,7 @@
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
   const sidebarToggleEl = document.getElementById('sidebar-toggle');
+  const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
   const sidebarStorageKey = 'meridian-sidebar-expanded';
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
@@ -22,6 +23,7 @@
 
   function storedSidebarExpanded() {
     try {
+      if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) return false;
       return !!(window.localStorage && window.localStorage.getItem(sidebarStorageKey) === 'true');
     } catch (_) {
       return false;
@@ -53,6 +55,27 @@
       setSidebarExpanded(!shellEl.classList.contains('sidebar-expanded'), true);
     });
   }
+  if (sidebarDrawerCloseEl) sidebarDrawerCloseEl.addEventListener('click', () => setSidebarExpanded(false, true));
+
+  const dismissMobileDrawer = () => {
+    if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches && shellEl.classList.contains('sidebar-expanded')) {
+      setSidebarExpanded(false, true);
+    }
+  };
+  if (typeof document.querySelector === 'function') {
+    document.querySelector('.main')?.addEventListener('click', dismissMobileDrawer);
+    document.querySelector('.app-header')?.addEventListener('click', event => {
+      if (!event.target.closest('#sidebar-toggle')) dismissMobileDrawer();
+    });
+  }
+
+  document.querySelectorAll('.sidebar a[href^="#"]').forEach(link => {
+    link.addEventListener('click', function() {
+      if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
+        setSidebarExpanded(false, true);
+      }
+    });
+  });
 
   window.openModal = function(options) {
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
@@ -224,7 +247,7 @@
     if (username) username.textContent = API.username || '管理员';
     API.ingressCapabilities().then(capabilities => {
       if (!capabilities || !capabilities.app_version) return;
-      ['sidebar-version', 'mobile-version'].forEach(id => {
+      ['sidebar-version'].forEach(id => {
         const version = document.getElementById(id);
         if (version) version.textContent = capabilities.app_version;
       });
@@ -235,6 +258,9 @@
       Router.register('sites', renderSites);
       Router.register('traffic', renderTraffic);
       Router.register('request-logs', renderRequestLogs);
+      Router.register('telegram-report', renderTelegramReport);
+      Router.register('settings-tls', renderTLSSettings);
+      Router.register('global-settings', renderGlobalSettings);
       if (typeof renderDiag === 'function') {
         Router.register('diagnostics', renderDiag);
       } else {
@@ -247,6 +273,7 @@
         });
       }
       Router.init();
+      loadAppliedSystemSettings();
       appBootstrapped = true;
     }
 
@@ -268,7 +295,6 @@
   }
 
   document.getElementById('avatar-btn').addEventListener('click', logoutApp);
-  document.getElementById('mobile-logout').addEventListener('click', logoutApp);
 
   checkAuth();
 })();

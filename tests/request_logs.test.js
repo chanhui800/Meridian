@@ -14,15 +14,48 @@ function loadRequestLogHelpers() {
   return sandbox;
 }
 
-test('request log table keeps the requested seven columns without COLO fields', () => {
+test('request log table keeps P2 fields without COLO columns', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
     'utf8',
   );
-  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', '客户端地区', 'UA', '时间线']) {
-    assert.match(source, new RegExp(`<th>${heading}</th>`));
+  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', 'UA', '时间线']) {
+    assert.match(source, new RegExp(`<th[^>]*>${heading}</th>`));
   }
-  assert.doesNotMatch(source, /入站机房|出站机房|COLO/);
+  assert.doesNotMatch(source, /<th>入站机房<\/th>/);
+  assert.doesNotMatch(source, /<th>出站机房<\/th>/);
+  assert.match(source, /class="request-log-table"/);
+});
+
+test('global log write settings cover every visible request log column', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'global-settings.js'),
+    'utf8',
+  );
+  for (const [id, property] of [
+    ['setting-write-node', 'log_write_node'],
+    ['setting-write-category', 'log_write_category'],
+    ['setting-write-status', 'log_write_status'],
+    ['setting-write-ip', 'log_write_client_ip'],
+    ['setting-write-ua', 'log_write_ua'],
+    ['setting-write-timeline', 'log_write_timeline'],
+  ]) {
+    assert.match(source, new RegExp(id));
+    assert.match(source, new RegExp(`s\\.${property} = checkedSetting`));
+  }
+});
+
+test('global settings rendering stays scoped to the active page and keeps cached content visible', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'global-settings.js'),
+    'utf8',
+  );
+  assert.match(source, /function bindGlobalSettingsNav\(root = document\)/);
+  assert.match(source, /if \(globalSettingsCache\) paintGlobalSettings\(page\);/);
+  assert.match(source, /const content = page\.querySelector\('\.settings-content'\);/);
+  assert.match(source, /const nav = page\.querySelector\('\.settings-section-nav'\);/);
+  assert.doesNotMatch(source, /const content = document\.querySelector\('\.settings-content'\);/);
+  assert.match(source, /generation !== globalSettingsLoadGeneration/);
 });
 
 test('request log helpers map categories and status colors', () => {
@@ -32,6 +65,7 @@ test('request log helpers map categories and status colors', () => {
   assert.equal(sandbox.requestLogCategoryLabel('image'), '图片海报');
   assert.equal(sandbox.requestLogCategoryLabel('api'), '常规 API');
   assert.equal(sandbox.requestLogCategoryLabel('auth'), '用户认证');
+  assert.equal(sandbox.requestLogCategoryLabel(''), '—');
   assert.equal(sandbox.requestLogStatusClass(200), 'request-log-status-ok');
   assert.equal(sandbox.requestLogStatusClass(404), 'request-log-status-client');
   assert.equal(sandbox.requestLogStatusClass(503), 'request-log-status-server');
@@ -45,8 +79,8 @@ test('request log panel exposes video stream filtering and live refresh', () => 
   assert.match(source, /data-category="video">只看视频流/);
   assert.match(source, /requestLogRefreshTimer = setInterval/);
   assert.match(source, /Router\.current === 'request-logs'/);
-  assert.match(source, /class="request-log-ip mono" title="\$\{esc\(entry\.client_ip/);
-  assert.match(source, /class="request-log-region" title="\$\{esc\(entry\.client_region/);
+  assert.match(source, /class="request-log-ip mono"/);
+  assert.match(source, /class="request-log-region"/);
   assert.match(source, /requestLogLoading/);
   assert.match(source, /previousScrollTop/);
   assert.match(source, /previousScrollTop \+ addedHeight/);
@@ -142,6 +176,7 @@ test('request log date range covers the selected local days', () => {
 test('request log timeline uses concise Chinese relative time', () => {
   const sandbox = loadRequestLogHelpers();
   const now = Date.parse('2026-08-05T12:00:00Z');
+  assert.equal(sandbox.requestLogRelativeTime(0, now), '—');
   assert.equal(sandbox.requestLogRelativeTime(now - 30_000, now), '刚刚');
   assert.equal(sandbox.requestLogRelativeTime(now - 5 * 60_000, now), '5 分钟前');
   assert.equal(sandbox.requestLogRelativeTime(now - 2 * 60 * 60_000, now), '2 小时前');
