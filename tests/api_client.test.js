@@ -97,11 +97,46 @@ test('dynamic discovery API calls use the exact authenticated paths and verbs', 
   }
 });
 
+test('account API reads and updates the authenticated administrator', async () => {
+  const sandbox = loadAPIClient();
+  const requests = [];
+  sandbox.fetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    return {
+      status: 200,
+      ok: true,
+      statusText: 'OK',
+      json: async () => ({ username: 'renamed-admin', role: '管理员' }),
+    };
+  };
+
+  await vm.runInContext('API.getAccount()', sandbox);
+  await vm.runInContext(`API.updateAccount({
+    username: "renamed-admin",
+    current_password: "current password",
+    new_password: "new password value"
+  })`, sandbox);
+
+  assert.deepEqual(requests.map(request => [request.options.method, request.url]), [
+    ['GET', '/api/account'],
+    ['PUT', '/api/account'],
+  ]);
+  assert.equal(requests[0].options.body, undefined);
+  assert.deepEqual(JSON.parse(requests[1].options.body), {
+    username: 'renamed-admin',
+    current_password: 'current password',
+    new_password: 'new password value',
+  });
+});
+
 test('mobile credential inputs disable keyboard text transformations', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'index.html'), 'utf8');
 
-  for (const id of ['inp-username', 'inp-password', 'inp-setup-token']) {
-    const input = html.match(new RegExp(`<input\\b(?=[^>]*\\bid="${id}")[^>]*>`));
+  for (const id of ['inp-username', 'inp-password', 'inp-setup-token', 'account-username', 'account-current-password', 'account-new-password', 'account-confirm-password']) {
+    const source = id.startsWith('account-')
+      ? fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'account.js'), 'utf8')
+      : html;
+    const input = source.match(new RegExp(`<input\\b(?=[^>]*\\bid="${id}")[^>]*>`));
     assert.ok(input, `missing ${id} input`);
     assert.match(input[0], /\bautocapitalize="none"/);
     assert.match(input[0], /\bautocorrect="off"/);

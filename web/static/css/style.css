@@ -1988,8 +1988,8 @@ html[data-theme="light"] .login-brand h1 {
 }
 
 .sidebar-account:hover {
-  border-color: color-mix(in srgb, var(--red) 28%, var(--panel-border));
-  background: var(--red-dim);
+  border-color: color-mix(in srgb, var(--blue) 28%, var(--panel-border));
+  background: var(--blue-dim);
 }
 
 .sidebar-account-copy,
@@ -4370,6 +4370,262 @@ html {
   .request-log-time-block {
     grid-column: 2;
     grid-row: 1 / span 2;
+  }
+}
+
+/* Responsive dashboard request axis and administrator account page. */
+.sidebar-account.active {
+  border-color: color-mix(in srgb, var(--blue) 28%, var(--panel-border));
+  background: var(--blue-dim);
+}
+
+.dashboard-trend-unit {
+  color: var(--white-60);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.account-page {
+  width: min(980px, 100%);
+  display: grid;
+  gap: 16px;
+}
+
+.account-profile-card,
+.account-settings-card,
+.account-session-card {
+  border: 1px solid var(--panel-border);
+  border-radius: var(--ui-radius);
+  background: var(--panel);
+  box-shadow: var(--page-shadow);
+}
+
+.account-profile-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, .75fr);
+  align-items: center;
+  gap: 28px;
+  padding: 24px;
+}
+
+.account-profile-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.account-profile-avatar {
+  width: 58px;
+  height: 58px;
+  flex: 0 0 58px;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  background: linear-gradient(145deg, var(--blue), #6366f1);
+  color: #fff;
+  font-size: 23px;
+  font-weight: 800;
+  box-shadow: 0 10px 24px rgba(59,130,246,.22);
+}
+
+.account-eyebrow {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--white-38);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.account-profile-main h2,
+.account-card-head h2,
+.account-session-card h2 {
+  margin: 0;
+  color: var(--white);
+  font-size: 20px;
+}
+
+.account-profile-main h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-profile-main p,
+.account-card-head p,
+.account-session-card p {
+  margin: 5px 0 0;
+  color: var(--white-60);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.account-profile-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.account-profile-meta > div {
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: var(--panel-soft);
+}
+
+.account-profile-meta dt {
+  color: var(--white-38);
+  font-size: 11px;
+}
+
+.account-profile-meta dd {
+  margin: 5px 0 0;
+  overflow: hidden;
+  color: var(--white-87);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-settings-card {
+  padding: 22px 24px;
+}
+
+.account-card-head {
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.account-settings-form {
+  display: grid;
+  gap: 2px;
+}
+
+.account-password-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.account-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
+.account-form-actions .btn-primary {
+  min-width: 148px;
+}
+
+.account-session-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 24px;
+  border-color: color-mix(in srgb, var(--red) 24%, var(--panel-border));
+}
+
+.account-logout-button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 18px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--red);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 750;
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--red) 24%, transparent);
+}
+
+.account-logout-button:hover {
+  color: #fff;
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.account-logout-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--red) 55%, #fff);
+  outline-offset: 2px;
+}
+
+.account-logout-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 768px) {
+  .dashboard-trend-card {
+    padding: 16px 12px;
+  }
+
+  .dashboard-trend-unit {
+    font-size: 11px;
+  }
+
+  .account-page {
+    gap: 12px;
+  }
+
+  .account-profile-card {
+    grid-template-columns: 1fr;
+    gap: 18px;
+    padding: 18px;
+  }
+
+  .account-profile-meta {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .account-settings-card {
+    padding: 18px 16px;
+  }
+
+  .account-password-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .account-form-actions,
+  .account-form-actions .btn-primary {
+    width: 100%;
+  }
+
+  .account-session-card {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 17px 18px;
+  }
+
+  .account-logout-button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 420px) {
+  .dashboard-trend-card .glass-card-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .account-profile-meta {
+    grid-template-columns: 1fr;
   }
 }
 

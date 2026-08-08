@@ -2958,12 +2958,103 @@ var errInvalidCredentials = errors.New("invalid username or password")
 var errAdminNotConfigured = errors.New("administrator is not configured")
 var errMultipleAdmins = errors.New("multiple administrator accounts found")
 var errInvalidAdminPassword = errors.New("password must be 12-72 bytes")
+var errInvalidAdminUsername = errors.New("username must be 1-64 characters")
+var errNoAccountChanges = errors.New("no account changes requested")
 
 func validateAdminPassword(password string) error {
 	if len(password) < 12 || len(password) > 72 {
 		return errInvalidAdminPassword
 	}
 	return nil
+}
+
+func validateAdminUsername(username string) error {
+	if username == "" || len(username) > 64 {
+		return errInvalidAdminUsername
+	}
+	return nil
+}
+
+type AdminAccount struct {
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	CreatedAt string `json:"created_at"`
+}
+
+func (d *DB) AdminAccountByID(userID int64) (AdminAccount, error) {
+	var account AdminAccount
+	err := d.db.QueryRow(`
+		SELECT username, COALESCE(CAST(created_at AS TEXT), '')
+		FROM users
+		WHERE id=?`, userID).Scan(&account.Username, &account.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AdminAccount{}, errAdminNotConfigured
+	}
+	if err != nil {
+		return AdminAccount{}, err
+	}
+	account.Role = "管理员"
+	return account, nil
+}
+
+func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPassword string) (AdminAccount, error) {
+	username = strings.TrimSpace(username)
+	if err := validateAdminUsername(username); err != nil {
+		return AdminAccount{}, err
+	}
+	if currentPassword == "" || len(currentPassword) > 72 {
+		return AdminAccount{}, errInvalidCredentials
+	}
+	if newPassword != "" {
+		if err := validateAdminPassword(newPassword); err != nil {
+			return AdminAccount{}, err
+		}
+	}
+
+	var currentUsername, currentHash, createdAt string
+	err := d.db.QueryRow(`
+		SELECT username, password_hash, COALESCE(CAST(created_at AS TEXT), '')
+		FROM users
+		WHERE id=?`, userID).Scan(&currentUsername, &currentHash, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AdminAccount{}, errAdminNotConfigured
+	}
+	if err != nil {
+		return AdminAccount{}, err
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(currentPassword)); err != nil {
+		return AdminAccount{}, errInvalidCredentials
+	}
+	if username == currentUsername && newPassword == "" {
+		return AdminAccount{}, errNoAccountChanges
+	}
+
+	nextHash := currentHash
+	if newPassword != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return AdminAccount{}, err
+		}
+		nextHash = string(hash)
+	}
+	result, err := d.db.Exec(`
+		UPDATE users
+		SET username=?, password_hash=?
+		WHERE id=? AND username=? AND password_hash=?`, username, nextHash, userID, currentUsername, currentHash)
+	if err != nil {
+		if isSQLiteUniqueConstraintError(err) {
+			return AdminAccount{}, errInvalidAdminUsername
+		}
+		return AdminAccount{}, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return AdminAccount{}, err
+	}
+	if rows != 1 {
+		return AdminAccount{}, errors.New("administrator account changed concurrently")
+	}
+	return AdminAccount{Username: username, Role: "管理员", CreatedAt: createdAt}, nil
 }
 
 func (d *DB) CreateInitialUser(username, password string) (int64, error) {
@@ -14669,14 +14760,14 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	username := strings.TrimSpace(req.Username)
 	if username == "" || len(username) > 64 || req.Password == "" || len(req.Password) > 72 {
 		a.limiter().recordFailure(client, time.Now())
-		a.jsonErr(w, http.StatusUnauthorized, errInvalidCredentials.Error())
+		a.jsonErr(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	id, err := a.db.VerifyUser(username, req.Password)
 	if err != nil {
 		a.limiter().recordFailure(client, time.Now())
 		if errors.Is(err, errInvalidCredentials) {
-			a.jsonErr(w, http.StatusUnauthorized, errInvalidCredentials.Error())
+			a.jsonErr(w, http.StatusUnauthorized, "用户名或密码错误")
 			return
 		}
 		a.jsonErr(w, http.StatusInternalServerError, "authentication unavailable")
@@ -14733,6 +14824,58 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 		"authenticated":        authenticated,
 		"username":             username,
 	})
+}
+
+// GET/PUT /api/account
+func (a *App) handleAccount(w http.ResponseWriter, r *http.Request) {
+	userID, _, err := sessionIdentity(r)
+	if err != nil {
+		a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+
+	switch r.Method {
+	case http.MethodGet:
+		account, err := a.db.AdminAccountByID(userID)
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "account information unavailable")
+			return
+		}
+		a.jsonOK(w, account)
+	case http.MethodPut:
+		var req struct {
+			Username        string `json:"username"`
+			CurrentPassword string `json:"current_password"` // #nosec G117 -- request-only credential DTO; the value is never serialized or stored in plaintext.
+			NewPassword     string `json:"new_password"`     // #nosec G117 -- request-only credential DTO; the value is never serialized or stored in plaintext.
+		}
+		if err := decodeJSONBody(w, r, &req); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, "invalid request")
+			return
+		}
+		account, err := a.db.UpdateAdminAccount(userID, req.CurrentPassword, req.Username, req.NewPassword)
+		if err != nil {
+			switch {
+			case errors.Is(err, errInvalidCredentials):
+				a.jsonErr(w, http.StatusForbidden, "current password is incorrect")
+			case errors.Is(err, errInvalidAdminUsername), errors.Is(err, errInvalidAdminPassword), errors.Is(err, errNoAccountChanges):
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+			default:
+				a.jsonErr(w, http.StatusInternalServerError, "unable to update account")
+			}
+			return
+		}
+		token, err := generateToken(userID, account.Username)
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "unable to refresh session")
+			return
+		}
+		a.setSessionCookie(w, r, token)
+		a.jsonOK(w, account)
+	default:
+		w.Header().Set("Allow", "GET, PUT")
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 // GET /api/dashboard
@@ -15932,7 +16075,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.21"
+var appVersion = "v1.8.22"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -16218,6 +16361,7 @@ func main() {
 	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
 
 	// Protected routes
+	mux.HandleFunc("/api/account", cors(app.authMiddleware(app.handleAccount)))
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
 	mux.HandleFunc("/api/dashboard-insights", cors(app.authMiddleware(app.handleDashboardInsights)))
 	mux.HandleFunc("/api/system-settings", cors(app.authMiddleware(app.handleSystemSettings)))

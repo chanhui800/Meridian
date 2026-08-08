@@ -345,7 +345,7 @@ test('logout tears down the traffic refresh timer', async () => {
   vm.runInContext('startTrafficRefresh()', sandbox);
   const timerId = nextTimerId - 1;
 
-  await listeners['avatar-btn'].click();
+  await sandbox.window.logoutMeridian();
 
   assert.deepEqual(cleared, [timerId], 'logout must stop the traffic refresh timer');
   assert.ok(calls.includes('/api/auth/logout'), 'logout must POST the session away');
@@ -448,4 +448,36 @@ test('dashboard table paints live traffic_used and the running badge from one /a
   assert.ok(html.includes(sandbox.formatBytes(2048)), 'each site cache size must be formatted into the row');
   assert.equal(elements['s-cache'].textContent, sandbox.formatBytes(3072), 'the dashboard cache card must sum every site');
   assert.ok(html.includes('运行中') && html.includes('已停止'), 'the running flag must drive the status badge');
+});
+
+test('mobile dashboard request trend uses readable time labels and a numeric request axis', () => {
+  const labels = [];
+  const context = makeCanvasContext();
+  context.setTransform = () => {};
+  context.fillText = (text, x, y) => labels.push({ text: String(text), x, y });
+  const canvas = makeElement('dashboardRequestTrend');
+  canvas.clientWidth = 360;
+  canvas.clientHeight = 230;
+  canvas.parentElement = { clientWidth: 360 };
+  canvas.getContext = () => context;
+  const sandbox = {
+    window: { devicePixelRatio: 1 },
+    document: makeDocument({ dashboardRequestTrend: canvas }),
+    console,
+    Router: { current: 'dashboard' },
+    setTimeout() { return 0; },
+    clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'pages/dashboard.js');
+
+  vm.runInContext('drawDashboardTrend([5,4,3,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])', sandbox);
+
+  const timeLabels = labels.filter(label => label.text.endsWith(':00')).map(label => label.text);
+  const requestLabels = labels.filter(label => !label.text.endsWith(':00')).map(label => label.text);
+  assert.ok(timeLabels.length >= 4 && timeLabels.length <= 6, `mobile time labels must be sparse: ${timeLabels}`);
+  assert.equal(timeLabels[0], '00:00');
+  assert.equal(timeLabels.at(-1), '23:00');
+  assert.ok(requestLabels.includes('0'), `request axis must include zero: ${requestLabels}`);
+  assert.ok(requestLabels.some(label => Number(label) >= 5), `request axis must display the request range: ${requestLabels}`);
 });

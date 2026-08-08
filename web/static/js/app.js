@@ -133,11 +133,11 @@
     if (authStatus.mode === 'single_admin') {
       lines.push(isSetup
         ? '当前为单管理员模式，请创建唯一的管理员账号。'
-        : '当前为单管理员模式。首次使用？<a href="#" id="link-register">创建管理员账号</a>');
+        : '当前为单管理员模式。');
     } else {
       lines.push(isSetup
         ? '首次使用，请创建管理员账号。'
-        : '首次使用？<a href="#" id="link-register">创建管理员账号</a>');
+        : '请输入管理员账户信息登录。');
     }
 
     if (authStatus.jwt_secret_ephemeral) {
@@ -224,17 +224,10 @@
       setupTokenInputEl.value = '';
       enterApp();
     } catch (err) {
-      Toast.error(err.message);
+      Toast.error(err.message === 'invalid username or password' ? '用户名或密码错误' : err.message);
       loginButtonEl.disabled = false;
       loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
     }
-  });
-
-  loginFooterEl.addEventListener('click', function(e) {
-    const registerLink = e.target.closest('#link-register');
-    if (!registerLink) return;
-    e.preventDefault();
-    showSetupMode();
   });
 
   function enterApp() {
@@ -261,6 +254,7 @@
       Router.register('telegram-report', renderTelegramReport);
       Router.register('settings-tls', renderTLSSettings);
       Router.register('global-settings', renderGlobalSettings);
+      Router.register('account', renderAccount);
       if (typeof renderDiag === 'function') {
         Router.register('diagnostics', renderDiag);
       } else {
@@ -294,7 +288,12 @@
     Toast.info('已退出登录');
   }
 
-  document.getElementById('avatar-btn').addEventListener('click', logoutApp);
+  window.logoutMeridian = logoutApp;
+  document.getElementById('avatar-btn').addEventListener('click', function() {
+    if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
+      setSidebarExpanded(false, true);
+    }
+  });
 
   checkAuth();
 })();

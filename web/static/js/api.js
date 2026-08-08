@@ -52,6 +52,8 @@ const API = {
   setup(username, password, setupToken) {
     return this.request('POST', '/api/auth/setup', { username, password, setup_token: setupToken });
   },
+  getAccount() { return this.request('GET', '/api/account'); },
+  updateAccount(data) { return this.request('PUT', '/api/account', data); },
 
   // Dashboard
   dashboard() { return this.request('GET', '/api/dashboard'); },

@@ -1247,7 +1247,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.21", "/css/style.css?v=1.8.21", "/js/pages/sites.js?v=1.8.21", "/js/pages/request-logs.js?v=1.8.21", "/js/app.js?v=1.8.21"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.22", "/css/style.css?v=1.8.22", "/js/pages/sites.js?v=1.8.22", "/js/pages/request-logs.js?v=1.8.22", "/js/app.js?v=1.8.22"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -1566,6 +1566,28 @@ func TestLoginCookieAuthAndCSRFProtection(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsBadCredentialsWithChineseMessage(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+
+	for _, body := range []string{
+		`{"username":"admin","password":"incorrect password"}`,
+		`{"username":"missing-admin","password":"incorrect password"}`,
+	} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(body))
+		app.handleLogin(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("bad login status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		if got := mustStringValue(t, decodeBody(t, rr), "error"); got != "用户名或密码错误" {
+			t.Fatalf("bad login error=%q", got)
+		}
+	}
+}
+
 func TestLogoutClearsSessionCookie(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.csrfMiddleware(app.handleLogout)
@@ -1664,6 +1686,96 @@ func TestResetAdminPasswordUpdatesOnlyConfiguredAdministrator(t *testing.T) {
 	}
 	if _, err := app.db.VerifyUser("admin", newPassword); err != nil {
 		t.Fatalf("new password rejected: %v", err)
+	}
+}
+
+func TestUpdateAdminAccountRequiresCurrentPasswordAndPersistsChanges(t *testing.T) {
+	app := newTestApp(t)
+	const oldPassword = "correct horse battery staple"
+	const newPassword = "a newer correct horse battery staple"
+	userID, err := app.db.CreateInitialUser("admin", oldPassword)
+	if err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+
+	if _, err := app.db.UpdateAdminAccount(userID, "wrong current password", "renamed-admin", newPassword); !errors.Is(err, errInvalidCredentials) {
+		t.Fatalf("wrong current password error = %v, want invalid credentials", err)
+	}
+	if _, err := app.db.VerifyUser("admin", oldPassword); err != nil {
+		t.Fatalf("rejected unchanged credentials after failed update: %v", err)
+	}
+
+	account, err := app.db.UpdateAdminAccount(userID, oldPassword, " renamed-admin ", newPassword)
+	if err != nil {
+		t.Fatalf("UpdateAdminAccount: %v", err)
+	}
+	if account.Username != "renamed-admin" || account.Role != "管理员" || account.CreatedAt == "" {
+		t.Fatalf("updated account = %#v", account)
+	}
+	if _, err := app.db.VerifyUser("admin", oldPassword); !errors.Is(err, errInvalidCredentials) {
+		t.Fatalf("old credentials error = %v, want invalid credentials", err)
+	}
+	if gotID, err := app.db.VerifyUser("renamed-admin", newPassword); err != nil || gotID != userID {
+		t.Fatalf("new credentials id=%d err=%v, want id=%d", gotID, err, userID)
+	}
+	if _, err := app.db.UpdateAdminAccount(userID, newPassword, "renamed-admin", ""); !errors.Is(err, errNoAccountChanges) {
+		t.Fatalf("unchanged account error = %v, want no changes", err)
+	}
+}
+
+func TestHandleAccountReadsAndUpdatesAuthenticatedAdministrator(t *testing.T) {
+	app := newTestApp(t)
+	const oldPassword = "correct horse battery staple"
+	const newPassword = "another correct horse battery staple"
+	userID, err := app.db.CreateInitialUser("admin", oldPassword)
+	if err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+	token, err := generateToken(userID, "admin")
+	if err != nil {
+		t.Fatalf("generateToken: %v", err)
+	}
+	cookie := &http.Cookie{Name: sessionCookieName, Value: token}
+	handler := app.authMiddleware(app.handleAccount)
+
+	read := httptest.NewRecorder()
+	readRequest := httptest.NewRequest(http.MethodGet, "https://panel.example/api/account", nil)
+	readRequest.AddCookie(cookie)
+	handler(read, readRequest)
+	if read.Code != http.StatusOK {
+		t.Fatalf("account GET status=%d body=%s", read.Code, read.Body.String())
+	}
+	readBody := decodeBody(t, read)
+	if mustStringValue(t, readBody, "username") != "admin" || mustStringValue(t, readBody, "role") != "管理员" || mustStringValue(t, readBody, "created_at") == "" {
+		t.Fatalf("account GET body=%v", readBody)
+	}
+
+	update := httptest.NewRecorder()
+	updateRequest := httptest.NewRequest(http.MethodPut, "https://panel.example/api/account", strings.NewReader(`{
+		"username":"renamed-admin",
+		"current_password":"correct horse battery staple",
+		"new_password":"another correct horse battery staple"
+	}`))
+	updateRequest.Header.Set("Origin", "https://panel.example")
+	updateRequest.AddCookie(cookie)
+	handler(update, updateRequest)
+	if update.Code != http.StatusOK {
+		t.Fatalf("account PUT status=%d body=%s", update.Code, update.Body.String())
+	}
+	updateBody := decodeBody(t, update)
+	if mustStringValue(t, updateBody, "username") != "renamed-admin" {
+		t.Fatalf("account PUT body=%v", updateBody)
+	}
+	cookies := update.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != sessionCookieName || cookies[0].Value == token || !cookies[0].HttpOnly || !cookies[0].Secure {
+		t.Fatalf("account PUT session cookie=%#v", cookies)
+	}
+	updatedUserID, updatedUsername, err := validateToken(cookies[0].Value)
+	if err != nil || updatedUserID != userID || updatedUsername != "renamed-admin" {
+		t.Fatalf("updated session identity id=%d username=%q err=%v", updatedUserID, updatedUsername, err)
+	}
+	if _, err := app.db.VerifyUser("renamed-admin", newPassword); err != nil {
+		t.Fatalf("new credentials rejected: %v", err)
 	}
 }
 
