@@ -257,29 +257,6 @@ input, select { font-family: inherit; }
 
 .btn-login:active { transform: scale(.98); }
 
-.login-security-note {
-  margin-top: 12px;
-  color: var(--white-38);
-  font-size: .75rem;
-  line-height: 1.55;
-  text-align: center;
-}
-
-.login-message {
-  margin-top: 12px;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--red) 30%, var(--panel-border));
-  border-radius: 9px;
-  background: var(--red-dim);
-  color: color-mix(in srgb, var(--red) 78%, white);
-  font-size: .8rem;
-  font-weight: 600;
-  line-height: 1.5;
-  text-align: left;
-}
-
-.login-message[hidden] { display: none; }
-
 .login-footer {
   text-align: center;
   margin-top: 32px;

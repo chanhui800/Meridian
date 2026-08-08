@@ -41,13 +41,7 @@ const API = {
       throw new Error(res.statusText || 'Request failed');
     }
     if (!res.ok) {
-      const error = new Error(data.error || 'Request failed');
-      error.status = res.status;
-      const retryAfter = res.headers && typeof res.headers.get === 'function'
-        ? Number(res.headers.get('Retry-After'))
-        : 0;
-      if (Number.isFinite(retryAfter) && retryAfter > 0) error.retryAfter = Math.ceil(retryAfter);
-      throw error;
+      throw new Error(data.error || 'Request failed');
     }
     return data;
   },

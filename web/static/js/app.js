@@ -5,7 +5,6 @@
   const shellEl = document.getElementById('app-shell');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
-  const loginMessageEl = document.getElementById('login-message');
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
   const sidebarToggleEl = document.getElementById('sidebar-toggle');
@@ -14,64 +13,6 @@
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
-  let loginRetryTimer = null;
-
-  function clearLoginMessage() {
-    if (!loginMessageEl) return;
-    loginMessageEl.textContent = '';
-    loginMessageEl.hidden = true;
-  }
-
-  function showLoginMessage(message) {
-    if (!loginMessageEl) return;
-    loginMessageEl.textContent = message;
-    loginMessageEl.hidden = false;
-  }
-
-  function loginRetryText(seconds) {
-    const remaining = Math.max(1, Math.ceil(Number(seconds) || 0));
-    const minutes = Math.floor(remaining / 60);
-    const rest = remaining % 60;
-    if (minutes && rest) return `${minutes} 分 ${rest} 秒`;
-    if (minutes) return `${minutes} 分钟`;
-    return `${rest} 秒`;
-  }
-
-  function stopLoginRetryCountdown() {
-    if (loginRetryTimer !== null) clearInterval(loginRetryTimer);
-    loginRetryTimer = null;
-  }
-
-  function startLoginRetryCountdown(seconds) {
-    stopLoginRetryCountdown();
-    let remaining = Math.max(1, Math.ceil(Number(seconds) || 15 * 60));
-    const render = () => {
-      if (remaining <= 0) {
-        stopLoginRetryCountdown();
-        clearLoginMessage();
-        loginButtonEl.disabled = false;
-        loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
-        return;
-      }
-      showLoginMessage(`登录尝试次数过多，请在 ${loginRetryText(remaining)}后重试。连续输错 5 次会锁定 15 分钟。`);
-      loginButtonEl.disabled = true;
-      loginButtonEl.textContent = `请等待 ${loginRetryText(remaining)}`;
-      remaining--;
-    };
-    render();
-    loginRetryTimer = setInterval(render, 1000);
-  }
-
-  function loginErrorMessage(error) {
-    const message = String(error && error.message || '登录失败');
-    if (Number(error && error.status) === 429 || message.includes('too many login attempts') || message.includes('登录尝试次数过多')) {
-      return { rateLimited: true, retryAfter: Number(error && error.retryAfter) || 15 * 60 };
-    }
-    if (message === 'invalid username or password' || message === '用户名或密码错误') {
-      return { rateLimited: false, message: '用户名或密码错误。连续输错 5 次将锁定登录 15 分钟。' };
-    }
-    return { rateLimited: false, message };
-  }
   let modalPreviousFocus = null;
   let authStatus = {
     needs_setup: false,
@@ -207,8 +148,6 @@
   }
 
   function showSetupMode() {
-    stopLoginRetryCountdown();
-    clearLoginMessage();
     loginButtonEl.textContent = '注册';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(true);
@@ -219,8 +158,6 @@
   }
 
   function showLoginMode() {
-    stopLoginRetryCountdown();
-    clearLoginMessage();
     loginButtonEl.textContent = '登录';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(false);
@@ -251,23 +188,22 @@
 
   document.getElementById('loginForm').addEventListener('submit', async function(e) {
     e.preventDefault();
-    clearLoginMessage();
     const username = document.getElementById('inp-username').value.trim();
     const password = document.getElementById('inp-password').value;
     const setupToken = setupTokenInputEl.value.trim();
 
     if (!username || !password) {
-      showLoginMessage('请填写用户名和密码');
+      Toast.error('请填写用户名和密码');
       return;
     }
 
     if (loginEl._isSetup && password.length < 12) {
-      showLoginMessage('管理员密码至少需要 12 位');
+      Toast.error('管理员密码至少需要 12 位');
       return;
     }
 
     if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {
-      showLoginMessage('请填写安装时显示或部署环境中设置的初始化令牌');
+      Toast.error('请填写安装时显示或部署环境中设置的初始化令牌');
       return;
     }
 
@@ -284,20 +220,13 @@
         Toast.success('欢迎回来, ' + res.username + '!');
       }
       API.setSession(res);
-      stopLoginRetryCountdown();
-      clearLoginMessage();
       document.getElementById('inp-password').value = '';
       setupTokenInputEl.value = '';
       enterApp();
     } catch (err) {
-      const failure = loginErrorMessage(err);
-      if (failure.rateLimited) {
-        startLoginRetryCountdown(failure.retryAfter);
-      } else {
-        showLoginMessage(failure.message);
-        loginButtonEl.disabled = false;
-        loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
-      }
+      Toast.error(err.message === 'invalid username or password' ? '用户名或密码错误' : err.message);
+      loginButtonEl.disabled = false;
+      loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
     }
   });
 

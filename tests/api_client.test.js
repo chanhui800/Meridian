@@ -69,28 +69,6 @@ test('401 on the login endpoint is an ordinary failure the caller can report', a
   assert.equal(reloads, 0, 'a failed login must not reload the page');
 });
 
-test('login rate limits preserve status and Retry-After for a visible countdown', async () => {
-  const sandbox = loadAPIClient();
-  sandbox.fetch = async () => ({
-    status: 429,
-    ok: false,
-    statusText: 'Too Many Requests',
-    headers: { get(name) { return name === 'Retry-After' ? '269' : null; } },
-    json: async () => ({ error: '登录尝试次数过多，请稍后重试' }),
-  });
-
-  let failure;
-  try {
-    await vm.runInContext('API.login("admin", "wrong password")', sandbox);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, 'rate-limited login must reject');
-  assert.equal(failure.message, '登录尝试次数过多，请稍后重试');
-  assert.equal(failure.status, 429);
-  assert.equal(failure.retryAfter, 269);
-});
-
 test('dynamic discovery API calls use the exact authenticated paths and verbs', async () => {
   const sandbox = loadAPIClient();
   const requests = [];
