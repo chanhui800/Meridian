@@ -65,7 +65,7 @@ function renderDashboard() {
       <section class="dashboard-insight-card" id="dashboard-log-health"><div class="dashboard-insight-head"><h2>日志写入</h2><span class="dashboard-health-dot"></span></div><p>正在读取…</p></section>
       <section class="dashboard-insight-card" id="dashboard-schedule-health"><div class="dashboard-insight-head"><h2>定时任务</h2><span class="dashboard-health-dot"></span></div><p>正在读取…</p></section>
     </div>
-    <section class="dashboard-trend-card fade-up stagger-5"><div class="glass-card-header"><div class="glass-card-title">请求趋势</div></div><div class="dashboard-trend-wrap"><canvas id="dashboardRequestTrend" height="230"></canvas></div></section>
+    <section class="dashboard-trend-card fade-up stagger-5"><div class="glass-card-header"><div class="glass-card-title">请求趋势</div><div class="dashboard-trend-unit">每小时请求总次数</div></div><div class="dashboard-trend-wrap"><canvas id="dashboardRequestTrend" height="230" aria-label="当日每小时请求总次数趋势图"></canvas></div></section>
   `;
 
   observeDashboardTrendResize();
@@ -88,8 +88,31 @@ async function loadDashboardInsights() {
   }
 }
 
+function dashboardRequestScale(maxValue) {
+  if (!(maxValue > 0)) return { max: 1, step: 1, ticks: 1 };
+  const roughStep = maxValue / 4;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
+  const fraction = roughStep / magnitude;
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 2.5 ? 2.5 : fraction <= 5 ? 5 : 10;
+  const step = niceFraction * magnitude;
+  const max = Math.ceil(maxValue / step) * step;
+  return { max, step, ticks: Math.max(1, Math.round(max / step)) };
+}
+
+function dashboardTimeLabelIndexes(pointCount, plotWidth) {
+  if (pointCount <= 1) return [0];
+  const maxLabels = Math.max(2, Math.min(pointCount, Math.floor(plotWidth / 58) + 1));
+  const minimumStep = Math.ceil((pointCount - 1) / Math.max(1, maxLabels - 1));
+  const step = [1, 2, 3, 4, 6, 8, 12, 24].find(candidate => candidate >= minimumStep) || minimumStep;
+  const indexes = [];
+  for (let index = 0; index < pointCount; index += step) indexes.push(index);
+  if (indexes[indexes.length - 1] !== pointCount - 1) indexes.push(pointCount - 1);
+  return indexes;
+}
+
 function drawDashboardTrend(values) {
   dashboardTrendValues = Array.isArray(values) ? values.map(value => Math.max(0, Number(value) || 0)) : [];
+  if (dashboardTrendValues.length === 0) dashboardTrendValues = Array(24).fill(0);
   const canvas = document.getElementById('dashboardRequestTrend');
   if (!canvas || !canvas.getContext) return;
   const ctx = canvas.getContext('2d');
@@ -99,16 +122,32 @@ function drawDashboardTrend(values) {
   canvas.width = width * ratio; canvas.height = height * ratio;
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  const max = Math.max(1, ...dashboardTrendValues);
-  const left = 36, right = 14, top = 16, bottom = 28;
+  const scale = dashboardRequestScale(Math.max(0, ...dashboardTrendValues));
+  const left = width <= 480 ? 43 : 50, right = width <= 480 ? 8 : 14, top = 16, bottom = 30;
   const plotW = width - left - right, plotH = height - top - bottom;
-  ctx.strokeStyle = 'rgba(100,116,139,.18)'; ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) { const y = top + plotH * i / 4; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke(); }
-  const points = dashboardTrendValues.map((value, index) => ({ x: left + plotW * index / Math.max(1, dashboardTrendValues.length - 1), y: top + plotH * (1 - value / max) }));
+  ctx.font = `${width <= 480 ? 11 : 12}px system-ui`;
+  ctx.fillStyle = '#64748b';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= scale.ticks; i++) {
+    const value = scale.max - scale.step * i;
+    const y = top + plotH * i / scale.ticks;
+    ctx.strokeStyle = 'rgba(100,116,139,.18)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
+    ctx.textAlign = 'right';
+    ctx.fillText(formatNumber(Math.round(value)), left - 8, y);
+  }
+  ctx.strokeStyle = 'rgba(100,116,139,.34)';
+  ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(left, top + plotH); ctx.lineTo(width - right, top + plotH); ctx.stroke();
+
+  const points = dashboardTrendValues.map((value, index) => ({ x: left + plotW * index / Math.max(1, dashboardTrendValues.length - 1), y: top + plotH * (1 - value / scale.max) }));
   ctx.beginPath(); points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
   ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.stroke();
-  ctx.font = '12px system-ui'; ctx.fillStyle = '#64748b'; ctx.textAlign = 'center';
-  for (let i = 0; i < 24; i += 2) ctx.fillText(`${String(i).padStart(2, '0')}:00`, left + plotW * i / 23, height - 8);
+  ctx.fillStyle = '#64748b'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  const lastIndex = Math.max(1, dashboardTrendValues.length - 1);
+  dashboardTimeLabelIndexes(dashboardTrendValues.length, plotW).forEach(index => {
+    const hour = index % 24;
+    ctx.fillText(`${String(hour).padStart(2, '0')}:00`, left + plotW * index / lastIndex, height - 7);
+  });
 }
 
 function observeDashboardTrendResize() {

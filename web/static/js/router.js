@@ -9,6 +9,7 @@ const Router = {
     'telegram-report': ['Telegram 日报', '配置请求与流量数据的定时通知'],
     'settings-tls': ['TLS 设置', '管理面板域名、监听端口与证书'],
     'global-settings': ['全局设置', ''],
+    account: ['账户', '查看账户信息并修改用户名或密码'],
     traffic: ['流量统计', '查看各站点流量使用趋势'],
     diagnostics: ['故障诊断', '检查入口、回源与运行状态'],
   },
@@ -48,6 +49,15 @@ const Router = {
       }
       if (active) activeNav = link;
     });
+    const accountButton = document.getElementById('avatar-btn');
+    if (accountButton) {
+      const active = hash === 'account';
+      accountButton.classList.toggle('active', active);
+      if (typeof accountButton.setAttribute === 'function' && typeof accountButton.removeAttribute === 'function') {
+        if (active) accountButton.setAttribute('aria-current', 'page');
+        else accountButton.removeAttribute('aria-current');
+      }
+    }
     document.querySelectorAll('.mobile-tab').forEach(tab => {
       const active = tab.dataset.page === hash;
       tab.classList.toggle('active', active);
@@ -67,7 +77,9 @@ const Router = {
       subtitle.hidden = !meta[1];
     }
     document.title = `${meta[0]} — Meridian`;
-    if (icon && activeNav && typeof activeNav.querySelector === 'function') {
+    if (icon && hash === 'account') {
+      icon.innerHTML = '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>';
+    } else if (icon && activeNav && typeof activeNav.querySelector === 'function') {
       const svg = activeNav.querySelector('svg');
       if (svg) icon.innerHTML = svg.outerHTML;
     }

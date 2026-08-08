@@ -6,8 +6,8 @@
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.8.0">
-<script src="/js/theme.js?v=1.8.21"></script>
-<link rel="stylesheet" href="/css/style.css?v=1.8.21">
+<script src="/js/theme.js?v=1.8.22"></script>
+<link rel="stylesheet" href="/css/style.css?v=1.8.22">
 </head>
 <body class="auth-checking">
 
@@ -46,7 +46,7 @@
     <div class="sidebar-brand">
       <img src="/favicon.svg" alt="" class="sidebar-logo">
       <span class="sidebar-brand-name">Meridian</span>
-      <span class="sidebar-version" id="sidebar-version">v1.8.21</span>
+      <span class="sidebar-version" id="sidebar-version">v1.8.22</span>
     </div>
     <nav class="sidebar-nav" aria-label="功能菜单">
       <a href="#dashboard" class="topnav-link active" data-page="dashboard" title="仪表盘">
@@ -70,11 +70,11 @@
         <span>全局设置</span>
       </a>
     </nav>
-    <button class="sidebar-account" id="avatar-btn" type="button" aria-label="退出登录" title="退出登录">
+    <a class="sidebar-account" id="avatar-btn" href="#account" aria-label="打开账户页面" title="账户">
       <span class="avatar-btn" id="avatar-initial">A</span>
-      <span class="sidebar-account-copy"><strong id="sidebar-username">管理员</strong><small>退出登录</small></span>
+      <span class="sidebar-account-copy"><strong id="sidebar-username">管理员</strong><small>账户</small></span>
       <svg viewBox="0 0 24 24"><path d="M10 17l5-5-5-5"/></svg>
-    </button>
+    </a>
   </aside>
 
   <header class="app-header">
@@ -115,6 +115,7 @@
     <div id="page-telegram-report" class="page"></div>
     <div id="page-settings-tls" class="page"></div>
     <div id="page-global-settings" class="page"></div>
+    <div id="page-account" class="page"></div>
   </div>
 
   <!-- Modal -->
@@ -134,16 +135,17 @@
 
 </div>
 
-<script src="/js/api.js?v=1.8.21"></script>
-<script src="/js/toast.js?v=1.8.21"></script>
-<script src="/js/router.js?v=1.8.21"></script>
-<script src="/js/pages/dashboard.js?v=1.8.21"></script>
-<script src="/js/pages/sites.js?v=1.8.21"></script>
-<script src="/js/pages/traffic.js?v=1.8.21"></script>
-<script src="/js/pages/diag.js?v=1.8.21"></script>
-<script src="/js/pages/request-logs.js?v=1.8.21"></script>
-<script src="/js/pages/telegram-report.js?v=1.8.21"></script>
-<script src="/js/pages/global-settings.js?v=1.8.21"></script>
-<script src="/js/app.js?v=1.8.21"></script>
+<script src="/js/api.js?v=1.8.22"></script>
+<script src="/js/toast.js?v=1.8.22"></script>
+<script src="/js/router.js?v=1.8.22"></script>
+<script src="/js/pages/dashboard.js?v=1.8.22"></script>
+<script src="/js/pages/sites.js?v=1.8.22"></script>
+<script src="/js/pages/traffic.js?v=1.8.22"></script>
+<script src="/js/pages/diag.js?v=1.8.22"></script>
+<script src="/js/pages/request-logs.js?v=1.8.22"></script>
+<script src="/js/pages/telegram-report.js?v=1.8.22"></script>
+<script src="/js/pages/global-settings.js?v=1.8.22"></script>
+<script src="/js/pages/account.js?v=1.8.22"></script>
+<script src="/js/app.js?v=1.8.22"></script>
 </body>
 </html>
