@@ -4,7 +4,7 @@
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
-当前发布版本：`v1.8.24`
+当前发布版本：`v1.8.25`
 
 ## 界面预览
 
@@ -85,7 +85,6 @@ services:
     environment:
       PORT: "9090"
       DB_PATH: /app/data/meridian.db
-      JWT_SECRET: change-this-to-a-long-random-secret
 ```
 
 ```bash
@@ -94,7 +93,9 @@ docker compose up -d
 docker compose logs -f meridian
 ```
 
-首次打开 `http://服务器地址:9090` 完成管理员初始化。之后在 TLS 页面修改监听端口并重启，容器会直接在宿主机的新端口监听。`network_mode: host` 适用于 Linux Docker；它不使用 `ports` 映射，需在宿主机防火墙中放行所选端口。数据目录必须可写，并应限制为仅运行用户可读。
+首次启动时，容器会自动生成互不相同的 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY` 和 `SETUP_TOKEN`，并以 `0600` 权限持久化到数据卷内的 `/app/data/.meridian-secrets`；重启会继续复用，不需要用户手动生成。运行 `docker compose logs meridian` 查看首次管理员初始化令牌，再打开 `http://服务器地址:9090` 完成管理员初始化。若有高级部署需求，仍可通过同名环境变量显式覆盖自动值。
+
+入口脚本会把固定的 `/app/data` 数据目录权限收敛给容器内 UID `10001`，因此新建的宿主机绑定目录无需手动执行 `chown`。之后在 TLS 页面修改监听端口并重启，容器会直接在宿主机的新端口监听。`network_mode: host` 适用于 Linux Docker；它不使用 `ports` 映射，需在宿主机防火墙中放行所选端口。
 
 ### Linux 原生 systemd
 
@@ -185,7 +186,10 @@ Telegram 通知可按每天或每周发送，包含当日请求概览、今日/�
 | `PANEL_BIND_ADDR` | `0.0.0.0` | 监听地址 |
 | `PORT` | `9090` | 首次初始化时的默认面板监听端口；之后以 TLS 页面设置为准 |
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
-| `JWT_SECRET` | 无 | 建议设置为长度足够的随机字符串 |
+| `JWT_SECRET` | Docker 自动生成；原生安装器自动生成 | 登录会话签名密钥，至少 32 字节 |
+| `UPSTREAM_HEADER_KEY` | Docker 自动生成；原生安装器自动生成 | 固定上游请求头加密密钥，至少 32 字节且不得与其他密钥相同 |
+| `DYNAMIC_ROUTE_KEY` | Docker 自动生成；原生安装器自动生成 | 自动发现动态路由密钥，至少 32 字节且不得与其他密钥相同 |
+| `SETUP_TOKEN` | Docker 自动生成；原生安装器自动生成 | 首次创建管理员使用的初始化令牌；已有管理员后自动忽略 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 允许读取前级转发身份的 CIDR 列表 |
 | `ASSET_CACHE_DIR` | 数据库目录下 `asset-cache` | 静态缓存目录 |
 | `CLIENT_IP_REGION_ENDPOINT` | `https://ipwho.is/{ip}?lang=zh-CN` | 公网客户端 IP 地区查询地址；每个 IP 在内存中缓存 24 小时，设置为 `off` 可关闭 |
