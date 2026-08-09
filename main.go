@@ -1343,6 +1343,7 @@ const (
 	requestLogCategoryImage    = "image"
 	requestLogCategoryAPI      = "api"
 	requestLogCategoryAuth     = "auth"
+	clientClosedRequestStatus  = 499
 )
 
 // requestLogEvent is the bounded hot-path payload accepted from a site proxy.
@@ -11117,6 +11118,8 @@ type requestLogResponseWriter struct {
 	statusCode int
 }
 
+type originalRequestContextKey struct{}
+
 func (w *requestLogResponseWriter) WriteHeader(statusCode int) {
 	if w.statusCode != 0 {
 		return
@@ -11169,6 +11172,24 @@ func (w *requestLogResponseWriter) Push(target string, options *http.PushOptions
 		return pusher.Push(target, options)
 	}
 	return http.ErrNotSupported
+}
+
+// isClientRequestCancellation distinguishes a browser/player abandoning an
+// in-flight request from Meridian stopping the site. The proxy receives a
+// derived context which is canceled for both cases, so the original HTTP
+// request context is carried separately and must be canceled as well.
+func isClientRequestCancellation(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) && ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+}
+
+func originalRequestContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	if original, ok := ctx.Value(originalRequestContextKey{}).(context.Context); ok {
+		return original
+	}
+	return ctx
 }
 
 // metered response writer
@@ -12930,6 +12951,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				discoveryErr.writeResponse(w)
 				return
 			}
+			if isClientRequestCancellation(originalRequestContext(r.Context()), err) {
+				return
+			}
 			log.Printf("[%s] proxy error: %v", site.Name, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
@@ -12966,15 +12990,20 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return
 		}
 		defer inst.endRequest()
+		clientRequestContext := r.Context()
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
 		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies)
 		defer func() {
 			requestLogEntry.StatusCode = requestLogWriter.StatusCode()
+			if errors.Is(clientRequestContext.Err(), context.Canceled) {
+				requestLogEntry.StatusCode = clientClosedRequestStatus
+			}
 			requestLogEntry.OutboundColo = requestLogColo(requestLogWriter.Header().Get("CF-Ray"))
 			pm.database.EnqueueRequestLog(requestLogEntry)
 		}()
 		w = requestLogWriter
 		requestCtx, requestCancel := context.WithCancel(r.Context())
+		requestCtx = context.WithValue(requestCtx, originalRequestContextKey{}, clientRequestContext)
 		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
 		defer func() {
 			stopInstanceCancel()
@@ -16075,7 +16104,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.26"
+var appVersion = "v1.8.27"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
