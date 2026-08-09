@@ -56,8 +56,9 @@ saved_upstream=
 saved_dynamic=
 saved_setup=
 if [ -e "$secrets_file" ]; then
-    [ -f "$secrets_file" ] && [ ! -L "$secrets_file" ] \
-        || fail "$secrets_file must be a regular file"
+    if [ ! -f "$secrets_file" ] || [ -L "$secrets_file" ]; then
+        fail "$secrets_file must be a regular file"
+    fi
     while IFS='=' read -r name value || [ -n "$name$value" ]; do
         case "$name" in
             ''|'#'*) ;;
