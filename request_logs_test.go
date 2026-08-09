@@ -30,7 +30,7 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	}
 
 	for _, event := range []requestLogEvent{
-		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryPlayback, StatusCode: 200, ClientIP: "203.0.113.10", UserAgent: "CapyPlayer/1.1.3", Method: http.MethodPost, Path: "/Items/abc/PlaybackInfo"},
+		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryPlayback, StatusCode: 200, ClientIP: "203.0.113.10", UserAgent: "CapyPlayer/1.1.3", BackendAddress: "https://media.example:443", Method: http.MethodPost, Path: "/Items/abc/PlaybackInfo"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryVideo, StatusCode: 206, ClientIP: "203.0.113.14", UserAgent: "StreamPlayer/1.0", Method: http.MethodGet, Path: "/Videos/abc/stream"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryImage, StatusCode: 404, ClientIP: "203.0.113.11", UserAgent: "Hills/1.8", Method: http.MethodGet, Path: "/Items/abc/Images/Primary"},
 		{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAuth, StatusCode: 401, ClientIP: "203.0.113.12", UserAgent: "Hills/1.8", Method: http.MethodPost, Path: "/Users/AuthenticateByName"},
@@ -49,6 +49,13 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	playback, err := db.ListRequestLogs(RequestLogFilter{Category: requestLogCategoryPlayback})
 	if err != nil || len(playback) != 1 || playback[0].Path != "/Items/abc/PlaybackInfo" {
 		t.Fatalf("playback logs=%#v err=%v", playback, err)
+	}
+	if playback[0].BackendAddress != "https://media.example:443" {
+		t.Fatalf("backend address=%q", playback[0].BackendAddress)
+	}
+	backendSearch, err := db.ListRequestLogs(RequestLogFilter{Query: "media.example"})
+	if err != nil || len(backendSearch) != 1 {
+		t.Fatalf("backend search logs=%#v err=%v", backendSearch, err)
 	}
 	video, err := db.ListRequestLogs(RequestLogFilter{Category: requestLogCategoryVideo})
 	if err != nil || len(video) != 1 || video[0].Path != "/Videos/abc/stream" {
@@ -109,13 +116,14 @@ func TestRequestLogWriteFieldSettingsOmitOnlyNewLogValues(t *testing.T) {
 	settings.LogWriteStatus = false
 	settings.LogWriteClientIP = false
 	settings.LogWriteUA = false
+	settings.LogWriteBackendAddress = false
 	settings.LogWriteTimeline = false
 	if err := db.saveSystemSettings(settings); err != nil {
 		t.Fatal(err)
 	}
 	db.EnqueueRequestLog(requestLogEvent{
 		SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAPI,
-		StatusCode: http.StatusOK, ClientIP: "203.0.113.40", UserAgent: "Test/1",
+		StatusCode: http.StatusOK, ClientIP: "203.0.113.40", UserAgent: "Test/1", BackendAddress: "https://media.example:443",
 		Method: http.MethodGet, Path: "/System/Info",
 	})
 	logs, err := db.ListRequestLogs(RequestLogFilter{Limit: 10})
@@ -123,7 +131,7 @@ func TestRequestLogWriteFieldSettingsOmitOnlyNewLogValues(t *testing.T) {
 		t.Fatalf("logs=%#v err=%v", logs, err)
 	}
 	entry := logs[0]
-	if entry.SiteName != "" || entry.ResourceCategory != "" || entry.StatusCode != 0 || entry.ClientIP != "" || entry.UserAgent != "" || entry.RecordedAtMS != 0 {
+	if entry.SiteName != "" || entry.ResourceCategory != "" || entry.StatusCode != 0 || entry.ClientIP != "" || entry.UserAgent != "" || entry.BackendAddress != "" || entry.RecordedAtMS != 0 {
 		t.Fatalf("disabled fields were still written: %#v", entry)
 	}
 	var recordedAtMS, timelineAtMS int64

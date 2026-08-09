@@ -19,7 +19,7 @@ test('request log table keeps P2 fields without COLO columns', () => {
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
     'utf8',
   );
-  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', 'UA', '时间线']) {
+  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', 'UA', '后端地址', '时间线']) {
     assert.match(source, new RegExp(`<th[^>]*>${heading}</th>`));
   }
   assert.doesNotMatch(source, /<th>入站机房<\/th>/);
@@ -38,6 +38,7 @@ test('global log write settings cover every visible request log column', () => {
     ['setting-write-status', 'log_write_status'],
     ['setting-write-ip', 'log_write_client_ip'],
     ['setting-write-ua', 'log_write_ua'],
+    ['setting-write-backend-address', 'log_write_backend_address'],
     ['setting-write-timeline', 'log_write_timeline'],
   ]) {
     assert.match(source, new RegExp(id));
