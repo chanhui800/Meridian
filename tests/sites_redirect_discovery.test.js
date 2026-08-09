@@ -434,14 +434,18 @@ test('profile risk notices and transition confirmations match the approved produ
   assert.equal(unchangedExtreme.requirement, 'none');
 });
 
-test('site modal presents automatic proxying without discovery or security controls', async () => {
+test('site modal presents proxy and direct main-video choices without discovery or security controls', async () => {
   const { sandbox, document } = loadModalHarness();
   await sandbox.showSiteModal(null);
   const body = document.getElementById('modal-body').innerHTML;
 
-  assert.match(body, /自动反代/);
-  assert.match(body, /已自动启用/);
-  assert.match(body, /无需选择模式、来源、域名规则或额外地址/);
+  assert.match(body, /主视频流策略/);
+  assert.match(body, /反代/);
+  assert.match(body, /直连/);
+  assert.match(body, /网盘或 CDN 的 302/);
+  assert.match(body, /面板、API、PlaybackInfo、HLS \/ DASH、字幕、图片和必要静态资源/);
+  assert.equal(document.getElementById('m-main-video-proxy').checked, true);
+  assert.equal(document.getElementById('m-main-video-direct').checked, false);
   assert.doesNotMatch(body, /播放回源/);
   assert.equal(document.getElementById('m-dynamic-enabled'), null);
   assert.equal(document.getElementById('m-dynamic-profile'), null);
@@ -465,6 +469,7 @@ test('new site submission enables every automatic proxy source without manual pl
   assert.equal(state.creates.length, 1);
   assert.equal(state.creates[0].playback_target_url, '');
   assert.equal(state.creates[0].playback_mode, 'direct');
+  assert.equal(state.creates[0].main_video_stream_mode, 'proxy');
   assert.deepEqual(state.creates[0].stream_hosts, []);
   assert.equal(state.creates[0].dynamic_discovery_enabled, true);
   assert.equal(state.creates[0].dynamic_profile, 'compatible');
@@ -754,6 +759,7 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
     public_host: '',
     ua_mode: 'infuse',
     playback_target_url: '',
+    main_video_stream_mode: 'direct',
     stream_hosts: [],
     upstream_headers: [],
     dynamic_discovery_enabled: true,
@@ -773,4 +779,6 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
   assert.deepEqual(state.observationDeletes, []);
   assert.deepEqual(state.confirmations, []);
   assert.deepEqual(state.errors, []);
+  assert.equal(document.getElementById('m-main-video-proxy').checked, false);
+  assert.equal(document.getElementById('m-main-video-direct').checked, true);
 });

@@ -1092,9 +1092,13 @@ async function showSiteModal(site) {
       <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
     </div>
     <div class="form-group">
-      <label>自动反代</label>
-      <div class="form-help" style="padding:10px 12px;border:1px solid var(--green);border-radius:8px;background:var(--green-dim)"><strong style="color:var(--green)">已自动启用</strong>：无需选择模式、来源、域名规则或额外地址。</div>
-      <div class="form-help">Meridian 会自动改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址，使后端切换后仍继续经过本站点代理；localhost、私网、链路本地及回环目标始终拒绝。</div>
+      <label>主视频流策略</label>
+      <div class="main-video-mode-control" role="radiogroup" aria-label="主视频流策略">
+        <label><input type="radio" id="m-main-video-proxy" name="m-main-video-stream-mode" value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'checked' : ''}><span>反代</span></label>
+        <label><input type="radio" id="m-main-video-direct" name="m-main-video-stream-mode" value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'checked' : ''}><span>直连</span></label>
+      </div>
+      <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
+      <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
     </div>
     <div class="form-group">
       <label class="switch-row"><input type="checkbox" id="m-asset-cache" ${isEdit && site.asset_cache_enabled ? 'checked' : ''}><span>缓存图片与静态资源</span></label>
@@ -1231,6 +1235,7 @@ async function showSiteModal(site) {
 	      target_url: document.getElementById('m-target').value.trim(),
       playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
       playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
+		main_video_stream_mode: document.getElementById('m-main-video-direct').checked ? 'direct' : 'proxy',
 		stream_hosts: isEdit ? normalizeStreamHosts(site.stream_hosts) : [],
 			...ingressPayload,
 		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),

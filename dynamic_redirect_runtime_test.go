@@ -628,6 +628,64 @@ func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) 
 	}
 }
 
+func TestDynamicRedirectRuntimeDirectModeExposesValidatedMainVideoTarget(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "cdn.example.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	}))
+	redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("upstream redirect")}
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp := redirectRuntimeResponse(req, http.StatusFound, []string{"https://cdn.example.com/media/movie.mkv?sig=client-target"}, redirectBody)
+			resp.Header.Set("Set-Cookie", "origin=must-not-cross")
+			return resp, nil
+		}),
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		mainVideoDirect:       true,
+		dynamicPolicy:         policy,
+		dynamicState:          state,
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream"))
+	if err != nil {
+		t.Fatalf("return direct main-video redirect: %v", err)
+	}
+	if resp.StatusCode != http.StatusTemporaryRedirect || !redirectBody.closed.Load() {
+		t.Fatalf("direct response status/bodyClosed=%d/%t", resp.StatusCode, redirectBody.closed.Load())
+	}
+	if got := resp.Header.Get("Location"); got != "https://cdn.example.com:443/media/movie.mkv?sig=client-target" {
+		t.Fatalf("direct Location = %q", got)
+	}
+	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Content-Length") != "0" || resp.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("direct response headers = %#v", resp.Header)
+	}
+}
+
+func TestDynamicRedirectRuntimeDirectModeDoesNotExposeRedirectUserInfo(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	_, state := redirectRuntimeState(t, policy.limits, nil)
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return redirectRuntimeResponse(req, http.StatusFound, []string{"https://user:secret@origin.example.net/media/movie.mkv"}, http.NoBody), nil
+		}),
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		mainVideoDirect:       true,
+		dynamicPolicy:         policy,
+		dynamicState:          state,
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream"))
+	if err == nil || resp != nil {
+		t.Fatalf("userinfo redirect response/error = %#v/%v, want rejection", resp, err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("userinfo rejection exposed credentials: %v", err)
+	}
+}
+
 func TestDynamicRedirectRuntimeInternallyFollowsMediaRedirects(t *testing.T) {
 	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {

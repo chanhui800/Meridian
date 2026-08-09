@@ -194,11 +194,21 @@ func (d *DB) saveTelegramReportSettings(settings TelegramReportSettings, botToke
 	var query string
 	var args []any
 	if replaceToken {
-		query = `UPDATE telegram_report_settings SET enabled=?, bot_token_ciphertext=?, chat_id=?, schedule_time=?, frequency=?, weekday=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`
-		args = []any{sqliteBool(settings.Enabled), botTokenCiphertext, settings.ChatID, settings.ScheduleTime, settings.Frequency, settings.Weekday}
+		query = `UPDATE telegram_report_settings SET
+			last_sent_key=CASE WHEN enabled<>? OR bot_token_ciphertext<>? OR chat_id<>? OR schedule_time<>? OR frequency<>? OR weekday<>? THEN '' ELSE last_sent_key END,
+			enabled=?, bot_token_ciphertext=?, chat_id=?, schedule_time=?, frequency=?, weekday=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`
+		args = []any{
+			sqliteBool(settings.Enabled), botTokenCiphertext, settings.ChatID, settings.ScheduleTime, settings.Frequency, settings.Weekday,
+			sqliteBool(settings.Enabled), botTokenCiphertext, settings.ChatID, settings.ScheduleTime, settings.Frequency, settings.Weekday,
+		}
 	} else {
-		query = `UPDATE telegram_report_settings SET enabled=?, chat_id=?, schedule_time=?, frequency=?, weekday=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`
-		args = []any{sqliteBool(settings.Enabled), settings.ChatID, settings.ScheduleTime, settings.Frequency, settings.Weekday}
+		query = `UPDATE telegram_report_settings SET
+			last_sent_key=CASE WHEN enabled<>? OR chat_id<>? OR schedule_time<>? OR frequency<>? OR weekday<>? THEN '' ELSE last_sent_key END,
+			enabled=?, chat_id=?, schedule_time=?, frequency=?, weekday=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`
+		args = []any{
+			sqliteBool(settings.Enabled), settings.ChatID, settings.ScheduleTime, settings.Frequency, settings.Weekday,
+			sqliteBool(settings.Enabled), settings.ChatID, settings.ScheduleTime, settings.Frequency, settings.Weekday,
+		}
 	}
 	_, err = d.db.Exec(query, args...)
 	return err
@@ -620,7 +630,9 @@ func runTelegramReportScheduler(ctx context.Context, db *DB) {
 			}
 			if err := db.markTelegramReportSent(key); err != nil {
 				log.Printf("[telegram-report] mark sent failed: %v", err)
+				continue
 			}
+			log.Printf("[telegram-report] sent %s", key)
 		case <-ctx.Done():
 			return
 		}

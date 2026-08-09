@@ -565,7 +565,7 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			defer db.Close()
 
-			for _, column := range []string{"playback_target_url", "playback_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "public_host", "ingress_mode", "upstream_headers"} {
+			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "public_host", "ingress_mode", "upstream_headers"} {
 				var count int
 				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
 					t.Fatalf("inspect %s: %v", column, err)
@@ -1247,7 +1247,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.27", "/css/style.css?v=1.8.27", "/js/pages/sites.js?v=1.8.27", "/js/pages/request-logs.js?v=1.8.27", "/js/app.js?v=1.8.27"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.29", "/css/style.css?v=1.8.29", "/js/pages/sites.js?v=1.8.29", "/js/pages/request-logs.js?v=1.8.29", "/js/app.js?v=1.8.29"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4585,7 +4585,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 	}
 	expectedKeys := map[string]bool{
 		"id": true, "name": true, "listen_port": true, "public_host": true, "ingress_mode": true, "target_url": true,
-		"playback_target_url": true, "playback_mode": true, "stream_hosts": true,
+		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
 		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
