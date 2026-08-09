@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -192,6 +193,32 @@ func TestRequestLogResponseWriterAndAPI(t *testing.T) {
 	app.handleRequestLogs(cleared, httptest.NewRequest(http.MethodDelete, "/api/request-logs", nil))
 	if cleared.Code != http.StatusOK {
 		t.Fatalf("DELETE status=%d body=%s", cleared.Code, cleared.Body.String())
+	}
+}
+
+func TestClientRequestCancellationClassification(t *testing.T) {
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	derivedClientCtx := context.WithValue(clientCtx, originalRequestContextKey{}, clientCtx)
+	clientCancel()
+	if !isClientRequestCancellation(derivedClientCtx, context.Canceled) {
+		t.Fatal("canceled original request was not classified as a client cancellation")
+	}
+
+	clientRequestCtx := context.Background()
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	derivedCtx, derivedCancel := context.WithCancel(serverCtx)
+	if isClientRequestCancellation(context.WithValue(derivedCtx, originalRequestContextKey{}, clientRequestCtx), context.Canceled) {
+		t.Fatal("server-side derived cancellation was misclassified as a client cancellation")
+	}
+	serverCancel()
+	derivedCancel()
+	if originalRequestContext(derivedCtx) != derivedCtx {
+		t.Fatal("context without an original marker should be returned unchanged")
+	}
+
+	marked := context.WithValue(derivedCtx, originalRequestContextKey{}, serverCtx)
+	if originalRequestContext(marked) != serverCtx {
+		t.Fatal("original request context marker was not recovered")
 	}
 }
 
