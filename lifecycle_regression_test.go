@@ -53,26 +53,21 @@ type finalFlushFailureFixture struct {
 	requestDone <-chan struct{}
 }
 
-// newFinalFlushFailureFixture keeps one proxied request active until StopSite
-// cancels the instance. The upstream then adds a small amount of tail traffic,
-// so StopSite's pre-close checkpoint is a no-op while its post-close checkpoint
-// reaches the injected SQLite failure. This deterministically exercises the
-// irreversible-close error path rather than the retryable pre-close path.
+// newFinalFlushFailureFixture keeps one lifecycle-tracked request active until
+// StopSite cancels the instance. The synthetic request adds a small amount of
+// tail traffic before releasing activeRequests, so StopSite's pre-close
+// checkpoint is a no-op while its post-close checkpoint reaches the injected
+// SQLite failure. Using the instance lifecycle gate directly avoids racing an
+// outbound httptest handler against ReverseProxy cancellation under -race.
 func newFinalFlushFailureFixture(t *testing.T, name string) finalFlushFailureFixture {
 	t.Helper()
 	registerLifecycleFailureFunction(t)
 	failNextTrafficUpdate.Store(false)
 
 	app := newTestApp(t)
-	started := make(chan struct{})
 	requestDone := make(chan struct{})
-	var inst *ProxyInstance
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		close(started)
-		<-r.Context().Done()
-		inst.bytesOut.Add(23)
-	}))
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	t.Cleanup(upstream.Close)
 
 	port := freePort(t)
@@ -85,7 +80,7 @@ func newFinalFlushFailureFixture(t *testing.T, name string) finalFlushFailureFix
 		t.Fatalf("StartSite: %v", err)
 	}
 	app.pm.mu.RLock()
-	inst = app.pm.proxies[site.ID]
+	inst := app.pm.proxies[site.ID]
 	app.pm.mu.RUnlock()
 	if inst == nil {
 		t.Fatal("proxy instance was not installed")
@@ -95,20 +90,15 @@ func newFinalFlushFailureFixture(t *testing.T, name string) finalFlushFailureFix
 		_ = app.pm.StopSite(site.ID)
 	})
 
+	if !inst.beginRequest() {
+		t.Fatal("failed to register synthetic in-flight request")
+	}
 	go func() {
 		defer close(requestDone)
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, requestErr := client.Get(fmt.Sprintf("http://127.0.0.1:%d/stream", port))
-		if requestErr == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-		}
+		<-inst.ctx.Done()
+		inst.bytesOut.Add(23)
+		inst.endRequest()
 	}()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("in-flight request did not reach upstream")
-	}
 
 	if _, err := app.db.db.Exec(`
 		CREATE TRIGGER fail_one_final_lifecycle_traffic_update
@@ -229,25 +219,10 @@ func TestDifferentPortUpdateRestartsOldSiteAfterPostShutdownReplaceFailure(t *te
 	failNextTrafficUpdate.Store(false)
 
 	app := newTestApp(t)
-	started := make(chan struct{})
 	requestDone := make(chan struct{})
-	var firstRequest sync.Once
 	var oldInst *ProxyInstance
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		isFirst := false
-		firstRequest.Do(func() {
-			isFirst = true
-			close(started)
-		})
-		if isFirst {
-			<-r.Context().Done()
-			// Produce traffic after StartSite's pre-stop flush. The replacement's
-			// final flush is therefore the first traffic_used update and the one
-			// deliberately failed by the trigger below.
-			oldInst.bytesOut.Add(17)
-			return
-		}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "restored")
 	}))
 	defer upstream.Close()
@@ -270,20 +245,17 @@ func TestDifferentPortUpdateRestartsOldSiteAfterPostShutdownReplaceFailure(t *te
 		t.Fatal("old proxy instance was not installed")
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	if !oldInst.beginRequest() {
+		t.Fatal("failed to register synthetic old-instance request")
+	}
 	go func() {
 		defer close(requestDone)
-		resp, requestErr := client.Get(fmt.Sprintf("http://127.0.0.1:%d/stream", oldPort))
-		if requestErr == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-		}
+		<-oldInst.ctx.Done()
+		// Produce traffic only after StartSite's pre-stop flush. Releasing the
+		// lifecycle gate after the write guarantees the final flush observes it.
+		oldInst.bytesOut.Add(17)
+		oldInst.endRequest()
 	}()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("in-flight request did not reach the old upstream")
-	}
 
 	if _, err := app.db.db.Exec(`
 		CREATE TRIGGER fail_one_lifecycle_traffic_update
