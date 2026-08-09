@@ -27,12 +27,12 @@ read_secret() {
         sh "$name"
 }
 
-docker build --build-arg VERSION=v1.8.25 -t "$image" "$repo_root" >/dev/null
+docker build --build-arg VERSION=v1.8.26 -t "$image" "$repo_root" >/dev/null
 
 fresh_data="$test_root/fresh"
 mkdir -p "$fresh_data"
 first_output=$(docker run --rm -v "$fresh_data:/app/data" "$image" --version)
-printf '%s\n' "$first_output" | grep -Fq 'v1.8.25' \
+printf '%s\n' "$first_output" | grep -Fq 'v1.8.26' \
     || fail_test '--version was not forwarded to Meridian'
 printf '%s\n' "$first_output" | grep -Fq 'Meridian 首次初始化令牌:' \
     || fail_test 'the generated setup token was not printed on first startup'
