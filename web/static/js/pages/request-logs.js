@@ -22,9 +22,15 @@ function requestLogGetUAWidth() {
 
 function requestLogSetUAWidth(value) {
   const width = requestLogNormalizeUAWidth(value);
+  const cssWidth = `${width}px`;
   if (document.documentElement?.style?.setProperty) {
-    document.documentElement.style.setProperty('--request-log-ua-width', `${width}px`);
+    document.documentElement.style.setProperty('--request-log-ua-width', cssWidth);
   }
+  const table = document.querySelector?.('.request-log-table');
+  if (table?.style?.setProperty) table.style.setProperty('--request-log-ua-width', cssWidth);
+  document.querySelectorAll?.('col.request-log-col-ua, th[data-log-field="ua"]').forEach(node => {
+    node.style?.setProperty('width', cssWidth, 'important');
+  });
   try {
     window.localStorage.setItem(requestLogUAWidthStorageKey, String(width));
   } catch (_) {}
@@ -191,6 +197,7 @@ function renderRequestLogs() {
       </div>
     </section>
   `;
+  requestLogApplyUAWidth();
 
   document.querySelectorAll('#request-log-category-pills .request-log-pill').forEach(button => {
     button.onclick = () => {
@@ -217,12 +224,14 @@ function renderRequestLogs() {
   document.getElementById('request-cache-clear').onclick = clearAssetCache;
   const uaWidthInput = document.getElementById('request-log-ua-width');
   if (uaWidthInput) {
-    uaWidthInput.oninput = () => {
+    const applyUAWidth = () => {
       const width = requestLogSetUAWidth(uaWidthInput.value);
       uaWidthInput.value = String(width);
       const output = document.getElementById('request-log-ua-width-value');
       if (output) output.textContent = `${width} px`;
     };
+    uaWidthInput.oninput = applyUAWidth;
+    uaWidthInput.onchange = applyUAWidth;
   }
   if (API.getSystemSettings) API.getSystemSettings().then(requestLogApplyDisplaySettings).catch(() => requestLogApplyDisplaySettings(null));
   loadRequestLogs({ showLoading: true });

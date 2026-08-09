@@ -4114,13 +4114,20 @@ html {
   display: flex;
   align-items: center;
   gap: 10px;
+  max-width: 380px;
   margin-top: 14px;
   color: var(--white-60);
   font-size: 13px;
 }
 
+.request-log-ua-width-control label {
+  flex: 0 0 84px;
+}
+
 .request-log-ua-width-control input[type="range"] {
   flex: 1 1 220px;
+  width: 220px;
+  max-width: 220px;
   min-width: 140px;
   accent-color: var(--blue);
 }
@@ -4707,7 +4714,7 @@ html { font-size: 15px; }
 
 .request-log-table-card { width: 100%; min-width: 0; }
 .request-log-table-scroll { width: 100%; min-width: 0; overflow-x: auto; }
-.request-log-table { width: 100%; min-width: 920px; table-layout: fixed; }
+.request-log-table { width: 100%; min-width: calc(680px + var(--request-log-ua-width, 240px)); table-layout: fixed; }
 .request-log-table th,
 .request-log-table td { padding: 12px 14px; vertical-align: middle; }
 .request-log-table th { font-size: 13px; }
@@ -4723,6 +4730,8 @@ html { font-size: 15px; }
 .request-log-table th:nth-child(4) { width: 25% !important; }
 .request-log-table th:nth-child(5) { width: var(--request-log-ua-width, 240px) !important; }
 .request-log-table th:nth-child(6) { width: 132px !important; }
+.request-log-table th[data-log-field="timeline"],
+.request-log-table td[data-log-field="timeline"] { text-align: right; }
 .request-log-ip { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
 .request-log-region { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .request-log-ua { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
@@ -4747,7 +4756,7 @@ html { font-size: 15px; }
   .settings-section-nav { gap: 4px; padding: 9px; }
   .settings-nav-item { min-height: 34px; padding-block: 4px; }
   .settings-panel, .telegram-report-card, .settings-content .diag-card { padding: 12px; }
-  .request-log-table { min-width: 820px; }
+  .request-log-table { min-width: calc(580px + var(--request-log-ua-width, 240px)); }
   .request-log-table th, .request-log-table td { padding: 10px 11px; }
 }
 

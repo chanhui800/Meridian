@@ -173,6 +173,34 @@ test('request log date range covers the selected local days', () => {
   assert.equal(range.to_ms - range.from_ms, (2 * 24 * 60 * 60 * 1000) - 1);
 });
 
+test('request log timeline heading aligns with timeline values', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'),
+    'utf8',
+  );
+  assert.match(source, /\.request-log-table th\[data-log-field="timeline"\],\s*\.request-log-table td\[data-log-field="timeline"\]\s*\{\s*text-align:\s*right;\s*\}/);
+});
+
+test('request log UA width is applied to the live table and handles drag completion', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
+    'utf8',
+  );
+  assert.match(source, /table\.style\.setProperty\('--request-log-ua-width', cssWidth\)/);
+  assert.match(source, /col\.request-log-col-ua, th\[data-log-field="ua"\]/);
+  assert.match(source, /uaWidthInput\.oninput = applyUAWidth/);
+  assert.match(source, /uaWidthInput\.onchange = applyUAWidth/);
+});
+
+test('request log UA width slider stays compact', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'),
+    'utf8',
+  );
+  assert.match(source, /\.request-log-ua-width-control\s*\{[^}]*max-width:\s*380px;/s);
+  assert.match(source, /\.request-log-ua-width-control input\[type="range"\]\s*\{[^}]*max-width:\s*220px;/s);
+});
+
 test('request log timeline uses concise Chinese relative time', () => {
   const sandbox = loadRequestLogHelpers();
   const now = Date.parse('2026-08-05T12:00:00Z');
