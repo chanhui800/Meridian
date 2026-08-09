@@ -784,6 +784,23 @@ func TestCapabilityRoutePinsDialAndStripsCrossOriginSecrets(t *testing.T) {
 	}
 }
 
+func TestCapabilityRouteDirectModeRedirectsPlaybackInfoMainVideo(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	issuer.site.MainVideoStreamMode = mainVideoStreamModeDirect
+	target := mustStructuredURL(t, "https://cdn.example.com/video.mp4?sig=client-target")
+	route, discoveryErr := issuer.mint(context.Background(), mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo"), target, dynamicDiscoverySourcePlaybackInfo)
+	if discoveryErr != nil {
+		t.Fatalf("mint direct capability: %v", discoveryErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	issuer.serve(recorder, httptest.NewRequest(http.MethodGet, "https://site.example.com"+route, nil))
+	if recorder.Code != http.StatusTemporaryRedirect || recorder.Header().Get("Location") != target.String() || recorder.Header().Get("Content-Length") != "0" {
+		t.Fatalf("direct capability response = %d %#v", recorder.Code, recorder.Header())
+	}
+
+}
+
 func TestHLSCapabilityDeliveryDirectivesAreConstrained(t *testing.T) {
 	target := mustStructuredURL(t, "https://cdn.example.com/live.m3u8?a=one&sig=signed&z=last")
 	claims := dynamicCapabilityClaims{Source: dynamicDiscoverySourceHLS, Kind: dynamicCapabilityKindManifest, Depth: 1}

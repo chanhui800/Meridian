@@ -50,3 +50,43 @@ func TestTelegramReportMessageIsBoundedAtUTF8Boundary(t *testing.T) {
 		t.Fatal("long report should end with an ellipsis")
 	}
 }
+
+func TestTelegramReportScheduleChangeRearmsCurrentPeriod(t *testing.T) {
+	app := newTestApp(t)
+	settings := TelegramReportSettings{
+		Enabled: true, ChatID: "123456", ScheduleTime: "20:00", Frequency: "daily", Weekday: 1,
+	}
+	ciphertext, err := encryptTelegramBotToken("123456:example-token")
+	if err != nil {
+		t.Fatalf("encrypt token: %v", err)
+	}
+	if err := app.db.saveTelegramReportSettings(settings, ciphertext, true); err != nil {
+		t.Fatalf("save initial settings: %v", err)
+	}
+	if err := app.db.markTelegramReportSent("daily:2026-08-10"); err != nil {
+		t.Fatalf("mark sent: %v", err)
+	}
+
+	if err := app.db.saveTelegramReportSettings(settings, ciphertext, false); err != nil {
+		t.Fatalf("save unchanged settings: %v", err)
+	}
+	stored, err := app.db.telegramReportSettings()
+	if err != nil {
+		t.Fatalf("read unchanged settings: %v", err)
+	}
+	if stored.LastSentKey != "daily:2026-08-10" {
+		t.Fatalf("unchanged settings cleared last_sent_key: %q", stored.LastSentKey)
+	}
+
+	settings.ScheduleTime = "20:05"
+	if err := app.db.saveTelegramReportSettings(settings, ciphertext, false); err != nil {
+		t.Fatalf("save changed schedule: %v", err)
+	}
+	stored, err = app.db.telegramReportSettings()
+	if err != nil {
+		t.Fatalf("read changed settings: %v", err)
+	}
+	if stored.LastSentKey != "" {
+		t.Fatalf("changed schedule kept last_sent_key: %q", stored.LastSentKey)
+	}
+}

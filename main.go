@@ -233,6 +233,8 @@ const (
 	ingressModePort                    = "port"
 	ingressModeHost                    = "host"
 	ingressModeBoth                    = "both"
+	mainVideoStreamModeProxy           = "proxy"
+	mainVideoStreamModeDirect          = "direct"
 	dynamicRoutePrefix                 = "/_meridian/d/"
 	dynamicDiscoverySourceRedirect     = "redirect"
 	dynamicDiscoverySourcePlaybackInfo = "playback_info"
@@ -2294,6 +2296,7 @@ func (d *DB) migrateOnce() error {
 			target_url TEXT NOT NULL,
 		playback_target_url TEXT NOT NULL DEFAULT '',
 		playback_mode TEXT NOT NULL DEFAULT 'direct',
+		main_video_stream_mode TEXT NOT NULL DEFAULT 'proxy',
 		stream_hosts TEXT NOT NULL DEFAULT '[]',
 		ua_mode TEXT DEFAULT 'passthrough',
 		custom_user_agent TEXT NOT NULL DEFAULT '',
@@ -2403,6 +2406,7 @@ func (d *DB) migrateOnce() error {
 	}{
 		{"playback_target_url", "ALTER TABLE sites ADD COLUMN playback_target_url TEXT NOT NULL DEFAULT ''"},
 		{"playback_mode", "ALTER TABLE sites ADD COLUMN playback_mode TEXT NOT NULL DEFAULT 'direct'"},
+		{"main_video_stream_mode", "ALTER TABLE sites ADD COLUMN main_video_stream_mode TEXT NOT NULL DEFAULT 'proxy'"},
 		{"stream_hosts", "ALTER TABLE sites ADD COLUMN stream_hosts TEXT NOT NULL DEFAULT '[]'"},
 		{"custom_user_agent", "ALTER TABLE sites ADD COLUMN custom_user_agent TEXT NOT NULL DEFAULT ''"},
 		{"custom_client", "ALTER TABLE sites ADD COLUMN custom_client TEXT NOT NULL DEFAULT ''"},
@@ -2841,6 +2845,7 @@ type Site struct {
 	TargetURL                     string               `json:"target_url"`
 	PlaybackTargetURL             string               `json:"playback_target_url"`
 	PlaybackMode                  string               `json:"playback_mode"`
+	MainVideoStreamMode           string               `json:"main_video_stream_mode"`
 	StreamHosts                   string               `json:"-"`
 	StreamHostList                []string             `json:"stream_hosts"`
 	UAMode                        string               `json:"ua_mode"`
@@ -3160,7 +3165,7 @@ func (d *DB) ResetAdminPassword(password string) error {
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
+	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, main_video_stream_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -3169,7 +3174,7 @@ func (d *DB) ListSites() ([]Site, error) {
 	for rows.Next() {
 		var s Site
 		var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int
-		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Enabled = enabled == 1
@@ -3190,8 +3195,8 @@ func (d *DB) ListSites() ([]Site, error) {
 func (d *DB) GetSite(id int64) (*Site, error) {
 	var s Site
 	var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int
-	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, main_video_stream_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
+		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -3224,6 +3229,11 @@ func (d *DB) CreateSiteWithCustomUA(name string, port int, targetURL, playbackTa
 }
 
 func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
+	var err error
+	site.MainVideoStreamMode, err = normalizeMainVideoStreamMode(site.MainVideoStreamMode)
+	if err != nil {
+		return nil, err
+	}
 	if site.StreamHosts == "" {
 		site.StreamHosts = "[]"
 	}
@@ -3250,8 +3260,8 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	}
 	site.DynamicPolicyRevision = 1
 	res, err := d.db.Exec(
-		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, site.TrafficQuota, site.SpeedLimit,
+		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, main_video_stream_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.MainVideoStreamMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -3299,6 +3309,11 @@ func (d *DB) restoreSiteRecord(site Site) error {
 }
 
 func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
+	var err error
+	site.MainVideoStreamMode, err = normalizeMainVideoStreamMode(site.MainVideoStreamMode)
+	if err != nil {
+		return err
+	}
 	if site.StreamHosts == "" {
 		site.StreamHosts = "[]"
 	}
@@ -3352,7 +3367,7 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	revisionExpression := "dynamic_policy_revision=dynamic_policy_revision+CASE WHEN dynamic_discovery_enabled<>? OR dynamic_profile<>? OR dynamic_discovery_sources<>? OR dynamic_domain_rules<>? OR dynamic_allow_https_downgrade<>? THEN 1 ELSE 0 END"
 	args := []interface{}{
 		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL,
-		site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode,
+		site.PlaybackTargetURL, site.PlaybackMode, site.MainVideoStreamMode, site.StreamHosts, site.UAMode,
 		site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders,
 		dynamicEnabled, site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, dynamicDowngrade,
 	}
@@ -3364,7 +3379,7 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	}
 	args = append(args, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, site.TrafficQuota, site.SpeedLimit, site.ID)
 	_, err = tx.Exec(
-		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, dynamic_discovery_enabled=?, dynamic_profile=?, dynamic_discovery_sources=?, dynamic_domain_rules=?, dynamic_allow_https_downgrade=?, "+revisionExpression+", asset_cache_enabled=?, asset_cache_ttl_sec=?, asset_cache_max_bytes=?, asset_cache_rules=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, main_video_stream_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, dynamic_discovery_enabled=?, dynamic_profile=?, dynamic_discovery_sources=?, dynamic_domain_rules=?, dynamic_allow_https_downgrade=?, "+revisionExpression+", asset_cache_enabled=?, asset_cache_ttl_sec=?, asset_cache_max_bytes=?, asset_cache_rules=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
 		args...,
 	)
 	if err != nil {
@@ -9476,6 +9491,17 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		transport = dynamicTransport
 	}
 	defer rollback()
+	mainVideoDirect := i.site.MainVideoStreamMode == mainVideoStreamModeDirect && claims.Kind == dynamicCapabilityKindResource && claims.Source != dynamicDiscoverySourceHLS && claims.Source != dynamicDiscoverySourceDASH && len(claims.RequiredHeaders) == 0 && isMainVideoStreamURL(target)
+	if mainVideoDirect {
+		if !i.state.useCapability(token, time.Now()) {
+			writeDynamicCapabilityUnavailable(w)
+			return
+		}
+		commit()
+		i.observe(claims.Source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, authority)
+		writeMainVideoDirectRedirect(w, target)
+		return
+	}
 	releaseStream, acquired := i.state.acquireStream()
 	if !acquired {
 		rollback()
@@ -9560,6 +9586,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			dynamicState:            i.state,
 			capabilityIssuer:        i,
 			streamLeaseHeld:         true,
+			mainVideoDirect:         i.site.MainVideoStreamMode == mainVideoStreamModeDirect,
 			database:                i.database,
 			siteID:                  i.siteID,
 		}
@@ -9679,6 +9706,26 @@ func singleDynamicLocation(resp *http.Response) (string, bool) {
 	return values[0], true
 }
 
+func replaceResponseWithMainVideoRedirect(resp *http.Response, target *url.URL) *http.Response {
+	if resp == nil || target == nil {
+		return resp
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	resp.StatusCode = http.StatusTemporaryRedirect
+	resp.Status = strconv.Itoa(http.StatusTemporaryRedirect) + " " + http.StatusText(http.StatusTemporaryRedirect)
+	resp.Header = make(http.Header)
+	resp.Header.Set("Location", target.String())
+	resp.Header.Set("Cache-Control", "private, no-store")
+	resp.Header.Set("Referrer-Policy", "no-referrer")
+	resp.Header.Set("Content-Length", "0")
+	resp.Body = http.NoBody
+	resp.ContentLength = 0
+	resp.Trailer = nil
+	return resp
+}
+
 type dynamicTransportFactory func(*url.URL, []net.IP, *dynamicSelfTargetPolicy) (*http.Transport, error)
 
 type redirectFollowTransport struct {
@@ -9698,6 +9745,7 @@ type redirectFollowTransport struct {
 	dynamicState            *dynamicSiteState
 	capabilityIssuer        *dynamicCapabilityIssuer
 	streamLeaseHeld         bool
+	mainVideoDirect         bool
 	database                *DB
 	siteID                  int64
 }
@@ -10070,6 +10118,13 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		manualAuthority := redirectHostKey(locationURL)
 		sameAuthority := sameRedirectAuthority(req.URL, locationURL)
 		unknownAuthority := !sameAuthority && !t.configuredAuthorities[manualAuthority]
+		directMainVideo := t.mainVideoDirect && expectedStructuredSource != dynamicDiscoverySourceHLS && expectedStructuredSource != dynamicDiscoverySourceDASH && (isMainVideoStreamRequest(req) || isMainVideoStreamURL(locationURL))
+		if directMainVideo && !unknownAuthority && locationURL.User == nil && (locationURL.Scheme == "http" || locationURL.Scheme == "https") {
+			if tracker := backendAddressTrackerFromContext(req.Context()); tracker != nil {
+				tracker.SetURL(locationURL)
+			}
+			return replaceResponseWithMainVideoRedirect(resp, locationURL), nil
+		}
 		if !dynamicActive && sameAuthority {
 			observationAuthority := dynamicCanonicalAuthority(locationURL)
 			if observationAuthority == "" {
@@ -10168,6 +10223,25 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 		if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
 			return fail(dynamicObservationReasonHopLimit, authority)
+		}
+		if directMainVideo {
+			if reasonCode := t.dynamicPolicy.validateTarget(req.URL, normalized, selfTargets); reasonCode != "" {
+				return fail(reasonCode, authority)
+			}
+			reservation, reasonCode := t.dynamicState.reserveAuthority(authority, time.Now())
+			if reasonCode != "" {
+				return fail(reasonCode, authority)
+			}
+			if _, reasonCode = reservation.resolve(req.Context(), normalized, selfTargets); reasonCode != "" {
+				reservation.rollback()
+				return fail(reasonCode, authority)
+			}
+			reservation.commit()
+			if tracker := backendAddressTrackerFromContext(req.Context()); tracker != nil {
+				tracker.SetURL(normalized)
+			}
+			t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
+			return replaceResponseWithMainVideoRedirect(resp, normalized), nil
 		}
 		if t.followUnknownRedirects && shouldInternallyFollowDynamicRedirect(req) {
 			if reasonCode := t.dynamicPolicy.validateTarget(req.URL, normalized, selfTargets); reasonCode != "" {
@@ -12360,6 +12434,99 @@ func validateSiteSettings(name string, listenPort int, targetURL, playbackTarget
 	return nil
 }
 
+func normalizeMainVideoStreamMode(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return mainVideoStreamModeProxy, nil
+	}
+	if value != mainVideoStreamModeProxy && value != mainVideoStreamModeDirect {
+		return "", fmt.Errorf("main_video_stream_mode must be proxy or direct")
+	}
+	return value, nil
+}
+
+func isMainVideoStreamURL(target *url.URL) bool {
+	if target == nil {
+		return false
+	}
+	pathValue := strings.ToLower(target.Path)
+	for _, suffix := range []string{
+		".m3u8", ".m3u", ".mpd", ".ts", ".m4s",
+		".srt", ".ass", ".vtt", ".sub",
+		".jpg", ".jpeg", ".gif", ".png", ".svg", ".ico", ".webp",
+		".js", ".css", ".woff", ".woff2", ".ttf", ".otf", ".map", ".webmanifest",
+	} {
+		if strings.HasSuffix(pathValue, suffix) {
+			return false
+		}
+	}
+	for _, suffix := range []string{".mp4", ".m4v", ".ogv", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv"} {
+		if strings.HasSuffix(pathValue, suffix) {
+			return true
+		}
+	}
+	parts := strings.Split(strings.Trim(pathValue, "/"), "/")
+	if len(parts) > 0 && parts[0] == "emby" {
+		parts = parts[1:]
+	}
+	if len(parts) >= 3 && parts[0] == "videos" && parts[1] != "" {
+		name := parts[2]
+		if dot := strings.IndexByte(name, '.'); dot >= 0 {
+			name = name[:dot]
+		}
+		switch name {
+		case "stream", "original", "download", "file":
+			return true
+		}
+	}
+	if len(parts) >= 3 && parts[0] == "items" && parts[1] != "" && parts[2] == "download" {
+		return true
+	}
+	for key, values := range target.Query() {
+		if !strings.EqualFold(key, "Static") && !strings.EqualFold(key, "Download") {
+			continue
+		}
+		for _, value := range values {
+			if strings.EqualFold(value, "true") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isMainVideoStreamRequest(r *http.Request) bool {
+	return r != nil && r.URL != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && !hasUpgradeIntent(r) && !isReservedDynamicRoute(r.URL.Path) && !isPlaybackInfoRequest(r.URL.Path) && isMainVideoStreamURL(r.URL)
+}
+
+func mainVideoDirectTarget(r *http.Request, upstream *url.URL) *url.URL {
+	if r == nil || r.URL == nil || upstream == nil {
+		return nil
+	}
+	target := *r.URL
+	base := *upstream
+	// Configured base queries can contain origin-only credentials. Direct mode
+	// exposes only authentication that was already present in the client URL.
+	base.RawQuery = ""
+	base.ForceQuery = false
+	applyUpstreamURL(&target, &base)
+	target.User = nil
+	target.Fragment = ""
+	target.RawFragment = ""
+	return &target
+}
+
+func writeMainVideoDirectRedirect(w http.ResponseWriter, target *url.URL) {
+	if w == nil || target == nil {
+		return
+	}
+	w.Header().Set("Location", target.String())
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Length", "0")
+	w.WriteHeader(http.StatusTemporaryRedirect)
+}
+
 func isPlaybackRequest(path string) bool {
 	path = strings.ToLower(path)
 	switch {
@@ -13048,6 +13215,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			dynamicTransportFactory: pm.dynamicTransportFactory,
 			dynamicState:            dynamicState,
 			capabilityIssuer:        dynamicIssuer,
+			mainVideoDirect:         site.MainVideoStreamMode == mainVideoStreamModeDirect,
 			database:                pm.database,
 			siteID:                  site.ID,
 		}
@@ -13123,6 +13291,19 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			} else {
 				dynamicIssuer.serve(rw, r)
 			}
+			return
+		}
+
+		if site.MainVideoStreamMode == mainVideoStreamModeDirect && isMainVideoStreamRequest(r) {
+			directUpstream := target
+			if !isRedirectMode {
+				directUpstream = upstreamTargetForRequest(r, target, playbackTarget)
+			}
+			directTarget := mainVideoDirectTarget(r, directUpstream)
+			if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
+				tracker.SetURL(directTarget)
+			}
+			writeMainVideoDirectRedirect(w, directTarget)
 			return
 		}
 
@@ -15274,6 +15455,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			TargetURL                  string                `json:"target_url"`
 			PlaybackTargetURL          string                `json:"playback_target_url"`
 			PlaybackMode               string                `json:"playback_mode"`
+			MainVideoStreamMode        string                `json:"main_video_stream_mode"`
 			StreamHosts                []string              `json:"stream_hosts"`
 			UAMode                     string                `json:"ua_mode"`
 			CustomUserAgent            string                `json:"custom_user_agent"`
@@ -15391,6 +15573,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		req.CustomUserAgent = customUserAgent
 		req.CustomClient = customClient
 		req.CustomVersion = customVersion
+		req.MainVideoStreamMode, err = normalizeMainVideoStreamMode(req.MainVideoStreamMode)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -15418,6 +15605,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			TargetURL:                     req.TargetURL,
 			PlaybackTargetURL:             req.PlaybackTargetURL,
 			PlaybackMode:                  req.PlaybackMode,
+			MainVideoStreamMode:           req.MainVideoStreamMode,
 			StreamHosts:                   string(streamHostsJSON),
 			UAMode:                        req.UAMode,
 			CustomUserAgent:               req.CustomUserAgent,
@@ -15605,6 +15793,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			TargetURL                  string                 `json:"target_url"`
 			PlaybackTargetURL          *string                `json:"playback_target_url"`
 			PlaybackMode               *string                `json:"playback_mode"`
+			MainVideoStreamMode        *string                `json:"main_video_stream_mode"`
 			StreamHosts                *[]string              `json:"stream_hosts"`
 			UAMode                     *string                `json:"ua_mode"`
 			CustomUserAgent            *string                `json:"custom_user_agent"`
@@ -15639,6 +15828,14 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		playbackMode := oldSite.PlaybackMode
 		if req.PlaybackMode != nil {
 			playbackMode = *req.PlaybackMode
+		}
+		mainVideoStreamMode := oldSite.MainVideoStreamMode
+		if req.MainVideoStreamMode != nil {
+			mainVideoStreamMode, err = normalizeMainVideoStreamMode(*req.MainVideoStreamMode)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		streamHosts := oldSite.StreamHosts
 		if req.StreamHosts != nil {
@@ -15774,6 +15971,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.TargetURL = req.TargetURL
 		candidate.PlaybackTargetURL = playbackTargetURL
 		candidate.PlaybackMode = playbackMode
+		candidate.MainVideoStreamMode = mainVideoStreamMode
 		candidate.StreamHosts = streamHosts
 		candidate.UAMode = uaMode
 		candidate.CustomUserAgent = customUserAgent
@@ -16188,7 +16386,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.28"
+var appVersion = "v1.8.29"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
