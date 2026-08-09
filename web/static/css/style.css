@@ -4714,7 +4714,7 @@ html { font-size: 15px; }
 
 .request-log-table-card { width: 100%; min-width: 0; }
 .request-log-table-scroll { width: 100%; min-width: 0; overflow-x: auto; }
-.request-log-table { width: 100%; min-width: calc(680px + var(--request-log-ua-width, 240px)); table-layout: fixed; }
+.request-log-table { width: 100%; min-width: calc(840px + var(--request-log-ua-width, 240px)); table-layout: fixed; }
 .request-log-table th,
 .request-log-table td { padding: 12px 14px; vertical-align: middle; }
 .request-log-table th { font-size: 13px; }
@@ -4723,18 +4723,21 @@ html { font-size: 15px; }
 .request-log-table col.request-log-col-status { width: 8%; }
 .request-log-table col.request-log-col-ip { width: 25%; }
 .request-log-table col.request-log-col-ua { width: var(--request-log-ua-width, 240px); }
+.request-log-table col.request-log-col-backend { width: 210px; }
 .request-log-table col.request-log-col-time { width: 132px; }
 .request-log-table th:nth-child(1) { width: 15% !important; }
 .request-log-table th:nth-child(2) { width: 12% !important; }
 .request-log-table th:nth-child(3) { width: 8% !important; }
 .request-log-table th:nth-child(4) { width: 25% !important; }
 .request-log-table th:nth-child(5) { width: var(--request-log-ua-width, 240px) !important; }
-.request-log-table th:nth-child(6) { width: 132px !important; }
+.request-log-table th:nth-child(6) { width: 210px !important; }
+.request-log-table th:nth-child(7) { width: 132px !important; }
 .request-log-table th[data-log-field="timeline"],
 .request-log-table td[data-log-field="timeline"] { text-align: right; }
 .request-log-ip { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
 .request-log-region { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .request-log-ua { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+.request-log-backend { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
 .request-log-time { display: block; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 
 .dashboard-trend-card { min-width: 0; overflow: hidden; }

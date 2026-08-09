@@ -1358,6 +1358,7 @@ type requestLogEvent struct {
 	InboundColo      string
 	OutboundColo     string
 	UserAgent        string
+	BackendAddress   string
 	Method           string
 	Path             string
 }
@@ -1373,6 +1374,7 @@ type RequestLog struct {
 	InboundColo      string `json:"inbound_colo"`
 	OutboundColo     string `json:"outbound_colo"`
 	UserAgent        string `json:"user_agent"`
+	BackendAddress   string `json:"backend_address"`
 	Method           string `json:"method"`
 	Path             string `json:"path"`
 	RecordedAtMS     int64  `json:"recorded_at_ms"`
@@ -1673,6 +1675,9 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	if !settings.LogWriteUA {
 		event.UserAgent = ""
 	}
+	if !settings.LogWriteBackendAddress {
+		event.BackendAddress = ""
+	}
 	if !settings.LogWriteNode {
 		event.SiteName = ""
 	}
@@ -1688,7 +1693,7 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	if event.SiteID <= 0 || event.ResourceCategory != "" && !validRequestLogCategory(event.ResourceCategory) ||
 		event.StatusCode != 0 && (event.StatusCode < 100 || event.StatusCode > 599) ||
 		len(event.SiteName) > requestLogMaxSiteNameBytes || len(event.ClientIP) > requestLogMaxClientIPBytes ||
-		len(event.UserAgent) > requestLogMaxUserAgentBytes || event.Method == "" || len(event.Method) > 16 || event.Path == "" || len(event.Path) > requestLogMaxPathBytes {
+		len(event.UserAgent) > requestLogMaxUserAgentBytes || len(event.BackendAddress) > maxDynamicTargetURLBytes || event.Method == "" || len(event.Method) > 16 || event.Path == "" || len(event.Path) > requestLogMaxPathBytes {
 		d.droppedRequestLogs.Add(1)
 		return
 	}
@@ -1806,12 +1811,12 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		conditions = append(conditions, "status_code BETWEEN 500 AND 599")
 	}
 	if filter.Query != "" {
-		conditions = append(conditions, `(instr(lower(request_logs.site_name), lower(?))>0 OR instr(lower(COALESCE(sites.name, '')), lower(?))>0 OR instr(lower(request_logs.client_ip), lower(?))>0 OR instr(lower(request_logs.user_agent), lower(?))>0 OR instr(lower(request_logs.path), lower(?))>0 OR CAST(request_logs.status_code AS TEXT)=?)`)
-		for range 6 {
+		conditions = append(conditions, `(instr(lower(request_logs.site_name), lower(?))>0 OR instr(lower(COALESCE(sites.name, '')), lower(?))>0 OR instr(lower(request_logs.client_ip), lower(?))>0 OR instr(lower(request_logs.user_agent), lower(?))>0 OR instr(lower(request_logs.backend_address), lower(?))>0 OR instr(lower(request_logs.path), lower(?))>0 OR CAST(request_logs.status_code AS TEXT)=?)`)
+		for range 7 {
 			args = append(args, filter.Query)
 		}
 	}
-	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.method, request_logs.path, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
+	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- conditions are fixed SQL fragments selected from validated filters; values remain parameters.
 	}
@@ -1825,7 +1830,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	logs := make([]RequestLog, 0)
 	for rows.Next() {
 		var entry RequestLog
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
 			return nil, err
 		}
 		logs = append(logs, entry)
@@ -1837,6 +1842,9 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		}
 		if !settings.LogDisplayUA {
 			logs[i].UserAgent = "hidden"
+		}
+		if !settings.LogDisplayBackendAddress {
+			logs[i].BackendAddress = "hidden"
 		}
 		if !settings.LogDisplayColo {
 			logs[i].InboundColo, logs[i].OutboundColo = "hidden", "hidden"
@@ -2136,8 +2144,8 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 	defer tx.Rollback()
 	statement, err := tx.Prepare(`
 		INSERT INTO request_logs
-			(site_id, site_name, resource_category, status_code, client_ip, user_agent, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			(site_id, site_name, resource_category, status_code, client_ip, user_agent, backend_address, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM sites WHERE id=?)`)
 	if err != nil {
 		return 0, err
@@ -2153,6 +2161,7 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 			event.StatusCode,
 			event.ClientIP,
 			event.UserAgent,
+			event.BackendAddress,
 			event.InboundColo,
 			event.OutboundColo,
 			event.Method,
@@ -2325,6 +2334,7 @@ func (d *DB) migrateOnce() error {
 		status_code INTEGER NOT NULL,
 		client_ip TEXT NOT NULL,
 		user_agent TEXT NOT NULL,
+		backend_address TEXT NOT NULL DEFAULT '',
 		inbound_colo TEXT NOT NULL DEFAULT '',
 		outbound_colo TEXT NOT NULL DEFAULT '',
 		method TEXT NOT NULL,
@@ -2370,8 +2380,8 @@ func (d *DB) migrateOnce() error {
 		log_write_video INTEGER NOT NULL DEFAULT 1, log_write_api INTEGER NOT NULL DEFAULT 1, log_write_auth INTEGER NOT NULL DEFAULT 1,
 		log_write_node INTEGER NOT NULL DEFAULT 1, log_write_category INTEGER NOT NULL DEFAULT 1, log_write_status INTEGER NOT NULL DEFAULT 1,
 		log_write_client_ip INTEGER NOT NULL DEFAULT 1, log_write_colo INTEGER NOT NULL DEFAULT 0,
-		log_write_ua INTEGER NOT NULL DEFAULT 1, log_write_timeline INTEGER NOT NULL DEFAULT 1, log_display_client_ip INTEGER NOT NULL DEFAULT 1,
-		log_display_colo INTEGER NOT NULL DEFAULT 0, log_display_ua INTEGER NOT NULL DEFAULT 1,
+		log_write_ua INTEGER NOT NULL DEFAULT 1, log_write_backend_address INTEGER NOT NULL DEFAULT 1, log_write_timeline INTEGER NOT NULL DEFAULT 1, log_display_client_ip INTEGER NOT NULL DEFAULT 1,
+		log_display_colo INTEGER NOT NULL DEFAULT 0, log_display_ua INTEGER NOT NULL DEFAULT 1, log_display_backend_address INTEGER NOT NULL DEFAULT 1,
 		log_display_node INTEGER NOT NULL DEFAULT 1, log_display_category INTEGER NOT NULL DEFAULT 1,
 		log_display_status INTEGER NOT NULL DEFAULT 1, log_display_timeline INTEGER NOT NULL DEFAULT 1,
 		log_search_mode TEXT NOT NULL DEFAULT 'like', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -2429,10 +2439,12 @@ func (d *DB) migrateOnce() error {
 		{"log_write_category", "ALTER TABLE system_settings ADD COLUMN log_write_category INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_status", "ALTER TABLE system_settings ADD COLUMN log_write_status INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_timeline", "ALTER TABLE system_settings ADD COLUMN log_write_timeline INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_backend_address", "ALTER TABLE system_settings ADD COLUMN log_write_backend_address INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_node", "ALTER TABLE system_settings ADD COLUMN log_display_node INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_category", "ALTER TABLE system_settings ADD COLUMN log_display_category INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_status", "ALTER TABLE system_settings ADD COLUMN log_display_status INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_timeline", "ALTER TABLE system_settings ADD COLUMN log_display_timeline INTEGER NOT NULL DEFAULT 1"},
+		{"log_display_backend_address", "ALTER TABLE system_settings ADD COLUMN log_display_backend_address INTEGER NOT NULL DEFAULT 1"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('system_settings') WHERE name=?", migration.column).Scan(&exists); err != nil {
@@ -2450,6 +2462,7 @@ func (d *DB) migrateOnce() error {
 	for _, migration := range []struct{ column, sql string }{
 		{"inbound_colo", "ALTER TABLE request_logs ADD COLUMN inbound_colo TEXT NOT NULL DEFAULT ''"},
 		{"outbound_colo", "ALTER TABLE request_logs ADD COLUMN outbound_colo TEXT NOT NULL DEFAULT ''"},
+		{"backend_address", "ALTER TABLE request_logs ADD COLUMN backend_address TEXT NOT NULL DEFAULT ''"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name=?", migration.column).Scan(&exists); err != nil {
@@ -3543,6 +3556,9 @@ func (outbound dynamicOutboundContext) Value(key any) any {
 	// Preserve only Meridian's internal PlaybackInfo learning base across a
 	// dynamic hop. All caller-provided context values remain isolated.
 	if _, ok := key.(dynamicPlaybackInfoBaseContextKey); ok {
+		return outbound.Context.Value(key)
+	}
+	if _, ok := key.(backendAddressContextKey); ok {
 		return outbound.Context.Value(key)
 	}
 	return nil
@@ -9405,6 +9421,9 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		writeDynamicCapabilityUnavailable(w)
 		return
 	}
+	if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
+		tracker.SetURL(target)
+	}
 	var previous *url.URL
 	if claims.PreviousScheme != "" {
 		if claims.PreviousScheme != "http" && claims.PreviousScheme != "https" {
@@ -9955,6 +9974,9 @@ func (t *redirectFollowTransport) roundTripLegacy(req *http.Request, resp *http.
 		}
 		applyUAHeaderPolicy(newReq.Header, t.policy)
 		t.upstreamHeaderPolicy.apply(newReq.Header, locURL)
+		if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
+			tracker.SetURL(locURL)
+		}
 		resp, err = t.base.RoundTrip(newReq)
 		if err != nil {
 			return nil, err
@@ -10073,6 +10095,9 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			if stripBodyHeaders {
 				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
 			}
+			if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
+				tracker.SetURL(locationURL)
+			}
 			if resp.Body != nil {
 				_ = resp.Body.Close()
 			}
@@ -10108,6 +10133,9 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			t.upstreamHeaderPolicy.apply(newReq.Header, locationURL)
 			if stripBodyHeaders {
 				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
+			}
+			if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
+				tracker.SetURL(locationURL)
 			}
 			if resp.Body != nil {
 				_ = resp.Body.Close()
@@ -10186,6 +10214,9 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			}
 			if stripBodyHeaders {
 				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
+			}
+			if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
+				tracker.SetURL(normalized)
 			}
 			closeResponse()
 			resp = nil
@@ -10281,6 +10312,9 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 		if stripBodyHeaders {
 			stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
+		}
+		if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
+			tracker.SetURL(normalized)
 		}
 		closeResponse()
 		resp = nil
@@ -11116,6 +11150,43 @@ func requestLogColo(cfRay string) string {
 type requestLogResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
+}
+
+type backendAddressContextKey struct{}
+
+type backendAddressTracker struct {
+	mu    sync.RWMutex
+	value string
+}
+
+func (t *backendAddressTracker) SetURL(target *url.URL) {
+	if t == nil || target == nil {
+		return
+	}
+	value := dynamicCanonicalAuthority(target)
+	if value == "" {
+		value = redactUpstreamURL(target)
+	}
+	t.mu.Lock()
+	t.value = value
+	t.mu.Unlock()
+}
+
+func (t *backendAddressTracker) Get() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.value
+}
+
+func backendAddressTrackerFromContext(ctx context.Context) *backendAddressTracker {
+	if ctx == nil {
+		return nil
+	}
+	tracker, _ := ctx.Value(backendAddressContextKey{}).(*backendAddressTracker)
+	return tracker
 }
 
 type originalRequestContextKey struct{}
@@ -12886,6 +12957,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			} else {
 				upstream = upstreamTargetForRequest(proxyReq.In, target, playbackTarget)
 			}
+			if tracker := backendAddressTrackerFromContext(proxyReq.Out.Context()); tracker != nil {
+				tracker.SetURL(upstream)
+			}
 			applyUpstreamURL(proxyReq.Out.URL, upstream)
 			proxyReq.Out.Host = upstream.Host
 			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy, inst.trustedProxies)
@@ -12999,11 +13073,21 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				requestLogEntry.StatusCode = clientClosedRequestStatus
 			}
 			requestLogEntry.OutboundColo = requestLogColo(requestLogWriter.Header().Get("CF-Ray"))
+			if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
+				requestLogEntry.BackendAddress = tracker.Get()
+			}
 			pm.database.EnqueueRequestLog(requestLogEntry)
 		}()
 		w = requestLogWriter
 		requestCtx, requestCancel := context.WithCancel(r.Context())
 		requestCtx = context.WithValue(requestCtx, originalRequestContextKey{}, clientRequestContext)
+		backendTracker := &backendAddressTracker{}
+		initialBackend := target
+		if !isRedirectMode {
+			initialBackend = upstreamTargetForRequest(r, target, playbackTarget)
+		}
+		backendTracker.SetURL(initialBackend)
+		requestCtx = context.WithValue(requestCtx, backendAddressContextKey{}, backendTracker)
 		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
 		defer func() {
 			stopInstanceCancel()
@@ -16104,7 +16188,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.27"
+var appVersion = "v1.8.28-pre.1"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
