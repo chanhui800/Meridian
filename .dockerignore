@@ -1,4 +1,6 @@
 .git
+.codex-remote-attachments
+COLLABORATION_RULES.md
 .github
 .gitignore
 .env

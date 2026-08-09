@@ -6,8 +6,8 @@
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.8.0">
-<script src="/js/theme.js?v=1.8.24"></script>
-<link rel="stylesheet" href="/css/style.css?v=1.8.24">
+<script src="/js/theme.js?v=1.8.25"></script>
+<link rel="stylesheet" href="/css/style.css?v=1.8.25">
 </head>
 <body class="auth-checking">
 
@@ -31,7 +31,7 @@
       <div class="form-group" id="setup-token-group" hidden>
         <label for="inp-setup-token">初始化令牌</label>
         <input type="password" class="form-input" id="inp-setup-token" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="请从安装输出或部署配置中复制">
-        <div class="form-help">首次创建管理员时需要。令牌由安装器或部署环境显式设置，不会写入服务日志。</div>
+        <div class="form-help">首次创建管理员时需要。Docker 用户可通过 <code>docker compose logs meridian</code> 查看自动生成的初始化令牌。</div>
       </div>
       <button type="submit" class="btn-login" id="btn-login">登录</button>
     </form>
@@ -46,7 +46,7 @@
     <div class="sidebar-brand">
       <img src="/favicon.svg" alt="" class="sidebar-logo">
       <span class="sidebar-brand-name">Meridian</span>
-      <span class="sidebar-version" id="sidebar-version">v1.8.24</span>
+      <span class="sidebar-version" id="sidebar-version">v1.8.25</span>
     </div>
     <nav class="sidebar-nav" aria-label="功能菜单">
       <a href="#dashboard" class="topnav-link active" data-page="dashboard" title="仪表盘">
@@ -135,17 +135,17 @@
 <!-- Login errors must remain visible while the application shell is hidden. -->
 <div id="toast-container" aria-live="polite"></div>
 
-<script src="/js/api.js?v=1.8.24"></script>
-<script src="/js/toast.js?v=1.8.24"></script>
-<script src="/js/router.js?v=1.8.24"></script>
-<script src="/js/pages/dashboard.js?v=1.8.24"></script>
-<script src="/js/pages/sites.js?v=1.8.24"></script>
-<script src="/js/pages/traffic.js?v=1.8.24"></script>
-<script src="/js/pages/diag.js?v=1.8.24"></script>
-<script src="/js/pages/request-logs.js?v=1.8.24"></script>
-<script src="/js/pages/telegram-report.js?v=1.8.24"></script>
-<script src="/js/pages/global-settings.js?v=1.8.24"></script>
-<script src="/js/pages/account.js?v=1.8.24"></script>
-<script src="/js/app.js?v=1.8.24"></script>
+<script src="/js/api.js?v=1.8.25"></script>
+<script src="/js/toast.js?v=1.8.25"></script>
+<script src="/js/router.js?v=1.8.25"></script>
+<script src="/js/pages/dashboard.js?v=1.8.25"></script>
+<script src="/js/pages/sites.js?v=1.8.25"></script>
+<script src="/js/pages/traffic.js?v=1.8.25"></script>
+<script src="/js/pages/diag.js?v=1.8.25"></script>
+<script src="/js/pages/request-logs.js?v=1.8.25"></script>
+<script src="/js/pages/telegram-report.js?v=1.8.25"></script>
+<script src="/js/pages/global-settings.js?v=1.8.25"></script>
+<script src="/js/pages/account.js?v=1.8.25"></script>
+<script src="/js/app.js?v=1.8.25"></script>
 </body>
 </html>
