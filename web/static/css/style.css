@@ -2618,6 +2618,12 @@ html[data-theme="light"] .toast {
   box-shadow: 0 14px 34px rgba(2,6,23,.18);
 }
 
+.toast.error,
+html[data-theme="light"] .toast.error {
+  border-left-color: var(--red);
+  color: var(--red);
+}
+
 /* Responsive */
 @media (max-width: 1280px) {
   .stats-row {

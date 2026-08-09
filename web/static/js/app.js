@@ -186,6 +186,17 @@
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
   }
 
+  function loginErrorMessage(error) {
+    const message = String(error && error.message || '登录失败');
+    if (message.includes('too many login attempts') || message.includes('登录尝试次数过多')) {
+      return '登录尝试次数过多，请稍后重试';
+    }
+    if (message === 'invalid username or password' || message === '用户名或密码错误') {
+      return '用户名或密码错误';
+    }
+    return message;
+  }
+
   document.getElementById('loginForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     const username = document.getElementById('inp-username').value.trim();
@@ -224,7 +235,7 @@
       setupTokenInputEl.value = '';
       enterApp();
     } catch (err) {
-      Toast.error(err.message === 'invalid username or password' ? '用户名或密码错误' : err.message);
+      Toast.error(loginErrorMessage(err));
       loginButtonEl.disabled = false;
       loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
     }
