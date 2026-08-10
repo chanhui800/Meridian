@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=v1.8.29
+ARG VERSION=v1.8.30
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION}" -o meridian .
 
 # Runtime stage
@@ -31,7 +31,7 @@ ENV DB_PATH=/app/data/meridian.db
 VOLUME ["/app/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD sh -c 'db_path="${DB_PATH:-/app/data/meridian.db}"; marker="$(dirname "$db_path")/panel-port"; port="$(cat "$marker" 2>/dev/null || true)"; case "$port" in ""|*[!0-9]*) exit 1;; esac; wget --no-check-certificate -q -O - "https://127.0.0.1:$port/api/auth/check" >/dev/null 2>&1 || wget -q -O - "http://127.0.0.1:$port/api/auth/check" >/dev/null 2>&1' || exit 1
+  CMD ["/app/meridian", "--healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["./meridian"]

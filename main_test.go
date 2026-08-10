@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1247,7 +1248,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.29", "/css/style.css?v=1.8.29", "/js/pages/sites.js?v=1.8.29", "/js/pages/request-logs.js?v=1.8.29", "/js/app.js?v=1.8.29"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.30", "/css/style.css?v=1.8.30", "/js/pages/sites.js?v=1.8.30", "/js/pages/request-logs.js?v=1.8.30", "/js/app.js?v=1.8.30"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -1816,6 +1817,47 @@ func TestResetAdminPasswordAcceptsLengthBoundaries(t *testing.T) {
 		if _, err := app.db.VerifyUser("admin", password); err != nil {
 			t.Fatalf("length %d password did not verify: %v", length, err)
 		}
+	}
+}
+
+func TestInternalHealthcheckUsesTLSWithoutExternalHelpers(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/auth/check" {
+			t.Fatalf("healthcheck path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse TLS server URL: %v", err)
+	}
+	_, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("split TLS server address: %v", err)
+	}
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "panel-port"), []byte(port), 0600); err != nil {
+		t.Fatalf("write panel port marker: %v", err)
+	}
+	t.Setenv("DB_PATH", filepath.Join(dataDir, "meridian.db"))
+
+	handled, err := runCommandLine([]string{"--healthcheck"}, strings.NewReader(""), io.Discard)
+	if err != nil || !handled {
+		t.Fatalf("healthcheck handled=%v err=%v", handled, err)
+	}
+
+	dockerfile, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	contents := string(dockerfile)
+	if !strings.Contains(contents, `CMD ["/app/meridian", "--healthcheck"]`) {
+		t.Fatal("Docker healthcheck must execute Meridian directly")
+	}
+	if strings.Contains(contents, "wget --no-check-certificate") {
+		t.Fatal("Docker healthcheck must not spawn BusyBox ssl_client zombies")
 	}
 }
 

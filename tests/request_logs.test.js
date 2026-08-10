@@ -46,6 +46,27 @@ test('global log write settings cover every visible request log column', () => {
   }
 });
 
+test('global log resource settings cover the complete request taxonomy', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'global-settings.js'),
+    'utf8',
+  );
+  for (const [id, property] of [
+    ['setting-write-playback', 'log_write_playback'],
+    ['setting-write-video', 'log_write_video'],
+    ['setting-write-image', 'log_write_image'],
+    ['setting-write-metadata', 'log_write_metadata'],
+    ['setting-write-subtitle', 'log_write_subtitle'],
+    ['setting-write-asset', 'log_write_asset'],
+    ['setting-write-websocket', 'log_write_websocket'],
+    ['setting-write-api', 'log_write_api'],
+    ['setting-write-auth', 'log_write_auth'],
+  ]) {
+    assert.match(source, new RegExp(id));
+    assert.match(source, new RegExp(`s\\.${property} = checkedSetting`));
+  }
+});
+
 test('global settings rendering stays scoped to the active page and keeps cached content visible', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'global-settings.js'),
@@ -62,8 +83,16 @@ test('global settings rendering stays scoped to the active page and keeps cached
 test('request log helpers map categories and status colors', () => {
   const sandbox = loadRequestLogHelpers();
   assert.equal(sandbox.requestLogCategoryLabel('playback'), '播放信息');
+  assert.equal(sandbox.requestLogCategoryLabel('playback_sync'), '播放状态同步');
   assert.equal(sandbox.requestLogCategoryLabel('video'), '视频流');
+  assert.equal(sandbox.requestLogCategoryLabel('stream'), '主视频流');
+  assert.equal(sandbox.requestLogCategoryLabel('manifest'), '播放清单');
+  assert.equal(sandbox.requestLogCategoryLabel('segment'), '媒体分片');
   assert.equal(sandbox.requestLogCategoryLabel('image'), '图片海报');
+  assert.equal(sandbox.requestLogCategoryLabel('metadata'), '媒体元数据');
+  assert.equal(sandbox.requestLogCategoryLabel('subtitle'), '字幕');
+  assert.equal(sandbox.requestLogCategoryLabel('asset'), '静态资源');
+  assert.equal(sandbox.requestLogCategoryLabel('websocket'), 'WebSocket');
   assert.equal(sandbox.requestLogCategoryLabel('api'), '常规 API');
   assert.equal(sandbox.requestLogCategoryLabel('auth'), '用户认证');
   assert.equal(sandbox.requestLogCategoryLabel(''), '—');
@@ -72,12 +101,16 @@ test('request log helpers map categories and status colors', () => {
   assert.equal(sandbox.requestLogStatusClass(503), 'request-log-status-server');
 });
 
-test('request log panel exposes video stream filtering and live refresh', () => {
+test('request log panel exposes only concrete resource-category filters and live refresh', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
     'utf8',
   );
-  assert.match(source, /data-category="video">只看视频流/);
+  for (const category of ['playback', 'playback_sync', 'stream', 'manifest', 'segment', 'image', 'metadata', 'subtitle', 'asset', 'websocket', 'api', 'auth']) {
+    assert.match(source, new RegExp(`data-category="${category}"`));
+  }
+  assert.doesNotMatch(source, /data-category="video"/);
+  assert.doesNotMatch(source, /request-log-advanced-filters|<details|高级分类/);
   assert.match(source, /requestLogRefreshTimer = setInterval/);
   assert.match(source, /Router\.current === 'request-logs'/);
   assert.match(source, /class="request-log-ip mono"/);
@@ -200,6 +233,21 @@ test('request log UA width slider stays compact', () => {
   );
   assert.match(source, /\.request-log-ua-width-control\s*\{[^}]*max-width:\s*380px;/s);
   assert.match(source, /\.request-log-ua-width-control input\[type="range"\]\s*\{[^}]*max-width:\s*220px;/s);
+});
+
+test('mobile request log table uses fixed readable columns without overlap', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'),
+    'utf8',
+  );
+  assert.match(source, /\.request-log-table col\.request-log-col-node,\s*\.request-log-table th:nth-child\(1\)\s*\{\s*width:\s*112px !important;/s);
+  assert.match(source, /\.request-log-table col\.request-log-col-category,\s*\.request-log-table th:nth-child\(2\)\s*\{\s*width:\s*144px !important;/s);
+  assert.match(source, /\.request-log-table col\.request-log-col-status,\s*\.request-log-table th:nth-child\(3\)\s*\{\s*width:\s*76px !important;/s);
+  assert.match(source, /\.request-log-table col\.request-log-col-ip,\s*\.request-log-table th:nth-child\(4\)\s*\{\s*width:\s*170px !important;/s);
+  assert.match(source, /\.request-log-table tbody tr\s*\{\s*height:\s*58px;/s);
+  assert.match(source, /\.request-log-table th,\s*\.request-log-table td\s*\{[^}]*overflow:\s*hidden;[^}]*padding:\s*10px 12px;[^}]*font-size:\s*13px;[^}]*line-height:\s*1\.3;/s);
+  assert.match(source, /\.request-log-category,\s*\.request-log-node,\s*\.request-log-status\s*\{\s*white-space:\s*nowrap;/s);
+  assert.match(source, /\.request-log-table th\s*\{[^}]*font-size:\s*12px;[^}]*white-space:\s*nowrap;/s);
 });
 
 test('request log timeline uses concise Chinese relative time', () => {

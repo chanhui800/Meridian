@@ -79,8 +79,16 @@ function requestLogRangeMilliseconds(fromValue, toValue) {
 function requestLogCategoryLabel(category) {
   return ({
     playback: '播放信息',
+    playback_sync: '播放状态同步',
     video: '视频流',
+    stream: '主视频流',
+    manifest: '播放清单',
+    segment: '媒体分片',
     image: '图片海报',
+    metadata: '媒体元数据',
+    subtitle: '字幕',
+    asset: '静态资源',
+    websocket: 'WebSocket',
     api: '常规 API',
     auth: '用户认证',
   })[category] || '—';
@@ -141,11 +149,18 @@ function renderRequestLogs() {
       <div class="request-log-filter-row">
         <span class="request-log-filter-label">筛选模式</span>
         <div class="request-log-pills" id="request-log-category-pills">
-          <button type="button" class="request-log-pill active" data-category="all">全部模式</button>
-          <button type="button" class="request-log-pill" data-category="playback">只看播放信息</button>
-          <button type="button" class="request-log-pill" data-category="video">只看视频流</button>
-          <button type="button" class="request-log-pill" data-category="image">只看图片海报</button>
-          <button type="button" class="request-log-pill" data-category="api">只看常规 API</button>
+          <button type="button" class="request-log-pill active" data-category="all">全部</button>
+          <button type="button" class="request-log-pill" data-category="playback">播放信息</button>
+          <button type="button" class="request-log-pill" data-category="playback_sync">播放状态同步</button>
+          <button type="button" class="request-log-pill" data-category="stream">主视频流</button>
+          <button type="button" class="request-log-pill" data-category="manifest">播放清单</button>
+          <button type="button" class="request-log-pill" data-category="segment">媒体分片</button>
+          <button type="button" class="request-log-pill" data-category="image">图片海报</button>
+          <button type="button" class="request-log-pill" data-category="metadata">媒体元数据</button>
+          <button type="button" class="request-log-pill" data-category="subtitle">字幕</button>
+          <button type="button" class="request-log-pill" data-category="asset">静态资源</button>
+          <button type="button" class="request-log-pill" data-category="websocket">WebSocket</button>
+          <button type="button" class="request-log-pill" data-category="api">常规 API</button>
           <button type="button" class="request-log-pill" data-category="auth">用户认证</button>
         </div>
       </div>
