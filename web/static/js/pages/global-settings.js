@@ -120,9 +120,11 @@ function renderLogSettingsForm(s) {
     ${settingsNumber('setting-log-lease', '定时任务租约时长', s.log_task_lease_ms, 1000, 900000, 'ms')}
   </div></section>
   <section class="settings-panel"><header><span>RESOURCE CATEGORIES</span><h2>资源类别写入</h2><b>默认按需写入</b></header><p class="settings-panel-help">图片海报与媒体元数据默认不写入。勾选后，后续命中的请求才会写入日志，并自然出现在日志页中。</p><div class="settings-grid">
-    ${settingsCheck('setting-write-playback', '媒体元数据', s.log_write_metadata === true, 'PlaybackInfo 等媒体元数据请求。')}${settingsCheck('setting-write-video', '视频流', s.log_write_video !== false, '视频流、HLS 与 DASH 请求。')}
-    ${settingsCheck('setting-write-image', '图片海报', s.log_write_image === true, '图片与海报资源请求。')}${settingsCheck('setting-write-api', '常规 API', s.log_write_api !== false, '普通 API 与状态查询请求。')}
-    ${settingsCheck('setting-write-auth', '用户认证', s.log_write_auth !== false, '登录、鉴权与会话请求。')}
+    ${settingsCheck('setting-write-playback', '播放信息与状态同步', s.log_write_playback !== false, 'PlaybackInfo，以及 Sessions/Playing、Progress、Stopped、Ping 等播放状态同步请求。')}${settingsCheck('setting-write-video', '视频流', s.log_write_video !== false, '主视频或音频流、HLS/DASH 清单与媒体分片。')}
+    ${settingsCheck('setting-write-image', '图片海报', s.log_write_image === true, 'Images、Icons、Branding、封面与常见图片文件。')}${settingsCheck('setting-write-metadata', '媒体元数据', s.log_write_metadata === true, 'Items、Shows、Movies 与 Users 等媒体资料请求。')}
+    ${settingsCheck('setting-write-api', '常规 API', s.log_write_api !== false, '不属于其他明确类别的普通 API 与状态查询请求。')}${settingsCheck('setting-write-auth', '用户认证', s.log_write_auth !== false, 'Authenticate 与 QuickConnect 等登录认证请求。')}
+    ${settingsCheck('setting-write-subtitle', '字幕', s.log_write_subtitle !== false, '字幕路径以及 SRT、ASS、VTT 等字幕文件。')}${settingsCheck('setting-write-asset', '静态资源', s.log_write_asset !== false, 'JavaScript、CSS、字体、Source Map 与 Web Manifest。')}
+    ${settingsCheck('setting-write-websocket', 'WebSocket', s.log_write_websocket !== false, '带 Upgrade 意图的实时连接请求。')}
   </div></section>
   <div class="settings-two-column"><section class="settings-panel"><header><span>WRITE</span><h2>日志字段写入</h2><b>仅影响后续新日志</b></header><p class="settings-panel-help">关闭后，新写入日志会直接省略对应字段；旧日志不会被回收或改写。</p>${settingsCheck('setting-write-node', '写入节点', s.log_write_node !== false, '保存请求命中的站点节点名称。')}${settingsCheck('setting-write-category', '写入资源类别', s.log_write_category !== false, '保存媒体元数据、视频流、图片海报、API 或认证类别。')}${settingsCheck('setting-write-status', '写入状态', s.log_write_status !== false, '保存请求返回的 HTTP 状态码。')}${settingsCheck('setting-write-ip', '写入客户端 IP', s.log_write_client_ip !== false, '保存访问来源 IP，便于区分客户端。')}${settingsCheck('setting-write-ua', '写入 UA', s.log_write_ua !== false, '保存客户端 UA，用于识别播放客户端。')}${settingsCheck('setting-write-backend-address', '写入后端地址', s.log_write_backend_address !== false, '保存该请求实际连接的推流后端 authority，不写入路径、查询参数或令牌。')}${settingsCheck('setting-write-timeline', '写入时间线', s.log_write_timeline !== false, '保存日志页展示的请求发生时间；内部清理与统计时间不受影响。')}</section>
   <section class="settings-panel"><header><span>DISPLAY</span><h2>日志字段展示</h2><b>仅影响日志页</b></header><p class="settings-panel-help">关闭后，字段仍可按写入设置保留在新日志里，但日志表格会隐藏对应列。</p>${settingsCheck('setting-display-node', '展示节点', s.log_display_node !== false, '在日志表格中显示节点名称。')}${settingsCheck('setting-display-category', '展示资源类别', s.log_display_category !== false, '在日志表格中显示资源类别。')}${settingsCheck('setting-display-status', '展示状态', s.log_display_status !== false, '在日志表格中显示 HTTP 状态码。')}${settingsCheck('setting-display-ip', '展示客户端 IP', s.log_display_client_ip !== false, '在日志表格中显示客户端 IP 列。')}${settingsCheck('setting-display-ua', '展示 UA', s.log_display_ua !== false, '在日志表格中显示 UA 列。')}${settingsCheck('setting-display-backend-address', '展示后端地址', s.log_display_backend_address !== false, '在日志表格中显示该请求最终使用的推流后端。')}${settingsCheck('setting-display-timeline', '展示时间线', s.log_display_timeline !== false, '在日志表格中显示请求相对时间。')}</section></div>
@@ -163,9 +165,13 @@ async function saveGlobalSettings() {
     s.log_retry_count = numericSetting('setting-log-retries', s.log_retry_count);
     s.log_retry_backoff_ms = numericSetting('setting-log-backoff', s.log_retry_backoff_ms);
     s.log_task_lease_ms = numericSetting('setting-log-lease', s.log_task_lease_ms);
-    s.log_write_image = checkedSetting('setting-write-image', true);
-    s.log_write_metadata = checkedSetting('setting-write-playback', true);
+    s.log_write_image = checkedSetting('setting-write-image', false);
+    s.log_write_playback = checkedSetting('setting-write-playback', true);
+    s.log_write_metadata = checkedSetting('setting-write-metadata', false);
     s.log_write_video = checkedSetting('setting-write-video', true);
+    s.log_write_subtitle = checkedSetting('setting-write-subtitle', true);
+    s.log_write_asset = checkedSetting('setting-write-asset', true);
+    s.log_write_websocket = checkedSetting('setting-write-websocket', true);
     s.log_write_api = checkedSetting('setting-write-api', true);
     s.log_write_auth = checkedSetting('setting-write-auth', true);
     s.log_write_node = checkedSetting('setting-write-node', true);

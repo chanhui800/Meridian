@@ -1,10 +1,19 @@
 # Meridian（基于原项目的修改版）
 
+[![CI](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/chanhui800/Meridian/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/chanhui800/Meridian/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/chanhui800/Meridian)](https://github.com/chanhui800/Meridian/releases/latest)
+[![License](https://img.shields.io/github/license/chanhui800/Meridian)](LICENSE)
+
 本仓库是基于原项目 [snnabb/Meridian](https://github.com/snnabb/Meridian) 的修改版，保留原项目的核心反向代理能力，并针对实际部署补充和调整了域名前缀入口、自动后端改写、TLS 面板配置、缓存、日志和 UI。当前修改版仓库地址为 [chanhui800/Meridian](https://github.com/chanhui800/Meridian)。
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
-当前正式版本：`v1.8.29`
+当前正式版本：`v1.8.30`
+
+本版本基于 `v1.8.29`，包含日志筛选精简、请求日志字段完善、移动端日志布局优化、账户管理和登录错误提示等改进。主视频流策略保持稳定：默认反代，选择直连时仅将符合主视频路径规则的媒体流交给客户端直连。
+
+快速导航：[Docker 部署](#docker) · [Linux 原生安装](#linux-原生-systemd) · [TLS 与域名前缀](#域名前缀入口与-tls) · [日志设置](#全局设置与日志) · [安全策略](SECURITY.md) · [贡献指南](CONTRIBUTING.md)
 
 客户端在切换页面、刷新列表或取消未完成的图片/媒体请求时，日志会记录为 HTTP `499`（客户端已关闭请求），不再误计为 Meridian 生成的 `502`。真实的上游 502 仍会按 502 记录。
 
@@ -60,8 +69,8 @@ Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多�
 - 自动识别并改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 中的播放地址，使后端切换后仍经过当前站点代理；默认允许 HTTPS → HTTP 回源降级。
 - 对 localhost、回环、私网、链路本地和其他特殊目标执行拒绝，防止动态发现绕过目标安全边界。
 - 媒体认证头默认完全透传；UA 默认透传，可按站点覆盖。
-- 请求日志支持按日期、资源类别、状态、节点、客户端 IP、UA、路径和状态码检索，可直接调整 UA 列宽并清理日志或缓存。
-- 日志设置可分别控制资源类别写入，以及节点、资源类别、状态、客户端 IP、UA、时间线六个字段的写入与展示；图片海报和媒体元数据默认不写入。
+- 请求日志支持按日期、真实资源类别、状态、节点、客户端 IP、UA、后端地址、路径和状态码检索；筛选区直接平铺播放信息、播放状态同步、主视频流、播放清单、媒体分片、图片海报、媒体元数据、字幕、静态资源、WebSocket、常规 API 和用户认证，不再提供聚合视频流或高级分类。
+- 日志设置可分别控制播放信息、视频流、图片海报、媒体元数据、字幕、静态资源、WebSocket、常规 API 与用户认证的写入，以及节点、资源类别、状态、客户端 IP、UA、后端地址、时间线七个字段的写入与展示；图片海报和媒体元数据默认不写入。
 - Telegram 定时日报支持每天或每周发送，可配置发送时间、星期和目标会话；默认使用北京时间，可在系统 UI 中调整调度时区。
 - 全局设置统一管理系统 UI、日志、TLS、Telegram 通知和故障诊断，设置页采用紧凑卡片布局并支持缓存数据即时呈现。
 - 面板支持白色/黑色主题、桌面折叠导航和移动端可收起侧栏，右上角可直接进入本项目 GitHub 仓库。
@@ -148,7 +157,7 @@ ACME 证书订单只申请 `*.example.com` 泛域名，不会重复提交 `panel
 
 Meridian 会从 PlaybackInfo、HLS、DASH 和 HTTP 30x 响应中识别播放后端，并把播放地址重新指向当前 Meridian 入口。内部仍保留严格的目标校验、DNS 固定和动态能力边界；localhost、回环、私网、链路本地及其他保留目标不会因为自动识别而被放行。
 
-选择“直连”后，MP4、MKV、MOV、AVI、WebM 等主视频文件，以及 Emby / Jellyfin 的 `/Videos/.../stream`、`/original`、`/download`、`/file` 等厚媒体请求会通过 HTTP `307` 转到经过校验的实际后端。网盘服或 CDN 上游返回 HTTP `301`、`302`、`307`、`308` 时，Meridian 会校验最终公网目标，再将主视频直接交给播放器，不会让大流量视频体经过 Meridian。面板、普通 API、PlaybackInfo、WebSocket、HLS / DASH 清单与分片、字幕、图片和必要前端静态资源继续走 Meridian 反代。
+选择“直连”后，MP4、MKV、MOV、AVI、WebM 等主视频文件，以及 Emby / Jellyfin 的 `/Videos/.../stream`、`/original`、`/download`、`/file` 等厚媒体请求会先访问主站并只读取响应头。网盘服或 CDN 上游返回 HTTP `301`、`302`、`307`、`308` 时，Meridian 会校验第一层公网目标，再通过 HTTP `307` 将主视频直接交给播放器；主站直接返回媒体正文或探测失败时会回退到原主站直连地址，不会让大流量视频体经过 Meridian。非法、私网、回环或其他受限跳转仍会拒绝。面板、普通 API、PlaybackInfo、WebSocket、HLS / DASH 清单与分片、字幕、图片和必要前端静态资源继续走 Meridian 反代。
 
 认证头采用完全透传：`Authorization`、`X-Emby-Authorization` 和 `X-MediaBrowser-Authorization` 不会被面板改写。`X-Real-IP` 和 `X-Forwarded-For` 按可信代理配置生成或透传；只有明确配置的可信代理才会被采纳为前级身份来源。
 
@@ -171,8 +180,8 @@ Meridian 会从 PlaybackInfo、HLS、DASH 和 HTTP 30x 响应中识别播放后�
 
 日志设置分为三层：
 
-- 资源类别写入：控制媒体元数据、视频流、图片海报、常规 API 和用户认证是否进入后续新日志。
-- 日志字段写入：控制节点、资源类别、状态、客户端 IP、UA 和时间线是否保存在后续新日志中，旧日志不会被改写。
+- 资源类别写入：控制播放信息与状态同步、视频流、图片海报、媒体元数据、字幕、静态资源、WebSocket、常规 API 和用户认证是否进入后续新日志。PlaybackInfo 归入播放信息；Sessions/Playing、Progress、Stopped、Ping 独立显示为播放状态同步；Items、Shows、Movies、Users 才归入媒体元数据。
+- 日志字段写入：控制节点、资源类别、状态、客户端 IP、UA、后端地址和时间线是否保存在后续新日志中，旧日志不会被改写。
 - 日志字段展示：只控制日志表格列是否显示，不影响已经允许写入的字段。
 
 日志页不会保存查询参数、令牌、Cookie 或请求正文。客户端 IP 只会信任 `TRUSTED_PROXY_CIDRS` 中明确配置的前级代理；未配置可信代理时不会采纳外部伪造的转发头。
