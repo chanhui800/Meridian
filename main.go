@@ -1340,12 +1340,21 @@ type DynamicObservationsResponse struct {
 }
 
 const (
-	requestLogCategoryPlayback = "playback"
-	requestLogCategoryVideo    = "video"
-	requestLogCategoryImage    = "image"
-	requestLogCategoryAPI      = "api"
-	requestLogCategoryAuth     = "auth"
-	clientClosedRequestStatus  = 499
+	requestLogCategoryPlayback            = "playback"
+	requestLogCategoryPlaybackSync        = "playback_sync"
+	requestLogCategoryVideo               = "video" // legacy grouped value retained for old rows and filters
+	requestLogCategoryStream              = "stream"
+	requestLogCategoryManifest            = "manifest"
+	requestLogCategorySegment             = "segment"
+	requestLogCategoryImage               = "image"
+	requestLogCategoryMetadata            = "metadata"
+	requestLogCategorySubtitle            = "subtitle"
+	requestLogCategoryAsset               = "asset"
+	requestLogCategoryWebSocket           = "websocket"
+	requestLogCategoryAPI                 = "api"
+	requestLogCategoryAuth                = "auth"
+	clientClosedRequestStatus             = 499
+	requestLogLegacyPlaybackSyncPredicate = `(lower(request_logs.path)='/sessions/playing' OR lower(request_logs.path) LIKE '/sessions/playing/%' OR lower(request_logs.path)='/emby/sessions/playing' OR lower(request_logs.path) LIKE '/emby/sessions/playing/%')`
 )
 
 // requestLogEvent is the bounded hot-path payload accepted from a site proxy.
@@ -1398,7 +1407,10 @@ type RequestLogsResponse struct {
 
 func validRequestLogCategory(category string) bool {
 	switch category {
-	case requestLogCategoryPlayback, requestLogCategoryVideo, requestLogCategoryImage, requestLogCategoryAPI, requestLogCategoryAuth:
+	case requestLogCategoryPlayback, requestLogCategoryPlaybackSync, requestLogCategoryVideo, requestLogCategoryStream,
+		requestLogCategoryManifest, requestLogCategorySegment, requestLogCategoryImage,
+		requestLogCategoryMetadata, requestLogCategorySubtitle, requestLogCategoryAsset,
+		requestLogCategoryWebSocket, requestLogCategoryAPI, requestLogCategoryAuth:
 		return true
 	default:
 		return false
@@ -1665,8 +1677,12 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	settings := d.currentSystemSettings()
 	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode < 400) ||
 		(!settings.LogWriteImage && event.ResourceCategory == requestLogCategoryImage) ||
-		(!settings.LogWriteMetadata && event.ResourceCategory == requestLogCategoryPlayback) ||
-		(!settings.LogWriteVideo && event.ResourceCategory == requestLogCategoryVideo) ||
+		(!settings.LogWritePlayback && (event.ResourceCategory == requestLogCategoryPlayback || event.ResourceCategory == requestLogCategoryPlaybackSync)) ||
+		(!settings.LogWriteMetadata && event.ResourceCategory == requestLogCategoryMetadata) ||
+		(!settings.LogWriteVideo && (event.ResourceCategory == requestLogCategoryVideo || event.ResourceCategory == requestLogCategoryStream || event.ResourceCategory == requestLogCategoryManifest || event.ResourceCategory == requestLogCategorySegment)) ||
+		(!settings.LogWriteSubtitle && event.ResourceCategory == requestLogCategorySubtitle) ||
+		(!settings.LogWriteAsset && event.ResourceCategory == requestLogCategoryAsset) ||
+		(!settings.LogWriteWebSocket && event.ResourceCategory == requestLogCategoryWebSocket) ||
 		(!settings.LogWriteAPI && event.ResourceCategory == requestLogCategoryAPI) ||
 		(!settings.LogWriteAuth && event.ResourceCategory == requestLogCategoryAuth) {
 		return
@@ -1803,8 +1819,20 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		args = append(args, filter.ToMS)
 	}
 	if filter.Category != "" && filter.Category != "all" {
-		conditions = append(conditions, "resource_category=?")
-		args = append(args, filter.Category)
+		switch filter.Category {
+		case requestLogCategoryVideo:
+			conditions = append(conditions, "resource_category IN (?,?,?,?)")
+			args = append(args, requestLogCategoryVideo, requestLogCategoryStream, requestLogCategoryManifest, requestLogCategorySegment)
+		case requestLogCategoryPlaybackSync:
+			conditions = append(conditions, "(resource_category=? OR (resource_category=? AND "+requestLogLegacyPlaybackSyncPredicate+"))")
+			args = append(args, requestLogCategoryPlaybackSync, requestLogCategoryPlayback)
+		case requestLogCategoryPlayback:
+			conditions = append(conditions, "(resource_category=? AND NOT "+requestLogLegacyPlaybackSyncPredicate+")")
+			args = append(args, requestLogCategoryPlayback)
+		default:
+			conditions = append(conditions, "resource_category=?")
+			args = append(args, filter.Category)
+		}
 	}
 	switch filter.StatusGroup {
 	case "4xx":
@@ -1834,6 +1862,9 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		var entry RequestLog
 		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
 			return nil, err
+		}
+		if entry.ResourceCategory == requestLogCategoryPlayback && isRequestLogPlaybackActivityPath(entry.Path) {
+			entry.ResourceCategory = requestLogCategoryPlaybackSync
 		}
 		logs = append(logs, entry)
 	}
@@ -2379,8 +2410,10 @@ func (d *DB) migrateOnce() error {
 		log_flush_threshold INTEGER NOT NULL DEFAULT 1, log_batch_size INTEGER NOT NULL DEFAULT 50,
 		log_retry_count INTEGER NOT NULL DEFAULT 2, log_retry_backoff_ms INTEGER NOT NULL DEFAULT 75,
 		log_task_lease_ms INTEGER NOT NULL DEFAULT 300000,
-		log_write_image INTEGER NOT NULL DEFAULT 0, log_write_metadata INTEGER NOT NULL DEFAULT 0,
+		log_write_image INTEGER NOT NULL DEFAULT 0, log_write_playback INTEGER NOT NULL DEFAULT 1, log_write_metadata INTEGER NOT NULL DEFAULT 0,
 		log_write_video INTEGER NOT NULL DEFAULT 1, log_write_api INTEGER NOT NULL DEFAULT 1, log_write_auth INTEGER NOT NULL DEFAULT 1,
+		log_write_subtitle INTEGER NOT NULL DEFAULT 1, log_write_asset INTEGER NOT NULL DEFAULT 1, log_write_websocket INTEGER NOT NULL DEFAULT 1,
+		log_resource_taxonomy_version INTEGER NOT NULL DEFAULT 1,
 		log_write_node INTEGER NOT NULL DEFAULT 1, log_write_category INTEGER NOT NULL DEFAULT 1, log_write_status INTEGER NOT NULL DEFAULT 1,
 		log_write_client_ip INTEGER NOT NULL DEFAULT 1, log_write_colo INTEGER NOT NULL DEFAULT 0,
 		log_write_ua INTEGER NOT NULL DEFAULT 1, log_write_backend_address INTEGER NOT NULL DEFAULT 1, log_write_timeline INTEGER NOT NULL DEFAULT 1, log_display_client_ip INTEGER NOT NULL DEFAULT 1,
@@ -2436,9 +2469,14 @@ func (d *DB) migrateOnce() error {
 		}
 	}
 	for _, migration := range []struct{ column, sql string }{
+		{"log_write_playback", "ALTER TABLE system_settings ADD COLUMN log_write_playback INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_video", "ALTER TABLE system_settings ADD COLUMN log_write_video INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_api", "ALTER TABLE system_settings ADD COLUMN log_write_api INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_auth", "ALTER TABLE system_settings ADD COLUMN log_write_auth INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_subtitle", "ALTER TABLE system_settings ADD COLUMN log_write_subtitle INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_asset", "ALTER TABLE system_settings ADD COLUMN log_write_asset INTEGER NOT NULL DEFAULT 1"},
+		{"log_write_websocket", "ALTER TABLE system_settings ADD COLUMN log_write_websocket INTEGER NOT NULL DEFAULT 1"},
+		{"log_resource_taxonomy_version", "ALTER TABLE system_settings ADD COLUMN log_resource_taxonomy_version INTEGER NOT NULL DEFAULT 0"},
 		{"log_write_node", "ALTER TABLE system_settings ADD COLUMN log_write_node INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_category", "ALTER TABLE system_settings ADD COLUMN log_write_category INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_status", "ALTER TABLE system_settings ADD COLUMN log_write_status INTEGER NOT NULL DEFAULT 1"},
@@ -2458,6 +2496,19 @@ func (d *DB) migrateOnce() error {
 			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
 				return err
 			}
+		}
+	}
+	var logResourceTaxonomyVersion int
+	if err := conn.QueryRowContext(ctx, "SELECT log_resource_taxonomy_version FROM system_settings WHERE id=1").Scan(&logResourceTaxonomyVersion); err != nil {
+		return err
+	}
+	if logResourceTaxonomyVersion < 1 {
+		if _, err := conn.ExecContext(ctx, `UPDATE system_settings SET
+			log_write_playback=log_write_metadata,
+			log_write_metadata=0,
+			log_resource_taxonomy_version=1
+			WHERE id=1`); err != nil {
+			return err
 		}
 	}
 	if err := ensurePanelSettingsListenPortSchema(ctx, conn); err != nil {
@@ -3558,6 +3609,8 @@ type dynamicRequestEligibleContextKey struct{}
 type dynamicResponseContextKey struct{}
 type dynamicExpectedStructuredSourceContextKey struct{}
 type dynamicPlaybackInfoBaseContextKey struct{}
+type mainVideoDirectFallbackContextKey struct{}
+type mainVideoDirectResolvedContextKey struct{}
 
 // dynamicOutboundContext keeps request cancellation and deadlines while
 // dropping ReverseProxy's outbound httptrace and every other caller value.
@@ -9710,6 +9763,18 @@ func replaceResponseWithMainVideoRedirect(resp *http.Response, target *url.URL) 
 	if resp == nil || target == nil {
 		return resp
 	}
+	resp = replaceResponseWithMainVideoDirectTarget(resp, target)
+	if resp.Request != nil {
+		ctx := context.WithValue(resp.Request.Context(), mainVideoDirectResolvedContextKey{}, true)
+		resp.Request = resp.Request.WithContext(ctx)
+	}
+	return resp
+}
+
+func replaceResponseWithMainVideoDirectTarget(resp *http.Response, target *url.URL) *http.Response {
+	if resp == nil || target == nil {
+		return resp
+	}
 	if resp.Body != nil {
 		_ = resp.Body.Close()
 	}
@@ -9724,6 +9789,36 @@ func replaceResponseWithMainVideoRedirect(resp *http.Response, target *url.URL) 
 	resp.ContentLength = 0
 	resp.Trailer = nil
 	return resp
+}
+
+func mainVideoDirectFallbackTarget(ctx context.Context) *url.URL {
+	if ctx == nil {
+		return nil
+	}
+	target, _ := ctx.Value(mainVideoDirectFallbackContextKey{}).(*url.URL)
+	return target
+}
+
+func mainVideoDirectResponseResolved(resp *http.Response) bool {
+	if resp == nil || resp.Request == nil {
+		return false
+	}
+	resolved, _ := resp.Request.Context().Value(mainVideoDirectResolvedContextKey{}).(bool)
+	return resolved
+}
+
+func newMainVideoDirectFallbackResponse(req *http.Request, target *url.URL) *http.Response {
+	if req == nil || target == nil {
+		return nil
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusTemporaryRedirect,
+		Status:     strconv.Itoa(http.StatusTemporaryRedirect) + " " + http.StatusText(http.StatusTemporaryRedirect),
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+		Request:    req,
+	}
+	return replaceResponseWithMainVideoDirectTarget(resp, target)
 }
 
 type dynamicTransportFactory func(*url.URL, []net.IP, *dynamicSelfTargetPolicy) (*http.Transport, error)
@@ -10066,7 +10161,6 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 		return nil, t.denied(reasonCode, authority)
 	}
-
 	for {
 		if resp == nil {
 			return fail(dynamicObservationReasonResponseFailure, dynamicCanonicalAuthority(req.URL))
@@ -10419,9 +10513,32 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 }
 
 func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	directFallback := mainVideoDirectFallbackTarget(req.Context())
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
+		if t.mainVideoDirect && directFallback != nil {
+			if tracker := backendAddressTrackerFromContext(req.Context()); tracker != nil {
+				tracker.SetURL(directFallback)
+			}
+			return newMainVideoDirectFallbackResponse(req, directFallback), nil
+		}
 		return nil, err
+	}
+	if t.mainVideoDirect && directFallback != nil {
+		if t.dynamicPolicy.configured && t.dynamicPolicy.sourceEnabled(dynamicDiscoverySourceRedirect) {
+			resolved, resolveErr := t.roundTripDynamic(req, resp)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			if mainVideoDirectResponseResolved(resolved) {
+				return resolved, nil
+			}
+			resp = resolved
+		}
+		if tracker := backendAddressTrackerFromContext(req.Context()); tracker != nil {
+			tracker.SetURL(directFallback)
+		}
+		return replaceResponseWithMainVideoDirectTarget(resp, directFallback), nil
 	}
 	eligible, _ := req.Context().Value(dynamicRequestEligibleContextKey{}).(bool)
 	if !t.dynamicPolicy.configured {
@@ -11158,16 +11275,61 @@ func classifyRequestLogResource(r *http.Request) string {
 	}
 	path := strings.ToLower(r.URL.Path)
 	switch {
+	case hasUpgradeIntent(r):
+		return requestLogCategoryWebSocket
 	case strings.Contains(path, "/authenticate"), strings.Contains(path, "/quickconnect"):
 		return requestLogCategoryAuth
-	case strings.Contains(path, "/images/"), strings.HasSuffix(path, "/images"), strings.Contains(path, "/image/"):
-		return requestLogCategoryImage
 	case isPlaybackInfoRequest(path):
 		return requestLogCategoryPlayback
-	case isPlaybackRequest(path), isPlaybackRedirectEndpoint(path), dynamicStructuredRequestSource(path) != "", isReservedDynamicRoute(path):
-		return requestLogCategoryVideo
+	case isRequestLogPlaybackActivityPath(path):
+		return requestLogCategoryPlaybackSync
+	case requestLogPathHasSuffix(path, ".m3u8", ".m3u", ".mpd"):
+		return requestLogCategoryManifest
+	case requestLogPathHasSuffix(path, ".ts", ".m4s"):
+		return requestLogCategorySegment
+	case strings.Contains(path, "/subtitles/"), strings.HasSuffix(path, "/subtitles"), strings.Contains(path, "/captions/"), requestLogPathHasSuffix(path, ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup"):
+		return requestLogCategorySubtitle
+	case strings.Contains(path, "/images/"), strings.HasSuffix(path, "/images"), strings.Contains(path, "/image/"), strings.Contains(path, "/icons/"), strings.Contains(path, "/branding/"), strings.Contains(path, "/covers/"), requestLogPathHasSuffix(path, ".jpg", ".jpeg", ".gif", ".png", ".svg", ".ico", ".webp", ".avif"):
+		return requestLogCategoryImage
+	case requestLogPathHasSuffix(path, ".js", ".css", ".woff", ".woff2", ".ttf", ".otf", ".map", ".webmanifest"):
+		return requestLogCategoryAsset
+	case isPlaybackRequest(path), isPlaybackRedirectEndpoint(path), isReservedDynamicRoute(path), requestLogPathHasSuffix(path, ".mp4", ".m4v", ".ogv", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"):
+		return requestLogCategoryStream
+	case isRequestLogMetadataPath(path):
+		return requestLogCategoryMetadata
 	default:
 		return requestLogCategoryAPI
+	}
+}
+
+func requestLogPathHasSuffix(path string, suffixes ...string) bool {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRequestLogPlaybackActivityPath(path string) bool {
+	path = strings.TrimSuffix(strings.ToLower(path), "/")
+	return path == "/sessions/playing" || strings.HasPrefix(path, "/sessions/playing/") ||
+		path == "/emby/sessions/playing" || strings.HasPrefix(path, "/emby/sessions/playing/")
+}
+
+func isRequestLogMetadataPath(path string) bool {
+	parts := strings.Split(strings.Trim(strings.ToLower(path), "/"), "/")
+	if len(parts) > 0 && parts[0] == "emby" {
+		parts = parts[1:]
+	}
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "items", "shows", "movies", "users":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -13303,8 +13465,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
 				tracker.SetURL(directTarget)
 			}
-			writeMainVideoDirectRedirect(w, directTarget)
-			return
+			r = r.WithContext(context.WithValue(r.Context(), mainVideoDirectFallbackContextKey{}, directTarget))
 		}
 
 		if hasUpgradeIntent(r) {
@@ -16386,7 +16547,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.29"
+var appVersion = "v1.8.30"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
@@ -16399,11 +16560,60 @@ func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, err
 		}
 		_, err := fmt.Fprintln(output, appVersion)
 		return true, err
+	case "--healthcheck":
+		if len(args) != 1 {
+			return true, errors.New("healthcheck command does not accept arguments")
+		}
+		return true, runHealthcheckCommand()
 	case "admin":
 		return true, runAdminCommand(args[1:], input, output)
 	default:
 		return false, nil
 	}
+}
+
+func runHealthcheckCommand() error {
+	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
+	if dbPath == "" {
+		dbPath = "/app/data/meridian.db"
+	}
+	markerPath := filepath.Join(filepath.Dir(dbPath), "panel-port")
+	marker, err := os.ReadFile(markerPath)
+	if err != nil {
+		return fmt.Errorf("read panel port: %w", err)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(string(marker)))
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid panel port %q", strings.TrimSpace(string(marker)))
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Local loopback readiness probe.
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   4 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	var lastErr error
+	for _, scheme := range []string{"https", "http"} {
+		endpoint := fmt.Sprintf("%s://127.0.0.1:%d/api/auth/check", scheme, port)
+		resp, requestErr := client.Get(endpoint)
+		if requestErr != nil {
+			lastErr = requestErr
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		closeErr := resp.Body.Close()
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices && closeErr == nil {
+			return nil
+		}
+		lastErr = fmt.Errorf("%s returned HTTP %d", endpoint, resp.StatusCode)
+	}
+	return fmt.Errorf("panel healthcheck failed: %w", lastErr)
 }
 
 func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
