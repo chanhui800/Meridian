@@ -16578,6 +16578,7 @@ func runHealthcheckCommand() error {
 		dbPath = "/app/data/meridian.db"
 	}
 	markerPath := filepath.Join(filepath.Dir(dbPath), "panel-port")
+	// #nosec G703 G304 -- DB_PATH is an administrator-controlled local database location; this only reads the sibling panel-port marker written by Meridian itself.
 	marker, err := os.ReadFile(markerPath)
 	if err != nil {
 		return fmt.Errorf("read panel port: %w", err)
@@ -16588,7 +16589,8 @@ func runHealthcheckCommand() error {
 	}
 
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Local loopback readiness probe.
+		// #nosec G402 -- the healthcheck connects only to the fixed 127.0.0.1 host; the configured panel certificate normally names its public domain rather than loopback.
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
@@ -16601,6 +16603,7 @@ func runHealthcheckCommand() error {
 	var lastErr error
 	for _, scheme := range []string{"https", "http"} {
 		endpoint := fmt.Sprintf("%s://127.0.0.1:%d/api/auth/check", scheme, port)
+		// #nosec G704 -- scheme is selected from the fixed list above, host/path are constant loopback values, and port is range-validated.
 		resp, requestErr := client.Get(endpoint)
 		if requestErr != nil {
 			lastErr = requestErr
