@@ -5,7 +5,7 @@ let requestLogRefreshTimer = null;
 let requestLogLoadGeneration = 0;
 let requestLogLoading = false;
 let requestLogReloadQueued = false;
-let requestLogDisplaySettings = { node: true, category: true, status: true, client_ip: true, ua: true, backend_address: true, timeline: true };
+let requestLogDisplaySettings = { node: true, category: true, status: true, client_ip: true, ua: true, upstream_ua: true, backend_address: true, timeline: true };
 const requestLogUAWidthStorageKey = 'meridian-request-log-ua-width';
 
 function requestLogNormalizeUAWidth(value) {
@@ -28,7 +28,7 @@ function requestLogSetUAWidth(value) {
   }
   const table = document.querySelector?.('.request-log-table');
   if (table?.style?.setProperty) table.style.setProperty('--request-log-ua-width', cssWidth);
-  document.querySelectorAll?.('col.request-log-col-ua, th[data-log-field="ua"]').forEach(node => {
+  document.querySelectorAll?.('col.request-log-col-ua, col.request-log-col-upstream-ua, th[data-log-field="ua"], th[data-log-field="upstream-ua"]').forEach(node => {
     node.style?.setProperty('width', cssWidth, 'important');
   });
   try {
@@ -48,6 +48,7 @@ function requestLogApplyDisplaySettings(settings) {
     status: settings?.log_display_status !== false,
     client_ip: settings?.log_display_client_ip !== false,
     ua: settings?.log_display_ua !== false,
+    upstream_ua: settings?.log_display_upstream_ua !== false,
     backend_address: settings?.log_display_backend_address !== false,
     timeline: settings?.log_display_timeline !== false,
   };
@@ -56,6 +57,7 @@ function requestLogApplyDisplaySettings(settings) {
   document.querySelectorAll('[data-log-field="status"]').forEach(node => { node.hidden = !requestLogDisplaySettings.status; });
   document.querySelectorAll('[data-log-field="ip"]').forEach(node => { node.hidden = !requestLogDisplaySettings.client_ip; });
   document.querySelectorAll('[data-log-field="ua"]').forEach(node => { node.hidden = !requestLogDisplaySettings.ua; });
+  document.querySelectorAll('[data-log-field="upstream-ua"]').forEach(node => { node.hidden = !requestLogDisplaySettings.upstream_ua; });
   document.querySelectorAll('[data-log-field="backend-address"]').forEach(node => { node.hidden = !requestLogDisplaySettings.backend_address; });
   document.querySelectorAll('[data-log-field="timeline"]').forEach(node => { node.hidden = !requestLogDisplaySettings.timeline; });
 }
@@ -126,7 +128,7 @@ function renderRequestLogs() {
 
   page.innerHTML = `
     <h1 class="section-title fade-up">日志记录</h1>
-    <p class="section-sub fade-up">查看各站点的请求状态、客户端 IP 与客户端标识。日志不保存查询参数、令牌、Cookie 或正文。</p>
+    <p class="section-sub fade-up">查看各站点的请求状态、客户端 IP、客户端 UA 与实际发往后端的上游 UA。日志不保存查询参数、令牌、Cookie 或正文。</p>
 
     <section class="request-log-controls fade-up">
       <div class="request-log-search-row">
@@ -141,7 +143,7 @@ function renderRequestLogs() {
         </label>
         <label class="request-log-search-field">
           <span class="sr-only">搜索日志</span>
-          <input type="search" class="form-input" id="request-log-search" placeholder="搜索节点、客户端 IP、UA、路径或状态码（如 200）" autocomplete="off">
+          <input type="search" class="form-input" id="request-log-search" placeholder="搜索节点、客户端 IP、客户端/上游 UA、路径或状态码（如 200）" autocomplete="off">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
         </label>
       </div>
@@ -202,13 +204,13 @@ function renderRequestLogs() {
         <table class="request-log-table">
           <colgroup>
             <col class="request-log-col-node"><col class="request-log-col-category"><col class="request-log-col-status">
-            <col class="request-log-col-ip"><col class="request-log-col-ua"><col class="request-log-col-backend"><col class="request-log-col-time">
+            <col class="request-log-col-ip"><col class="request-log-col-ua"><col class="request-log-col-upstream-ua"><col class="request-log-col-backend"><col class="request-log-col-time">
           </colgroup>
           <thead><tr>
-            <th data-log-field="node">节点</th><th data-log-field="category">资源类别</th><th data-log-field="status">状态</th><th data-log-field="ip">客户端 IP</th><th data-log-field="ua">UA</th><th data-log-field="backend-address">后端地址</th><th data-log-field="timeline">时间线</th>
+            <th data-log-field="node">节点</th><th data-log-field="category">资源类别</th><th data-log-field="status">状态</th><th data-log-field="ip">客户端 IP</th><th data-log-field="ua">客户端 UA</th><th data-log-field="upstream-ua">上游 UA</th><th data-log-field="backend-address">后端地址</th><th data-log-field="timeline">时间线</th>
           </tr></thead>
           <tbody id="request-log-body">
-            <tr><td colspan="7" class="request-log-empty">正在加载…</td></tr>
+            <tr><td colspan="8" class="request-log-empty">正在加载…</td></tr>
           </tbody>
         </table>
       </div>
@@ -299,7 +301,7 @@ async function loadRequestLogs(options = {}) {
   const preserveViewport = previousScrollTop > 0;
   requestLogLoading = true;
   if (options.showLoading === true && !body.querySelector('tr[data-log-id]')) {
-    body.innerHTML = '<tr><td colspan="7" class="request-log-empty">正在加载…</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="request-log-empty">正在加载…</td></tr>';
   }
   try {
     const response = await API.getRequestLogs({
@@ -322,7 +324,7 @@ async function loadRequestLogs(options = {}) {
   } catch (error) {
     if (generation !== requestLogLoadGeneration) return;
     if (!body.querySelector('tr[data-log-id]')) {
-      body.innerHTML = '<tr><td colspan="6" class="request-log-empty request-log-error">日志读取失败</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" class="request-log-empty request-log-error">日志读取失败</td></tr>';
     }
     Toast.error(error.message);
   } finally {
@@ -338,7 +340,7 @@ function renderRequestLogRows(logs) {
   const body = document.getElementById('request-log-body');
   if (!body) return;
   if (!logs.length) {
-    body.innerHTML = '<tr><td colspan="6" class="request-log-empty">当前条件下暂无日志</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="request-log-empty">当前条件下暂无日志</td></tr>';
     return;
   }
   body.innerHTML = logs.map(entry => {
@@ -353,6 +355,7 @@ function renderRequestLogRows(logs) {
         <td data-log-field="status"><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
         <td data-log-field="ip"><span class="request-log-ip mono">${esc(entry.client_ip || '—')}</span><small class="request-log-region">${esc(entry.client_region || '')}</small></td>
         <td data-log-field="ua"><span class="request-log-ua">${esc(entry.user_agent || '—')}</span></td>
+        <td data-log-field="upstream-ua"><span class="request-log-ua">${esc(entry.upstream_user_agent || '—')}</span></td>
         <td data-log-field="backend-address"><span class="request-log-backend mono">${esc(entry.backend_address || '—')}</span></td>
         <td data-log-field="timeline"><time class="request-log-time"${recordedAtMS ? ` datetime="${new Date(recordedAtMS).toISOString()}"` : ''} title="${esc(exactTime)}">${esc(requestLogRelativeTime(recordedAtMS))}</time></td>
       </tr>

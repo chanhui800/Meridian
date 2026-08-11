@@ -58,11 +58,13 @@ type SystemSettings struct {
 	LogWriteClientIP         bool   `json:"log_write_client_ip"`
 	LogWriteColo             bool   `json:"log_write_colo"`
 	LogWriteUA               bool   `json:"log_write_ua"`
+	LogWriteUpstreamUA       bool   `json:"log_write_upstream_ua"`
 	LogWriteBackendAddress   bool   `json:"log_write_backend_address"`
 	LogWriteTimeline         bool   `json:"log_write_timeline"`
 	LogDisplayClientIP       bool   `json:"log_display_client_ip"`
 	LogDisplayColo           bool   `json:"log_display_colo"`
 	LogDisplayUA             bool   `json:"log_display_ua"`
+	LogDisplayUpstreamUA     bool   `json:"log_display_upstream_ua"`
 	LogDisplayBackendAddress bool   `json:"log_display_backend_address"`
 	LogDisplayNode           bool   `json:"log_display_node"`
 	LogDisplayCategory       bool   `json:"log_display_category"`
@@ -78,8 +80,8 @@ func defaultSystemSettings() SystemSettings {
 		LogEnabled:       true, LogLevel: "info", LogRetentionDays: 30, LogFlushThreshold: 1,
 		LogBatchSize: 50, LogRetryCount: 2, LogRetryBackoffMS: 75, LogTaskLeaseMS: 300000,
 		LogWriteImage: false, LogWritePlayback: true, LogWriteMetadata: false, LogWriteVideo: true, LogWriteSubtitle: true, LogWriteAsset: true, LogWriteWebSocket: true, LogWriteAPI: true, LogWriteAuth: true,
-		LogWriteNode: true, LogWriteCategory: true, LogWriteStatus: true, LogWriteClientIP: true, LogWriteUA: true, LogWriteBackendAddress: true, LogWriteTimeline: true,
-		LogDisplayClientIP: true, LogDisplayUA: true, LogDisplayBackendAddress: true, LogDisplayNode: true, LogDisplayCategory: true, LogDisplayStatus: true, LogDisplayTimeline: true, LogSearchMode: "like",
+		LogWriteNode: true, LogWriteCategory: true, LogWriteStatus: true, LogWriteClientIP: true, LogWriteUA: true, LogWriteUpstreamUA: true, LogWriteBackendAddress: true, LogWriteTimeline: true,
+		LogDisplayClientIP: true, LogDisplayUA: true, LogDisplayUpstreamUA: true, LogDisplayBackendAddress: true, LogDisplayNode: true, LogDisplayCategory: true, LogDisplayStatus: true, LogDisplayTimeline: true, LogSearchMode: "like",
 	}
 }
 
@@ -110,16 +112,16 @@ func normalizeSystemSettings(settings SystemSettings) (SystemSettings, error) {
 
 func (d *DB) loadSystemSettings() (SystemSettings, error) {
 	settings := defaultSystemSettings()
-	var enabled, writeImage, writePlayback, writeMetadata, writeVideo, writeSubtitle, writeAsset, writeWebSocket, writeAPI, writeAuth, writeNode, writeCategory, writeStatus, writeIP, writeColo, writeUA, writeBackendAddress, writeTimeline, displayIP, displayColo, displayUA, displayBackendAddress, displayNode, displayCategory, displayStatus, displayTimeline int
+	var enabled, writeImage, writePlayback, writeMetadata, writeVideo, writeSubtitle, writeAsset, writeWebSocket, writeAPI, writeAuth, writeNode, writeCategory, writeStatus, writeIP, writeColo, writeUA, writeUpstreamUA, writeBackendAddress, writeTimeline, displayIP, displayColo, displayUA, displayUpstreamUA, displayBackendAddress, displayNode, displayCategory, displayStatus, displayTimeline int
 	err := d.db.QueryRow(`SELECT ui_mode, ui_radius, probe_timeout_ms, ping_cache_minutes, schedule_timezone_offset,
 		log_enabled, log_level, log_retention_days, log_write_delay_minutes, log_flush_threshold, log_batch_size,
 		log_retry_count, log_retry_backoff_ms, log_task_lease_ms, log_write_image, log_write_playback, log_write_metadata, log_write_video, log_write_subtitle, log_write_asset, log_write_websocket, log_write_api, log_write_auth,
-		log_write_node, log_write_category, log_write_status, log_write_client_ip, log_write_colo, log_write_ua, log_write_backend_address, log_write_timeline, log_display_client_ip, log_display_colo,
-		log_display_ua, log_display_backend_address, log_display_node, log_display_category, log_display_status, log_display_timeline, log_search_mode FROM system_settings WHERE id=1`).Scan(
+		log_write_node, log_write_category, log_write_status, log_write_client_ip, log_write_colo, log_write_ua, log_write_upstream_ua, log_write_backend_address, log_write_timeline, log_display_client_ip, log_display_colo,
+		log_display_ua, log_display_upstream_ua, log_display_backend_address, log_display_node, log_display_category, log_display_status, log_display_timeline, log_search_mode FROM system_settings WHERE id=1`).Scan(
 		&settings.UIMode, &settings.UIRadius, &settings.ProbeTimeoutMS, &settings.PingCacheMinutes, &settings.ScheduleTimezone,
 		&enabled, &settings.LogLevel, &settings.LogRetentionDays, &settings.LogWriteDelayMinutes, &settings.LogFlushThreshold, &settings.LogBatchSize,
 		&settings.LogRetryCount, &settings.LogRetryBackoffMS, &settings.LogTaskLeaseMS, &writeImage, &writePlayback, &writeMetadata, &writeVideo, &writeSubtitle, &writeAsset, &writeWebSocket, &writeAPI, &writeAuth,
-		&writeNode, &writeCategory, &writeStatus, &writeIP, &writeColo, &writeUA, &writeBackendAddress, &writeTimeline, &displayIP, &displayColo, &displayUA, &displayBackendAddress, &displayNode, &displayCategory, &displayStatus, &displayTimeline, &settings.LogSearchMode)
+		&writeNode, &writeCategory, &writeStatus, &writeIP, &writeColo, &writeUA, &writeUpstreamUA, &writeBackendAddress, &writeTimeline, &displayIP, &displayColo, &displayUA, &displayUpstreamUA, &displayBackendAddress, &displayNode, &displayCategory, &displayStatus, &displayTimeline, &settings.LogSearchMode)
 	if err != nil {
 		return settings, err
 	}
@@ -128,9 +130,9 @@ func (d *DB) loadSystemSettings() (SystemSettings, error) {
 	settings.LogWriteVideo, settings.LogWriteAPI, settings.LogWriteAuth = writeVideo == 1, writeAPI == 1, writeAuth == 1
 	settings.LogWriteSubtitle, settings.LogWriteAsset, settings.LogWriteWebSocket = writeSubtitle == 1, writeAsset == 1, writeWebSocket == 1
 	settings.LogWriteNode, settings.LogWriteCategory, settings.LogWriteStatus = writeNode == 1, writeCategory == 1, writeStatus == 1
-	settings.LogWriteClientIP, settings.LogWriteColo, settings.LogWriteUA, settings.LogWriteBackendAddress = writeIP == 1, writeColo == 1, writeUA == 1, writeBackendAddress == 1
+	settings.LogWriteClientIP, settings.LogWriteColo, settings.LogWriteUA, settings.LogWriteUpstreamUA, settings.LogWriteBackendAddress = writeIP == 1, writeColo == 1, writeUA == 1, writeUpstreamUA == 1, writeBackendAddress == 1
 	settings.LogWriteTimeline = writeTimeline == 1
-	settings.LogDisplayClientIP, settings.LogDisplayColo, settings.LogDisplayUA, settings.LogDisplayBackendAddress = displayIP == 1, displayColo == 1, displayUA == 1, displayBackendAddress == 1
+	settings.LogDisplayClientIP, settings.LogDisplayColo, settings.LogDisplayUA, settings.LogDisplayUpstreamUA, settings.LogDisplayBackendAddress = displayIP == 1, displayColo == 1, displayUA == 1, displayUpstreamUA == 1, displayBackendAddress == 1
 	settings.LogDisplayNode, settings.LogDisplayCategory, settings.LogDisplayStatus, settings.LogDisplayTimeline = displayNode == 1, displayCategory == 1, displayStatus == 1, displayTimeline == 1
 	return normalizeSystemSettings(settings)
 }
@@ -152,13 +154,13 @@ func (d *DB) saveSystemSettings(settings SystemSettings) error {
 	_, err = d.db.Exec(`UPDATE system_settings SET ui_mode=?, ui_radius=?, probe_timeout_ms=?, ping_cache_minutes=?, schedule_timezone_offset=?,
 		log_enabled=?, log_level=?, log_retention_days=?, log_write_delay_minutes=?, log_flush_threshold=?, log_batch_size=?,
 		log_retry_count=?, log_retry_backoff_ms=?, log_task_lease_ms=?, log_write_image=?, log_write_playback=?, log_write_metadata=?, log_write_video=?, log_write_subtitle=?, log_write_asset=?, log_write_websocket=?, log_write_api=?, log_write_auth=?,
-		log_write_node=?, log_write_category=?, log_write_status=?, log_write_client_ip=?, log_write_colo=?, log_write_ua=?, log_write_backend_address=?, log_write_timeline=?, log_display_client_ip=?, log_display_colo=?,
-		log_display_ua=?, log_display_backend_address=?, log_display_node=?, log_display_category=?, log_display_status=?, log_display_timeline=?, log_search_mode=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
+		log_write_node=?, log_write_category=?, log_write_status=?, log_write_client_ip=?, log_write_colo=?, log_write_ua=?, log_write_upstream_ua=?, log_write_backend_address=?, log_write_timeline=?, log_display_client_ip=?, log_display_colo=?,
+		log_display_ua=?, log_display_upstream_ua=?, log_display_backend_address=?, log_display_node=?, log_display_category=?, log_display_status=?, log_display_timeline=?, log_search_mode=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
 		settings.UIMode, settings.UIRadius, settings.ProbeTimeoutMS, settings.PingCacheMinutes, settings.ScheduleTimezone,
 		sqliteBool(settings.LogEnabled), settings.LogLevel, settings.LogRetentionDays, settings.LogWriteDelayMinutes, settings.LogFlushThreshold, settings.LogBatchSize,
 		settings.LogRetryCount, settings.LogRetryBackoffMS, settings.LogTaskLeaseMS, sqliteBool(settings.LogWriteImage), sqliteBool(settings.LogWritePlayback), sqliteBool(settings.LogWriteMetadata), sqliteBool(settings.LogWriteVideo), sqliteBool(settings.LogWriteSubtitle), sqliteBool(settings.LogWriteAsset), sqliteBool(settings.LogWriteWebSocket), sqliteBool(settings.LogWriteAPI), sqliteBool(settings.LogWriteAuth),
-		sqliteBool(settings.LogWriteNode), sqliteBool(settings.LogWriteCategory), sqliteBool(settings.LogWriteStatus), sqliteBool(settings.LogWriteClientIP), sqliteBool(settings.LogWriteColo), sqliteBool(settings.LogWriteUA), sqliteBool(settings.LogWriteBackendAddress), sqliteBool(settings.LogWriteTimeline), sqliteBool(settings.LogDisplayClientIP), sqliteBool(settings.LogDisplayColo),
-		sqliteBool(settings.LogDisplayUA), sqliteBool(settings.LogDisplayBackendAddress), sqliteBool(settings.LogDisplayNode), sqliteBool(settings.LogDisplayCategory), sqliteBool(settings.LogDisplayStatus), sqliteBool(settings.LogDisplayTimeline), settings.LogSearchMode)
+		sqliteBool(settings.LogWriteNode), sqliteBool(settings.LogWriteCategory), sqliteBool(settings.LogWriteStatus), sqliteBool(settings.LogWriteClientIP), sqliteBool(settings.LogWriteColo), sqliteBool(settings.LogWriteUA), sqliteBool(settings.LogWriteUpstreamUA), sqliteBool(settings.LogWriteBackendAddress), sqliteBool(settings.LogWriteTimeline), sqliteBool(settings.LogDisplayClientIP), sqliteBool(settings.LogDisplayColo),
+		sqliteBool(settings.LogDisplayUA), sqliteBool(settings.LogDisplayUpstreamUA), sqliteBool(settings.LogDisplayBackendAddress), sqliteBool(settings.LogDisplayNode), sqliteBool(settings.LogDisplayCategory), sqliteBool(settings.LogDisplayStatus), sqliteBool(settings.LogDisplayTimeline), settings.LogSearchMode)
 	if err != nil {
 		return err
 	}
