@@ -4760,7 +4760,7 @@ html { font-size: 15px; }
 
 .request-log-table-card { width: 100%; min-width: 0; }
 .request-log-table-scroll { width: 100%; min-width: 0; overflow-x: auto; }
-.request-log-table { width: 100%; min-width: calc(840px + var(--request-log-ua-width, 240px)); table-layout: fixed; }
+.request-log-table { width: 100%; min-width: calc(840px + var(--request-log-ua-width, 240px) + var(--request-log-ua-width, 240px)); table-layout: fixed; }
 .request-log-table th,
 .request-log-table td { padding: 12px 14px; vertical-align: middle; }
 .request-log-table th { font-size: 13px; }
@@ -4769,6 +4769,7 @@ html { font-size: 15px; }
 .request-log-table col.request-log-col-status { width: 8%; }
 .request-log-table col.request-log-col-ip { width: 25%; }
 .request-log-table col.request-log-col-ua { width: var(--request-log-ua-width, 240px); }
+.request-log-table col.request-log-col-upstream-ua { width: var(--request-log-ua-width, 240px); }
 .request-log-table col.request-log-col-backend { width: 210px; }
 .request-log-table col.request-log-col-time { width: 132px; }
 .request-log-table th:nth-child(1) { width: 15% !important; }
@@ -4776,8 +4777,9 @@ html { font-size: 15px; }
 .request-log-table th:nth-child(3) { width: 8% !important; }
 .request-log-table th:nth-child(4) { width: 25% !important; }
 .request-log-table th:nth-child(5) { width: var(--request-log-ua-width, 240px) !important; }
-.request-log-table th:nth-child(6) { width: 210px !important; }
-.request-log-table th:nth-child(7) { width: 132px !important; }
+.request-log-table th:nth-child(6) { width: var(--request-log-ua-width, 240px) !important; }
+.request-log-table th:nth-child(7) { width: 210px !important; }
+.request-log-table th:nth-child(8) { width: 132px !important; }
 .request-log-table th[data-log-field="timeline"],
 .request-log-table td[data-log-field="timeline"] { text-align: right; }
 .request-log-ip { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
@@ -4805,7 +4807,7 @@ html { font-size: 15px; }
   .settings-section-nav { gap: 4px; padding: 9px; }
   .settings-nav-item { min-height: 34px; padding-block: 4px; }
   .settings-panel, .telegram-report-card, .settings-content .diag-card { padding: 12px; }
-  .request-log-table { min-width: calc(580px + var(--request-log-ua-width, 240px)); }
+  .request-log-table { min-width: calc(580px + var(--request-log-ua-width, 240px) + var(--request-log-ua-width, 240px)); }
   .request-log-table th, .request-log-table td { padding: 10px 11px; }
 }
 
@@ -4876,8 +4878,8 @@ html { font-size: 15px; }
 
   /* Keep the mobile log table dense enough to scan several requests at once. */
   .request-log-table {
-    width: calc(844px + var(--request-log-ua-width, 240px));
-    min-width: calc(844px + var(--request-log-ua-width, 240px));
+    width: calc(844px + var(--request-log-ua-width, 240px) + var(--request-log-ua-width, 240px));
+    min-width: calc(844px + var(--request-log-ua-width, 240px) + var(--request-log-ua-width, 240px));
   }
   .request-log-table col.request-log-col-node,
   .request-log-table th:nth-child(1) { width: 112px !important; }
@@ -4889,10 +4891,12 @@ html { font-size: 15px; }
   .request-log-table th:nth-child(4) { width: 170px !important; }
   .request-log-table col.request-log-col-ua,
   .request-log-table th:nth-child(5) { width: var(--request-log-ua-width, 240px) !important; }
+  .request-log-table col.request-log-col-upstream-ua,
+  .request-log-table th:nth-child(6) { width: var(--request-log-ua-width, 240px) !important; }
   .request-log-table col.request-log-col-backend,
-  .request-log-table th:nth-child(6) { width: 220px !important; }
+  .request-log-table th:nth-child(7) { width: 220px !important; }
   .request-log-table col.request-log-col-time,
-  .request-log-table th:nth-child(7) { width: 122px !important; }
+  .request-log-table th:nth-child(8) { width: 122px !important; }
   .request-log-table tbody tr { height: 58px; }
   .request-log-table th,
   .request-log-table td {

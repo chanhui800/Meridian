@@ -11,7 +11,7 @@ func TestSystemSettingsDefaultsUseBeijingSchedule(t *testing.T) {
 	if settings.ScheduleTimezone != 480 {
 		t.Fatalf("schedule timezone = %d, want 480", settings.ScheduleTimezone)
 	}
-	if settings.LogEnabled != true || settings.LogBatchSize != 50 || settings.LogDisplayUA != true || settings.LogWriteImage || !settings.LogWritePlayback || settings.LogWriteMetadata || !settings.LogWriteVideo || !settings.LogWriteSubtitle || !settings.LogWriteAsset || !settings.LogWriteWebSocket || !settings.LogWriteAPI || !settings.LogWriteAuth || !settings.LogWriteNode || !settings.LogWriteCategory || !settings.LogWriteStatus || !settings.LogWriteClientIP || !settings.LogWriteUA || !settings.LogWriteTimeline {
+	if settings.LogEnabled != true || settings.LogBatchSize != 50 || !settings.LogDisplayUA || !settings.LogDisplayUpstreamUA || settings.LogWriteImage || !settings.LogWritePlayback || settings.LogWriteMetadata || !settings.LogWriteVideo || !settings.LogWriteSubtitle || !settings.LogWriteAsset || !settings.LogWriteWebSocket || !settings.LogWriteAPI || !settings.LogWriteAuth || !settings.LogWriteNode || !settings.LogWriteCategory || !settings.LogWriteStatus || !settings.LogWriteClientIP || !settings.LogWriteUA || !settings.LogWriteUpstreamUA || !settings.LogWriteTimeline {
 		t.Fatalf("unexpected defaults: %+v", settings)
 	}
 }
