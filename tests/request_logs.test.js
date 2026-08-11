@@ -19,7 +19,7 @@ test('request log table keeps P2 fields without COLO columns', () => {
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
     'utf8',
   );
-  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', 'UA', '后端地址', '时间线']) {
+  for (const heading of ['节点', '资源类别', '状态', '客户端 IP', '客户端 UA', '上游 UA', '后端地址', '时间线']) {
     assert.match(source, new RegExp(`<th[^>]*>${heading}</th>`));
   }
   assert.doesNotMatch(source, /<th>入站机房<\/th>/);
@@ -38,6 +38,7 @@ test('global log write settings cover every visible request log column', () => {
     ['setting-write-status', 'log_write_status'],
     ['setting-write-ip', 'log_write_client_ip'],
     ['setting-write-ua', 'log_write_ua'],
+    ['setting-write-upstream-ua', 'log_write_upstream_ua'],
     ['setting-write-backend-address', 'log_write_backend_address'],
     ['setting-write-timeline', 'log_write_timeline'],
   ]) {
@@ -221,7 +222,7 @@ test('request log UA width is applied to the live table and handles drag complet
     'utf8',
   );
   assert.match(source, /table\.style\.setProperty\('--request-log-ua-width', cssWidth\)/);
-  assert.match(source, /col\.request-log-col-ua, th\[data-log-field="ua"\]/);
+  assert.match(source, /col\.request-log-col-ua, col\.request-log-col-upstream-ua, th\[data-log-field="ua"\], th\[data-log-field="upstream-ua"\]/);
   assert.match(source, /uaWidthInput\.oninput = applyUAWidth/);
   assert.match(source, /uaWidthInput\.onchange = applyUAWidth/);
 });

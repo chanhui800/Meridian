@@ -8,7 +8,7 @@ const test = require('node:test');
 const root = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'web', 'static', 'index.html'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'web', 'static', 'js', 'app.js'), 'utf8');
-const css = fs.readFileSync(path.join(root, 'web', 'static', 'css', 'style.css'), 'utf8');
+const css = fs.readFileSync(path.join(root, 'web', 'static', 'css', 'style.css'), 'utf8').replace(/\r\n/g, '\n');
 
 test('login notifications remain outside the hidden application shell', () => {
   assert.match(
