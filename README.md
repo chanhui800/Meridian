@@ -6,6 +6,7 @@
 [![License](https://img.shields.io/github/license/chanhui800/Meridian)](LICENSE)
 
 本仓库是基于原项目 [snnabb/Meridian](https://github.com/snnabb/Meridian) 的修改版，保留原项目的核心反向代理能力，并针对实际部署补充和调整了域名前缀入口、自动后端改写、TLS 面板配置、缓存、日志和 UI。当前修改版仓库地址为 [chanhui800/Meridian](https://github.com/chanhui800/Meridian)。
+UI界面参考CF面板项目[axuitomo/CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)
 
 Meridian 是面向 Emby 及兼容媒体服务的反向代理面板。它把多个上游站点统一到一个管理界面，提供独立端口、域名前缀入口、动态后端发现、播放地址改写、TLS、流量统计、请求日志和静态资源缓存。
 
