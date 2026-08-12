@@ -1268,7 +1268,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.32", "/css/style.css?v=1.8.32", "/js/pages/sites.js?v=1.8.32", "/js/pages/request-logs.js?v=1.8.32", "/js/app.js?v=1.8.32"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.33", "/css/style.css?v=1.8.33", "/js/pages/sites.js?v=1.8.33", "/js/pages/request-logs.js?v=1.8.33", "/js/app.js?v=1.8.33"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}

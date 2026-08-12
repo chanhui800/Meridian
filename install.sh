@@ -2173,5 +2173,11 @@ run_cli() {
 }
 
 if [[ "${BASH_SOURCE[0]-}" == "$0" || -z "${BASH_SOURCE[0]-}" ]]; then
-    run_cli "$@"
+    # curl | bash consumes standard input while Bash reads the script. Keep the
+    # complete interactive flow attached to the controlling terminal instead.
+    if [ ! -t 0 ] && { : </dev/tty; } 2>/dev/null; then
+        run_cli "$@" </dev/tty
+    else
+        run_cli "$@"
+    fi
 fi

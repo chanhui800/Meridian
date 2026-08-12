@@ -7,7 +7,7 @@
 
 Meridian 是面向 Emby、Jellyfin 等媒体服务的多节点反向代理面板。本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，并参考 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI) 优化界面与交互。
 
-当前版本：`v1.8.32`
+当前版本：`v1.8.33`
 
 ## 主要功能
 
@@ -67,6 +67,12 @@ Linux Docker 使用 `network_mode: host`，面板和节点端口会直接监听�
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/main/install.sh | sudo bash
 sudo systemctl status meridian
+```
+
+管道执行时，交互菜单及后续输入会自动从当前终端读取。无终端的自动化安装可显式执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chanhui800/Meridian/main/install.sh | sudo bash -s -- install -y --no-domain
 ```
 
 默认数据库为 `/var/lib/meridian/meridian.db`，服务由 `systemd` 管理。日志可通过以下命令查看：

@@ -36,6 +36,19 @@ stdin_help=$(bash -s -- help < "${REPO_ROOT}/install.sh")
 printf '%s' "$stdin_help" | grep -Fq 'Meridian 一键安装工具' \
     || { echo 'FAIL: stdin execution did not enter the CLI' >&2; exit 1; }
 
+# Piped execution must read its menu choice from the controlling terminal,
+# rather than the already-consumed script input. util-linux script provides a
+# disposable PTY while Bash still reads the installer itself from stdin.
+if command -v script >/dev/null 2>&1; then
+    piped_menu=$(printf '0\n' | script -qec "bash < '${REPO_ROOT}/install.sh'" /dev/null)
+    printf '%s' "$piped_menu" | grep -Fq '请选择 [0-4]:' \
+        || { echo 'FAIL: piped menu was not attached to the terminal' >&2; exit 1; }
+    if printf '%s' "$piped_menu" | grep -Fq '无效选项'; then
+        echo 'FAIL: piped menu did not read the terminal selection' >&2
+        exit 1
+    fi
+fi
+
 assert_eq() {
     local expected="$1" actual="$2" label="$3"
     if [ "$expected" != "$actual" ]; then
