@@ -78,6 +78,7 @@ type rateLimitedWriter struct {
 	written        *atomic.Int64
 	requestWritten int64
 	start          time.Time
+	ctx            context.Context
 }
 
 func (w *rateLimitedWriter) Write(b []byte) (int, error) {
@@ -94,7 +95,15 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 		}
 		allowed := int64(elapsed*float64(w.bytesPerSec)) - w.requestWritten
 		if allowed <= 0 {
-			time.Sleep(10 * time.Millisecond)
+			if w.ctx == nil {
+				time.Sleep(10 * time.Millisecond)
+			} else {
+				select {
+				case <-w.ctx.Done():
+					return totalWritten, w.ctx.Err()
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
 			continue
 		}
 		chunk := b
