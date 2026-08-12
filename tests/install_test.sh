@@ -30,6 +30,12 @@ export MERIDIAN_ASSUME_YES=1
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/install.sh"
 
+# The documented curl | sudo bash form runs the script from stdin, where Bash
+# leaves BASH_SOURCE as an empty array. Nounset must not abort before run_cli.
+stdin_help=$(bash -s -- help < "${REPO_ROOT}/install.sh")
+printf '%s' "$stdin_help" | grep -Fq 'Meridian 一键安装工具' \
+    || { echo 'FAIL: stdin execution did not enter the CLI' >&2; exit 1; }
+
 assert_eq() {
     local expected="$1" actual="$2" label="$3"
     if [ "$expected" != "$actual" ]; then

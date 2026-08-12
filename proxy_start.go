@@ -231,13 +231,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	speedLimitBytes := int64(site.SpeedLimit) * 125000 // Mbps -> bytes/sec
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !inst.beginRequest() {
+		requestController, accepted := inst.beginHTTPRequest(w)
+		if !accepted {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"error":"site is stopping"}`))
 			return
 		}
-		defer inst.endRequest()
+		defer inst.endHTTPRequest(requestController)
 		clientRequestContext := r.Context()
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
 		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies, policy)
@@ -288,6 +289,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					bytesPerSec:    speedLimitBytes,
 					written:        &inst.bytesOut,
 					start:          time.Now(),
+					ctx:            r.Context(),
 				}
 			} else {
 				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
@@ -335,7 +337,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
 				var cacheWriter http.ResponseWriter
 				if speedLimitBytes > 0 {
-					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, start: time.Now()}
+					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, start: time.Now(), ctx: r.Context()}
 				} else {
 					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
 				}
@@ -368,6 +370,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				bytesPerSec:    speedLimitBytes,
 				written:        &inst.bytesOut,
 				start:          time.Now(),
+				ctx:            r.Context(),
 			}
 		} else {
 			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}

@@ -2172,6 +2172,6 @@ run_cli() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]-}" == "$0" || -z "${BASH_SOURCE[0]-}" ]]; then
     run_cli "$@"
 fi

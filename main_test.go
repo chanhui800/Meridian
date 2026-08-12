@@ -1193,6 +1193,26 @@ func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
 	}
 }
 
+func TestRateLimitedWriterStopsWaitingWhenRequestIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var siteTraffic atomic.Int64
+	writer := &rateLimitedWriter{
+		ResponseWriter: httptest.NewRecorder(),
+		bytesPerSec:    1,
+		written:        &siteTraffic,
+		start:          time.Now(),
+		ctx:            ctx,
+	}
+	n, err := writer.Write([]byte("stream"))
+	if !errors.Is(err, context.Canceled) || n != 0 {
+		t.Fatalf("Write after cancellation = (%d, %v), want (0, context canceled)", n, err)
+	}
+	if siteTraffic.Load() != 0 {
+		t.Fatalf("canceled writer accounted %d bytes", siteTraffic.Load())
+	}
+}
+
 func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	css, err := web.StaticFiles.ReadFile("static/css/style.css")
 	if err != nil {
@@ -1248,7 +1268,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.31", "/css/style.css?v=1.8.31", "/js/pages/sites.js?v=1.8.31", "/js/pages/request-logs.js?v=1.8.31", "/js/app.js?v=1.8.31"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.32", "/css/style.css?v=1.8.32", "/js/pages/sites.js?v=1.8.32", "/js/pages/request-logs.js?v=1.8.32", "/js/app.js?v=1.8.32"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}

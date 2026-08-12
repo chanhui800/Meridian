@@ -29,6 +29,7 @@ type ProxyInstance struct {
 	lifecycleMu     sync.Mutex
 	closing         bool
 	activeRequests  sync.WaitGroup
+	activeHTTP      map[*http.ResponseController]struct{}
 	hijackedConns   map[net.Conn]struct{}
 	portServing     atomic.Bool
 	portServeFailed atomic.Bool
@@ -108,6 +109,28 @@ func (inst *ProxyInstance) endRequest() {
 	inst.activeRequests.Done()
 }
 
+func (inst *ProxyInstance) beginHTTPRequest(w http.ResponseWriter) (*http.ResponseController, bool) {
+	controller := http.NewResponseController(w)
+	inst.lifecycleMu.Lock()
+	defer inst.lifecycleMu.Unlock()
+	if inst.closing {
+		return nil, false
+	}
+	if inst.activeHTTP == nil {
+		inst.activeHTTP = make(map[*http.ResponseController]struct{})
+	}
+	inst.activeHTTP[controller] = struct{}{}
+	inst.activeRequests.Add(1)
+	return controller, true
+}
+
+func (inst *ProxyInstance) endHTTPRequest(controller *http.ResponseController) {
+	inst.lifecycleMu.Lock()
+	delete(inst.activeHTTP, controller)
+	inst.lifecycleMu.Unlock()
+	inst.activeRequests.Done()
+}
+
 func (inst *ProxyInstance) isAccepting() bool {
 	inst.lifecycleMu.Lock()
 	defer inst.lifecycleMu.Unlock()
@@ -155,6 +178,15 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 	connections := make([]net.Conn, 0, len(inst.hijackedConns))
 	for conn := range inst.hijackedConns {
 		connections = append(connections, conn)
+	}
+	// Shared-host sites run on the panel server, so their listener/server cannot
+	// be closed per site. Set deadlines while holding lifecycleMu: a handler
+	// cannot unregister and let its connection be reused by another Host between
+	// the active check and the deadline change.
+	now := time.Now()
+	for controller := range inst.activeHTTP {
+		_ = controller.SetReadDeadline(now)
+		_ = controller.SetWriteDeadline(now)
 	}
 	inst.lifecycleMu.Unlock()
 
