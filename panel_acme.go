@@ -479,7 +479,7 @@ func loadOrCreateACMEAccountKey(directory, filename string) (crypto.Signer, erro
 }
 
 func writePrivateFileAtomic(filename string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil { // #nosec G703 G304 -- filename is generated from the configured private TLS directory.
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(filename), ".meridian-tls-*")
@@ -504,11 +504,11 @@ func writePrivateFileAtomic(filename string, data []byte) error {
 		return err
 	}
 	if runtime.GOOS == "windows" {
-		if err := os.Remove(filename); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(filename); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- filename is generated from the configured private TLS directory.
 			return err
 		}
 	}
-	return os.Rename(tmpName, filename)
+	return os.Rename(tmpName, filename) // #nosec G703 G304 -- both paths are generated within the private TLS directory.
 }
 
 func fulfillCloudflareDNSAuthorization(ctx context.Context, acmeClient *acme.Client, cf *cloudflareClient, authorizationURL, routeDomain string) error {

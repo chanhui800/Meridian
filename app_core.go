@@ -130,7 +130,7 @@ func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 					if r.URL.RawQuery != "" {
 						target += "?" + r.URL.RawQuery
 					}
-					http.Redirect(w, r, target, http.StatusPermanentRedirect)
+					http.Redirect(w, r, target, http.StatusPermanentRedirect) // #nosec G710 -- target is constructed solely from the matched local ingress prefix and original query.
 					return
 				}
 				r = r.Clone(context.WithValue(r.Context(), pathIngressContextKey{}, prefix))
