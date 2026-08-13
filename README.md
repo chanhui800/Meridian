@@ -1,4 +1,4 @@
-# Meridian
+﻿# Meridian
 
 [![CI](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/chanhui800/Meridian/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/chanhui800/Meridian/actions/workflows/codeql.yml)
@@ -7,16 +7,17 @@
 
 Meridian 是面向 Emby、Jellyfin 等媒体服务的多节点反向代理面板。本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，并参考 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI) 优化界面与交互。
 
-当前版本：`v1.8.33`
+当前正式版本：`v1.8.34`
 
 ## 主要功能
 
-- 多节点管理，支持独立端口和域名前缀入口。
+- 多节点管理，支持独立端口、路径和域名前缀入口。
 - 自动发现并改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 播放地址。
 - 主视频流可选“反代”或“直连”，默认反代；网盘服 30x 可校验后交给客户端直连。
 - 支持 TLS 泛域名证书、静态资源缓存、流量统计和运行诊断。
 - 请求日志可筛选资源类别，并分别记录客户端 UA、上游 UA 和最终后端地址。
 - Telegram 每日或每周定时日报，默认使用北京时间，可自定义调度时区。
+- 支持从全局设置下载密码加密备份，并在同机或新安装中安全恢复数据库与 TLS 数据。
 - 白色/黑色主题、响应式侧栏和移动端日志布局。
 - Docker 与 Linux systemd 均支持健康检查、优雅停止和自动重启。
 
@@ -90,6 +91,18 @@ sudo journalctl -u meridian -f
 
 媒体认证头默认完全透传。客户端 UA 默认透传，也可按站点改为预设或自定义 UA。
 
+## 路径入口
+
+路径入口让多个站点共用面板域名和端口。例如站点入口填写 `/movie` 后，客户端通过以下地址连接：
+
+```text
+https://panel.example.com:9090/movie
+```
+
+入口必须是唯一的单级路径，仅支持字母、数字、短横线和下划线，不能使用 `/api`、`/css`、`/js` 等面板保留路径。Meridian 会按本次请求的入口自动剥离外层路径，并处理 Emby/Jellyfin 返回地址中入口前缀与 `/emby`、`/jellyfin` Base URL 重复或顺序错位的情况。PlaybackInfo、HLS、DASH、30x、WebSocket、Cookie Path 和自定义播放路径都会继续经过对应站点，不需要为不同路径名称修改代码。
+
+路径入口名称不会从上游自动创建。新增或编辑站点时选择“路径入口”并填写前缀即可；这样可以避免多个站点误占同一路径。若修改入口名称，客户端也需要改用新的访问地址。
+
 ## 域名前缀与 TLS
 
 域名前缀入口使用“节点前缀 + 泛域名 + 面板端口”，例如：
@@ -115,6 +128,14 @@ DNS API Token 仅用于当前证书申请，不会保存到数据库或日志。
 - **日志字段展示**：只控制日志表格列，不改写历史数据。
 
 Telegram 日报支持每天或每周发送请求量、流量、排行和客户端分布。Bot Token 加密存储，发送时间按“系统 UI”中的调度时区执行。
+
+## 备份与恢复
+
+“全局设置 → 备份与恢复”可下载带密码加密的 `.mrbak` 文件。备份包含账户、站点、流量与请求日志、全局设置和 Telegram 配置；TLS 设置、证书与 ACME 账户可选备份，默认不包含，用户主动勾选后才会写入备份。备份不包含静态缓存、`.env` 或部署密钥文件。
+
+恢复前会校验备份密码、文件结构和 SQLite 完整性；校验通过后 Meridian 会优雅重启并原子替换数据，启动失败时自动回滚。未包含 TLS 的备份会保留目标服务器现有面板域名、端口、TLS 开关和证书。跨机器恢复会使用目标安装当前密钥重新加密自定义上游请求头和 Telegram Token。恢复后请使用备份中的管理员账户登录。
+
+跨服务器恢复时会按目标服务器的入口能力迁移站点：支持原入口模式的站点保留配置并按备份状态直接启用；不支持原入口模式的站点仍会完整保留，但入口改为“未配置”并自动停用。用户在站点管理中选择当前服务器可用的入口并保存后即可启用，不会因此回滚其他恢复数据。
 
 ## 常用环境变量
 

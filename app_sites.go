@@ -50,6 +50,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			ListenPort                 int                   `json:"listen_port"`
 			PublicHost                 string                `json:"public_host"`
 			RoutePrefix                string                `json:"route_prefix"`
+			PathPrefix                 string                `json:"path_prefix"`
 			IngressMode                string                `json:"ingress_mode"`
 			TargetURL                  string                `json:"target_url"`
 			PlaybackTargetURL          string                `json:"playback_target_url"`
@@ -136,9 +137,26 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.PublicHost = publicHost
+		req.PathPrefix, err = normalizePathPrefix(req.PathPrefix)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		req.IngressMode, err = normalizeIngressMode(req.IngressMode, req.PublicHost)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.IngressMode == ingressModeUnset {
+			a.jsonErr(w, http.StatusBadRequest, errUnsetIngress.Error())
+			return
+		}
+		if req.IngressMode == ingressModePath && req.PathPrefix == "" {
+			a.jsonErr(w, http.StatusBadRequest, "path_prefix is required for path ingress")
+			return
+		}
+		if req.IngressMode != ingressModePath && req.PathPrefix != "" {
+			a.jsonErr(w, http.StatusBadRequest, "path_prefix is only valid for path ingress")
 			return
 		}
 		if err := a.pm.validateIngressSafety(req.IngressMode); err != nil {
@@ -148,7 +166,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
 		if req.ListenPort == 0 {
-			if req.IngressMode != ingressModeHost {
+			if !ingressUsesPanel(req.IngressMode) {
 				a.jsonErr(w, http.StatusBadRequest, "listen_port is required for dedicated-port ingress")
 				return
 			}
@@ -196,10 +214,17 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if req.PathPrefix != "" {
+			if _, exists := a.pm.PathPrefixSiteID(req.PathPrefix); exists {
+				a.jsonErr(w, http.StatusBadRequest, "path_prefix is already assigned to another site")
+				return
+			}
+		}
 		site, err := a.db.CreateSiteRecord(Site{
 			Name:                          req.Name,
 			ListenPort:                    req.ListenPort,
 			PublicHost:                    req.PublicHost,
+			PathPrefix:                    req.PathPrefix,
 			IngressMode:                   req.IngressMode,
 			TargetURL:                     req.TargetURL,
 			PlaybackTargetURL:             req.PlaybackTargetURL,
@@ -388,6 +413,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			ListenPort                 int                    `json:"listen_port"`
 			PublicHost                 *string                `json:"public_host"`
 			RoutePrefix                *string                `json:"route_prefix"`
+			PathPrefix                 *string                `json:"path_prefix"`
 			IngressMode                *string                `json:"ingress_mode"`
 			TargetURL                  string                 `json:"target_url"`
 			PlaybackTargetURL          *string                `json:"playback_target_url"`
@@ -500,13 +526,32 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if ingressMode == ingressModeUnset {
+			a.jsonErr(w, http.StatusBadRequest, errUnsetIngress.Error())
+			return
+		}
+		pathPrefix := oldSite.PathPrefix
+		if req.PathPrefix != nil {
+			pathPrefix, err = normalizePathPrefix(*req.PathPrefix)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		if ingressMode == ingressModePath && pathPrefix == "" {
+			a.jsonErr(w, http.StatusBadRequest, "path_prefix is required for path ingress")
+			return
+		}
+		if ingressMode != ingressModePath {
+			pathPrefix = ""
+		}
 		if err := a.pm.validateIngressSafety(ingressMode); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		listenPort := req.ListenPort
 		if listenPort == 0 {
-			if ingressMode != ingressModeHost {
+			if !ingressUsesPanel(ingressMode) {
 				a.jsonErr(w, http.StatusBadRequest, "listen_port is required for dedicated-port ingress")
 				return
 			}
@@ -566,6 +611,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.Name = req.Name
 		candidate.ListenPort = listenPort
 		candidate.PublicHost = publicHost
+		candidate.PathPrefix = pathPrefix
 		candidate.IngressMode = ingressMode
 		candidate.TargetURL = req.TargetURL
 		candidate.PlaybackTargetURL = playbackTargetURL
@@ -625,6 +671,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		if candidate.PublicHost != "" {
 			if assignedID, exists := a.pm.PublicHostSiteID(candidate.PublicHost); exists && assignedID != candidate.ID {
 				a.jsonErr(w, http.StatusBadRequest, "public_host is already assigned to another site")
+				return
+			}
+		}
+		if candidate.PathPrefix != "" {
+			if assignedID, exists := a.pm.PathPrefixSiteID(candidate.PathPrefix); exists && assignedID != candidate.ID {
+				a.jsonErr(w, http.StatusBadRequest, "path_prefix is already assigned to another site")
 				return
 			}
 		}

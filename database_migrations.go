@@ -86,6 +86,7 @@ func (d *DB) migrateOnce() error {
 			name TEXT NOT NULL,
 			listen_port INTEGER NOT NULL UNIQUE,
 			public_host TEXT NOT NULL DEFAULT '',
+			path_prefix TEXT NOT NULL DEFAULT '',
 			ingress_mode TEXT NOT NULL DEFAULT 'port',
 			target_url TEXT NOT NULL,
 		playback_target_url TEXT NOT NULL DEFAULT '',
@@ -209,6 +210,7 @@ func (d *DB) migrateOnce() error {
 		{"custom_client", "ALTER TABLE sites ADD COLUMN custom_client TEXT NOT NULL DEFAULT ''"},
 		{"custom_version", "ALTER TABLE sites ADD COLUMN custom_version TEXT NOT NULL DEFAULT ''"},
 		{"public_host", "ALTER TABLE sites ADD COLUMN public_host TEXT NOT NULL DEFAULT ''"},
+		{"path_prefix", "ALTER TABLE sites ADD COLUMN path_prefix TEXT NOT NULL DEFAULT ''"},
 		{"ingress_mode", "ALTER TABLE sites ADD COLUMN ingress_mode TEXT NOT NULL DEFAULT 'port'"},
 		{"upstream_headers", "ALTER TABLE sites ADD COLUMN upstream_headers TEXT NOT NULL DEFAULT '[]'"},
 		{"dynamic_discovery_enabled", "ALTER TABLE sites ADD COLUMN dynamic_discovery_enabled INTEGER NOT NULL DEFAULT 0"},
@@ -315,6 +317,9 @@ func (d *DB) migrateOnce() error {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_public_host ON sites(public_host COLLATE NOCASE) WHERE public_host <> ''"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_path_prefix ON sites(path_prefix COLLATE NOCASE) WHERE path_prefix <> ''"); err != nil {
 		return err
 	}
 

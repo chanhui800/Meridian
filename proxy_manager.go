@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,7 @@ type ProxyManager struct {
 	proxies                 map[int64]*ProxyInstance
 	publicHosts             map[string]int64
 	publicHostModes         map[string]string
+	pathPrefixes            map[string]int64
 	upstreamHeaderKey       []byte
 	trustedProxies          []*net.IPNet
 	hostOnlyIngressSafe     bool
@@ -145,7 +147,7 @@ func (inst *ProxyInstance) isOperational() bool {
 	if !inst.isAccepting() {
 		return false
 	}
-	return ingressUsesHost(inst.Site.IngressMode) || !inst.portServeFailed.Load()
+	return ingressUsesPanel(inst.Site.IngressMode) || !inst.portServeFailed.Load()
 }
 
 func (inst *ProxyInstance) trackHijackedConn(conn net.Conn) bool {
@@ -222,6 +224,7 @@ func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 		proxies:         make(map[int64]*ProxyInstance),
 		publicHosts:     make(map[string]int64),
 		publicHostModes: make(map[string]string),
+		pathPrefixes:    make(map[string]int64),
 		dynamicRuntime:  newDynamicRuntime(),
 		database:        db,
 	}
@@ -374,17 +377,31 @@ func (pm *ProxyManager) registerSiteHostLocked(site Site) error {
 			return fmt.Errorf("public_host %s is already assigned to another site", desiredHost)
 		}
 	}
+	desiredPath := ""
+	if ingressUsesPath(site.IngressMode) {
+		desiredPath = site.PathPrefix
+		if existing, ok := pm.pathPrefixes[desiredPath]; ok && existing != site.ID {
+			return fmt.Errorf("path_prefix %s is already assigned to another site", desiredPath)
+		}
+	}
 	for host, id := range pm.publicHosts {
 		if id == site.ID && host != desiredHost {
 			delete(pm.publicHosts, host)
 			delete(pm.publicHostModes, host)
 		}
 	}
-	if desiredHost == "" {
-		return nil
+	if desiredHost != "" {
+		pm.publicHosts[desiredHost] = site.ID
+		pm.publicHostModes[desiredHost] = site.IngressMode
 	}
-	pm.publicHosts[desiredHost] = site.ID
-	pm.publicHostModes[desiredHost] = site.IngressMode
+	for pathPrefix, id := range pm.pathPrefixes {
+		if id == site.ID && pathPrefix != desiredPath {
+			delete(pm.pathPrefixes, pathPrefix)
+		}
+	}
+	if desiredPath != "" {
+		pm.pathPrefixes[desiredPath] = site.ID
+	}
 	return nil
 }
 
@@ -399,9 +416,16 @@ func (pm *ProxyManager) RegisterSiteHost(site Site) error {
 		return err
 	}
 	site.PublicHost = publicHost
+	site.PathPrefix, err = normalizePathPrefix(site.PathPrefix)
+	if err != nil {
+		return err
+	}
 	site.IngressMode, err = normalizeIngressMode(site.IngressMode, site.PublicHost)
 	if err != nil {
 		return err
+	}
+	if site.IngressMode == ingressModePath && site.PathPrefix == "" {
+		return fmt.Errorf("path_prefix is required when ingress_mode is path")
 	}
 	nextSelfTargets, snapshotErr := pm.buildDynamicSelfTargetPolicy()
 	pm.mu.Lock()
@@ -432,6 +456,11 @@ func (pm *ProxyManager) UnregisterSiteHost(siteID int64) {
 		if id == siteID {
 			delete(pm.publicHosts, host)
 			delete(pm.publicHostModes, host)
+		}
+	}
+	for pathPrefix, id := range pm.pathPrefixes {
+		if id == siteID {
+			delete(pm.pathPrefixes, pathPrefix)
 		}
 	}
 	if snapshotErr != nil {
@@ -469,5 +498,39 @@ func (pm *ProxyManager) PublicHostSiteID(host string) (int64, bool) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	id, ok := pm.publicHosts[host]
+	return id, ok
+}
+
+func (pm *ProxyManager) PathRoute(requestPath string) (http.Handler, string, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for prefix, id := range pm.pathPrefixes {
+		if !ingressPathMatches(requestPath, prefix) && !embeddedIngressPathMatches(requestPath, prefix) {
+			continue
+		}
+		inst := pm.proxies[id]
+		if inst == nil {
+			return nil, prefix, true
+		}
+		return inst.handler, prefix, true
+	}
+	return nil, "", false
+}
+
+func embeddedIngressPathMatches(requestPath, prefix string) bool {
+	for _, appBase := range []string{"/emby", "/jellyfin"} {
+		embedded := appBase + prefix
+		if len(requestPath) >= len(embedded) && strings.EqualFold(requestPath[:len(embedded)], embedded) &&
+			(len(requestPath) == len(embedded) || requestPath[len(embedded)] == '/') {
+			return true
+		}
+	}
+	return false
+}
+
+func (pm *ProxyManager) PathPrefixSiteID(prefix string) (int64, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	id, ok := pm.pathPrefixes[prefix]
 	return id, ok
 }

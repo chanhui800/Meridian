@@ -267,7 +267,7 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	}
 	session.seen[seenKey] = route
 	if acquired {
-		token := strings.TrimPrefix(baseRoute, dynamicRoutePrefix)
+		token := session.issuer.capabilityToken(baseRoute)
 		session.minted = append(session.minted, token)
 	}
 	return route, nil

@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.33"
+var appVersion = "v1.8.34"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -88,7 +88,18 @@ func main() {
 		log.Fatalf("invalid dynamic route key: %v", err)
 	}
 
+	restoreState, err := applyPendingRestore(dbPath)
+	if err != nil {
+		log.Fatalf("apply pending restore: %v", err)
+	}
 	db, err := openDB(dbPath)
+	if err != nil && restoreState != nil {
+		log.Printf("restored database failed to open; rolling back: %v", err)
+		if rollbackErr := rollbackAppliedRestore(dbPath, restoreState); rollbackErr != nil {
+			log.Fatalf("restored database failed and rollback failed: %v (original error: %v)", rollbackErr, err)
+		}
+		db, err = openDB(dbPath)
+	}
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
@@ -180,6 +191,7 @@ func main() {
 	}
 	app := &App{
 		db:                db,
+		dbPath:            dbPath,
 		pm:                pm,
 		setupToken:        setupToken,
 		loginLimiter:      newLoginRateLimiter(),
@@ -213,6 +225,8 @@ func main() {
 	mux.HandleFunc("/api/panel-settings", cors(app.authMiddleware(app.handlePanelSettings)))
 	mux.HandleFunc("/api/panel-certificate/issue", cors(app.authMiddleware(app.handlePanelCertificateIssue)))
 	mux.HandleFunc("/api/system/restart", cors(app.authMiddleware(app.handleSystemRestart)))
+	mux.HandleFunc("/api/backup/export", cors(app.authMiddleware(app.handleBackupExport)))
+	mux.HandleFunc("/api/backup/restore", cors(app.authMiddleware(app.handleBackupRestore)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
@@ -253,6 +267,16 @@ func main() {
 	}
 	if panelTLSEnabled {
 		panelListener = tls.NewListener(panelListener, panelTLSConfig)
+	}
+	// Keep the rollback marker until the restored database, TLS configuration,
+	// proxy sites, and panel listener have all initialized successfully. A fatal
+	// startup before this point leaves the marker for the next process to roll
+	// back automatically.
+	if restoreState != nil {
+		if err := finalizeAppliedRestore(dbPath); err != nil {
+			_ = panelListener.Close()
+			log.Fatalf("finalize restored data: %v", err)
+		}
 	}
 
 	log.Println("============================================================")

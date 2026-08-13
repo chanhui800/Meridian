@@ -27,7 +27,97 @@ function globalSettingsNav(active) {
     <a href="#settings-tls" class="settings-nav-item ${active === 'tls' ? 'active' : ''}">TLS 设置</a>
     <a href="#telegram-report" class="settings-nav-item ${active === 'telegram' ? 'active' : ''}">Telegram 通知</a>
     <a href="#diagnostics" class="settings-nav-item ${active === 'diagnostics' ? 'active' : ''}">故障诊断</a>
+    <a href="#backup-restore" class="settings-nav-item ${active === 'backup' ? 'active' : ''}">备份与恢复</a>
   </aside>`;
+}
+
+function backupPasswordField(id, label) {
+  return `<label class="settings-field"><span>${label}</span><div><input class="form-input" id="${id}" type="password" minlength="12" maxlength="128" autocomplete="new-password" placeholder="至少 12 个字符"></div></label>`;
+}
+
+function renderBackupRestore() {
+  const page = document.getElementById('page-backup-restore');
+  if (!page) return;
+  page.innerHTML = `<div class="settings-layout fade-up">${globalSettingsNav('backup')}<main class="settings-content backup-restore-content">
+    <section class="settings-panel"><header><span>BACKUP</span><h2>数据备份</h2><b>密码加密</b></header>
+      <p class="settings-panel-help">备份包含站点、账户、流量与请求日志、全局设置及 Telegram 配置；不包含缓存、.env 或部署密钥文件。</p>
+      <div class="settings-grid">${backupPasswordField('backup-password', '备份密码')}${backupPasswordField('backup-password-confirm', '确认备份密码')}</div>
+      ${settingsCheck('backup-include-tls', '包含 TLS 设置与证书', false, '默认不包含。勾选后才会备份面板域名、监听端口、TLS 开关、证书与 ACME 账户；未勾选时，恢复会保留目标服务器现有 TLS 配置。')}
+      <div class="backup-warning">备份中含管理员账户、站点地址及加密凭据，必须妥善保存密码和备份文件。忘记密码后无法恢复。</div>
+      <div class="settings-save-bar"><button class="telegram-btn primary" type="button" id="backup-download">下载加密备份</button></div>
+    </section>
+    <section class="settings-panel backup-restore-danger"><header><span>RESTORE</span><h2>数据恢复</h2><b>自动重启</b></header>
+      <p class="settings-panel-help">恢复会替换当前数据库并使用备份中的管理员账户；只有备份明确包含 TLS 时才会替换 TLS 数据，否则保留当前服务器的 TLS 设置与证书。文件通过解密、结构检查和 SQLite 完整性检查后，Meridian 才会重启应用。</p>
+      <div class="settings-grid">
+        <label class="settings-field"><span>Meridian 备份文件</span><div><input class="form-input backup-file-input" id="restore-file" type="file" accept=".mrbak,application/octet-stream"></div></label>
+        ${backupPasswordField('restore-password', '备份密码')}
+      </div>
+      <label class="settings-field backup-confirm-field"><span>确认操作</span><div><input class="form-input" id="restore-confirm" type="text" autocomplete="off" placeholder="请输入：恢复"></div><small>输入“恢复”后才能提交。开始恢复前建议先下载一份当前数据备份。</small></label>
+      <div class="backup-warning danger">恢复后当前登录会失效；请使用备份中的管理员用户名和密码重新登录。</div>
+      <div class="settings-save-bar"><button class="telegram-btn danger" type="button" id="backup-restore-submit">校验并恢复</button></div>
+    </section>
+  </main></div>`;
+  bindGlobalSettingsNav(page);
+  document.getElementById('backup-download').onclick = downloadMeridianBackup;
+  document.getElementById('backup-restore-submit').onclick = restoreMeridianBackup;
+}
+
+function backupFilename(disposition) {
+  const match = String(disposition || '').match(/filename="?([^";]+)"?/i);
+  return match ? match[1] : `meridian-backup-${new Date().toISOString().slice(0, 10)}.mrbak`;
+}
+
+async function downloadMeridianBackup() {
+  const password = document.getElementById('backup-password').value;
+  const confirmation = document.getElementById('backup-password-confirm').value;
+  if (password.length < 12) return Toast.error('备份密码至少需要 12 个字符');
+  if (password !== confirmation) return Toast.error('两次输入的备份密码不一致');
+  const button = document.getElementById('backup-download');
+  button.disabled = true;
+  button.textContent = '正在创建备份…';
+  try {
+    const result = await API.exportBackup(password, document.getElementById('backup-include-tls').checked);
+    if (!result) return;
+    const url = URL.createObjectURL(result.blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = backupFilename(result.disposition);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    Toast.success('加密备份已创建，请妥善保存');
+  } catch (error) {
+    Toast.error(error.message);
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = '下载加密备份';
+    }
+  }
+}
+
+async function restoreMeridianBackup() {
+  const fileInput = document.getElementById('restore-file');
+  const password = document.getElementById('restore-password').value;
+  const confirmation = document.getElementById('restore-confirm').value.trim();
+  if (!fileInput.files || !fileInput.files[0]) return Toast.error('请选择 Meridian 备份文件');
+  if (password.length < 12) return Toast.error('请输入正确的备份密码');
+  if (confirmation !== '恢复') return Toast.error('请输入“恢复”确认操作');
+  const button = document.getElementById('backup-restore-submit');
+  button.disabled = true;
+  button.textContent = '正在校验备份…';
+  try {
+    const result = await API.restoreBackup(fileInput.files[0], password, confirmation);
+    if (!result) return;
+    Toast.success(result.message || '恢复已开始，Meridian 正在重启');
+    button.textContent = '正在重启…';
+    setTimeout(() => window.location.reload(), 5000);
+  } catch (error) {
+    Toast.error(error.message);
+    button.disabled = false;
+    button.textContent = '校验并恢复';
+  }
 }
 
 function settingsNumber(id, label, value, min, max, unit, help) {

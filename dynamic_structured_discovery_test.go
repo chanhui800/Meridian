@@ -1425,6 +1425,82 @@ func TestConfiguredPrefixPlaybackInfoUsesExpectedSourceAndTrustedAbsoluteCapabil
 	}
 }
 
+func TestPathIngressPlaybackInfoPrefixesRelativeAndDynamicRoutes(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	issuer.pathPrefix = "/emby"
+	upstreamBase := mustStructuredURL(t, "https://origin.example.com/Items/1/PlaybackInfo")
+	authority := redirectHostKey(upstreamBase)
+	issuer.configuredAuthorities = map[string]bool{authority: true}
+	issuer.primaryAuthority = authority
+	issuer.configuredTransport = structuredRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("unexpected configured transport call")
+	})
+	request := httptest.NewRequest(http.MethodGet, upstreamBase.String(), nil)
+	request = request.WithContext(context.WithValue(request.Context(), dynamicExpectedStructuredSourceContextKey{}, dynamicDiscoverySourcePlaybackInfo))
+	body := `{"MediaSources":[{"DirectStreamUrl":"https://origin.example.com/Videos/1/stream.mp4?api_key=absolute-secret","TranscodingUrl":"/Videos/1/master.m3u8?api_key=relative-client"}]}`
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	response := &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: request}
+	if err := rewriteDynamicStructuredResponseExpected(response, issuer, true, dynamicDiscoverySourcePlaybackInfo, 0, false); err != nil {
+		t.Fatalf("rewrite path PlaybackInfo: %v", err)
+	}
+	rewritten, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		MediaSources []struct {
+			DirectStreamURL string `json:"DirectStreamUrl"`
+			TranscodingURL  string `json:"TranscodingUrl"`
+		} `json:"MediaSources"`
+	}
+	if err := json.Unmarshal(rewritten, &payload); err != nil || len(payload.MediaSources) != 1 {
+		t.Fatalf("decode path PlaybackInfo: payload=%#v err=%v", payload, err)
+	}
+	media := payload.MediaSources[0]
+	if media.TranscodingURL != "/emby/Videos/1/master.m3u8?api_key=relative-client" {
+		t.Fatalf("path relative URL=%q", media.TranscodingURL)
+	}
+	if !strings.HasPrefix(media.DirectStreamURL, "/emby"+dynamicRoutePrefix) {
+		t.Fatalf("path dynamic URL=%q", media.DirectStreamURL)
+	}
+	claims, err := openDynamicCapability(issuer.key, issuer.capabilityToken(media.DirectStreamURL))
+	if err != nil || claims.Target != "https://origin.example.com:443/Videos/1/stream.mp4?api_key=absolute-secret" {
+		t.Fatalf("path capability claims=%#v err=%v", claims, err)
+	}
+}
+
+func TestPathIngressPlaybackInfoMovesEmbeddedPrefixOutsideEmbyBase(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	issuer.pathPrefix = "/sntp"
+	base := mustStructuredURL(t, "https://origin.example.com/emby/Items/1/PlaybackInfo")
+	request := httptest.NewRequest(http.MethodGet, base.String(), nil)
+	request = request.WithContext(context.WithValue(request.Context(), dynamicExpectedStructuredSourceContextKey{}, dynamicDiscoverySourcePlaybackInfo))
+	body := `{"MediaSources":[{"DirectStreamUrl":"/emby/sntp/videos/1975846/original.mkv","TranscodingUrl":"/jellyfin/sntp/Videos/1975846/master.m3u8"}]}`
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	response := &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: request}
+	if err := rewriteDynamicStructuredResponseExpected(response, issuer, true, dynamicDiscoverySourcePlaybackInfo, 0, false); err != nil {
+		t.Fatalf("rewrite embedded path PlaybackInfo: %v", err)
+	}
+	rewritten, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(rewritten)
+	for _, want := range []string{
+		`"DirectStreamUrl":"/sntp/emby/videos/1975846/original.mkv"`,
+		`"TranscodingUrl":"/sntp/jellyfin/Videos/1975846/master.m3u8"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rewritten PlaybackInfo lacks %s: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "/emby/sntp/") || strings.Contains(text, "/jellyfin/sntp/") {
+		t.Fatalf("embedded ingress prefix survived: %s", text)
+	}
+}
+
 func TestConfiguredOriginDASHTemplateUsesTrustedTransport(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "https://origin.example.com/manifest.mpd")

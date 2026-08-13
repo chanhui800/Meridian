@@ -87,7 +87,7 @@ async function loadSites() {
         </div>
         <div class="site-actions">
           <button class="btn-ghost site-action-test" data-site-action="latency" data-site-id="${s.id}">测速</button>
-          <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}">${s.enabled ? '停用' : '启用'}</button>
+          <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}" ${normalizedIngressMode(s) === 'unset' ? 'disabled title="请先编辑并配置入口"' : ''}>${normalizedIngressMode(s) === 'unset' ? '待配置' : (s.enabled ? '停用' : '启用')}</button>
           <button class="btn-ghost" data-site-action="edit" data-site-id="${s.id}">编辑</button>
           <button class="btn-ghost danger" data-site-action="delete" data-site-id="${s.id}">删除</button>
         </div>
@@ -228,6 +228,8 @@ function normalizeSiteCapabilities(value) {
 		domain_prefix_available: { value: capabilities.domain_prefix_available === undefined ? undefined : capabilities.domain_prefix_available === true, enumerable: false },
 		route_domain: { value: String(capabilities.route_domain || '').trim().toLowerCase(), enumerable: false },
 		panel_tls_enabled: { value: capabilities.panel_tls_enabled === true, enumerable: false },
+		path_ingress_available: { value: capabilities.path_ingress_available !== false, enumerable: false },
+		panel_access_url: { value: String(capabilities.panel_access_url || '').replace(/\/$/, ''), enumerable: false },
 	});
 	return normalized;
 }
@@ -699,27 +701,43 @@ function renderUpstreamHeaderRows(headers, upstreamHeadersAvailable) {
 
 function normalizedIngressMode(site) {
 	const mode = String((site && site.ingress_mode) || '').trim().toLowerCase();
-	if (mode === 'port' || mode === 'host' || mode === 'both') return mode;
+	if (mode === 'unset' || mode === 'port' || mode === 'path' || mode === 'host' || mode === 'both') return mode;
 	return site && String(site.public_host || '').trim() ? 'host' : 'port';
 }
 
 function ingressFormState(mode) {
-	const normalized = ['port', 'host', 'both'].includes(mode) ? mode : 'host';
+	const normalized = ['unset', 'port', 'path', 'host', 'both'].includes(mode) ? mode : 'host';
+	if (normalized === 'unset') {
+		return {
+			mode: normalized,
+			showPublicHost: false,
+			requirePublicHost: false,
+			requireListenPort: false,
+			showPathPrefix: false,
+			requirePathPrefix: false,
+			portLabel: '监听端口',
+			warning: '该站点来自其他服务器，原入口不适用于当前环境。请选择可用入口并保存后再启用。',
+		};
+	}
 	return {
 		mode: normalized,
-		showPublicHost: normalized !== 'port',
-		requirePublicHost: normalized !== 'port',
-		requireListenPort: normalized !== 'host',
-		portLabel: normalized === 'host' ? '独立端口（可选）' : '监听端口',
+		showPublicHost: normalized === 'host' || normalized === 'both',
+		requirePublicHost: normalized === 'host' || normalized === 'both',
+		showPathPrefix: normalized === 'path',
+		requirePathPrefix: normalized === 'path',
+		requireListenPort: normalized === 'port' || normalized === 'both',
+		portLabel: normalized === 'host' || normalized === 'path' ? '独立端口（可选，自动分配）' : '监听端口',
 		warning: normalized === 'port'
 			? '独立端口会绑定所有网络接口；公网部署时请配置防火墙。'
+			: normalized === 'path'
+				? '路径入口复用面板域名和端口，例如 https://panel.example.com/emby/。客户端服务器地址需要包含该路径。'
 			: normalized === 'both'
 				? '兼容模式会同时开放独立端口和共享域名，建议迁移到单一入口。'
 				: '域名前缀通过面板端口转发，不会绑定站点端口，例如 https://123.example.com:9090。请先在 TLS 页配置面板域名、泛域名并申请证书，完成后再启用。',
 	};
 }
 
-function buildIngressPayload(mode, port, publicHost, routePrefix, routeDomain) {
+function buildIngressPayload(mode, port, publicHost, routePrefix, routeDomain, pathPrefix) {
 	const state = ingressFormState(mode);
 	const parsedPort = parseInt(port, 10);
 	const prefix = String(routePrefix || '').trim().toLowerCase();
@@ -730,6 +748,7 @@ function buildIngressPayload(mode, port, publicHost, routePrefix, routeDomain) {
 		ingress_mode: state.mode,
 		listen_port: Number.isInteger(parsedPort) ? parsedPort : 0,
 		public_host: state.showPublicHost ? generatedHost : '',
+		path_prefix: state.showPathPrefix ? String(pathPrefix || '').trim() : '',
 		...(state.showPublicHost && prefix ? { route_prefix: prefix } : {}),
 	};
 }
@@ -751,6 +770,11 @@ function siteAccessAddress(site, capabilities) {
 	if (mode === 'port') {
 		const host = locationObject.hostname || '127.0.0.1';
 		return `${protocol}://${host}:${Number(site.listen_port) || ''}`;
+	}
+	if (mode === 'path') {
+		const base = String(capabilities && capabilities.panel_access_url || '').replace(/\/$/, '') || `${protocol}://${locationObject.host || locationObject.hostname || '127.0.0.1'}`;
+		const prefix = String(site.path_prefix || '').trim().replace(/^\/+|\/+$/g, '');
+		return prefix ? `${base}/${prefix}/` : '';
 	}
 	const host = String(site.public_host || '').trim();
 	const panelPort = locationObject.port || (protocol === 'https' ? '443' : '80');
@@ -801,8 +825,8 @@ async function copySiteAccessAddress(button) {
 let siteIngressCapabilities = normalizeSiteCapabilities({});
 
 function siteIngressModeLabel(site) {
-	const labels = { port: '独立端口', host: '域名前缀', both: '域名前缀（兼容）' };
-	return labels[normalizedIngressMode(site)] || labels.host;
+	const labels = { unset: '入口未配置', port: '独立端口', path: '路径', host: '域名前缀', both: '域名前缀（兼容）' };
+	return labels[normalizedIngressMode(site)] || labels.unset;
 }
 
 function routePrefixForSite(site, routeDomain) {
@@ -1050,7 +1074,9 @@ async function showSiteModal(site) {
 	<div class="form-group">
 	  <label>入口模式</label>
 	  <select class="form-select modal-select" id="m-ingress-mode">
+		${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
 		<option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
+		<option value="path">路径</option>
 		<option value="port">独立端口</option>
 	  </select>
 	  <div class="form-help" id="m-ingress-warning"></div>
@@ -1058,7 +1084,7 @@ async function showSiteModal(site) {
 	</div>
 	<div class="form-group" id="m-port-group">
 	  <label id="m-port-label">监听端口</label>
-	  <input type="number" class="form-input" id="m-port" value="${isEdit && normalizedIngressMode(site) !== 'host' ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
+	  <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
 	  <div class="form-help" id="m-port-help"></div>
 	</div>
 	<div class="form-group" id="m-public-host-group">
@@ -1066,6 +1092,11 @@ async function showSiteModal(site) {
 	  <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
 	  <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
 	  <div class="form-help">访问地址为 https://前缀.${esc(siteCapabilities.route_domain || 'example.com')}:${esc(String((typeof window !== 'undefined' && window.location && window.location.port) || '9090'))}，由面板端口统一转发。</div>
+	</div>
+	<div class="form-group" id="m-path-prefix-group" hidden>
+	  <label>路径前缀</label>
+	  <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+	  <div class="form-help">只填写一段路径，系统会自动补全为 /emby/；不能使用 api、js、css、_meridian 等系统路径。</div>
 	</div>
 		<div class="form-group">
 		  <label>主回源固定请求头（可选）</label>
@@ -1133,6 +1164,8 @@ async function showSiteModal(site) {
 	const publicHostGroup = document.getElementById('m-public-host-group');
 	const publicHostInput = document.getElementById('m-public-host');
 	const routePrefixInput = document.getElementById('m-route-prefix');
+	const pathPrefixGroup = document.getElementById('m-path-prefix-group');
+	const pathPrefixInput = document.getElementById('m-path-prefix');
 	const portInput = document.getElementById('m-port');
 	const portLabel = document.getElementById('m-port-label');
 	const portHelp = document.getElementById('m-port-help');
@@ -1144,11 +1177,15 @@ async function showSiteModal(site) {
 		publicHostInput.required = state.requirePublicHost;
 		routePrefixInput.required = state.requirePublicHost && domainPrefixAvailable;
 		routePrefixInput.disabled = !state.showPublicHost;
+		pathPrefixGroup.hidden = !state.showPathPrefix;
+		pathPrefixInput.required = state.requirePathPrefix;
+		pathPrefixInput.disabled = !state.showPathPrefix;
 		portInput.required = state.requireListenPort;
+		document.getElementById('m-port-group').hidden = !state.requireListenPort;
 		portLabel.textContent = state.portLabel;
 		portHelp.textContent = state.requireListenPort
 			? '独立端口模式需要填写未被占用的监听端口。'
-			: '域名前缀模式共享面板端口，此项可留空，不会另外建立端口监听。';
+			: '共享入口不会另外开放站点端口。';
 		ingressWarning.textContent = state.warning;
 	}
 	updateIngressFields();
@@ -1229,6 +1266,7 @@ async function showSiteModal(site) {
 		  publicHostInput.value,
 		  routePrefixInput.value,
 		  siteCapabilities.route_domain,
+		  pathPrefixInput.value,
 		);
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
@@ -1255,7 +1293,11 @@ async function showSiteModal(site) {
     };
 
 		const listenPortRequired = ingressFormState(data.ingress_mode).requireListenPort;
-		if (!data.name || !data.target_url || (listenPortRequired && !data.listen_port) || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host)) {
+		if (data.ingress_mode === 'unset') {
+		  Toast.error('请选择当前服务器可用的入口模式');
+		  return;
+		}
+		if (!data.name || !data.target_url || (listenPortRequired && !data.listen_port) || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host) || (data.ingress_mode === 'path' && !data.path_prefix)) {
 	      Toast.error('请填写所有必填项');
 	      return;
 	    }

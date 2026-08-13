@@ -79,6 +79,7 @@ type DiagHeaders struct {
 type DiagProxy struct {
 	Running       bool   `json:"running"`
 	IngressMode   string `json:"ingress_mode"`
+	PathPrefix    string `json:"path_prefix"`
 	PublicHost    string `json:"public_host,omitempty"`
 	PortListening bool   `json:"port_listening"`
 	ListenPort    int    `json:"listen_port"`
@@ -558,6 +559,7 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	result.Proxy = DiagProxy{
 		Running:       running,
 		IngressMode:   site.IngressMode,
+		PathPrefix:    site.PathPrefix,
 		PublicHost:    site.PublicHost,
 		PortListening: portListening,
 		ListenPort:    site.ListenPort,

@@ -138,6 +138,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		return
 	}
 	stripPanelSessionSetCookies(resp.Header)
+	prefixPathIngressSetCookies(resp.Header, inst.Site.PathPrefix, target.Path)
 
 	// Relay the switch verbatim; the client needs Sec-WebSocket-Accept.
 	if _, err := io.WriteString(clientConn, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {

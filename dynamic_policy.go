@@ -23,6 +23,8 @@ const (
 	ingressModePort                    = "port"
 	ingressModeHost                    = "host"
 	ingressModeBoth                    = "both"
+	ingressModePath                    = "path"
+	ingressModeUnset                   = "unset"
 	mainVideoStreamModeProxy           = "proxy"
 	mainVideoStreamModeDirect          = "direct"
 	dynamicRoutePrefix                 = "/_meridian/d/"

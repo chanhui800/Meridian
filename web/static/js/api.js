@@ -67,6 +67,48 @@ const API = {
   savePanelSettings(data) { return this.request('POST', '/api/panel-settings', data); },
   requestPanelCertificate(data) { return this.request('POST', '/api/panel-certificate/issue', data); },
   restartSystem() { return this.request('POST', '/api/system/restart', {}); },
+  async exportBackup(password, includeTLS) {
+    const res = await fetch('/api/backup/export', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password, include_tls: includeTLS === true }),
+    });
+    if (res.status === 401) {
+      await this.logout();
+      window.location.reload();
+      return;
+    }
+    if (!res.ok) {
+      let message = '创建备份失败';
+      try { message = (await res.json()).error || message; } catch (_) {}
+      throw new Error(message);
+    }
+    return {
+      blob: await res.blob(),
+      disposition: res.headers.get('Content-Disposition') || '',
+    };
+  },
+  async restoreBackup(file, password, confirm) {
+    const body = new FormData();
+    body.append('backup', file);
+    body.append('password', password);
+    body.append('confirm', confirm);
+    const res = await fetch('/api/backup/restore', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body,
+    });
+    if (res.status === 401) {
+      await this.logout();
+      window.location.reload();
+      return;
+    }
+    let data;
+    try { data = await res.json(); } catch (_) { throw new Error(res.statusText || '恢复失败'); }
+    if (!res.ok) throw new Error(data.error || '恢复失败');
+    return data;
+  },
   listSites() { return this.request('GET', '/api/sites'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },
   updateSite(id, data) { return this.request('PUT', '/api/sites/' + id, data); },

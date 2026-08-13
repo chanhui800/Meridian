@@ -25,9 +25,19 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		return fmt.Errorf("invalid public host: %w", err)
 	}
 	site.PublicHost = publicHost
+	site.PathPrefix, err = normalizePathPrefix(site.PathPrefix)
+	if err != nil {
+		return fmt.Errorf("invalid path prefix: %w", err)
+	}
 	site.IngressMode, err = normalizeIngressMode(site.IngressMode, site.PublicHost)
 	if err != nil {
 		return fmt.Errorf("invalid ingress configuration: %w", err)
+	}
+	if site.IngressMode == ingressModeUnset {
+		return errUnsetIngress
+	}
+	if site.IngressMode == ingressModePath && site.PathPrefix == "" {
+		return fmt.Errorf("invalid ingress configuration: path_prefix is required when ingress_mode is path")
 	}
 	if err := pm.validateIngressSafety(site.IngressMode); err != nil {
 		return err
@@ -78,6 +88,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			trustedProxies:        append([]*net.IPNet(nil), pm.trustedProxies...),
 			uaPolicy:              policy,
 			upstreamHeaderPolicy:  configuredHeaders,
+			pathPrefix:            site.PathPrefix,
 		}
 	}
 	instanceCtx, instanceCancel := context.WithCancel(context.Background())
@@ -114,6 +125,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	proxy := &httputil.ReverseProxy{
 		Transport: proxyTransport,
 		Rewrite: func(proxyReq *httputil.ProxyRequest) {
+			ingressPrefix, _ := proxyReq.In.Context().Value(pathIngressContextKey{}).(string)
 			if redirectPolicy.configured {
 				eligible := isDynamicRedirectEligibleRequestForState(proxyReq.In, dynamicState)
 				if redirectPolicy.profile == dynamicProfileExtreme {
@@ -148,6 +160,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				ctx := context.WithValue(proxyReq.Out.Context(), dynamicExpectedStructuredSourceContextKey{}, source)
 				if source == dynamicDiscoverySourcePlaybackInfo && proxyReq.In != nil && proxyReq.In.URL != nil {
 					clientBase := *proxyReq.In.URL
+					if ingressPrefix != "" {
+						clientBase.Path = addIngressPathPrefix(clientBase.Path, ingressPrefix)
+						clientBase.RawPath = ""
+					}
 					clientBase.Scheme = ""
 					clientBase.Host = ""
 					clientBase.User = nil
@@ -169,7 +185,8 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		ModifyResponse: func(resp *http.Response) error {
 			dynamicResponse := responseIsDynamic(resp)
 			expectedSource := dynamicResponseExpectedStructuredSource(resp)
-			if err := rewriteDynamicStructuredResponseExpected(resp, dynamicIssuer, dynamicResponse, expectedSource, 0, false); err != nil {
+			rewriteRelative := ingressUsesPath(site.IngressMode) && dynamicIssuer != nil
+			if err := rewriteDynamicStructuredResponseExpected(resp, dynamicIssuer, dynamicResponse || rewriteRelative, expectedSource, 0, false); err != nil {
 				rollbackDynamicResponseAuthorities(resp)
 				return err
 			}
@@ -183,9 +200,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			if dynamicResponse {
 				rebuildDynamicResponseHeaders(resp)
+				stripPanelSessionSetCookies(resp.Header)
+				prefixPathIngressResponse(resp, site.PathPrefix, target.Path)
 				return nil
 			}
 			stripPanelSessionSetCookies(resp.Header)
+			prefixPathIngressResponse(resp, site.PathPrefix, target.Path)
 			if err := prepareAssetCacheResponse(resp, pm.assetCache, site); err != nil {
 				return err
 			}
@@ -416,6 +436,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return fmt.Errorf("public_host %s is already assigned to another site", site.PublicHost)
 		}
 	}
+	if ingressUsesPath(site.IngressMode) {
+		if assignedID, ok := pm.pathPrefixes[site.PathPrefix]; ok && assignedID != site.ID {
+			pm.mu.Unlock()
+			closeNewListener()
+			return fmt.Errorf("path_prefix %s is already assigned to another site", site.PathPrefix)
+		}
+	}
 	existing := pm.proxies[site.ID]
 	pm.mu.Unlock()
 	if existing != nil {
@@ -470,7 +497,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	upstreamLogTarget := redactUpstreamURL(target)
 	if server == nil {
-		log.Printf("[%s] shared-host proxy %s -> %s (UA: %s)", site.Name, site.PublicHost, upstreamLogTarget, site.UAMode)
+		if ingressUsesPath(site.IngressMode) {
+			log.Printf("[%s] shared-path proxy %s -> %s (UA: %s)", site.Name, site.PathPrefix, upstreamLogTarget, site.UAMode)
+		} else {
+			log.Printf("[%s] shared-host proxy %s -> %s (UA: %s)", site.Name, site.PublicHost, upstreamLogTarget, site.UAMode)
+		}
 		return nil
 	}
 	inst.portServing.Store(true)

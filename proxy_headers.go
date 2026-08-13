@@ -24,10 +24,22 @@ func applyUAHeaderPolicy(header http.Header, policy UAHeaderPolicy) {
 }
 
 type publicHostIngressContextKey struct{}
+type pathIngressContextKey struct{}
 
 func applySiteForwardedHost(header http.Header, inbound *http.Request, site Site) {
 	header.Del("X-Forwarded-Host")
-	if inbound == nil || !ingressUsesHost(site.IngressMode) {
+	header.Del("X-Forwarded-Prefix")
+	if inbound == nil {
+		return
+	}
+	if ingressUsesPath(site.IngressMode) {
+		if prefix, _ := inbound.Context().Value(pathIngressContextKey{}).(string); prefix == site.PathPrefix {
+			header.Set("X-Forwarded-Host", inbound.Host)
+			header.Set("X-Forwarded-Prefix", prefix)
+		}
+		return
+	}
+	if !ingressUsesHost(site.IngressMode) {
 		return
 	}
 	sharedIngress, _ := inbound.Context().Value(publicHostIngressContextKey{}).(bool)

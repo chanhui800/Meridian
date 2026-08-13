@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func normalizeTargetURL(addr string) (*url.URL, error) {
@@ -174,6 +175,226 @@ func normalizeRoutePrefix(value string) (string, error) {
 	return value, nil
 }
 
+var reservedPathIngressPrefixes = map[string]struct{}{
+	"api": {}, "css": {}, "js": {}, "index.html": {}, "favicon.svg": {}, "_meridian": {},
+}
+
+// normalizePathPrefix validates the single URL path segment used by shared
+// path ingress. A single segment keeps routing deterministic and prevents a
+// site from shadowing panel APIs or embedded assets.
+func normalizePathPrefix(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, "/")
+	value = strings.ToLower(value)
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > 64 {
+		return "", fmt.Errorf("path_prefix must not exceed 64 characters")
+	}
+	if _, reserved := reservedPathIngressPrefixes[value]; reserved {
+		return "", fmt.Errorf("path_prefix conflicts with a reserved panel path")
+	}
+	for _, r := range value {
+		if r > unicode.MaxASCII || !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return "", fmt.Errorf("path_prefix must use only ASCII letters, digits, hyphens, and underscores")
+		}
+	}
+	return "/" + value, nil
+}
+
+func ingressPathMatches(requestPath, prefix string) bool {
+	return prefix != "" && (requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/"))
+}
+
+// normalizeEmbeddedIngressRequestPath accepts clients that request the
+// historical /emby/<entry>/... form. Emby may construct this form when its
+// Base URL is /emby and the external path entry is forwarded separately.
+func normalizeEmbeddedIngressRequestPath(requestURL *url.URL, prefix string) bool {
+	if requestURL == nil || prefix == "" || requestURL.Path == "" {
+		return false
+	}
+	pathValue := requestURL.Path
+	for _, appBase := range []string{"/emby", "/jellyfin"} {
+		embedded := appBase + prefix
+		if len(pathValue) < len(embedded) || !strings.EqualFold(pathValue[:len(embedded)], embedded) {
+			continue
+		}
+		if len(pathValue) != len(embedded) && pathValue[len(embedded)] != '/' {
+			continue
+		}
+		requestURL.Path = prefix + appBase + pathValue[len(embedded):]
+		requestURL.RawPath = ""
+		return true
+	}
+	return false
+}
+
+func normalizeStrippedIngressRequestPath(requestURL *url.URL, prefix string) bool {
+	if requestURL == nil || prefix == "" || requestURL.Path == "" {
+		return false
+	}
+	normalized := normalizeEmbeddedIngressPathPrefix(requestURL.Path, prefix)
+	if normalized == requestURL.Path {
+		return false
+	}
+	requestURL.Path = normalized
+	requestURL.RawPath = ""
+	return true
+}
+
+// normalizeEmbeddedIngressPathPrefix fixes Emby/Jellyfin responses that place
+// X-Forwarded-Prefix after their own application base. For an external entry
+// /sntp, Emby can return /emby/sntp/videos/... even though the public route is
+// /sntp/emby/videos/.... Only known application-base boundaries are adjusted;
+// arbitrary path segments are left untouched.
+func normalizeEmbeddedIngressPathPrefix(route, prefix string) string {
+	if route == "" || prefix == "" || route[0] != '/' {
+		return route
+	}
+	pathEnd := len(route)
+	if index := strings.IndexAny(route, "?#"); index >= 0 {
+		pathEnd = index
+	}
+	pathValue := route[:pathEnd]
+	suffix := route[pathEnd:]
+	for _, appBase := range []string{"/emby", "/jellyfin"} {
+		embedded := appBase + prefix
+		if len(pathValue) < len(embedded) || !strings.EqualFold(pathValue[:len(embedded)], embedded) {
+			continue
+		}
+		if len(pathValue) != len(embedded) && pathValue[len(embedded)] != '/' {
+			continue
+		}
+		remainder := pathValue[len(embedded):]
+		// Keep an intentionally named /videos-style entry intact when it is
+		// indistinguishable from a real Emby media route. Other paths, including
+		// vendor-specific playback routes such as /emya/video, are unambiguous.
+		if isKnownMediaApplicationRoute(prefix) {
+			continue
+		}
+		return pathValue[:len(appBase)] + remainder + suffix
+	}
+	return route
+}
+
+func isKnownMediaApplicationRoute(pathValue string) bool {
+	if pathValue == "" || pathValue[0] != '/' {
+		return false
+	}
+	segment := pathValue[1:]
+	if index := strings.IndexByte(segment, '/'); index >= 0 {
+		segment = segment[:index]
+	}
+	if index := strings.IndexAny(segment, "?#"); index >= 0 {
+		segment = segment[:index]
+	}
+	switch strings.ToLower(segment) {
+	case "videos", "items", "users", "sessions", "library", "playback", "socket", "system", "web", "api":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripIngressPathPrefix(requestURL *url.URL, prefix string) {
+	if requestURL == nil || !ingressPathMatches(requestURL.Path, prefix) {
+		return
+	}
+	path := strings.TrimPrefix(requestURL.Path, prefix)
+	if path == "" {
+		path = "/"
+	}
+	requestURL.Path = path
+	if requestURL.RawPath != "" {
+		rawPrefix := (&url.URL{Path: prefix}).EscapedPath()
+		rawPath := strings.TrimPrefix(requestURL.RawPath, rawPrefix)
+		if rawPath == "" {
+			rawPath = "/"
+		}
+		requestURL.RawPath = rawPath
+	}
+}
+
+func addIngressPathPrefix(route, prefix string) string {
+	route = normalizeEmbeddedIngressPathPrefix(route, prefix)
+	if prefix == "" || route == "" || route[0] != '/' || ingressPathMatches(route, prefix) {
+		return route
+	}
+	return prefix + route
+}
+
+func stripUpstreamBasePath(route, basePath string) string {
+	basePath = strings.TrimSuffix(basePath, "/")
+	if basePath == "" || basePath == "/" {
+		return route
+	}
+	if route == basePath {
+		return "/"
+	}
+	if strings.HasPrefix(route, basePath+"/") {
+		return strings.TrimPrefix(route, basePath)
+	}
+	return route
+}
+
+func pathIngressCookiePath(cookiePath, upstreamBasePath, prefix string) string {
+	if cookiePath == "" || cookiePath[0] != '/' || prefix == "" {
+		return cookiePath
+	}
+	mapped := stripUpstreamBasePath(cookiePath, upstreamBasePath)
+	mapped = addIngressPathPrefix(mapped, prefix)
+	if cookiePath == "/" || strings.HasSuffix(cookiePath, "/") {
+		mapped = strings.TrimSuffix(mapped, "/") + "/"
+	}
+	return mapped
+}
+
+func prefixPathIngressSetCookies(header http.Header, prefix, upstreamBasePath string) {
+	if header == nil || prefix == "" {
+		return
+	}
+	values := header.Values("Set-Cookie")
+	if len(values) == 0 {
+		return
+	}
+	header.Del("Set-Cookie")
+	for _, value := range values {
+		cookie, err := http.ParseSetCookie(value)
+		if err != nil {
+			continue
+		}
+		cookie.Path = pathIngressCookiePath(cookie.Path, upstreamBasePath, prefix)
+		header.Add("Set-Cookie", cookie.String())
+	}
+}
+
+func prefixPathIngressResponse(resp *http.Response, prefix, upstreamBasePath string) {
+	if resp == nil || prefix == "" {
+		return
+	}
+	prefixPathIngressSetCookies(resp.Header, prefix, upstreamBasePath)
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return
+	}
+	parsed, err := url.Parse(location)
+	if err != nil || parsed.Path == "" {
+		return
+	}
+	if parsed.IsAbs() || parsed.Host != "" {
+		if resp.Request == nil || resp.Request.URL == nil || !sameRedirectAuthority(parsed, resp.Request.URL) {
+			return
+		}
+		parsed.Scheme = ""
+		parsed.Host = ""
+		parsed.User = nil
+	}
+	parsed.Path = addIngressPathPrefix(stripUpstreamBasePath(parsed.Path, upstreamBasePath), prefix)
+	parsed.RawPath = ""
+	resp.Header.Set("Location", parsed.String())
+}
+
 func normalizeRouteDomain(value string) (string, error) {
 	return normalizePublicHost(value)
 }
@@ -231,16 +452,20 @@ func normalizeIngressMode(value, publicHost string) (string, error) {
 		}
 	}
 	switch mode {
-	case ingressModePort:
+	case ingressModeUnset:
 		if publicHost != "" {
-			return "", fmt.Errorf("public_host must be empty when ingress_mode is port")
+			return "", fmt.Errorf("public_host must be empty when ingress_mode is unset")
+		}
+	case ingressModePort, ingressModePath:
+		if publicHost != "" {
+			return "", fmt.Errorf("public_host must be empty when ingress_mode is %s", mode)
 		}
 	case ingressModeHost, ingressModeBoth:
 		if publicHost == "" {
 			return "", fmt.Errorf("public_host is required when ingress_mode is %s", mode)
 		}
 	default:
-		return "", fmt.Errorf("ingress_mode must be port, host, or both")
+		return "", fmt.Errorf("ingress_mode must be unset, port, path, host, or both")
 	}
 	return mode, nil
 }
@@ -252,6 +477,10 @@ func ingressUsesPort(mode string) bool {
 func ingressUsesHost(mode string) bool {
 	return mode == ingressModeHost || mode == ingressModeBoth
 }
+
+func ingressUsesPath(mode string) bool { return mode == ingressModePath }
+
+func ingressUsesPanel(mode string) bool { return ingressUsesHost(mode) || ingressUsesPath(mode) }
 
 const internalHostOnlyPortStart = 8001
 
