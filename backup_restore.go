@@ -61,7 +61,7 @@ type backupManifest struct {
 	CreatedAt         string   `json:"created_at"`
 	Files             []string `json:"files"`
 	IncludeTLS        *bool    `json:"include_tls,omitempty"`
-	JWTSecret         string   `json:"jwt_secret"`
+	JWTSecret         string   `json:"jwt_secret"` // #nosec G117 -- encrypted backup manifest field; it is never logged or persisted outside the encrypted archive.
 	UpstreamHeaderKey string   `json:"upstream_header_key"`
 }
 
@@ -95,7 +95,7 @@ func markerIncludesTLS(marker restoreMarker) bool {
 }
 
 func restoreDirectoryIncludesTLS(dir string) bool {
-	data, err := os.ReadFile(filepath.Join(dir, "restore.json"))
+	data, err := os.ReadFile(filepath.Join(dir, "restore.json")) // #nosec G304 G703 -- dir is an internal rollback directory created by Meridian.
 	if err != nil {
 		// Restores created before include_tls was introduced always replaced TLS.
 		return true
@@ -143,7 +143,10 @@ func sealBackup(plain []byte, password string) ([]byte, error) {
 		return nil, fmt.Errorf("生成备份随机数: %w", err)
 	}
 	header := append([]byte(backupMagic), salt...)
-	header = append(header, byte(len(nonce)))
+	if len(nonce) > 255 {
+		return nil, errors.New("backup nonce is too large")
+	}
+	header = append(header, byte(len(nonce))) // #nosec G115 -- nonce length is bounded by the AES-GCM implementation and checked above.
 	header = append(header, nonce...)
 	sealed := gcm.Seal(nil, nonce, plain, header)
 	return append(header, sealed...), nil
@@ -206,7 +209,7 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	snapshot := filepath.Join(dir, backupDatabaseEntry)
-	if _, err := a.db.db.Exec("VACUUM INTO " + quoteSQLiteString(snapshot)); err != nil {
+	if _, err := a.db.db.Exec("VACUUM INTO " + quoteSQLiteString(snapshot)); err != nil { // #nosec G202 -- snapshot is created in a private temporary directory and quoteSQLiteString escapes the complete literal.
 		cleanup()
 		return "", func() {}, fmt.Errorf("创建 SQLite 一致性快照: %w", err)
 	}
@@ -218,7 +221,7 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 }
 
 func addZipFile(writer *zip.Writer, name, path string) (bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path is selected from internal database/TLS files before entering the archive.
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -289,7 +292,7 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 		JWTSecret:         base64.RawStdEncoding.EncodeToString(jwtSecret),
 		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(a.pm.upstreamHeaderKey),
 	}
-	manifestData, err := json.Marshal(manifest)
+	manifestData, err := json.Marshal(manifest) // #nosec G117 -- the manifest is immediately encrypted before it leaves the process.
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +313,7 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 }
 
 func readZipEntry(file *zip.File, maxBytes int64) ([]byte, error) {
-	if file.UncompressedSize64 > uint64(maxBytes) {
+	if file.UncompressedSize64 > uint64(maxBytes) { // #nosec G115 -- maxBytes is a positive, fixed per-entry limit selected by Meridian.
 		return nil, fmt.Errorf("%s 解压后过大", file.Name)
 	}
 	reader, err := file.Open()
@@ -666,7 +669,7 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 }
 
 func copyPrivateFile(source, target string) error {
-	data, err := os.ReadFile(source)
+	data, err := os.ReadFile(source) // #nosec G304 G703 -- source is always a path generated from the private restore directory and an allowlisted entry.
 	if err != nil {
 		return err
 	}
@@ -701,26 +704,26 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	pending := dbPath + backupPendingSuffix
 	appliedMarker := dbPath + backupAppliedSuffix
 	rollback := dbPath + backupRollbackSuffix
-	if _, err := os.Stat(appliedMarker); err == nil {
+	if _, err := os.Stat(appliedMarker); err == nil { // #nosec G703 G304 -- all paths are derived from the administrator-controlled database path and fixed restore suffixes.
 		if err := rollbackRestoreFiles(dbPath, rollback); err != nil {
 			return nil, fmt.Errorf("回滚上次未完成的恢复: %w", err)
 		}
-		_ = os.Remove(appliedMarker)
-		_ = os.RemoveAll(rollback)
+		_ = os.Remove(appliedMarker) // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
+		_ = os.RemoveAll(rollback)   // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
 		// A crash after the staged database was moved leaves an incomplete
 		// pending directory. The old installation is authoritative after the
 		// rollback; discard that stage instead of trying to apply it again.
-		_ = os.RemoveAll(pending)
+		_ = os.RemoveAll(pending) // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
 		return nil, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if _, err := os.Stat(pending); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(pending); errors.Is(err, os.ErrNotExist) { // #nosec G703 -- pending is the fixed restore suffix derived from the configured database path.
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
-	markerData, err := os.ReadFile(filepath.Join(pending, "restore.json"))
+	markerData, err := os.ReadFile(filepath.Join(pending, "restore.json")) // #nosec G304 G703 -- pending is the fixed restore staging directory.
 	if err != nil {
 		return nil, fmt.Errorf("读取待恢复清单: %w", err)
 	}
@@ -728,10 +731,10 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	if err := json.Unmarshal(markerData, &marker); err != nil {
 		return nil, fmt.Errorf("待恢复清单损坏: %w", err)
 	}
-	if err := os.RemoveAll(rollback); err != nil {
+	if err := os.RemoveAll(rollback); err != nil { // #nosec G703 G304 -- fixed rollback suffix path.
 		return nil, err
 	}
-	if err := os.MkdirAll(rollback, 0o700); err != nil {
+	if err := os.MkdirAll(rollback, 0o700); err != nil { // #nosec G703 G304 -- fixed rollback suffix path.
 		return nil, err
 	}
 	rollbackReady := false
@@ -739,14 +742,14 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	defer func() {
 		if rollbackReady && !committed {
 			_ = rollbackRestoreFiles(dbPath, rollback)
-			_ = os.Remove(dbPath + backupAppliedSuffix)
-			_ = os.RemoveAll(rollback)
-			_ = os.RemoveAll(pending)
+			_ = os.Remove(dbPath + backupAppliedSuffix) // #nosec G703 G304 -- fixed restore marker suffix.
+			_ = os.RemoveAll(rollback)                  // #nosec G703 G304 -- fixed rollback suffix path.
+			_ = os.RemoveAll(pending)                   // #nosec G703 G304 -- fixed pending suffix path.
 		}
 	}()
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		source := dbPath + suffix
-		if _, err := os.Stat(source); err == nil {
+		if _, err := os.Stat(source); err == nil { // #nosec G703 G304 -- source is the configured database path plus a fixed SQLite suffix.
 			if err := copyPrivateFile(source, filepath.Join(rollback, backupDatabaseEntry+suffix)); err != nil {
 				return nil, err
 			}
@@ -756,7 +759,7 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	}
 	// Persist the scope before the first destructive action. If startup is
 	// interrupted later, automatic rollback must know whether TLS participated.
-	if err := writePrivateFileAtomic(filepath.Join(rollback, "restore.json"), markerData); err != nil {
+	if err := writePrivateFileAtomic(filepath.Join(rollback, "restore.json"), markerData); err != nil { // #nosec G703 G304 -- rollback is the fixed restore directory.
 		return nil, err
 	}
 	rollbackReady = true
@@ -769,7 +772,7 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 			if target == "" {
 				continue
 			}
-			if _, err := os.Stat(target); err == nil {
+			if _, err := os.Stat(target); err == nil { // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
 				if err := copyPrivateFile(target, filepath.Join(rollback, filepath.FromSlash(entry))); err != nil {
 					return nil, err
 				}
@@ -781,7 +784,7 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	// From this point on every destructive change is recoverable. The marker is
 	// written before replacing live files so a process interruption at any later
 	// instruction causes the next startup to restore the complete old snapshot.
-	if err := writePrivateFileAtomic(appliedMarker, []byte("pending validation\n")); err != nil {
+	if err := writePrivateFileAtomic(appliedMarker, []byte("pending validation\n")); err != nil { // #nosec G703 G304 -- fixed restore marker suffix.
 		return nil, err
 	}
 	if markerIncludesTLS(marker) {
@@ -791,18 +794,18 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 			}
 			target := targetTLSPath(dbPath, entry)
 			if target != "" {
-				if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
 					return nil, err
 				}
 			}
 		}
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if err := os.Remove(dbPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(dbPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- fixed SQLite sidecar suffix.
 			return nil, err
 		}
 	}
-	if err := os.Rename(filepath.Join(pending, backupDatabaseEntry), dbPath); err != nil {
+	if err := os.Rename(filepath.Join(pending, backupDatabaseEntry), dbPath); err != nil { // #nosec G703 G304 -- source is the fixed database archive entry in pending.
 		return nil, err
 	}
 	if markerIncludesTLS(marker) {
@@ -814,12 +817,12 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 			if target == "" {
 				continue
 			}
-			if err := copyPrivateFile(filepath.Join(pending, filepath.FromSlash(entry)), target); err != nil {
+			if err := copyPrivateFile(filepath.Join(pending, filepath.FromSlash(entry)), target); err != nil { // #nosec G703 G304 -- entry is allowlisted and target is a fixed TLS path.
 				return nil, err
 			}
 		}
 	}
-	if err := os.RemoveAll(pending); err != nil {
+	if err := os.RemoveAll(pending); err != nil { // #nosec G703 G304 -- fixed pending suffix path.
 		return nil, err
 	}
 	committed = true
@@ -831,9 +834,9 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		return errors.New("恢复回滚目录为空")
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		_ = os.Remove(dbPath + suffix)
+		_ = os.Remove(dbPath + suffix) // #nosec G703 G304 -- fixed SQLite sidecar suffix.
 		source := filepath.Join(rollback, backupDatabaseEntry+suffix)
-		if _, err := os.Stat(source); err == nil {
+		if _, err := os.Stat(source); err == nil { // #nosec G703 G304 -- source is the fixed rollback database entry.
 			if err := os.Rename(source, dbPath+suffix); err != nil {
 				return err
 			}
@@ -850,9 +853,9 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 			if target == "" {
 				continue
 			}
-			_ = os.Remove(target)
+			_ = os.Remove(target) // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
 			source := filepath.Join(rollback, filepath.FromSlash(entry))
-			if _, err := os.Stat(source); err == nil {
+			if _, err := os.Stat(source); err == nil { // #nosec G703 G304 -- source is an allowlisted rollback TLS entry.
 				if err := copyPrivateFile(source, target); err != nil {
 					return err
 				}
@@ -869,15 +872,15 @@ func rollbackAppliedRestore(dbPath string, state *restoreAppliedState) error {
 	if err := rollbackRestoreFiles(dbPath, state.RollbackDir); err != nil {
 		return err
 	}
-	_ = os.Remove(dbPath + backupAppliedSuffix)
-	return os.RemoveAll(state.RollbackDir)
+	_ = os.Remove(dbPath + backupAppliedSuffix) // #nosec G703 G304 -- fixed restore marker suffix.
+	return os.RemoveAll(state.RollbackDir)      // #nosec G703 G304 -- rollback directory was created by Meridian.
 }
 
 func finalizeAppliedRestore(dbPath string) error {
-	if err := os.Remove(dbPath + backupAppliedSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(dbPath + backupAppliedSuffix); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- fixed restore marker suffix.
 		return err
 	}
-	return os.RemoveAll(dbPath + backupRollbackSuffix)
+	return os.RemoveAll(dbPath + backupRollbackSuffix) // #nosec G703 G304 -- fixed rollback suffix path.
 }
 
 func (a *App) handleBackupExport(w http.ResponseWriter, r *http.Request) {
