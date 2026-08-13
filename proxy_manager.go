@@ -46,6 +46,7 @@ type ProxyInstance struct {
 	persistedTraffic atomic.Int64
 	trustedProxies   []*net.IPNet
 	dynamicState     *dynamicSiteState
+	failoverState    *upstreamFailoverState
 }
 
 type ProxyManager struct {

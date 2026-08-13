@@ -459,7 +459,8 @@ test('new site submission enables every automatic proxy source without manual pl
   const { sandbox, document, state } = loadModalHarness();
   await sandbox.showSiteModal(null);
   document.getElementById('m-name').value = 'Media';
-  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-target-address').value = 'https://origin.example';
+  document.getElementById('m-target-port').value = '443';
   document.getElementById('m-ingress-mode').value = 'port';
   document.getElementById('m-ingress-mode').onchange();
   document.getElementById('m-port').value = '8096';
@@ -467,6 +468,7 @@ test('new site submission enables every automatic proxy source without manual pl
   await document.getElementById('m-submit').onclick();
 
   assert.equal(state.creates.length, 1);
+  assert.equal(state.creates[0].target_url, 'https://origin.example');
   assert.equal(state.creates[0].playback_target_url, '');
   assert.equal(state.creates[0].playback_mode, 'direct');
   assert.equal(state.creates[0].main_video_stream_mode, 'proxy');

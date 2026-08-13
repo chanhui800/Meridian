@@ -7,11 +7,11 @@
 
 Meridian 是面向 Emby、Jellyfin 等媒体服务的多节点反向代理面板。本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，并参考 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI) 优化界面与交互。
 
-当前正式版本：`v1.8.34`
+当前正式版本：`v1.8.35`
 
 ## 主要功能
 
-- 多节点管理，支持独立端口、路径和域名前缀入口。
+- 多节点管理，支持独立端口、路径和域名前缀入口，以及主线路自动回切的多线路故障转移。
 - 自动发现并改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 播放地址。
 - 主视频流可选“反代”或“直连”，默认反代；网盘服 30x 可校验后交给客户端直连。
 - 支持 TLS 泛域名证书、静态资源缓存、流量统计和运行诊断。
@@ -85,6 +85,8 @@ sudo journalctl -u meridian -f
 ## 站点与播放策略
 
 新增站点后自动发现默认开启，不需要配置安全模式、发现来源或播放回源列表。Meridian 会自动识别播放后端，同时拒绝 localhost、回环、私网、链路本地及其他保留目标。
+
+每个站点可配置一条主线路和最多七条备用线路。主线路不可用时按列表顺序切换，恢复后自动回切；备用线路沿用主线路的反代、自动发现、UA 和请求策略。添加或编辑站点时可统一测试全部启用线路的连通性与延迟。
 
 - **反代**：主视频流继续经过 Meridian，适合统一入口和隐藏后端。
 - **直连**：MP4、MKV、MOV、AVI、WebM 及 `/Videos/.../stream`、`/original`、`/download`、`/file` 等主视频请求会先访问主站；若上游返回合法公网 30x，客户端将直连最终 CDN。普通 API、HLS/DASH、字幕、图片和静态资源仍由 Meridian 反代。

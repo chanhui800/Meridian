@@ -25,8 +25,9 @@ type DiagResult struct {
 }
 
 type DiagUpstreams struct {
-	Primary  DiagUpstream `json:"primary"`
-	Playback DiagUpstream `json:"playback"`
+	Primary   DiagUpstream   `json:"primary"`
+	Playback  DiagUpstream   `json:"playback"`
+	Failovers []DiagUpstream `json:"failovers"`
 }
 
 type DiagUpstream struct {
@@ -477,6 +478,26 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	policy, profileErr := resolveUAHeaderPolicy(*site)
 	primary, primaryKey := diagnoseUpstreamTarget(site.TargetURL, "metadata_api")
 	primary.Configured = true
+	failovers := make([]DiagUpstream, 0, len(site.FailoverTargetList))
+	if len(site.FailoverTargetList) > 0 {
+		failovers = make([]DiagUpstream, len(site.FailoverTargetList))
+		// Keep diagnostics responsive even when several backup lines are down.
+		// The small bound avoids a scan creating an unbounded burst of dials.
+		workers := make(chan struct{}, 2)
+		var wait sync.WaitGroup
+		for index, targetURL := range site.FailoverTargetList {
+			wait.Add(1)
+			go func(index int, targetURL string) {
+				defer wait.Done()
+				workers <- struct{}{}
+				defer func() { <-workers }()
+				upstream, _ := diagnoseUpstreamTarget(targetURL, "metadata_api")
+				upstream.Configured = true
+				failovers[index] = upstream
+			}(index, targetURL)
+		}
+		wait.Wait()
+	}
 	primary.ShowHealth = true
 	primary.ShowTLS = primary.TLS.Enabled
 
@@ -518,8 +539,9 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 
 	result := DiagResult{
 		Upstreams: DiagUpstreams{
-			Primary:  primary,
-			Playback: playback,
+			Primary:   primary,
+			Playback:  playback,
+			Failovers: failovers,
 		},
 		Health: primary.Health,
 		TLS:    primary.TLS,

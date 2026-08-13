@@ -115,6 +115,7 @@ const API = {
   deleteSite(id) { return this.request('DELETE', '/api/sites/' + id); },
   toggleSite(id) { return this.request('POST', '/api/sites/' + id + '/toggle'); },
   diagSite(id) { return this.request('GET', '/api/sites/' + id + '/diag'); },
+  testUpstream(targetURL) { return this.request('POST', '/api/upstream-test', { target_url: targetURL }); },
 
   // Traffic
   getTraffic(siteId, hours) { return this.request('GET', '/api/traffic/' + siteId + '?hours=' + (hours || 24)); },

@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.34"
+var appVersion = "v1.8.35"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -229,6 +229,7 @@ func main() {
 	mux.HandleFunc("/api/backup/restore", cors(app.authMiddleware(app.handleBackupRestore)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
+	mux.HandleFunc("/api/upstream-test", cors(app.authMiddleware(app.handleUpstreamTest)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
 	mux.HandleFunc("/api/asset-cache", cors(app.authMiddleware(app.handleAssetCache)))
 	mux.HandleFunc("/api/request-logs", cors(app.authMiddleware(app.handleRequestLogs)))

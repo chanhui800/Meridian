@@ -46,6 +46,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	if err != nil {
 		return fmt.Errorf("invalid target URL: %w", err)
 	}
+	failoverTargets, err := parseFailoverTargets(site.TargetURL, site.FailoverTargetList)
+	if err != nil {
+		return fmt.Errorf("invalid failover targets: %w", err)
+	}
 	playbackTarget, playbackHostsSet, err := resolvePlaybackConfiguration(site.PlaybackTargetURL, site.StreamHosts)
 	if err != nil {
 		return err
@@ -65,6 +69,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	}
 	configuredAuthorities := make(map[string]bool, len(playbackHostsSet)+1)
 	configuredAuthorities[redirectHostKey(target)] = true
+	for _, failoverTarget := range failoverTargets[1:] {
+		configuredAuthorities[redirectHostKey(failoverTarget)] = true
+	}
 	for authority := range playbackHostsSet {
 		configuredAuthorities[authority] = true
 	}
@@ -100,6 +107,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		hijackedConns:  make(map[net.Conn]struct{}),
 		trustedProxies: append([]*net.IPNet(nil), pm.trustedProxies...),
 		dynamicState:   dynamicState,
+		failoverState:  newUpstreamFailoverState(),
 	}
 	installed := false
 	defer func() {
@@ -145,6 +153,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if tracker := backendAddressTrackerFromContext(proxyReq.Out.Context()); tracker != nil {
 				tracker.SetURL(upstream)
 			}
+			originalURL := *proxyReq.Out.URL
 			applyUpstreamURL(proxyReq.Out.URL, upstream)
 			proxyReq.Out.Host = upstream.Host
 			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy, inst.trustedProxies)
@@ -156,6 +165,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			applySiteForwardedHost(proxyReq.Out.Header, proxyReq.In, site)
 			configuredHeaders.apply(proxyReq.Out.Header, upstream)
+			// Backup lines apply to the configured main upstream, including proxied
+			// playback reads and replayable PlaybackInfo requests. Separate playback
+			// targets, direct video, redirects and WebSockets keep their own routes.
+			if len(failoverTargets) > 1 && upstreamTargetKey(upstream) == upstreamTargetKey(target) &&
+				!isRedirectMode && site.MainVideoStreamMode != mainVideoStreamModeDirect && len(configuredHeaders.values) == 0 {
+				proxyReq.Out = withFailoverRequestPlan(proxyReq.Out, &originalURL, failoverTargets, target, redirectPolicy.limits.MaxBodyBytes)
+			}
 			if source := dynamicStructuredRequestIdentity(proxyReq.In); source != "" {
 				ctx := context.WithValue(proxyReq.Out.Context(), dynamicExpectedStructuredSourceContextKey{}, source)
 				if source == dynamicDiscoverySourcePlaybackInfo && proxyReq.In != nil && proxyReq.In.URL != nil {
@@ -227,10 +243,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
 		},
 	}
-
 	if isRedirectMode || redirectPolicy.configured {
 		proxy.Transport = &redirectFollowTransport{
-			base:                    proxyTransport,
+			base:                    proxy.Transport,
 			playbackHosts:           playbackHostsSet,
 			configuredAuthorities:   configuredAuthorities,
 			disableLegacyRedirects:  !isRedirectMode,
@@ -245,6 +260,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			database:                pm.database,
 			siteID:                  site.ID,
 		}
+	}
+	if len(failoverTargets) > 1 {
+		proxy.Transport = &failoverTransport{base: proxy.Transport, state: inst.failoverState}
 	}
 
 	// Speed limit in bytes/sec (field is in Mbps, 0 = unlimited)
@@ -369,6 +387,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 		if r.Body != nil {
 			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn}
+		}
+		if len(failoverTargets) > 1 {
+			if err := prepareFailoverPlaybackInfoBody(r, redirectPolicy.limits.MaxBodyBytes); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid request body"}`))
+				return
+			}
 		}
 		if redirectPolicy.profile == dynamicProfileExtreme && isExtremeDynamicRedirectEligibleRequest(r) {
 			releaseReplayBody, err := prepareExtremeRedirectReplayBody(r, dynamicState, redirectPolicy.limits.MaxBodyBytes)

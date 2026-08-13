@@ -12,6 +12,36 @@ import (
 	"strings"
 )
 
+func (a *App) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		TargetURL string `json:"target_url"`
+	}
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if strings.TrimSpace(req.TargetURL) == "" {
+		a.jsonErr(w, http.StatusBadRequest, "target_url is required")
+		return
+	}
+	if _, err := normalizeTargetURL(req.TargetURL); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	health := probeSiteHealth(req.TargetURL)
+	a.jsonOK(w, map[string]interface{}{
+		"status":        health.Status,
+		"http_status":   health.Probe.HTTPStatus,
+		"latency_ms":    health.LatencyMs,
+		"effective_url": health.Probe.URL,
+		"error":         health.Error,
+	})
+}
+
 func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -53,9 +83,12 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PathPrefix                 string                `json:"path_prefix"`
 			IngressMode                string                `json:"ingress_mode"`
 			TargetURL                  string                `json:"target_url"`
+			PrimaryLineName            string                `json:"primary_line_name"`
 			PlaybackTargetURL          string                `json:"playback_target_url"`
 			PlaybackMode               string                `json:"playback_mode"`
 			MainVideoStreamMode        string                `json:"main_video_stream_mode"`
+			FailoverTargets            []string              `json:"failover_targets"`
+			FailoverLines              []FailoverLine        `json:"failover_lines"`
 			StreamHosts                []string              `json:"stream_hosts"`
 			UAMode                     string                `json:"ua_mode"`
 			CustomUserAgent            string                `json:"custom_user_agent"`
@@ -114,6 +147,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Name = strings.TrimSpace(req.Name)
+		req.PrimaryLineName, err = normalizePrimaryLineName(req.PrimaryLineName)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		req.PlaybackMode = strings.ToLower(strings.TrimSpace(req.PlaybackMode))
 		if strings.TrimSpace(req.RoutePrefix) != "" {
 			prefixHost, prefixErr := routeHostForPrefix(req.RoutePrefix, a.routeDomain)
@@ -199,13 +237,32 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		normalizedLines, enabledFailovers, err := normalizeFailoverLines(req.TargetURL, req.FailoverLines, req.FailoverTargets)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.FailoverLines = normalizedLines
+		req.FailoverTargets = enabledFailovers
 		streamHostsJSON, _ := json.Marshal(req.StreamHosts)
 		if req.StreamHosts == nil {
 			streamHostsJSON = []byte("[]")
 		}
+		failoverTargetsJSON, _ := json.Marshal(req.FailoverTargets)
+		if req.FailoverTargets == nil {
+			failoverTargetsJSON = []byte("[]")
+		}
+		failoverLinesJSON, _ := json.Marshal(req.FailoverLines)
+		if req.FailoverLines == nil {
+			failoverLinesJSON = []byte("[]")
+		}
 		storedHeaders, err := mergeUpstreamHeaders("[]", req.UpstreamHeaders, a.pm.upstreamHeaderKey, req.TargetURL)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if len(req.FailoverTargets) > 0 && storedHeaders != "[]" {
+			a.jsonErr(w, http.StatusBadRequest, "failover_targets cannot be combined with fixed upstream headers")
 			return
 		}
 		if req.PublicHost != "" {
@@ -227,9 +284,12 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PathPrefix:                    req.PathPrefix,
 			IngressMode:                   req.IngressMode,
 			TargetURL:                     req.TargetURL,
+			PrimaryLineName:               req.PrimaryLineName,
 			PlaybackTargetURL:             req.PlaybackTargetURL,
 			PlaybackMode:                  req.PlaybackMode,
 			MainVideoStreamMode:           req.MainVideoStreamMode,
+			FailoverTargets:               string(failoverTargetsJSON),
+			StoredFailoverLines:           string(failoverLinesJSON),
 			StreamHosts:                   string(streamHostsJSON),
 			UAMode:                        req.UAMode,
 			CustomUserAgent:               req.CustomUserAgent,
@@ -416,9 +476,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			PathPrefix                 *string                `json:"path_prefix"`
 			IngressMode                *string                `json:"ingress_mode"`
 			TargetURL                  string                 `json:"target_url"`
+			PrimaryLineName            *string                `json:"primary_line_name"`
 			PlaybackTargetURL          *string                `json:"playback_target_url"`
 			PlaybackMode               *string                `json:"playback_mode"`
 			MainVideoStreamMode        *string                `json:"main_video_stream_mode"`
+			FailoverTargets            *[]string              `json:"failover_targets"`
+			FailoverLines              *[]FailoverLine        `json:"failover_lines"`
 			StreamHosts                *[]string              `json:"stream_hosts"`
 			UAMode                     *string                `json:"ua_mode"`
 			CustomUserAgent            *string                `json:"custom_user_agent"`
@@ -466,6 +529,27 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		if req.StreamHosts != nil {
 			sh, _ := json.Marshal(*req.StreamHosts)
 			streamHosts = string(sh)
+		}
+		failoverTargets := oldSite.FailoverTargets
+		failoverLines := oldSite.StoredFailoverLines
+		if req.FailoverLines != nil {
+			normalizedLines, enabledFailovers, normalizeErr := normalizeFailoverLines(req.TargetURL, *req.FailoverLines, nil)
+			if normalizeErr != nil {
+				a.jsonErr(w, http.StatusBadRequest, normalizeErr.Error())
+				return
+			}
+			serialized, _ := json.Marshal(enabledFailovers)
+			failoverTargets = string(serialized)
+			serializedLines, _ := json.Marshal(normalizedLines)
+			failoverLines = string(serializedLines)
+		} else if req.FailoverTargets != nil {
+			serialized, marshalErr := json.Marshal(*req.FailoverTargets)
+			if marshalErr != nil {
+				a.jsonErr(w, http.StatusBadRequest, "invalid failover_targets")
+				return
+			}
+			failoverTargets = string(serialized)
+			failoverLines = "[]"
 		}
 		speedLimit := oldSite.SpeedLimit
 		if req.SpeedLimit != nil {
@@ -607,6 +691,19 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, "invalid stream_hosts")
 			return
 		}
+		var failoverTargetList []string
+		if err := json.Unmarshal([]byte(failoverTargets), &failoverTargetList); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, "invalid failover_targets")
+			return
+		}
+		if _, err := parseFailoverTargets(req.TargetURL, failoverTargetList); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if len(failoverTargetList) > 0 && storedHeaders != "[]" {
+			a.jsonErr(w, http.StatusBadRequest, "failover_targets cannot be combined with fixed upstream headers")
+			return
+		}
 		candidate := *oldSite
 		candidate.Name = req.Name
 		candidate.ListenPort = listenPort
@@ -614,9 +711,18 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.PathPrefix = pathPrefix
 		candidate.IngressMode = ingressMode
 		candidate.TargetURL = req.TargetURL
+		if req.PrimaryLineName != nil {
+			candidate.PrimaryLineName, err = normalizePrimaryLineName(*req.PrimaryLineName)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		candidate.PlaybackTargetURL = playbackTargetURL
 		candidate.PlaybackMode = playbackMode
 		candidate.MainVideoStreamMode = mainVideoStreamMode
+		candidate.FailoverTargets = failoverTargets
+		candidate.StoredFailoverLines = failoverLines
 		candidate.StreamHosts = streamHosts
 		candidate.UAMode = uaMode
 		candidate.CustomUserAgent = customUserAgent

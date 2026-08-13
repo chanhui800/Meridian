@@ -57,6 +57,7 @@ async function runDiag() {
     const upstreams = result.upstreams || {};
     const primary = upstreams.primary || {};
     const playback = upstreams.playback || {};
+		const failovers = Array.isArray(upstreams.failovers) ? upstreams.failovers : [];
     const headers = result.headers || {};
     const proxy = result.proxy || {};
 
@@ -79,6 +80,9 @@ async function runDiag() {
     if (playback.show_tls) {
       cards.push(renderTLSCard('播放回源 TLS', '播放回源上游站点证书信息', playback, 'stagger-5'));
     }
+		if (failovers.length) {
+			cards.push(renderFailoverCard(failovers, 'stagger-5'));
+		}
 
     cards.push(renderHeadersCard(headers, 'stagger-5'));
     cards.push(renderProxyCard(proxy, 'stagger-6'));
@@ -90,6 +94,29 @@ async function runDiag() {
     btn.classList.remove('running');
     btn.textContent = '开始诊断';
   }
+}
+
+function renderFailoverCard(failovers, staggerClass) {
+  return `
+    <div class="diag-card diag-card-wide fade-up ${staggerClass}">
+      <div class="diag-head">
+        <div class="diag-icon" style="background:var(--blue-dim)">
+          <svg viewBox="0 0 24 24" style="stroke:var(--blue)"><path d="M7 7h11l-3-3"/><path d="M18 17H7l3 3"/><path d="M18 7v4a3 3 0 0 1-3 3H7"/><path d="M7 17v-4a3 3 0 0 1 3-3h8"/></svg>
+        </div>
+        <div>
+          <div class="diag-title">备用线路健康</div>
+          <div class="diag-subtitle">按站点配置顺序探测；实际请求会在失败后临时优先使用可用线路</div>
+        </div>
+      </div>
+      <div class="diag-rows">
+        ${failovers.map((upstream, index) => {
+          const health = upstream.health || {};
+          const latency = typeof health.latency_ms === 'number' ? `${health.latency_ms}ms` : '--';
+          return `<div class="diag-row"><span class="diag-key">备用 ${index + 1}</span><span class="diag-val diag-wrap">${diagText(upstream.effective_url)}</span><span class="diag-val ${statusClass(health.status)}">${statusText(health.status)} ${latency}</span></div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
 }
 
 function renderDiagNotes(notes) {

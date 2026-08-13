@@ -81,6 +81,9 @@
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
     modalPreviousFocus = document.activeElement;
     const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    modal.className = 'modal';
+    if (options && options.modalClass) modal.classList.add(options.modalClass);
     overlay.scrollTop = 0;
     document.getElementById('modal-body').scrollTop = 0;
     overlay.classList.add('active');
