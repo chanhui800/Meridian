@@ -691,10 +691,10 @@ function canAddPlaybackAddress(currentCount, maxPlaybackAddresses) {
 
 function renderUpstreamHeaderRows(headers, upstreamHeadersAvailable) {
 	return headers.map((header, idx) => `
-		<div style="display:flex;gap:6px;margin-bottom:6px;align-items:center">
-		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="flex:1" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" style="flex:1" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <button type="button" class="btn-ghost danger m-upstream-header-remove" data-idx="${idx}" style="padding:4px 8px;font-size:13px;flex-shrink:0">删除</button>
+		<div class="upstream-header-row">
+		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <button type="button" class="icon-button danger m-upstream-header-remove" data-idx="${idx}" title="删除请求头" aria-label="删除请求头"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg></button>
 		</div>
 	`).join('');
 }
@@ -1053,6 +1053,38 @@ async function showSiteModal(site) {
 	const domainPrefixAvailable = siteCapabilities.domain_prefix_available === true;
 	const panelTLSReady = siteCapabilities.panel_tls_enabled === true;
 	const canUseHostIngress = hostOnlyAvailable && domainPrefixAvailable && (panelTLSReady || (isEdit && String(site.public_host || '').trim() !== ''));
+	const splitTargetAddress = value => {
+		const raw = String(value || '').trim();
+		if (!raw) return { address: '', port: '' };
+		const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+		try {
+			const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
+			const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
+			const hostname = parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname;
+			const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
+			return {
+				address: `${explicitScheme ? `${parsed.protocol}//` : ''}${hostname}${path}`,
+				port: parsed.port || defaultPort,
+			};
+		} catch (_) {
+			return { address: raw, port: '' };
+		}
+	};
+	const joinTargetAddress = (address, port) => {
+		const rawAddress = String(address || '').trim();
+		const rawPort = String(port || '').trim();
+		if (!rawAddress) return '';
+		const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawAddress);
+		try {
+			const parsed = new URL(explicitScheme ? rawAddress : `http://${rawAddress}`);
+			parsed.port = rawPort;
+			const normalized = parsed.toString().replace(/\/$/, parsed.pathname === '/' && !parsed.search && !parsed.hash ? '' : '/');
+			return explicitScheme ? normalized : normalized.replace(/^http:\/\//i, '');
+		} catch (_) {
+			return rawPort ? `${rawAddress.replace(/:\d+$/, '')}:${rawPort}` : rawAddress;
+		}
+	};
+	const primaryTargetParts = splitTargetAddress(isEdit ? site.target_url : '');
 	const hostIngressBlockedHint = !hostOnlyAvailable
 		? '当前面板未满足安全的域名前缀转发条件，请先设置 PANEL_BIND_ADDR 或 TRUSTED_PROXY_CIDRS 并重启。'
 		: !domainPrefixAvailable
@@ -1065,11 +1097,6 @@ async function showSiteModal(site) {
     <div class="form-group">
       <label>站点名称</label>
       <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
-    </div>
-    <div class="form-group">
-      <label>主回源地址</label>
-      <input type="text" class="form-input" id="m-target" value="${isEdit ? esc(site.target_url) : ''}" placeholder="如：192.168.1.10:8096 或 https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required>
-      <div class="form-help">网页、API 和默认回源都走这里。未写协议时，:443 自动使用 HTTPS，其他端口默认 HTTP。</div>
     </div>
 	<div class="form-group">
 	  <label>入口模式</label>
@@ -1098,13 +1125,44 @@ async function showSiteModal(site) {
 	  <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
 	  <div class="form-help">只填写一段路径，系统会自动补全为 /emby/；不能使用 api、js、css、_meridian 等系统路径。</div>
 	</div>
-		<div class="form-group">
+	<div class="form-group upstream-lines-card">
+	  <div class="upstream-lines-head">
+	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。备用线路沿用主线路的反代、自动发现和请求策略。</div></div>
+	    <div class="upstream-lines-buttons">
+	      <button type="button" class="btn-ghost upstream-test-all" id="m-test-all-lines">线路测速</button>
+	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
+	    </div>
+	  </div>
+	  <div class="upstream-line-labels" aria-hidden="true"><span>启用</span><span>线路名称</span><span>协议与域名 / 路径</span><span>端口</span><span>延迟</span><span>排序 / 删除</span></div>
+	  <div class="upstream-lines" id="m-upstream-lines">
+	    <div class="upstream-line is-primary" data-line="primary">
+	      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
+	      <input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称">
+	      <input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址">
+	      <input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口">
+	      <span class="upstream-line-latency">--</span>
+	      <div class="upstream-line-actions primary-actions"><span class="upstream-line-primary-note">主线路</span></div>
+	      <input type="hidden" id="m-target">
+	    </div>
+	    <div id="m-failover-lines"></div>
+	  </div>
+	  <div class="form-help">域名栏可包含协议和 Base URL 路径；端口单独填写。443 默认 HTTPS，其他端口默认 HTTP。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
+	</div>
+		<div class="form-group site-form-wide">
 		  <label>主回源固定请求头（可选）</label>
 		  <div id="m-upstream-headers"></div>
-		  <button type="button" class="btn-ghost" id="m-add-upstream-header" style="margin-top:6px;font-size:13px" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
+		  <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
 		  <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
 		  ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
 		</div>
+    <details class="site-advanced-card site-form-wide" open>
+      <summary class="site-advanced-summary">
+        <span>高级设置</span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </summary>
+      <div class="site-advanced-body">
+    <div class="site-form-columns">
+      <div class="site-form-column">
     <div class="form-group">
       <label>UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
@@ -1131,6 +1189,8 @@ async function showSiteModal(site) {
       <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
       <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
     </div>
+      </div>
+      <div class="site-form-column">
     <div class="form-group">
       <label class="switch-row"><input type="checkbox" id="m-asset-cache" ${isEdit && site.asset_cache_enabled ? 'checked' : ''}><span>缓存图片与静态资源</span></label>
       <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
@@ -1141,7 +1201,8 @@ async function showSiteModal(site) {
         <label>容量上限（MB）<input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}"></label>
       </div>
     </div>
-
+      </div>
+      <div class="site-form-column">
     <div class="form-group">
       <label>流量额度 (GB, 0=不限)</label>
       <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
@@ -1151,6 +1212,10 @@ async function showSiteModal(site) {
       <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
       <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
     </div>
+      </div>
+    </div>
+      </div>
+    </details>
   `;
 
   document.getElementById('modal-footer').innerHTML = `
@@ -1159,6 +1224,111 @@ async function showSiteModal(site) {
   `;
 
 	document.getElementById('m-cancel').addEventListener('click', closeModal);
+
+	const failoverLinesContainer = document.getElementById('m-failover-lines');
+	let failoverLines = isEdit && Array.isArray(site.failover_lines)
+		? site.failover_lines.map(line => ({ name: String(line.name || ''), url: String(line.url || ''), enabled: line.enabled !== false, ...splitTargetAddress(line.url) }))
+		: (isEdit && Array.isArray(site.failover_targets)
+			? site.failover_targets.map((url, index) => ({ name: `线路${index + 2}`, url: String(url || ''), enabled: true, ...splitTargetAddress(url) }))
+			: []);
+
+	function lineActionIcon(kind) {
+		if (kind === 'up') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>';
+		if (kind === 'down') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+		if (kind === 'remove') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg>';
+		return '';
+	}
+
+	function renderFailoverLines() {
+		failoverLinesContainer.innerHTML = failoverLines.map((line, index) => `
+		  <div class="upstream-line" data-line-index="${index}">
+		    <label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '开' : '关'}</span></label>
+		    <input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称">
+		    <input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址">
+		    <input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口">
+		    <span class="upstream-line-latency">--</span>
+		    <div class="upstream-line-actions">
+		      <button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button>
+		      <button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button>
+		      <button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button>
+		    </div>
+		  </div>`).join('');
+
+		failoverLinesContainer.querySelectorAll('.upstream-line').forEach(row => {
+			const index = Number(row.dataset.lineIndex);
+			row.querySelector('.upstream-line-toggle').onchange = event => {
+				failoverLines[index].enabled = event.target.checked;
+				renderFailoverLines();
+			};
+			row.querySelector('.upstream-line-name').oninput = event => { failoverLines[index].name = event.target.value; };
+			row.querySelector('.upstream-line-address').oninput = event => { failoverLines[index].address = event.target.value; };
+			row.querySelector('.upstream-line-port').oninput = event => { failoverLines[index].port = event.target.value; };
+			row.querySelector('.upstream-line-move-up').onclick = () => {
+				[failoverLines[index - 1], failoverLines[index]] = [failoverLines[index], failoverLines[index - 1]];
+				renderFailoverLines();
+			};
+			row.querySelector('.upstream-line-move-down').onclick = () => {
+				[failoverLines[index + 1], failoverLines[index]] = [failoverLines[index], failoverLines[index + 1]];
+				renderFailoverLines();
+			};
+			row.querySelector('.upstream-line-remove').onclick = () => {
+				failoverLines.splice(index, 1);
+				renderFailoverLines();
+			};
+		});
+	}
+
+	async function testUpstreamLine(row, addressInput, portInput) {
+		const latency = row.querySelector('.upstream-line-latency');
+		const targetURL = joinTargetAddress(addressInput.value, portInput.value);
+		if (!targetURL) {
+			latency.textContent = '请填写地址';
+			latency.className = 'upstream-line-latency bad';
+			return;
+		}
+		latency.textContent = '测试中…';
+		latency.className = 'upstream-line-latency';
+		try {
+			const result = await API.testUpstream(targetURL);
+			if (result && result.status === 'online') {
+				latency.textContent = `${Number(result.latency_ms) || 0} ms`;
+				latency.className = `upstream-line-latency ${(Number(result.latency_ms) || 0) < 800 ? 'good' : 'warn'}`;
+			} else {
+				throw new Error((result && result.error) || '线路不可用');
+			}
+		} catch (error) {
+			latency.textContent = '失败';
+			latency.className = 'upstream-line-latency bad';
+			latency.title = error.message || '线路测试失败';
+		}
+	}
+
+	renderFailoverLines();
+	document.getElementById('m-add-failover-line').onclick = () => {
+		if (failoverLines.length >= 7) {
+			Toast.error('最多添加 7 条备用线路');
+			return;
+		}
+		failoverLines.push({ name: `线路${failoverLines.length + 2}`, url: '', address: '', port: '', enabled: true });
+		renderFailoverLines();
+		const inputs = failoverLinesContainer.querySelectorAll('.upstream-line-address');
+		if (inputs.length) inputs[inputs.length - 1].focus();
+	};
+	document.getElementById('m-test-all-lines').onclick = async event => {
+		const button = event.currentTarget;
+		button.disabled = true;
+		button.textContent = '测试中…';
+		const rows = [...document.querySelectorAll('#m-upstream-lines .upstream-line')].filter(row => {
+			if (row.dataset.line === 'primary') return true;
+			const index = Number(row.dataset.lineIndex);
+			return failoverLines[index] && failoverLines[index].enabled;
+		});
+		for (const row of rows) {
+			await testUpstreamLine(row, row.querySelector('.upstream-line-address'), row.querySelector('.upstream-line-port'));
+		}
+		button.disabled = false;
+		button.textContent = '线路测速';
+	};
 
 	const ingressSelect = document.getElementById('m-ingress-mode');
 	const publicHostGroup = document.getElementById('m-public-host-group');
@@ -1215,9 +1385,9 @@ async function showSiteModal(site) {
   uaSelect.addEventListener('change', toggleCustomUAFields);
 
   const upstreamHeadersContainer = document.getElementById('m-upstream-headers');
-  let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers)
+  let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers) && site.upstream_headers.length
     ? site.upstream_headers.map(header => ({ name: header.name || '', value: '', configured: !!header.configured }))
-    : [];
+    : [{ name: '', value: '', configured: false }];
 
   function renderUpstreamHeaders() {
     upstreamHeadersContainer.innerHTML = renderUpstreamHeaderRows(upstreamHeaders, upstreamHeadersAvailable);
@@ -1268,9 +1438,21 @@ async function showSiteModal(site) {
 		  siteCapabilities.route_domain,
 		  pathPrefixInput.value,
 		);
+		const primaryTargetURL = joinTargetAddress(
+			document.getElementById('m-target-address').value,
+			document.getElementById('m-target-port').value,
+		);
+		document.getElementById('m-target').value = primaryTargetURL;
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
-	      target_url: document.getElementById('m-target').value.trim(),
+	      target_url: primaryTargetURL,
+	      primary_line_name: document.getElementById('m-primary-line-name').value.trim() || '主线路',
+	      failover_lines: failoverLines.map((line, index) => ({
+	        name: String(line.name || '').trim() || `线路${index + 2}`,
+	        url: joinTargetAddress(line.address, line.port),
+	        enabled: line.enabled !== false,
+	      })),
+	      failover_targets: failoverLines.filter(line => line.enabled !== false).map(line => joinTargetAddress(line.address, line.port)).filter(Boolean),
       playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
       playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
 		main_video_stream_mode: document.getElementById('m-main-video-direct').checked ? 'direct' : 'proxy',
@@ -1315,6 +1497,14 @@ async function showSiteModal(site) {
 			Toast.error('请完整填写新增请求头的名称和值；已有值可留空保持不变');
 			return;
 		}
+		if (!document.getElementById('m-target-port').value || data.failover_lines.some((line, index) => !line.url || !String(failoverLines[index].port || '').trim())) {
+			Toast.error('请完整填写每条线路的域名和端口，或删除空线路');
+			return;
+		}
+		if (data.failover_targets.length > 0 && upstreamHeaders.some(header => String(header.name || '').trim())) {
+			Toast.error('备用线路不能与主回源固定请求头同时使用');
+			return;
+		}
 		if (isEdit && normalizedTargetAuthority(site.target_url) !== normalizedTargetAuthority(data.target_url)) {
 			const retainedSecret = upstreamHeaders.some(header => header.configured && !String(header.value || '').trim());
 			if (retainedSecret) {
@@ -1338,7 +1528,7 @@ async function showSiteModal(site) {
     }
   };
 
-  openModal({ closeOnBackdrop: false });
+  openModal({ closeOnBackdrop: false, modalClass: 'site-config-modal' });
 }
 
 // Global actions

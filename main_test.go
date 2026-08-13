@@ -1268,7 +1268,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.34", "/css/style.css?v=1.8.34", "/js/pages/sites.js?v=1.8.34", "/js/pages/request-logs.js?v=1.8.34", "/js/app.js?v=1.8.34"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.35", "/css/style.css?v=1.8.35", "/js/pages/sites.js?v=1.8.35", "/js/pages/request-logs.js?v=1.8.35", "/js/app.js?v=1.8.35"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4610,6 +4610,36 @@ func TestSiteUpdateAbortsWhenPreStopFlushFails(t *testing.T) {
 // for running sites while preserving the exact Site JSON shape plus the
 // running flag; the read never writes the database, so pending bytes appear
 // before any flush.
+func TestHandleUpstreamTestReportsReachableTarget(t *testing.T) {
+	app := newTestApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/System/Info/Public" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Version":"4.8.0"}`))
+	}))
+	defer upstream.Close()
+
+	body, _ := json.Marshal(map[string]string{"target_url": upstream.URL})
+	rr := httptest.NewRecorder()
+	app.handleUpstreamTest(rr, httptest.NewRequest(http.MethodPost, "/api/upstream-test", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upstream test status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var result struct {
+		Status     string `json:"status"`
+		HTTPStatus int    `json:"http_status"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode upstream test: %v", err)
+	}
+	if result.Status != "online" || result.HTTPStatus != http.StatusOK {
+		t.Fatalf("upstream test result=%+v", result)
+	}
+}
+
 func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 	app := newTestApp(t)
 	running, err := app.db.CreateSite("live", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
@@ -4647,7 +4677,8 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 	}
 	expectedKeys := map[string]bool{
 		"id": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
-		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "stream_hosts": true,
+		"primary_line_name":   true,
+		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
 		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
@@ -4898,6 +4929,129 @@ func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 	}
 	if reloaded.PlaybackTargetURL != "https://media.example.com" {
 		t.Fatalf("persisted playback_target_url = %q, want %q", reloaded.PlaybackTargetURL, "https://media.example.com")
+	}
+}
+
+func TestHandleSitesPersistsAndUpdatesFailoverTargets(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	createPayload := []byte(`{"name":"failover-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096/emby","failover_targets":["https://backup-one.example.com/emby","https://backup-two.example.com/emby"]}`)
+	created := httptest.NewRecorder()
+	app.handleSites(created, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(createPayload)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var site Site
+	if err := json.Unmarshal(created.Body.Bytes(), &site); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	if got, want := strings.Join(site.FailoverTargetList, ","), "https://backup-one.example.com/emby,https://backup-two.example.com/emby"; got != want {
+		t.Fatalf("create failover_targets=%q, want %q", got, want)
+	}
+
+	// Omitted fields preserve the existing backup list during an update.
+	preservePayload := []byte(`{"name":"failover-site-renamed","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096/emby"}`)
+	preserved := httptest.NewRecorder()
+	app.handleSiteByID(preserved, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(preservePayload)))
+	if preserved.Code != http.StatusOK {
+		t.Fatalf("preserve update status=%d body=%s", preserved.Code, preserved.Body.String())
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.FailoverTargetList) != 2 {
+		t.Fatalf("omitted failover_targets did not persist: %#v", reloaded.FailoverTargetList)
+	}
+
+	// An explicit empty list removes every backup line.
+	clearPayload := []byte(`{"name":"failover-site-renamed","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096/emby","failover_targets":[]}`)
+	cleared := httptest.NewRecorder()
+	app.handleSiteByID(cleared, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(clearPayload)))
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("clear update status=%d body=%s", cleared.Code, cleared.Body.String())
+	}
+	reloaded, err = app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.FailoverTargetList) != 0 {
+		t.Fatalf("explicit empty failover_targets=%#v, want none", reloaded.FailoverTargetList)
+	}
+}
+
+func TestHandleSitesPersistsDisabledFailoverLineWithoutActivatingIt(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload := []byte(`{"name":"structured-lines","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","failover_lines":[{"name":"香港备用","url":"https://backup-one.example.com","enabled":true},{"name":"维护中","url":"https://backup-two.example.com","enabled":false}]}`)
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+	reloaded, err := app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.FailoverLines) != 2 || reloaded.FailoverLines[1].Name != "维护中" || reloaded.FailoverLines[1].Enabled {
+		t.Fatalf("stored failover lines=%+v", reloaded.FailoverLines)
+	}
+	if len(reloaded.FailoverTargetList) != 1 || reloaded.FailoverTargetList[0] != "https://backup-one.example.com" {
+		t.Fatalf("runtime failover targets=%+v", reloaded.FailoverTargetList)
+	}
+}
+
+func TestHandleSitesPersistsEditablePrimaryLineName(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload := []byte(`{"name":"named-primary","listen_port":` + jsonNumber(port) + `,"target_url":"https://primary.example.com:443/emby","primary_line_name":"香港主线"}`)
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+	if created.PrimaryLineName != "香港主线" {
+		t.Fatalf("primary_line_name=%q", created.PrimaryLineName)
+	}
+
+	update := []byte(`{"name":"named-primary","listen_port":` + jsonNumber(port) + `,"target_url":"https://primary.example.com:443/emby","primary_line_name":"东京主线"}`)
+	updated := httptest.NewRecorder()
+	app.handleSiteByID(updated, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(created.ID), bytes.NewReader(update)))
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	reloaded, err := app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.PrimaryLineName != "东京主线" {
+		t.Fatalf("updated primary_line_name=%q", reloaded.PrimaryLineName)
+	}
+}
+
+func TestHandleSitesRejectsFailoverTargetsWithFixedUpstreamHeaders(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload := []byte(`{"name":"incompatible-failover","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","failover_targets":["https://backup.example.com"],"upstream_headers":[{"name":"X-Origin-Secret","value":"do-not-forward"}]}`)
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "failover_targets cannot be combined") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

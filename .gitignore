@@ -29,4 +29,5 @@ Thumbs.db
 .codex-remote-attachments/
 .tmp/
 .tmp-*.patch
+.tmp-*.log
 COLLABORATION_RULES.md
