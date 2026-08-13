@@ -1268,7 +1268,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.33", "/css/style.css?v=1.8.33", "/js/pages/sites.js?v=1.8.33", "/js/pages/request-logs.js?v=1.8.33", "/js/app.js?v=1.8.33"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.34", "/css/style.css?v=1.8.34", "/js/pages/sites.js?v=1.8.34", "/js/pages/request-logs.js?v=1.8.34", "/js/app.js?v=1.8.34"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4646,7 +4646,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		t.Fatalf("decode /api/sites: %v", err)
 	}
 	expectedKeys := map[string]bool{
-		"id": true, "name": true, "listen_port": true, "public_host": true, "ingress_mode": true, "target_url": true,
+		"id": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
 		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
 		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
@@ -5807,11 +5807,14 @@ func TestNormalizeIngressMode(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "legacy port", want: ingressModePort},
+		{name: "restored unset", mode: ingressModeUnset, want: ingressModeUnset},
 		{name: "secure shared default", publicHost: "media.example.com", want: ingressModeHost},
 		{name: "host", mode: ingressModeHost, publicHost: "media.example.com", want: ingressModeHost},
 		{name: "both", mode: ingressModeBoth, publicHost: "media.example.com", want: ingressModeBoth},
+		{name: "path", mode: ingressModePath, want: ingressModePath},
 		{name: "port rejects host", mode: ingressModePort, publicHost: "media.example.com", wantErr: true},
 		{name: "host requires domain", mode: ingressModeHost, wantErr: true},
+		{name: "unset rejects host", mode: ingressModeUnset, publicHost: "media.example.com", wantErr: true},
 		{name: "unknown", mode: "unsafe", wantErr: true},
 	}
 	for _, tt := range tests {
@@ -5824,6 +5827,212 @@ func TestNormalizeIngressMode(t *testing.T) {
 				t.Fatalf("normalizeIngressMode(%q, %q)=%q, want %q", tt.mode, tt.publicHost, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPathIngressNormalizationAndPrefixHelpers(t *testing.T) {
+	for _, tt := range []struct {
+		input string
+		want  string
+		err   bool
+	}{
+		{input: " /Emby/ ", want: "/emby"},
+		{input: "api", err: true},
+		{input: "a/b", err: true},
+	} {
+		got, err := normalizePathPrefix(tt.input)
+		if (err != nil) != tt.err || got != tt.want {
+			t.Fatalf("normalizePathPrefix(%q)=(%q,%v), want (%q,%v)", tt.input, got, err, tt.want, tt.err)
+		}
+	}
+	u, err := url.Parse("https://panel.example/emby/Videos/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripIngressPathPrefix(u, "/emby")
+	if u.Path != "/Videos/1" {
+		t.Fatalf("stripped path=%q", u.Path)
+	}
+	if got := addIngressPathPrefix("/Videos/1", "/emby"); got != "/emby/Videos/1" {
+		t.Fatalf("prefixed path=%q", got)
+	}
+	for _, tt := range []struct {
+		route  string
+		prefix string
+		want   string
+	}{
+		{route: "/emby/sntp/videos/1/original.mkv", prefix: "/sntp", want: "/sntp/emby/videos/1/original.mkv"},
+		{route: "/Jellyfin/SNTP/Videos/1?api_key=value", prefix: "/sntp", want: "/sntp/Jellyfin/Videos/1?api_key=value"},
+		{route: "/emby/sntp-other/videos/1", prefix: "/sntp", want: "/sntp/emby/sntp-other/videos/1"},
+		{route: "/emby/videos/1", prefix: "/videos", want: "/videos/emby/videos/1"},
+		{route: "/emby/emos/emya/video", prefix: "/emos", want: "/emos/emby/emya/video"},
+	} {
+		if got := addIngressPathPrefix(tt.route, tt.prefix); got != tt.want {
+			t.Fatalf("addIngressPathPrefix(%q, %q)=%q, want %q", tt.route, tt.prefix, got, tt.want)
+		}
+	}
+	if got := stripUpstreamBasePath("/jellyfin/Videos/1", "/jellyfin"); got != "/Videos/1" {
+		t.Fatalf("stripped upstream base path=%q", got)
+	}
+	if got := pathIngressCookiePath("/jellyfin/", "/jellyfin", "/emby"); got != "/emby/" {
+		t.Fatalf("mapped cookie path=%q", got)
+	}
+}
+
+func TestPathIngressResponseNormalizesEmbeddedBaseLocation(t *testing.T) {
+	requestURL, err := url.Parse("https://panel.example/sntp/Items/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{Header: make(http.Header), Request: &http.Request{URL: requestURL}}
+	resp.Header.Set("Location", "/emby/sntp/videos/1/original.mkv?token=ok")
+	prefixPathIngressResponse(resp, "/sntp", "")
+	if got := resp.Header.Get("Location"); got != "/sntp/emby/videos/1/original.mkv?token=ok" {
+		t.Fatalf("normalized Location=%q", got)
+	}
+}
+
+func TestPathIngressAcceptsEmbeddedBaseRequestPath(t *testing.T) {
+	requestURL, err := url.Parse("https://panel.example/emby/sntp/videos/1/original.mkv?token=ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !normalizeEmbeddedIngressRequestPath(requestURL, "/sntp") || requestURL.Path != "/sntp/emby/videos/1/original.mkv" {
+		t.Fatalf("normalized embedded request path=%q", requestURL.Path)
+	}
+	stripIngressPathPrefix(requestURL, "/sntp")
+	if requestURL.Path != "/emby/videos/1/original.mkv" {
+		t.Fatalf("upstream embedded request path=%q", requestURL.Path)
+	}
+}
+
+func TestPathIngressRoutesThroughPanelAndStripsPrefix(t *testing.T) {
+	app := newTestApp(t)
+	upstreamPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath <- r.URL.RequestURI()
+		if got := r.Header.Get("X-Forwarded-Prefix"); got != "/emby" {
+			t.Errorf("X-Forwarded-Prefix=%q", got)
+		}
+		w.Header().Set("Location", "/jellyfin/Videos/2/stream")
+		w.Header().Add("Set-Cookie", "emby_session=keep; Path=/jellyfin/; HttpOnly")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	site := Site{
+		ID: 701, Name: "path-entry", ListenPort: freePort(t), PathPrefix: "/emby",
+		IngressMode: ingressModePath, TargetURL: upstream.URL + "/jellyfin", PlaybackMode: "direct",
+		MainVideoStreamMode: mainVideoStreamModeProxy, StreamHosts: "[]", UAMode: passthroughUAMode,
+	}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	panel := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	router := app.publicHostRouter(panel)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "http://panel.example/emby/Items/1?x=1", nil)
+	router.ServeHTTP(recorder, request)
+	if got := <-upstreamPath; got != "/jellyfin/Items/1?x=1" {
+		t.Fatalf("upstream request URI=%q", got)
+	}
+	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/emby/Videos/2/stream" {
+		t.Fatalf("path response=%d Location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if cookie := recorder.Header().Get("Set-Cookie"); !strings.Contains(cookie, "Path=/emby/") {
+		t.Fatalf("path response cookie=%q", cookie)
+	}
+
+	panelRecorder := httptest.NewRecorder()
+	router.ServeHTTP(panelRecorder, httptest.NewRequest(http.MethodGet, "http://panel.example/api/auth/check", nil))
+	if panelRecorder.Code != http.StatusTeapot {
+		t.Fatalf("panel API was shadowed: %d", panelRecorder.Code)
+	}
+
+	redirectRecorder := httptest.NewRecorder()
+	router.ServeHTTP(redirectRecorder, httptest.NewRequest(http.MethodGet, "http://panel.example/emby?x=1", nil))
+	if redirectRecorder.Code != http.StatusPermanentRedirect || redirectRecorder.Header().Get("Location") != "/emby/?x=1" {
+		t.Fatalf("path root redirect=%d Location=%q", redirectRecorder.Code, redirectRecorder.Header().Get("Location"))
+	}
+}
+
+func TestPathIngressEmbeddedClientRouteStripsBothPrefixes(t *testing.T) {
+	app := newTestApp(t)
+	upstreamPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath <- r.URL.RequestURI()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	site := Site{
+		ID: 702, Name: "embedded-path-entry", ListenPort: freePort(t), PathPrefix: "/sntp",
+		IngressMode: ingressModePath, TargetURL: upstream.URL, PlaybackMode: "direct",
+		MainVideoStreamMode: mainVideoStreamModeProxy, StreamHosts: "[]", UAMode: passthroughUAMode,
+	}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	router := app.publicHostRouter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://panel.example/sntp/emby/sntp/videos/1/original.mkv?token=ok", nil))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("embedded path response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := <-upstreamPath; got != "/emby/videos/1/original.mkv?token=ok" {
+		t.Fatalf("embedded path upstream URI=%q", got)
+	}
+}
+
+func TestHandleSitesPathIngressRejectsDuplicatePrefix(t *testing.T) {
+	app := newTestApp(t)
+	app.panelListenPort = 9090
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	create := func(name, prefix string) *httptest.ResponseRecorder {
+		payload, err := json.Marshal(map[string]any{
+			"name":          name,
+			"ingress_mode":  ingressModePath,
+			"path_prefix":   prefix,
+			"target_url":    upstream.URL,
+			"ua_mode":       passthroughUAMode,
+			"playback_mode": "direct",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder := httptest.NewRecorder()
+		app.handleSites(recorder, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+		return recorder
+	}
+
+	first := create("path-one", " /Emby/ ")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first path create status=%d body=%s", first.Code, first.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+	if created.PathPrefix != "/emby" || created.IngressMode != ingressModePath || created.ListenPort == 0 {
+		t.Fatalf("created path site=%#v", created)
+	}
+
+	duplicate := create("path-two", "EMBY")
+	if duplicate.Code != http.StatusBadRequest || !strings.Contains(duplicate.Body.String(), "path_prefix") {
+		t.Fatalf("duplicate path create status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	sites, err := app.db.ListSites()
+	if err != nil || len(sites) != 1 {
+		t.Fatalf("sites after duplicate=%#v err=%v", sites, err)
 	}
 }
 

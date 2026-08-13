@@ -213,7 +213,10 @@ function renderHeadersCard(headers, staggerClass) {
 
 function renderProxyCard(proxy, staggerClass) {
 	const mode = String(proxy.ingress_mode || (proxy.public_host ? 'host' : 'port')).toLowerCase();
-	const modeLabel = { port: '仅独立端口', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+	const modeLabel = { port: '仅独立端口', path: '共享路径', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+	const pathRow = proxy.path_prefix
+	  ? `<div class="diag-row"><span class="diag-key">路径前缀</span><span class="diag-val">${esc(proxy.path_prefix)}</span></div>`
+	  : '';
 	const hostRow = proxy.public_host
 	  ? `<div class="diag-row"><span class="diag-key">共享域名</span><span class="diag-val">${esc(proxy.public_host)}</span></div>`
 	  : '';
@@ -234,7 +237,8 @@ function renderProxyCard(proxy, staggerClass) {
       <div class="diag-rows">
 		<div class="diag-row"><span class="diag-key">代理运行</span><span class="diag-val ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></div>
 			<div class="diag-row"><span class="diag-key">入口模式</span><span class="diag-val">${esc(modeLabel)}</span></div>
-		${hostRow}
+	  ${hostRow}
+	  ${pathRow}
 		<div class="diag-row"><span class="diag-key">端口状态</span><span class="diag-val">${portValue}</span></div>
         <div class="diag-row"><span class="diag-key">总请求数</span><span class="diag-val">${typeof proxy.total_requests === 'number' ? proxy.total_requests : '--'}</span></div>
       </div>

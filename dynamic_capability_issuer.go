@@ -26,6 +26,21 @@ type dynamicCapabilityIssuer struct {
 	configuredTransport   http.RoundTripper
 	uaPolicy              UAHeaderPolicy
 	upstreamHeaderPolicy  upstreamHeaderPolicy
+	pathPrefix            string
+}
+
+func (i *dynamicCapabilityIssuer) clientRoute(route string) string {
+	if i == nil {
+		return route
+	}
+	return addIngressPathPrefix(route, i.pathPrefix)
+}
+
+func (i *dynamicCapabilityIssuer) capabilityToken(route string) string {
+	if i == nil {
+		return strings.TrimPrefix(route, dynamicRoutePrefix)
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(route, i.pathPrefix), dynamicRoutePrefix)
 }
 
 func validDynamicCapabilityResource(source, kind string, depth int) bool {
@@ -61,7 +76,7 @@ func (i *dynamicCapabilityIssuer) observe(source, decision, reasonCode, authorit
 
 func (i *dynamicCapabilityIssuer) mint(ctx context.Context, previous, target *url.URL, source string) (string, *dynamicProxyError) {
 	route, acquired, err := i.mintTracked(ctx, previous, target, source)
-	if err == nil && acquired && !i.state.settleCapabilities([]string{strings.TrimPrefix(route, dynamicRoutePrefix)}, true, time.Now()) {
+	if err == nil && acquired && !i.state.settleCapabilities([]string{i.capabilityToken(route)}, true, time.Now()) {
 		return "", newDynamicProxyError(dynamicObservationReasonCapacityLimit)
 	}
 	return route, err
@@ -76,7 +91,7 @@ func (i *dynamicCapabilityIssuer) mintTracked(ctx context.Context, previous, tar
 
 func (i *dynamicCapabilityIssuer) mintValidated(ctx context.Context, previous, validationTarget *url.URL, source, claimTarget string, template []string) (string, *dynamicProxyError) {
 	route, acquired, err := i.mintValidatedTracked(ctx, previous, validationTarget, source, claimTarget, template)
-	if err == nil && acquired && !i.state.settleCapabilities([]string{strings.TrimPrefix(route, dynamicRoutePrefix)}, true, time.Now()) {
+	if err == nil && acquired && !i.state.settleCapabilities([]string{i.capabilityToken(route)}, true, time.Now()) {
 		return "", newDynamicProxyError(dynamicObservationReasonCapacityLimit)
 	}
 	return route, err
@@ -164,7 +179,7 @@ func (i *dynamicCapabilityIssuer) mintValidatedResourceWithRequiredHeadersTracke
 	if token, exists := i.state.reuseCapability(cacheKey, time.Now()); exists {
 		reservation.rollback()
 		i.observe(source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, authority)
-		return dynamicRoutePrefix + token, true, nil
+		return i.clientRoute(dynamicRoutePrefix + token), true, nil
 	}
 	claims := dynamicCapabilityClaims{
 		Version:         dynamicCapabilityVersion,
@@ -199,7 +214,7 @@ func (i *dynamicCapabilityIssuer) mintValidatedResourceWithRequiredHeadersTracke
 		reservation.rollback()
 	}
 	i.observe(source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, authority)
-	return dynamicRoutePrefix + registeredToken, true, nil
+	return i.clientRoute(dynamicRoutePrefix + registeredToken), true, nil
 }
 
 func (i *dynamicCapabilityIssuer) mintTrustedTracked(target *url.URL, source, kind string, depth int) (string, bool, *dynamicProxyError) {
@@ -229,7 +244,7 @@ func (i *dynamicCapabilityIssuer) mintTrustedValidatedWithRequiredHeadersTracked
 	expiresAt := time.Unix(now.Unix()+i.policy.limits.AbsoluteLifetimeSeconds, 0)
 	cacheKey := trustedCapabilityCacheKeyWithRequiredHeaders(source, kind, depth, claimTarget, template, templateFixed, requiredHeaders)
 	if token, exists := i.state.reuseCapability(cacheKey, now); exists {
-		return dynamicRoutePrefix + token, true, nil
+		return i.clientRoute(dynamicRoutePrefix + token), true, nil
 	}
 	claims := dynamicCapabilityClaims{
 		Version:         dynamicCapabilityVersion,
@@ -254,5 +269,5 @@ func (i *dynamicCapabilityIssuer) mintTrustedValidatedWithRequiredHeadersTracked
 	if !registered {
 		return "", false, newDynamicProxyError(dynamicObservationReasonCapacityLimit)
 	}
-	return dynamicRoutePrefix + registeredToken, true, nil
+	return i.clientRoute(dynamicRoutePrefix + registeredToken), true, nil
 }

@@ -11,7 +11,9 @@ import (
 
 type App struct {
 	db                *DB
+	dbPath            string
 	pm                *ProxyManager
+	backupMu          sync.Mutex
 	siteLifecycleMu   sync.Mutex
 	setupTokenMu      sync.Mutex
 	setupToken        string
@@ -116,6 +118,28 @@ func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 			}
 		}
 		if a.panelHost == "" || host == a.panelHost || isLoopbackHealthProbe(r) {
+			if handler, prefix, configured := a.pm.PathRoute(r.URL.Path); configured {
+				if handler == nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(`{"error":"site unavailable"}`))
+					return
+				}
+				if r.URL.Path == prefix && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+					target := prefix + "/"
+					if r.URL.RawQuery != "" {
+						target += "?" + r.URL.RawQuery
+					}
+					http.Redirect(w, r, target, http.StatusPermanentRedirect)
+					return
+				}
+				r = r.Clone(context.WithValue(r.Context(), pathIngressContextKey{}, prefix))
+				normalizeEmbeddedIngressRequestPath(r.URL, prefix)
+				stripIngressPathPrefix(r.URL, prefix)
+				normalizeStrippedIngressRequestPath(r.URL, prefix)
+				handler.ServeHTTP(w, r)
+				return
+			}
 			panel.ServeHTTP(w, r)
 			return
 		}

@@ -4733,6 +4733,15 @@ html { font-size: 15px; }
 .settings-range output { min-width: 58px; color: var(--white-60); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
 .settings-range small { color: var(--white-60); font-size: 12px; font-weight: 400; line-height: 1.45; }
 
+.backup-restore-content { max-width: 980px; }
+.backup-warning { margin-top: 10px; padding: 10px 12px; border: 1px solid rgba(245, 158, 11, .28); border-radius: 10px; background: rgba(245, 158, 11, .08); color: var(--white-70); font-size: 12px; line-height: 1.5; }
+.backup-warning.danger { border-color: rgba(239, 68, 68, .3); background: rgba(239, 68, 68, .08); }
+.backup-confirm-field { margin-top: 10px; }
+.backup-file-input { padding: 5px 8px !important; }
+.backup-file-input::file-selector-button { min-height: 28px; margin-right: 10px; padding: 4px 10px; border: 0; border-radius: 7px; background: var(--panel-soft); color: var(--white-87); cursor: pointer; }
+.telegram-btn.danger { border-color: rgba(239, 68, 68, .45); background: #dc2626; color: #fff; }
+.telegram-btn.danger:hover { background: #b91c1c; }
+
 .telegram-report-layout { gap: 12px; }
 .telegram-report-card { padding: 15px; }
 .telegram-report-card-head { gap: 14px; margin-bottom: 13px; }

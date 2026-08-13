@@ -57,6 +57,7 @@ func normalizeAssetCacheConfig(site *Site) error {
 }
 
 var errUnsafeHostOnlyIngress = errors.New("host-only ingress requires loopback PANEL_BIND_ADDR or a non-empty TRUSTED_PROXY_CIDRS source allowlist; use port/both only with the documented risk controls")
+var errUnsetIngress = errors.New("站点入口尚未配置，请编辑站点并选择域名前缀、路径或独立端口后再启用")
 var errProxyManagerShuttingDown = errors.New("proxy manager is shutting down")
 
 // UAHeaderPolicy is the explicit discriminator for how a site's inbound

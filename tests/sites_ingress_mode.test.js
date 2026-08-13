@@ -28,22 +28,30 @@ test('ingress form exposes the secure host-only mode without a listener', () => 
 	assert.match(host.warning, /不会绑定/);
 	assert.match(host.warning, /TLS .*\u8bc1\u4e66/);
 	assert.equal(ingressFormState('port').requireListenPort, true);
+	assert.equal(ingressFormState('path').requireListenPort, false);
+	assert.equal(ingressFormState('path').requirePathPrefix, true);
+	assert.match(ingressFormState('path').warning, /面板域名和端口/);
+	assert.equal(ingressFormState('unset').requireListenPort, false);
+	assert.match(ingressFormState('unset').warning, /请选择可用入口/);
 });
 
 test('ingress payload clears stale host for port mode and preserves it otherwise', () => {
   const { buildIngressPayload } = loadHelpers();
   assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('port', '8001', 'stale.example.com'))), {
-    ingress_mode: 'port', listen_port: 8001, public_host: '',
+    ingress_mode: 'port', listen_port: 8001, public_host: '', path_prefix: '',
   });
   assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('host', '8002', ' media.example.com '))), {
-    ingress_mode: 'host', listen_port: 8002, public_host: 'media.example.com',
+    ingress_mode: 'host', listen_port: 8002, public_host: 'media.example.com', path_prefix: '',
   });
 	assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('host', '', ' media.example.com '))), {
-		ingress_mode: 'host', listen_port: 0, public_host: 'media.example.com',
+		ingress_mode: 'host', listen_port: 0, public_host: 'media.example.com', path_prefix: '',
 	});
   assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('both', '8003', 'media.example.com'))), {
-    ingress_mode: 'both', listen_port: 8003, public_host: 'media.example.com',
+    ingress_mode: 'both', listen_port: 8003, public_host: 'media.example.com', path_prefix: '',
   });
+	assert.deepEqual(JSON.parse(JSON.stringify(buildIngressPayload('path', '', 'stale.example.com', '', '', ' Emby '))), {
+		ingress_mode: 'path', listen_port: 0, public_host: '', path_prefix: 'Emby',
+	});
 });
 
 test('new-site ingress defaults follow backend host-only capability', () => {
@@ -59,7 +67,9 @@ test('ingress mode labels remain concise for the site card', () => {
   const { siteIngressModeLabel } = loadHelpers();
   assert.equal(siteIngressModeLabel({ ingress_mode: 'host' }), '域名前缀');
   assert.equal(siteIngressModeLabel({ ingress_mode: 'port' }), '独立端口');
+	assert.equal(siteIngressModeLabel({ ingress_mode: 'path' }), '路径');
   assert.equal(siteIngressModeLabel({ ingress_mode: 'both' }), '域名前缀（兼容）');
+  assert.equal(siteIngressModeLabel({ ingress_mode: 'unset' }), '入口未配置');
 });
 
 test('site cards place ingress mode above running status and omit playback rows', () => {
@@ -70,6 +80,8 @@ test('site cards place ingress mode above running status and omit playback rows'
 
   assert.match(cardSource, /class="site-card-state"/);
   assert.match(cardSource, /siteIngressModeLabel\(s\)/);
+  assert.match(cardSource, /normalizedIngressMode\(s\) === 'unset'/);
+  assert.match(cardSource, /待配置/);
   assert.match(cardSource, /data-access-address/);
   assert.match(cardSource, /toggleSiteAccessAddress/);
   assert.match(cardSource, /data-site-action="copy"/);

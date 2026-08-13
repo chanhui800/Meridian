@@ -329,6 +329,7 @@ async function loadDashboardTable() {
 function dashboardIngressLabel(site) {
 	const mode = String(site.ingress_mode || (site.public_host ? 'host' : 'port')).toLowerCase();
 	if (mode === 'host') return `Host: ${esc(site.public_host || '')}`;
+	if (mode === 'path') return `Path: ${esc(site.path_prefix || '')}`;
 	if (mode === 'both') return `Host + :${site.listen_port}`;
 	return `:${site.listen_port}`;
 }

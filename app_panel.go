@@ -49,6 +49,8 @@ func (a *App) handleIngressCapabilities(w http.ResponseWriter, r *http.Request) 
 	a.jsonOK(w, map[string]interface{}{
 		"app_version":                appVersion,
 		"host_only_available":        a.pm.HostOnlyIngressSafe(),
+		"path_ingress_available":     true,
+		"panel_access_url":           a.panelAccessURL(),
 		"route_domain":               a.routeDomain,
 		"domain_prefix_available":    a.routeDomain != "",
 		"panel_tls_enabled":          a.panelTLSEnabled,

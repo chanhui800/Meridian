@@ -265,6 +265,7 @@
       Router.register('telegram-report', renderTelegramReport);
       Router.register('settings-tls', renderTLSSettings);
       Router.register('global-settings', renderGlobalSettings);
+      Router.register('backup-restore', renderBackupRestore);
       Router.register('account', renderAccount);
       if (typeof renderDiag === 'function') {
         Router.register('diagnostics', renderDiag);

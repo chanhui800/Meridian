@@ -87,18 +87,26 @@ type telegramReportStats struct {
 }
 
 func telegramReportKey() []byte {
+	return telegramReportKeyForSecret(jwtSecret)
+}
+
+func telegramReportKeyForSecret(secret []byte) []byte {
 	h := sha256.New()
 	_, _ = h.Write([]byte("meridian telegram report bot token v1\x00"))
-	_, _ = h.Write(jwtSecret)
+	_, _ = h.Write(secret)
 	return h.Sum(nil)
 }
 
 func encryptTelegramBotToken(token string) (string, error) {
+	return encryptTelegramBotTokenWithSecret(token, jwtSecret)
+}
+
+func encryptTelegramBotTokenWithSecret(token string, secret []byte) (string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" || strings.ContainsAny(token, "\r\n\t ") || len(token) > 256 {
 		return "", fmt.Errorf("invalid Telegram bot token")
 	}
-	block, err := aes.NewCipher(telegramReportKey())
+	block, err := aes.NewCipher(telegramReportKeyForSecret(secret))
 	if err != nil {
 		return "", err
 	}
@@ -116,6 +124,10 @@ func encryptTelegramBotToken(token string) (string, error) {
 }
 
 func decryptTelegramBotToken(ciphertext string) (string, error) {
+	return decryptTelegramBotTokenWithSecret(ciphertext, jwtSecret)
+}
+
+func decryptTelegramBotTokenWithSecret(ciphertext string, secret []byte) (string, error) {
 	if !strings.HasPrefix(ciphertext, telegramReportCipherPrefix) {
 		return "", fmt.Errorf("invalid Telegram bot token ciphertext")
 	}
@@ -123,7 +135,7 @@ func decryptTelegramBotToken(ciphertext string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("decode Telegram bot token: %w", err)
 	}
-	block, err := aes.NewCipher(telegramReportKey())
+	block, err := aes.NewCipher(telegramReportKeyForSecret(secret))
 	if err != nil {
 		return "", err
 	}

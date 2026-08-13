@@ -708,6 +708,9 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 				// client will request it through Meridian, while the short-lived learned
 				// path only enables safe 30x backend discovery for that later request.
 				session.rememberRelativePlaybackPath(text)
+				if session.rewriteRelative && session.issuer != nil && session.issuer.pathPrefix != "" {
+					source[field] = addIngressPathPrefix(text, session.issuer.pathPrefix)
+				}
 			}
 			shouldRewrite := exists && isString && !relativeMainURL && playbackInfoShouldRewriteURL(text, session)
 			if shouldRewrite && playbackInfoRequiredHeadersUnsupported(text, hasRequiredHeaders, session) {
