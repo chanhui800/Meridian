@@ -82,12 +82,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		log.Printf("[WS] write request line: %v", err)
 		return
 	}
-	upstreamHeader := prepareWebSocketUpstreamHeadersWithTrustedProxies(r, target, policy, inst.trustedProxies, upstreamPolicies...)
+	upstreamHeader := prepareWebSocketUpstreamHeadersWithClientIPMode(r, target, policy, inst.trustedProxies, inst.Site.ClientIPMode, upstreamPolicies...)
 	if primaryTarget != nil && !sameRedirectAuthority(primaryTarget, target) {
 		// A separately configured playback/CDN authority is a different trust
 		// domain. Preserve only WebSocket negotiation fields and normalized client
 		// identity; browser/API credentials must stay with the main origin.
-		upstreamHeader = crossAuthorityWebSocketHeaders(upstreamHeader)
+		upstreamHeader = crossAuthorityWebSocketHeadersWithClientIPMode(upstreamHeader, inst.Site.ClientIPMode)
 		upstreamHeader.Set("Host", target.Host)
 	}
 	applySiteForwardedHost(upstreamHeader, r, inst.Site)

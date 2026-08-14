@@ -1161,8 +1161,7 @@ async function showSiteModal(site) {
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
       </summary>
       <div class="site-advanced-body">
-    <div class="site-form-columns">
-      <div class="site-form-column">
+      <div class="site-form-columns">
     <div class="form-group">
       <label>UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
@@ -1181,28 +1180,47 @@ async function showSiteModal(site) {
       <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
     </div>
     <div class="form-group">
+      <label>真实客户端 IP 透传</label>
+      <select class="form-select modal-select" id="m-client-ip-mode">
+        <option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
+        <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
+        <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
+      </select>
+      <div class="form-help">仅控制发送给回源的 X-Real-IP 与 X-Forwarded-For；客户端来源仍按可信代理规则识别，日志中的客户端 IP 不受影响。</div>
+    </div>
+    <div class="form-group">
       <label>主视频流策略</label>
-      <div class="main-video-mode-control" role="radiogroup" aria-label="主视频流策略">
-        <label><input type="radio" id="m-main-video-proxy" name="m-main-video-stream-mode" value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'checked' : ''}><span>反代</span></label>
-        <label><input type="radio" id="m-main-video-direct" name="m-main-video-stream-mode" value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'checked' : ''}><span>直连</span></label>
-      </div>
+      <select class="form-select modal-select" id="m-main-video-mode">
+        <option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option>
+        <option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option>
+      </select>
       <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
       <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
     </div>
-      </div>
-      <div class="site-form-column">
     <div class="form-group">
-      <label class="switch-row"><input type="checkbox" id="m-asset-cache" ${isEdit && site.asset_cache_enabled ? 'checked' : ''}><span>缓存图片与静态资源</span></label>
+      <label for="m-asset-cache">缓存图片与静态资源</label>
+      <select class="form-select modal-select" id="m-asset-cache">
+        <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
+        <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
+      </select>
       <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
-      <label style="display:block;margin-top:10px">缓存规则（每行一条，支持 * 通配）</label>
+    </div>
+    <div class="form-group">
+      <label>缓存规则（每行一条，支持 * 通配）</label>
       <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-        <label>缓存时间（小时）<input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}"></label>
-        <label>容量上限（MB）<input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}"></label>
+    </div>
+    <div class="form-group cache-limit-group">
+      <div class="cache-limit-grid">
+        <div>
+          <label for="m-cache-ttl">缓存时间（小时）</label>
+          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+        </div>
+        <div>
+          <label for="m-cache-max">容量上限（MB）</label>
+          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
+        </div>
       </div>
     </div>
-      </div>
-      <div class="site-form-column">
     <div class="form-group">
       <label>流量额度 (GB, 0=不限)</label>
       <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
@@ -1211,9 +1229,7 @@ async function showSiteModal(site) {
       <label>单连接限速 (Mbps, 0=不限)</label>
       <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
       <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
-    </div>
       </div>
-    </div>
       </div>
     </details>
   `;
@@ -1362,6 +1378,8 @@ async function showSiteModal(site) {
 	ingressSelect.addEventListener('change', updateIngressFields);
 
 	const uaSelect = document.getElementById('m-ua');
+  const clientIPModeSelect = document.getElementById('m-client-ip-mode');
+  const mainVideoModeSelect = document.getElementById('m-main-video-mode');
   const customUAGroup = document.getElementById('m-custom-ua-group');
   const customUAInputs = [
     document.getElementById('m-custom-ua'),
@@ -1370,6 +1388,8 @@ async function showSiteModal(site) {
   ];
   const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'passthrough', site);
   uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'passthrough';
+  clientIPModeSelect.value = isEdit && ['both', 'real_ip', 'none'].includes(site.client_ip_mode) ? site.client_ip_mode : 'both';
+  mainVideoModeSelect.value = isEdit && site.main_video_stream_mode === 'direct' ? 'direct' : 'proxy';
   customUAInputs[0].value = initialUAState.customUserAgent;
   customUAInputs[1].value = initialUAState.customClient;
   customUAInputs[2].value = initialUAState.customVersion;
@@ -1455,18 +1475,19 @@ async function showSiteModal(site) {
 	      failover_targets: failoverLines.filter(line => line.enabled !== false).map(line => joinTargetAddress(line.address, line.port)).filter(Boolean),
       playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
       playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
-		main_video_stream_mode: document.getElementById('m-main-video-direct').checked ? 'direct' : 'proxy',
+		main_video_stream_mode: mainVideoModeSelect.value,
 		stream_hosts: isEdit ? normalizeStreamHosts(site.stream_hosts) : [],
 			...ingressPayload,
 		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),
       ua_mode: uaMode,
+      client_ip_mode: clientIPModeSelect.value,
       ...customUAPayload,
 		dynamic_discovery_enabled: true,
 		dynamic_profile: 'compatible',
 		dynamic_discovery_sources: [...DEFAULT_DYNAMIC_SOURCE_IDS, ...ADVANCED_DYNAMIC_SOURCE_IDS],
 		dynamic_domain_rules: [],
 		dynamic_allow_https_downgrade: true,
-      asset_cache_enabled: document.getElementById('m-asset-cache').checked,
+      asset_cache_enabled: document.getElementById('m-asset-cache').value === 'on',
       asset_cache_ttl_sec: parseInt(document.getElementById('m-cache-ttl').value || 24) * 3600,
       asset_cache_max_bytes: parseInt(document.getElementById('m-cache-max').value || 512) * 1048576,
       asset_cache_rules: document.getElementById('m-cache-rules').value.trim(),

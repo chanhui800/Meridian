@@ -7,7 +7,7 @@
 
 Meridian 是面向 Emby、Jellyfin 等媒体服务的多节点反向代理面板。本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，并参考 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI) 优化界面与交互。
 
-当前正式版本：`v1.8.35`
+当前正式版本：`v1.8.36`
 
 ## 主要功能
 

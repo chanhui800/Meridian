@@ -1,11 +1,41 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 )
+
+const (
+	clientIPModeBoth   = "both"
+	clientIPModeRealIP = "real_ip"
+	clientIPModeNone   = "none"
+)
+
+func normalizeClientIPMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", clientIPModeBoth:
+		return clientIPModeBoth, nil
+	case clientIPModeRealIP:
+		return clientIPModeRealIP, nil
+	case clientIPModeNone:
+		return clientIPModeNone, nil
+	default:
+		return "", fmt.Errorf("invalid client_ip_mode")
+	}
+}
+
+func applyClientIPMode(header http.Header, mode string) {
+	switch mode {
+	case clientIPModeRealIP:
+		header.Del("X-Forwarded-For")
+	case clientIPModeNone:
+		header.Del("X-Real-IP")
+		header.Del("X-Forwarded-For")
+	}
+}
 
 func applyUAProfileHeaders(header http.Header, profile UAProfile) {
 	header.Set("User-Agent", profile.UserAgent)
@@ -83,8 +113,13 @@ func stripCookieByName(header http.Header, name string) {
 }
 
 func prepareUpstreamHeaders(header http.Header, inbound *http.Request, policy UAHeaderPolicy, trustedProxies ...[]*net.IPNet) {
+	prepareUpstreamHeadersWithClientIPMode(header, inbound, policy, clientIPModeBoth, trustedProxies...)
+}
+
+func prepareUpstreamHeadersWithClientIPMode(header http.Header, inbound *http.Request, policy UAHeaderPolicy, clientIPMode string, trustedProxies ...[]*net.IPNet) {
 	stripCookieByName(header, sessionCookieName)
 	setTrustedForwardingHeaders(header, inbound, trustedProxies...)
+	applyClientIPMode(header, clientIPMode)
 	applyUAHeaderPolicy(header, policy)
 }
 
@@ -93,6 +128,10 @@ func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, pol
 }
 
 func prepareWebSocketUpstreamHeadersWithTrustedProxies(inbound *http.Request, target *url.URL, policy UAHeaderPolicy, trustedProxies []*net.IPNet, upstreamPolicies ...upstreamHeaderPolicy) http.Header {
+	return prepareWebSocketUpstreamHeadersWithClientIPMode(inbound, target, policy, trustedProxies, clientIPModeBoth, upstreamPolicies...)
+}
+
+func prepareWebSocketUpstreamHeadersWithClientIPMode(inbound *http.Request, target *url.URL, policy UAHeaderPolicy, trustedProxies []*net.IPNet, clientIPMode string, upstreamPolicies ...upstreamHeaderPolicy) http.Header {
 	header := inbound.Header.Clone()
 	// RFC 9110 hop-by-hop: every header named by the inbound Connection header
 	// is consumed by the first recipient and must not be forwarded. Delete them
@@ -123,7 +162,7 @@ func prepareWebSocketUpstreamHeadersWithTrustedProxies(inbound *http.Request, ta
 	header.Set("Connection", "Upgrade")
 	header.Set("Upgrade", "websocket")
 	header.Set("Host", target.Host)
-	prepareUpstreamHeaders(header, inbound, policy, trustedProxies)
+	prepareUpstreamHeadersWithClientIPMode(header, inbound, policy, clientIPMode, trustedProxies)
 	if len(upstreamPolicies) > 0 {
 		upstreamPolicies[0].apply(header, target)
 	}

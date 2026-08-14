@@ -136,6 +136,7 @@ type redirectFollowTransport struct {
 	// Emby 308 -> capability -> 502/context-canceled startup sequence.
 	followUnknownRedirects  bool
 	policy                  UAHeaderPolicy
+	clientIPMode            string
 	upstreamHeaderPolicy    upstreamHeaderPolicy
 	dynamicTransportFactory dynamicTransportFactory
 	dynamicPolicy           dynamicRedirectPolicy
@@ -312,6 +313,27 @@ func crossAuthorityRedirectHeaders(source http.Header) http.Header {
 	return crossAuthorityHeaders(source)
 }
 
+func copyNormalizedClientIPHeaders(destination, source http.Header, mode string) {
+	var names []string
+	switch mode {
+	case clientIPModeBoth:
+		names = []string{"X-Real-IP", "X-Forwarded-For"}
+	case clientIPModeRealIP:
+		names = []string{"X-Real-IP"}
+	}
+	for _, name := range names {
+		if values := source.Values(name); len(values) > 0 {
+			destination[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+		}
+	}
+}
+
+func crossAuthorityRedirectHeadersWithClientIPMode(source http.Header, mode string) http.Header {
+	header := crossAuthorityRedirectHeaders(source)
+	copyNormalizedClientIPHeaders(header, source, mode)
+	return header
+}
+
 var dynamicReplayBodyHeaderNames = [...]string{
 	"Content-Encoding",
 	"Content-Language",
@@ -334,6 +356,12 @@ func crossAuthorityRedirectBodyHeaders(source http.Header) http.Header {
 	return header
 }
 
+func crossAuthorityRedirectBodyHeadersWithClientIPMode(source http.Header, mode string) http.Header {
+	header := crossAuthorityRedirectBodyHeaders(source)
+	copyNormalizedClientIPHeaders(header, source, mode)
+	return header
+}
+
 func dynamicRedirectBodyHeaders(source http.Header) http.Header {
 	header := dynamicRedirectHeaders(source)
 	copyDynamicReplayBodyHeaders(header, source)
@@ -353,6 +381,12 @@ func crossAuthorityWebSocketHeaders(source http.Header) http.Header {
 	// client. Rebuild them after the cross-authority allowlist has run.
 	header.Set("Connection", "Upgrade")
 	header.Set("Upgrade", "websocket")
+	return header
+}
+
+func crossAuthorityWebSocketHeadersWithClientIPMode(source http.Header, mode string) http.Header {
+	header := crossAuthorityWebSocketHeaders(source)
+	copyNormalizedClientIPHeaders(header, source, mode)
 	return header
 }
 
@@ -413,7 +447,7 @@ func (t *redirectFollowTransport) roundTripLegacy(req *http.Request, resp *http.
 		}
 		newReq.Host = locURL.Host
 		if !sameRedirectAuthority(req.URL, locURL) {
-			newReq.Header = crossAuthorityRedirectHeaders(req.Header)
+			newReq.Header = crossAuthorityRedirectHeadersWithClientIPMode(req.Header, t.clientIPMode)
 		} else {
 			newReq.Header = req.Header.Clone()
 		}
@@ -573,9 +607,9 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			}
 			if !sameRedirectAuthority(req.URL, locationURL) {
 				if newReq.Body != nil {
-					newReq.Header = crossAuthorityRedirectBodyHeaders(req.Header)
+					newReq.Header = crossAuthorityRedirectBodyHeadersWithClientIPMode(req.Header, t.clientIPMode)
 				} else {
-					newReq.Header = crossAuthorityRedirectHeaders(req.Header)
+					newReq.Header = crossAuthorityRedirectHeadersWithClientIPMode(req.Header, t.clientIPMode)
 				}
 			} else {
 				newReq.Header = req.Header.Clone()

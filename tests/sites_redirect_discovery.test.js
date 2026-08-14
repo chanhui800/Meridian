@@ -444,8 +444,7 @@ test('site modal presents proxy and direct main-video choices without discovery 
   assert.match(body, /直连/);
   assert.match(body, /网盘或 CDN 的 302/);
   assert.match(body, /面板、API、PlaybackInfo、HLS \/ DASH、字幕、图片和必要静态资源/);
-  assert.equal(document.getElementById('m-main-video-proxy').checked, true);
-  assert.equal(document.getElementById('m-main-video-direct').checked, false);
+  assert.equal(document.getElementById('m-main-video-mode').value, 'proxy');
   assert.doesNotMatch(body, /播放回源/);
   assert.equal(document.getElementById('m-dynamic-enabled'), null);
   assert.equal(document.getElementById('m-dynamic-profile'), null);
@@ -472,6 +471,7 @@ test('new site submission enables every automatic proxy source without manual pl
   assert.equal(state.creates[0].playback_target_url, '');
   assert.equal(state.creates[0].playback_mode, 'direct');
   assert.equal(state.creates[0].main_video_stream_mode, 'proxy');
+  assert.equal(state.creates[0].client_ip_mode, 'both');
   assert.deepEqual(state.creates[0].stream_hosts, []);
   assert.equal(state.creates[0].dynamic_discovery_enabled, true);
   assert.equal(state.creates[0].dynamic_profile, 'compatible');
@@ -760,6 +760,7 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
     listen_port: 8096,
     public_host: '',
     ua_mode: 'infuse',
+    client_ip_mode: 'real_ip',
     playback_target_url: '',
     main_video_stream_mode: 'direct',
     stream_hosts: [],
@@ -781,6 +782,35 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
   assert.deepEqual(state.observationDeletes, []);
   assert.deepEqual(state.confirmations, []);
   assert.deepEqual(state.errors, []);
-  assert.equal(document.getElementById('m-main-video-proxy').checked, false);
-  assert.equal(document.getElementById('m-main-video-direct').checked, true);
+  assert.equal(document.getElementById('m-main-video-mode').value, 'direct');
+  assert.equal(document.getElementById('m-client-ip-mode').value, 'real_ip');
+});
+
+test('client IP forwarding selector exposes only the three node-level modes', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  for (const value of ['both', 'real_ip', 'none']) {
+    assert.match(source, new RegExp(`<option value="${value}"`));
+  }
+  assert.doesNotMatch(source, /client_ip_mode[^\n]*(inherit|global)|继承全局/i);
+  assert.match(source, /clientIPModeSelect\.value = isEdit[^\n]+: 'both'/);
+  assert.match(source, /client_ip_mode: clientIPModeSelect\.value/);
+});
+
+test('main video strategy uses a compact selector and defaults to proxy', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /<select[^>]+id="m-main-video-mode"/);
+  assert.match(source, /<option value="proxy"[^>]*>反代<\/option>/);
+  assert.match(source, /<option value="direct"[^>]*>直连<\/option>/);
+  assert.doesNotMatch(source, /m-main-video-(?:proxy|direct)|main-video-mode-control/);
+  assert.match(source, /mainVideoModeSelect\.value = isEdit[^\n]+: 'proxy'/);
+  assert.match(source, /main_video_stream_mode: mainVideoModeSelect\.value/);
+});
+
+test('advanced settings align main video with the separate cache limit row', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  const style = fs.readFileSync(path.join(STATIC_JS, '..', 'css', 'style.css'), 'utf8');
+  assert.match(source, /class="form-group cache-limit-group"/);
+  assert.match(source, /class="cache-limit-grid"/);
+  assert.match(style, /"video cache-limits \."/);
+  assert.match(style, /\.cache-limit-group \{ grid-area: cache-limits; \}/);
 });

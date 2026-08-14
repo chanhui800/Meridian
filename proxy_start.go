@@ -156,12 +156,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			originalURL := *proxyReq.Out.URL
 			applyUpstreamURL(proxyReq.Out.URL, upstream)
 			proxyReq.Out.Host = upstream.Host
-			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy, inst.trustedProxies)
+			prepareUpstreamHeadersWithClientIPMode(proxyReq.Out.Header, proxyReq.In, policy, site.ClientIPMode, inst.trustedProxies)
 			if !sameRedirectAuthority(target, upstream) {
 				// Direct playback can target a separate CDN. Treat that authority like
 				// a cross-origin redirect and rebuild from a narrow allowlist so client
 				// cookies, bearer tokens, and arbitrary secret headers cannot follow it.
-				proxyReq.Out.Header = crossAuthorityRedirectHeaders(proxyReq.Out.Header)
+				proxyReq.Out.Header = crossAuthorityRedirectHeadersWithClientIPMode(proxyReq.Out.Header, site.ClientIPMode)
 			}
 			applySiteForwardedHost(proxyReq.Out.Header, proxyReq.In, site)
 			configuredHeaders.apply(proxyReq.Out.Header, upstream)
@@ -251,6 +251,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			disableLegacyRedirects:  !isRedirectMode,
 			followUnknownRedirects:  redirectPolicy.configured,
 			policy:                  policy,
+			clientIPMode:            site.ClientIPMode,
 			upstreamHeaderPolicy:    configuredHeaders,
 			dynamicPolicy:           redirectPolicy,
 			dynamicTransportFactory: pm.dynamicTransportFactory,

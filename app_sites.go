@@ -94,6 +94,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomUserAgent            string                `json:"custom_user_agent"`
 			CustomClient               string                `json:"custom_client"`
 			CustomVersion              string                `json:"custom_version"`
+			ClientIPMode               string                `json:"client_ip_mode"`
 			UpstreamHeaders            []UpstreamHeaderInput `json:"upstream_headers"`
 			DynamicDiscoveryEnabled    bool                  `json:"dynamic_discovery_enabled"`
 			DynamicProfile             string                `json:"dynamic_profile"`
@@ -228,6 +229,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		req.CustomUserAgent = customUserAgent
 		req.CustomClient = customClient
 		req.CustomVersion = customVersion
+		req.ClientIPMode, err = normalizeClientIPMode(req.ClientIPMode)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		req.MainVideoStreamMode, err = normalizeMainVideoStreamMode(req.MainVideoStreamMode)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
@@ -295,6 +301,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomUserAgent:               req.CustomUserAgent,
 			CustomClient:                  req.CustomClient,
 			CustomVersion:                 req.CustomVersion,
+			ClientIPMode:                  req.ClientIPMode,
 			StoredUpstreamHeaders:         storedHeaders,
 			DynamicDiscoveryEnabled:       dynamicPolicy.DynamicDiscoveryEnabled,
 			DynamicProfile:                dynamicPolicy.DynamicProfile,
@@ -487,6 +494,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			CustomUserAgent            *string                `json:"custom_user_agent"`
 			CustomClient               *string                `json:"custom_client"`
 			CustomVersion              *string                `json:"custom_version"`
+			ClientIPMode               *string                `json:"client_ip_mode"`
 			UpstreamHeaders            *[]UpstreamHeaderInput `json:"upstream_headers"`
 			DynamicDiscoveryEnabled    *bool                  `json:"dynamic_discovery_enabled"`
 			DynamicProfile             *string                `json:"dynamic_profile"`
@@ -728,6 +736,13 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.CustomUserAgent = customUserAgent
 		candidate.CustomClient = customClient
 		candidate.CustomVersion = customVersion
+		if req.ClientIPMode != nil {
+			candidate.ClientIPMode, err = normalizeClientIPMode(*req.ClientIPMode)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		candidate.StoredUpstreamHeaders = storedHeaders
 		if req.DynamicDiscoveryEnabled != nil {
 			candidate.DynamicDiscoveryEnabled = *req.DynamicDiscoveryEnabled
