@@ -997,16 +997,30 @@ html[data-theme="light"] .modal.site-config-modal {
 .site-form-columns {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-areas:
+    "ua cache-toggle quota"
+    "client-ip cache-rules speed"
+    "video cache-limits .";
   gap: 16px;
   align-items: start;
 }
-.site-form-column {
-  display: flex;
+.site-form-columns > .form-group {
   min-width: 0;
-  flex-direction: column;
-  gap: 16px;
+  margin-bottom: 0;
 }
-.site-form-column > .form-group { margin-bottom: 0; }
+.site-form-columns > .form-group:has(> #m-ua) { grid-area: ua; }
+.site-form-columns > .form-group:has(> #m-client-ip-mode) { grid-area: client-ip; }
+.site-form-columns > .form-group:has(> #m-main-video-mode) { grid-area: video; }
+.site-form-columns > .form-group:has(> #m-asset-cache) { grid-area: cache-toggle; }
+.site-form-columns > .form-group:has(> #m-cache-rules) { grid-area: cache-rules; }
+.site-form-columns > .cache-limit-group { grid-area: cache-limits; }
+.site-form-columns > .form-group:has(> #m-quota) { grid-area: quota; }
+.site-form-columns > .form-group:has(> #m-speed) { grid-area: speed; }
+.cache-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
 
 .site-advanced-card {
   align-self: start;
@@ -1066,7 +1080,14 @@ html[data-theme="light"] .modal.site-config-modal {
 
 @media (max-width: 1100px) {
   .site-config-modal .modal-body { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .site-form-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .site-form-columns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas:
+      "ua cache-toggle"
+      "client-ip quota"
+      "video speed"
+      "cache-rules cache-limits";
+  }
 }
 
 .modal-select {
@@ -1722,7 +1743,6 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
   .site-advanced-summary { min-height: 48px; padding: 0 14px; }
   .site-advanced-body { padding: 14px; }
   .site-form-columns { display: block; }
-  .site-form-column + .site-form-column { margin-top: 12px; }
   .site-config-modal .upstream-line {
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
@@ -2914,52 +2934,6 @@ html[data-theme="light"] .toast {
   box-shadow: 0 14px 34px rgba(2,6,23,.18);
 }
 
-.main-video-mode-control {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px;
-  padding: 4px;
-  border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  background: var(--panel-soft);
-}
-
-.form-group .main-video-mode-control label {
-  position: relative;
-  margin: 0;
-  cursor: pointer;
-  text-align: center;
-  text-transform: none;
-  letter-spacing: 0;
-}
-
-.main-video-mode-control input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.main-video-mode-control span {
-  display: block;
-  min-height: 36px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  color: var(--white-60);
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.main-video-mode-control input:checked + span {
-  background: var(--panel-raised);
-  color: var(--blue);
-  box-shadow: 0 1px 4px rgba(15,23,42,.12);
-}
-
-.main-video-mode-control input:focus-visible + span {
-  outline: 2px solid var(--blue);
-  outline-offset: 1px;
-}
-
 .toast.error,
 html[data-theme="light"] .toast.error {
   border-left-color: var(--red);
@@ -3138,6 +3112,13 @@ html[data-theme="light"] .toast.error {
 @media (max-width: 480px) {
   .login-card {
     padding: 28px 22px;
+  }
+
+  #m-client-ip-mode {
+    padding-left: 10px;
+    padding-right: 28px;
+    background-position: right 9px center;
+    font-size: .72rem;
   }
 
   .stats-row {

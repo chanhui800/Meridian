@@ -566,7 +566,7 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			defer db.Close()
 
-			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "public_host", "ingress_mode", "upstream_headers"} {
+			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "client_ip_mode", "public_host", "ingress_mode", "upstream_headers"} {
 				var count int
 				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
 					t.Fatalf("inspect %s: %v", column, err)
@@ -589,7 +589,7 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			if site.UAMode != "infuse" || site.CustomUserAgent != "" || site.CustomClient != "" || site.CustomVersion != "" {
 				t.Fatalf("migrated site UA config = %#v", site)
 			}
-			if site.PublicHost != "" || site.IngressMode != ingressModePort || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
+			if site.PublicHost != "" || site.IngressMode != ingressModePort || site.ClientIPMode != clientIPModeBoth || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
 				t.Fatalf("migrated site ingress config = %#v", site)
 			}
 		})
@@ -1167,6 +1167,131 @@ func TestTrustedProxyForwardingUsesOnlyNormalizedEdgeValues(t *testing.T) {
 	}
 }
 
+func TestClientIPModeFiltersNormalizedForwardingHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://media.example.com/Videos/1/stream", nil)
+	request.RemoteAddr = "198.51.100.25:43210"
+	request.Header.Set("X-Real-IP", "203.0.113.10")
+	request.Header.Set("X-Forwarded-For", "203.0.113.11, 10.0.0.1")
+
+	for _, tc := range []struct {
+		mode      string
+		realIP    string
+		forwarded string
+	}{
+		{mode: clientIPModeBoth, realIP: "198.51.100.25", forwarded: "198.51.100.25"},
+		{mode: clientIPModeRealIP, realIP: "198.51.100.25"},
+		{mode: clientIPModeNone},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			header := request.Header.Clone()
+			prepareUpstreamHeadersWithClientIPMode(header, request, UAHeaderPolicy{}, tc.mode)
+			if got := header.Get("X-Real-IP"); got != tc.realIP {
+				t.Fatalf("X-Real-IP=%q, want %q", got, tc.realIP)
+			}
+			if got := header.Get("X-Forwarded-For"); got != tc.forwarded {
+				t.Fatalf("X-Forwarded-For=%q, want %q", got, tc.forwarded)
+			}
+			if got := header.Get("X-Forwarded-Proto"); got != "http" {
+				t.Fatalf("X-Forwarded-Proto=%q, want http", got)
+			}
+		})
+	}
+
+	target, err := normalizeTargetURL("http://origin.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsHeader := prepareWebSocketUpstreamHeadersWithClientIPMode(request, target, UAHeaderPolicy{}, nil, clientIPModeNone)
+	if wsHeader.Get("X-Real-IP") != "" || wsHeader.Get("X-Forwarded-For") != "" {
+		t.Fatalf("WebSocket forwarding headers were not removed: %v", wsHeader)
+	}
+
+	normalized := make(http.Header)
+	normalized.Set("X-Real-IP", "198.51.100.25")
+	normalized.Set("X-Forwarded-For", "198.51.100.25")
+	normalized.Set("Authorization", "Bearer must-not-cross")
+	crossAuthority := crossAuthorityRedirectHeadersWithClientIPMode(normalized, clientIPModeBoth)
+	if crossAuthority.Get("X-Real-IP") != "198.51.100.25" || crossAuthority.Get("X-Forwarded-For") != "198.51.100.25" {
+		t.Fatalf("normalized cross-authority client IP headers were not preserved: %v", crossAuthority)
+	}
+	if crossAuthority.Get("Authorization") != "" {
+		t.Fatalf("cross-authority authorization leaked: %q", crossAuthority.Get("Authorization"))
+	}
+
+	for _, mode := range []string{"", "both", "REAL_IP", "none"} {
+		if _, err := normalizeClientIPMode(mode); err != nil {
+			t.Fatalf("normalizeClientIPMode(%q): %v", mode, err)
+		}
+	}
+	if _, err := normalizeClientIPMode("inherit"); err == nil {
+		t.Fatal("inherit client_ip_mode unexpectedly accepted")
+	}
+}
+
+func TestClientIPModeAppliesToLiveReverseProxyRequests(t *testing.T) {
+	for _, tc := range []struct {
+		mode          string
+		wantRealIP    bool
+		wantForwarded bool
+	}{
+		{mode: clientIPModeBoth, wantRealIP: true, wantForwarded: true},
+		{mode: clientIPModeRealIP, wantRealIP: true},
+		{mode: clientIPModeNone},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			received := make(chan http.Header, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Header.Clone()
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+
+			app := newTestApp(t)
+			port := freePort(t)
+			releasePort(port)
+			site, err := app.db.CreateSiteRecord(Site{
+				Name:         "client-ip-" + tc.mode,
+				ListenPort:   port,
+				IngressMode:  ingressModePort,
+				TargetURL:    upstream.URL,
+				UAMode:       passthroughUAMode,
+				ClientIPMode: tc.mode,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := app.pm.StartSite(*site); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/System/Info/Public", port), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Real-IP", "203.0.113.10")
+			req.Header.Set("X-Forwarded-For", "203.0.113.11, 10.0.0.1")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+
+			select {
+			case header := <-received:
+				if got := header.Get("X-Real-IP"); (got != "") != tc.wantRealIP {
+					t.Fatalf("X-Real-IP=%q, want present=%v", got, tc.wantRealIP)
+				}
+				if got := header.Get("X-Forwarded-For"); (got != "") != tc.wantForwarded {
+					t.Fatalf("X-Forwarded-For=%q, want present=%v", got, tc.wantForwarded)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("upstream request was not received")
+			}
+		})
+	}
+}
+
 func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
 	var siteTraffic atomic.Int64
 	siteTraffic.Store(10 << 20)
@@ -1268,7 +1393,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.35", "/css/style.css?v=1.8.35", "/js/pages/sites.js?v=1.8.35", "/js/pages/request-logs.js?v=1.8.35", "/js/app.js?v=1.8.35"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.36", "/css/style.css?v=1.8.36", "/js/pages/sites.js?v=1.8.36", "/js/pages/request-logs.js?v=1.8.36", "/js/app.js?v=1.8.36"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4680,7 +4805,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"primary_line_name":   true,
 		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
-		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
+		"custom_version": true, "client_ip_mode": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
 		"updated_at": true, "running": true,
 		"dynamic_discovery_enabled": true, "dynamic_profile": true,
@@ -4979,6 +5104,47 @@ func TestHandleSitesPersistsAndUpdatesFailoverTargets(t *testing.T) {
 	}
 	if len(reloaded.FailoverTargetList) != 0 {
 		t.Fatalf("explicit empty failover_targets=%#v, want none", reloaded.FailoverTargetList)
+	}
+}
+
+func TestHandleSitesPersistsAndUpdatesClientIPMode(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	createPayload := []byte(`{"name":"client-ip-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","client_ip_mode":"real_ip"}`)
+	created := httptest.NewRecorder()
+	app.handleSites(created, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(createPayload)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var site Site
+	if err := json.Unmarshal(created.Body.Bytes(), &site); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	if site.ClientIPMode != clientIPModeRealIP {
+		t.Fatalf("created client_ip_mode=%q, want %q", site.ClientIPMode, clientIPModeRealIP)
+	}
+
+	updatePayload := []byte(`{"name":"client-ip-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","client_ip_mode":"none"}`)
+	updated := httptest.NewRecorder()
+	app.handleSiteByID(updated, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(updatePayload)))
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ClientIPMode != clientIPModeNone {
+		t.Fatalf("updated client_ip_mode=%q, want %q", reloaded.ClientIPMode, clientIPModeNone)
+	}
+
+	invalidPayload := []byte(`{"name":"client-ip-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","client_ip_mode":"inherit"}`)
+	invalid := httptest.NewRecorder()
+	app.handleSiteByID(invalid, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(invalidPayload)))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid update status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
 }
 

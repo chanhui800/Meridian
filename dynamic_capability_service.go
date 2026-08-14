@@ -662,9 +662,9 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 	outbound.Close = !claims.Trusted
 	if claims.Trusted {
 		outbound.Header = r.Header.Clone()
-		prepareUpstreamHeaders(outbound.Header, r, i.uaPolicy, i.trustedProxies)
+		prepareUpstreamHeadersWithClientIPMode(outbound.Header, r, i.uaPolicy, i.site.ClientIPMode, i.trustedProxies)
 		if redirectHostKey(target) != i.primaryAuthority {
-			outbound.Header = crossAuthorityRedirectHeaders(outbound.Header)
+			outbound.Header = crossAuthorityRedirectHeadersWithClientIPMode(outbound.Header, i.site.ClientIPMode)
 		}
 		applySiteForwardedHost(outbound.Header, r, i.site)
 		i.upstreamHeaderPolicy.apply(outbound.Header, target)
@@ -720,6 +720,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			disableLegacyRedirects:  disableLegacyRedirects,
 			followUnknownRedirects:  true,
 			policy:                  uaPolicy,
+			clientIPMode:            i.site.ClientIPMode,
 			upstreamHeaderPolicy:    upstreamPolicy,
 			dynamicPolicy:           i.policy,
 			dynamicTransportFactory: i.transportFactory,

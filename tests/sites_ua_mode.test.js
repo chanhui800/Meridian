@@ -107,6 +107,9 @@ test('site management exposes latency tests and safe asset cache controls', () =
   assert.match(source, /async function testSiteLatency/);
   assert.match(source, /async function testAllSitesLatency/);
   assert.match(source, /id="m-asset-cache"/);
+  assert.match(source, /<select[^>]+id="m-asset-cache"/);
+  assert.doesNotMatch(source, /<input[^>]+id="m-asset-cache"/);
+  assert.match(source, /asset_cache_enabled: document\.getElementById\('m-asset-cache'\)\.value === 'on'/);
   assert.match(source, /asset_cache_enabled:/);
   assert.match(source, /asset_cache_rules:/);
   assert.match(source, /\*\/file\/\*/);
