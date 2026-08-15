@@ -1,4 +1,5 @@
 // Sites management page
+let siteSortingCleanup = null;
 function renderSites() {
   const page = document.getElementById('page-sites');
   page.innerHTML = `
@@ -42,9 +43,14 @@ async function loadSites() {
 		const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
 
       return `
-      <div class="site-card fade-up stagger-${Math.min(i + 1, 6)}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
+      <div class="site-card" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
         <div class="site-top">
-          <div class="site-heading"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
+          <div class="site-heading">
+            <button type="button" class="site-drag-handle" data-site-drag-handle aria-label="拖拽调整 ${esc(s.name)} 的顺序" title="拖拽调整顺序">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"></circle><circle cx="13" cy="5" r="1.25"></circle><circle cx="7" cy="10" r="1.25"></circle><circle cx="13" cy="10" r="1.25"></circle><circle cx="7" cy="15" r="1.25"></circle><circle cx="13" cy="15" r="1.25"></circle></svg>
+            </button>
+            <div class="site-heading-content"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
+          </div>
           <div class="site-card-state">
             <span class="site-mode-badge">${siteIngressModeLabel(s)}</span>
             <span class="status-badge site-status">
@@ -108,6 +114,7 @@ async function loadSites() {
         if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
       });
     });
+    setupSiteSorting(grid);
   } catch (e) {
     Toast.error('加载站点失败: ' + e.message);
   }
@@ -115,9 +122,201 @@ async function loadSites() {
 
 function filterSiteCards(query) {
   const needle = String(query || '').trim().toLowerCase();
-  document.querySelectorAll('#sites-grid .site-card').forEach(card => {
+  const grid = document.getElementById('sites-grid');
+  if (!grid) return;
+  grid.classList.toggle('is-filtered', !!needle);
+  grid.querySelectorAll('.site-card').forEach(card => {
     card.hidden = !!needle && !String(card.dataset.siteSearch || '').includes(needle);
   });
+  grid.querySelectorAll('[data-site-drag-handle]').forEach(handle => {
+    handle.disabled = !!needle;
+    handle.title = needle ? '清除搜索后可调整顺序' : '拖拽调整顺序';
+  });
+}
+
+function siteOrderFromGrid(grid) {
+  return [...grid.querySelectorAll('.site-card[data-site-id]')]
+    .map(card => Number(card.dataset.siteId))
+    .filter(Number.isSafeInteger);
+}
+
+function captureSiteDropSlots(grid, draggedCard) {
+  const scrollX = typeof window !== 'undefined' ? (window.scrollX || 0) : 0;
+  const scrollY = typeof window !== 'undefined' ? (window.scrollY || 0) : 0;
+  return [...grid.children]
+    .filter(node => node !== draggedCard && !node.hidden)
+    .map(node => {
+      const rect = node.getBoundingClientRect();
+      return {
+        x: rect.left + rect.width / 2 + scrollX,
+        y: rect.top + rect.height / 2 + scrollY,
+        width: Math.max(rect.width, 1),
+        height: Math.max(rect.height, 1),
+      };
+    });
+}
+
+function moveSitePlaceholderAtPoint(grid, draggedCard, placeholder, dropSlots, clientX, clientY) {
+  if (!placeholder || !dropSlots.length) return;
+  const scrollX = typeof window !== 'undefined' ? (window.scrollX || 0) : 0;
+  const scrollY = typeof window !== 'undefined' ? (window.scrollY || 0) : 0;
+  const pointerX = clientX + scrollX;
+  const pointerY = clientY + scrollY;
+  let desiredIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  dropSlots.forEach((slot, index) => {
+    const dx = (pointerX - slot.x) / slot.width;
+    const dy = (pointerY - slot.y) / slot.height;
+    const distance = dx * dx + dy * dy;
+    if (distance < nearestDistance) {
+      desiredIndex = index;
+      nearestDistance = distance;
+    }
+  });
+
+  const orderedCards = [...grid.querySelectorAll('.site-card[data-site-id]')]
+    .filter(card => card !== draggedCard);
+  const reference = orderedCards[desiredIndex] || null;
+  if (reference !== placeholder.nextSibling) grid.insertBefore(placeholder, reference);
+}
+
+function positionDraggedSiteCard(card, clientX, clientY, offsetX, offsetY) {
+  card.style.left = `${clientX - offsetX}px`;
+  card.style.top = `${clientY - offsetY}px`;
+  card.style.transform = 'translate3d(0, 0, 0)';
+}
+
+async function persistSiteOrder(grid) {
+  const siteIds = siteOrderFromGrid(grid);
+  const nextOrder = siteIds.join(',');
+  if (!siteIds.length || nextOrder === grid.dataset.siteOrder) return;
+  grid.classList.add('is-saving-order');
+  try {
+    await API.reorderSites(siteIds);
+    grid.dataset.siteOrder = nextOrder;
+    Toast.success('站点顺序已保存，仪表盘已同步');
+  } catch (error) {
+    Toast.error('保存站点顺序失败: ' + error.message);
+    await loadSites();
+  } finally {
+    grid.classList.remove('is-saving-order');
+  }
+}
+
+function setupSiteSorting(grid) {
+  if (typeof siteSortingCleanup === 'function') siteSortingCleanup();
+  const cards = [...grid.querySelectorAll('.site-card[data-site-id]')];
+  grid.dataset.siteOrder = siteOrderFromGrid(grid).join(',');
+  let draggedCard = null;
+  let placeholder = null;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+  let dropSlots = [];
+  let activeHandle = null;
+  let activePointerId = null;
+
+  const beginDrag = (card, event) => {
+    const rect = card.getBoundingClientRect();
+    draggedCard = card;
+    dragOffsetX = event.clientX - rect.left;
+    dragOffsetY = event.clientY - rect.top;
+    placeholder = document.createElement('div');
+    placeholder.className = 'site-card-placeholder';
+    placeholder.setAttribute('aria-hidden', 'true');
+    placeholder.style.height = `${rect.height}px`;
+    grid.insertBefore(placeholder, card);
+
+    card.style.position = 'fixed';
+    card.style.left = `${rect.left}px`;
+    card.style.top = `${rect.top}px`;
+    card.style.width = `${rect.width}px`;
+    card.style.height = `${rect.height}px`;
+    card.style.margin = '0';
+    card.style.transform = 'translate3d(0, 0, 0)';
+    card.classList.add('is-dragging');
+    grid.classList.add('is-reordering');
+    document.body.classList.add('is-site-dragging');
+    dropSlots = captureSiteDropSlots(grid, card);
+  };
+  const finishDrag = card => {
+    if (draggedCard !== card) return;
+    if (placeholder && placeholder.parentElement === grid) grid.insertBefore(card, placeholder);
+    if (placeholder) placeholder.remove();
+    placeholder = null;
+    dropSlots = [];
+    card.style.position = '';
+    card.style.left = '';
+    card.style.top = '';
+    card.style.width = '';
+    card.style.height = '';
+    card.style.margin = '';
+    card.style.transform = '';
+    card.classList.remove('is-dragging');
+    grid.classList.remove('is-reordering');
+    document.body.classList.remove('is-site-dragging');
+    draggedCard = null;
+    void persistSiteOrder(grid);
+  };
+
+  const movePointer = event => {
+    if (!draggedCard) return;
+    if (event.type === 'pointermove' && activePointerId !== null && event.pointerId !== activePointerId) return;
+    if (event.cancelable) event.preventDefault();
+    positionDraggedSiteCard(draggedCard, event.clientX, event.clientY, dragOffsetX, dragOffsetY);
+    const edge = 64;
+    if (typeof window !== 'undefined' && window.scrollBy) {
+      if (event.clientY < edge) window.scrollBy(0, -12);
+      if (event.clientY > window.innerHeight - edge) window.scrollBy(0, 12);
+    }
+    moveSitePlaceholderAtPoint(grid, draggedCard, placeholder, dropSlots, event.clientX, event.clientY);
+  };
+
+  const finishPointer = event => {
+    if (!draggedCard) return;
+    if (event.type.startsWith('pointer') && activePointerId !== null && event.pointerId !== activePointerId) return;
+    const card = draggedCard;
+    if (activeHandle && activePointerId !== null && activeHandle.releasePointerCapture && activeHandle.hasPointerCapture) {
+      try {
+        if (activeHandle.hasPointerCapture(activePointerId)) activeHandle.releasePointerCapture(activePointerId);
+      } catch (_) {}
+    }
+    activeHandle = null;
+    activePointerId = null;
+    finishDrag(card);
+  };
+
+  cards.forEach(card => {
+    const handle = card.querySelector('[data-site-drag-handle]');
+    if (!handle) return;
+
+    handle.addEventListener('pointerdown', event => {
+      if (handle.disabled || (Number.isFinite(event.button) && event.button !== 0)) return;
+      event.preventDefault();
+      activeHandle = handle;
+      activePointerId = event.pointerId;
+      beginDrag(card, event);
+      if (handle.setPointerCapture) {
+        try { handle.setPointerCapture(event.pointerId); } catch (_) {}
+      }
+    });
+  });
+
+  window.addEventListener('pointermove', movePointer, { passive: false });
+  window.addEventListener('pointerup', finishPointer);
+  window.addEventListener('pointercancel', finishPointer);
+  // Mouse fallbacks cover browsers and automation surfaces that begin with a
+  // PointerEvent but only deliver compatibility mouse movement afterwards.
+  window.addEventListener('mousemove', movePointer, { passive: false });
+  window.addEventListener('mouseup', finishPointer);
+  siteSortingCleanup = () => {
+    window.removeEventListener('pointermove', movePointer);
+    window.removeEventListener('pointerup', finishPointer);
+    window.removeEventListener('pointercancel', finishPointer);
+    window.removeEventListener('mousemove', movePointer);
+    window.removeEventListener('mouseup', finishPointer);
+    if (draggedCard) finishPointer({ type: 'pointercancel', pointerId: activePointerId });
+    siteSortingCleanup = null;
+  };
 }
 
 async function testSiteLatency(id, button) {

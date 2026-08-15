@@ -45,6 +45,7 @@ func (a *App) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
+		w.Header().Set("Cache-Control", "no-store")
 		sites, err := a.db.ListSites()
 		if err != nil {
 			a.jsonErr(w, 500, err.Error())
@@ -343,6 +344,34 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.jsonErr(w, 405, "method not allowed")
 	}
+}
+
+func (a *App) handleSiteReorder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		SiteIDs []int64 `json:"site_ids"`
+	}
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	a.siteLifecycleMu.Lock()
+	defer a.siteLifecycleMu.Unlock()
+	if err := a.db.ReorderSites(req.SiteIDs); err != nil {
+		if errors.Is(err, errInvalidSiteOrder) {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("reorder sites: %v", err)
+		a.jsonErr(w, http.StatusInternalServerError, "save site order failed")
+		return
+	}
+	a.jsonOK(w, map[string]interface{}{
+		"site_ids": req.SiteIDs,
+	})
 }
 
 // Site lifecycle, diagnostics, and dynamic-observation routes.

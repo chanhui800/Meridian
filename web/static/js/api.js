@@ -111,6 +111,7 @@ const API = {
   },
   listSites() { return this.request('GET', '/api/sites'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },
+  reorderSites(siteIds) { return this.request('PUT', '/api/sites/reorder', { site_ids: siteIds }); },
   updateSite(id, data) { return this.request('PUT', '/api/sites/' + id, data); },
   deleteSite(id) { return this.request('DELETE', '/api/sites/' + id); },
   toggleSite(id) { return this.request('POST', '/api/sites/' + id + '/toggle'); },
