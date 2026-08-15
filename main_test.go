@@ -1393,7 +1393,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.36", "/css/style.css?v=1.8.36", "/js/pages/sites.js?v=1.8.36", "/js/pages/request-logs.js?v=1.8.36", "/js/app.js?v=1.8.36"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.37", "/css/style.css?v=1.8.37", "/js/pages/sites.js?v=1.8.37", "/js/pages/request-logs.js?v=1.8.37", "/js/app.js?v=1.8.37"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -2129,6 +2129,30 @@ func TestPanelListenAddressSeparatesPanelFromSiteListeners(t *testing.T) {
 	} {
 		if _, err := panelListenAddress(tc.bind, tc.port); err == nil {
 			t.Fatalf("panelListenAddress(%q, %d) unexpectedly succeeded", tc.bind, tc.port)
+		}
+	}
+}
+
+func TestPanelListenerSpecsUseBothIPVersionsForWildcard(t *testing.T) {
+	for _, bind := range []string{"", "0.0.0.0", "::"} {
+		specs, err := panelListenerSpecs(bind, 9090)
+		if err != nil {
+			t.Fatalf("panelListenerSpecs(%q): %v", bind, err)
+		}
+		if len(specs) != 2 || specs[0].network != "tcp4" || specs[1].network != "tcp6" {
+			t.Fatalf("panelListenerSpecs(%q) = %#v, want tcp4 and tcp6", bind, specs)
+		}
+	}
+	for _, tc := range []struct {
+		bind    string
+		network string
+	}{
+		{bind: "127.0.0.1", network: "tcp4"},
+		{bind: "::1", network: "tcp6"},
+	} {
+		specs, err := panelListenerSpecs(tc.bind, 9090)
+		if err != nil || len(specs) != 1 || specs[0].network != tc.network {
+			t.Fatalf("panelListenerSpecs(%q) = %#v, %v; want one %s listener", tc.bind, specs, err, tc.network)
 		}
 	}
 }

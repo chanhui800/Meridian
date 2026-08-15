@@ -29,6 +29,10 @@ read_secret() {
 
 docker build --build-arg VERSION=v1.8.26 -t "$image" "$repo_root" >/dev/null
 
+binary_capability=$(docker run --rm --entrypoint sh "$image" -c 'getcap /app/meridian')
+printf '%s\n' "$binary_capability" | grep -Fq 'cap_net_bind_service=ep' \
+    || fail_test "Meridian binary lacks CAP_NET_BIND_SERVICE: $binary_capability"
+
 fresh_data="$test_root/fresh"
 mkdir -p "$fresh_data"
 first_output=$(docker run --rm -v "$fresh_data:/app/data" "$image" --version)

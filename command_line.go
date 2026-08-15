@@ -67,20 +67,23 @@ func runHealthcheckCommand() error {
 		},
 	}
 	var lastErr error
+	hosts := []string{"127.0.0.1", "::1"}
 	for _, scheme := range []string{"https", "http"} {
-		endpoint := fmt.Sprintf("%s://127.0.0.1:%d/api/auth/check", scheme, port)
-		// #nosec G704 -- scheme is selected from the fixed list above, host/path are constant loopback values, and port is range-validated.
-		resp, requestErr := client.Get(endpoint)
-		if requestErr != nil {
-			lastErr = requestErr
-			continue
+		for _, host := range hosts {
+			endpoint := fmt.Sprintf("%s://%s/api/auth/check", scheme, net.JoinHostPort(host, strconv.Itoa(port)))
+			// #nosec G704 -- scheme and host are selected from fixed loopback lists, path is constant, and port is range-validated.
+			resp, requestErr := client.Get(endpoint)
+			if requestErr != nil {
+				lastErr = requestErr
+				continue
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			closeErr := resp.Body.Close()
+			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices && closeErr == nil {
+				return nil
+			}
+			lastErr = fmt.Errorf("%s returned HTTP %d", endpoint, resp.StatusCode)
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		closeErr := resp.Body.Close()
-		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices && closeErr == nil {
-			return nil
-		}
-		lastErr = fmt.Errorf("%s returned HTTP %d", endpoint, resp.StatusCode)
 	}
 	return fmt.Errorf("panel healthcheck failed: %w", lastErr)
 }
