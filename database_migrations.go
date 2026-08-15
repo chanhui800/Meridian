@@ -83,6 +83,7 @@ func (d *DB) migrateOnce() error {
 	);
 		CREATE TABLE IF NOT EXISTS sites (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			sort_order INTEGER NOT NULL DEFAULT 0,
 			name TEXT NOT NULL,
 			listen_port INTEGER NOT NULL UNIQUE,
 			public_host TEXT NOT NULL DEFAULT '',
@@ -231,6 +232,7 @@ func (d *DB) migrateOnce() error {
 		{"asset_cache_ttl_sec", "ALTER TABLE sites ADD COLUMN asset_cache_ttl_sec INTEGER NOT NULL DEFAULT 86400"},
 		{"asset_cache_max_bytes", "ALTER TABLE sites ADD COLUMN asset_cache_max_bytes BIGINT NOT NULL DEFAULT 536870912"},
 		{"asset_cache_rules", "ALTER TABLE sites ADD COLUMN asset_cache_rules TEXT NOT NULL DEFAULT '*/file/*\n*/emby/Items/*/Images/*'"},
+		{"sort_order", "ALTER TABLE sites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 	} {
 		exists, err := sqliteColumnExists(ctx, conn, migration.column)
 		if err != nil {
@@ -239,6 +241,11 @@ func (d *DB) migrateOnce() error {
 		if !exists {
 			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
 				return err
+			}
+			if migration.column == "sort_order" {
+				if _, err := conn.ExecContext(ctx, "UPDATE sites SET sort_order=id"); err != nil {
+					return err
+				}
 			}
 		}
 	}

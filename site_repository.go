@@ -8,8 +8,11 @@ import (
 	"strings"
 )
 
+var errInvalidSiteOrder = errors.New("invalid site order")
+
 type Site struct {
 	ID                            int64                `json:"id"`
+	SortOrder                     int64                `json:"sort_order"`
 	Name                          string               `json:"name"`
 	ListenPort                    int                  `json:"listen_port"`
 	PublicHost                    string               `json:"public_host"`
@@ -138,7 +141,7 @@ func (d *DB) validateStoredDynamicPolicies() error {
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
+	rows, err := d.db.Query("SELECT id, sort_order, name, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY sort_order, id")
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +150,7 @@ func (d *DB) ListSites() ([]Site, error) {
 	for rows.Next() {
 		var s Site
 		var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int
-		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SortOrder, &s.Name, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Enabled = enabled == 1
@@ -168,8 +171,8 @@ func (d *DB) ListSites() ([]Site, error) {
 func (d *DB) GetSite(id int64) (*Site, error) {
 	var s Site
 	var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled int
-	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	err := d.db.QueryRow("SELECT id, sort_order, name, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
+		Scan(&s.ID, &s.SortOrder, &s.Name, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +270,7 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	}
 	site.DynamicPolicyRevision = 1
 	res, err := d.db.Exec(
-		"INSERT INTO sites (name, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO sites (sort_order, name, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, traffic_quota, speed_limit) VALUES ((SELECT COALESCE(MAX(sort_order), -1) + 1 FROM sites),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		site.Name, site.ListenPort, site.PublicHost, site.PathPrefix, site.IngressMode, site.TargetURL, site.PrimaryLineName, site.PlaybackTargetURL, site.PlaybackMode, site.MainVideoStreamMode, site.FailoverTargets, site.StoredFailoverLines, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.ClientIPMode, site.StoredUpstreamHeaders, sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
@@ -278,6 +281,55 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 		return nil, err
 	}
 	return d.GetSite(id)
+}
+
+func (d *DB) ReorderSites(siteIDs []int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT id FROM sites")
+	if err != nil {
+		return err
+	}
+	stored := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		stored[id] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(siteIDs) != len(stored) {
+		return fmt.Errorf("%w: site_ids must contain every site exactly once", errInvalidSiteOrder)
+	}
+
+	seen := make(map[int64]struct{}, len(siteIDs))
+	for position, id := range siteIDs {
+		if id <= 0 {
+			return fmt.Errorf("%w: invalid site id", errInvalidSiteOrder)
+		}
+		if _, ok := stored[id]; !ok {
+			return fmt.Errorf("%w: site %d does not exist", errInvalidSiteOrder, id)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("%w: site %d is duplicated", errInvalidSiteOrder, id)
+		}
+		seen[id] = struct{}{}
+		if _, err := tx.Exec("UPDATE sites SET sort_order=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", position, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (d *DB) UpdateSite(id int64, name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode string, quota int64, speedLimit int) error {

@@ -444,6 +444,7 @@ test('dashboard table paints live traffic_used and the running badge from one /a
   assert.deepEqual(calls, ['/api/sites'], 'the dashboard table must load from exactly one /api/sites request');
   const html = elements['dash-table'].innerHTML;
   assert.ok(html.includes('Alpha') && html.includes('Beta'), 'every site must be rendered');
+  assert.ok(html.indexOf('Alpha') < html.indexOf('Beta'), 'dashboard rows must preserve the persisted /api/sites order');
   assert.ok(html.includes(sandbox.formatBytes(1048576)), 'the authoritative traffic_used must be formatted into the row');
   assert.ok(html.includes(sandbox.formatBytes(2048)), 'each site cache size must be formatted into the row');
   assert.equal(elements['s-cache'].textContent, sandbox.formatBytes(3072), 'the dashboard cache card must sum every site');

@@ -1393,7 +1393,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.37", "/css/style.css?v=1.8.37", "/js/pages/sites.js?v=1.8.37", "/js/pages/request-logs.js?v=1.8.37", "/js/app.js?v=1.8.37"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.38", "/css/style.css?v=1.8.38", "/js/pages/sites.js?v=1.8.38", "/js/pages/request-logs.js?v=1.8.38", "/js/app.js?v=1.8.38"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4825,7 +4825,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		t.Fatalf("decode /api/sites: %v", err)
 	}
 	expectedKeys := map[string]bool{
-		"id": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
+		"id": true, "sort_order": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
 		"primary_line_name":   true,
 		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,

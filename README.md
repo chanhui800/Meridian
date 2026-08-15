@@ -7,11 +7,11 @@
 
 Meridian 是面向 Emby、Jellyfin 等媒体服务的多节点反向代理面板。本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，并参考 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI) 优化界面与交互。
 
-当前正式版本：`v1.8.37`
+当前正式版本：`v1.8.38`
 
 ## 主要功能
 
-- 多节点管理，支持独立端口、路径和域名前缀入口，以及主线路自动回切的多线路故障转移。
+- 多节点管理，支持拖拽调整站点顺序并同步到仪表盘，以及独立端口、路径、域名前缀入口和主线路自动回切的多线路故障转移。
 - 自动发现并改写 PlaybackInfo、HLS、DASH 和 HTTP 30x 播放地址。
 - 主视频流可选“反代”或“直连”，默认反代；网盘服 30x 可校验后交给客户端直连。
 - 支持 TLS 泛域名证书、静态资源缓存、流量统计和运行诊断。

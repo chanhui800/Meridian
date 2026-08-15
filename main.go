@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.37"
+var appVersion = "v1.8.38"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -228,6 +228,7 @@ func main() {
 	mux.HandleFunc("/api/backup/export", cors(app.authMiddleware(app.handleBackupExport)))
 	mux.HandleFunc("/api/backup/restore", cors(app.authMiddleware(app.handleBackupRestore)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
+	mux.HandleFunc("/api/sites/reorder", cors(app.authMiddleware(app.handleSiteReorder)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/upstream-test", cors(app.authMiddleware(app.handleUpstreamTest)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))

@@ -5219,3 +5219,120 @@ html { font-size: 15px; }
   }
   .request-log-region { font-size: 11px; line-height: 1.2; }
 }
+
+/* Persistent site ordering shared by the site list and dashboard. */
+.site-heading {
+  min-width: 0;
+}
+
+.site-heading-content {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.site-drag-handle {
+  width: 28px;
+  height: 32px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: -6px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--white-38);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition: color .18s ease, background .18s ease;
+}
+
+.site-drag-handle svg {
+  width: 19px;
+  height: 19px;
+  fill: currentColor;
+}
+
+.site-drag-handle:hover,
+.site-drag-handle:focus-visible {
+  color: var(--white-87);
+  background: var(--panel-soft);
+  outline: none;
+}
+
+.site-drag-handle:active {
+  cursor: grabbing;
+}
+
+.site-drag-handle:disabled {
+  opacity: .28;
+  cursor: not-allowed;
+}
+
+.site-card.is-dragging,
+.site-card.is-dragging:hover {
+  z-index: 10020;
+  opacity: .96;
+  pointer-events: none;
+  cursor: grabbing;
+  transition: none;
+  will-change: transform;
+  background: var(--panel);
+  border-color: color-mix(in srgb, var(--blue) 55%, var(--panel-border));
+  box-shadow: 0 22px 55px color-mix(in srgb, #000 42%, transparent), 0 0 0 2px color-mix(in srgb, var(--blue) 28%, transparent);
+}
+
+.sites-grid.is-reordering .site-card:not(.is-dragging) {
+  transition: transform .14s ease, border-color .14s ease;
+}
+
+.site-card-placeholder {
+  position: relative;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.site-card-placeholder::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: min(72%, 260px);
+  aspect-ratio: 1;
+  border: 2px dashed color-mix(in srgb, var(--blue) 68%, transparent);
+  border-radius: 24px;
+  background: color-mix(in srgb, var(--blue) 11%, var(--panel-soft));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 9%, transparent), 0 12px 30px color-mix(in srgb, var(--blue) 8%, transparent);
+  transform: translate(-50%, -50%);
+}
+
+body.is-site-dragging,
+body.is-site-dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+.sites-grid.is-saving-order {
+  pointer-events: none;
+  cursor: progress;
+  opacity: .78;
+}
+
+@media (max-width: 720px) {
+  .site-heading {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .site-heading-content {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 7px;
+  }
+}
