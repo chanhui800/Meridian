@@ -6,13 +6,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=v1.8.36
+ARG VERSION=v1.8.37
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION}" -o meridian .
 
 # Runtime stage
 FROM alpine:3.24
 
-RUN apk add --no-cache ca-certificates su-exec tzdata
+RUN apk add --no-cache ca-certificates libcap su-exec tzdata
 
 WORKDIR /app
 RUN addgroup -S meridian && \
@@ -22,6 +22,8 @@ RUN addgroup -S meridian && \
     chmod 0700 /app/data
 COPY --from=builder --chown=root:root --chmod=0555 /app/meridian /app/meridian
 COPY --chown=root:root --chmod=0555 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN setcap cap_net_bind_service=+ep /app/meridian && \
+    getcap /app/meridian | grep -Fq 'cap_net_bind_service=ep'
 
 EXPOSE 9090
 

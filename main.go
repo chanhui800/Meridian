@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.36"
+var appVersion = "v1.8.37"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -262,12 +262,17 @@ func main() {
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 64 << 10,
 	}
-	panelListener, err := net.Listen("tcp", addr)
+	panelListeners, listenerFailures, err := listenPanel(os.Getenv("PANEL_BIND_ADDR"), port)
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
 	}
+	for _, failure := range listenerFailures {
+		log.Printf("panel %s listener unavailable on %s: %v", failure.spec.network, failure.spec.address, failure.err)
+	}
 	if panelTLSEnabled {
-		panelListener = tls.NewListener(panelListener, panelTLSConfig)
+		for i, listener := range panelListeners {
+			panelListeners[i] = tls.NewListener(listener, panelTLSConfig)
+		}
 	}
 	// Keep the rollback marker until the restored database, TLS configuration,
 	// proxy sites, and panel listener have all initialized successfully. A fatal
@@ -275,7 +280,9 @@ func main() {
 	// back automatically.
 	if restoreState != nil {
 		if err := finalizeAppliedRestore(dbPath); err != nil {
-			_ = panelListener.Close()
+			for _, listener := range panelListeners {
+				_ = listener.Close()
+			}
 			log.Fatalf("finalize restored data: %v", err)
 		}
 	}
@@ -286,7 +293,9 @@ func main() {
 	if panelTLSEnabled {
 		panelScheme = "https"
 	}
-	log.Printf("  Listening on: %s://%s", panelScheme, addr)
+	for _, listener := range panelListeners {
+		log.Printf("  Listening on: %s://%s", panelScheme, listener.Addr())
+	}
 	if routeDomain != "" {
 		log.Printf("  Domain-prefix ingress: *.%s", routeDomain)
 	}
@@ -298,11 +307,14 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		if err := srv.Serve(panelListener); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server failed: %v", err)
-		}
-	}()
+	serveErrors := make(chan error, len(panelListeners))
+	for _, listener := range panelListeners {
+		go func(listener net.Listener) {
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				serveErrors <- err
+			}
+		}(listener)
+	}
 
 	restartRequested := false
 	select {
@@ -311,6 +323,8 @@ func main() {
 	case <-app.restartCh:
 		restartRequested = true
 		log.Println("\nPanel restart requested, stopping Meridian...")
+	case err := <-serveErrors:
+		log.Fatalf("server failed: %v", err)
 	}
 
 	// Cancel background goroutines

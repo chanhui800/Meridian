@@ -7,7 +7,7 @@
 
 Meridian 是面向 Emby、Jellyfin 等媒体服务的多节点反向代理面板。本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，并参考 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI) 优化界面与交互。
 
-当前正式版本：`v1.8.36`
+当前正式版本：`v1.8.37`
 
 ## 主要功能
 
@@ -59,7 +59,7 @@ docker compose logs -f meridian
 
 首次启动会自动生成并持久化登录、上游请求头、动态路由和初始化所需的随机密钥，无需手动创建。查看容器日志获取首次管理员初始化令牌，然后访问 `http://服务器地址:9090`。
 
-Linux Docker 使用 `network_mode: host`，面板和节点端口会直接监听宿主机，请在防火墙中放行相应端口。数据保存在 `./data`，升级容器不会清除数据库、证书和缓存。
+Linux Docker 使用 `network_mode: host`，面板和节点端口会直接监听宿主机，请在防火墙中放行相应端口。容器中的 Meridian 仍以 UID 10001 非 root 用户运行，但二进制仅具备绑定低位端口所需的 `CAP_NET_BIND_SERVICE`，因此可直接使用包括 80、443 在内的任意未占用端口。数据保存在 `./data`，升级容器不会清除数据库、证书和缓存。
 
 ## Linux 原生安装
 
@@ -143,7 +143,7 @@ Telegram 日报支持每天或每周发送请求量、流量、排行和客户�
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PANEL_BIND_ADDR` | `0.0.0.0` | 面板监听地址 |
+| `PANEL_BIND_ADDR` | `0.0.0.0` | 面板监听地址；默认同时监听 IPv4 与 IPv6 |
 | `PORT` | `9090` | 首次初始化监听端口 |
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
 | `JWT_SECRET` | 自动生成 | 登录会话签名密钥 |
