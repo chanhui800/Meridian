@@ -473,13 +473,17 @@ func TestHeaderHasToken(t *testing.T) {
 
 func TestTunnelWriterMetersAndPaces(t *testing.T) {
 	var counter atomic.Int64
+	var cumulative atomic.Int64
 	var sink bytes.Buffer
-	w := &tunnelWriter{dst: &sink, counter: &counter, start: time.Now()}
+	w := &tunnelWriter{dst: &sink, counter: &counter, cumulative: &cumulative, start: time.Now()}
 	if _, err := w.Write([]byte("0123456789")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	if got := counter.Load(); got != 10 {
 		t.Fatalf("counter = %d, want 10", got)
+	}
+	if got := cumulative.Load(); got != 10 {
+		t.Fatalf("cumulative counter = %d, want 10", got)
 	}
 	if sink.String() != "0123456789" {
 		t.Fatalf("sink = %q", sink.String())
@@ -488,7 +492,8 @@ func TestTunnelWriterMetersAndPaces(t *testing.T) {
 	// At 1000 bytes/sec, 200 bytes cannot complete in much under 200ms.
 	sink.Reset()
 	counter.Store(0)
-	paced := &tunnelWriter{dst: &sink, counter: &counter, bytesPerSec: 1000, start: time.Now()}
+	cumulative.Store(0)
+	paced := &tunnelWriter{dst: &sink, counter: &counter, cumulative: &cumulative, bytesPerSec: 1000, start: time.Now()}
 	began := time.Now()
 	if _, err := paced.Write(make([]byte, 200)); err != nil {
 		t.Fatalf("paced Write: %v", err)
@@ -498,5 +503,8 @@ func TestTunnelWriterMetersAndPaces(t *testing.T) {
 	}
 	if got := counter.Load(); got != 200 {
 		t.Fatalf("paced counter = %d, want 200", got)
+	}
+	if got := cumulative.Load(); got != 200 {
+		t.Fatalf("paced cumulative counter = %d, want 200", got)
 	}
 }

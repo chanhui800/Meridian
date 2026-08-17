@@ -449,6 +449,69 @@ test('dashboard table paints live traffic_used and the running badge from one /a
   assert.ok(html.includes(sandbox.formatBytes(2048)), 'each site cache size must be formatted into the row');
   assert.equal(elements['s-cache'].textContent, sandbox.formatBytes(3072), 'the dashboard cache card must sum every site');
   assert.ok(html.includes('运行中') && html.includes('已停止'), 'the running flag must drive the status badge');
+  assert.ok(html.includes('↓ 0 B/s') && html.includes('↑ 0 B/s'), 'the table must show a stable zero rate before the first SSE sample');
+  assert.ok(!html.includes('dashboard-speed-placeholder'), 'the dashboard must not flash a placeholder while sampling');
+});
+
+test('dashboard live speed uses consecutive bidirectional SSE counters and rejects negative resets', async () => {
+  const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
+  let now = 1000;
+  const sandbox = {
+    window: {}, document: makeDocument(elements), console,
+    Date: { now: () => now },
+    Toast: { error() {}, success() {}, info() {} },
+    fetch: async () => okJson([{ id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 300, cache_size_bytes: 0 }]),
+    Router: { current: 'dashboard' },
+    setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+  await vm.runInContext('loadDashboardTable()', sandbox);
+
+  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:100, cumulative_bytes_out:200, bytes_in:100, bytes_out:200, traffic_used:300}])', sandbox);
+  assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'));
+  now = 3000;
+  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:2148, bytes_out:1048776, traffic_used:1050924}])', sandbox);
+  const html = elements['dash-table'].innerHTML;
+  assert.ok(html.includes('↓ 512 KB/s'), html);
+  assert.ok(html.includes('↑ 1 KB/s'), html);
+
+  await vm.runInContext('loadDashboardTable()', sandbox);
+  const refreshedHTML = elements['dash-table'].innerHTML;
+  assert.ok(refreshedHTML.includes('↓ 512 KB/s'), 'periodic site refresh must preserve the last live download speed');
+  assert.ok(refreshedHTML.includes('↑ 1 KB/s'), 'periodic site refresh must preserve the last live upload speed');
+  assert.ok(!refreshedHTML.includes('dashboard-speed-placeholder'), 'refreshing site metadata must not flash the speed placeholder');
+
+  now = 5000;
+  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:1, cumulative_bytes_out:1, bytes_in:1, bytes_out:1, traffic_used:2}])', sandbox);
+  assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'), 'counter reset must render zero instead of a negative speed or placeholder');
+  assert.ok(!elements['dash-table'].innerHTML.includes('dashboard-speed-placeholder'));
+});
+
+test('dashboard keeps SSE samples that arrive before the site list and across partial payloads', async () => {
+  const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
+  let now = 1000;
+  const sandbox = {
+    window: {}, document: makeDocument(elements), console,
+    Date: { now: () => now },
+    Toast: { error() {}, success() {}, info() {} },
+    fetch: async () => okJson([{ id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 300, cache_size_bytes: 0 }]),
+    Router: { current: 'dashboard' },
+    setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+
+  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:100, cumulative_bytes_out:200, bytes_in:100, bytes_out:200, traffic_used:300}])', sandbox);
+  await vm.runInContext('loadDashboardTable()', sandbox);
+  assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'), 'the first pre-list sample should render a stable zero rate');
+
+  now = 2000;
+  vm.runInContext('updateDashboardSiteSpeeds([])', sandbox);
+  now = 3000;
+  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:0, bytes_out:0, traffic_used:1050924}])', sandbox);
+  assert.ok(elements['dash-table'].innerHTML.includes('↓ 512 KB/s'), 'the sample received before /api/sites must be used');
+  assert.ok(elements['dash-table'].innerHTML.includes('↑ 1 KB/s'), 'the bidirectional sample must be retained');
 });
 
 test('mobile dashboard request trend uses readable time labels and a numeric request axis', () => {

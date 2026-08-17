@@ -155,6 +155,10 @@ func (d *DB) migrateOnce() error {
 		listen_port INTEGER NOT NULL DEFAULT 0,
 		tls_enabled INTEGER NOT NULL DEFAULT 0,
 		configured INTEGER NOT NULL DEFAULT 0,
+		acme_email TEXT NOT NULL DEFAULT '',
+		acme_dns_provider TEXT NOT NULL DEFAULT 'cloudflare',
+		acme_token_ciphertext TEXT NOT NULL DEFAULT '',
+		acme_staging INTEGER NOT NULL DEFAULT 0,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO panel_settings (id) VALUES (1);
@@ -395,32 +399,25 @@ func (d *DB) migrateOnce() error {
 }
 
 func ensurePanelSettingsListenPortSchema(ctx context.Context, conn *sql.Conn) error {
-	rows, err := conn.QueryContext(ctx, "PRAGMA table_info(panel_settings)")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	found := false
-	for rows.Next() {
-		var cid int
-		var name, columnType string
-		var notNull, primaryKey int
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+	for _, migration := range []struct{ column, sql string }{
+		{"listen_port", "ALTER TABLE panel_settings ADD COLUMN listen_port INTEGER NOT NULL DEFAULT 0"},
+		{"acme_email", "ALTER TABLE panel_settings ADD COLUMN acme_email TEXT NOT NULL DEFAULT ''"},
+		{"acme_dns_provider", "ALTER TABLE panel_settings ADD COLUMN acme_dns_provider TEXT NOT NULL DEFAULT 'cloudflare'"},
+		{"acme_token_ciphertext", "ALTER TABLE panel_settings ADD COLUMN acme_token_ciphertext TEXT NOT NULL DEFAULT ''"},
+		{"acme_staging", "ALTER TABLE panel_settings ADD COLUMN acme_staging INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var found int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('panel_settings') WHERE name=?", migration.column).Scan(&found); err != nil {
 			return err
 		}
-		if name == "listen_port" {
-			found = true
+		if found != 0 {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+			return err
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if found {
-		return nil
-	}
-	_, err = conn.ExecContext(ctx, "ALTER TABLE panel_settings ADD COLUMN listen_port INTEGER NOT NULL DEFAULT 0")
-	return err
+	return nil
 }
 
 func sqliteColumnExists(ctx context.Context, conn *sql.Conn, column string) (bool, error) {

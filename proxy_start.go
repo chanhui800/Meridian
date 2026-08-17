@@ -327,11 +327,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					ResponseWriter: w,
 					bytesPerSec:    speedLimitBytes,
 					written:        &inst.bytesOut,
+					cumulative:     &inst.cumulativeBytesOut,
 					start:          time.Now(),
 					ctx:            r.Context(),
 				}
 			} else {
-				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
+				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
 			}
 			if dynamicIssuer == nil {
 				writeDynamicCapabilityUnavailable(rw)
@@ -376,9 +377,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
 				var cacheWriter http.ResponseWriter
 				if speedLimitBytes > 0 {
-					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, start: time.Now(), ctx: r.Context()}
+					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, start: time.Now(), ctx: r.Context()}
 				} else {
-					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
+					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
 				}
 				serveAssetCacheHit(cacheWriter, r, hit)
 				return
@@ -387,7 +388,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 
 		if r.Body != nil {
-			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn}
+			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn}
 		}
 		if len(failoverTargets) > 1 {
 			if err := prepareFailoverPlaybackInfoBody(r, redirectPolicy.limits.MaxBodyBytes); err != nil {
@@ -416,11 +417,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				ResponseWriter: w,
 				bytesPerSec:    speedLimitBytes,
 				written:        &inst.bytesOut,
+				cumulative:     &inst.cumulativeBytesOut,
 				start:          time.Now(),
 				ctx:            r.Context(),
 			}
 		} else {
-			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
+			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
 		}
 		proxy.ServeHTTP(rw, r) // #nosec G704 -- forwarding to the administrator-configured, validated upstream is the product's purpose.
 	})

@@ -205,6 +205,15 @@ func makeBackupDatabase(t *testing.T, path string, jwt, upstreamKey []byte) {
 		db.Close()
 		t.Fatal(err)
 	}
+	acmeToken, err := encryptPanelACMETokenWithSecret("cloudflare-backup-token-value", jwt)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`UPDATE panel_settings SET acme_email='admin@example.com', acme_dns_provider='cloudflare', acme_token_ciphertext=?, acme_staging=1 WHERE id=1`, acmeToken); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
 	if _, err := db.db.Exec(`INSERT INTO users (username, password_hash) VALUES ('admin', 'hash')`); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -266,6 +275,17 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	value, err = decryptTelegramBotTokenWithSecret(telegramCiphertext, newJWT)
 	if err != nil || value != "123456:test-token" {
 		t.Fatalf("telegram token = %q, %v", value, err)
+	}
+	var acmeCiphertext string
+	if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	value, err = decryptPanelACMETokenWithSecret(acmeCiphertext, newJWT)
+	if err != nil || value != "cloudflare-backup-token-value" {
+		t.Fatalf("ACME token = %q, %v", value, err)
+	}
+	if _, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldJWT); err == nil {
+		t.Fatal("old JWT secret still decrypts migrated ACME token")
 	}
 }
 
@@ -330,6 +350,14 @@ func TestRestoreWithoutTLSPreservesTargetSettingsAndFiles(t *testing.T) {
 		targetDB.Close()
 		t.Fatal(err)
 	}
+	targetJWT := bytes.Repeat([]byte("n"), 32)
+	targetACME, err := encryptPanelACMETokenWithSecret("target-cloudflare-token-value", targetJWT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := targetDB.db.Exec(`UPDATE panel_settings SET acme_email='target@example.com', acme_dns_provider='cloudflare', acme_token_ciphertext=?, acme_staging=1 WHERE id=1`, targetACME); err != nil {
+		t.Fatal(err)
+	}
 	preserved, err := readBackupPanelSettings(targetDB.db)
 	if err != nil {
 		targetDB.Close()
@@ -347,7 +375,7 @@ func TestRestoreWithoutTLSPreservesTargetSettingsAndFiles(t *testing.T) {
 	}
 
 	oldJWT := bytes.Repeat([]byte("j"), 32)
-	newJWT := bytes.Repeat([]byte("n"), 32)
+	newJWT := targetJWT
 	oldHeader := bytes.Repeat([]byte("h"), 32)
 	newHeader := bytes.Repeat([]byte("k"), 32)
 	backupPath := filepath.Join(dir, "backup.db")
@@ -388,15 +416,21 @@ func TestRestoreWithoutTLSPreservesTargetSettingsAndFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var panelDomain, routeDomain string
-	var listenPort, tlsEnabled, configured int
-	if err := restoredDB.QueryRow(`SELECT panel_domain, route_domain, listen_port, tls_enabled, configured FROM panel_settings WHERE id=1`).Scan(&panelDomain, &routeDomain, &listenPort, &tlsEnabled, &configured); err != nil {
+	var panelDomain, routeDomain, acmeEmail, acmeCiphertext string
+	var listenPort, tlsEnabled, configured, acmeStaging int
+	if err := restoredDB.QueryRow(`SELECT panel_domain, route_domain, listen_port, tls_enabled, configured, acme_email, acme_token_ciphertext, acme_staging FROM panel_settings WHERE id=1`).Scan(&panelDomain, &routeDomain, &listenPort, &tlsEnabled, &configured, &acmeEmail, &acmeCiphertext, &acmeStaging); err != nil {
 		restoredDB.Close()
 		t.Fatal(err)
 	}
 	restoredDB.Close()
 	if panelDomain != preserved.PanelDomain || routeDomain != preserved.RouteDomain || listenPort != preserved.ListenPort || tlsEnabled != preserved.TLSEnabled || configured != preserved.Configured {
 		t.Fatalf("target panel settings were not preserved: %q %q %d %d %d", panelDomain, routeDomain, listenPort, tlsEnabled, configured)
+	}
+	if acmeEmail != "target@example.com" || acmeStaging != 1 {
+		t.Fatalf("target ACME settings were not preserved: email=%q staging=%d", acmeEmail, acmeStaging)
+	}
+	if value, err := decryptPanelACMETokenWithSecret(acmeCiphertext, newJWT); err != nil || value != "target-cloudflare-token-value" {
+		t.Fatalf("target ACME token was not preserved: %q %v", value, err)
 	}
 	cert, err := os.ReadFile(certPath)
 	if err != nil || string(cert) != "target certificate" {

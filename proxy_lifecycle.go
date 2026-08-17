@@ -241,6 +241,8 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 	snap.PersistedTraffic = inst.persistedTraffic.Load()
 	snap.BytesIn = inst.bytesIn.Load()
 	snap.BytesOut = inst.bytesOut.Load()
+	snap.CumulativeBytesIn = inst.cumulativeBytesIn.Load()
+	snap.CumulativeBytesOut = inst.cumulativeBytesOut.Load()
 	snap.TrafficUsed = snap.PersistedTraffic + snap.BytesIn + snap.BytesOut
 	snap.Requests = inst.reqCount.Load()
 	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut, inst.pendingRequests.Load())
@@ -260,6 +262,8 @@ func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
 		st.PersistedTraffic = inst.persistedTraffic.Load()
 		st.BytesIn = inst.bytesIn.Load()
 		st.BytesOut = inst.bytesOut.Load()
+		st.CumulativeBytesIn = inst.cumulativeBytesIn.Load()
+		st.CumulativeBytesOut = inst.cumulativeBytesOut.Load()
 		st.TrafficUsed = st.PersistedTraffic + st.BytesIn + st.BytesOut
 		st.Requests = inst.reqCount.Load()
 		inst.trafficMu.Unlock()

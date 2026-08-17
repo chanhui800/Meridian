@@ -335,10 +335,10 @@ async function renderTLSSettings() {
         </section>
         <section class="settings-panel fade-up">
           <header><span>ACME</span><h2>申请泛域名证书</h2><b>Cloudflare DNS</b></header>
-          <div class="form-group"><label>ACME 邮箱</label><input type="email" class="form-input" id="p-acme-email" autocomplete="email" maxlength="254" placeholder="admin@example.com"></div>
+          <div class="form-group"><label>ACME 邮箱</label><input type="email" class="form-input" id="p-acme-email" autocomplete="email" maxlength="254" value="${esc(status.acme_email || '')}" placeholder="admin@example.com"><div class="form-help">邮箱会直接显示在面板中，用于 ACME 账户与证书续签通知。</div></div>
           <div class="form-group"><label>DNS 服务商</label><select class="form-select" id="p-acme-provider"><option value="cloudflare">Cloudflare DNS</option></select></div>
-          <div class="form-group"><label>DNS API Token</label><input type="password" class="form-input" id="p-acme-token" autocomplete="new-password" maxlength="512" placeholder="仅本次申请使用"><div class="form-help">Token 只发送到当前 Meridian 进程，不写入数据库、证书文件或日志。</div></div>
-          <label class="settings-check"><input type="checkbox" id="p-acme-staging"><span>ACME 测试环境</span></label>
+          <div class="form-group"><label>DNS API Token</label><input type="text" class="form-input mono" id="p-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token"><div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div></div>
+          <label class="settings-check"><input type="checkbox" id="p-acme-staging" ${status.acme_staging ? 'checked' : ''}><span>ACME 测试环境</span></label>
           <div class="settings-save-bar tls-settings-actions">
             ${status.restart_required && ((status.configured && status.certificate_current) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="telegram-btn primary" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
             <button class="telegram-btn" type="button" id="p-cert-save">保存设置</button>
@@ -420,7 +420,6 @@ async function renderTLSSettings() {
       button.textContent = '申请中…';
       try {
         const updated = await API.requestPanelCertificate(payload);
-        tokenInput.value = '';
         Toast.success(updated.certificate_reused ? '泛域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
         await renderTLSSettings();
       } catch (error) {

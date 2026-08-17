@@ -3,6 +3,9 @@ let dashAbortController = null;
 let dashRetryTimer = null;
 let dashboardTrendValues = [];
 let dashboardTrendResizeObserver = null;
+let dashboardSites = [];
+let dashboardSpeedSamples = new Map();
+let dashboardLiveSpeeds = new Map();
 
 function renderDashboard() {
   const page = document.getElementById('page-dashboard');
@@ -55,7 +58,7 @@ function renderDashboard() {
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>已用流量</th><th>缓存大小</th>
+            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>实时网速</th><th>已用流量</th><th>缓存大小</th>
           </tr></thead>
           <tbody id="dash-table"></tbody>
         </table>
@@ -245,6 +248,51 @@ function updateDashboardLive(stats) {
 
   const requestsEl = document.getElementById('s-requests');
   if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
+  updateDashboardSiteSpeeds(stats.live_sites || []);
+}
+
+function updateDashboardSiteSpeeds(liveSites) {
+  const now = Date.now();
+  const liveMap = new Map();
+  for (const site of (liveSites || [])) {
+    const siteID = Number(site.id);
+    if (!Number.isFinite(siteID)) continue;
+    liveMap.set(siteID, site);
+    const current = {
+      trafficUsed: Number(site.traffic_used || 0),
+      bytesIn: Number(site.cumulative_bytes_in != null ? site.cumulative_bytes_in : (site.bytes_in || site.bytes_in_total || 0)),
+      bytesOut: Number(site.cumulative_bytes_out != null ? site.cumulative_bytes_out : (site.bytes_out || site.bytes_out_total || 0)),
+      timestamp: now,
+    };
+    const previous = dashboardSpeedSamples.get(siteID);
+    if (!previous) dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
+    if (previous && current.timestamp > previous.timestamp) {
+      const seconds = (current.timestamp - previous.timestamp) / 1000;
+      const down = current.bytesOut - previous.bytesOut;
+      const up = current.bytesIn - previous.bytesIn;
+      if (down >= 0 && up >= 0) {
+        dashboardLiveSpeeds.set(siteID, { down: down / seconds, up: up / seconds });
+      } else {
+        // A site process restart resets the cumulative runtime counters. Show
+        // zero until the next monotonic pair instead of flashing a placeholder.
+        dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
+      }
+    }
+    // Keep the latest sample even when a later SSE payload omits another site.
+    dashboardSpeedSamples.set(siteID, current);
+  }
+  dashboardSites = dashboardSites.map(site => {
+    const siteID = Number(site.id);
+    const live = liveMap.get(siteID);
+    if (!live) return site;
+    const speed = dashboardLiveSpeeds.get(siteID);
+    if (!speed) {
+      const { _liveSpeed, ...siteWithoutSpeed } = site;
+      return { ...siteWithoutSpeed, ...live };
+    }
+    return { ...site, ...live, _liveSpeed: speed };
+  });
+  renderDashboardTableRows();
 }
 
 function dashboardCurrentPanelURL(fallback) {
@@ -277,6 +325,8 @@ function animateValue(id, newVal) {
 }
 
 function stopDashSSE() {
+	dashboardSpeedSamples = new Map();
+  dashboardLiveSpeeds = new Map();
   if (dashboardTrendResizeObserver) {
     dashboardTrendResizeObserver.disconnect();
     dashboardTrendResizeObserver = null;
@@ -306,24 +356,48 @@ async function loadDashboardTable() {
     if (cacheEl) cacheEl.textContent = formatBytes(totalCache);
 
     if (!sites || sites.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
+      dashboardSites = [];
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
       return;
     }
 
-    tbody.innerHTML = sites.map(s => `
+    const currentSites = new Map(dashboardSites.map(site => [Number(site.id), site]));
+    dashboardSites = sites.map(site => {
+      const siteID = Number(site.id);
+      const current = currentSites.get(siteID);
+      const speed = dashboardLiveSpeeds.get(siteID) || (current && current._liveSpeed);
+      return speed ? { ...site, _liveSpeed: speed } : site;
+    });
+    renderDashboardTableRows();
+  } catch (e) {
+    console.error('Dashboard table load error:', e);
+  }
+}
+
+function renderDashboardTableRows() {
+  const tbody = document.getElementById('dash-table');
+  if (!tbody || !dashboardSites.length) return;
+  tbody.innerHTML = dashboardSites.map(s => `
       <tr>
         <td style="font-weight:600">${esc(s.name)}</td>
         <td><span class="status-badge"><span class="status-led ${s.running ? 'on' : 'off'}"></span>${s.running ? '运行中' : '已停止'}</span></td>
         <td class="mono">${esc(s.target_url)}</td>
         <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></td>
         <td class="mono">${dashboardIngressLabel(s)}</td>
+		<td>${dashboardSpeedMarkup(s._liveSpeed)}</td>
         <td>${formatBytes(s.traffic_used)}</td>
         <td>${formatBytes(s.cache_size_bytes)}</td>
       </tr>
     `).join('');
-  } catch (e) {
-    console.error('Dashboard table load error:', e);
-  }
+}
+
+function dashboardSpeedMarkup(speed) {
+  if (!speed) speed = { down: 0, up: 0 };
+  return `<span class="dashboard-speed"><span>↓ ${formatRate(speed.down)}</span><span>↑ ${formatRate(speed.up)}</span></span>`;
+}
+
+function formatRate(bytesPerSecond) {
+  return `${formatBytes(Math.max(0, Number(bytesPerSecond) || 0))}/s`;
 }
 
 function dashboardIngressLabel(site) {

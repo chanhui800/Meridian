@@ -1066,6 +1066,8 @@ function renderPanelCertificateStatus(status) {
 	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
 	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${status.certificate_current ? 'good' : 'warn'}">${status.certificate_current ? '泛域名一致' : '需要申请或更新'}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
+	  <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${status.certificate_valid ? 'good' : 'warn'}">${status.certificate_valid ? '有效' : '已过期或不可用'}</span></div>
+	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token'}</span></div>
 	  <div class="diag-row"><span class="diag-key">当前监听端口</span><span class="diag-val">${esc(String(status.active_listen_port || '—'))}</span></div>
 	  <div class="diag-row"><span class="diag-key">设置监听端口</span><span class="diag-val ${status.listen_port !== status.active_listen_port ? 'warn' : ''}">${esc(String(status.listen_port || '—'))}</span></div>
 	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.restart_required ? 'warn' : 'good'}">${status.restart_required ? '等待重启应用' : '已启用'}</span></div>
@@ -1129,7 +1131,8 @@ async function showPanelCertificateModal() {
 	  </div>
 	  <div class="form-group">
 	    <label>ACME 邮箱</label>
-	    <input type="email" class="form-input" id="m-acme-email" autocomplete="email" maxlength="254" placeholder="admin@example.com">
+	    <input type="email" class="form-input" id="m-acme-email" autocomplete="email" maxlength="254" value="${esc(status.acme_email || '')}" placeholder="admin@example.com">
+	    <div class="form-help">邮箱会直接显示在面板中，用于 ACME 账户与证书续签通知。</div>
 	  </div>
 	  <div class="form-group">
 	    <label>DNS 服务商</label>
@@ -1137,11 +1140,11 @@ async function showPanelCertificateModal() {
 	  </div>
 	  <div class="form-group">
 	    <label>DNS API Token</label>
-	    <input type="password" class="form-input" id="m-acme-token" autocomplete="new-password" maxlength="512" placeholder="仅本次申请使用">
-	    <div class="form-help">Token 只发送到当前 Meridian 进程，不写入数据库、证书文件或日志。</div>
+	    <input type="text" class="form-input mono" id="m-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token">
+	    <div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div>
 	  </div>
 	  <label style="display:flex;align-items:center;gap:8px;margin-top:10px;color:var(--white-60);font-size:.82rem">
-	    <input type="checkbox" id="m-acme-staging">
+	    <input type="checkbox" id="m-acme-staging" ${status.acme_staging ? 'checked' : ''}>
 	    <span>ACME 测试环境</span>
 	  </label>
 	`;
@@ -1224,7 +1227,6 @@ async function showPanelCertificateModal() {
 		button.textContent = '申请中…';
 		try {
 			const updated = await API.requestPanelCertificate(payload);
-			tokenInput.value = '';
 			Toast.success(updated.certificate_reused ? '泛域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
 			closeModal();
 			await showPanelCertificateModal();

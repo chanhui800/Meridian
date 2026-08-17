@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -29,8 +33,11 @@ import (
 )
 
 const (
-	letsEncryptProductionDirectory = "https://acme-v02.api.letsencrypt.org/directory"
-	letsEncryptStagingDirectory    = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	letsEncryptProductionDirectory  = "https://acme-v02.api.letsencrypt.org/directory"
+	letsEncryptStagingDirectory     = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	panelCertificateRenewalWindow   = 30 * 24 * time.Hour
+	panelCertificateRenewalInterval = 12 * time.Hour
+	panelACMETokenCipherPrefix      = "v1:"
 )
 
 var errCertificateIssuanceBusy = errors.New("a certificate request is already running")
@@ -44,6 +51,7 @@ type panelCertificateStatus struct {
 	WildcardDomain            string `json:"wildcard_domain"`
 	CertificateWildcardDomain string `json:"certificate_wildcard_domain,omitempty"`
 	CertificateCurrent        bool   `json:"certificate_current"`
+	CertificateValid          bool   `json:"certificate_valid"`
 	CertificateReused         bool   `json:"certificate_reused,omitempty"`
 	ListenPort                int    `json:"listen_port"`
 	ActiveListenPort          int    `json:"active_listen_port"`
@@ -52,6 +60,11 @@ type panelCertificateStatus struct {
 	Subject                   string `json:"subject,omitempty"`
 	ExpiresAt                 string `json:"expires_at,omitempty"`
 	DaysRemaining             int    `json:"days_remaining,omitempty"`
+	AutoRenewEnabled          bool   `json:"auto_renew_enabled"`
+	ACMEEmail                 string `json:"acme_email,omitempty"`
+	ACMEDNSProvider           string `json:"dns_provider,omitempty"`
+	DNSAPIToken               string `json:"dns_api_token,omitempty"`
+	ACMEStaging               bool   `json:"acme_staging"`
 	RestartRequired           bool   `json:"restart_required"`
 	Issuing                   bool   `json:"issuing"`
 }
@@ -166,6 +179,7 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 		}
 	}
 	status.CertificateCurrent = status.CertificateWildcardDomain != "" && status.CertificateWildcardDomain == status.WildcardDomain
+	status.CertificateValid = time.Now().Before(certificate.NotAfter)
 	status.Subject = certificate.Subject.CommonName
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
 	days := int(time.Until(certificate.NotAfter).Hours() / 24)
@@ -174,6 +188,73 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	}
 	status.DaysRemaining = days
 	return status
+}
+
+func certificateNeedsRenewal(status panelCertificateStatus) bool {
+	return !status.Configured || !status.CertificateCurrent || !status.CertificateValid || status.DaysRemaining <= int(panelCertificateRenewalWindow.Hours()/24)
+}
+
+func certificateCanBeReused(status panelCertificateStatus) bool {
+	return status.CertificateCurrent && status.CertificateValid && !certificateNeedsRenewal(status)
+}
+
+func panelACMETokenKeyForSecret(secret []byte) []byte {
+	h := sha256.New()
+	_, _ = h.Write([]byte("meridian panel acme dns token v1\x00"))
+	_, _ = h.Write(secret)
+	return h.Sum(nil)
+}
+
+func encryptPanelACMEToken(token string) (string, error) {
+	return encryptPanelACMETokenWithSecret(token, jwtSecret)
+}
+
+func encryptPanelACMETokenWithSecret(token string, secret []byte) (string, error) {
+	token = strings.TrimSpace(token)
+	if len(token) < 20 || len(token) > 512 || strings.ContainsAny(token, "\r\n") {
+		return "", errors.New("a valid Cloudflare DNS API token is required")
+	}
+	block, err := aes.NewCipher(panelACMETokenKeyForSecret(secret))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(token), []byte("meridian-panel-acme"))
+	return panelACMETokenCipherPrefix + base64.RawURLEncoding.EncodeToString(append(nonce, sealed...)), nil
+}
+
+func decryptPanelACMEToken(ciphertext string) (string, error) {
+	return decryptPanelACMETokenWithSecret(ciphertext, jwtSecret)
+}
+
+func decryptPanelACMETokenWithSecret(ciphertext string, secret []byte) (string, error) {
+	if !strings.HasPrefix(ciphertext, panelACMETokenCipherPrefix) {
+		return "", errors.New("invalid Cloudflare DNS API token ciphertext")
+	}
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(ciphertext, panelACMETokenCipherPrefix))
+	if err != nil {
+		return "", fmt.Errorf("decode Cloudflare DNS API token: %w", err)
+	}
+	block, err := aes.NewCipher(panelACMETokenKeyForSecret(secret))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil || len(payload) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("invalid Cloudflare DNS API token ciphertext")
+	}
+	plain, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], []byte("meridian-panel-acme"))
+	if err != nil {
+		return "", fmt.Errorf("decrypt Cloudflare DNS API token: %w", err)
+	}
+	return string(plain), nil
 }
 
 func (m *panelCertificateManager) tlsConfig(enabled bool) (*tls.Config, bool, error) {
@@ -335,6 +416,24 @@ func (m *panelCertificateManager) activate(issued *issuedPanelCertificate) {
 	certificate := issued.certificate
 	m.currentCertificate = &certificate
 	m.mu.Unlock()
+}
+
+// disable clears the active in-memory certificate and marker without deleting
+// the certificate files. Keeping the files allows a later manual issuance or
+// renewal to reuse the existing storage after the panel has fallen back to
+// HTTP.
+func (m *panelCertificateManager) disable() error {
+	if m == nil || m.accountDir == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentCertificate = nil
+	err := os.Remove(filepath.Join(m.accountDir, "enabled"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func readOptionalFile(filename string) ([]byte, bool, error) {

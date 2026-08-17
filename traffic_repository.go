@@ -23,15 +23,17 @@ type TrafficLog struct {
 // baseline plus in-memory pending bytes. TrafficUsed is always
 // PersistedTraffic + BytesIn + BytesOut (pending, not yet flushed).
 type SiteTraffic struct {
-	ID               int64  `json:"id"`
-	Name             string `json:"name"`
-	Running          bool   `json:"running"`
-	TrafficQuota     int64  `json:"traffic_quota"`
-	PersistedTraffic int64  `json:"persisted_traffic"`
-	BytesIn          int64  `json:"bytes_in"`
-	BytesOut         int64  `json:"bytes_out"`
-	TrafficUsed      int64  `json:"traffic_used"`
-	Requests         int64  `json:"requests"`
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Running            bool   `json:"running"`
+	TrafficQuota       int64  `json:"traffic_quota"`
+	PersistedTraffic   int64  `json:"persisted_traffic"`
+	BytesIn            int64  `json:"bytes_in"`
+	BytesOut           int64  `json:"bytes_out"`
+	CumulativeBytesIn  int64  `json:"cumulative_bytes_in"`
+	CumulativeBytesOut int64  `json:"cumulative_bytes_out"`
+	TrafficUsed        int64  `json:"traffic_used"`
+	Requests           int64  `json:"requests"`
 }
 
 // TrafficSnapshot is the single authoritative global traffic payload shared by

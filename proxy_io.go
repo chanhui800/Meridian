@@ -36,12 +36,25 @@ func originalRequestContext(ctx context.Context) context.Context {
 // metered response writer
 type meteredWriter struct {
 	http.ResponseWriter
-	written *atomic.Int64
+	written    *atomic.Int64
+	cumulative *atomic.Int64
+}
+
+func addMeteredBytes(primary, cumulative *atomic.Int64, n int) {
+	if n <= 0 {
+		return
+	}
+	if primary != nil {
+		primary.Add(int64(n))
+	}
+	if cumulative != nil {
+		cumulative.Add(int64(n))
+	}
 }
 
 func (m *meteredWriter) Write(b []byte) (int, error) {
 	n, err := m.ResponseWriter.Write(b)
-	m.written.Add(int64(n))
+	addMeteredBytes(m.written, m.cumulative, n)
 	return n, err
 }
 
@@ -63,12 +76,13 @@ func (m *meteredWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // metered request body reader
 type meteredReader struct {
 	io.ReadCloser
-	read *atomic.Int64
+	read       *atomic.Int64
+	cumulative *atomic.Int64
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
 	n, err := m.ReadCloser.Read(p)
-	m.read.Add(int64(n))
+	addMeteredBytes(m.read, m.cumulative, n)
 	return n, err
 }
 
@@ -76,6 +90,7 @@ type rateLimitedWriter struct {
 	http.ResponseWriter
 	bytesPerSec    int64
 	written        *atomic.Int64
+	cumulative     *atomic.Int64
 	requestWritten int64
 	start          time.Time
 	ctx            context.Context
@@ -84,7 +99,7 @@ type rateLimitedWriter struct {
 func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 	if w.bytesPerSec <= 0 {
 		n, err := w.ResponseWriter.Write(b)
-		w.written.Add(int64(n))
+		addMeteredBytes(w.written, w.cumulative, n)
 		return n, err
 	}
 	totalWritten := 0
@@ -111,7 +126,7 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 			chunk = b[:allowed]
 		}
 		n, err := w.ResponseWriter.Write(chunk)
-		w.written.Add(int64(n))
+		addMeteredBytes(w.written, w.cumulative, n)
 		w.requestWritten += int64(n)
 		totalWritten += n
 		b = b[n:]
@@ -145,6 +160,7 @@ func (w *rateLimitedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 type tunnelWriter struct {
 	dst         io.Writer
 	counter     *atomic.Int64
+	cumulative  *atomic.Int64
 	bytesPerSec int64
 	written     int64
 	start       time.Time
@@ -153,7 +169,7 @@ type tunnelWriter struct {
 func (t *tunnelWriter) Write(b []byte) (int, error) {
 	if t.bytesPerSec <= 0 {
 		n, err := t.dst.Write(b)
-		t.counter.Add(int64(n))
+		addMeteredBytes(t.counter, t.cumulative, n)
 		return n, err
 	}
 	total := 0
@@ -172,7 +188,7 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 			chunk = b[:allowed]
 		}
 		n, err := t.dst.Write(chunk)
-		t.counter.Add(int64(n))
+		addMeteredBytes(t.counter, t.cumulative, n)
 		t.written += int64(n)
 		total += n
 		b = b[n:]
