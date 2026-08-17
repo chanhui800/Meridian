@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.38"
+var appVersion = "v1.8.39"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -126,6 +126,14 @@ func main() {
 	panelHost := panelSettings.PanelDomain
 	routeDomain := panelSettings.RouteDomain
 	panelCertificates := newPanelCertificateManager(dbPath, nil)
+	if disabled, err := disableExpiredPanelTLSIfNeeded(db, panelCertificates); err != nil {
+		log.Fatalf("check panel TLS certificate: %v", err)
+	} else if disabled {
+		panelSettings, err = db.PanelSettings()
+		if err != nil {
+			log.Fatalf("reload panel settings after HTTPS fallback: %v", err)
+		}
+	}
 	panelTLSConfig, panelTLSEnabled, err := panelCertificates.tlsConfig(panelSettings.TLSEnabled)
 	if err != nil {
 		log.Fatalf("invalid panel TLS configuration: %v", err)
@@ -206,6 +214,7 @@ func main() {
 		dynamicRouteKey:   dynamicRouteKey,
 		restartCh:         make(chan struct{}),
 	}
+	go runPanelCertificateRenewalScheduler(ctx, db, panelCertificates, app.requestRestart)
 
 	mux := http.NewServeMux()
 

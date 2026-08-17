@@ -75,11 +75,15 @@ type restoreMarker struct {
 }
 
 type backupPanelSettings struct {
-	PanelDomain string
-	RouteDomain string
-	ListenPort  int
-	TLSEnabled  int
-	Configured  int
+	PanelDomain         string
+	RouteDomain         string
+	ListenPort          int
+	TLSEnabled          int
+	Configured          int
+	ACMEEmail           string
+	ACMEDNSProvider     string
+	ACMETokenCiphertext string
+	ACMEStaging         int
 }
 
 func boolPointer(value bool) *bool { return &value }
@@ -510,7 +514,56 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 			return err
 		}
 	}
+	hasACMEToken, err := backupSQLiteColumnExists(tx, "panel_settings", "acme_token_ciphertext")
+	if err != nil {
+		return err
+	}
+	if hasACMEToken {
+		var acmeCiphertext string
+		err = tx.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if acmeCiphertext != "" {
+			token, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldJWT)
+			if err != nil {
+				if _, currentErr := decryptPanelACMETokenWithSecret(acmeCiphertext, newJWT); currentErr == nil {
+					return tx.Commit()
+				}
+				return fmt.Errorf("无法解密 DNS API Token: %w", err)
+			}
+			migrated, err := encryptPanelACMETokenWithSecret(token, newJWT)
+			if err != nil {
+				return fmt.Errorf("无法迁移 DNS API Token: %w", err)
+			}
+			if _, err := tx.Exec("UPDATE panel_settings SET acme_token_ciphertext=? WHERE id=1", migrated); err != nil {
+				return err
+			}
+		}
+	}
 	return tx.Commit()
+}
+
+func backupSQLiteColumnExists(queryer interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, tableName, columnName string) (bool, error) {
+	rows, err := queryer.Query("PRAGMA table_info(" + tableName + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func backupHasTelegramToken(database []byte) (bool, error) {
@@ -542,14 +595,44 @@ func readBackupPanelSettings(db *sql.DB) (*backupPanelSettings, error) {
 	if db == nil {
 		return nil, errors.New("当前数据库不可用")
 	}
+	if err := ensureBackupPanelACMEColumns(db); err != nil {
+		return nil, err
+	}
 	var settings backupPanelSettings
-	err := db.QueryRow(`SELECT panel_domain, route_domain, listen_port, tls_enabled, configured FROM panel_settings WHERE id=1`).Scan(
+	err := db.QueryRow(`SELECT panel_domain, route_domain, listen_port, tls_enabled, configured,
+		acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging FROM panel_settings WHERE id=1`).Scan(
 		&settings.PanelDomain, &settings.RouteDomain, &settings.ListenPort, &settings.TLSEnabled, &settings.Configured,
+		&settings.ACMEEmail, &settings.ACMEDNSProvider, &settings.ACMETokenCiphertext, &settings.ACMEStaging,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return &settings, nil
+}
+
+func ensureBackupPanelACMEColumns(db *sql.DB) error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{"acme_email", "TEXT NOT NULL DEFAULT ''"},
+		{"acme_dns_provider", "TEXT NOT NULL DEFAULT 'cloudflare'"},
+		{"acme_token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
+		{"acme_staging", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, column := range columns {
+		exists, err := backupSQLiteColumnExists(db, "panel_settings", column.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE panel_settings ADD COLUMN " + column.name + " " + column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func preserveBackupPanelSettings(path string, settings *backupPanelSettings) error {
@@ -561,8 +644,13 @@ func preserveBackupPanelSettings(path string, settings *backupPanelSettings) err
 		return err
 	}
 	defer db.Close()
-	_, err = db.Exec(`UPDATE panel_settings SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
-		settings.PanelDomain, settings.RouteDomain, settings.ListenPort, settings.TLSEnabled, settings.Configured)
+	if err := ensureBackupPanelACMEColumns(db); err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE panel_settings SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=?,
+		acme_email=?, acme_dns_provider=?, acme_token_ciphertext=?, acme_staging=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
+		settings.PanelDomain, settings.RouteDomain, settings.ListenPort, settings.TLSEnabled, settings.Configured,
+		settings.ACMEEmail, settings.ACMEDNSProvider, settings.ACMETokenCiphertext, settings.ACMEStaging)
 	return err
 }
 

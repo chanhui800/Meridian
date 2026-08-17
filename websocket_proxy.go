@@ -160,11 +160,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 	// download direction is paced, matching rateLimitedWriter on the HTTP path.
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, start: time.Now()}, clientBuf)
+		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn, start: time.Now()}, clientBuf)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
+		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
 		done <- struct{}{}
 	}()
 	// The first closed direction must tear down its counterpart, then both copy

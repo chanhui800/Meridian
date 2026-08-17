@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type App struct {
@@ -30,6 +31,15 @@ type App struct {
 	dynamicRouteKey   []byte
 	restartCh         chan struct{}
 	restartOnce       sync.Once
+}
+
+func (a *App) requestRestart() {
+	if a == nil || a.restartCh == nil {
+		return
+	}
+	a.restartOnce.Do(func() {
+		time.AfterFunc(500*time.Millisecond, func() { close(a.restartCh) })
+	})
 }
 
 func (pm *ProxyManager) snapshotDynamicSelfTargetPolicy(panelHost string, panelPort int, interfaceAddrs dynamicInterfaceAddrsFunc) (*dynamicSelfTargetPolicy, error) {

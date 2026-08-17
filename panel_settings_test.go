@@ -118,3 +118,21 @@ func TestSaveManagedPanelSettingsMigratesPrefixHosts(t *testing.T) {
 		t.Fatalf("migrated site host = %q, want one.example.com", host)
 	}
 }
+
+func TestSaveManagedPanelSettingsPreservesACMECredentials(t *testing.T) {
+	db, err := openDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SavePanelACMECredentials("admin@example.com", "cloudflare", "v1:ciphertext", true); err != nil {
+		t.Fatal(err)
+	}
+	settings, _, err := db.SaveManagedPanelSettings("panel.example.com", "example.com", 9443, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.ACMEEmail != "admin@example.com" || settings.ACMEDNSProvider != "cloudflare" || settings.ACMETokenCiphertext != "v1:ciphertext" || !settings.ACMEStaging {
+		t.Fatalf("ACME credentials changed while saving panel settings: %+v", settings)
+	}
+}

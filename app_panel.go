@@ -74,7 +74,7 @@ func (a *App) handlePanelCertificate(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
 			return
 		}
-		a.jsonOK(w, a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled))
+		a.jsonOK(w, a.panelCertificateStatus(settings))
 	case http.MethodPost:
 		a.handlePanelCertificateIssue(w, r)
 	default:
@@ -117,9 +117,27 @@ func (a *App) handlePanelSettings(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	status := a.panelCertificateStatus(settings)
 	log.Printf("panel settings saved for %s and *.%s (migrated sites: %d, restart required: %t)", settings.PanelDomain, settings.RouteDomain, migrated, status.RestartRequired)
 	a.jsonOK(w, status)
+}
+
+func (a *App) panelCertificateStatus(settings PanelSettings) panelCertificateStatus {
+	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	status.ACMEEmail = settings.ACMEEmail
+	status.ACMEDNSProvider = settings.ACMEDNSProvider
+	status.ACMEStaging = settings.ACMEStaging
+	status.AutoRenewEnabled = !jwtSecretEphemeral && settings.ACMEEmail != "" && settings.ACMETokenCiphertext != ""
+	if settings.ACMETokenCiphertext == "" {
+		return status
+	}
+	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
+	if err != nil {
+		status.AutoRenewEnabled = false
+		return status
+	}
+	status.DNSAPIToken = token
+	return status
 }
 
 func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request) {
@@ -137,10 +155,6 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 		a.jsonErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	if strings.ToLower(strings.TrimSpace(req.Provider)) != "cloudflare" {
-		a.jsonErr(w, http.StatusBadRequest, "only Cloudflare DNS is currently supported")
-		return
-	}
 	settings, err := a.db.PanelSettings()
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
@@ -150,16 +164,61 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 		a.jsonErr(w, http.StatusConflict, "请先保存面板前缀、泛域名和监听端口")
 		return
 	}
-	currentStatus := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
-	if currentStatus.CertificateCurrent {
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(settings.ACMEDNSProvider))
+	}
+	if provider == "" {
+		provider = "cloudflare"
+	}
+	if provider != "cloudflare" {
+		a.jsonErr(w, http.StatusBadRequest, "only Cloudflare DNS is currently supported")
+		return
+	}
+	email := strings.TrimSpace(req.Email)
+	if email == "" {
+		email = settings.ACMEEmail
+	}
+	token := strings.TrimSpace(req.APIToken)
+	if token == "" && settings.ACMETokenCiphertext != "" {
+		var decryptErr error
+		token, decryptErr = decryptPanelACMEToken(settings.ACMETokenCiphertext)
+		if decryptErr != nil {
+			a.jsonErr(w, http.StatusConflict, "已保存的 DNS API Token 无法解密，请重新填写后保存")
+			return
+		}
+	}
+	if jwtSecretEphemeral {
+		a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全保存自动续签凭据；请先配置稳定密钥")
+		return
+	}
+	if err := validatePanelCertificateRequest(email, token); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ciphertext, err := encryptPanelACMEToken(token)
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "无法加密 DNS API Token")
+		return
+	}
+	if err := a.db.SavePanelACMECredentials(email, provider, ciphertext, req.UseStaging); err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "无法保存自动续签凭据")
+		return
+	}
+	settings, err = a.db.PanelSettings()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
+		return
+	}
+	currentStatus := a.panelCertificateStatus(settings)
+	if certificateCanBeReused(currentStatus) {
 		if !settings.TLSEnabled {
-			var err error
 			settings, _, err = a.db.SaveManagedPanelSettings(settings.PanelDomain, settings.RouteDomain, settings.ListenPort, true)
 			if err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			currentStatus = a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+			currentStatus = a.panelCertificateStatus(settings)
 		}
 		currentStatus.CertificateReused = true
 		a.jsonOK(w, currentStatus)
@@ -167,12 +226,12 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	issued, err := a.panelCertificates.issueCloudflare(ctx, req.Email, req.APIToken, settings.PanelDomain, settings.RouteDomain, req.UseStaging)
+	issued, err := a.panelCertificates.issueCloudflare(ctx, email, token, settings.PanelDomain, settings.RouteDomain, req.UseStaging)
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, errCertificateIssuanceBusy) {
 			status = http.StatusConflict
-		} else if validateErr := validatePanelCertificateRequest(req.Email, req.APIToken); validateErr != nil {
+		} else if validateErr := validatePanelCertificateRequest(email, token); validateErr != nil {
 			status = http.StatusBadRequest
 		}
 		log.Printf("panel certificate request failed for %s: %v", settings.RouteDomain, err)
@@ -195,7 +254,7 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 		a.jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	status := a.panelCertificateStatus(settings)
 	if !status.RestartRequired {
 		a.panelCertificates.activate(issued)
 	}
@@ -220,12 +279,12 @@ func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
 		return
 	}
-	status := a.panelCertificates.status(settings, a.panelHost, a.routeDomain, a.panelListenPort, a.panelTLSEnabled)
+	status := a.panelCertificateStatus(settings)
 	if settings.PanelDomain == "" || settings.ListenPort == 0 {
 		a.jsonErr(w, http.StatusConflict, "请先保存面板域名和监听端口")
 		return
 	}
-	if settings.TLSEnabled && (!status.Configured || !status.CertificateCurrent) {
+	if settings.TLSEnabled && (!status.Configured || !status.CertificateCurrent || !status.CertificateValid) {
 		a.jsonErr(w, http.StatusConflict, "泛域名已改变，请先申请匹配的 TLS 证书")
 		return
 	}
@@ -241,13 +300,8 @@ func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 		"restarting":   true,
 		"redirect_url": scheme + "://" + host,
 	})
-	if a.restartCh == nil {
-		return
-	}
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
-	a.restartOnce.Do(func() {
-		time.AfterFunc(500*time.Millisecond, func() { close(a.restartCh) })
-	})
+	a.requestRestart()
 }

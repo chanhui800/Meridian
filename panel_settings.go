@@ -9,11 +9,15 @@ import (
 const panelSettingsRowID = 1
 
 type PanelSettings struct {
-	PanelDomain string `json:"panel_domain"`
-	RouteDomain string `json:"route_domain"`
-	ListenPort  int    `json:"listen_port"`
-	TLSEnabled  bool   `json:"tls_enabled"`
-	Configured  bool   `json:"-"`
+	PanelDomain         string `json:"panel_domain"`
+	RouteDomain         string `json:"route_domain"`
+	ListenPort          int    `json:"listen_port"`
+	TLSEnabled          bool   `json:"tls_enabled"`
+	Configured          bool   `json:"-"`
+	ACMEEmail           string `json:"-"`
+	ACMEDNSProvider     string `json:"-"`
+	ACMETokenCiphertext string `json:"-"`
+	ACMEStaging         bool   `json:"-"`
 }
 
 // normalizeWildcardDomain accepts the UI form (*.example.com) and stores the
@@ -58,10 +62,14 @@ func wildcardDomainForSettings(settings PanelSettings) string {
 
 func scanPanelSettings(scanner interface{ Scan(...any) error }) (PanelSettings, error) {
 	var settings PanelSettings
-	var tlsEnabled, configured int
-	err := scanner.Scan(&settings.PanelDomain, &settings.RouteDomain, &settings.ListenPort, &tlsEnabled, &configured)
+	var tlsEnabled, configured, acmeStaging int
+	err := scanner.Scan(
+		&settings.PanelDomain, &settings.RouteDomain, &settings.ListenPort, &tlsEnabled, &configured,
+		&settings.ACMEEmail, &settings.ACMEDNSProvider, &settings.ACMETokenCiphertext, &acmeStaging,
+	)
 	settings.TLSEnabled = tlsEnabled != 0
 	settings.Configured = configured != 0
+	settings.ACMEStaging = acmeStaging != 0
 	return settings, err
 }
 
@@ -70,7 +78,8 @@ func (d *DB) PanelSettings() (PanelSettings, error) {
 		return PanelSettings{}, errors.New("panel settings database is unavailable")
 	}
 	return scanPanelSettings(d.db.QueryRow(`
-		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured
+		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured,
+			acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 }
 
@@ -202,7 +211,8 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPor
 	defer tx.Rollback()
 
 	current, err := scanPanelSettings(tx.QueryRow(`
-		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured
+		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured,
+			acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 	if err != nil {
 		return PanelSettings{}, 0, err
@@ -269,7 +279,35 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPor
 	if err := tx.Commit(); err != nil {
 		return PanelSettings{}, 0, err
 	}
-	return candidate, len(migrations), nil
+	persisted, err := d.PanelSettings()
+	if err != nil {
+		return PanelSettings{}, 0, err
+	}
+	return persisted, len(migrations), nil
+}
+
+func (d *DB) SavePanelACMECredentials(email, provider, tokenCiphertext string, staging bool) error {
+	if d == nil || d.db == nil {
+		return errors.New("panel settings database is unavailable")
+	}
+	_, err := d.db.Exec(`
+		UPDATE panel_settings
+		SET acme_email=?, acme_dns_provider=?, acme_token_ciphertext=?, acme_staging=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, email, provider, tokenCiphertext, sqliteBool(staging), panelSettingsRowID)
+	return err
+}
+
+// SetPanelTLSEnabled changes only the active panel transport. Certificate and
+// ACME files remain intact so HTTPS can be re-enabled or renewed later.
+func (d *DB) SetPanelTLSEnabled(enabled bool) error {
+	if d == nil || d.db == nil {
+		return errors.New("panel settings database is unavailable")
+	}
+	_, err := d.db.Exec(`
+		UPDATE panel_settings
+		SET tls_enabled=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, sqliteBool(enabled), panelSettingsRowID)
+	return err
 }
 
 func (d *DB) restorePanelSettings(settings PanelSettings) error {
@@ -278,7 +316,9 @@ func (d *DB) restorePanelSettings(settings PanelSettings) error {
 	}
 	_, err := d.db.Exec(`
 		UPDATE panel_settings
-		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=?, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, sqliteBool(settings.TLSEnabled), sqliteBool(settings.Configured), panelSettingsRowID)
+		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=?,
+			acme_email=?, acme_dns_provider=?, acme_token_ciphertext=?, acme_staging=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, sqliteBool(settings.TLSEnabled), sqliteBool(settings.Configured),
+		settings.ACMEEmail, settings.ACMEDNSProvider, settings.ACMETokenCiphertext, sqliteBool(settings.ACMEStaging), panelSettingsRowID)
 	return err
 }

@@ -1294,12 +1294,14 @@ func TestClientIPModeAppliesToLiveReverseProxyRequests(t *testing.T) {
 
 func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
 	var siteTraffic atomic.Int64
+	var cumulativeTraffic atomic.Int64
 	siteTraffic.Store(10 << 20)
 	recorder := httptest.NewRecorder()
 	writer := &rateLimitedWriter{
 		ResponseWriter: recorder,
 		bytesPerSec:    1024,
 		written:        &siteTraffic,
+		cumulative:     &cumulativeTraffic,
 		start:          time.Now().Add(-time.Second),
 	}
 	payload := bytes.Repeat([]byte("x"), 512)
@@ -1315,6 +1317,9 @@ func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
 	}
 	if got := siteTraffic.Load(); got != (10<<20)+int64(len(payload)) {
 		t.Fatalf("site traffic = %d, want %d", got, (10<<20)+len(payload))
+	}
+	if got := cumulativeTraffic.Load(); got != int64(len(payload)) {
+		t.Fatalf("cumulative traffic = %d, want %d", got, len(payload))
 	}
 }
 
@@ -1393,7 +1398,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.38", "/css/style.css?v=1.8.38", "/js/pages/sites.js?v=1.8.38", "/js/pages/request-logs.js?v=1.8.38", "/js/app.js?v=1.8.38"} {
+	for _, asset := range []string{"/js/theme.js?v=1.8.39", "/css/style.css?v=1.8.39", "/js/pages/sites.js?v=1.8.39", "/js/pages/request-logs.js?v=1.8.39", "/js/app.js?v=1.8.39"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -3697,6 +3702,8 @@ func TestFlushTrafficUpdatesBaselineAndStopPersistsPendingUsage(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.cumulativeBytesIn.Store(120)
+	inst.cumulativeBytesOut.Store(80)
 	app.pm.proxies[site.ID] = inst
 
 	app.pm.FlushTraffic()
@@ -3802,6 +3809,8 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.cumulativeBytesIn.Store(120)
+	inst.cumulativeBytesOut.Store(80)
 	inst.reqCount.Store(5)
 	inst.pendingRequests.Store(5)
 	app.pm.proxies[site.ID] = inst
@@ -3812,7 +3821,7 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
 	live := findLiveSite(t, snap, site.ID)
-	if live.TrafficUsed != 200 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 {
+	if live.TrafficUsed != 200 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 || live.CumulativeBytesIn != 120 || live.CumulativeBytesOut != 80 {
 		t.Fatalf("pre-flush live state = %+v, want used=200 persisted=0 in=120 out=80", live)
 	}
 
@@ -3827,6 +3836,12 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	}
 	if got := inst.bytesOut.Load(); got != 0 {
 		t.Fatalf("bytesOut after flush = %d, want 0", got)
+	}
+	if got := inst.cumulativeBytesIn.Load(); got != 120 {
+		t.Fatalf("cumulativeBytesIn after flush = %d, want 120", got)
+	}
+	if got := inst.cumulativeBytesOut.Load(); got != 80 {
+		t.Fatalf("cumulativeBytesOut after flush = %d, want 80", got)
 	}
 	if got := inst.pendingRequests.Load(); got != 0 {
 		t.Fatalf("pendingRequests after flush = %d, want 0", got)
