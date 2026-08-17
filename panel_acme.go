@@ -159,7 +159,7 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	status.Issuing = m.issuing
-	data, err := os.ReadFile(m.certFile)
+	data, err := os.ReadFile(m.certFile) // #nosec G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
 	if err != nil {
 		return status
 	}
@@ -429,7 +429,7 @@ func (m *panelCertificateManager) disable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.currentCertificate = nil
-	err := os.Remove(filepath.Join(m.accountDir, "enabled"))
+	err := os.Remove(filepath.Join(m.accountDir, "enabled")) // #nosec G703 -- accountDir is the managed TLS directory and enabled is a fixed marker basename.
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -492,7 +492,7 @@ func restoreOptionalFile(filename string, data []byte, existed bool) error {
 	if existed {
 		return writePrivateFileAtomic(filename, data)
 	}
-	err := os.Remove(filename)
+	err := os.Remove(filename) // #nosec G703 -- callers pass only the manager's certificate, private-key, or fixed enabled-marker path.
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
