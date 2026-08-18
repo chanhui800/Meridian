@@ -610,8 +610,8 @@ test('observation normalization accepts only finite enums and privacy-safe aggre
       source: 'redirect',
       decision: 'allowed',
       reason: 'redirect_allowed',
-      firstSeen: '1970-01-01T00:00:00.000Z',
-      lastSeen: '2023-11-14T22:13:20.123Z',
+      firstSeen: '1970-01-01 08:00:00',
+      lastSeen: '2023-11-15 06:13:20',
       count: 3,
     },
     {
@@ -619,8 +619,8 @@ test('observation normalization accepts only finite enums and privacy-safe aggre
       source: 'redirect',
       decision: 'denied',
       reason: 'scheme_denied',
-      firstSeen: '1970-01-01T00:00:00.001Z',
-      lastSeen: '1970-01-01T00:00:00.002Z',
+      firstSeen: '1970-01-01 08:00:00',
+      lastSeen: '1970-01-01 08:00:00',
       count: Number.MAX_SAFE_INTEGER,
     },
   ]);
@@ -631,8 +631,8 @@ test('observation normalization accepts only finite enums and privacy-safe aggre
       source,
       decision: 'denied',
       reason,
-      firstSeen: new Date(10 + (index * 2)).toISOString(),
-      lastSeen: new Date(11 + (index * 2)).toISOString(),
+      firstSeen: '1970-01-01 08:00:00',
+      lastSeen: '1970-01-01 08:00:00',
       count: index + 1,
     })),
   );
@@ -641,8 +641,8 @@ test('observation normalization accepts only finite enums and privacy-safe aggre
     source: 'playback_info',
     decision: 'denied',
     reason: '—',
-    firstSeen: '1970-01-01T00:00:00.030Z',
-    lastSeen: '1970-01-01T00:00:00.031Z',
+    firstSeen: '1970-01-01 08:00:00',
+    lastSeen: '1970-01-01 08:00:00',
     count: 1,
   });
   assert.equal(normalized.dropped, 4);

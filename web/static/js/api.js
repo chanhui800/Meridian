@@ -1,4 +1,78 @@
 // Meridian API Client
+let meridianTimezoneOffsetMinutes = 480;
+
+function meridianSetTimezoneOffset(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= -720 && numeric <= 840) {
+    meridianTimezoneOffsetMinutes = Math.trunc(numeric);
+  }
+  return meridianTimezoneOffsetMinutes;
+}
+
+function meridianGetTimezoneOffset() {
+  return meridianTimezoneOffsetMinutes;
+}
+
+function meridianTimezoneLabel(offset) {
+  const value = Number.isFinite(Number(offset)) ? Number(offset) : meridianTimezoneOffsetMinutes;
+  const sign = value < 0 ? '-' : '+';
+  const absolute = Math.abs(value);
+  return `UTC${sign}${String(Math.floor(absolute / 60)).padStart(2, '0')}:${String(absolute % 60).padStart(2, '0')}`;
+}
+
+function meridianTimezoneDate(timestamp) {
+  const value = Number(timestamp);
+  return new Date((Number.isFinite(value) ? value : Date.now()) + meridianTimezoneOffsetMinutes * 60000);
+}
+
+function meridianFormatDateTime(timestamp, includeSeconds = true) {
+  const date = meridianTimezoneDate(timestamp);
+  const pad = value => String(value).padStart(2, '0');
+  const base = `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+  return includeSeconds ? `${base}:${pad(date.getUTCSeconds())}` : base;
+}
+
+function meridianFormatDate(timestamp) {
+  const date = meridianTimezoneDate(timestamp);
+  return `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
+}
+
+function meridianDateTimeLocalValue(dateOrTimestamp) {
+  const timestamp = dateOrTimestamp instanceof Date ? dateOrTimestamp.getTime() : Number(dateOrTimestamp);
+  const date = meridianTimezoneDate(Number.isFinite(timestamp) ? timestamp : Date.now());
+  const pad = value => String(value).padStart(2, '0');
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+function meridianParseDateTimeLocal(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) return NaN;
+  const timestamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]));
+  return timestamp - meridianTimezoneOffsetMinutes * 60000;
+}
+
+function meridianParseDateTimeText(value) {
+  const normalized = String(value || '').trim().replace(' ', 'T');
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return NaN;
+  const timestamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6] || 0));
+  return timestamp - meridianTimezoneOffsetMinutes * 60000;
+}
+
+function meridianDateOnlyValue(dateOrTimestamp) {
+  const timestamp = dateOrTimestamp instanceof Date ? dateOrTimestamp.getTime() : Number(dateOrTimestamp);
+  const date = meridianTimezoneDate(Number.isFinite(timestamp) ? timestamp : Date.now());
+  const pad = value => String(value).padStart(2, '0');
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+}
+
+function meridianParseDateOnly(value, endOfDay = false) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return NaN;
+  const timestamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0);
+  return timestamp - meridianTimezoneOffsetMinutes * 60000;
+}
+
 const API = {
   username: '',
   authenticated: false,
@@ -58,8 +132,12 @@ const API = {
   // Dashboard
   dashboard() { return this.request('GET', '/api/dashboard'); },
   dashboardInsights() { return this.request('GET', '/api/dashboard-insights'); },
-  dashboardTrends(siteId, range) {
+  dashboardTrends(siteId, range, customStart, customEnd) {
     const params = new URLSearchParams({ site_id: siteId || 'all', range: range || 'realtime' });
+    if ((range || '').toLowerCase() === 'custom') {
+      if (customStart) params.set('start', customStart);
+      if (customEnd) params.set('end', customEnd);
+    }
     return this.request('GET', '/api/dashboard-trends?' + params.toString());
   },
   getSystemSettings() { return this.request('GET', '/api/system-settings'); },

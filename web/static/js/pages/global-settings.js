@@ -5,6 +5,7 @@ let globalSettingsLoadGeneration = 0;
 
 function applySystemUISettings(settings) {
   if (!settings) return;
+  if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(settings.schedule_timezone_offset);
   const radius = Math.max(0, Math.min(24, Number(settings.ui_radius || 0)));
   document.documentElement.style.setProperty('--ui-radius', `${radius}px`);
 }
