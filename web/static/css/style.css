@@ -687,6 +687,8 @@ tr:hover td { background: var(--surface); }
 }
 
 .site-row-label { font-size: .78rem; color: var(--white-38); }
+.site-row-value { font-size: .78rem; font-weight: 500; color: var(--white-60); }
+
 
 .site-access-value {
   display: inline-flex;
@@ -964,6 +966,8 @@ html[data-theme="light"] .modal.site-config-modal {
 .site-config-modal .upstream-line-labels span:nth-child(5) { text-align: right; }
 .site-config-modal .upstream-line-labels span:nth-child(6) { text-align: center; }
 .site-config-modal .upstream-line-actions { justify-content: center; }
+
+.form-input-stack { display: flex; flex-direction: column; gap: var(--space-2); }
 
 .upstream-header-row {
   display: grid;

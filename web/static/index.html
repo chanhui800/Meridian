@@ -15,27 +15,39 @@
 <div id="page-login">
   <div class="login-card">
     <div class="login-brand">
-      <img src="/favicon.svg" alt="" class="login-logo">
       <h1>Meridian</h1>
       <p>Emby 反代管理面板</p>
     </div>
-    <form id="loginForm">
+    <div class="auth-check-status" id="auth-check-status" role="status" aria-live="polite">
+      <span id="auth-check-message">正在检查初始化状态...</span>
+      <button type="button" class="auth-retry" id="btn-auth-retry" hidden>重试</button>
+    </div>
+    <form id="loginForm" aria-busy="true">
       <div class="form-group">
-        <label>用户名</label>
+        <label for="inp-username">用户名</label>
         <input type="text" class="form-input" id="inp-username" placeholder="admin" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+        <div class="form-help" id="admin-username-help" hidden>首次创建管理员时，用户名必须为 1-64 个 UTF-8 字节。</div>
       </div>
       <div class="form-group">
-        <label>密码</label>
+        <label for="inp-password">密码</label>
         <input type="password" class="form-input" id="inp-password" placeholder="••••••••" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+        <div class="form-help" id="admin-password-help" hidden>首次创建管理员时，密码必须为 12-72 个 UTF-8 字节。</div>
+      </div>
+      <div class="form-group" id="confirm-password-group" hidden>
+        <label for="inp-confirm-password">确认密码</label>
+        <input type="password" class="form-input" id="inp-confirm-password" placeholder="再次输入密码" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false">
       </div>
       <div class="form-group" id="setup-token-group" hidden>
         <label for="inp-setup-token">初始化令牌</label>
-        <input type="password" class="form-input" id="inp-setup-token" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="请从安装输出或部署配置中复制">
-        <div class="form-help">首次创建管理员时需要。Docker 用户可通过 <code>docker compose logs meridian</code> 查看自动生成的初始化令牌。</div>
+        <div class="secret-input-wrap">
+          <input type="password" class="form-input" id="inp-setup-token" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="请从安装输出或部署配置中复制">
+          <button type="button" class="secret-toggle" id="btn-toggle-setup-token" aria-controls="inp-setup-token" aria-pressed="false" aria-label="显示初始化令牌">显示</button>
+        </div>
+        <div class="form-help" id="setup-token-help">首次创建管理员时必须填写。仅在初始化仍待完成时，root 才可从 /opt/meridian/.env 恢复现有 SETUP_TOKEN；本页面不会读取或显示服务端令牌。</div>
       </div>
-      <button type="submit" class="btn-login" id="btn-login">登录</button>
+      <button type="submit" class="btn-login" id="btn-login" disabled>正在检查...</button>
     </form>
-    <div class="login-footer" id="login-footer">正在检查初始化状态...</div>
+    <div class="login-footer" id="login-footer" hidden></div>
   </div>
 </div>
 

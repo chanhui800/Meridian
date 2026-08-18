@@ -3,23 +3,74 @@
 
   const loginEl = document.getElementById('page-login');
   const shellEl = document.getElementById('app-shell');
+  const loginFormEl = document.getElementById('loginForm');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
+  const usernameInputEl = document.getElementById('inp-username');
+  const usernameHelpEl = document.getElementById('admin-username-help');
+  const passwordInputEl = document.getElementById('inp-password');
+  const passwordHelpEl = document.getElementById('admin-password-help');
+  const confirmPasswordGroupEl = document.getElementById('confirm-password-group');
+  const confirmPasswordInputEl = document.getElementById('inp-confirm-password');
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
-  const sidebarToggleEl = document.getElementById('sidebar-toggle');
-  const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
-  const sidebarStorageKey = 'meridian-sidebar-expanded';
+  const setupTokenToggleEl = document.getElementById('btn-toggle-setup-token');
+  const authCheckStatusEl = document.getElementById('auth-check-status');
+  const authCheckMessageEl = document.getElementById('auth-check-message');
+  const authRetryButtonEl = document.getElementById('btn-auth-retry');
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
   let modalPreviousFocus = null;
+  let authMode = 'checking';
+  let authSubmissionInFlight = false;
   let authStatus = {
     needs_setup: false,
     mode: 'single_admin',
     jwt_secret_ephemeral: false,
     setup_token_required: false,
   };
+
+  window.openModal = function(options) {
+    modalBackdropClosable = !!(options && options.closeOnBackdrop);
+    modalPreviousFocus = document.activeElement;
+    const overlay = document.getElementById('modal-overlay');
+    document.getElementById('modal-body').scrollTop = 0;
+    overlay.classList.add('active');
+    overlay.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
+  };
+
+  window.closeModal = function() {
+    modalBackdropClosable = false;
+    const overlay = document.getElementById('modal-overlay');
+    overlay.classList.remove('active');
+    overlay.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-open');
+    if (modalPreviousFocus && modalPreviousFocus.isConnected) modalPreviousFocus.focus();
+    modalPreviousFocus = null;
+  };
+
+  document.getElementById('modal-overlay').addEventListener('click', function(e) {
+    if (e.target === this && modalBackdropClosable) closeModal();
+  });
+
+  document.getElementById('modal-close').addEventListener('click', closeModal);
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('modal-overlay').classList.contains('active')) closeModal();
+  });
+
+  function setSetupTokenVisible(visible) {
+    setupTokenInputEl.type = visible ? 'text' : 'password';
+    setupTokenToggleEl.textContent = visible ? '隐藏' : '显示';
+    setupTokenToggleEl.setAttribute('aria-pressed', visible ? 'true' : 'false');
+    setupTokenToggleEl.setAttribute('aria-label', visible ? '隐藏初始化令牌' : '显示初始化令牌');
+  }
+
+  const sidebarToggleEl = document.getElementById('sidebar-toggle');
+  const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
+  const sidebarStorageKey = 'meridian-sidebar-expanded';
 
   function storedSidebarExpanded() {
     try {
@@ -32,7 +83,11 @@
 
   function setSidebarExpanded(expanded, persist) {
     expanded = !!expanded;
-    shellEl.classList.toggle('sidebar-expanded', expanded);
+    if (shellEl && shellEl.classList) {
+      if (typeof shellEl.classList.toggle === 'function') shellEl.classList.toggle('sidebar-expanded', expanded);
+      else if (expanded && typeof shellEl.classList.add === 'function') shellEl.classList.add('sidebar-expanded');
+      else if (!expanded && typeof shellEl.classList.remove === 'function') shellEl.classList.remove('sidebar-expanded');
+    }
     if (sidebarToggleEl) {
       const label = expanded ? '折叠导航栏' : '展开导航栏';
       sidebarToggleEl.setAttribute('aria-expanded', String(expanded));
@@ -66,7 +121,7 @@
     });
   }
 
-  document.querySelectorAll('.sidebar a[href^="#"]').forEach(link => {
+  if (typeof document.querySelectorAll === 'function') document.querySelectorAll('.sidebar a[href^="#"]').forEach(link => {
     link.addEventListener('click', function() {
       if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
         setSidebarExpanded(false, true);
@@ -74,44 +129,54 @@
     });
   });
 
-  window.openModal = function(options) {
-    modalBackdropClosable = !!(options && options.closeOnBackdrop);
-    modalPreviousFocus = document.activeElement;
-    const overlay = document.getElementById('modal-overlay');
-    const modal = document.getElementById('modal');
-    modal.className = 'modal';
-    if (options && options.modalClass) modal.classList.add(options.modalClass);
-    overlay.scrollTop = 0;
-    document.getElementById('modal-body').scrollTop = 0;
-    overlay.classList.add('active');
-    overlay.setAttribute('aria-hidden', 'false');
-    document.body.classList.add('modal-open');
-  };
+  function setAuthChecking() {
+    authMode = 'checking';
+    loginFormEl.setAttribute('aria-busy', 'true');
+    loginButtonEl.disabled = true;
+    loginButtonEl.textContent = '正在检查...';
+    if (authCheckStatusEl) {
+      authCheckStatusEl.hidden = false;
+      authCheckStatusEl.classList.remove('error');
+      authCheckStatusEl.setAttribute('role', 'status');
+    }
+    if (authCheckMessageEl) authCheckMessageEl.textContent = '正在检查初始化状态...';
+    if (authRetryButtonEl) {
+      authRetryButtonEl.hidden = true;
+      authRetryButtonEl.disabled = true;
+    }
+    if (loginFooterEl) loginFooterEl.hidden = true;
+  }
 
-  window.closeModal = function() {
-    modalBackdropClosable = false;
-    const overlay = document.getElementById('modal-overlay');
-    overlay.classList.remove('active');
-    overlay.setAttribute('aria-hidden', 'true');
-    document.body.classList.remove('modal-open');
-    if (modalPreviousFocus && modalPreviousFocus.isConnected) modalPreviousFocus.focus();
-    modalPreviousFocus = null;
-  };
-
-  document.getElementById('modal-overlay').addEventListener('click', function(e) {
-    if (e.target === this && modalBackdropClosable) closeModal();
-  });
-
-  document.getElementById('modal-close').addEventListener('click', closeModal);
-
-  document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && document.getElementById('modal-overlay').classList.contains('active')) closeModal();
-  });
+  function showAuthCheckError() {
+    authMode = 'error';
+    loginFormEl.setAttribute('aria-busy', 'false');
+    loginButtonEl.disabled = true;
+    loginButtonEl.textContent = '状态检查失败';
+    if (authCheckStatusEl) {
+      authCheckStatusEl.hidden = false;
+      authCheckStatusEl.classList.add('error');
+      authCheckStatusEl.setAttribute('role', 'alert');
+    }
+    if (authCheckMessageEl) authCheckMessageEl.textContent = '初始化状态检查失败，无法确定应登录还是创建管理员。请确认服务可用后重试。';
+    if (authRetryButtonEl) {
+      authRetryButtonEl.hidden = false;
+      authRetryButtonEl.disabled = false;
+    }
+    if (loginFooterEl) loginFooterEl.hidden = true;
+  }
 
   async function checkAuth() {
+    setAuthChecking();
     try {
       const res = await API.checkSetup();
-      authStatus = Object.assign({}, authStatus, res || {});
+      if (!res || typeof res.needs_setup !== 'boolean') {
+        throw new Error('invalid auth check response');
+      }
+      authStatus = {
+        needs_setup: res.needs_setup,
+        mode: typeof res.mode === 'string' ? res.mode : 'single_admin',
+        jwt_secret_ephemeral: !!res.jwt_secret_ephemeral,
+      };
       if (res.needs_setup) {
         showSetupMode();
         return;
@@ -121,24 +186,16 @@
         enterApp();
         return;
       }
+      showLoginMode();
     } catch (e) {
-      // Server not available, just show login
+      showAuthCheckError();
     }
-
-    showLoginMode();
   }
 
   function renderLoginFooter(isSetup) {
-    const lines = [];
-    if (authStatus.mode === 'single_admin') {
-      lines.push(isSetup
-        ? '当前为单管理员模式，请创建唯一的管理员账号。'
-        : '当前为单管理员模式。');
-    } else {
-      lines.push(isSetup
-        ? '首次使用，请创建管理员账号。'
-        : '请输入管理员账户信息登录。');
-    }
+    const lines = [isSetup
+      ? '当前为单管理员模式，请创建唯一的管理员账号。'
+      : '当前为单管理员模式。'];
 
     if (authStatus.jwt_secret_ephemeral) {
       lines.push('<span class="login-note warn">当前未固定 JWT_SECRET，服务重启后需要重新登录。</span>');
@@ -148,24 +205,62 @@
   }
 
   function showSetupMode() {
-    loginButtonEl.textContent = '注册';
+    authMode = 'setup';
+    loginFormEl.setAttribute('aria-busy', 'false');
+    if (authCheckStatusEl) authCheckStatusEl.hidden = true;
+    loginButtonEl.textContent = '创建管理员';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(true);
-    loginEl._isSetup = true;
-    setupTokenGroupEl.hidden = !authStatus.setup_token_required;
-    setupTokenInputEl.required = !!authStatus.setup_token_required;
-    document.body.classList.remove('auth-checking');
+    loginFooterEl.hidden = false;
+    usernameHelpEl.hidden = false;
+    usernameInputEl.setAttribute('aria-describedby', 'admin-username-help');
+    passwordHelpEl.hidden = false;
+    passwordInputEl.autocomplete = 'new-password';
+    passwordInputEl.setAttribute('aria-describedby', 'admin-password-help');
+    confirmPasswordGroupEl.hidden = false;
+    confirmPasswordInputEl.required = true;
+    setupTokenGroupEl.hidden = false;
+    setupTokenInputEl.required = true;
+    setSetupTokenVisible(false);
   }
 
   function showLoginMode() {
+    authMode = 'login';
+    loginFormEl.setAttribute('aria-busy', 'false');
+    if (authCheckStatusEl) authCheckStatusEl.hidden = true;
     loginButtonEl.textContent = '登录';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(false);
-    loginEl._isSetup = false;
-    setupTokenGroupEl.hidden = true;
-    setupTokenInputEl.required = false;
-    document.body.classList.remove('auth-checking');
+    loginFooterEl.hidden = false;
+    if (usernameHelpEl) usernameHelpEl.hidden = true;
+    if (usernameInputEl && typeof usernameInputEl.removeAttribute === 'function') usernameInputEl.removeAttribute('aria-describedby');
+    if (passwordHelpEl) passwordHelpEl.hidden = true;
+    if (passwordInputEl) {
+      passwordInputEl.autocomplete = 'current-password';
+      if (typeof passwordInputEl.removeAttribute === 'function') passwordInputEl.removeAttribute('aria-describedby');
+    }
+    if (confirmPasswordGroupEl) confirmPasswordGroupEl.hidden = true;
+    if (confirmPasswordInputEl) {
+      confirmPasswordInputEl.required = false;
+      confirmPasswordInputEl.value = '';
+    }
+    if (setupTokenGroupEl) setupTokenGroupEl.hidden = true;
+    if (setupTokenInputEl) {
+      setupTokenInputEl.required = false;
+      setupTokenInputEl.value = '';
+    }
+    if (setupTokenToggleEl) setSetupTokenVisible(false);
   }
+
+  function setupUsernameValidationError(username) {
+    const length = utf8ByteLength(username);
+    return length < 1 || length > 64 ? '管理员用户名必须为 1-64 个 UTF-8 字节' : '';
+  }
+
+  if (authRetryButtonEl) authRetryButtonEl.addEventListener('click', checkAuth);
+  if (setupTokenToggleEl) setupTokenToggleEl.addEventListener('click', function() {
+    setSetupTokenVisible(setupTokenInputEl.type === 'password');
+  });
 
   function startDashboardRefresh() {
     if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
@@ -183,49 +278,62 @@
   function teardownAppRuntime() {
     stopDashboardRefresh();
     if (typeof stopDashSSE === 'function') stopDashSSE();
-    // Keep cleanup compatible with cached clients that still have the retired
-    // traffic page script loaded; the page is no longer registered or linked.
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
   }
 
   function loginErrorMessage(error) {
     const message = String(error && error.message || '登录失败');
-    if (message.includes('too many login attempts') || message.includes('登录尝试次数过多')) {
-      return '登录尝试次数过多，请稍后重试';
-    }
-    if (message === 'invalid username or password' || message === '用户名或密码错误') {
-      return '用户名或密码错误';
-    }
+    if (message.includes('too many login attempts') || message.includes('登录尝试次数过多')) return '登录尝试次数过多，请稍后重试';
+    if (message === 'invalid username or password' || message === '用户名或密码错误') return '用户名或密码错误';
     return message;
   }
-
-  document.getElementById('loginForm').addEventListener('submit', async function(e) {
+  loginFormEl.addEventListener('submit', async function(e) {
     e.preventDefault();
-    const username = document.getElementById('inp-username').value.trim();
-    const password = document.getElementById('inp-password').value;
+    if (authSubmissionInFlight) return;
+    if (authMode !== 'setup' && authMode !== 'login') {
+      Toast.error('初始化状态尚未确认，请先重试');
+      return;
+    }
+    const submittingSetup = authMode === 'setup';
+
+    const username = usernameInputEl.value.trim();
+    const password = passwordInputEl.value;
+    const confirmPassword = confirmPasswordInputEl.value;
     const setupToken = setupTokenInputEl.value.trim();
 
-    if (!username || !password) {
-      Toast.error('请填写用户名和密码');
-      return;
+    if (!submittingSetup) {
+      if (!username || !password) {
+        Toast.error('请填写用户名和密码');
+        return;
+      }
+    } else {
+      const usernameError = setupUsernameValidationError(username);
+      if (usernameError) {
+        Toast.error(usernameError);
+        return;
+      }
+      const passwordError = adminPasswordValidationError(password);
+      if (passwordError) {
+        Toast.error(passwordError);
+        return;
+      }
+      if (password !== confirmPassword) {
+        Toast.error('两次输入的密码不一致');
+        return;
+      }
+      if (!setupToken) {
+        Toast.error('请填写初始化令牌');
+        return;
+      }
     }
 
-    if (loginEl._isSetup && password.length < 12) {
-      Toast.error('管理员密码至少需要 12 位');
-      return;
-    }
-
-    if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {
-      Toast.error('请填写安装时显示或部署环境中设置的初始化令牌');
-      return;
-    }
-
+    authSubmissionInFlight = true;
     loginButtonEl.disabled = true;
     loginButtonEl.textContent = '处理中...';
 
     try {
       let res;
-      if (loginEl._isSetup) {
+      if (submittingSetup) {
         res = await API.setup(username, password, setupToken);
         Toast.success('管理员创建成功');
       } else {
@@ -233,15 +341,24 @@
         Toast.success('欢迎回来, ' + res.username + '!');
       }
       API.setSession(res);
-      document.getElementById('inp-password').value = '';
+      passwordInputEl.value = '';
+      confirmPasswordInputEl.value = '';
       setupTokenInputEl.value = '';
+      setSetupTokenVisible(false);
       enterApp();
     } catch (err) {
       Toast.error(loginErrorMessage(err));
-      loginButtonEl.disabled = false;
-      loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
+      if (submittingSetup) {
+        await checkAuth();
+      } else {
+        loginButtonEl.disabled = false;
+        loginButtonEl.textContent = '登录';
+      }
+    } finally {
+      authSubmissionInFlight = false;
     }
   });
+
 
   function enterApp() {
     loginEl.classList.add('hidden');
@@ -302,7 +419,7 @@
   }
 
   window.logoutMeridian = logoutApp;
-  document.getElementById('avatar-btn').addEventListener('click', function() {
+  if (document.getElementById('avatar-btn')) document.getElementById('avatar-btn').addEventListener('click', function() {
     if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
       setSidebarExpanded(false, true);
     }

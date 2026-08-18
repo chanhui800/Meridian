@@ -889,11 +889,14 @@ function canAddPlaybackAddress(currentCount, maxPlaybackAddresses) {
 
 function renderUpstreamHeaderRows(headers, upstreamHeadersAvailable) {
 	return headers.map((header, idx) => `
-		<div class="upstream-header-row">
-		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <button type="button" class="icon-button danger m-upstream-header-remove" data-idx="${idx}" title="删除请求头" aria-label="删除请求头"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg></button>
-		</div>
+		<fieldset class="form-list-row upstream-header-row">
+		  <legend class="sr-only">上游请求头 ${idx + 1}</legend>
+		  <label class="sr-only" for="m-upstream-header-name-${idx}">请求头名称</label>
+		  <input type="text" class="form-input m-upstream-header-name" id="m-upstream-header-name-${idx}" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <label class="sr-only" for="m-upstream-header-value-${idx}">请求头值</label>
+		  <input type="password" class="form-input m-upstream-header-value" id="m-upstream-header-value-${idx}" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <button type="button" class="btn-ghost danger form-row-action m-upstream-header-remove" data-idx="${idx}" aria-label="删除上游请求头 ${idx + 1}">删除</button>
+		</fieldset>
 	`).join('');
 }
 
