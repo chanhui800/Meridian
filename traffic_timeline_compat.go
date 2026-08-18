@@ -75,7 +75,10 @@ func (d *DB) addTrafficMinuteBuckets(siteID, bytesIn, bytesOut int64, buckets ma
 		}
 	}
 	cutoff := trafficMinuteStart(now.Add(-trafficMinuteRetention))
-	if _, err := tx.Exec(`DELETE FROM traffic_minute_logs WHERE minute_start_unix < ?`, cutoff); err != nil {
+	if _, err := tx.Exec(`DELETE FROM traffic_minute_logs
+		WHERE rowid IN (
+			SELECT rowid FROM traffic_minute_logs WHERE minute_start_unix < ? ORDER BY minute_start_unix, site_id LIMIT ?
+		)`, cutoff, trafficMinutePruneBatchSize); err != nil {
 		return err
 	}
 	return tx.Commit()

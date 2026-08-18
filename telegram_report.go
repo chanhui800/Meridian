@@ -99,7 +99,7 @@ func telegramReportKeyForSecret(secret []byte) []byte {
 }
 
 func encryptTelegramBotToken(token string) (string, error) {
-	return encryptTelegramBotTokenWithSecret(token, jwtSecret)
+	return encryptTelegramBotTokenWithSecret(token, activeStoredCredentialSecret())
 }
 
 func encryptTelegramBotTokenWithSecret(token string, secret []byte) (string, error) {
@@ -125,7 +125,15 @@ func encryptTelegramBotTokenWithSecret(token string, secret []byte) (string, err
 }
 
 func decryptTelegramBotToken(ciphertext string) (string, error) {
-	return decryptTelegramBotTokenWithSecret(ciphertext, jwtSecret)
+	var lastErr error
+	for _, secret := range storedCredentialSecrets() {
+		plain, err := decryptTelegramBotTokenWithSecret(ciphertext, secret)
+		if err == nil {
+			return plain, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
 }
 
 func decryptTelegramBotTokenWithSecret(ciphertext string, secret []byte) (string, error) {

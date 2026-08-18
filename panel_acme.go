@@ -206,8 +206,9 @@ func panelACMETokenKeyForSecret(secret []byte) []byte {
 }
 
 func encryptPanelACMEToken(token string) (string, error) {
-	return encryptPanelACMETokenWithSecret(token, jwtSecret)
+	return encryptPanelACMETokenWithSecret(token, activeStoredCredentialSecret())
 }
+
 
 func encryptPanelACMETokenWithSecret(token string, secret []byte) (string, error) {
 	token = strings.TrimSpace(token)
@@ -231,8 +232,17 @@ func encryptPanelACMETokenWithSecret(token string, secret []byte) (string, error
 }
 
 func decryptPanelACMEToken(ciphertext string) (string, error) {
-	return decryptPanelACMETokenWithSecret(ciphertext, jwtSecret)
+	var lastErr error
+	for _, secret := range storedCredentialSecrets() {
+		plain, err := decryptPanelACMETokenWithSecret(ciphertext, secret)
+		if err == nil {
+			return plain, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
 }
+
 
 func decryptPanelACMETokenWithSecret(ciphertext string, secret []byte) (string, error) {
 	if !strings.HasPrefix(ciphertext, panelACMETokenCipherPrefix) {

@@ -103,6 +103,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
+	if err := migrateStoredCredentialCiphertexts(db); err != nil {
+		log.Fatalf("migrate stored credentials: %v", err)
+	}
 	defer db.Close()
 	panelSettings, err := db.BootstrapPanelSettings(os.Getenv("PANEL_DOMAIN"), os.Getenv("PANEL_ROUTE_DOMAIN"), envBool("PANEL_TLS_ENABLED"), port)
 	if err != nil {

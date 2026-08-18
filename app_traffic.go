@@ -27,6 +27,10 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasSuffix(path, "/timeline") {
+		if r.Method != http.MethodGet {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
 		path = strings.TrimSuffix(path, "/timeline")
 		siteID, err := strconv.ParseInt(path, 10, 64)
 		if err != nil {

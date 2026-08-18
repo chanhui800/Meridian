@@ -542,10 +542,11 @@ read_strict_dynamic_route_key() {
 }
 
 validate_existing_secret_configuration() {
-    local jwt_secret upstream_header_key dynamic_route_key
+    local jwt_secret upstream_header_key dynamic_route_key credential_key
     jwt_secret=$(read_legacy_env_secret JWT_SECRET) || return 1
     upstream_header_key=$(read_legacy_env_secret UPSTREAM_HEADER_KEY) || return 1
     dynamic_route_key=$(read_strict_dynamic_route_key) || return 1
+    credential_key=$(read_legacy_env_secret MERIDIAN_SECRET_KEY) || return 1
 
     if [ -n "$jwt_secret" ] && [ "${#jwt_secret}" -lt 32 ]; then
         fail "现有 JWT_SECRET 少于 32 字节；现有配置未修改"
@@ -555,6 +556,9 @@ validate_existing_secret_configuration() {
     fi
     if [ -n "$dynamic_route_key" ] && [ "${#dynamic_route_key}" -lt 32 ]; then
         fail "现有 DYNAMIC_ROUTE_KEY 少于 32 字节；现有配置未修改"
+    fi
+    if [ -n "$credential_key" ] && [ "${#credential_key}" -lt 32 ]; then
+        fail "现有 MERIDIAN_SECRET_KEY 少于 32 字节；现有配置未修改"
     fi
     if [ -n "$jwt_secret" ] && [ -n "$upstream_header_key" ] \
         && [ "$jwt_secret" = "$upstream_header_key" ]; then
@@ -763,7 +767,7 @@ ensure_service_user() {
 }
 
 prepare_data_and_config() {
-    local tmp_dir="$1" env_file secret upstream_header_key dynamic_route_key env_tmp
+    local tmp_dir="$1" env_file secret upstream_header_key dynamic_route_key credential_key env_tmp
     validate_data_dir || return 1
     env_file=$(env_file_path) || return 1
     if as_root test -L "$env_file"; then
@@ -786,10 +790,11 @@ prepare_data_and_config() {
         secret=$(generate_distinct_secret) || return 1
         upstream_header_key=$(generate_distinct_secret "$secret") || return 1
         dynamic_route_key=$(generate_distinct_secret "$secret" "$upstream_header_key") || return 1
-        INITIAL_SETUP_TOKEN=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key") || return 1
+        credential_key=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key") || return 1
+        INITIAL_SETUP_TOKEN=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key" "$credential_key") || return 1
         env_tmp="${tmp_dir}/meridian.env"
-        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=\n' \
-            "$secret" "$upstream_header_key" "$dynamic_route_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
+        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nMERIDIAN_SECRET_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=\n' \
+            "$secret" "$upstream_header_key" "$dynamic_route_key" "$credential_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
         chmod 0600 "$env_tmp" || return 1
         install_env_file "$env_tmp" || return 1
         SETUP_TOKEN_ORIGIN="generated"
@@ -803,6 +808,7 @@ prepare_data_and_config() {
         append_env_default PANEL_TLS_CERT_FILE "" "$tmp_dir" || return 1
         append_env_default PANEL_TLS_KEY_FILE "" "$tmp_dir" || return 1
         append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir" || return 1
+        append_env_default MERIDIAN_SECRET_KEY "$(generate_secret)" "$tmp_dir" || return 1
         ensure_upstream_header_key "$tmp_dir" || return 1
         ensure_setup_token "$tmp_dir" || return 1
         if is_systemd; then

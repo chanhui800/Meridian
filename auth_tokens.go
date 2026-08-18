@@ -14,6 +14,8 @@ import (
 
 var jwtSecret []byte
 var jwtSecretEphemeral bool
+var meridianSecretKey []byte
+var meridianSecretKeyConfigured bool
 
 const (
 	sessionCookieName = "meridian_session"
@@ -25,6 +27,13 @@ func init() {
 	jwtSecret, jwtSecretEphemeral, err = resolveJWTSecret(os.Getenv("JWT_SECRET"))
 	if err != nil {
 		panic(err)
+	}
+	if configured := strings.TrimSpace(os.Getenv("MERIDIAN_SECRET_KEY")); configured != "" {
+		if len(configured) < 32 {
+			panic("MERIDIAN_SECRET_KEY must be at least 32 bytes")
+		}
+		meridianSecretKey = []byte(configured)
+		meridianSecretKeyConfigured = true
 	}
 }
 

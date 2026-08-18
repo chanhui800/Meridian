@@ -409,7 +409,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return
 		}
 
+		if route, eligible := pingCacheRouteForRequest(r); eligible && inst.pingCache != nil {
+			r = r.WithContext(context.WithValue(r.Context(), pingCacheRequestContextKey{}, route))
+		}
 		cacheTarget := upstreamTargetForRequest(r, target, playbackTarget)
+		if isRedirectMode {
+			cacheTarget = target
+		}
+
 		if isRedirectMode {
 			cacheTarget = target
 		}

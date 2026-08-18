@@ -108,7 +108,7 @@ func cacheDirectiveValue(directives cacheControlDirectives, name string) (string
 func cachePragmaNoCache(header http.Header) bool {
 	values, ok := cacheHeaderValues(header, "Pragma")
 	if !ok {
-		return true
+		return false
 	}
 	for _, value := range values {
 		for _, part := range strings.Split(value, ",") {
@@ -667,7 +667,7 @@ func imageCacheRequestKeyFor(site *imageCacheSite, primary *url.URL, r *http.Req
 	if site == nil || site.runtime == nil || primary == nil || r == nil || r.URL == nil || r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return imageCacheKey{}, false
 	}
-	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 || r.Body != nil && r.Body != http.NoBody || hasUpgradeIntent(r) || isReservedDynamicRoute(r.URL.Path) || cacheRequestForcesRevalidation(r) {
+	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 || hasUpgradeIntent(r) || isReservedDynamicRoute(r.URL.Path) || cacheRequestForcesRevalidation(r) {
 		return imageCacheKey{}, false
 	}
 	if cacheHeaderPresent(r.Header, "Range") || cacheHeaderPresent(r.Header, "If-Range") {

@@ -130,8 +130,15 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	inst.pendingMinuteTraffic = make(map[int64]trafficMinuteDelta)
 	inst.flushBytesIn = 0
 	inst.flushBytesOut = 0
-	if len(buckets) == 0 && requests > 0 {
-		buckets[trafficMinuteStart(time.Now())] = trafficMinuteDelta{Requests: requests}
+	var bucketRequests int64
+	for _, delta := range buckets {
+		bucketRequests += delta.Requests
+	}
+	if requests > bucketRequests {
+		minute := trafficMinuteStart(time.Now())
+		delta := buckets[minute]
+		delta.Requests += requests - bucketRequests
+		buckets[minute] = delta
 	}
 	if pm.database == nil {
 		inst.bytesIn.Add(in)

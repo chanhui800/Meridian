@@ -55,6 +55,7 @@ saved_jwt=
 saved_upstream=
 saved_dynamic=
 saved_setup=
+saved_credential=
 if [ -e "$secrets_file" ]; then
     if [ ! -f "$secrets_file" ] || [ -L "$secrets_file" ]; then
         fail "$secrets_file must be a regular file"
@@ -66,6 +67,7 @@ if [ -e "$secrets_file" ]; then
             UPSTREAM_HEADER_KEY) saved_upstream=$value ;;
             DYNAMIC_ROUTE_KEY) saved_dynamic=$value ;;
             SETUP_TOKEN) saved_setup=$value ;;
+            MERIDIAN_SECRET_KEY) saved_credential=$value ;;
             *) fail "unexpected entry in $secrets_file: $name" ;;
         esac
     done < "$secrets_file"
@@ -94,9 +96,15 @@ else
     setup_generated=1
 fi
 
-validate_secret JWT_SECRET "$jwt"
+if [ -n "${MERIDIAN_SECRET_KEY:-}" ]; then credential=$MERIDIAN_SECRET_KEY
+elif [ -n "$saved_credential" ]; then credential=$saved_credential
+else credential=$(generate_secret)
+fi
+
 validate_secret UPSTREAM_HEADER_KEY "$upstream"
+validate_secret JWT_SECRET "$jwt"
 validate_secret DYNAMIC_ROUTE_KEY "$dynamic"
+validate_secret MERIDIAN_SECRET_KEY "$credential"
 validate_secret SETUP_TOKEN "$setup"
 
 [ "$jwt" != "$upstream" ] || fail "UPSTREAM_HEADER_KEY must differ from JWT_SECRET"
@@ -116,6 +124,7 @@ trap 'rm -f -- "$tmp_file"' EXIT HUP INT TERM
     printf 'JWT_SECRET=%s\n' "$jwt"
     printf 'UPSTREAM_HEADER_KEY=%s\n' "$upstream"
     printf 'DYNAMIC_ROUTE_KEY=%s\n' "$dynamic"
+    printf 'MERIDIAN_SECRET_KEY=%s\n' "$credential"
     printf 'SETUP_TOKEN=%s\n' "$setup"
 } > "$tmp_file"
 chmod 0600 "$tmp_file"
@@ -125,6 +134,7 @@ trap - EXIT HUP INT TERM
 export "JWT_SECRET=$jwt"
 export "UPSTREAM_HEADER_KEY=$upstream"
 export "DYNAMIC_ROUTE_KEY=$dynamic"
+export "MERIDIAN_SECRET_KEY=$credential"
 export "SETUP_TOKEN=$setup"
 
 if [ "$(id -u)" -eq 0 ]; then
