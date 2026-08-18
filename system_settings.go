@@ -31,6 +31,8 @@ func timezoneLabel(offsetMinutes int) string {
 type SystemSettings struct {
 	UIMode                   string `json:"ui_mode"`
 	UIRadius                 int    `json:"ui_radius"`
+	TrafficBillingMode       string `json:"traffic_billing_mode"`
+	TrafficResetDay          int    `json:"traffic_reset_day"`
 	ProbeTimeoutMS           int    `json:"probe_timeout_ms"`
 	PingCacheMinutes         int    `json:"ping_cache_minutes"`
 	ScheduleTimezone         int    `json:"schedule_timezone_offset"`
@@ -75,7 +77,7 @@ type SystemSettings struct {
 
 func defaultSystemSettings() SystemSettings {
 	return SystemSettings{
-		UIMode: "novice", UIRadius: 10, ProbeTimeoutMS: 5000, PingCacheMinutes: 10,
+		UIMode: "novice", UIRadius: 10, TrafficBillingMode: trafficBillingModeBidirectional, TrafficResetDay: 1, ProbeTimeoutMS: 5000, PingCacheMinutes: 10,
 		ScheduleTimezone: beijingTimezoneOffsetMinutes,
 		LogEnabled:       true, LogLevel: "info", LogRetentionDays: 30, LogFlushThreshold: 1,
 		LogBatchSize: 50, LogRetryCount: 2, LogRetryBackoffMS: 75, LogTaskLeaseMS: 300000,
@@ -87,10 +89,20 @@ func defaultSystemSettings() SystemSettings {
 
 func normalizeSystemSettings(settings SystemSettings) (SystemSettings, error) {
 	settings.UIMode = strings.ToLower(strings.TrimSpace(settings.UIMode))
+	settings.TrafficBillingMode = strings.ToLower(strings.TrimSpace(settings.TrafficBillingMode))
+	if settings.TrafficBillingMode == "" {
+		settings.TrafficBillingMode = trafficBillingModeBidirectional
+	}
 	settings.LogLevel = strings.ToLower(strings.TrimSpace(settings.LogLevel))
 	settings.LogSearchMode = strings.ToLower(strings.TrimSpace(settings.LogSearchMode))
 	if settings.UIMode != "novice" && settings.UIMode != "expert" {
 		return settings, fmt.Errorf("ui_mode must be novice or expert")
+	}
+	if settings.TrafficBillingMode != trafficBillingModeBidirectional && settings.TrafficBillingMode != trafficBillingModeOutbound {
+		return settings, fmt.Errorf("traffic_billing_mode must be outbound or bidirectional")
+	}
+	if settings.TrafficResetDay < 0 || settings.TrafficResetDay > 31 {
+		return settings, fmt.Errorf("traffic_reset_day must be 0 (disabled) or between 1 and 31")
 	}
 	if settings.ScheduleTimezone < -720 || settings.ScheduleTimezone > 840 {
 		return settings, fmt.Errorf("schedule_timezone_offset must be between -720 and 840 minutes")
@@ -113,12 +125,12 @@ func normalizeSystemSettings(settings SystemSettings) (SystemSettings, error) {
 func (d *DB) loadSystemSettings() (SystemSettings, error) {
 	settings := defaultSystemSettings()
 	var enabled, writeImage, writePlayback, writeMetadata, writeVideo, writeSubtitle, writeAsset, writeWebSocket, writeAPI, writeAuth, writeNode, writeCategory, writeStatus, writeIP, writeColo, writeUA, writeUpstreamUA, writeBackendAddress, writeTimeline, displayIP, displayColo, displayUA, displayUpstreamUA, displayBackendAddress, displayNode, displayCategory, displayStatus, displayTimeline int
-	err := d.db.QueryRow(`SELECT ui_mode, ui_radius, probe_timeout_ms, ping_cache_minutes, schedule_timezone_offset,
+	err := d.db.QueryRow(`SELECT ui_mode, ui_radius, traffic_billing_mode, traffic_reset_day, probe_timeout_ms, ping_cache_minutes, schedule_timezone_offset,
 		log_enabled, log_level, log_retention_days, log_write_delay_minutes, log_flush_threshold, log_batch_size,
 		log_retry_count, log_retry_backoff_ms, log_task_lease_ms, log_write_image, log_write_playback, log_write_metadata, log_write_video, log_write_subtitle, log_write_asset, log_write_websocket, log_write_api, log_write_auth,
 		log_write_node, log_write_category, log_write_status, log_write_client_ip, log_write_colo, log_write_ua, log_write_upstream_ua, log_write_backend_address, log_write_timeline, log_display_client_ip, log_display_colo,
 		log_display_ua, log_display_upstream_ua, log_display_backend_address, log_display_node, log_display_category, log_display_status, log_display_timeline, log_search_mode FROM system_settings WHERE id=1`).Scan(
-		&settings.UIMode, &settings.UIRadius, &settings.ProbeTimeoutMS, &settings.PingCacheMinutes, &settings.ScheduleTimezone,
+		&settings.UIMode, &settings.UIRadius, &settings.TrafficBillingMode, &settings.TrafficResetDay, &settings.ProbeTimeoutMS, &settings.PingCacheMinutes, &settings.ScheduleTimezone,
 		&enabled, &settings.LogLevel, &settings.LogRetentionDays, &settings.LogWriteDelayMinutes, &settings.LogFlushThreshold, &settings.LogBatchSize,
 		&settings.LogRetryCount, &settings.LogRetryBackoffMS, &settings.LogTaskLeaseMS, &writeImage, &writePlayback, &writeMetadata, &writeVideo, &writeSubtitle, &writeAsset, &writeWebSocket, &writeAPI, &writeAuth,
 		&writeNode, &writeCategory, &writeStatus, &writeIP, &writeColo, &writeUA, &writeUpstreamUA, &writeBackendAddress, &writeTimeline, &displayIP, &displayColo, &displayUA, &displayUpstreamUA, &displayBackendAddress, &displayNode, &displayCategory, &displayStatus, &displayTimeline, &settings.LogSearchMode)
@@ -151,12 +163,12 @@ func (d *DB) saveSystemSettings(settings SystemSettings) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.db.Exec(`UPDATE system_settings SET ui_mode=?, ui_radius=?, probe_timeout_ms=?, ping_cache_minutes=?, schedule_timezone_offset=?,
+	_, err = d.db.Exec(`UPDATE system_settings SET ui_mode=?, ui_radius=?, traffic_billing_mode=?, traffic_reset_day=?, probe_timeout_ms=?, ping_cache_minutes=?, schedule_timezone_offset=?,
 		log_enabled=?, log_level=?, log_retention_days=?, log_write_delay_minutes=?, log_flush_threshold=?, log_batch_size=?,
 		log_retry_count=?, log_retry_backoff_ms=?, log_task_lease_ms=?, log_write_image=?, log_write_playback=?, log_write_metadata=?, log_write_video=?, log_write_subtitle=?, log_write_asset=?, log_write_websocket=?, log_write_api=?, log_write_auth=?,
 		log_write_node=?, log_write_category=?, log_write_status=?, log_write_client_ip=?, log_write_colo=?, log_write_ua=?, log_write_upstream_ua=?, log_write_backend_address=?, log_write_timeline=?, log_display_client_ip=?, log_display_colo=?,
 		log_display_ua=?, log_display_upstream_ua=?, log_display_backend_address=?, log_display_node=?, log_display_category=?, log_display_status=?, log_display_timeline=?, log_search_mode=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
-		settings.UIMode, settings.UIRadius, settings.ProbeTimeoutMS, settings.PingCacheMinutes, settings.ScheduleTimezone,
+		settings.UIMode, settings.UIRadius, settings.TrafficBillingMode, settings.TrafficResetDay, settings.ProbeTimeoutMS, settings.PingCacheMinutes, settings.ScheduleTimezone,
 		sqliteBool(settings.LogEnabled), settings.LogLevel, settings.LogRetentionDays, settings.LogWriteDelayMinutes, settings.LogFlushThreshold, settings.LogBatchSize,
 		settings.LogRetryCount, settings.LogRetryBackoffMS, settings.LogTaskLeaseMS, sqliteBool(settings.LogWriteImage), sqliteBool(settings.LogWritePlayback), sqliteBool(settings.LogWriteMetadata), sqliteBool(settings.LogWriteVideo), sqliteBool(settings.LogWriteSubtitle), sqliteBool(settings.LogWriteAsset), sqliteBool(settings.LogWriteWebSocket), sqliteBool(settings.LogWriteAPI), sqliteBool(settings.LogWriteAuth),
 		sqliteBool(settings.LogWriteNode), sqliteBool(settings.LogWriteCategory), sqliteBool(settings.LogWriteStatus), sqliteBool(settings.LogWriteClientIP), sqliteBool(settings.LogWriteColo), sqliteBool(settings.LogWriteUA), sqliteBool(settings.LogWriteUpstreamUA), sqliteBool(settings.LogWriteBackendAddress), sqliteBool(settings.LogWriteTimeline), sqliteBool(settings.LogDisplayClientIP), sqliteBool(settings.LogDisplayColo),

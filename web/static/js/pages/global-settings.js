@@ -124,6 +124,14 @@ function settingsNumber(id, label, value, min, max, unit, help) {
   return `<label class="settings-field"><span>${label}</span><div><input class="form-input" id="${id}" type="number" min="${min}" max="${max}" value="${value}"><em>${unit}</em></div>${help ? `<small>${help}</small>` : ''}</label>`;
 }
 
+function trafficResetDaySelect(value) {
+  const selected = Number(value);
+  const options = ['<option value="0">不重置（累计流量）</option>'];
+  for (let day = 1; day <= 31; day++) options.push(`<option value="${day}" ${selected === day ? 'selected' : ''}>每月 ${day} 日</option>`);
+  if (selected === 0) options[0] = '<option value="0" selected>不重置（累计流量）</option>';
+  return `<label class="settings-field"><span>流量周期</span><div><select class="form-select settings-reset-select" id="setting-traffic-reset-day">${options.join('')}</select></div><small>默认每月 1 日；选择不重置后，额度和流量统计使用全部累计值。</small></label>`;
+}
+
 function settingsCheck(id, label, checked, help) {
   return `<label class="settings-check"><input id="${id}" type="checkbox" ${checked ? 'checked' : ''}><span class="settings-check-copy"><strong>${label}</strong>${help ? `<small>${help}</small>` : ''}</span></label>`;
 }
@@ -187,7 +195,15 @@ function paintGlobalSettings(page = document.getElementById('page-global-setting
 }
 
 function renderSystemUIForm(s) {
-  return `<section class="settings-panel"><header><span>RADIUS</span><h2>UI 圆角弧度</h2><b>0-24 px</b></header>
+  return `<section class="settings-panel"><header><span>TRAFFIC</span><h2>流量计费模式</h2><b>全局统计与额度</b></header>
+    <p class="settings-panel-help">单向仅计 VPS 发给客户端的出站流量；双向同时计源站回到 VPS 的入站与 VPS 发给客户端的出站流量。</p>
+    <span class="settings-label">计费方向</span><div class="settings-choice" id="traffic-billing-mode-choice"><button data-setting-choice="outbound" class="${s.traffic_billing_mode === 'outbound' ? 'active' : ''}">单向（仅下载）</button><button data-setting-choice="bidirectional" class="${s.traffic_billing_mode !== 'outbound' ? 'active' : ''}">双向（下载 + 上传）</button></div>
+  </section>
+  <section class="settings-panel"><header><span>TRAFFIC RESET</span><h2>流量周期</h2><b>可重置或累计</b></header>
+    <p class="settings-panel-help">可按每月指定日期重置站点额度和面板周期流量，也可选择不重置。设置为 29、30 或 31 日时，短月自动使用该月最后一天。</p>
+    ${trafficResetDaySelect(s.traffic_reset_day == null ? 1 : s.traffic_reset_day)}
+  </section>
+  <section class="settings-panel"><header><span>RADIUS</span><h2>UI 圆角弧度</h2><b>0-24 px</b></header>
     ${settingsNumber('setting-ui-radius', '圆角弧度', s.ui_radius, 0, 24, 'px', '保存后立即应用到管理面板，不影响代理业务。')}
   </section>
   <section class="settings-panel"><header><span>PROBE</span><h2>健康检查探测</h2><b>1000-180000 ms</b></header>
@@ -241,6 +257,8 @@ function checkedSetting(id, fallback) {
 async function saveGlobalSettings() {
   const s = { ...globalSettingsCache };
   if (globalSettingsSection === 'system-ui') {
+    s.traffic_billing_mode = activeSettingChoice('traffic-billing-mode-choice', s.traffic_billing_mode || 'bidirectional');
+    s.traffic_reset_day = numericSetting('setting-traffic-reset-day', s.traffic_reset_day == null ? 1 : s.traffic_reset_day);
     s.ui_radius = numericSetting('setting-ui-radius', s.ui_radius);
     s.probe_timeout_ms = numericSetting('setting-probe-timeout', s.probe_timeout_ms);
     s.ping_cache_minutes = numericSetting('setting-ping-cache', s.ping_cache_minutes);

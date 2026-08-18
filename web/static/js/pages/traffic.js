@@ -86,12 +86,14 @@ async function loadTrafficChart() {
 
     const snapshot = data.snapshot || {};
     const logs = data.logs || [];
+    const billingMode = data.billing_mode === 'outbound' ? 'outbound' : 'bidirectional';
     const totalIn = logs.reduce((sum, log) => sum + Math.max(0, Number(log.bytes_in) || 0), 0);
     const totalOut = logs.reduce((sum, log) => sum + Math.max(0, Number(log.bytes_out) || 0), 0);
+    const billableRange = billingMode === 'outbound' ? totalOut : totalIn + totalOut;
     const totalRequests = logs.reduce((sum, log) => sum + Math.max(0, Number(log.requests) || 0), 0);
     const rangeLabel = trafficRangeLabel(hours);
     const rangeNote = document.getElementById('traffic-range-note');
-    if (rangeNote) rangeNote.textContent = `分钟级聚合 · ${rangeLabel}`;
+    if (rangeNote) rangeNote.textContent = `分钟级聚合 · ${rangeLabel} · ${billingMode === 'outbound' ? '单向计费（仅出站）' : '双向计费（入站 + 出站）'}`;
 
     document.getElementById('traffic-totals').innerHTML = `
       <div class="total-card fade-up stagger-2">
@@ -107,7 +109,11 @@ async function loadTrafficChart() {
         <div class="total-value">${formatTrafficCount(totalRequests)}</div>
       </div>
       <div class="total-card fade-up stagger-5">
-        <div class="total-label">累计使用</div>
+        <div class="total-label">${rangeLabel}计费流量</div>
+        <div class="total-value">${formatBytes(billableRange)}</div>
+      </div>
+      <div class="total-card fade-up stagger-6">
+        <div class="total-label">累计计费流量${billingMode === 'outbound' ? '（单向）' : '（双向）'}</div>
         <div class="total-value">${formatBytes(snapshot.traffic_used || 0)}</div>
         ${snapshot.traffic_quota > 0 ? `<div class="total-delta" style="color:var(--white-38)">额度 ${formatBytes(snapshot.traffic_quota)}</div>` : ''}
       </div>

@@ -272,7 +272,7 @@ test('renderTraffic restarts the timer and never re-registers the resize listene
   assert.equal(h.resizeListeners, 1, 're-rendering must not add another resize listener');
 });
 
-test('leaving the traffic route stops the refresh timer; staying keeps it', () => {
+test('the retired traffic route redirects to the dashboard', () => {
   const cleared = [];
   let nextTimerId = 1;
   const sandbox = {
@@ -290,17 +290,9 @@ test('leaving the traffic route stops the refresh timer; staying keeps it', () =
   loadInto(sandbox, 'pages/traffic.js', 'router.js');
 
   vm.runInContext('Router.resolve()', sandbox);
-  assert.equal(vm.runInContext('Router.current', sandbox), 'traffic');
-  vm.runInContext('startTrafficRefresh()', sandbox);
-  const timerId = nextTimerId - 1;
-
-  sandbox.location.hash = '#traffic';
-  vm.runInContext('Router.resolve()', sandbox);
-  assert.deepEqual(cleared, [], 'staying on traffic must keep the timer alive');
-
-  sandbox.location.hash = '#sites';
-  vm.runInContext('Router.resolve()', sandbox);
-  assert.deepEqual(cleared, [timerId], 'leaving traffic must stop the refresh timer');
+  assert.equal(sandbox.location.hash, 'dashboard');
+  assert.equal(vm.runInContext('Router.current', sandbox), null);
+  assert.deepEqual(cleared, []);
 });
 
 test('logout tears down the traffic refresh timer', async () => {
@@ -514,34 +506,71 @@ test('dashboard keeps SSE samples that arrive before the site list and across pa
   assert.ok(elements['dash-table'].innerHTML.includes('↑ 1 KB/s'), 'the bidirectional sample must be retained');
 });
 
-test('mobile dashboard request trend uses readable time labels and a numeric request axis', () => {
-  const labels = [];
-  const context = makeCanvasContext();
-  context.setTransform = () => {};
-  context.fillText = (text, x, y) => labels.push({ text: String(text), x, y });
-  const canvas = makeElement('dashboardRequestTrend');
-  canvas.clientWidth = 360;
-  canvas.clientHeight = 230;
-  canvas.parentElement = { clientWidth: 360 };
-  canvas.getContext = () => context;
-  const sandbox = {
-    window: { devicePixelRatio: 1 },
-    document: makeDocument({ dashboardRequestTrend: canvas }),
-    console,
-    Router: { current: 'dashboard' },
-    setTimeout() { return 0; },
-    clearTimeout() {},
-  };
-  vm.createContext(sandbox);
-  loadInto(sandbox, 'pages/dashboard.js');
+test('dashboard trends use pointer interaction and dashed crosshairs', () => {
+  const source = readScript('pages/dashboard.js');
+  const css = readScript('../css/style.css');
+  assert.match(source, /addEventListener\('pointermove'/);
+  assert.match(source, /addEventListener\('pointerdown'/);
+  assert.match(source, /setLineDash\(\[5, 4\]\)/);
+  assert.match(source, /const ticks = 6/);
+  assert.match(source, /dashboardRoundRect/);
+  assert.match(source, /dashboardRealtimeTrendSamples/);
+  assert.match(source, /dashboardTimeLabelIndexes\(points\.length, plotW, dashboardTrendState\.range\)/);
+  assert.doesNotMatch(source, /实时（请求采样）/);
+  assert.match(css, /touch-action:\s*none/);
+  assert.match(css, /cursor:\s*default/);
+});
 
-  vm.runInContext('drawDashboardTrend([5,4,3,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])', sandbox);
+test('dashboard trend pointer coordinates use the plot bounds and keep the crosshair on the pointer', () => {
+  const { sandbox } = makeTrafficHarness();
+  const state = vm.runInContext(`dashboardTrendPointerState(
+    { left: 100, top: 50, width: 300, height: 200 },
+    { width: 300, height: 200, left: 60, top: 14, plotW: 228, plotH: 156 },
+    { clientX: 160, clientY: 50 },
+    7
+  )`, sandbox);
+  assert.equal(state.x, 60, 'the left edge of the plot should be the minimum crosshair X');
+  assert.equal(state.y, 14, 'the top edge of the plot should be the minimum crosshair Y');
+  assert.equal(state.index, 0, 'the first sample should be selected at the plot start');
 
-  const timeLabels = labels.filter(label => label.text.endsWith(':00')).map(label => label.text);
-  const requestLabels = labels.filter(label => !label.text.endsWith(':00')).map(label => label.text);
-  assert.ok(timeLabels.length >= 4 && timeLabels.length <= 6, `mobile time labels must be sparse: ${timeLabels}`);
-  assert.equal(timeLabels[0], '00:00');
-  assert.equal(timeLabels.at(-1), '23:00');
-  assert.ok(requestLabels.includes('0'), `request axis must include zero: ${requestLabels}`);
-  assert.ok(requestLabels.some(label => Number(label) >= 5), `request axis must display the request range: ${requestLabels}`);
+  const right = vm.runInContext(`dashboardTrendPointerState(
+    { left: 100, top: 50, width: 300, height: 200 },
+    { width: 300, height: 200, left: 60, top: 14, plotW: 228, plotH: 156 },
+    { clientX: 400, clientY: 250 },
+    7
+  )`, sandbox);
+  assert.equal(right.x, 288, 'the right edge of the plot should be the maximum crosshair X');
+  assert.equal(right.y, 170, 'the bottom edge of the plot should be the maximum crosshair Y');
+  assert.equal(right.index, 6, 'the last sample should be selected at the plot end');
+});
+
+test('dashboard trend tooltip avoids the pointer and flips at chart edges', () => {
+  const { sandbox } = makeTrafficHarness();
+  const rightEdge = vm.runInContext('dashboardTooltipPosition(270, 100, 300, 200, 100, 50)', sandbox);
+  assert.equal(rightEdge.left, 156, 'the tooltip should move to the pointer left when the right side is full');
+  assert.equal(rightEdge.top, 36, 'the tooltip should sit above the pointer when there is room');
+  const topEdge = vm.runInContext('dashboardTooltipPosition(100, 10, 300, 200, 100, 50)', sandbox);
+  assert.equal(topEdge.left, 114, 'the tooltip should default to the pointer right');
+  assert.equal(topEdge.top, 24, 'the tooltip should move below the pointer at the top edge');
+  const css = readScript('../css/style.css');
+  assert.match(css, /\.dashboard-chart-tooltip[^\n]*transform:\s*none/);
+  assert.match(css, /\.dashboard-chart-tooltip[^\n]*pointer-events:\s*none/);
+});
+
+test('dashboard zero-value trend scales never render negative or invalid labels', () => {
+  const { sandbox } = makeTrafficHarness();
+  const scale = vm.runInContext('dashboardRequestScale(0)', sandbox);
+  assert.deepEqual({ max: scale.max, step: scale.step, ticks: scale.ticks }, { max: 6, step: 1, ticks: 6 });
+  assert.equal(vm.runInContext('formatBytes(-5)', sandbox), '0 B');
+  assert.equal(vm.runInContext('formatBytes(Number.NaN)', sandbox), '0 B');
+  assert.equal(vm.runInContext('dashboardTrendValueLabel(0, "requests")', sandbox), '0');
+});
+
+test('global traffic settings expose reset and no-reset billing cycles', () => {
+  const source = readScript('pages/global-settings.js');
+  assert.match(source, /setting-traffic-reset-day/);
+  assert.match(source, /traffic_reset_day\s*=\s*numericSetting\('setting-traffic-reset-day'/);
+  assert.match(source, /短月自动使用该月最后一天/);
+  assert.match(source, /不重置（累计流量）/);
+  assert.match(source, /s\.traffic_reset_day == null \? 1 : s\.traffic_reset_day/);
 });

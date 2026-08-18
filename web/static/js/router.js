@@ -11,7 +11,6 @@ const Router = {
     'global-settings': ['全局设置', ''],
     'backup-restore': ['备份与恢复', '创建加密备份或恢复 Meridian 数据'],
     account: ['账户', '查看账户信息并修改用户名或密码'],
-    traffic: ['流量统计', '查看各站点流量使用趋势'],
     diagnostics: ['故障诊断', '检查入口、回源与运行状态'],
   },
   parentRoutes: new Set(['settings-tls', 'telegram-report', 'diagnostics', 'backup-restore']),
@@ -26,13 +25,14 @@ const Router = {
 
   resolve() {
     const hash = location.hash.slice(1) || 'dashboard';
+    if (hash === 'traffic') {
+      location.hash = 'dashboard';
+      return;
+    }
     const previous = this.current;
 
     if (previous === 'dashboard' && hash !== 'dashboard' && typeof stopDashSSE === 'function') {
       stopDashSSE();
-    }
-    if (previous === 'traffic' && hash !== 'traffic' && typeof stopTrafficRefresh === 'function') {
-      stopTrafficRefresh();
     }
     if (previous === 'request-logs' && hash !== 'request-logs' && typeof stopRequestLogRefresh === 'function') {
       stopRequestLogRefresh();
