@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +40,49 @@ func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, err
 	}
 }
 
+func healthcheckPanelDomain(dbPath string) string {
+	if strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return ""
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+	var domain string
+	if err := db.QueryRow(`SELECT panel_domain FROM panel_settings WHERE id=1`).Scan(&domain); err != nil {
+		return ""
+	}
+	domain, err = normalizePublicHost(domain)
+	if err != nil {
+		return ""
+	}
+	return domain
+}
+
+func healthcheckTLSConfig(dbPath string) (*tls.Config, string) {
+	serverName := healthcheckPanelDomain(dbPath)
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	certFile, _ := panelTLSPaths(dbPath)
+	if certFile != "" {
+		if data, readErr := os.ReadFile(certFile); readErr == nil {
+			// Trust the administrator-installed panel chain for the local probe,
+			// while still performing normal TLS chain and hostname validation.
+			roots.AppendCertsFromPEM(data)
+		}
+	}
+	if serverName == "" {
+		// An unconfigured local panel may use a temporary/self-signed certificate
+		// before panel settings are persisted. The healthcheck never sends
+		// credentials and only dials the fixed loopback addresses below.
+		return &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}, serverName
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: serverName}, serverName
+}
+
 func runHealthcheckCommand() error {
 	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
 	if dbPath == "" {
@@ -54,9 +99,9 @@ func runHealthcheckCommand() error {
 		return fmt.Errorf("invalid panel port %q", strings.TrimSpace(string(marker)))
 	}
 
+	tlsConfig, _ := healthcheckTLSConfig(dbPath)
 	transport := &http.Transport{
-		// #nosec G402 -- the healthcheck connects only to the fixed 127.0.0.1 host; the configured panel certificate normally names its public domain rather than loopback.
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{

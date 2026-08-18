@@ -278,7 +278,7 @@ func newDynamicSiteState(runtime *dynamicRuntime, limits DynamicProfileLimits) *
 }
 
 func canonicalDynamicPlaybackPath(pathValue string) string {
-	if pathValue == "" || len(pathValue) > maxDynamicTargetURLBytes || !strings.HasPrefix(pathValue, "/") || strings.ContainsAny(pathValue, "?#\\") || containsDynamicUnsafeRune(pathValue) {
+	if pathValue == "" || len(pathValue) > maxDynamicTargetURLBytes || !strings.HasPrefix(pathValue, "/") || strings.HasPrefix(pathValue, "//") || strings.HasPrefix(pathValue, "/\\") || strings.ContainsAny(pathValue, "?#\\") || containsDynamicUnsafeRune(pathValue) {
 		return ""
 	}
 	canonical := (&url.URL{Path: pathValue}).EscapedPath()

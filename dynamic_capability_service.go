@@ -73,6 +73,10 @@ func rebuildDynamicResponseHeaders(resp *http.Response) {
 	if resp.ContentLength >= 0 && header.Get("Content-Length") == "" {
 		header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
+	if contentType := strings.ToLower(header.Get("Content-Type")); strings.HasPrefix(contentType, "text/html") || strings.HasPrefix(contentType, "application/xhtml+xml") {
+		header.Set("Content-Type", "text/plain; charset=utf-8")
+		header.Set("Content-Disposition", "attachment")
+	}
 	header.Set("Cache-Control", "private, no-store")
 	header.Set("Content-Security-Policy", "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'")
 	header.Set("X-Frame-Options", "DENY")

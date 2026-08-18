@@ -350,6 +350,10 @@ func pathIngressCookiePath(cookiePath, upstreamBasePath, prefix string) string {
 	return mapped
 }
 
+func safeIngressRedirectPath(pathValue string) bool {
+	return pathValue != "" && strings.HasPrefix(pathValue, "/") && !strings.HasPrefix(pathValue, "//") && !strings.HasPrefix(pathValue, "/\\") && !strings.Contains(pathValue, "\\")
+}
+
 func prefixPathIngressSetCookies(header http.Header, prefix, upstreamBasePath string) {
 	if header == nil || prefix == "" {
 		return
@@ -390,7 +394,13 @@ func prefixPathIngressResponse(resp *http.Response, prefix, upstreamBasePath str
 		parsed.Host = ""
 		parsed.User = nil
 	}
+	if !safeIngressRedirectPath(parsed.Path) {
+		return
+	}
 	parsed.Path = addIngressPathPrefix(stripUpstreamBasePath(parsed.Path, upstreamBasePath), prefix)
+	if !safeIngressRedirectPath(parsed.Path) {
+		return
+	}
 	parsed.RawPath = ""
 	resp.Header.Set("Location", parsed.String())
 }
