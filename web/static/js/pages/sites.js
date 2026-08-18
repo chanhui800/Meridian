@@ -1,68 +1,79 @@
 // Sites management page
+let siteSortingCleanup = null;
 function renderSites() {
   const page = document.getElementById('page-sites');
   page.innerHTML = `
-    <h1 class="section-title fade-up">站点管理</h1>
-    <p class="section-sub fade-up stagger-1">管理 Emby 反代站点、入口与播放策略</p>
-    <div class="page-toolbar fade-up stagger-1">
+    <div class="sites-page-head fade-up">
+      <div><h1 class="section-title">站点管理</h1><p class="section-sub">管理所有 Emby 反代站点与回源配置</p></div>
       <div class="toolbar-info" id="sites-count"></div>
+    </div>
+    <div class="page-toolbar sites-toolbar fade-up stagger-1">
       <button class="btn-add" id="btn-add-site">
         <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         添加站点
       </button>
+      <label class="sites-search"><span class="sr-only">搜索站点</span><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16" y1="16" x2="21" y2="21"/></svg><input id="sites-search" type="search" placeholder="搜索站点名称或回源地址"></label>
+      <button class="btn-ghost btn-test-all" id="btn-test-all-sites"><span aria-hidden="true">⌁</span> 全部测速</button>
     </div>
     <div class="sites-grid" id="sites-grid"></div>
   `;
 
   document.getElementById('btn-add-site').onclick = () => showSiteModal();
+  document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
+  document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
   loadSites();
 }
 
 async function loadSites() {
   try {
-    const sites = await API.listSites();
+	const [sites, capabilities] = await Promise.all([API.listSites(), API.ingressCapabilities()]);
+	siteIngressCapabilities = normalizeSiteCapabilities(capabilities);
     document.getElementById('sites-count').innerHTML = `共 <strong>${sites.length}</strong> 个站点`;
 
     const grid = document.getElementById('sites-grid');
     if (!sites || sites.length === 0) {
-      grid.innerHTML = renderSitesEmptyState();
+      grid.innerHTML = '<div style="text-align:center;color:var(--white-38);padding:60px;grid-column:1/-1">暂无站点，点击右上角添加</div>';
       return;
     }
 
 	grid.innerHTML = sites.map((s, i) => {
       const pct = s.traffic_quota > 0 ? (s.traffic_used / s.traffic_quota * 100).toFixed(1) : 0;
       const pctClass = pct > 85 ? 'danger' : pct > 50 ? 'warn' : 'normal';
-		const playbackRow = renderPlaybackRow(s);
 		const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
-		const ingressRows = renderIngressSummary(s);
-		const discoveryRow = renderDynamicSiteSummary(s);
+		const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
 
       return `
-      <div class="site-card fade-up stagger-${Math.min(i + 1, 6)}">
+      <div class="site-card" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
         <div class="site-top">
-          <div class="site-name">${esc(s.name)}</div>
-          <span class="status-badge">
-            <span class="status-led ${s.running ? 'on' : 'off'}"></span>
-            ${s.running ? '运行中' : '已停止'}
-          </span>
+          <div class="site-heading">
+            <button type="button" class="site-drag-handle" data-site-drag-handle aria-label="拖拽调整 ${esc(s.name)} 的顺序" title="拖拽调整顺序">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"></circle><circle cx="13" cy="5" r="1.25"></circle><circle cx="7" cy="10" r="1.25"></circle><circle cx="13" cy="10" r="1.25"></circle><circle cx="7" cy="15" r="1.25"></circle><circle cx="13" cy="15" r="1.25"></circle></svg>
+            </button>
+            <div class="site-heading-content"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
+          </div>
+          <div class="site-card-state">
+            <span class="site-mode-badge">${siteIngressModeLabel(s)}</span>
+            <span class="status-badge site-status">
+              <span class="status-led ${s.running ? 'on' : 'off'}"></span>
+              ${s.running ? '运行中' : '已停止'}
+            </span>
+          </div>
         </div>
-        <div class="site-rows">
+        <div class="site-latency-line"><span class="status-led ${s.running ? 'on' : 'off'}"></span><span>回源延迟：</span><strong class="site-latency" id="site-latency-${s.id}">未测试</strong></div>
+		<div class="site-rows">
+		  <div class="site-row site-access-row">
+		    <span class="site-row-label">访问地址</span>
+		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" title="显示访问地址">◉</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path></svg></button></span>
+		  </div>
           <div class="site-row">
             <span class="site-row-label">主回源地址</span>
             <span class="mono">${esc(s.target_url)}</span>
           </div>
-          ${playbackRow}
-		  ${ingressRows}
-		  ${discoveryRow}
 		  ${upstreamHeaderCount > 0 ? `
 		  <div class="site-row">
 			<span class="site-row-label">上游请求头</span>
-			<span class="site-row-value">${upstreamHeaderCount} 个（加密）</span>
+			<span>${upstreamHeaderCount} 个（加密）</span>
 		  </div>` : ''}
-          <div class="site-row">
-            <span class="site-row-label">UA 模式</span>
-            <span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span>
-          </div>
           ${s.traffic_quota > 0 ? `
           <div class="progress-wrap">
             <div class="progress-labels">
@@ -76,12 +87,13 @@ async function loadSites() {
           ` : `
           <div class="site-row">
             <span class="site-row-label">已用流量</span>
-            <span class="site-row-value">${formatBytes(s.traffic_used)}</span>
+            <span>${formatBytes(s.traffic_used)}</span>
           </div>
           `}
         </div>
         <div class="site-actions">
-          <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}">${s.enabled ? '停用' : '启用'}</button>
+          <button class="btn-ghost site-action-test" data-site-action="latency" data-site-id="${s.id}">测速</button>
+          <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}" ${normalizedIngressMode(s) === 'unset' ? 'disabled title="请先编辑并配置入口"' : ''}>${normalizedIngressMode(s) === 'unset' ? '待配置' : (s.enabled ? '停用' : '启用')}</button>
           <button class="btn-ghost" data-site-action="edit" data-site-id="${s.id}">编辑</button>
           <button class="btn-ghost danger" data-site-action="delete" data-site-id="${s.id}">删除</button>
         </div>
@@ -94,124 +106,257 @@ async function loadSites() {
         const id = Number(button.dataset.siteId);
         const site = sitesById.get(id);
         if (!site) return;
-        if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
+		if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
+		if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
+		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
+		if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
         if (button.dataset.siteAction === 'edit') showSiteModal(site);
         if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
       });
     });
+    setupSiteSorting(grid);
   } catch (e) {
     Toast.error('加载站点失败: ' + e.message);
   }
 }
 
-function renderPlaybackRow(site) {
-  const playback = (site.playback_target_url || '').trim();
-  const extraHosts = normalizeStreamHosts(site.stream_hosts);
-  const totalHosts = (playback ? 1 : 0) + extraHosts.length;
+function filterSiteCards(query) {
+  const needle = String(query || '').trim().toLowerCase();
+  const grid = document.getElementById('sites-grid');
+  if (!grid) return;
+  grid.classList.toggle('is-filtered', !!needle);
+  grid.querySelectorAll('.site-card').forEach(card => {
+    card.hidden = !!needle && !String(card.dataset.siteSearch || '').includes(needle);
+  });
+  grid.querySelectorAll('[data-site-drag-handle]').forEach(handle => {
+    handle.disabled = !!needle;
+    handle.title = needle ? '清除搜索后可调整顺序' : '拖拽调整顺序';
+  });
+}
 
-  if (totalHosts === 0) {
-    return `
-      <div class="site-row">
-        <span class="site-row-label">播放回源</span>
-        <span class="site-row-value">跟随主回源</span>
-      </div>
-    `;
+function siteOrderFromGrid(grid) {
+  return [...grid.querySelectorAll('.site-card[data-site-id]')]
+    .map(card => Number(card.dataset.siteId))
+    .filter(Number.isSafeInteger);
+}
+
+function captureSiteDropSlots(grid, draggedCard) {
+  const scrollX = typeof window !== 'undefined' ? (window.scrollX || 0) : 0;
+  const scrollY = typeof window !== 'undefined' ? (window.scrollY || 0) : 0;
+  return [...grid.children]
+    .filter(node => node !== draggedCard && !node.hidden)
+    .map(node => {
+      const rect = node.getBoundingClientRect();
+      return {
+        x: rect.left + rect.width / 2 + scrollX,
+        y: rect.top + rect.height / 2 + scrollY,
+        width: Math.max(rect.width, 1),
+        height: Math.max(rect.height, 1),
+      };
+    });
+}
+
+function moveSitePlaceholderAtPoint(grid, draggedCard, placeholder, dropSlots, clientX, clientY) {
+  if (!placeholder || !dropSlots.length) return;
+  const scrollX = typeof window !== 'undefined' ? (window.scrollX || 0) : 0;
+  const scrollY = typeof window !== 'undefined' ? (window.scrollY || 0) : 0;
+  const pointerX = clientX + scrollX;
+  const pointerY = clientY + scrollY;
+  let desiredIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  dropSlots.forEach((slot, index) => {
+    const dx = (pointerX - slot.x) / slot.width;
+    const dy = (pointerY - slot.y) / slot.height;
+    const distance = dx * dx + dy * dy;
+    if (distance < nearestDistance) {
+      desiredIndex = index;
+      nearestDistance = distance;
+    }
+  });
+
+  const orderedCards = [...grid.querySelectorAll('.site-card[data-site-id]')]
+    .filter(card => card !== draggedCard);
+  const reference = orderedCards[desiredIndex] || null;
+  if (reference !== placeholder.nextSibling) grid.insertBefore(placeholder, reference);
+}
+
+function positionDraggedSiteCard(card, clientX, clientY, offsetX, offsetY) {
+  card.style.left = `${clientX - offsetX}px`;
+  card.style.top = `${clientY - offsetY}px`;
+  card.style.transform = 'translate3d(0, 0, 0)';
+}
+
+async function persistSiteOrder(grid) {
+  const siteIds = siteOrderFromGrid(grid);
+  const nextOrder = siteIds.join(',');
+  if (!siteIds.length || nextOrder === grid.dataset.siteOrder) return;
+  grid.classList.add('is-saving-order');
+  try {
+    await API.reorderSites(siteIds);
+    grid.dataset.siteOrder = nextOrder;
+    Toast.success('站点顺序已保存，仪表盘已同步');
+  } catch (error) {
+    Toast.error('保存站点顺序失败: ' + error.message);
+    await loadSites();
+  } finally {
+    grid.classList.remove('is-saving-order');
   }
+}
 
-  if (totalHosts === 1 && playback === (site.target_url || '').trim()) {
-    return `
-      <div class="site-row">
-        <span class="site-row-label">播放回源</span>
-        <span class="site-row-value">与主回源相同</span>
-      </div>
-    `;
+function setupSiteSorting(grid) {
+  if (typeof siteSortingCleanup === 'function') siteSortingCleanup();
+  const cards = [...grid.querySelectorAll('.site-card[data-site-id]')];
+  grid.dataset.siteOrder = siteOrderFromGrid(grid).join(',');
+  let draggedCard = null;
+  let placeholder = null;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+  let dropSlots = [];
+  let activeHandle = null;
+  let activePointerId = null;
+
+  const beginDrag = (card, event) => {
+    const rect = card.getBoundingClientRect();
+    draggedCard = card;
+    dragOffsetX = event.clientX - rect.left;
+    dragOffsetY = event.clientY - rect.top;
+    placeholder = document.createElement('div');
+    placeholder.className = 'site-card-placeholder';
+    placeholder.setAttribute('aria-hidden', 'true');
+    placeholder.style.height = `${rect.height}px`;
+    grid.insertBefore(placeholder, card);
+
+    card.style.position = 'fixed';
+    card.style.left = `${rect.left}px`;
+    card.style.top = `${rect.top}px`;
+    card.style.width = `${rect.width}px`;
+    card.style.height = `${rect.height}px`;
+    card.style.margin = '0';
+    card.style.transform = 'translate3d(0, 0, 0)';
+    card.classList.add('is-dragging');
+    grid.classList.add('is-reordering');
+    document.body.classList.add('is-site-dragging');
+    dropSlots = captureSiteDropSlots(grid, card);
+  };
+  const finishDrag = card => {
+    if (draggedCard !== card) return;
+    if (placeholder && placeholder.parentElement === grid) grid.insertBefore(card, placeholder);
+    if (placeholder) placeholder.remove();
+    placeholder = null;
+    dropSlots = [];
+    card.style.position = '';
+    card.style.left = '';
+    card.style.top = '';
+    card.style.width = '';
+    card.style.height = '';
+    card.style.margin = '';
+    card.style.transform = '';
+    card.classList.remove('is-dragging');
+    grid.classList.remove('is-reordering');
+    document.body.classList.remove('is-site-dragging');
+    draggedCard = null;
+    void persistSiteOrder(grid);
+  };
+
+  const movePointer = event => {
+    if (!draggedCard) return;
+    if (event.type === 'pointermove' && activePointerId !== null && event.pointerId !== activePointerId) return;
+    if (event.cancelable) event.preventDefault();
+    positionDraggedSiteCard(draggedCard, event.clientX, event.clientY, dragOffsetX, dragOffsetY);
+    const edge = 64;
+    if (typeof window !== 'undefined' && window.scrollBy) {
+      if (event.clientY < edge) window.scrollBy(0, -12);
+      if (event.clientY > window.innerHeight - edge) window.scrollBy(0, 12);
+    }
+    moveSitePlaceholderAtPoint(grid, draggedCard, placeholder, dropSlots, event.clientX, event.clientY);
+  };
+
+  const finishPointer = event => {
+    if (!draggedCard) return;
+    if (event.type.startsWith('pointer') && activePointerId !== null && event.pointerId !== activePointerId) return;
+    const card = draggedCard;
+    if (activeHandle && activePointerId !== null && activeHandle.releasePointerCapture && activeHandle.hasPointerCapture) {
+      try {
+        if (activeHandle.hasPointerCapture(activePointerId)) activeHandle.releasePointerCapture(activePointerId);
+      } catch (_) {}
+    }
+    activeHandle = null;
+    activePointerId = null;
+    finishDrag(card);
+  };
+
+  cards.forEach(card => {
+    const handle = card.querySelector('[data-site-drag-handle]');
+    if (!handle) return;
+
+    handle.addEventListener('pointerdown', event => {
+      if (handle.disabled || (Number.isFinite(event.button) && event.button !== 0)) return;
+      event.preventDefault();
+      activeHandle = handle;
+      activePointerId = event.pointerId;
+      beginDrag(card, event);
+      if (handle.setPointerCapture) {
+        try { handle.setPointerCapture(event.pointerId); } catch (_) {}
+      }
+    });
+  });
+
+  window.addEventListener('pointermove', movePointer, { passive: false });
+  window.addEventListener('pointerup', finishPointer);
+  window.addEventListener('pointercancel', finishPointer);
+  // Mouse fallbacks cover browsers and automation surfaces that begin with a
+  // PointerEvent but only deliver compatibility mouse movement afterwards.
+  window.addEventListener('mousemove', movePointer, { passive: false });
+  window.addEventListener('mouseup', finishPointer);
+  siteSortingCleanup = () => {
+    window.removeEventListener('pointermove', movePointer);
+    window.removeEventListener('pointerup', finishPointer);
+    window.removeEventListener('pointercancel', finishPointer);
+    window.removeEventListener('mousemove', movePointer);
+    window.removeEventListener('mouseup', finishPointer);
+    if (draggedCard) finishPointer({ type: 'pointercancel', pointerId: activePointerId });
+    siteSortingCleanup = null;
+  };
+}
+
+async function testSiteLatency(id, button) {
+  const value = document.getElementById(`site-latency-${id}`);
+  if (button) button.disabled = true;
+  if (value) value.textContent = '测速中…';
+  try {
+    const result = await API.diagSite(id);
+    const health = result && result.upstreams && result.upstreams.primary
+      ? result.upstreams.primary.health || {}
+      : (result && result.health) || {};
+    if (health.status === 'online' && Number.isFinite(Number(health.latency_ms))) {
+      const latency = Number(health.latency_ms);
+      if (value) {
+        value.textContent = `${latency} ms`;
+        value.className = `site-latency ${latency < 200 ? 'good' : latency < 800 ? 'warn' : 'bad'}`;
+      }
+    } else {
+      throw new Error(health.error || '回源不可用');
+    }
+  } catch (error) {
+    if (value) {
+      value.textContent = '测速失败';
+      value.className = 'site-latency bad';
+      value.title = error.message || '测速失败';
+    }
+  } finally {
+    if (button) button.disabled = false;
   }
-
-  const modeLabel = site.playback_mode === 'redirect' ? '重定向跟随' : '直连分流';
-  let rows = '';
-  if (playback) {
-    rows += `
-    <div class="site-row">
-      <span class="site-row-label">播放回源</span>
-      <span class="mono">${esc(playback)}</span>
-    </div>`;
-  }
-  for (const h of extraHosts) {
-    rows += `
-    <div class="site-row">
-      <span class="site-row-label">播放回源</span>
-      <span class="mono">${esc(h)}</span>
-    </div>`;
-  }
-  rows += `
-    <div class="site-row">
-      <span class="site-row-label">播放模式</span>
-      <span class="site-row-value">${modeLabel}</span>
-    </div>`;
-  return rows;
 }
 
-function renderSitesEmptyState() {
-	return '<div class="sites-empty" role="status"><strong>还没有站点</strong><span>选择“添加站点”连接第一个 Emby 回源。</span></div>';
-}
-
-function renderDynamicSiteSummary(site) {
-	const policy = normalizeDynamicSitePolicy(site);
-	const profile = DYNAMIC_PROFILE_LABELS[policy.dynamic_profile] || policy.dynamic_profile;
-	return `
-	  <div class="site-row">
-		<span class="site-row-label">自动发现</span>
-		<span class="site-row-value">${policy.dynamic_discovery_enabled ? '已启用' : '已关闭'} · ${esc(profile)}</span>
-	  </div>`;
-}
-
-function buildProxyOptimizationPayload(pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled) {
-	return {
-		ping_cache_enabled: pingCacheEnabled === true,
-		image_cache_enabled: imageCacheEnabled === true,
-		progress_coalescing_enabled: progressCoalescingEnabled === true,
-	};
-}
-
-function buildRequestLimitPayload(enabled, quotaGB, speedMbps) {
-	const quota = parseInt(quotaGB, 10);
-	const speed = parseInt(speedMbps, 10);
-	return {
-		traffic_quota: enabled === true && Number.isFinite(quota) && quota > 0 ? quota * 1073741824 : 0,
-		speed_limit: enabled === true && Number.isFinite(speed) && speed > 0 ? speed : 0,
-	};
-}
-
-function cycleSiteModalFocus(event, elements, activeElement) {
-	if (!event || event.key !== 'Tab') return false;
-	const focusable = Array.from(elements || []).filter(Boolean);
-	if (focusable.length === 0) return false;
-	const activeIndex = focusable.indexOf(activeElement);
-	let target = null;
-	if (event.shiftKey && activeIndex <= 0) target = focusable[focusable.length - 1];
-	if (!event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1)) target = focusable[0];
-	if (!target) return false;
-	event.preventDefault();
-	target.focus();
-	return true;
-}
-
-function setupSiteModalFocus() {
-	const modal = document.getElementById('modal');
-	const initialFocus = document.getElementById('m-name');
-	if (modal) {
-		if (modal._siteModalFocusHandler && typeof modal.removeEventListener === 'function') {
-			modal.removeEventListener('keydown', modal._siteModalFocusHandler);
-		}
-		modal._siteModalFocusHandler = event => {
-			if (!document.getElementById('m-name')) return;
-			const elements = Array.from(modal.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, [href], [tabindex]:not([tabindex="-1"])'))
-				.filter(element => !element.hidden && (typeof element.getClientRects !== 'function' || element.getClientRects().length > 0));
-			cycleSiteModalFocus(event, elements, document.activeElement);
-		};
-		modal.addEventListener('keydown', modal._siteModalFocusHandler);
-	}
-	if (initialFocus) initialFocus.focus();
+async function testAllSitesLatency() {
+  const button = document.getElementById('btn-test-all-sites');
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  button.textContent = '全部测速中…';
+  const buttons = [...document.querySelectorAll('[data-site-action="latency"]')];
+  await Promise.all(buttons.map(siteButton => testSiteLatency(Number(siteButton.dataset.siteId), siteButton)));
+  button.disabled = false;
+  button.textContent = '全部测速';
 }
 
 function customUAFormState(mode, site) {
@@ -269,22 +414,39 @@ function normalizeStreamHosts(value) {
 function normalizeSiteCapabilities(value) {
 	const capabilities = value && typeof value === 'object' ? value : {};
 	const requestedMax = Number(capabilities.max_playback_addresses);
-	return {
+	const normalized = {
 		host_only_available: capabilities.host_only_available !== false,
 		upstream_headers_available: capabilities.upstream_headers_available !== false,
 		max_playback_addresses: Number.isInteger(requestedMax) && requestedMax > 0
 			? requestedMax
 			: DEFAULT_MAX_PLAYBACK_ADDRESSES,
 	};
+	// Keep the legacy capability object's enumerable shape stable for embedded
+	// clients while exposing the new fields to the UI.
+	Object.defineProperties(normalized, {
+		domain_prefix_available: { value: capabilities.domain_prefix_available === undefined ? undefined : capabilities.domain_prefix_available === true, enumerable: false },
+		route_domain: { value: String(capabilities.route_domain || '').trim().toLowerCase(), enumerable: false },
+		panel_tls_enabled: { value: capabilities.panel_tls_enabled === true, enumerable: false },
+		path_ingress_available: { value: capabilities.path_ingress_available !== false, enumerable: false },
+		panel_access_url: { value: String(capabilities.panel_access_url || '').replace(/\/$/, ''), enumerable: false },
+	});
+	return normalized;
 }
 
 const DYNAMIC_PROFILE_IDS = ['safe', 'compatible', 'extreme'];
 const DYNAMIC_SOURCE_IDS = ['redirect', 'playback_info', 'hls', 'dash'];
+const DEFAULT_DYNAMIC_SOURCE_IDS = ['redirect', 'playback_info'];
+const ADVANCED_DYNAMIC_SOURCE_IDS = ['hls', 'dash'];
 const DYNAMIC_SOURCE_LABELS = {
 	redirect: 'HTTP 30x',
 	playback_info: 'PlaybackInfo',
 	hls: 'HLS',
 	dash: 'DASH',
+};
+const DYNAMIC_PROFILE_SOURCE_IDS = {
+	safe: ['redirect', 'playback_info'],
+	compatible: [...DYNAMIC_SOURCE_IDS],
+	extreme: [...DYNAMIC_SOURCE_IDS],
 };
 const DYNAMIC_PROFILE_LABELS = {
 	safe: 'Safe（安全）',
@@ -336,108 +498,52 @@ const DYNAMIC_FEATURES = [
 	['custom_ca', '自定义 CA', false],
 	['raw_fallback', '原始响应回退', false],
 ];
-const DYNAMIC_OBSERVATION_MAX_ROWS = 500;
-const DYNAMIC_OBSERVATION_UNAVAILABLE = '不可用';
-const DYNAMIC_OBSERVATION_TARGET_KIND_IDS = ['same_authority', 'configured', 'discovered'];
-const DYNAMIC_OBSERVATION_STAGE_IDS = ['response', 'location', 'policy', 'resolve', 'connect', 'capacity', 'parse', 'capability', 'runtime'];
-const DYNAMIC_OBSERVATION_DECISION_IDS = ['allowed', 'denied'];
-const DYNAMIC_OBSERVATION_SOURCE_LABELS = {
-	redirect: 'HTTP 30x 重定向',
-	playback_info: 'PlaybackInfo 响应',
-	hls: 'HLS 清单',
-	dash: 'DASH 清单',
-};
-const DYNAMIC_OBSERVATION_TARGET_KIND_LABELS = {
-	same_authority: '同权威目标',
-	configured: '已配置目标',
-	discovered: '自动发现目标',
-};
-const DYNAMIC_OBSERVATION_DECISION_LABELS = {
-	allowed: '通过',
-	denied: '拒绝',
-};
-const DYNAMIC_OBSERVATION_STAGE_LABELS = {
-	response: '响应处理',
-	location: 'Location 读取',
-	policy: '安全策略',
-	resolve: 'DNS 解析',
-	connect: '建立连接',
-	capacity: '容量控制',
-	parse: '内容解析',
-	capability: '能力链接',
-	runtime: '运行时',
-};
-const DYNAMIC_OBSERVATION_REASON_LABELS = {
-	redirect_allowed: '重定向目标通过验证',
-	candidate_allowed: '候选目标通过验证',
-	invalid_location: 'Location 无效',
-	unsupported_status: '重定向状态不受支持',
-	redirect_loop: '检测到重定向循环',
-	hop_limit: '达到重定向跳数上限',
-	scheme_denied: '协议不在允许范围',
-	port_denied: '端口不在允许范围',
-	domain_denied: '域名不在允许范围',
-	https_downgrade_denied: 'HTTPS 降级被拒绝',
-	self_target: '目标指向当前站点',
-	dns_failure: 'DNS 解析失败',
-	address_denied: '解析地址被安全策略拒绝',
-	dial_failure: '目标连接失败',
-	tls_failure: 'TLS 连接失败',
-	capacity_limit: '达到容量上限',
-	rate_limit: '达到新目标速率上限',
-	parse_failure: '响应解析失败',
-	request_unclassified: '请求类型无法分类',
-	structured_body_limit: '结构化响应正文超过上限',
-	playback_info_denied: 'PlaybackInfo 处理被拒绝',
-	hls_feature_denied: 'HLS 解析未启用',
-	dash_feature_denied: 'DASH 解析未启用',
-	redirect_body_replay_denied: '重定向请求体重放被拒绝',
-	capability_invalid: '能力链接无效',
-	capability_expired: '能力链接已过期',
-	response_failure: '上游响应失败',
-	runtime_unavailable: '运行时不可用',
-};
-const DYNAMIC_OBSERVATION_REASON_CODES = new Set(Object.keys(DYNAMIC_OBSERVATION_REASON_LABELS));
+const DYNAMIC_OBSERVATION_REASON_CODES = new Set([
+	'redirect_allowed',
+	'candidate_allowed',
+	'invalid_location',
+	'unsupported_status',
+	'redirect_loop',
+	'hop_limit',
+	'scheme_denied',
+	'port_denied',
+	'domain_denied',
+	'https_downgrade_denied',
+	'self_target',
+	'dns_failure',
+	'address_denied',
+	'dial_failure',
+	'tls_failure',
+	'capacity_limit',
+	'rate_limit',
+	'parse_failure',
+	'request_unclassified',
+	'structured_body_limit',
+	'playback_info_denied',
+	'hls_feature_denied',
+	'dash_feature_denied',
+	'redirect_body_replay_denied',
+	'capability_invalid',
+	'capability_expired',
+	'response_failure',
+	'runtime_unavailable',
+]);
 
 function hasOwnDynamicField(value, field) {
 	return Object.prototype.hasOwnProperty.call(value, field);
 }
 
-function dynamicSourceListMatchesProfile(profile) {
-	if (!profile || !Array.isArray(profile.discovery_sources)) return false;
-	const expected = ['redirect', 'playback_info'];
-	if (profile.features && profile.features.hls === true) expected.push('hls');
-	if (profile.features && profile.features.dash === true) expected.push('dash');
-	return profile.discovery_sources.length === expected.length
-		&& profile.discovery_sources.every((source, index) => source === expected[index]);
-}
-
-function isDynamicDefaultPolicy(value, profiles) {
-	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-	if (typeof value.dynamic_discovery_enabled !== 'boolean') return false;
-	if (!DYNAMIC_PROFILE_IDS.includes(value.dynamic_profile)) return false;
-	if (typeof value.dynamic_allow_https_downgrade !== 'boolean') return false;
-	if (!Array.isArray(value.dynamic_domain_rules) || !Array.isArray(value.dynamic_discovery_sources)) return false;
-	const normalizedRules = normalizeDynamicDomainRules(value.dynamic_domain_rules);
-	if (normalizedRules.length !== value.dynamic_domain_rules.length) return false;
-	if (normalizedRules.some((rule, index) => rule.type !== value.dynamic_domain_rules[index].type || rule.value !== value.dynamic_domain_rules[index].value)) return false;
-	const profile = profiles.get(value.dynamic_profile);
-	return !!profile
-		&& value.dynamic_discovery_sources.length === profile.discovery_sources.length
-		&& value.dynamic_discovery_sources.every((source, index) => source === profile.discovery_sources[index]);
-}
-
 function isStructuredDiscoveryContract(value) {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
 	if (value.stage !== 'structured-discovery' || typeof value.available !== 'boolean' || typeof value.key_configured !== 'boolean') return false;
-	if (value.available !== value.key_configured || value.empty_rules_semantics !== 'public_dns_https_443') return false;
+	if (value.available !== value.key_configured) return false;
 	if (!value.global_limits || typeof value.global_limits !== 'object' || Array.isArray(value.global_limits)) return false;
 	if (!DYNAMIC_GLOBAL_LIMIT_FIELDS.every(field => hasOwnDynamicField(value.global_limits, field) && Number.isInteger(value.global_limits[field]) && value.global_limits[field] > 0)) return false;
 	if (!Array.isArray(value.profiles) || value.profiles.length !== DYNAMIC_PROFILE_IDS.length) return false;
 
 	const profiles = new Map(value.profiles.map(profile => [profile && profile.id, profile]));
 	if (profiles.size !== DYNAMIC_PROFILE_IDS.length) return false;
-	const profilesValid = DYNAMIC_PROFILE_IDS.every(id => {
+	return DYNAMIC_PROFILE_IDS.every(id => {
 		const profile = profiles.get(id);
 		if (!profile || typeof profile.label !== 'string' || typeof profile.recommended !== 'boolean') return false;
 		if (!profile.limits || typeof profile.limits !== 'object' || Array.isArray(profile.limits)) return false;
@@ -447,13 +553,11 @@ function isStructuredDiscoveryContract(value) {
 		if (typeof profile.limits.allow_any_port !== 'boolean') return false;
 		if (!DYNAMIC_LIMIT_FIELDS.slice(3).every(field => Number.isInteger(profile.limits[field]) && profile.limits[field] > 0)) return false;
 		if (!profile.features || typeof profile.features !== 'object' || Array.isArray(profile.features)) return false;
-		const featuresValid = DYNAMIC_FEATURES.every(([field, , expected]) => {
+		return DYNAMIC_FEATURES.every(([field, , expected]) => {
 			const profileExpected = id === 'safe' && (field === 'hls' || field === 'dash') ? false : expected;
 			return hasOwnDynamicField(profile.features, field) && profile.features[field] === profileExpected;
 		});
-		return featuresValid && dynamicSourceListMatchesProfile(profile);
 	});
-	return profilesValid && isDynamicDefaultPolicy(value.default_policy, profiles);
 }
 
 function normalizeDynamicProfiles(value) {
@@ -465,28 +569,15 @@ function normalizeDynamicProfiles(value) {
 		stage: 'structured-discovery',
 		available: recognized && value.available === true,
 		key_configured: recognized && value.key_configured === true,
-		empty_rules_semantics: recognized ? value.empty_rules_semantics : '',
-		default_policy: recognized ? {
-			...value.default_policy,
-			dynamic_discovery_sources: [...value.default_policy.dynamic_discovery_sources],
-			dynamic_domain_rules: value.default_policy.dynamic_domain_rules.map(rule => ({ ...rule })),
-		} : {
-			dynamic_discovery_enabled: false,
-			dynamic_profile: 'safe',
-			dynamic_discovery_sources: [],
-			dynamic_domain_rules: [],
-			dynamic_allow_https_downgrade: false,
-		},
 		recognized,
 		profiles: DYNAMIC_PROFILE_IDS.map(id => {
 			const profile = sourceProfiles.get(id);
 			return {
 				id,
 				label: profile ? profile.label : DYNAMIC_PROFILE_LABELS[id],
-				recommended: profile ? profile.recommended : id === 'safe',
+				recommended: profile ? profile.recommended : id === 'compatible',
 				limits: profile ? profile.limits : DYNAMIC_PROFILE_NETWORK_DEFAULTS[id],
 				features: profile ? profile.features : {},
-				discovery_sources: profile ? [...profile.discovery_sources] : [],
 			};
 		}),
 		global_limits: recognized ? value.global_limits : {},
@@ -503,27 +594,18 @@ async function loadDynamicProfiles() {
 
 function normalizeDynamicProfile(value) {
 	const profile = String(value || '').trim().toLowerCase();
-	return DYNAMIC_PROFILE_IDS.includes(profile) ? profile : 'safe';
+	return DYNAMIC_PROFILE_IDS.includes(profile) ? profile : 'compatible';
+}
+function dynamicSourcesForProfile(value) {
+	return [...DYNAMIC_PROFILE_SOURCE_IDS[normalizeDynamicProfile(value)]];
 }
 
-function dynamicSourcesForProfile(capabilities, value) {
-	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
-	const profile = dynamicCapabilities.profiles.find(candidate => candidate.id === normalizeDynamicProfile(value));
-	return profile ? [...profile.discovery_sources] : [];
-}
 
-function dynamicSourcesForPlaybackInfoInspection(capabilities, profile, enabled) {
-	const sources = dynamicSourcesForProfile(capabilities, profile);
-	return enabled === false ? sources.filter(source => source !== 'playback_info') : sources;
-}
-
-function defaultDynamicSitePolicy(capabilities) {
-	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
-	const policy = normalizeDynamicSitePolicy(dynamicCapabilities.default_policy);
-	if (!dynamicCapabilities.recognized || !dynamicCapabilities.available || !policy.dynamic_discovery_enabled || policy.dynamic_profile !== 'safe') {
-		return normalizeDynamicSitePolicy(null);
-	}
-	return policy;
+function normalizeDynamicDiscoverySources(value, profile = 'compatible') {
+	const allowed = new Set(dynamicSourcesForProfile(profile));
+	if (!Array.isArray(value)) return DEFAULT_DYNAMIC_SOURCE_IDS.filter(source => allowed.has(source));
+	const selected = new Set(value.map(source => String(source || '').trim().toLowerCase()));
+	return DYNAMIC_SOURCE_IDS.filter(source => allowed.has(source) && selected.has(source));
 }
 
 function normalizeDynamicDomainRules(value) {
@@ -556,72 +638,32 @@ function isPlausibleSafeDynamicDNSRule(rule) {
 	return labels.every(label => label.length > 0 && label.length <= 63 && !label.startsWith('-') && !label.endsWith('-') && /^[a-z0-9-]+$/.test(label));
 }
 
-function dynamicDomainRuleWarning(profile, rules) {
-	const normalized = normalizeDynamicDomainRules(rules);
-	if (normalized.some(rule => !isPlausibleSafeDynamicDNSRule(rule))) {
-		return {
-			tone: 'warning',
-			message: '域名规则仅接受 DNS 主机名；不要填写 IP、通配符、协议、端口或路径。',
-		};
-	}
-	if (normalizeDynamicProfile(profile) === 'safe' && normalized.length === 0) {
-		return {
-			tone: 'info',
-			message: 'Safe 未设置规则时允许任意公网 DNS 主机名的 HTTPS:443；IP 字面量始终拒绝。添加规则会收窄为精确与后缀规则的并集。',
-		};
-	}
-	return { tone: '', message: '' };
-}
-
-function safeRulesBecomeUnrestricted(enabled, profile, beforeRules, afterRules) {
-	if (enabled !== true || normalizeDynamicProfile(profile) !== 'safe') return false;
-	const beforeRestricted = normalizeDynamicDomainRules(beforeRules).some(isPlausibleSafeDynamicDNSRule);
-	const afterRestricted = normalizeDynamicDomainRules(afterRules).some(isPlausibleSafeDynamicDNSRule);
-	return beforeRestricted && !afterRestricted;
-}
-
-function renderDynamicDomainWarning(profile, rules) {
-	const warning = dynamicDomainRuleWarning(profile, rules);
-	const toneClass = warning.tone ? ` form-warning-${warning.tone}` : '';
-	return `<div class="form-warning${toneClass}" id="m-dynamic-domain-warning" role="status" aria-live="polite" ${warning.message ? '' : 'hidden'}>${esc(warning.message)}</div>`;
-}
-
-function dynamicDowngradeFormState(profile, enabled) {
-	const visible = normalizeDynamicProfile(profile) !== 'safe';
-	return {
-		visible,
-		checked: visible && enabled === true,
-		open: visible && enabled === true,
-	};
+function hasRequiredSafeDynamicRules(profile, rules) {
+	return normalizeDynamicProfile(profile) !== 'safe' || normalizeDynamicDomainRules(rules).some(isPlausibleSafeDynamicDNSRule);
 }
 
 function normalizeDynamicSitePolicy(site) {
 	const value = site && typeof site === 'object' ? site : {};
+	const revision = value.dynamic_policy_revision;
 	const profile = normalizeDynamicProfile(value.dynamic_profile);
-	const playbackInfoEnabled = typeof value.dynamic_playback_info_enabled === 'boolean'
-		? value.dynamic_playback_info_enabled
-		: !Array.isArray(value.dynamic_discovery_sources) || value.dynamic_discovery_sources.includes('playback_info');
 	return {
 		dynamic_discovery_enabled: value.dynamic_discovery_enabled === true,
 		dynamic_profile: profile,
-		dynamic_playback_info_enabled: playbackInfoEnabled,
+		dynamic_discovery_sources: normalizeDynamicDiscoverySources(value.dynamic_discovery_sources, profile),
 		dynamic_domain_rules: normalizeDynamicDomainRules(value.dynamic_domain_rules),
-		dynamic_allow_https_downgrade: profile !== 'safe' && value.dynamic_allow_https_downgrade === true,
+		dynamic_allow_https_downgrade: value.dynamic_allow_https_downgrade === true,
+		dynamic_policy_revision: Number.isInteger(revision) && revision > 0 ? revision : 1,
 	};
 }
 
-function buildDynamicPolicyPayload(policy, capabilities, forCreate) {
+function buildDynamicPolicyPayload(policy, capabilities) {
 	const normalized = normalizeDynamicSitePolicy(policy);
 	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
-	if (!dynamicCapabilities.recognized) return forCreate ? { dynamic_discovery_enabled: false } : {};
+	if (!dynamicCapabilities.recognized) return {};
 	return {
-		dynamic_discovery_enabled: normalized.dynamic_discovery_enabled,
+        dynamic_discovery_enabled: normalized.dynamic_discovery_enabled,
 		dynamic_profile: normalized.dynamic_profile,
-		dynamic_discovery_sources: dynamicSourcesForPlaybackInfoInspection(
-			dynamicCapabilities,
-			normalized.dynamic_profile,
-			normalized.dynamic_playback_info_enabled,
-		),
+		dynamic_discovery_sources: normalized.dynamic_discovery_sources,
 		dynamic_domain_rules: normalized.dynamic_domain_rules,
 		dynamic_allow_https_downgrade: normalized.dynamic_allow_https_downgrade,
 	};
@@ -629,12 +671,30 @@ function buildDynamicPolicyPayload(policy, capabilities, forCreate) {
 
 function renderDynamicProfileOptions(capabilities, selectedProfile) {
 	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
-	const selected = normalizeDynamicProfile(selectedProfile);
-	return dynamicCapabilities.profiles.map(profile => `
+	const normalizedSelected = normalizeDynamicProfile(selectedProfile);
+	const selected = normalizedSelected === 'extreme' ? 'extreme' : 'compatible';
+	return dynamicCapabilities.profiles.filter(profile => profile.id !== 'safe').map(profile => `
 		<option value="${esc(profile.id)}" ${profile.id === selected ? 'selected' : ''}>${esc(profile.label)}${profile.recommended ? '（推荐）' : ''}</option>
 	`).join('');
 }
 
+function renderDynamicProfileSummaries(capabilities) {
+	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
+	return dynamicCapabilities.profiles.map(profile => {
+		const schemes = Array.isArray(profile.limits.allowed_schemes)
+			? profile.limits.allowed_schemes.map(scheme => String(scheme).toUpperCase()).join('/')
+			: '—';
+		const ports = profile.limits.allow_any_port === true
+			? '全部端口'
+			: (Array.isArray(profile.limits.allowed_ports) ? profile.limits.allowed_ports.join(', ') : '—');
+		const sources = dynamicSourcesForProfile(profile.id).map(source => DYNAMIC_SOURCE_LABELS[source]).join(' + ');
+		const compatibility = profile.id === 'extreme'
+			? '；额外启用全数据面 30x/303、受限请求体重放、PlaybackInfo 完整 URL 兼容、安全 RequiredHttpHeaders、HLS 变量/扩展标签与 DASH 惰性扩展/DRM 元数据'
+			: '；使用严格协议字段与已审核结构';
+		const accent = profile.id === 'safe' ? 'var(--green)' : profile.id === 'compatible' ? 'var(--orange)' : 'var(--red)';
+		return `<div class="form-help" data-profile-summary="${esc(profile.id)}" style="padding:8px 10px;margin-top:6px;border:1px solid ${accent};border-radius:6px;background:var(--surface-hover);color:var(--white-87)"><strong style="color:${accent}">${esc(profile.label)}</strong>：${esc(sources)}；仅公网 ${esc(schemes)}，端口 ${esc(ports)}${esc(compatibility)}</div>`;
+	}).join('');
+}
 
 function renderDynamicRuleRows(rules) {
 	const rows = Array.isArray(rules) ? rules : [];
@@ -642,62 +702,65 @@ function renderDynamicRuleRows(rules) {
 		const type = rule && rule.type === 'suffix' ? 'suffix' : 'exact';
 		const value = rule && rule.value !== undefined ? rule.value : '';
 		return `
-		<fieldset class="form-list-row dynamic-rule-row m-dynamic-rule-row" data-idx="${index}">
-		  <legend class="sr-only">域名规则 ${index + 1}</legend>
-		  <label class="sr-only" for="m-dynamic-rule-type-${index}">规则类型</label>
-		  <select class="form-select modal-select m-dynamic-rule-type" id="m-dynamic-rule-type-${index}" data-idx="${index}">
+		<div class="m-dynamic-rule-row" data-idx="${index}" style="display:flex;gap:6px;margin-bottom:6px;align-items:center">
+		  <select class="form-select modal-select m-dynamic-rule-type" data-idx="${index}" style="width:auto;flex-shrink:0">
 			<option value="exact" ${type === 'exact' ? 'selected' : ''}>精确</option>
 			<option value="suffix" ${type === 'suffix' ? 'selected' : ''}>后缀</option>
 		  </select>
-		  <label class="sr-only" for="m-dynamic-rule-value-${index}">域名</label>
-		  <input type="text" class="form-input m-dynamic-rule-value" id="m-dynamic-rule-value-${index}" data-idx="${index}" value="${esc(value)}" placeholder="media.example.com" maxlength="253" autocapitalize="none" autocorrect="off" spellcheck="false">
-		  <button type="button" class="btn-ghost danger form-row-action m-dynamic-rule-remove" data-idx="${index}" aria-label="删除域名规则 ${index + 1}">删除</button>
-		</fieldset>`;
+		  <input type="text" class="form-input m-dynamic-rule-value" data-idx="${index}" value="${esc(value)}" placeholder="media.example.com" maxlength="253" autocapitalize="none" autocorrect="off" spellcheck="false" style="flex:1">
+		  <button type="button" class="btn-ghost danger m-dynamic-rule-remove" data-idx="${index}" style="padding:4px 8px;font-size:13px;flex-shrink:0">删除</button>
+		</div>`;
 	}).join('');
 }
 
 function renderDynamicStatus(capabilities) {
 	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
-	if (!dynamicCapabilities.recognized) {
-		return '<div class="form-warning" role="alert">无法读取兼容的发现策略目录；新站点将保持关闭，编辑时不会覆盖已存策略。</div>';
-	}
-	if (!dynamicCapabilities.available) {
-		return '<div class="form-warning" role="alert">DYNAMIC_ROUTE_KEY 未配置，无法为新站点启用自动发现；已有策略仍会保留。</div>';
-	}
-	return '';
+	const contractWarning = dynamicCapabilities.recognized
+		? ''
+		: '<div class="form-help" style="color:var(--orange)">动态能力数据缺失、格式异常或版本过旧，已按不可用处理。</div>';
+	const keyStatus = !dynamicCapabilities.recognized ? '未知' : dynamicCapabilities.key_configured ? '已配置' : '未配置';
+	return `
+		<div class="form-help"><strong>自动发现</strong>默认处理 HTTP 30x 和 PlaybackInfo，无需手工维护额外地址。</div>
+		${contractWarning}
+		<div class="form-help">播放失败时，可在高级选项中开启 HLS、DASH，或切换到 Extreme 扩展兼容模式。</div>
+		<div class="form-help">部署状态：${dynamicCapabilities.available ? '可用' : '不可用'}；DYNAMIC_ROUTE_KEY：${keyStatus}</div>
+	`;
 }
 
-function dynamicProfileRiskNotice(profile, capabilities, playbackInfoEnabled = true) {
+function dynamicProfileRiskNotice(profile) {
 	const normalized = normalizeDynamicProfile(profile);
-	const sources = dynamicSourcesForPlaybackInfoInspection(capabilities, normalized, playbackInfoEnabled)
-		.map(source => DYNAMIC_SOURCE_LABELS[source] || source)
-		.join('、');
-	const sourceText = sources ? `${sources}；` : '';
 	switch (normalized) {
 	case 'compatible':
 		return {
 			level: 'compatible',
-			badge: '需确认',
-			message: `${sourceText}可访问任意公网域名和端口，启用时需要确认。`,
+			badge: '默认',
+			color: 'var(--orange)',
+			background: 'var(--orange-dim)',
+			message: '适合大多数后端，支持严格 HTTP 30x、PlaybackInfo、HLS 和 DASH；仍拒绝私网、特殊地址和未验证拨号。',
 		};
 	case 'extreme':
 		return {
 			level: 'extreme',
 			badge: '高风险',
-			message: `${sourceText}扩大公网发现与协议兼容，并可能重放有界请求体。`,
+			color: 'var(--red)',
+			background: 'var(--red-dim)',
+			message: '除放大公网 authority、动态流和生命周期上限外，还会对 CONNECT/Upgrade/保留路径之外的数据面方法和路径处理 30x/303，并可能把有界请求体重放到上游指定且通过安全校验的公网目标；同时启用 PlaybackInfo、HLS 与 DASH 扩展兼容。仍不开放隧道、私网、自定义 CA、原始地址回退或未签名 target。进入此档必须勾选确认、输入站点名称并通过弹窗。',
 		};
 	default:
 		return {
 			level: 'safe',
 			badge: '推荐',
-			message: `${sourceText}仅允许公网 HTTPS:443，拒绝 IP 字面量。`,
+			color: 'var(--green)',
+			background: 'var(--green-dim)',
+			message: '仅允许 HTTPS:443，且未知目标必须命中精确或后缀 DNS 域名规则。',
 		};
 	}
 }
 
-function renderDynamicProfileRisk(profile, capabilities, playbackInfoEnabled = true) {
-	const notice = dynamicProfileRiskNotice(profile, capabilities, playbackInfoEnabled);
-	return `<div class="profile-risk profile-risk-${esc(notice.level)}" data-profile-risk="${esc(notice.level)}"><span class="profile-risk-badge" data-profile-risk-badge="${esc(notice.level)}">${esc(notice.badge)}</span><span>${esc(notice.message)}</span></div>`;
+function renderDynamicProfileRisk(profile) {
+	const notice = dynamicProfileRiskNotice(profile);
+	const badgeTextColor = notice.level === 'extreme' ? '#fff' : '#111';
+	return `<div class="form-help" data-profile-risk="${esc(notice.level)}" style="padding:8px 10px;border:1px solid ${notice.color};border-radius:8px;background:${notice.background};color:var(--white-87)"><span data-profile-risk-badge="${esc(notice.level)}" style="display:inline-block;padding:2px 7px;border-radius:999px;background:${notice.color};color:${badgeTextColor};font-weight:800;margin-right:5px">${esc(notice.badge)}</span>${esc(notice.message)}</div>`;
 }
 
 function dynamicProfileConfirmationRequirement(initialPolicy, nextPolicy) {
@@ -705,16 +768,11 @@ function dynamicProfileConfirmationRequirement(initialPolicy, nextPolicy) {
 	const next = normalizeDynamicSitePolicy(nextPolicy);
 	if (!next.dynamic_discovery_enabled) return 'none';
 	if (next.dynamic_profile === 'extreme' && (!initial.dynamic_discovery_enabled || initial.dynamic_profile !== 'extreme')) return 'extreme';
-	if (next.dynamic_profile === 'compatible' && (!initial.dynamic_discovery_enabled || initial.dynamic_profile === 'safe')) return 'compatible';
 	return 'none';
 }
 
 function confirmDynamicProfileChange(initialPolicy, nextPolicy, siteName, extremeAcknowledged, extremeTypedName) {
 	const requirement = dynamicProfileConfirmationRequirement(initialPolicy, nextPolicy);
-	if (requirement === 'compatible') {
-		const accepted = window.confirm('Compatible（兼容）可访问任意公网域名和 1–65535 端口。仍会拒绝私网、特殊地址和未验证拨号。确定启用吗？');
-		return { ok: accepted, requirement, error: '' };
-	}
 	if (requirement === 'extreme') {
 		if (!extremeAcknowledged) return { ok: false, requirement, error: '启用 Extreme 前必须勾选高风险确认' };
 		if (String(extremeTypedName || '').trim() !== String(siteName || '').trim()) return { ok: false, requirement, error: '启用 Extreme 时必须准确输入站点名称' };
@@ -729,9 +787,9 @@ function renderDynamicEnableControl(capabilities, policy) {
 	const dynamicPolicy = normalizeDynamicSitePolicy(policy);
 	const enableEditable = dynamicCapabilities.recognized && (dynamicCapabilities.available || dynamicPolicy.dynamic_discovery_enabled);
 	return `
-		<label class="form-check form-check-compact" for="m-dynamic-enabled">
-		  <input type="checkbox" id="m-dynamic-enabled" ${dynamicPolicy.dynamic_discovery_enabled ? 'checked' : ''} ${enableEditable ? '' : 'disabled'}>
-		  <span>启用自动播放后端发现</span>
+		<label style="display:flex;gap:8px;align-items:center;margin-top:10px">
+          <input type="checkbox" id="m-dynamic-enabled" ${dynamicPolicy.dynamic_discovery_enabled ? 'checked' : ''} ${enableEditable ? '' : 'disabled'}>
+		  启用自动发现（推荐）
 		</label>
 	`;
 }
@@ -756,172 +814,72 @@ function privacySafeObservationAuthority(value) {
 }
 
 function privacySafeObservationReason(value) {
-	return typeof value === 'string' && DYNAMIC_OBSERVATION_REASON_CODES.has(value) ? value : '';
+	return typeof value === 'string' && DYNAMIC_OBSERVATION_REASON_CODES.has(value) ? value : '—';
 }
 
-function privacySafeObservationTimestamp(value) {
-	if (!Number.isSafeInteger(value) || value < 0) return null;
-	return formatShanghaiDateTimeParts(value);
-}
-
-function privacySafeObservationMetadata(value, allowZero) {
-	return Number.isSafeInteger(value) && (allowZero ? value >= 0 : value > 0) ? value : null;
-}
-
-function privacySafeRedirectStatus(value) {
-	return Number.isSafeInteger(value) && (value === 0 || (value >= 300 && value <= 399)) ? value : null;
+function formatObservationTimestamp(value) {
+	if (!Number.isSafeInteger(value) || value < 0) return '—';
+	return meridianFormatDateTime(value);
 }
 
 function normalizeDynamicObservationsResponse(value) {
 	const response = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 	const observations = Array.isArray(response.observations) ? response.observations : [];
 	return {
-		// The API is latest-first. Slice before mapping so even a malformed
-		// response cannot trigger unbounded client-side allocation or DOM work.
-		observations: observations.slice(0, DYNAMIC_OBSERVATION_MAX_ROWS).map(observation => {
+		observations: observations.map(observation => {
 			const item = observation && typeof observation === 'object' && !Array.isArray(observation) ? observation : {};
 			return {
 				authority: privacySafeObservationAuthority(item.canonical_authority),
-				source: DYNAMIC_SOURCE_IDS.includes(item.source) ? item.source : '',
-				targetKind: DYNAMIC_OBSERVATION_TARGET_KIND_IDS.includes(item.target_kind) ? item.target_kind : '',
-				stage: DYNAMIC_OBSERVATION_STAGE_IDS.includes(item.stage) ? item.stage : '',
-				decision: DYNAMIC_OBSERVATION_DECISION_IDS.includes(item.decision) ? item.decision : '',
+				source: DYNAMIC_SOURCE_IDS.includes(item.source) ? item.source : '—',
+				decision: item.decision === 'allowed' || item.decision === 'denied' ? item.decision : '—',
 				reason: privacySafeObservationReason(item.reason_code),
-				redirectStatus: privacySafeRedirectStatus(item.redirect_status),
-				firstSeen: privacySafeObservationTimestamp(item.first_seen_ms),
-				lastSeen: privacySafeObservationTimestamp(item.last_seen_ms),
-				count: privacySafeObservationMetadata(item.count, false),
+				firstSeen: formatObservationTimestamp(item.first_seen_ms),
+				lastSeen: formatObservationTimestamp(item.last_seen_ms),
+				count: Number.isSafeInteger(item.count) && item.count > 0 ? item.count : '—',
 			};
 		}),
-		droppedObservationsGlobal: privacySafeObservationMetadata(response.dropped_observations_global, true),
-		retentionDays: privacySafeObservationMetadata(response.retention_days, false),
-		perSiteRowLimit: privacySafeObservationMetadata(response.per_site_row_limit, false),
-		globalRowLimit: privacySafeObservationMetadata(response.global_row_limit, false),
+		dropped: Number.isSafeInteger(response.dropped_observations) && response.dropped_observations >= 0
+			? response.dropped_observations
+			: '—',
 	};
 }
 
-function normalizeDynamicObservationFilters(value) {
-	const filters = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-	return {
-		decision: DYNAMIC_OBSERVATION_DECISION_IDS.includes(filters.decision) ? filters.decision : '',
-		source: DYNAMIC_SOURCE_IDS.includes(filters.source) ? filters.source : '',
-		targetKind: DYNAMIC_OBSERVATION_TARGET_KIND_IDS.includes(filters.targetKind) ? filters.targetKind : '',
-	};
-}
-
-function filterDynamicObservations(observations, value) {
-	const filters = normalizeDynamicObservationFilters(value);
-	return (Array.isArray(observations) ? observations : []).filter(observation => (
-		(!filters.decision || observation.decision === filters.decision)
-		&& (!filters.source || observation.source === filters.source)
-		&& (!filters.targetKind || observation.targetKind === filters.targetKind)
-	));
-}
-
-function dynamicObservationLabel(labels, value) {
-	return Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : DYNAMIC_OBSERVATION_UNAVAILABLE;
-}
-
-function dynamicObservationRedirectStatusLabel(value) {
-	if (value === 0) return '非重定向';
-	return Number.isSafeInteger(value) && value >= 300 && value <= 399
-		? `HTTP ${value}`
-		: DYNAMIC_OBSERVATION_UNAVAILABLE;
-}
-
-function renderDynamicObservationTime(value) {
-	if (!value) return `<span class="dynamic-observation-unavailable">${DYNAMIC_OBSERVATION_UNAVAILABLE}</span>`;
-	const date = esc(value.date);
-	const time = esc(value.time);
-	return `<time class="dynamic-observation-time" datetime="${date}T${time}:00+08:00" aria-label="${date} ${time} 中国标准时间"><span>${date}</span><span>${time}</span></time>`;
-}
-
-function renderDynamicObservationReason(value) {
-	if (!DYNAMIC_OBSERVATION_REASON_CODES.has(value)) return `<span class="dynamic-observation-unavailable">${DYNAMIC_OBSERVATION_UNAVAILABLE}</span>`;
-	return `<span class="dynamic-observation-reason-label">${esc(DYNAMIC_OBSERVATION_REASON_LABELS[value])}</span><code>${esc(value)}</code>`;
-}
-
-function renderDynamicObservationNumber(value, suffix) {
-	return value === null ? DYNAMIC_OBSERVATION_UNAVAILABLE : `${String(value)}${suffix || ''}`;
-}
-
-function renderDynamicObservationFilterOptions(values, labels, selected, allLabel) {
-	return `<option value="">${esc(allLabel)}</option>${values.map(value => (
-		`<option value="${esc(value)}" ${selected === value ? 'selected' : ''}>${esc(labels[value])}</option>`
-	)).join('')}`;
-}
-
-function renderNormalizedDynamicObservations(response, filterValue) {
-	const filters = normalizeDynamicObservationFilters(filterValue);
-	const visibleObservations = filterDynamicObservations(response.observations, filters);
-	const rows = visibleObservations.map(observation => `
+function renderDynamicObservations(value) {
+	const response = normalizeDynamicObservationsResponse(value);
+	const rows = response.observations.map(observation => `
 		<tr>
-		  <td class="mono">${esc(observation.authority === '—' ? DYNAMIC_OBSERVATION_UNAVAILABLE : observation.authority)}</td>
-		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_TARGET_KIND_LABELS, observation.targetKind))}</td>
-		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_SOURCE_LABELS, observation.source))}</td>
-		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_DECISION_LABELS, observation.decision))}</td>
-		  <td>${esc(dynamicObservationLabel(DYNAMIC_OBSERVATION_STAGE_LABELS, observation.stage))}</td>
-		  <td class="dynamic-observation-reason">${renderDynamicObservationReason(observation.reason)}</td>
-		  <td>${esc(dynamicObservationRedirectStatusLabel(observation.redirectStatus))}</td>
-		  <td>${renderDynamicObservationTime(observation.firstSeen)}</td>
-		  <td>${renderDynamicObservationTime(observation.lastSeen)}</td>
-		  <td>${esc(renderDynamicObservationNumber(observation.count))}</td>
+		  <td>${esc(observation.authority)}</td>
+		  <td>${esc(observation.source)}</td>
+		  <td>${esc(observation.decision)}</td>
+		  <td>${esc(observation.reason)}</td>
+		  <td>${esc(observation.firstSeen)}</td>
+		  <td>${esc(observation.lastSeen)}</td>
+		  <td>${esc(observation.count)}</td>
 		</tr>
 	`).join('');
 	return `
-		<div class="dynamic-observation-metadata" aria-label="观察记录保留与容量边界">
-		  <span><strong>保留时间</strong>${esc(renderDynamicObservationNumber(response.retentionDays, ' 天'))}</span>
-		  <span><strong>单站点上限</strong>${esc(renderDynamicObservationNumber(response.perSiteRowLimit, ' 条'))}</span>
-		  <span><strong>全局存储上限</strong>${esc(renderDynamicObservationNumber(response.globalRowLimit, ' 条'))}</span>
-		  <span class="dynamic-observation-global-loss"><strong>进程全局队列丢失计数</strong>${esc(renderDynamicObservationNumber(response.droppedObservationsGlobal, ' 条'))}</span>
-		</div>
-		<div class="form-help dynamic-observation-global-loss-help">进程全局队列丢失计数跨全部站点累计，只表示有界非阻塞观察队列未能接收的记录数量。</div>
-		<div class="dynamic-observation-filters" aria-label="播放路由观察记录筛选">
-		  <label for="m-dynamic-observation-decision-filter">决策
-			<select class="form-select" id="m-dynamic-observation-decision-filter">
-			  ${renderDynamicObservationFilterOptions(DYNAMIC_OBSERVATION_DECISION_IDS, DYNAMIC_OBSERVATION_DECISION_LABELS, filters.decision, '全部决策')}
-			</select>
-		  </label>
-		  <label for="m-dynamic-observation-source-filter">来源
-			<select class="form-select" id="m-dynamic-observation-source-filter">
-			  ${renderDynamicObservationFilterOptions(DYNAMIC_SOURCE_IDS, DYNAMIC_OBSERVATION_SOURCE_LABELS, filters.source, '全部来源')}
-			</select>
-		  </label>
-		  <label for="m-dynamic-observation-target-kind-filter">目标类型
-			<select class="form-select" id="m-dynamic-observation-target-kind-filter">
-			  ${renderDynamicObservationFilterOptions(DYNAMIC_OBSERVATION_TARGET_KIND_IDS, DYNAMIC_OBSERVATION_TARGET_KIND_LABELS, filters.targetKind, '全部目标类型')}
-			</select>
-		  </label>
-		</div>
-		<div class="form-help dynamic-observation-result-count" role="status">显示 ${visibleObservations.length} / ${response.observations.length} 条</div>
+		<div class="form-help">已丢弃观察记录：${esc(response.dropped)}</div>
 		${rows ? `
-		<div class="dynamic-observation-table-wrap">
-		  <table class="dynamic-observation-table">
-			<thead><tr><th>目标权威</th><th>目标类型</th><th>来源</th><th>决策</th><th>阶段</th><th>原因</th><th>3xx 状态</th><th>首次观察</th><th>最近观察</th><th>次数</th></tr></thead>
+		<div style="overflow-x:auto;margin-top:8px">
+		  <table>
+			<thead><tr><th>规范化权威</th><th>来源</th><th>决策</th><th>原因代码</th><th>首次观察</th><th>最近观察</th><th>次数</th></tr></thead>
 			<tbody>${rows}</tbody>
 		  </table>
-		</div>` : `<div class="form-help dynamic-observation-empty">${response.observations.length ? '暂无符合筛选条件的观察记录。' : '暂无观察记录。'}</div>`}
+		</div>` : '<div class="form-help" style="margin-top:8px">暂无观察记录。</div>'}
 	`;
-}
-
-function renderDynamicObservations(value, filters) {
-	return renderNormalizedDynamicObservations(normalizeDynamicObservationsResponse(value), filters);
 }
 
 function renderDynamicObservationsPanel(supported) {
 	return `
-		<details class="site-disclosure" id="m-dynamic-observations-disclosure">
-		  <summary>播放路由观察记录</summary>
-		  <div class="site-disclosure-body">
-			<div class="form-help">“通过”只表示路由与安全校验通过，不代表播放成功。</div>
-			<div class="form-help">仅显示规范化目标权威、有限枚举/原因代码和聚合时间/次数；不显示完整 URL、路径、查询参数、令牌、请求头或正文。</div>
-			<div class="form-inline-actions">
-			  <button type="button" class="btn-ghost" id="m-refresh-dynamic-observations" ${supported ? '' : 'disabled'}>刷新</button>
-			  <button type="button" class="btn-ghost danger" id="m-clear-dynamic-observations" ${supported ? '' : 'disabled'}>清空</button>
-			</div>
-			<div id="m-dynamic-observations">${supported ? '<div class="form-help">正在读取观察记录…</div>' : '<div class="form-help">当前后端不提供播放路由观察记录。</div>'}</div>
+		<div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--glass-border)">
+		  <label>自动发现观察记录</label>
+		  <div class="form-help">记录由服务器限量保留并定期过期清理。这里只显示规范化权威、有限原因代码和聚合时间/次数；不会显示完整 URL、路径、查询参数、令牌、请求头或正文。</div>
+		  <div style="display:flex;gap:8px;margin-top:8px">
+			<button type="button" class="btn-ghost" id="m-refresh-dynamic-observations" ${supported ? '' : 'disabled'}>刷新</button>
+			<button type="button" class="btn-ghost danger" id="m-clear-dynamic-observations" ${supported ? '' : 'disabled'}>清空</button>
 		  </div>
-		</details>
+		  <div id="m-dynamic-observations" style="margin-top:8px">${supported ? '<div class="form-help">正在读取观察记录…</div>' : '<div class="form-help">当前后端不提供自动发现观察记录。</div>'}</div>
+		</div>
 	`;
 }
 
@@ -931,74 +889,151 @@ function canAddPlaybackAddress(currentCount, maxPlaybackAddresses) {
 
 function renderUpstreamHeaderRows(headers, upstreamHeadersAvailable) {
 	return headers.map((header, idx) => `
-		<fieldset class="form-list-row upstream-header-row">
-		  <legend class="sr-only">上游请求头 ${idx + 1}</legend>
-		  <label class="sr-only" for="m-upstream-header-name-${idx}">请求头名称</label>
-		  <input type="text" class="form-input m-upstream-header-name" id="m-upstream-header-name-${idx}" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <label class="sr-only" for="m-upstream-header-value-${idx}">请求头值</label>
-		  <input type="password" class="form-input m-upstream-header-value" id="m-upstream-header-value-${idx}" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <button type="button" class="btn-ghost danger form-row-action m-upstream-header-remove" data-idx="${idx}" aria-label="删除上游请求头 ${idx + 1}">删除</button>
-		</fieldset>
+		<div class="upstream-header-row">
+		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <button type="button" class="icon-button danger m-upstream-header-remove" data-idx="${idx}" title="删除请求头" aria-label="删除请求头"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg></button>
+		</div>
 	`).join('');
 }
 
 function normalizedIngressMode(site) {
 	const mode = String((site && site.ingress_mode) || '').trim().toLowerCase();
-	if (mode === 'port' || mode === 'host' || mode === 'both') return mode;
+	if (mode === 'unset' || mode === 'port' || mode === 'path' || mode === 'host' || mode === 'both') return mode;
 	return site && String(site.public_host || '').trim() ? 'host' : 'port';
 }
 
 function ingressFormState(mode) {
-	const normalized = ['port', 'host', 'both'].includes(mode) ? mode : 'host';
+	const normalized = ['unset', 'port', 'path', 'host', 'both'].includes(mode) ? mode : 'host';
+	if (normalized === 'unset') {
+		return {
+			mode: normalized,
+			showPublicHost: false,
+			requirePublicHost: false,
+			requireListenPort: false,
+			showPathPrefix: false,
+			requirePathPrefix: false,
+			portLabel: '监听端口',
+			warning: '该站点来自其他服务器，原入口不适用于当前环境。请选择可用入口并保存后再启用。',
+		};
+	}
 	return {
 		mode: normalized,
-		showPublicHost: normalized !== 'port',
-		requirePublicHost: normalized !== 'port',
-		portLabel: normalized === 'host' ? '保留端口（此模式不监听）' : '监听端口',
-		warning: normalized === 'both'
-			? '此模式会同时开放独立高端口；若前方使用 CDN，请用防火墙限制该端口，避免绕过 CDN。'
-			: normalized === 'port'
-				? '独立端口会绑定所有网络接口；公网部署时请配置防火墙。'
-				: '仅通过共享 Host 入口代理，不会绑定保留端口；要求面板绑定回环地址，或用 TRUSTED_PROXY_CIDRS 限定可信入口来源。',
+		showPublicHost: normalized === 'host' || normalized === 'both',
+		requirePublicHost: normalized === 'host' || normalized === 'both',
+		showPathPrefix: normalized === 'path',
+		requirePathPrefix: normalized === 'path',
+		requireListenPort: normalized === 'port' || normalized === 'both',
+		portLabel: normalized === 'host' || normalized === 'path' ? '独立端口（可选，自动分配）' : '监听端口',
+		warning: normalized === 'port'
+			? '独立端口会绑定所有网络接口；公网部署时请配置防火墙。'
+			: normalized === 'path'
+				? '路径入口复用面板域名和端口，例如 https://panel.example.com/emby/。客户端服务器地址需要包含该路径。'
+			: normalized === 'both'
+				? '兼容模式会同时开放独立端口和共享域名，建议迁移到单一入口。'
+				: '域名前缀通过面板端口转发，不会绑定站点端口，例如 https://123.example.com:9090。请先在 TLS 页配置面板域名、泛域名并申请证书，完成后再启用。',
 	};
 }
 
-function buildIngressPayload(mode, port, publicHost) {
+function buildIngressPayload(mode, port, publicHost, routePrefix, routeDomain, pathPrefix) {
 	const state = ingressFormState(mode);
+	const parsedPort = parseInt(port, 10);
+	const prefix = String(routePrefix || '').trim().toLowerCase();
+	const generatedHost = state.showPublicHost && prefix && routeDomain
+		? `${prefix}.${String(routeDomain).trim().toLowerCase()}`
+		: String(publicHost || '').trim();
 	return {
 		ingress_mode: state.mode,
-		listen_port: parseInt(port),
-		public_host: state.showPublicHost ? String(publicHost || '').trim() : '',
+		listen_port: Number.isInteger(parsedPort) ? parsedPort : 0,
+		public_host: state.showPublicHost ? generatedHost : '',
+		path_prefix: state.showPathPrefix ? String(pathPrefix || '').trim() : '',
+		...(state.showPublicHost && prefix ? { route_prefix: prefix } : {}),
 	};
 }
 
-function defaultIngressMode() {
-	return 'port';
+function defaultIngressMode(capabilities) {
+	if (!capabilities) return 'host';
+	if (capabilities.host_only_available === false) return 'port';
+	if (capabilities.domain_prefix_available !== true) return 'port';
+	if (capabilities.panel_tls_enabled !== true) return 'port';
+	return 'host';
 }
 
-function renderIngressSummary(site) {
+function siteAccessAddress(site, capabilities) {
 	const mode = normalizedIngressMode(site);
-	const labels = { port: '仅独立端口', host: '仅共享域名', both: '共享域名 + 独立端口' };
-	let rows = `
-	  <div class="site-row">
-		<span class="site-row-label">入口模式</span>
-		<span class="site-row-value">${labels[mode]}</span>
-	  </div>`;
-	if (mode === 'port' || mode === 'both') {
-		rows += `
-	  <div class="site-row">
-		<span class="site-row-label">监听端口</span>
-		<span class="mono">:${site.listen_port}</span>
-	  </div>`;
+	const locationObject = typeof window !== 'undefined' && window.location
+		? window.location
+		: { protocol: 'http:', hostname: '127.0.0.1', port: '' };
+	const protocol = capabilities && capabilities.panel_tls_enabled ? 'https' : locationObject.protocol.replace(':', '') || 'http';
+	if (mode === 'port') {
+		const host = locationObject.hostname || '127.0.0.1';
+		return `${protocol}://${host}:${Number(site.listen_port) || ''}`;
 	}
-	if (mode === 'host' || mode === 'both') {
-		rows += `
-	  <div class="site-row">
-		<span class="site-row-label">共享入口</span>
-		<span class="mono">Host: ${esc(site.public_host || '')}</span>
-	  </div>`;
+	if (mode === 'path') {
+		const base = String(capabilities && capabilities.panel_access_url || '').replace(/\/$/, '') || `${protocol}://${locationObject.host || locationObject.hostname || '127.0.0.1'}`;
+		const prefix = String(site.path_prefix || '').trim().replace(/^\/+|\/+$/g, '');
+		return prefix ? `${base}/${prefix}/` : '';
 	}
-	return rows;
+	const host = String(site.public_host || '').trim();
+	const panelPort = locationObject.port || (protocol === 'https' ? '443' : '80');
+	return host ? `${protocol}://${host}:${panelPort}` : '';
+}
+
+function toggleSiteAccessAddress(button) {
+	const row = button.closest('.site-access-row');
+	const value = row && row.querySelector('[data-access-address]');
+	if (!value) return;
+	const hidden = value.classList.toggle('is-hidden');
+	value.textContent = hidden ? '********' : value.dataset.accessAddress;
+	button.setAttribute('aria-label', hidden ? '显示访问地址' : '隐藏访问地址');
+	button.setAttribute('title', hidden ? '显示访问地址' : '隐藏访问地址');
+}
+
+async function copySiteAccessAddress(button) {
+	const row = button.closest('.site-access-row');
+	const value = row && row.querySelector('[data-access-address]');
+	const address = String(value && value.dataset.accessAddress || '').trim();
+	if (!address) {
+		Toast.error('当前站点没有可复制的访问地址');
+		return;
+	}
+
+	try {
+		if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+			await navigator.clipboard.writeText(address);
+		} else {
+			if (typeof document === 'undefined' || typeof document.execCommand !== 'function') throw new Error('clipboard unavailable');
+			const input = document.createElement('textarea');
+			input.value = address;
+			input.setAttribute('readonly', '');
+			input.style.position = 'fixed';
+			input.style.opacity = '0';
+			document.body.appendChild(input);
+			input.select();
+			const copied = document.execCommand('copy');
+			input.remove();
+			if (!copied) throw new Error('copy failed');
+		}
+		Toast.success('访问地址已复制');
+	} catch (_) {
+		Toast.error('复制失败，请手动复制访问地址');
+	}
+}
+
+let siteIngressCapabilities = normalizeSiteCapabilities({});
+
+function siteIngressModeLabel(site) {
+	const labels = { unset: '入口未配置', port: '独立端口', path: '路径', host: '域名前缀', both: '域名前缀（兼容）' };
+	return labels[normalizedIngressMode(site)] || labels.unset;
+}
+
+function routePrefixForSite(site, routeDomain) {
+	if (!site || normalizedIngressMode(site) !== 'host') return '';
+	const host = String(site.public_host || '').trim().toLowerCase();
+	const domain = String(routeDomain || '').trim().toLowerCase();
+	if (!host || !domain || !host.endsWith(`.${domain}`)) return '';
+	const prefix = host.slice(0, -(domain.length + 1));
+	return prefix.includes('.') ? '' : prefix;
 }
 
 function normalizedTargetAuthority(value) {
@@ -1019,6 +1054,190 @@ function normalizedTargetAuthority(value) {
 	}
 }
 
+function renderPanelCertificateStatus(status) {
+	if (!status || status.available === false) {
+		return '<div class="form-help" style="color:var(--orange)">TLS 数据目录不可写，请检查数据库所在数据目录的权限。</div>';
+	}
+	if (!status.configured) {
+		return '<div class="form-help">尚未申请证书。请先保存域名设置，再点击“申请证书”。</div>';
+	}
+	return `
+	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
+	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${status.certificate_current ? 'good' : 'warn'}">${status.certificate_current ? '泛域名一致' : '需要申请或更新'}</span></div>
+	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
+	  <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${status.certificate_valid ? 'good' : 'warn'}">${status.certificate_valid ? '有效' : '已过期或不可用'}</span></div>
+	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token'}</span></div>
+	  <div class="diag-row"><span class="diag-key">当前监听端口</span><span class="diag-val">${esc(String(status.active_listen_port || '—'))}</span></div>
+	  <div class="diag-row"><span class="diag-key">设置监听端口</span><span class="diag-val ${status.listen_port !== status.active_listen_port ? 'warn' : ''}">${esc(String(status.listen_port || '—'))}</span></div>
+	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.restart_required ? 'warn' : 'good'}">${status.restart_required ? '等待重启应用' : '已启用'}</span></div>
+	`;
+}
+
+function panelHTTPSPreview(panelDomain) {
+	const port = window.location.port;
+	return panelDomain ? `https://${panelDomain}${port && port !== '443' ? `:${port}` : ''}` : '—';
+}
+
+function panelDomainFromForm() {
+	const prefix = document.getElementById('m-panel-prefix').value.trim().replace(/^\*\./, '');
+	const wildcard = document.getElementById('m-wildcard-domain').value.trim().replace(/^\*\./, '');
+	return prefix && wildcard ? `${prefix}.${wildcard}` : '';
+}
+
+async function waitForPanelRestart(redirectURL) {
+	const deadline = Date.now() + 90000;
+	while (Date.now() < deadline) {
+		try {
+			await fetch(`${redirectURL}/api/auth/check`, { mode: 'no-cors', cache: 'no-store' });
+			window.location.replace(redirectURL);
+			return;
+		} catch (_) {
+			await new Promise(resolve => setTimeout(resolve, 1500));
+		}
+	}
+	Toast.error('服务重启超时，请稍后手动打开新的 HTTPS 地址');
+}
+
+async function showPanelCertificateModal() {
+	let status;
+	try {
+		status = await API.panelCertificate();
+	} catch (error) {
+		Toast.error(`无法读取证书状态：${error.message}`);
+		return;
+	}
+	document.getElementById('modal-title').textContent = 'TLS 证书';
+	document.getElementById('modal-body').innerHTML = `
+	  <div id="m-panel-certificate-status">${renderPanelCertificateStatus(status)}</div>
+	  <div class="form-group" style="margin-top:18px">
+	    <label>面板访问域名前缀</label>
+	    <input type="text" class="form-input" id="m-panel-prefix" maxlength="63" value="${esc(status.panel_prefix || '')}" placeholder="panel" autocomplete="off" autocapitalize="none" spellcheck="false">
+	    <div class="form-help">只需填写前缀，例如 <code>panel</code>，不要填写完整域名。</div>
+	  </div>
+	  <div class="form-group">
+	    <label>节点泛域名</label>
+	    <input type="text" class="form-input" id="m-wildcard-domain" maxlength="255" value="${esc(status.wildcard_domain || (status.route_domain ? `*.${status.route_domain}` : ''))}" placeholder="*.example.com" autocomplete="off" autocapitalize="none" spellcheck="false">
+	    <div class="form-help">仅使用泛域名申请证书，例如 <code>*.example.com</code>；请提前将泛域名解析到本机。</div>
+	  </div>
+	  <div class="form-group">
+	    <label>启用后的面板地址</label>
+	    <div class="form-help" id="m-panel-address-preview">${esc(panelHTTPSPreview(status.panel_domain || ''))}</div>
+	  </div>
+	  <div class="form-group">
+	    <label>面板监听端口</label>
+	    <input type="number" class="form-input" id="m-panel-listen-port" min="1" max="65535" step="1" value="${esc(String(status.listen_port || status.active_listen_port || 9090))}">
+	    <div class="form-help">修改端口后需要重启面板；Docker 请使用 host 网络，并在宿主机防火墙中放行新端口。</div>
+	  </div>
+	  <div class="form-group">
+	    <label>ACME 邮箱</label>
+	    <input type="email" class="form-input" id="m-acme-email" autocomplete="email" maxlength="254" value="${esc(status.acme_email || '')}" placeholder="admin@example.com">
+	    <div class="form-help">邮箱会直接显示在面板中，用于 ACME 账户与证书续签通知。</div>
+	  </div>
+	  <div class="form-group">
+	    <label>DNS 服务商</label>
+	    <select class="form-select modal-select" id="m-acme-provider"><option value="cloudflare">Cloudflare DNS</option></select>
+	  </div>
+	  <div class="form-group">
+	    <label>DNS API Token</label>
+	    <input type="text" class="form-input mono" id="m-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token">
+	    <div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div>
+	  </div>
+	  <label style="display:flex;align-items:center;gap:8px;margin-top:10px;color:var(--white-60);font-size:.82rem">
+	    <input type="checkbox" id="m-acme-staging" ${status.acme_staging ? 'checked' : ''}>
+	    <span>ACME 测试环境</span>
+	  </label>
+	`;
+	document.getElementById('modal-footer').innerHTML = `
+	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
+	  ${status.restart_required && ((status.configured && status.certificate_current) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="btn-modal primary" id="m-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
+	  <button class="btn-modal" id="m-cert-save">保存设置</button>
+	  <button class="btn-modal primary" id="m-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
+	`;
+	const refreshPreview = () => {
+		const domain = panelDomainFromForm();
+		const port = Number(document.getElementById('m-panel-listen-port').value) || 9090;
+		document.getElementById('m-panel-address-preview').textContent = domain ? `https://${domain}${port === 443 ? '' : `:${port}`}` : '—';
+	};
+	document.getElementById('m-panel-prefix').addEventListener('input', refreshPreview);
+	document.getElementById('m-wildcard-domain').addEventListener('input', refreshPreview);
+	document.getElementById('m-panel-listen-port').addEventListener('input', refreshPreview);
+	document.getElementById('m-cert-cancel').onclick = closeModal;
+	const restartButton = document.getElementById('m-cert-restart');
+	if (restartButton) restartButton.onclick = async () => {
+		if (!window.confirm('重启会短暂中断面板和所有站点连接，确定现在重启吗？')) return;
+		restartButton.disabled = true;
+		restartButton.textContent = '正在重启…';
+		try {
+			const result = await API.restartSystem();
+			Toast.success('重启请求已发送，正在等待 HTTPS 服务恢复');
+			await waitForPanelRestart(result.redirect_url);
+		} catch (error) {
+			restartButton.disabled = false;
+			restartButton.textContent = '启用 HTTPS 并重启';
+			Toast.error(error.message);
+		}
+	};
+	const settingsPayload = () => ({
+		panel_prefix: document.getElementById('m-panel-prefix').value.trim(),
+		wildcard_domain: document.getElementById('m-wildcard-domain').value.trim(),
+		listen_port: Number(document.getElementById('m-panel-listen-port').value),
+	});
+	document.getElementById('m-cert-save').onclick = async () => {
+		const button = document.getElementById('m-cert-save');
+		const payload = settingsPayload();
+		if (!payload.panel_prefix || !payload.wildcard_domain || !Number.isInteger(payload.listen_port) || payload.listen_port < 1 || payload.listen_port > 65535) {
+			Toast.error('请填写面板前缀、泛域名和有效监听端口');
+			return;
+		}
+		button.disabled = true;
+		button.textContent = '保存中…';
+		try {
+			await API.savePanelSettings(payload);
+			Toast.success('面板设置已保存；证书不会因修改前缀而重新申请');
+			closeModal();
+			await showPanelCertificateModal();
+		} catch (error) {
+			button.disabled = false;
+			button.textContent = '保存设置';
+			Toast.error(error.message);
+		}
+	};
+	document.getElementById('m-cert-issue').onclick = async () => {
+		const button = document.getElementById('m-cert-issue');
+		const tokenInput = document.getElementById('m-acme-token');
+		const settingsPayloadValue = settingsPayload();
+		const savedWildcard = String(status.wildcard_domain || '').toLowerCase().replace(/^\*\./, '');
+		const formWildcard = settingsPayloadValue.wildcard_domain.toLowerCase().replace(/^\*\./, '');
+		if (settingsPayloadValue.panel_prefix !== status.panel_prefix || formWildcard !== savedWildcard || settingsPayloadValue.listen_port !== Number(status.listen_port)) {
+			Toast.error('请先点击“保存设置”，再申请证书');
+			return;
+		}
+		const payload = {
+			email: document.getElementById('m-acme-email').value.trim(),
+			dns_provider: document.getElementById('m-acme-provider').value,
+			dns_api_token: tokenInput.value.trim(),
+			staging: document.getElementById('m-acme-staging').checked,
+		};
+		if (!payload.email || !payload.dns_api_token) {
+			Toast.error('请填写 ACME 邮箱和 DNS API Token');
+			return;
+		}
+		button.disabled = true;
+		button.textContent = '申请中…';
+		try {
+			const updated = await API.requestPanelCertificate(payload);
+			Toast.success(updated.certificate_reused ? '泛域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+			closeModal();
+			await showPanelCertificateModal();
+		} catch (error) {
+			button.disabled = false;
+			button.textContent = '申请证书';
+			Toast.error(error.message);
+		}
+	};
+	openModal({ closeOnBackdrop: false });
+}
+
 async function showSiteModal(site) {
   const isEdit = !!site;
   const title = isEdit ? '编辑站点' : '添加站点';
@@ -1031,231 +1250,346 @@ async function showSiteModal(site) {
 	}
 	const hostOnlyAvailable = siteCapabilities.host_only_available;
 	const upstreamHeadersAvailable = siteCapabilities.upstream_headers_available;
-	const maxPlaybackAddresses = siteCapabilities.max_playback_addresses;
-	const dynamicCapabilities = await loadDynamicProfiles();
-	const dynamicPolicy = isEdit
-		? normalizeDynamicSitePolicy(site)
-		: defaultDynamicSitePolicy(dynamicCapabilities);
-	const dynamicPolicyEditable = dynamicCapabilities.recognized && dynamicCapabilities.available;
-	const dynamicDowngradeState = dynamicDowngradeFormState(dynamicPolicy.dynamic_profile, dynamicPolicy.dynamic_allow_https_downgrade);
-	const optimizationState = buildProxyOptimizationPayload(
-		isEdit && site.ping_cache_enabled === true,
-		isEdit && site.image_cache_enabled === true,
-		isEdit && site.progress_coalescing_enabled === true,
-	);
-	const hasPlaybackConfiguration = isEdit && (
-		String(site.playback_target_url || '').trim()
-		|| normalizeStreamHosts(site.stream_hosts).length > 0
-		|| site.playback_mode === 'redirect'
-		|| site.ua_mode === 'custom'
-		|| site.ua_mode === 'passthrough'
-	);
-	const hasUpstreamHeaders = isEdit && Array.isArray(site.upstream_headers) && site.upstream_headers.length > 0;
-	const hasRequestLimits = isEdit && ((site.traffic_quota || 0) > 0 || (site.speed_limit || 0) > 0);
-
+	const domainPrefixAvailable = siteCapabilities.domain_prefix_available === true;
+	const panelTLSReady = siteCapabilities.panel_tls_enabled === true;
+	const canUseHostIngress = hostOnlyAvailable && domainPrefixAvailable && (panelTLSReady || (isEdit && String(site.public_host || '').trim() !== ''));
+	const splitTargetAddress = value => {
+		const raw = String(value || '').trim();
+		if (!raw) return { address: '', port: '' };
+		const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+		try {
+			const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
+			const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
+			const hostname = parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname;
+			const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
+			return {
+				address: `${explicitScheme ? `${parsed.protocol}//` : ''}${hostname}${path}`,
+				port: parsed.port || defaultPort,
+			};
+		} catch (_) {
+			return { address: raw, port: '' };
+		}
+	};
+	const joinTargetAddress = (address, port) => {
+		const rawAddress = String(address || '').trim();
+		const rawPort = String(port || '').trim();
+		if (!rawAddress) return '';
+		const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawAddress);
+		try {
+			const parsed = new URL(explicitScheme ? rawAddress : `http://${rawAddress}`);
+			parsed.port = rawPort;
+			const normalized = parsed.toString().replace(/\/$/, parsed.pathname === '/' && !parsed.search && !parsed.hash ? '' : '/');
+			return explicitScheme ? normalized : normalized.replace(/^http:\/\//i, '');
+		} catch (_) {
+			return rawPort ? `${rawAddress.replace(/:\d+$/, '')}:${rawPort}` : rawAddress;
+		}
+	};
+	const primaryTargetParts = splitTargetAddress(isEdit ? site.target_url : '');
+	const hostIngressBlockedHint = !hostOnlyAvailable
+		? '当前面板未满足安全的域名前缀转发条件，请先设置 PANEL_BIND_ADDR 或 TRUSTED_PROXY_CIDRS 并重启。'
+		: !domainPrefixAvailable
+			? '域名前缀通过面板端口转发，不会绑定站点端口，例如 https://123.example.com:9090。请配置 PANEL_ROUTE_DOMAIN。'
+			: !panelTLSReady
+				? '请先在 TLS 页配置面板域名、泛域名并申请证书，完成后才能启用域名前缀。'
+				: '';
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
-    <div class="site-form" id="site-form">
-      <fieldset class="site-form-section" data-site-group="basic">
-        <legend>基本信息</legend>
-        <div class="form-group">
-          <label for="m-name">站点名称</label>
-          <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
-        </div>
-        <div class="form-group">
-          <label for="m-target">主回源地址</label>
-          <input type="text" class="form-input" id="m-target" value="${isEdit ? esc(site.target_url) : ''}" placeholder="如：192.168.1.10:8096" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required>
-        </div>
-      </fieldset>
-
-      <fieldset class="site-form-section" data-site-group="access">
-        <legend>访问入口</legend>
-        <div class="form-group">
-          <label for="m-ingress-mode">入口模式</label>
-          <select class="form-select modal-select" id="m-ingress-mode">
-            <option value="port">仅独立端口</option>
-            <option value="host" ${hostOnlyAvailable ? '' : 'disabled'}>仅共享域名${hostOnlyAvailable ? '' : '（当前部署不可用）'}</option>
-            <option value="both">共享域名 + 独立端口（高风险）</option>
-          </select>
-          <div class="form-warning form-warning-info" id="m-ingress-warning" role="status"></div>
-          ${hostOnlyAvailable ? '' : '<div class="form-warning" role="alert">请先设置 PANEL_BIND_ADDR 或 TRUSTED_PROXY_CIDRS 并重启，才能使用共享域名入口。</div>'}
-        </div>
-        <div class="form-group" id="m-port-group">
-          <label for="m-port" id="m-port-label">监听端口</label>
-          <input type="number" class="form-input" id="m-port" value="${isEdit ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric" required>
-        </div>
-        <div class="form-group" id="m-public-host-group">
-          <label for="m-public-host">共享入口域名</label>
-          <input type="text" class="form-input" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}" placeholder="如：emby.example.com" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="253">
-        </div>
-        <details class="site-disclosure" id="m-access-advanced" ${hasUpstreamHeaders || !upstreamHeadersAvailable ? 'open' : ''}>
-          <summary>固定上游请求头</summary>
-          <div class="site-disclosure-body">
-            <div id="m-upstream-headers"></div>
-            <button type="button" class="btn-ghost form-add-action" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
-            <div class="form-help">值不会回显；留空保留已有值。更换主回源时需重新输入。</div>
-            ${upstreamHeadersAvailable ? '' : '<div class="form-warning" role="alert">UPSTREAM_HEADER_KEY 未配置：名称和值不可编辑，但仍可删除旧请求头。</div>'}
-          </div>
-        </details>
-      </fieldset>
-
-      <fieldset class="site-form-section" data-site-group="playback">
-        <legend>播放</legend>
-        <div class="form-group">
-          <div class="form-label">自动播放后端发现</div>
-          ${renderDynamicStatus(dynamicCapabilities)}
-          ${renderDynamicEnableControl(dynamicCapabilities, dynamicPolicy)}
-          <fieldset class="dynamic-policy-fields" id="m-dynamic-policy-fields" ${dynamicPolicyEditable ? '' : 'disabled'}>
-            <legend class="sr-only">自动发现策略</legend>
-            <label for="m-dynamic-profile">安全配置</label>
-            <select class="form-select modal-select" id="m-dynamic-profile">
-              ${renderDynamicProfileOptions(dynamicCapabilities, dynamicPolicy.dynamic_profile)}
-            </select>
-            <div id="m-dynamic-profile-risk">${renderDynamicProfileRisk(dynamicPolicy.dynamic_profile, dynamicCapabilities, dynamicPolicy.dynamic_playback_info_enabled)}</div>
-            <div class="form-toggle-list">
-              <label class="form-check form-check-panel" for="m-dynamic-playback-info">
-                <input type="checkbox" id="m-dynamic-playback-info" ${dynamicPolicy.dynamic_playback_info_enabled ? 'checked' : ''}>
-                <span><strong>解析 PlaybackInfo</strong><small>关闭后，PlaybackInfo 正文不再解析或改写；HTTP 30x 后端发现仍保持启用，动态跟随后的最终响应仍执行 Header 清洗。PlaybackInfo 中的外部 URL 不再封装为受控能力链接，可能直接交给客户端。</small></span>
-              </label>
-            </div>
-            <div class="form-warning form-warning-danger extreme-confirmation" id="m-dynamic-extreme-confirm" hidden>
-              <label class="form-check" for="m-dynamic-extreme-ack">
-                <input type="checkbox" id="m-dynamic-extreme-ack">
-                <span>我理解 Extreme 会扩大公网发现与协议兼容，并可能重放有界请求体。</span>
-              </label>
-              <label class="sr-only" for="m-dynamic-extreme-name">输入站点名称以确认 Extreme</label>
-              <input type="text" class="form-input" id="m-dynamic-extreme-name" placeholder="输入站点名称以确认" maxlength="100" autocomplete="off">
-            </div>
-            ${renderDynamicDomainWarning(dynamicPolicy.dynamic_profile, dynamicPolicy.dynamic_domain_rules)}
-            <details class="site-disclosure" id="m-dynamic-rules-disclosure" ${dynamicPolicy.dynamic_domain_rules.length > 0 || dynamicPolicy.dynamic_profile !== 'safe' ? 'open' : ''}>
-              <summary>域名范围</summary>
-              <div class="site-disclosure-body">
-                <div id="m-dynamic-rules"></div>
-                <button type="button" class="btn-ghost form-add-action" id="m-add-dynamic-rule">+ 添加域名规则</button>
-                <div class="form-help">精确与后缀规则可同时使用；后缀规则包含该域名及其子域名。</div>
-                <details class="site-disclosure nested-disclosure" id="m-dynamic-advanced" ${dynamicDowngradeState.visible ? '' : 'hidden'} ${dynamicDowngradeState.open ? 'open' : ''}>
-                  <summary>高级兼容设置</summary>
-                  <div class="site-disclosure-body">
-                    <label class="form-check" for="m-dynamic-downgrade">
-                      <input type="checkbox" id="m-dynamic-downgrade" ${dynamicDowngradeState.checked ? 'checked' : ''}>
-                      <span>允许动态目标从 HTTPS 降级到 HTTP</span>
-                    </label>
-                    <div class="form-warning">仅在确有 HTTP 播放后端时启用；目标仍须通过服务器安全策略。</div>
-                  </div>
-                </details>
-              </div>
-            </details>
-          </fieldset>
-          ${isEdit ? renderDynamicObservationsPanel(dynamicCapabilities.recognized) : ''}
-        </div>
-
-        <details class="site-disclosure" id="m-playback-advanced" ${hasPlaybackConfiguration ? 'open' : ''}>
-          <summary>手动播放回源与客户端身份</summary>
-          <div class="site-disclosure-body">
-            <div class="form-group">
-              <div class="form-label">播放回源（可选）</div>
-              <div id="m-playback-list"></div>
-              <button type="button" class="btn-ghost form-add-action" id="m-add-playback">+ 添加播放回源</button>
-              <div class="form-help">首个地址用于播放，其余地址仅作为重定向允许列表（最多 ${maxPlaybackAddresses} 个）。</div>
-            </div>
-            <div class="form-group" id="playback-mode-group" hidden>
-              <label for="m-playback-mode">播放模式</label>
-              <select class="form-select modal-select" id="m-playback-mode">
-                <option value="direct" ${(!isEdit || site.playback_mode !== 'redirect') ? 'selected' : ''}>直连分流</option>
-                <option value="redirect" ${isEdit && site.playback_mode === 'redirect' ? 'selected' : ''}>重定向跟随</option>
-              </select>
-              <div class="form-help">重定向跟随仅对非 Upgrade 的 GET/HEAD 生效，处理 301/302/303/307/308，最多 5 跳；每一跳必须精确命中已配置播放回源，跨权威会清除 Cookie、Authorization、Emby Token 和固定上游 Header。POST/PUT/DELETE 与请求正文不会跟随。</div>
-            </div>
-            <div class="form-group">
-              <label for="m-ua">UA 模式</label>
-              <select class="form-select modal-select" id="m-ua">
-                <option value="infuse" ${(!isEdit || site.ua_mode === 'infuse') ? 'selected' : ''}>Infuse</option>
-                <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
-                <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
-                <option value="custom">自定义</option>
-                <option value="passthrough" ${isEdit && site.ua_mode === 'passthrough' ? 'selected' : ''}>透传（保留客户端身份）</option>
-              </select>
-            </div>
-            <div class="form-group form-input-stack" id="m-custom-ua-group" hidden>
-              <div class="form-label">自定义身份</div>
-              <label class="sr-only" for="m-custom-ua">User-Agent</label>
-              <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
-              <label class="sr-only" for="m-custom-client">Emby Client</label>
-              <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false">
-              <label class="sr-only" for="m-custom-version">Emby Version</label>
-              <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false">
-            </div>
-          </div>
-        </details>
-      </fieldset>
-
-      <fieldset class="site-form-section" data-site-group="cache-request-policy">
-        <legend>缓存与请求策略</legend>
-        <div class="form-toggle-list">
-          <label class="form-check form-check-panel" for="m-ping-cache-enabled">
-            <input type="checkbox" id="m-ping-cache-enabled" ${optimizationState.ping_cache_enabled ? 'checked' : ''}>
-            <span><strong>Ping 缓存</strong><small>复用短期连通性结果</small></span>
-          </label>
-          <label class="form-check form-check-panel" for="m-image-cache-enabled">
-            <input type="checkbox" id="m-image-cache-enabled" ${optimizationState.image_cache_enabled ? 'checked' : ''}>
-            <span><strong>图片缓存</strong><small>缓存常用图片响应</small></span>
-          </label>
-          <label class="form-check form-check-panel" for="m-progress-coalescing-enabled">
-            <input type="checkbox" id="m-progress-coalescing-enabled" ${optimizationState.progress_coalescing_enabled ? 'checked' : ''}>
-            <span><strong>播放进度优化</strong><small>密集更新时仅保留最新一条待发往上游的进度；发送 Stopped 前会先向上游发送最终位置。</small></span>
-          </label>
-          <label class="form-check form-check-panel" for="m-request-limits-enabled">
-            <input type="checkbox" id="m-request-limits-enabled" aria-controls="m-request-limit-fields" ${hasRequestLimits ? 'checked' : ''}>
-            <span><strong>流量与速度限制</strong><small>启用后，流量额度或单连接限速至少填写一项大于 0 的值</small></span>
-          </label>
-          <div class="form-input-stack request-limit-fields" id="m-request-limit-fields" ${hasRequestLimits ? '' : 'hidden'}>
-            <div class="form-group">
-              <label for="m-quota">流量额度（GB）</label>
-              <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
-            </div>
-            <div class="form-group">
-              <label for="m-speed">单连接限速（Mbps）</label>
-              <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
-            </div>
-          </div>
-        </div>
-      </fieldset>
-
+    <div class="form-group">
+      <label>站点名称</label>
+      <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
     </div>
+	<div class="form-group">
+	  <label>入口模式</label>
+	  <select class="form-select modal-select" id="m-ingress-mode">
+		${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
+		<option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
+		<option value="path">路径</option>
+		<option value="port">独立端口</option>
+	  </select>
+	  <div class="form-help" id="m-ingress-warning"></div>
+	  ${hostIngressBlockedHint ? `<div class="form-help">${hostIngressBlockedHint}</div>` : ''}
+	</div>
+	<div class="form-group" id="m-port-group">
+	  <label id="m-port-label">监听端口</label>
+	  <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
+	  <div class="form-help" id="m-port-help"></div>
+	</div>
+	<div class="form-group" id="m-public-host-group">
+	  <label>域名前缀</label>
+	  <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
+	  <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
+	  <div class="form-help">访问地址为 https://前缀.${esc(siteCapabilities.route_domain || 'example.com')}:${esc(String((typeof window !== 'undefined' && window.location && window.location.port) || '9090'))}，由面板端口统一转发。</div>
+	</div>
+	<div class="form-group" id="m-path-prefix-group" hidden>
+	  <label>路径前缀</label>
+	  <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+	  <div class="form-help">只填写一段路径，系统会自动补全为 /emby/；不能使用 api、js、css、_meridian 等系统路径。</div>
+	</div>
+	<div class="form-group upstream-lines-card">
+	  <div class="upstream-lines-head">
+	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。备用线路沿用主线路的反代、自动发现和请求策略。</div></div>
+	    <div class="upstream-lines-buttons">
+	      <button type="button" class="btn-ghost upstream-test-all" id="m-test-all-lines">线路测速</button>
+	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
+	    </div>
+	  </div>
+	  <div class="upstream-line-labels" aria-hidden="true"><span>启用</span><span>线路名称</span><span>协议与域名 / 路径</span><span>端口</span><span>延迟</span><span>排序 / 删除</span></div>
+	  <div class="upstream-lines" id="m-upstream-lines">
+	    <div class="upstream-line is-primary" data-line="primary">
+	      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
+	      <input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称">
+	      <input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址">
+	      <input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口">
+	      <span class="upstream-line-latency">--</span>
+	      <div class="upstream-line-actions primary-actions"><span class="upstream-line-primary-note">主线路</span></div>
+	      <input type="hidden" id="m-target">
+	    </div>
+	    <div id="m-failover-lines"></div>
+	  </div>
+	  <div class="form-help">域名栏可包含协议和 Base URL 路径；端口单独填写。443 默认 HTTPS，其他端口默认 HTTP。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
+	</div>
+		<div class="form-group site-form-wide">
+		  <label>主回源固定请求头（可选）</label>
+		  <div id="m-upstream-headers"></div>
+		  <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
+		  <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
+		  ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
+		</div>
+    <details class="site-advanced-card site-form-wide" open>
+      <summary class="site-advanced-summary">
+        <span>高级设置</span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </summary>
+      <div class="site-advanced-body">
+      <div class="site-form-columns">
+    <div class="form-group">
+      <label>UA 模式</label>
+      <select class="form-select modal-select" id="m-ua">
+        <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
+        <option value="infuse" ${isEdit && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
+        <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
+        <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
+        <option value="custom">自定义</option>
+      </select>
+    </div>
+    <div class="form-group" id="m-custom-ua-group" hidden>
+      <label>自定义身份</label>
+      <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
+      <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
+      <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
+      <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
+    </div>
+    <div class="form-group">
+      <label>真实客户端 IP 透传</label>
+      <select class="form-select modal-select" id="m-client-ip-mode">
+        <option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
+        <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
+        <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
+      </select>
+      <div class="form-help">仅控制发送给回源的 X-Real-IP 与 X-Forwarded-For；客户端来源仍按可信代理规则识别，日志中的客户端 IP 不受影响。</div>
+    </div>
+    <div class="form-group">
+      <label>主视频流策略</label>
+      <select class="form-select modal-select" id="m-main-video-mode">
+        <option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option>
+        <option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option>
+      </select>
+      <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
+      <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
+    </div>
+    <div class="form-group">
+      <label for="m-asset-cache">缓存图片与静态资源</label>
+      <select class="form-select modal-select" id="m-asset-cache">
+        <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
+        <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
+      </select>
+      <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
+    </div>
+    <div class="form-group">
+      <label>缓存规则（每行一条，支持 * 通配）</label>
+      <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
+    </div>
+    <div class="form-group cache-limit-group">
+      <div class="cache-limit-grid">
+        <div>
+          <label for="m-cache-ttl">缓存时间（小时）</label>
+          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+        </div>
+        <div>
+          <label for="m-cache-max">容量上限（MB）</label>
+          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
+        </div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>流量额度 (GB, 0=不限)</label>
+      <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
+    </div>
+    <div class="form-group">
+      <label>单连接限速 (Mbps, 0=不限)</label>
+      <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
+      <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
+      </div>
+      </div>
+    </details>
   `;
 
   document.getElementById('modal-footer').innerHTML = `
-    <button type="button" class="btn-modal secondary" id="m-cancel">取消</button>
-    <button type="button" class="btn-modal primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
+    <button class="btn-modal secondary" id="m-cancel">取消</button>
+    <button class="btn-modal primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
   `;
 
 	document.getElementById('m-cancel').addEventListener('click', closeModal);
 
+	const failoverLinesContainer = document.getElementById('m-failover-lines');
+	let failoverLines = isEdit && Array.isArray(site.failover_lines)
+		? site.failover_lines.map(line => ({ name: String(line.name || ''), url: String(line.url || ''), enabled: line.enabled !== false, ...splitTargetAddress(line.url) }))
+		: (isEdit && Array.isArray(site.failover_targets)
+			? site.failover_targets.map((url, index) => ({ name: `线路${index + 2}`, url: String(url || ''), enabled: true, ...splitTargetAddress(url) }))
+			: []);
+
+	function lineActionIcon(kind) {
+		if (kind === 'up') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>';
+		if (kind === 'down') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+		if (kind === 'remove') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg>';
+		return '';
+	}
+
+	function renderFailoverLines() {
+		failoverLinesContainer.innerHTML = failoverLines.map((line, index) => `
+		  <div class="upstream-line" data-line-index="${index}">
+		    <label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '开' : '关'}</span></label>
+		    <input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称">
+		    <input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址">
+		    <input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口">
+		    <span class="upstream-line-latency">--</span>
+		    <div class="upstream-line-actions">
+		      <button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button>
+		      <button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button>
+		      <button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button>
+		    </div>
+		  </div>`).join('');
+
+		failoverLinesContainer.querySelectorAll('.upstream-line').forEach(row => {
+			const index = Number(row.dataset.lineIndex);
+			row.querySelector('.upstream-line-toggle').onchange = event => {
+				failoverLines[index].enabled = event.target.checked;
+				renderFailoverLines();
+			};
+			row.querySelector('.upstream-line-name').oninput = event => { failoverLines[index].name = event.target.value; };
+			row.querySelector('.upstream-line-address').oninput = event => { failoverLines[index].address = event.target.value; };
+			row.querySelector('.upstream-line-port').oninput = event => { failoverLines[index].port = event.target.value; };
+			row.querySelector('.upstream-line-move-up').onclick = () => {
+				[failoverLines[index - 1], failoverLines[index]] = [failoverLines[index], failoverLines[index - 1]];
+				renderFailoverLines();
+			};
+			row.querySelector('.upstream-line-move-down').onclick = () => {
+				[failoverLines[index + 1], failoverLines[index]] = [failoverLines[index], failoverLines[index + 1]];
+				renderFailoverLines();
+			};
+			row.querySelector('.upstream-line-remove').onclick = () => {
+				failoverLines.splice(index, 1);
+				renderFailoverLines();
+			};
+		});
+	}
+
+	async function testUpstreamLine(row, addressInput, portInput) {
+		const latency = row.querySelector('.upstream-line-latency');
+		const targetURL = joinTargetAddress(addressInput.value, portInput.value);
+		if (!targetURL) {
+			latency.textContent = '请填写地址';
+			latency.className = 'upstream-line-latency bad';
+			return;
+		}
+		latency.textContent = '测试中…';
+		latency.className = 'upstream-line-latency';
+		try {
+			const result = await API.testUpstream(targetURL);
+			if (result && result.status === 'online') {
+				latency.textContent = `${Number(result.latency_ms) || 0} ms`;
+				latency.className = `upstream-line-latency ${(Number(result.latency_ms) || 0) < 800 ? 'good' : 'warn'}`;
+			} else {
+				throw new Error((result && result.error) || '线路不可用');
+			}
+		} catch (error) {
+			latency.textContent = '失败';
+			latency.className = 'upstream-line-latency bad';
+			latency.title = error.message || '线路测试失败';
+		}
+	}
+
+	renderFailoverLines();
+	document.getElementById('m-add-failover-line').onclick = () => {
+		if (failoverLines.length >= 7) {
+			Toast.error('最多添加 7 条备用线路');
+			return;
+		}
+		failoverLines.push({ name: `线路${failoverLines.length + 2}`, url: '', address: '', port: '', enabled: true });
+		renderFailoverLines();
+		const inputs = failoverLinesContainer.querySelectorAll('.upstream-line-address');
+		if (inputs.length) inputs[inputs.length - 1].focus();
+	};
+	document.getElementById('m-test-all-lines').onclick = async event => {
+		const button = event.currentTarget;
+		button.disabled = true;
+		button.textContent = '测试中…';
+		const rows = [...document.querySelectorAll('#m-upstream-lines .upstream-line')].filter(row => {
+			if (row.dataset.line === 'primary') return true;
+			const index = Number(row.dataset.lineIndex);
+			return failoverLines[index] && failoverLines[index].enabled;
+		});
+		for (const row of rows) {
+			await testUpstreamLine(row, row.querySelector('.upstream-line-address'), row.querySelector('.upstream-line-port'));
+		}
+		button.disabled = false;
+		button.textContent = '线路测速';
+	};
+
 	const ingressSelect = document.getElementById('m-ingress-mode');
 	const publicHostGroup = document.getElementById('m-public-host-group');
 	const publicHostInput = document.getElementById('m-public-host');
+	const routePrefixInput = document.getElementById('m-route-prefix');
+	const pathPrefixGroup = document.getElementById('m-path-prefix-group');
+	const pathPrefixInput = document.getElementById('m-path-prefix');
+	const portInput = document.getElementById('m-port');
 	const portLabel = document.getElementById('m-port-label');
+	const portHelp = document.getElementById('m-port-help');
 	const ingressWarning = document.getElementById('m-ingress-warning');
 	ingressSelect.value = isEdit ? normalizedIngressMode(site) : defaultIngressMode(siteCapabilities);
 	function updateIngressFields() {
 		const state = ingressFormState(ingressSelect.value);
 		publicHostGroup.hidden = !state.showPublicHost;
 		publicHostInput.required = state.requirePublicHost;
+		routePrefixInput.required = state.requirePublicHost && domainPrefixAvailable;
+		routePrefixInput.disabled = !state.showPublicHost;
+		pathPrefixGroup.hidden = !state.showPathPrefix;
+		pathPrefixInput.required = state.requirePathPrefix;
+		pathPrefixInput.disabled = !state.showPathPrefix;
+		portInput.required = state.requireListenPort;
+		document.getElementById('m-port-group').hidden = !state.requireListenPort;
 		portLabel.textContent = state.portLabel;
+		portHelp.textContent = state.requireListenPort
+			? '独立端口模式需要填写未被占用的监听端口。'
+			: '共享入口不会另外开放站点端口。';
 		ingressWarning.textContent = state.warning;
 	}
 	updateIngressFields();
 	ingressSelect.addEventListener('change', updateIngressFields);
 
 	const uaSelect = document.getElementById('m-ua');
+  const clientIPModeSelect = document.getElementById('m-client-ip-mode');
+  const mainVideoModeSelect = document.getElementById('m-main-video-mode');
   const customUAGroup = document.getElementById('m-custom-ua-group');
   const customUAInputs = [
     document.getElementById('m-custom-ua'),
     document.getElementById('m-custom-client'),
     document.getElementById('m-custom-version'),
   ];
-  const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'infuse', site);
-  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'infuse';
+  const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'passthrough', site);
+  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'passthrough';
+  clientIPModeSelect.value = isEdit && ['both', 'real_ip', 'none'].includes(site.client_ip_mode) ? site.client_ip_mode : 'both';
+  mainVideoModeSelect.value = isEdit && site.main_video_stream_mode === 'direct' ? 'direct' : 'proxy';
   customUAInputs[0].value = initialUAState.customUserAgent;
   customUAInputs[1].value = initialUAState.customClient;
   customUAInputs[2].value = initialUAState.customVersion;
@@ -1270,255 +1604,10 @@ async function showSiteModal(site) {
   toggleCustomUAFields();
   uaSelect.addEventListener('change', toggleCustomUAFields);
 
-	const requestLimitsEnabledInput = document.getElementById('m-request-limits-enabled');
-	const requestLimitFields = document.getElementById('m-request-limit-fields');
-	const requestLimitInputs = [
-		document.getElementById('m-quota'),
-		document.getElementById('m-speed'),
-	];
-	function toggleRequestLimitFields() {
-		const enabled = requestLimitsEnabledInput.checked;
-		requestLimitFields.hidden = !enabled;
-		requestLimitInputs.forEach(input => {
-			input.disabled = !enabled;
-		});
-	}
-	toggleRequestLimitFields();
-	requestLimitsEnabledInput.addEventListener('change', toggleRequestLimitFields);
-
-	const dynamicEnabledInput = document.getElementById('m-dynamic-enabled');
-	const dynamicProfileSelect = document.getElementById('m-dynamic-profile');
-	dynamicProfileSelect.value = dynamicPolicy.dynamic_profile;
-	const dynamicPlaybackInfoInput = document.getElementById('m-dynamic-playback-info');
-	const dynamicDowngradeInput = document.getElementById('m-dynamic-downgrade');
-	const dynamicAdvancedDisclosure = document.getElementById('m-dynamic-advanced');
-	const dynamicRulesDisclosure = document.getElementById('m-dynamic-rules-disclosure');
-	const dynamicRulesContainer = document.getElementById('m-dynamic-rules');
-	const dynamicDomainWarningElement = document.getElementById('m-dynamic-domain-warning');
-	const dynamicProfileRiskContainer = document.getElementById('m-dynamic-profile-risk');
-	const dynamicExtremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
-	const dynamicExtremeAcknowledged = document.getElementById('m-dynamic-extreme-ack');
-	const dynamicExtremeTypedName = document.getElementById('m-dynamic-extreme-name');
-	let dynamicRules = dynamicPolicy.dynamic_domain_rules.map(rule => ({ ...rule }));
-	let safeRuleExpansionConfirmed = false;
-
-	function updateDynamicDomainWarning() {
-		const warning = dynamicDomainRuleWarning(dynamicProfileSelect.value, dynamicRules);
-		dynamicDomainWarningElement.hidden = !warning.message;
-		dynamicDomainWarningElement.className = `form-warning${warning.tone ? ` form-warning-${warning.tone}` : ''}`;
-		dynamicDomainWarningElement.textContent = warning.message;
-	}
-
-	function updateDynamicProfileState() {
-		dynamicProfileRiskContainer.innerHTML = renderDynamicProfileRisk(dynamicProfileSelect.value, dynamicCapabilities, dynamicPlaybackInfoInput.checked);
-		const requirement = dynamicProfileConfirmationRequirement(dynamicPolicy, {
-			dynamic_discovery_enabled: dynamicEnabledInput.checked,
-			dynamic_profile: dynamicProfileSelect.value,
-		});
-		dynamicExtremeConfirmation.hidden = requirement !== 'extreme';
-		if (dynamicExtremeConfirmation.hidden) {
-			dynamicExtremeAcknowledged.checked = false;
-			dynamicExtremeTypedName.value = '';
-		}
-		const downgradeState = dynamicDowngradeFormState(dynamicProfileSelect.value, dynamicDowngradeInput.checked);
-		dynamicAdvancedDisclosure.hidden = !downgradeState.visible;
-		if (!downgradeState.visible) dynamicDowngradeInput.checked = false;
-		if (downgradeState.visible) dynamicRulesDisclosure.open = true;
-		updateDynamicDomainWarning();
-	}
-	dynamicProfileSelect.addEventListener('change', () => {
-		dynamicExtremeAcknowledged.checked = false;
-		dynamicExtremeTypedName.value = '';
-		safeRuleExpansionConfirmed = false;
-		updateDynamicProfileState();
-	});
-	dynamicEnabledInput.addEventListener('change', updateDynamicProfileState);
-	dynamicPlaybackInfoInput.addEventListener('change', updateDynamicProfileState);
-	updateDynamicProfileState();
-
-	function renderDynamicRules() {
-		dynamicRulesContainer.innerHTML = renderDynamicRuleRows(dynamicRules);
-		dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-type').forEach(input => {
-			input.onchange = () => {
-				dynamicRules[Number(input.dataset.idx)].type = input.value;
-				safeRuleExpansionConfirmed = false;
-				updateDynamicDomainWarning();
-			};
-		});
-		dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-value').forEach(input => {
-			input.oninput = () => {
-				dynamicRules[Number(input.dataset.idx)].value = input.value;
-				safeRuleExpansionConfirmed = false;
-				updateDynamicDomainWarning();
-			};
-		});
-		dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-remove').forEach(button => {
-			button.onclick = () => {
-				const index = Number(button.dataset.idx);
-				const nextRules = dynamicRules.filter((_, ruleIndex) => ruleIndex !== index);
-				if (safeRulesBecomeUnrestricted(dynamicEnabledInput.checked, dynamicProfileSelect.value, dynamicRules, nextRules)) {
-					const accepted = window.confirm('删除最后一条 Safe 域名限制后，将允许任意公网 DNS 主机名的 HTTPS:443。确定删除吗？');
-					if (!accepted) return;
-					safeRuleExpansionConfirmed = true;
-				}
-				dynamicRules = nextRules;
-				renderDynamicRules();
-				updateDynamicDomainWarning();
-			};
-		});
-	}
-	renderDynamicRules();
-
-	document.getElementById('m-add-dynamic-rule').onclick = () => {
-		dynamicRules.push({ type: 'exact', value: '' });
-		safeRuleExpansionConfirmed = false;
-		renderDynamicRules();
-		updateDynamicDomainWarning();
-		const inputs = dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-value');
-		if (inputs.length) inputs[inputs.length - 1].focus();
-	};
-
-	const dynamicObservationsContainer = isEdit ? document.getElementById('m-dynamic-observations') : null;
-	const refreshDynamicObservationsButton = isEdit ? document.getElementById('m-refresh-dynamic-observations') : null;
-	const clearDynamicObservationsButton = isEdit ? document.getElementById('m-clear-dynamic-observations') : null;
-	let dynamicObservationRequest = 0;
-	let dynamicObservationResponse = normalizeDynamicObservationsResponse(null);
-	let dynamicObservationFilters = normalizeDynamicObservationFilters(null);
-
-	function dynamicObservationsPanelIsCurrent() {
-		return dynamicObservationsContainer && document.getElementById('m-dynamic-observations') === dynamicObservationsContainer;
-	}
-
-	function setDynamicObservationButtonsDisabled(disabled) {
-		if (refreshDynamicObservationsButton) refreshDynamicObservationsButton.disabled = disabled;
-		if (clearDynamicObservationsButton) clearDynamicObservationsButton.disabled = disabled;
-	}
-
-	function paintDynamicObservations() {
-		if (!dynamicObservationsPanelIsCurrent()) return;
-		dynamicObservationsContainer.innerHTML = renderNormalizedDynamicObservations(dynamicObservationResponse, dynamicObservationFilters);
-		for (const [id, field] of [
-			['m-dynamic-observation-decision-filter', 'decision'],
-			['m-dynamic-observation-source-filter', 'source'],
-			['m-dynamic-observation-target-kind-filter', 'targetKind'],
-		]) {
-			const control = document.getElementById(id);
-			if (!control) continue;
-			control.value = dynamicObservationFilters[field];
-			control.onchange = () => {
-				dynamicObservationFilters = normalizeDynamicObservationFilters({
-					...dynamicObservationFilters,
-					[field]: control.value,
-				});
-				paintDynamicObservations();
-			};
-		}
-	}
-
-	function displayDynamicObservations(response) {
-		// Retain only the strict aggregate contract; never keep arbitrary API
-		// fields in client-side filter state.
-		dynamicObservationResponse = normalizeDynamicObservationsResponse(response);
-		paintDynamicObservations();
-	}
-
-	async function refreshDynamicObservations() {
-		if (!isEdit || !dynamicCapabilities.recognized || !dynamicObservationsContainer) return;
-		const request = ++dynamicObservationRequest;
-		setDynamicObservationButtonsDisabled(true);
-		dynamicObservationsContainer.innerHTML = '<div class="form-help">正在读取观察记录…</div>';
-		try {
-			const response = await API.getDynamicObservations(site.id);
-			if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-			displayDynamicObservations(response);
-		} catch (_) {
-			if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-			dynamicObservationsContainer.innerHTML = '<div class="form-help dynamic-observation-error">无法读取观察记录；未显示任何后端返回值。</div>';
-		} finally {
-			if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) setDynamicObservationButtonsDisabled(false);
-		}
-	}
-
-	if (isEdit && dynamicCapabilities.recognized) {
-		refreshDynamicObservationsButton.onclick = refreshDynamicObservations;
-		clearDynamicObservationsButton.onclick = async () => {
-			if (!window.confirm('确定清空本站点的全部播放路由观察记录吗？此操作不可撤销。')) return;
-			const request = ++dynamicObservationRequest;
-			setDynamicObservationButtonsDisabled(true);
-			try {
-				const response = await API.deleteDynamicObservations(site.id);
-				if (request !== dynamicObservationRequest || !dynamicObservationsPanelIsCurrent()) return;
-				displayDynamicObservations(response);
-				Toast.success('播放路由观察记录已清空');
-			} catch (_) {
-				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) Toast.error('无法清空播放路由观察记录');
-			} finally {
-				if (request === dynamicObservationRequest && dynamicObservationsPanelIsCurrent()) setDynamicObservationButtonsDisabled(false);
-			}
-		};
-	}
-
-  // Build initial playback list from existing data
-  const listContainer = document.getElementById('m-playback-list');
-  const modeGroup = document.getElementById('playback-mode-group');
-  const addPlaybackButton = document.getElementById('m-add-playback');
-  let existingHosts = [];
-  if (isEdit) {
-    if ((site.playback_target_url || '').trim()) existingHosts.push(site.playback_target_url.trim());
-    for (const host of normalizeStreamHosts(site.stream_hosts)) existingHosts.push(host);
-  }
-  if (existingHosts.length === 0) existingHosts = [''];
-
-  function updatePlaybackAddState() {
-    const canAdd = canAddPlaybackAddress(existingHosts.length, maxPlaybackAddresses);
-    addPlaybackButton.disabled = !canAdd;
-    addPlaybackButton.title = canAdd ? '' : `每个站点最多配置 ${maxPlaybackAddresses} 个播放回源`;
-  }
-
-  function renderPlaybackInputs() {
-    listContainer.innerHTML = existingHosts.map((val, idx) => `
-      <fieldset class="form-list-row playback-address-row">
-        <legend class="sr-only">播放回源 ${idx + 1}</legend>
-        <label class="sr-only" for="m-playback-address-${idx}">${idx === 0 ? '主播放回源地址' : `额外播放回源地址 ${idx}`}</label>
-        <input type="text" class="form-input m-pb-input" id="m-playback-address-${idx}" value="${esc(val)}" placeholder="${idx === 0 ? '主播放回源地址' : '额外播放回源地址'}" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048">
-        ${existingHosts.length > 1 ? `<button type="button" class="btn-ghost danger form-row-action m-pb-remove" data-idx="${idx}" aria-label="删除播放回源 ${idx + 1}">删除</button>` : ''}
-      </fieldset>
-    `).join('');
-    listContainer.querySelectorAll('.m-pb-remove').forEach(btn => {
-      btn.onclick = () => {
-        existingHosts.splice(parseInt(btn.dataset.idx), 1);
-        renderPlaybackInputs();
-        toggleModeGroup();
-      };
-    });
-    listContainer.querySelectorAll('.m-pb-input').forEach((inp, idx) => {
-      inp.oninput = () => { existingHosts[idx] = inp.value; toggleModeGroup(); };
-    });
-    updatePlaybackAddState();
-  }
-  renderPlaybackInputs();
-
-  addPlaybackButton.onclick = () => {
-    if (!canAddPlaybackAddress(existingHosts.length, maxPlaybackAddresses)) {
-      Toast.error(`每个站点最多配置 ${maxPlaybackAddresses} 个播放回源`);
-      return;
-    }
-    existingHosts.push('');
-    renderPlaybackInputs();
-    const inputs = listContainer.querySelectorAll('.m-pb-input');
-    if (inputs.length) inputs[inputs.length - 1].focus();
-  };
-
-  function toggleModeGroup() {
-    const hasAny = existingHosts.some(h => h.trim());
-    modeGroup.hidden = !hasAny;
-  }
-  toggleModeGroup();
-
   const upstreamHeadersContainer = document.getElementById('m-upstream-headers');
-  let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers)
+  let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers) && site.upstream_headers.length
     ? site.upstream_headers.map(header => ({ name: header.name || '', value: '', configured: !!header.configured }))
-    : [];
+    : [{ name: '', value: '', configured: false }];
 
   function renderUpstreamHeaders() {
     upstreamHeadersContainer.innerHTML = renderUpstreamHeaderRows(upstreamHeaders, upstreamHeadersAvailable);
@@ -1554,11 +1643,6 @@ async function showSiteModal(site) {
   };
 
   document.getElementById('m-submit').onclick = async () => {
-    const allHosts = existingHosts.map(h => h.trim()).filter(Boolean);
-    if (allHosts.length > maxPlaybackAddresses) {
-      Toast.error(`每个站点最多配置 ${maxPlaybackAddresses} 个播放回源`);
-      return;
-    }
     const uaMode = uaSelect.value;
     const customUAPayload = buildCustomUAPayload(
       uaMode,
@@ -1570,70 +1654,56 @@ async function showSiteModal(site) {
 		  ingressSelect.value,
 		  document.getElementById('m-port').value,
 		  publicHostInput.value,
+		  routePrefixInput.value,
+		  siteCapabilities.route_domain,
+		  pathPrefixInput.value,
 		);
+		const primaryTargetURL = joinTargetAddress(
+			document.getElementById('m-target-address').value,
+			document.getElementById('m-target-port').value,
+		);
+		document.getElementById('m-target').value = primaryTargetURL;
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
-	      target_url: document.getElementById('m-target').value.trim(),
-      playback_target_url: allHosts.length > 0 ? allHosts[0] : '',
-      playback_mode: document.getElementById('m-playback-mode').value,
-		stream_hosts: allHosts.length > 1 ? allHosts.slice(1) : [],
+	      target_url: primaryTargetURL,
+	      primary_line_name: document.getElementById('m-primary-line-name').value.trim() || '主线路',
+	      failover_lines: failoverLines.map((line, index) => ({
+	        name: String(line.name || '').trim() || `线路${index + 2}`,
+	        url: joinTargetAddress(line.address, line.port),
+	        enabled: line.enabled !== false,
+	      })),
+	      failover_targets: failoverLines.filter(line => line.enabled !== false).map(line => joinTargetAddress(line.address, line.port)).filter(Boolean),
+      playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
+      playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
+		main_video_stream_mode: mainVideoModeSelect.value,
+		stream_hosts: isEdit ? normalizeStreamHosts(site.stream_hosts) : [],
 			...ingressPayload,
 		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),
       ua_mode: uaMode,
+      client_ip_mode: clientIPModeSelect.value,
       ...customUAPayload,
-      ...buildDynamicPolicyPayload({
-        dynamic_discovery_enabled: dynamicEnabledInput.checked,
-        dynamic_profile: dynamicProfileSelect.value,
-        dynamic_playback_info_enabled: dynamicPlaybackInfoInput.checked,
-        dynamic_domain_rules: dynamicRules,
-        dynamic_allow_https_downgrade: dynamicDowngradeInput.checked,
-      }, dynamicCapabilities, !isEdit),
-      ...buildProxyOptimizationPayload(
-        document.getElementById('m-ping-cache-enabled').checked,
-        document.getElementById('m-image-cache-enabled').checked,
-        document.getElementById('m-progress-coalescing-enabled').checked,
-      ),
-      ...buildRequestLimitPayload(
-        requestLimitsEnabledInput.checked,
-        document.getElementById('m-quota').value,
-        document.getElementById('m-speed').value,
-      ),
+		dynamic_discovery_enabled: true,
+		dynamic_profile: 'compatible',
+		dynamic_discovery_sources: [...DEFAULT_DYNAMIC_SOURCE_IDS, ...ADVANCED_DYNAMIC_SOURCE_IDS],
+		dynamic_domain_rules: [],
+		dynamic_allow_https_downgrade: true,
+      asset_cache_enabled: document.getElementById('m-asset-cache').value === 'on',
+      asset_cache_ttl_sec: parseInt(document.getElementById('m-cache-ttl').value || 24) * 3600,
+      asset_cache_max_bytes: parseInt(document.getElementById('m-cache-max').value || 512) * 1048576,
+      asset_cache_rules: document.getElementById('m-cache-rules').value.trim(),
+      traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
+      speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
 
-		if (!data.name || !data.target_url || !data.listen_port || ((data.ingress_mode === 'host' || data.ingress_mode === 'both') && !data.public_host)) {
+		const listenPortRequired = ingressFormState(data.ingress_mode).requireListenPort;
+		if (data.ingress_mode === 'unset') {
+		  Toast.error('请选择当前服务器可用的入口模式');
+		  return;
+		}
+		if (!data.name || !data.target_url || (listenPortRequired && !data.listen_port) || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host) || (data.ingress_mode === 'path' && !data.path_prefix)) {
 	      Toast.error('请填写所有必填项');
 	      return;
 	    }
-	  if (requestLimitsEnabledInput.checked && !(data.traffic_quota > 0 || data.speed_limit > 0)) {
-		Toast.error('启用“流量与速度限制”后，流量额度或单连接限速至少一项必须大于 0');
-		return;
-	  }
-	  const domainRuleState = dynamicDomainRuleWarning(data.dynamic_profile, data.dynamic_domain_rules);
-	  if (domainRuleState.tone === 'warning') {
-		Toast.error(domainRuleState.message);
-		return;
-	  }
-	  if (!safeRuleExpansionConfirmed && safeRulesBecomeUnrestricted(
-		data.dynamic_discovery_enabled,
-		data.dynamic_profile,
-		dynamicPolicy.dynamic_domain_rules,
-		data.dynamic_domain_rules,
-	  )) {
-		const accepted = window.confirm('保存后 Safe 将允许任意公网 DNS 主机名的 HTTPS:443。确定继续吗？');
-		if (!accepted) return;
-		safeRuleExpansionConfirmed = true;
-	  }
-	  const profileConfirmation = confirmDynamicProfileChange(
-		dynamicPolicy,
-		data,
-		data.name,
-		dynamicExtremeAcknowledged.checked,
-		dynamicExtremeTypedName.value,
-	  );
-	  if (!profileConfirmation.ok) {
-		if (profileConfirmation.error) Toast.error(profileConfirmation.error);
-		return;
-	  }
 	  if (uaMode === 'custom' && (!data.custom_user_agent || !data.custom_client || !data.custom_version)) {
       Toast.error('请完整填写自定义 User-Agent、Client 和 Version');
 		return;
@@ -1646,6 +1716,14 @@ async function showSiteModal(site) {
 	  });
 		if (invalidHeader) {
 			Toast.error('请完整填写新增请求头的名称和值；已有值可留空保持不变');
+			return;
+		}
+		if (!document.getElementById('m-target-port').value || data.failover_lines.some((line, index) => !line.url || !String(failoverLines[index].port || '').trim())) {
+			Toast.error('请完整填写每条线路的域名和端口，或删除空线路');
+			return;
+		}
+		if (data.failover_targets.length > 0 && upstreamHeaders.some(header => String(header.name || '').trim())) {
+			Toast.error('备用线路不能与主回源固定请求头同时使用');
 			return;
 		}
 		if (isEdit && normalizedTargetAuthority(site.target_url) !== normalizedTargetAuthority(data.target_url)) {
@@ -1671,9 +1749,7 @@ async function showSiteModal(site) {
     }
   };
 
-  openModal({ closeOnBackdrop: false });
-  setupSiteModalFocus();
-	if (isEdit && dynamicCapabilities.recognized) refreshDynamicObservations();
+  openModal({ closeOnBackdrop: false, modalClass: 'site-config-modal' });
 }
 
 // Global actions

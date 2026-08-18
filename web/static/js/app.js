@@ -3,37 +3,85 @@
 
   const loginEl = document.getElementById('page-login');
   const shellEl = document.getElementById('app-shell');
-  const loginFormEl = document.getElementById('loginForm');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
-  const usernameInputEl = document.getElementById('inp-username');
-  const usernameHelpEl = document.getElementById('admin-username-help');
-  const passwordInputEl = document.getElementById('inp-password');
-  const passwordHelpEl = document.getElementById('admin-password-help');
-  const confirmPasswordGroupEl = document.getElementById('confirm-password-group');
-  const confirmPasswordInputEl = document.getElementById('inp-confirm-password');
   const setupTokenGroupEl = document.getElementById('setup-token-group');
   const setupTokenInputEl = document.getElementById('inp-setup-token');
-  const setupTokenToggleEl = document.getElementById('btn-toggle-setup-token');
-  const authCheckStatusEl = document.getElementById('auth-check-status');
-  const authCheckMessageEl = document.getElementById('auth-check-message');
-  const authRetryButtonEl = document.getElementById('btn-auth-retry');
+  const sidebarToggleEl = document.getElementById('sidebar-toggle');
+  const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
+  const sidebarStorageKey = 'meridian-sidebar-expanded';
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
   let modalPreviousFocus = null;
-  let authMode = 'checking';
-  let authSubmissionInFlight = false;
   let authStatus = {
     needs_setup: false,
     mode: 'single_admin',
     jwt_secret_ephemeral: false,
+    setup_token_required: false,
   };
+
+  function storedSidebarExpanded() {
+    try {
+      if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) return false;
+      return !!(window.localStorage && window.localStorage.getItem(sidebarStorageKey) === 'true');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function setSidebarExpanded(expanded, persist) {
+    expanded = !!expanded;
+    shellEl.classList.toggle('sidebar-expanded', expanded);
+    if (sidebarToggleEl) {
+      const label = expanded ? '折叠导航栏' : '展开导航栏';
+      sidebarToggleEl.setAttribute('aria-expanded', String(expanded));
+      sidebarToggleEl.setAttribute('aria-label', label);
+      sidebarToggleEl.title = label;
+    }
+    if (persist) {
+      try {
+        if (window.localStorage) window.localStorage.setItem(sidebarStorageKey, String(expanded));
+      } catch (_) {}
+    }
+  }
+
+  setSidebarExpanded(storedSidebarExpanded(), false);
+  if (sidebarToggleEl) {
+    sidebarToggleEl.addEventListener('click', function() {
+      setSidebarExpanded(!shellEl.classList.contains('sidebar-expanded'), true);
+    });
+  }
+  if (sidebarDrawerCloseEl) sidebarDrawerCloseEl.addEventListener('click', () => setSidebarExpanded(false, true));
+
+  const dismissMobileDrawer = () => {
+    if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches && shellEl.classList.contains('sidebar-expanded')) {
+      setSidebarExpanded(false, true);
+    }
+  };
+  if (typeof document.querySelector === 'function') {
+    document.querySelector('.main')?.addEventListener('click', dismissMobileDrawer);
+    document.querySelector('.app-header')?.addEventListener('click', event => {
+      if (!event.target.closest('#sidebar-toggle')) dismissMobileDrawer();
+    });
+  }
+
+  document.querySelectorAll('.sidebar a[href^="#"]').forEach(link => {
+    link.addEventListener('click', function() {
+      if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
+        setSidebarExpanded(false, true);
+      }
+    });
+  });
 
   window.openModal = function(options) {
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
     modalPreviousFocus = document.activeElement;
     const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    modal.className = 'modal';
+    if (options && options.modalClass) modal.classList.add(options.modalClass);
+    overlay.scrollTop = 0;
     document.getElementById('modal-body').scrollTop = 0;
     overlay.classList.add('active');
     overlay.setAttribute('aria-hidden', 'false');
@@ -60,53 +108,10 @@
     if (e.key === 'Escape' && document.getElementById('modal-overlay').classList.contains('active')) closeModal();
   });
 
-  function setSetupTokenVisible(visible) {
-    setupTokenInputEl.type = visible ? 'text' : 'password';
-    setupTokenToggleEl.textContent = visible ? '隐藏' : '显示';
-    setupTokenToggleEl.setAttribute('aria-pressed', visible ? 'true' : 'false');
-    setupTokenToggleEl.setAttribute('aria-label', visible ? '隐藏初始化令牌' : '显示初始化令牌');
-  }
-
-  function setAuthChecking() {
-    authMode = 'checking';
-    loginFormEl.setAttribute('aria-busy', 'true');
-    loginButtonEl.disabled = true;
-    loginButtonEl.textContent = '正在检查...';
-    authCheckStatusEl.hidden = false;
-    authCheckStatusEl.classList.remove('error');
-    authCheckStatusEl.setAttribute('role', 'status');
-    authCheckMessageEl.textContent = '正在检查初始化状态...';
-    authRetryButtonEl.hidden = true;
-    authRetryButtonEl.disabled = true;
-    loginFooterEl.hidden = true;
-  }
-
-  function showAuthCheckError() {
-    authMode = 'error';
-    loginFormEl.setAttribute('aria-busy', 'false');
-    loginButtonEl.disabled = true;
-    loginButtonEl.textContent = '状态检查失败';
-    authCheckStatusEl.hidden = false;
-    authCheckStatusEl.classList.add('error');
-    authCheckStatusEl.setAttribute('role', 'alert');
-    authCheckMessageEl.textContent = '初始化状态检查失败，无法确定应登录还是创建管理员。请确认服务可用后重试。';
-    authRetryButtonEl.hidden = false;
-    authRetryButtonEl.disabled = false;
-    loginFooterEl.hidden = true;
-  }
-
   async function checkAuth() {
-    setAuthChecking();
     try {
       const res = await API.checkSetup();
-      if (!res || typeof res.needs_setup !== 'boolean') {
-        throw new Error('invalid auth check response');
-      }
-      authStatus = {
-        needs_setup: res.needs_setup,
-        mode: typeof res.mode === 'string' ? res.mode : 'single_admin',
-        jwt_secret_ephemeral: !!res.jwt_secret_ephemeral,
-      };
+      authStatus = Object.assign({}, authStatus, res || {});
       if (res.needs_setup) {
         showSetupMode();
         return;
@@ -116,16 +121,24 @@
         enterApp();
         return;
       }
-      showLoginMode();
     } catch (e) {
-      showAuthCheckError();
+      // Server not available, just show login
     }
+
+    showLoginMode();
   }
 
   function renderLoginFooter(isSetup) {
-    const lines = [isSetup
-      ? '当前为单管理员模式，请创建唯一的管理员账号。'
-      : '当前为单管理员模式。'];
+    const lines = [];
+    if (authStatus.mode === 'single_admin') {
+      lines.push(isSetup
+        ? '当前为单管理员模式，请创建唯一的管理员账号。'
+        : '当前为单管理员模式。');
+    } else {
+      lines.push(isSetup
+        ? '首次使用，请创建管理员账号。'
+        : '请输入管理员账户信息登录。');
+    }
 
     if (authStatus.jwt_secret_ephemeral) {
       lines.push('<span class="login-note warn">当前未固定 JWT_SECRET，服务重启后需要重新登录。</span>');
@@ -135,56 +148,24 @@
   }
 
   function showSetupMode() {
-    authMode = 'setup';
-    loginFormEl.setAttribute('aria-busy', 'false');
-    authCheckStatusEl.hidden = true;
-    loginButtonEl.textContent = '创建管理员';
+    loginButtonEl.textContent = '注册';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(true);
-    loginFooterEl.hidden = false;
-    usernameHelpEl.hidden = false;
-    usernameInputEl.setAttribute('aria-describedby', 'admin-username-help');
-    passwordHelpEl.hidden = false;
-    passwordInputEl.autocomplete = 'new-password';
-    passwordInputEl.setAttribute('aria-describedby', 'admin-password-help');
-    confirmPasswordGroupEl.hidden = false;
-    confirmPasswordInputEl.required = true;
-    setupTokenGroupEl.hidden = false;
-    setupTokenInputEl.required = true;
-    setSetupTokenVisible(false);
+    loginEl._isSetup = true;
+    setupTokenGroupEl.hidden = !authStatus.setup_token_required;
+    setupTokenInputEl.required = !!authStatus.setup_token_required;
+    document.body.classList.remove('auth-checking');
   }
 
   function showLoginMode() {
-    authMode = 'login';
-    loginFormEl.setAttribute('aria-busy', 'false');
-    authCheckStatusEl.hidden = true;
     loginButtonEl.textContent = '登录';
     loginButtonEl.disabled = false;
     loginFooterEl.innerHTML = renderLoginFooter(false);
-    loginFooterEl.hidden = false;
-    usernameHelpEl.hidden = true;
-    usernameInputEl.removeAttribute('aria-describedby');
-    passwordHelpEl.hidden = true;
-    passwordInputEl.autocomplete = 'current-password';
-    passwordInputEl.removeAttribute('aria-describedby');
-    confirmPasswordGroupEl.hidden = true;
-    confirmPasswordInputEl.required = false;
-    confirmPasswordInputEl.value = '';
+    loginEl._isSetup = false;
     setupTokenGroupEl.hidden = true;
     setupTokenInputEl.required = false;
-    setupTokenInputEl.value = '';
-    setSetupTokenVisible(false);
+    document.body.classList.remove('auth-checking');
   }
-
-  function setupUsernameValidationError(username) {
-    const length = utf8ByteLength(username);
-    return length < 1 || length > 64 ? '管理员用户名必须为 1-64 个 UTF-8 字节' : '';
-  }
-
-  authRetryButtonEl.addEventListener('click', checkAuth);
-  setupTokenToggleEl.addEventListener('click', function() {
-    setSetupTokenVisible(setupTokenInputEl.type === 'password');
-  });
 
   function startDashboardRefresh() {
     if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
@@ -202,56 +183,49 @@
   function teardownAppRuntime() {
     stopDashboardRefresh();
     if (typeof stopDashSSE === 'function') stopDashSSE();
+    // Keep cleanup compatible with cached clients that still have the retired
+    // traffic page script loaded; the page is no longer registered or linked.
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
   }
 
-  loginFormEl.addEventListener('submit', async function(e) {
-    e.preventDefault();
-    if (authSubmissionInFlight) return;
-    if (authMode !== 'setup' && authMode !== 'login') {
-      Toast.error('初始化状态尚未确认，请先重试');
-      return;
+  function loginErrorMessage(error) {
+    const message = String(error && error.message || '登录失败');
+    if (message.includes('too many login attempts') || message.includes('登录尝试次数过多')) {
+      return '登录尝试次数过多，请稍后重试';
     }
-    const submittingSetup = authMode === 'setup';
+    if (message === 'invalid username or password' || message === '用户名或密码错误') {
+      return '用户名或密码错误';
+    }
+    return message;
+  }
 
-    const username = usernameInputEl.value.trim();
-    const password = passwordInputEl.value;
-    const confirmPassword = confirmPasswordInputEl.value;
+  document.getElementById('loginForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const username = document.getElementById('inp-username').value.trim();
+    const password = document.getElementById('inp-password').value;
     const setupToken = setupTokenInputEl.value.trim();
 
-    if (!submittingSetup) {
-      if (!username || !password) {
-        Toast.error('请填写用户名和密码');
-        return;
-      }
-    } else {
-      const usernameError = setupUsernameValidationError(username);
-      if (usernameError) {
-        Toast.error(usernameError);
-        return;
-      }
-      const passwordError = adminPasswordValidationError(password);
-      if (passwordError) {
-        Toast.error(passwordError);
-        return;
-      }
-      if (password !== confirmPassword) {
-        Toast.error('两次输入的密码不一致');
-        return;
-      }
-      if (!setupToken) {
-        Toast.error('请填写初始化令牌');
-        return;
-      }
+    if (!username || !password) {
+      Toast.error('请填写用户名和密码');
+      return;
     }
 
-    authSubmissionInFlight = true;
+    if (loginEl._isSetup && password.length < 12) {
+      Toast.error('管理员密码至少需要 12 位');
+      return;
+    }
+
+    if (loginEl._isSetup && authStatus.setup_token_required && !setupToken) {
+      Toast.error('请填写安装时显示或部署环境中设置的初始化令牌');
+      return;
+    }
+
     loginButtonEl.disabled = true;
     loginButtonEl.textContent = '处理中...';
 
     try {
       let res;
-      if (submittingSetup) {
+      if (loginEl._isSetup) {
         res = await API.setup(username, password, setupToken);
         Toast.success('管理员创建成功');
       } else {
@@ -259,36 +233,41 @@
         Toast.success('欢迎回来, ' + res.username + '!');
       }
       API.setSession(res);
-      passwordInputEl.value = '';
-      confirmPasswordInputEl.value = '';
+      document.getElementById('inp-password').value = '';
       setupTokenInputEl.value = '';
-      setSetupTokenVisible(false);
       enterApp();
     } catch (err) {
-      Toast.error(err.message);
-      if (submittingSetup) {
-        await checkAuth();
-      } else {
-        loginButtonEl.disabled = false;
-        loginButtonEl.textContent = '登录';
-      }
-    } finally {
-      authSubmissionInFlight = false;
+      Toast.error(loginErrorMessage(err));
+      loginButtonEl.disabled = false;
+      loginButtonEl.textContent = loginEl._isSetup ? '注册' : '登录';
     }
   });
-
 
   function enterApp() {
     loginEl.classList.add('hidden');
     shellEl.classList.add('active');
 
-    const avatar = document.getElementById('avatar-btn');
-    avatar.textContent = (API.username || 'A')[0].toUpperCase();
+    const avatar = document.getElementById('avatar-initial');
+    if (avatar) avatar.textContent = (API.username || 'A')[0].toUpperCase();
+    const username = document.getElementById('sidebar-username');
+    if (username) username.textContent = API.username || '管理员';
+    API.ingressCapabilities().then(capabilities => {
+      if (!capabilities || !capabilities.app_version) return;
+      ['sidebar-version'].forEach(id => {
+        const version = document.getElementById(id);
+        if (version) version.textContent = capabilities.app_version;
+      });
+    }).catch(() => {});
 
     if (!appBootstrapped) {
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
-      Router.register('traffic', renderTraffic);
+      Router.register('request-logs', renderRequestLogs);
+      Router.register('telegram-report', renderTelegramReport);
+      Router.register('settings-tls', renderTLSSettings);
+      Router.register('global-settings', renderGlobalSettings);
+      Router.register('backup-restore', renderBackupRestore);
+      Router.register('account', renderAccount);
       if (typeof renderDiag === 'function') {
         Router.register('diagnostics', renderDiag);
       } else {
@@ -301,14 +280,16 @@
         });
       }
       Router.init();
+      loadAppliedSystemSettings();
       appBootstrapped = true;
     }
 
     Router.resolve();
     startDashboardRefresh();
+    document.body.classList.remove('auth-checking');
   }
 
-  document.getElementById('avatar-btn').addEventListener('click', async function() {
+  async function logoutApp() {
     if (!confirm('确认退出登录？')) return;
 
     teardownAppRuntime();
@@ -318,6 +299,13 @@
     showLoginMode();
     document.getElementById('inp-password').value = '';
     Toast.info('已退出登录');
+  }
+
+  window.logoutMeridian = logoutApp;
+  document.getElementById('avatar-btn').addEventListener('click', function() {
+    if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
+      setSidebarExpanded(false, true);
+    }
   });
 
   checkAuth();

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ['master']
+    branches: ['main']
   pull_request:
-    branches: ['master']
+    branches: ['main']
 
 permissions:
   contents: read
@@ -56,13 +56,18 @@ jobs:
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
           node --test tests/*.test.js
           bash -n install.sh
+          bash -n docker-entrypoint.sh
           bash -n tests/install_test.sh
+          bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh
           bash -n tests/dynamic_route_key_test.sh
-          shellcheck install.sh tests/install_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
+          shellcheck install.sh docker-entrypoint.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
+
+      - name: Test Docker entrypoint
+        run: bash tests/docker_entrypoint_test.sh
 
       - name: Build
         run: go build -trimpath -buildvcs=false -o meridian .

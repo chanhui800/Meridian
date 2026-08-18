@@ -111,6 +111,29 @@ test('passthrough payload clears the custom triplet', () => {
   assert.equal(payload.custom_version, '');
 });
 
+test('new site form defaults UA mode to passthrough', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /option value="passthrough" \$\{\(!isEdit \|\| site\.ua_mode === 'passthrough'\)/);
+  assert.match(source, /uaSelect\.value = isEdit && site\.ua_mode \? site\.ua_mode : 'passthrough'/);
+});
+
+test('site management exposes latency tests and safe asset cache controls', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /id="btn-test-all-sites"[^>]*>.*全部测速/);
+  assert.match(source, /data-site-action="latency"/);
+  assert.match(source, /async function testSiteLatency/);
+  assert.match(source, /async function testAllSitesLatency/);
+  assert.match(source, /id="m-asset-cache"/);
+  assert.match(source, /<select[^>]+id="m-asset-cache"/);
+  assert.doesNotMatch(source, /<input[^>]+id="m-asset-cache"/);
+  assert.match(source, /asset_cache_enabled: document\.getElementById\('m-asset-cache'\)\.value === 'on'/);
+  assert.match(source, /asset_cache_enabled:/);
+  assert.match(source, /asset_cache_rules:/);
+  assert.match(source, /\*\/file\/\*/);
+  assert.match(source, /\*\/emby\/Items\/\*\/Images\/\*/);
+  assert.match(source, /视频、音频、HLS、DASH、Range 请求/);
+});
+
 test('upstream header payload keeps configured rows write-only', () => {
 	const { buildUpstreamHeaderPayload } = loadSiteHelpers();
 	const payload = buildUpstreamHeaderPayload([

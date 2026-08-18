@@ -3,11 +3,17 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布版本号（例如 v1.8.5）'
+        required: true
+        type: string
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:
@@ -15,14 +21,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Validate release tag
         id: release_tag
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "Release tags must use vMAJOR.MINOR.PATCH or a safe prerelease suffix." >&2
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use exactly vMAJOR.MINOR.PATCH without a suffix." >&2
             exit 1
           fi
           printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -45,13 +53,18 @@ jobs:
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
           node --test tests/*.test.js
           bash -n install.sh
+          bash -n docker-entrypoint.sh
           bash -n tests/install_test.sh
+          bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh
           bash -n tests/dynamic_route_key_test.sh
-          shellcheck install.sh tests/install_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
+          shellcheck install.sh docker-entrypoint.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
+
+      - name: Test Docker entrypoint
+        run: bash tests/docker_entrypoint_test.sh
 
       - name: Vulnerability scan
         run: |
@@ -68,54 +81,48 @@ jobs:
 
   build:
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       contents: read
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            suffix: linux-amd64
-          - goos: linux
-            goarch: arm64
-            suffix: linux-arm64
-          - goos: windows
-            goarch: amd64
-            suffix: windows-amd64.exe
-          - goos: darwin
-            goarch: amd64
-            suffix: darwin-amd64
-          - goos: darwin
-            goarch: arm64
-            suffix: darwin-arm64
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Build
+      - name: Build release binaries
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" -o meridian-${{ matrix.suffix }} .
+        run: |
+          set -euo pipefail
+          build() {
+            local goos="$1" goarch="$2" suffix="$3"
+            echo "Building ${goos}/${goarch} -> meridian-${suffix}"
+            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -buildvcs=false \
+              -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" \
+              -o "meridian-${suffix}" .
+          }
+          build linux amd64 linux-amd64
+          build linux arm64 linux-arm64
+          build windows amd64 windows-amd64.exe
+          build darwin amd64 darwin-amd64
+          build darwin arm64 darwin-arm64
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: meridian-${{ matrix.suffix }}
-          path: meridian-${{ matrix.suffix }}
+          name: meridian-release-binaries
+          path: meridian-*
 
   release:
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [verify, build]
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
 
@@ -130,6 +137,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          tag_name: ${{ needs.verify.outputs.release_tag }}
           files: |
             meridian-*
             SHA256SUMS
@@ -137,18 +145,20 @@ jobs:
 
   docker:
     needs: [verify, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       packages: write
       contents: read
     env:
-      IMAGE_NAME: ghcr.io/snnabb/meridian
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/meridian
       RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
