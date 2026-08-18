@@ -41,19 +41,18 @@ func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, err
 }
 
 func healthcheckPanelDomain(dbPath string) string {
-	if strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+	domain := strings.TrimSpace(os.Getenv("PANEL_DOMAIN"))
+	if domain == "" && strings.TrimSpace(dbPath) != "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		db, err := sql.Open("sqlite", dbPath)
+		if err == nil {
+			defer db.Close()
+			_ = db.QueryRow(`SELECT panel_domain FROM panel_settings WHERE id=1`).Scan(&domain)
+		}
+	}
+	if domain == "" {
 		return ""
 	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return ""
-	}
-	defer db.Close()
-	var domain string
-	if err := db.QueryRow(`SELECT panel_domain FROM panel_settings WHERE id=1`).Scan(&domain); err != nil {
-		return ""
-	}
-	domain, err = normalizePublicHost(domain)
+	domain, err := normalizePublicHost(domain)
 	if err != nil {
 		return ""
 	}
@@ -68,17 +67,12 @@ func healthcheckTLSConfig(dbPath string) (*tls.Config, string) {
 	}
 	certFile, _ := panelTLSPaths(dbPath)
 	if certFile != "" {
+		// #nosec G304 -- certFile is an administrator-configured panel TLS path, not request data.
 		if data, readErr := os.ReadFile(certFile); readErr == nil {
 			// Trust the administrator-installed panel chain for the local probe,
 			// while still performing normal TLS chain and hostname validation.
 			roots.AppendCertsFromPEM(data)
 		}
-	}
-	if serverName == "" {
-		// An unconfigured local panel may use a temporary/self-signed certificate
-		// before panel settings are persisted. The healthcheck never sends
-		// credentials and only dials the fixed loopback addresses below.
-		return &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}, serverName
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: serverName}, serverName
 }

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -1997,6 +1999,19 @@ func TestInternalHealthcheckUsesTLSWithoutExternalHelpers(t *testing.T) {
 		t.Fatalf("write panel port marker: %v", err)
 	}
 	t.Setenv("DB_PATH", filepath.Join(dataDir, "meridian.db"))
+	cert, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
+	if err != nil || len(cert.DNSNames) == 0 {
+		t.Fatalf("parse test TLS certificate: %v", err)
+	}
+	certDir := filepath.Join(dataDir, "tls")
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		t.Fatalf("create TLS test directory: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.TLS.Certificates[0].Certificate[0]})
+	if err := os.WriteFile(filepath.Join(certDir, "fullchain.pem"), certPEM, 0600); err != nil {
+		t.Fatalf("write TLS test certificate: %v", err)
+	}
+	t.Setenv("PANEL_DOMAIN", cert.DNSNames[0])
 
 	handled, err := runCommandLine([]string{"--healthcheck"}, strings.NewReader(""), io.Discard)
 	if err != nil || !handled {
@@ -4856,8 +4871,8 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"dynamic_discovery_sources": true,
 		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
 		"dynamic_policy_revision": true,
-		"ping_cache_enabled": true, "image_cache_enabled": true, "progress_coalescing_enabled": true,
-		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
+		"ping_cache_enabled":      true, "image_cache_enabled": true, "progress_coalescing_enabled": true,
+		"asset_cache_enabled": true, "asset_cache_ttl_sec": true,
 		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,
 		"monthly_traffic": true,
 	}
