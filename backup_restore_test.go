@@ -245,7 +245,7 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	if value, decryptErr := decryptUpstreamHeaderValue(beforeStored[0].Name, beforeStored[0].Ciphertext, "https://emby.example.com", oldHeader[:]); decryptErr != nil || value != "secret-value" {
 		t.Fatalf("stored fixture header failed: %q, %v (%s)", value, decryptErr, beforeRaw)
 	}
-	if err := reencryptRestoredSecrets(path, oldJWT, oldHeader[:], newJWT, newHeader[:]); err != nil {
+	if err := reencryptRestoredSecrets(path, oldJWT, oldJWT, oldHeader[:], newJWT, newJWT, newHeader[:]); err != nil {
 		t.Fatal(err)
 	}
 	db, err := sql.Open("sqlite", path)
@@ -289,6 +289,82 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	}
 }
 
+func TestReencryptRestoredSecretsWithDedicatedCredentialKey(t *testing.T) {
+	oldJWT := bytes.Repeat([]byte("j"), 32)
+	oldCredential := bytes.Repeat([]byte("c"), 32)
+	newJWT := bytes.Repeat([]byte("n"), 32)
+	newCredential := bytes.Repeat([]byte("d"), 32)
+	oldHeader := sha256.Sum256([]byte("old-dedicated-header-key-material"))
+	newHeader := sha256.Sum256([]byte("new-dedicated-header-key-material"))
+	path := filepath.Join(t.TempDir(), "backup.db")
+	makeBackupDatabase(t, path, oldJWT, oldHeader[:])
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var telegramCiphertext, acmeCiphertext string
+	if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&telegramCiphertext); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	telegramToken, err := decryptTelegramBotTokenWithSecret(telegramCiphertext, oldJWT)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	telegramCiphertext, err = encryptTelegramBotTokenWithSecret(telegramToken, oldCredential)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	acmeToken, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldJWT)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	acmeCiphertext, err = encryptPanelACMETokenWithSecret(acmeToken, oldCredential)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE telegram_report_settings SET bot_token_ciphertext=? WHERE id=1", telegramCiphertext); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE panel_settings SET acme_token_ciphertext=? WHERE id=1", acmeCiphertext); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reencryptRestoredSecrets(path, oldJWT, oldCredential, oldHeader[:], newJWT, newCredential, newHeader[:]); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&telegramCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := decryptTelegramBotTokenWithSecret(telegramCiphertext, newCredential); err != nil || value != "123456:test-token" {
+		t.Fatalf("Telegram token = %q, %v", value, err)
+	}
+	if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := decryptPanelACMETokenWithSecret(acmeCiphertext, newCredential); err != nil || value != "cloudflare-backup-token-value" {
+		t.Fatalf("ACME token = %q, %v", value, err)
+	}
+}
 func TestApplyPendingRestoreAndRollback(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "meridian.db")
@@ -402,7 +478,7 @@ func TestRestoreWithoutTLSPreservesTargetSettingsAndFiles(t *testing.T) {
 		JWTSecret:         base64.RawStdEncoding.EncodeToString(oldJWT),
 		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(oldHeader),
 	}
-	if _, err := writeRestorePending(targetPath, manifest, map[string][]byte{backupDatabaseEntry: backupData}, newJWT, newHeader, preserved, false); err != nil {
+	if _, err := writeRestorePending(targetPath, manifest, map[string][]byte{backupDatabaseEntry: backupData}, newJWT, newJWT, newHeader, preserved, false); err != nil {
 		t.Fatal(err)
 	}
 	state, err := applyPendingRestore(targetPath)
@@ -510,7 +586,7 @@ func restoreIngressFixture(t *testing.T, targetHostIngressWithoutTLS bool, targe
 		JWTSecret:         base64.RawStdEncoding.EncodeToString(oldJWT),
 		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(oldHeader),
 	}
-	resetCount, err := writeRestorePending(targetPath, manifest, map[string][]byte{backupDatabaseEntry: backupData}, newJWT, newHeader, preserved, targetHostIngressWithoutTLS)
+	resetCount, err := writeRestorePending(targetPath, manifest, map[string][]byte{backupDatabaseEntry: backupData}, newJWT, newJWT, newHeader, preserved, targetHostIngressWithoutTLS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +698,7 @@ func TestWriteRestorePendingRejectsCorruptSQLite(t *testing.T) {
 		JWTSecret:         base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte("j"), 32)),
 		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte("h"), 32)),
 	}
-	_, err := writeRestorePending(dbPath, manifest, map[string][]byte{backupDatabaseEntry: []byte("not sqlite")}, bytes.Repeat([]byte("n"), 32), bytes.Repeat([]byte("k"), 32), nil, false)
+	_, err := writeRestorePending(dbPath, manifest, map[string][]byte{backupDatabaseEntry: []byte("not sqlite")}, bytes.Repeat([]byte("n"), 32), bytes.Repeat([]byte("n"), 32), bytes.Repeat([]byte("k"), 32), nil, false)
 	if err == nil || !strings.Contains(err.Error(), "SQLite") && !strings.Contains(strings.ToLower(err.Error()), "database") {
 		t.Fatalf("corrupt database error = %v", err)
 	}

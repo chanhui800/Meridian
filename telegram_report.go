@@ -580,6 +580,10 @@ func (a *App) handleTelegramReport(w http.ResponseWriter, r *http.Request) {
 			ciphertext, replaceToken = "", true
 		}
 		if strings.TrimSpace(input.BotToken) != "" {
+			if jwtSecretEphemeral {
+				a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全保存 Telegram Bot Token；请先配置稳定密钥")
+				return
+			}
 			ciphertext, err = encryptTelegramBotToken(input.BotToken)
 			if err != nil {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())

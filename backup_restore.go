@@ -61,7 +61,8 @@ type backupManifest struct {
 	CreatedAt         string   `json:"created_at"`
 	Files             []string `json:"files"`
 	IncludeTLS        *bool    `json:"include_tls,omitempty"`
-	JWTSecret         string   `json:"jwt_secret"` // #nosec G117 -- encrypted backup manifest field; it is never logged or persisted outside the encrypted archive.
+	JWTSecret         string   `json:"jwt_secret"`                  // #nosec G117 -- encrypted backup manifest field; it is never logged or persisted outside the encrypted archive.
+	CredentialSecret  string   `json:"credential_secret,omitempty"` // #nosec G117 -- encrypted backup manifest field; it is required to migrate dedicated credential ciphertexts.
 	UpstreamHeaderKey string   `json:"upstream_header_key"`
 }
 
@@ -294,6 +295,7 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 		Files:             files,
 		IncludeTLS:        boolPointer(includeTLS),
 		JWTSecret:         base64.RawStdEncoding.EncodeToString(jwtSecret),
+		CredentialSecret:  base64.RawStdEncoding.EncodeToString(activeStoredCredentialSecret()),
 		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(a.pm.upstreamHeaderKey),
 	}
 	manifestData, err := json.Marshal(manifest) // #nosec G117 -- the manifest is immediately encrypted before it leaves the process.
@@ -431,7 +433,7 @@ func validateSQLiteBackup(path string) error {
 	return nil
 }
 
-func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHeaderKey []byte) error {
+func reencryptRestoredSecrets(path string, oldJWT, oldCredentialKey, oldHeaderKey, newJWT, newCredentialKey, newHeaderKey []byte) error {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(DELETE)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return err
@@ -502,11 +504,11 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 		return err
 	}
 	if telegramCiphertext != "" {
-		token, err := decryptTelegramBotTokenWithSecret(telegramCiphertext, oldJWT)
+		token, err := decryptTelegramBotTokenWithSecret(telegramCiphertext, oldCredentialKey)
 		if err != nil {
 			return fmt.Errorf("无法解密 Telegram Bot Token: %w", err)
 		}
-		migrated, err := encryptTelegramBotTokenWithSecret(token, newJWT)
+		migrated, err := encryptTelegramBotTokenWithSecret(token, newCredentialKey)
 		if err != nil {
 			return fmt.Errorf("无法迁移 Telegram Bot Token: %w", err)
 		}
@@ -525,14 +527,14 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 			return err
 		}
 		if acmeCiphertext != "" {
-			token, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldJWT)
+			token, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldCredentialKey)
 			if err != nil {
-				if _, currentErr := decryptPanelACMETokenWithSecret(acmeCiphertext, newJWT); currentErr == nil {
+				if _, currentErr := decryptPanelACMETokenWithSecret(acmeCiphertext, newCredentialKey); currentErr == nil {
 					return tx.Commit()
 				}
 				return fmt.Errorf("无法解密 DNS API Token: %w", err)
 			}
-			migrated, err := encryptPanelACMETokenWithSecret(token, newJWT)
+			migrated, err := encryptPanelACMETokenWithSecret(token, newCredentialKey)
 			if err != nil {
 				return fmt.Errorf("无法迁移 DNS API Token: %w", err)
 			}
@@ -581,14 +583,15 @@ func backupHasTelegramToken(database []byte) (bool, error) {
 		return false, err
 	}
 	defer db.Close()
-	var ciphertext string
-	if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&ciphertext); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
+	var telegramCiphertext string
+	if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&telegramCiphertext); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	return ciphertext != "", nil
+	var acmeCiphertext string
+	if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	return telegramCiphertext != "" || acmeCiphertext != "", nil
 }
 
 func readBackupPanelSettings(db *sql.DB) (*backupPanelSettings, error) {
@@ -670,13 +673,20 @@ func reconcileRestoredSiteIngress(path string, hostIngressAvailable bool) (int64
 	return result.RowsAffected()
 }
 
-func writeRestorePending(dbPath string, manifest backupManifest, entries map[string][]byte, targetJWT, targetHeaderKey []byte, preservedPanelSettings *backupPanelSettings, targetHostIngressWithoutTLS bool) (int64, error) {
+func writeRestorePending(dbPath string, manifest backupManifest, entries map[string][]byte, targetJWT, targetCredentialKey, targetHeaderKey []byte, preservedPanelSettings *backupPanelSettings, targetHostIngressWithoutTLS bool) (int64, error) {
 	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
 		return 0, errors.New("当前数据库模式不支持恢复")
 	}
 	oldJWT, err := base64.RawStdEncoding.DecodeString(manifest.JWTSecret)
 	if err != nil || len(oldJWT) < 32 {
 		return 0, errors.New("备份缺少有效的 JWT 密钥迁移信息")
+	}
+	oldCredentialKey := oldJWT
+	if strings.TrimSpace(manifest.CredentialSecret) != "" {
+		oldCredentialKey, err = base64.RawStdEncoding.DecodeString(manifest.CredentialSecret)
+		if err != nil || len(oldCredentialKey) < 32 {
+			return 0, errors.New("备份中的凭据加密密钥无效")
+		}
 	}
 	oldHeaderKey, err := base64.RawStdEncoding.DecodeString(manifest.UpstreamHeaderKey)
 	if err != nil {
@@ -726,7 +736,7 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 	if err != nil {
 		return 0, fmt.Errorf("迁移站点入口配置: %w", err)
 	}
-	if err := reencryptRestoredSecrets(databasePath, oldJWT, oldHeaderKey, targetJWT, targetHeaderKey); err != nil {
+	if err := reencryptRestoredSecrets(databasePath, oldJWT, oldCredentialKey, oldHeaderKey, targetJWT, targetCredentialKey, targetHeaderKey); err != nil {
 		return 0, err
 	}
 	if err := validateSQLiteBackup(databasePath); err != nil {
@@ -1051,11 +1061,11 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	if jwtSecretEphemeral {
 		hasToken, tokenErr := backupHasTelegramToken(entries[backupDatabaseEntry])
 		if tokenErr != nil {
-			a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查 Telegram 配置")
+			a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查已保存凭据")
 			return
 		}
 		if hasToken {
-			a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全恢复 Telegram Token；请先配置稳定密钥")
+			a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全恢复 Telegram 或 ACME 凭据；请先配置稳定密钥")
 			return
 		}
 	}
@@ -1109,7 +1119,7 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	targetHostIngressWithoutTLS := a.panelBindLoopback || len(a.trustedProxies) > 0
-	resetIngressCount, err := writeRestorePending(a.dbPath, manifest, entries, jwtSecret, targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
+	resetIngressCount, err := writeRestorePending(a.dbPath, manifest, entries, jwtSecret, activeStoredCredentialSecret(), targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, "恢复校验失败："+err.Error())
 		return
