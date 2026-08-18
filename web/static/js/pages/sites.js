@@ -819,8 +819,7 @@ function privacySafeObservationReason(value) {
 
 function formatObservationTimestamp(value) {
 	if (!Number.isSafeInteger(value) || value < 0) return '—';
-	const timestamp = new Date(value);
-	return Number.isNaN(timestamp.getTime()) ? '—' : timestamp.toISOString();
+	return meridianFormatDateTime(value);
 }
 
 function normalizeDynamicObservationsResponse(value) {

@@ -2,13 +2,14 @@ let dashSSE = null;
 let dashAbortController = null;
 let dashRetryTimer = null;
 let dashboardTrendResizeObserver = null;
-let dashboardTrendState = { siteId: 'all', range: 'realtime' };
+let dashboardTrendState = { siteId: 'all', range: 'realtime', customStart: '', customEnd: '' };
 let dashboardTrendCharts = new Map();
 let dashboardTrendData = null;
 let dashboardSites = [];
 let dashboardSpeedSamples = new Map();
 let dashboardLiveSpeeds = new Map();
 let dashboardRealtimeTrendSamples = new Map();
+let dashboardRealtimeTrendSiteSamples = new Map();
 
 function renderDashboard() {
   const page = document.getElementById('page-dashboard');
@@ -56,14 +57,21 @@ function renderDashboard() {
     <div class="dashboard-trend-toolbar fade-up stagger-4">
       <div>
         <div class="glass-card-title">数据趋势</div>
-        <div class="dashboard-trend-help" id="dashboard-trend-help">默认显示全部站点；按全局流量重置日统计当前计费周期</div>
+        <div class="dashboard-trend-help" id="dashboard-trend-help">默认显示全部站点；“本月”按自然月 1 日至当前时间统计 · 数据时间 <span id="dashboard-trend-timezone">UTC+08:00</span></div>
       </div>
       <div class="dashboard-trend-controls">
         <label>站点<select id="dashboard-trend-site" class="form-select" aria-label="选择趋势站点"><option value="all">全部站点</option></select></label>
         <label>时间<select id="dashboard-trend-range" class="form-select" aria-label="选择趋势时间范围">
-          <option value="realtime">实时</option><option value="hour">1 小时</option><option value="6h">6 小时</option><option value="day">1 天</option><option value="7d">7 天</option>
+          <option value="realtime">实时</option><option value="hour">1 小时</option><option value="6h">6 小时</option><option value="day">1 天</option><option value="7d">7 天</option><option value="month">本月</option><option value="custom">自定义</option>
         </select></label>
+        <div class="dashboard-trend-custom" id="dashboard-trend-custom" hidden>
+          <label>开始时间<input type="datetime-local" id="dashboard-trend-start" class="form-input" step="60" aria-label="趋势开始时间"></label>
+          <span class="dashboard-trend-custom-separator" aria-hidden="true">至</span>
+          <label>结束时间<input type="datetime-local" id="dashboard-trend-end" class="form-input" step="60" aria-label="趋势结束时间"></label>
+          <button type="button" class="btn btn-primary dashboard-trend-apply" id="dashboard-trend-apply">应用</button>
+        </div>
       </div>
+      <div class="dashboard-trend-custom-error" id="dashboard-trend-custom-error" role="alert" aria-live="polite" hidden></div>
     </div>
     <div class="dashboard-trend-grid fade-up stagger-4">
       <section class="dashboard-trend-card" data-dashboard-chart="speed"><div class="glass-card-header"><div><div class="glass-card-title">速度</div><span class="dashboard-trend-unit">时间范围峰值</span></div><strong class="dashboard-trend-summary" id="dashboard-speed-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardSpeedTrend" aria-label="速度趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="download"></i>下载</span><span><i class="upload"></i>上传</span></div></section>
@@ -104,7 +112,7 @@ async function loadDashboardInsights() {
     if (!insights || Router.current !== 'dashboard') return;
     const log = document.querySelector('#dashboard-log-health p');
     const schedule = document.querySelector('#dashboard-schedule-health p');
-    const latestLog = insights.latest_log_ms ? new Date(insights.latest_log_ms).toLocaleString('zh-CN', { hour12: false }) : '暂无记录';
+    const latestLog = insights.latest_log_ms ? meridianFormatDateTime(insights.latest_log_ms) : '暂无记录';
     if (log) log.textContent = insights.log_healthy ? `今日写入 ${formatNumber(insights.log_count_today || 0)} 条 · 最近写入 ${latestLog}` : '已关闭';
     if (schedule) schedule.textContent = insights.schedule_enabled ? `Telegram 日报 · ${insights.schedule_label || '已启用'}` : 'Telegram 日报 · 未启用';
   } catch (error) {
@@ -184,19 +192,54 @@ function dashboardTooltipPosition(pointerX, pointerY, wrapWidth, wrapHeight, too
 }
 
 function dashboardTrendTimeLabel(timestamp, range) {
-  const date = new Date(timestamp);
-  if (range === '7d' || range === 'day') return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, '0')}:00`;
-  if (range === 'realtime') return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
-  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  const date = meridianTimezoneDate(timestamp);
+  const pad = value => String(value).padStart(2, '0');
+  if (range === '7d' || range === 'day' || range === 'month') return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:00`;
+  if (range === 'realtime') return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+  if (range === 'custom') return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+  return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
 
-function dashboardTrendTooltip(point, metric, range) {
-  const time = new Date(point.timestamp_ms).toLocaleString('zh-CN', { hour12: false });
-  const lines = [`<strong>${esc(time)}</strong>`];
-  if (metric === 'speed') lines.push(`↓ ${formatRate(point.download_bps)} · ↑ ${formatRate(point.upload_bps)}`);
-  if (metric === 'requests') lines.push(`请求 ${formatNumber(point.requests || 0)} 次`);
-  if (metric === 'traffic') lines.push(`流量 ${formatBytes(point.traffic_bytes || 0)}`);
-  return lines.join('<br>');
+function dashboardTrendMetricLine(point, metric) {
+  if (!point) return '暂无数据';
+  if (metric === 'speed') return `↓ ${formatRate(point.download_bps)} · ↑ ${formatRate(point.upload_bps)}`;
+  if (metric === 'requests') return `请求 ${formatNumber(point.requests || 0)} 次`;
+  if (metric === 'traffic') return `流量 ${formatBytes(point.traffic_bytes || 0)}`;
+  return '';
+}
+
+function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
+  const time = meridianFormatDateTime(point.timestamp_ms);
+  const siteSelect = document.getElementById('dashboard-trend-site');
+  const selectedOption = siteSelect?.selectedOptions?.[0];
+  const selectedSiteID = dashboardTrendState.siteId === 'all' ? null : String(dashboardTrendState.siteId);
+  const allSeries = dashboardTrendData?.site_series || [];
+  const realtimeSeries = dashboardRealtimeTrendSiteSamples;
+  const siteRows = [];
+  if (selectedSiteID === null) {
+    const realtimeOffset = dashboardTrendRealtimeOffset();
+    const realtimeIndex = pointIndex - realtimeOffset;
+    if (range === 'realtime' && realtimeSeries.size && realtimeIndex >= 0) {
+      const knownSites = dashboardSites.length ? dashboardSites : allSeries.map(series => ({ id: series.site_id, name: series.site_name }));
+      knownSites.forEach(site => {
+        const samples = realtimeSeries.get(String(site.id));
+        const sample = samples?.[realtimeIndex] || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+        siteRows.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(site.name || `站点 ${site.id}`)}</strong><span>${dashboardTrendMetricLine(sample, metric)}</span></div>`);
+      });
+    } else {
+      allSeries.forEach(series => {
+        const sitePoint = series.points?.[pointIndex];
+        if (sitePoint) siteRows.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(series.site_name || `站点 ${series.site_id}`)}</strong><span>${dashboardTrendMetricLine(sitePoint, metric)}</span></div>`);
+      });
+    }
+  } else {
+    const siteName = selectedOption?.textContent?.trim() || allSeries.find(series => String(series.site_id) === selectedSiteID)?.site_name || `站点 ${selectedSiteID}`;
+    siteRows.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(siteName)}</strong><span>${dashboardTrendMetricLine(point, metric)}</span></div>`);
+  }
+  const lines = [`<span>${esc(time)}</span>`];
+  if (siteRows.length) lines.push(siteRows.join(''));
+  else lines.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(selectedSiteID === null ? '全部站点' : (selectedOption?.textContent?.trim() || `站点 ${selectedSiteID}`))}</strong><span>${dashboardTrendMetricLine(point, metric)}</span></div>`);
+  return lines.join('');
 }
 
 function dashboardRealtimeTrendPoints() {
@@ -204,9 +247,21 @@ function dashboardRealtimeTrendPoints() {
   return dashboardRealtimeTrendSamples.get(key) || [];
 }
 
+function dashboardTrendRealtimeOffset() {
+  const historical = dashboardTrendData?.points || [];
+  const realtime = dashboardRealtimeTrendPoints();
+  if (dashboardTrendState.range !== 'realtime' || !historical.length || !realtime.length) return historical.length;
+  const firstRealtime = Number(realtime[0]?.timestamp_ms || 0);
+  return historical.filter(point => Number(point.timestamp_ms || 0) < firstRealtime).length;
+}
+
 function dashboardTrendPoints() {
-  const realtimePoints = dashboardTrendState.range === 'realtime' ? dashboardRealtimeTrendPoints() : [];
-  return realtimePoints.length ? realtimePoints : (dashboardTrendData?.points || []);
+  const historicalPoints = dashboardTrendData?.points || [];
+  if (dashboardTrendState.range !== 'realtime') return historicalPoints;
+  const realtimePoints = dashboardRealtimeTrendPoints();
+  if (!realtimePoints.length || !historicalPoints.length) return realtimePoints.length ? realtimePoints : historicalPoints;
+  const offset = dashboardTrendRealtimeOffset();
+  return historicalPoints.slice(0, offset).concat(realtimePoints);
 }
 
 function dashboardTrendSummary(data) {
@@ -223,6 +278,19 @@ function dashboardTrendSummary(data) {
   if (request) request.textContent = `${formatNumber(requests)} 次`;
   if (trafficEl) trafficEl.textContent = formatBytes(traffic);
   if (unit) unit.textContent = data?.billing_mode === 'outbound' ? '单向计费流量总数' : '双向计费流量总数';
+}
+
+function dashboardUpdateTrendHelp(resetEnabled) {
+  const help = document.getElementById('dashboard-trend-help');
+  if (!help) return;
+  const prefix = resetEnabled
+    ? '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量按全局重置日统计'
+    : '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量累计不重置';
+  help.textContent = `${prefix} · 数据时间 `;
+  const timezone = document.createElement('span');
+  timezone.id = 'dashboard-trend-timezone';
+  timezone.textContent = meridianTimezoneLabel();
+  help.appendChild(timezone);
 }
 
 function dashboardRoundRect(ctx, x, y, width, height, radius) {
@@ -349,12 +417,87 @@ function renderDashboardTrendCharts() {
   ['speed', 'requests', 'traffic'].forEach(drawDashboardTrendChart);
 }
 
+function dashboardLocalDateTimeValue(date) {
+  return meridianDateTimeLocalValue(date);
+}
+
+function dashboardDefaultCustomRange() {
+  const end = Date.now();
+  const start = end - 60 * 60 * 1000;
+  return { start: dashboardLocalDateTimeValue(start), end: dashboardLocalDateTimeValue(end) };
+}
+
+function dashboardSetCustomRangeControls(visible) {
+  const custom = document.getElementById('dashboard-trend-custom');
+  const error = document.getElementById('dashboard-trend-custom-error');
+  if (custom) custom.hidden = !visible;
+  if (!visible && error) {
+    error.hidden = true;
+    error.textContent = '';
+  }
+}
+
+function dashboardShowCustomError(message) {
+  const error = document.getElementById('dashboard-trend-custom-error');
+  if (!error) return;
+  error.textContent = message || '';
+  error.hidden = !message;
+}
+
+function dashboardReadCustomRange() {
+  const start = document.getElementById('dashboard-trend-start')?.value || '';
+  const end = document.getElementById('dashboard-trend-end')?.value || '';
+  if (!start || !end) return { error: '请选择开始时间和结束时间' };
+  const startDate = meridianParseDateTimeLocal(start);
+  const endDate = meridianParseDateTimeLocal(end);
+  if (!Number.isFinite(startDate) || !Number.isFinite(endDate)) {
+    return { error: '时间格式无效，请重新选择' };
+  }
+  if (endDate <= startDate) return { error: '结束时间必须晚于开始时间' };
+  return { start, end };
+}
+
 function setupDashboardTrendControls() {
   const siteSelect = document.getElementById('dashboard-trend-site');
   const rangeSelect = document.getElementById('dashboard-trend-range');
   if (!siteSelect || !rangeSelect) return;
   siteSelect.onchange = () => { dashboardTrendState.siteId = siteSelect.value; loadDashboardTrends(); };
-  rangeSelect.onchange = () => { dashboardTrendState.range = rangeSelect.value; loadDashboardTrends(); };
+  const startInput = document.getElementById('dashboard-trend-start');
+  const endInput = document.getElementById('dashboard-trend-end');
+  const applyButton = document.getElementById('dashboard-trend-apply');
+  const customDefault = dashboardDefaultCustomRange();
+  if (startInput && !startInput.value) startInput.value = dashboardTrendState.customStart || customDefault.start;
+  if (endInput && !endInput.value) endInput.value = dashboardTrendState.customEnd || customDefault.end;
+  rangeSelect.onchange = () => {
+    dashboardTrendState.range = rangeSelect.value;
+    dashboardSetCustomRangeControls(dashboardTrendState.range === 'custom');
+    if (dashboardTrendState.range === 'custom') {
+      const current = dashboardReadCustomRange();
+      if (current.error) {
+        dashboardShowCustomError(current.error);
+        return;
+      }
+      dashboardTrendState.customStart = current.start;
+      dashboardTrendState.customEnd = current.end;
+    } else {
+      dashboardShowCustomError('');
+    }
+    loadDashboardTrends();
+  };
+  if (applyButton) {
+    applyButton.onclick = () => {
+      const current = dashboardReadCustomRange();
+      if (current.error) {
+        dashboardShowCustomError(current.error);
+        return;
+      }
+      dashboardTrendState.customStart = current.start;
+      dashboardTrendState.customEnd = current.end;
+      dashboardShowCustomError('');
+      loadDashboardTrends();
+    };
+  }
+  dashboardSetCustomRangeControls(dashboardTrendState.range === 'custom');
   ['speed', 'requests', 'traffic'].forEach(metric => {
     const canvas = document.getElementById(metric === 'speed' ? 'dashboardSpeedTrend' : metric === 'requests' ? 'dashboardRequestsTrend' : 'dashboardTrafficTrend');
     if (!canvas) return;
@@ -371,7 +514,7 @@ function setupDashboardTrendControls() {
       chart.hoverX = pointer.x;
       chart.hoverY = pointer.y;
       if (tooltip) {
-        tooltip.innerHTML = dashboardTrendTooltip(points[pointer.index], metric, dashboardTrendState.range);
+        tooltip.innerHTML = dashboardTrendTooltip(points[pointer.index], metric, dashboardTrendState.range, pointer.index);
         tooltip.hidden = false;
         const wrap = canvas.parentElement;
         const wrapRect = wrap?.getBoundingClientRect ? wrap.getBoundingClientRect() : rect;
@@ -414,9 +557,29 @@ function setupDashboardTrendControls() {
 
 async function loadDashboardTrends() {
   try {
-    const data = await API.dashboardTrends(dashboardTrendState.siteId, dashboardTrendState.range);
+    const data = await API.dashboardTrends(
+      dashboardTrendState.siteId,
+      dashboardTrendState.range,
+      dashboardTrendState.customStart,
+      dashboardTrendState.customEnd,
+    );
     if (!data || Router.current !== 'dashboard') return;
+    if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(data.timezone_offset_minutes);
+    const timezone = document.getElementById('dashboard-trend-timezone');
+    if (timezone && typeof meridianTimezoneLabel === 'function') timezone.textContent = meridianTimezoneLabel(data.timezone_offset_minutes);
+    if (!dashboardTrendState.customStart && !dashboardTrendState.customEnd) {
+      const customDefault = dashboardDefaultCustomRange();
+      const startInput = document.getElementById('dashboard-trend-start');
+      const endInput = document.getElementById('dashboard-trend-end');
+      if (startInput) startInput.value = customDefault.start;
+      if (endInput) endInput.value = customDefault.end;
+    }
     dashboardTrendData = data;
+    if (Array.isArray(data.site_series)) {
+      data.site_series.forEach(series => {
+        if (!dashboardSites.some(site => Number(site.id) === Number(series.site_id))) dashboardSites.push({ id: series.site_id, name: series.site_name });
+      });
+    }
     dashboardTrendSummary(data);
     renderDashboardTrendCharts();
   } catch (error) {
@@ -429,7 +592,8 @@ function loadDashboardTrendSites() {
   if (!select) return;
   API.listSites().then(sites => {
     if (!select || Router.current !== 'dashboard') return;
-    select.innerHTML = '<option value="all">全部站点</option>' + (sites || []).map(site => `<option value="${Number(site.id)}">${esc(site.name)}</option>`).join('');
+    dashboardSites = sites || [];
+    select.innerHTML = '<option value="all">全部站点</option>' + dashboardSites.map(site => `<option value="${Number(site.id)}">${esc(site.name)}</option>`).join('');
     select.value = dashboardTrendState.siteId;
   }).catch(error => console.warn('Dashboard trend site list error', error));
 }
@@ -534,8 +698,7 @@ function updateDashboardLive(stats) {
 	const resetEnabled = Number(stats.traffic_reset_day == null ? 1 : stats.traffic_reset_day) !== 0;
 	const trafficTitle = document.getElementById('s-traffic-title');
 	if (trafficTitle) trafficTitle.textContent = '已用流量';
-  const trendHelp = document.getElementById('dashboard-trend-help');
-  if (trendHelp) trendHelp.textContent = resetEnabled ? '默认显示全部站点；按全局流量重置日统计当前计费周期' : '默认显示全部站点；当前设置为不重置，流量额度按累计值计算';
+  dashboardUpdateTrendHelp(resetEnabled);
 
   const uptimeEl = document.getElementById('s-uptime');
   if (uptimeEl) uptimeEl.textContent = formatUptime(stats.uptime_seconds || 0);
@@ -617,6 +780,17 @@ function updateDashboardSiteSpeeds(liveSites) {
     const rate = rateSamples.get(String(siteID)) || {};
     const delta = trendDeltas.get(siteID) || {};
     appendRealtimeTrendSample(String(siteID), { ...rate, ...delta });
+    const siteSamples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
+    siteSamples.push({
+      timestamp_ms: sampledAt,
+      download_bps: Math.max(0, Number(rate.download_bps || 0)),
+      upload_bps: Math.max(0, Number(rate.upload_bps || 0)),
+      bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
+      bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
+      requests: Math.max(0, Number(delta.requests || 0)),
+      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? Math.max(0, Number(delta.bytesOut || 0)) : Math.max(0, Number(delta.bytesIn || 0)) + Math.max(0, Number(delta.bytesOut || 0)),
+    });
+    dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples.slice(-1800));
   }
   dashboardSites = dashboardSites.map(site => {
     const siteID = Number(site.id);
@@ -665,6 +839,7 @@ function stopDashSSE() {
   dashboardSpeedSamples = new Map();
   dashboardLiveSpeeds = new Map();
   dashboardRealtimeTrendSamples = new Map();
+  dashboardRealtimeTrendSiteSamples = new Map();
   dashboardTrendData = null;
   dashboardTrendCharts = new Map();
   if (dashboardTrendResizeObserver) {

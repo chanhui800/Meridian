@@ -1,10 +1,9 @@
 function formatAccountCreatedAt(value) {
   const raw = String(value || '').trim();
   if (!raw) return '—';
-  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z';
-  const date = new Date(normalized);
-  if (Number.isNaN(date.getTime())) return raw;
-  return date.toLocaleString('zh-CN', { hour12: false });
+  const timestamp = typeof meridianParseDateTimeText === 'function' ? meridianParseDateTimeText(raw) : new Date(raw).getTime();
+  if (!Number.isFinite(timestamp)) return raw;
+  return meridianFormatDateTime(timestamp);
 }
 
 function accountErrorMessage(error) {

@@ -276,10 +276,9 @@ function drawTrafficChart(logs, hours) {
   ctx.font = '10px system-ui, sans-serif';
   ctx.textAlign = 'center';
   labelIndexes.forEach(index => {
-    const date = new Date(series.timestamps[index]);
     const label = Number(hours) >= 168
-      ? date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
-      : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+      ? meridianFormatDate(series.timestamps[index])
+      : meridianFormatDateTime(series.timestamps[index], false).slice(11);
     ctx.fillText(label, x(index), h - 12);
   });
 

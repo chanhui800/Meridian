@@ -11,7 +11,7 @@ const STATIC_JS = path.join(__dirname, '..', 'web', 'static', 'js');
 // Loads api.js into a sandbox where fetch/window are injected per test, the
 // same way a browser page provides them.
 function loadAPIClient() {
-  const sandbox = { window: {} };
+  const sandbox = { window: {}, URLSearchParams };
   vm.createContext(sandbox);
   vm.runInContext(
     fs.readFileSync(path.join(STATIC_JS, 'api.js'), 'utf8'),
@@ -127,6 +127,21 @@ test('account API reads and updates the authenticated administrator', async () =
     current_password: 'current password',
     new_password: 'new password value',
   });
+});
+
+test('dashboard trends API encodes a custom minute-precision time range', async () => {
+  const sandbox = loadAPIClient();
+  const requests = [];
+  sandbox.fetch = async (url) => {
+    requests.push(String(url));
+    return { status: 200, ok: true, json: async () => ({ points: [] }) };
+  };
+
+  await vm.runInContext('API.dashboardTrends("all", "custom", "2026-08-18T09:05", "2026-08-18T12:34")', sandbox);
+  assert.equal(
+    requests[0],
+    '/api/dashboard-trends?site_id=all&range=custom&start=2026-08-18T09%3A05&end=2026-08-18T12%3A34',
+  );
 });
 
 test('mobile credential inputs disable keyboard text transformations', () => {

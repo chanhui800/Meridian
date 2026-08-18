@@ -8,6 +8,29 @@ let requestLogReloadQueued = false;
 let requestLogDisplaySettings = { node: true, category: true, status: true, client_ip: true, ua: true, upstream_ua: true, backend_address: true, timeline: true };
 const requestLogUAWidthStorageKey = 'meridian-request-log-ua-width';
 
+function requestLogDateOnlyValue(value) {
+  if (typeof meridianDateOnlyValue === 'function') return meridianDateOnlyValue(value);
+  const date = value instanceof Date ? value : new Date(value);
+  const pad = number => String(number).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function requestLogParseDateOnly(value, endOfDay) {
+  if (typeof meridianParseDateOnly === 'function') return meridianParseDateOnly(value, endOfDay);
+  const date = new Date(`${value}T${endOfDay ? '23:59:59.999' : '00:00:00'}`);
+  return date.getTime();
+}
+
+function requestLogFormatDateTime(timestamp) {
+  if (typeof meridianFormatDateTime === 'function') return meridianFormatDateTime(timestamp);
+  return new Date(Number(timestamp)).toLocaleString('zh-CN', { hour12: false });
+}
+
+function requestLogFormatDate(timestamp) {
+  if (typeof meridianFormatDate === 'function') return meridianFormatDate(timestamp);
+  return new Date(Number(timestamp)).toLocaleDateString('zh-CN');
+}
+
 function requestLogNormalizeUAWidth(value) {
   return Math.max(180, Math.min(420, Number(value) || 240));
 }
@@ -63,18 +86,15 @@ function requestLogApplyDisplaySettings(settings) {
 }
 
 function requestLogDateInputValue(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+  return requestLogDateOnlyValue(date);
 }
 
 function requestLogRangeMilliseconds(fromValue, toValue) {
-  const from = new Date(`${fromValue}T00:00:00`);
-  const to = new Date(`${toValue}T23:59:59.999`);
+  const from = requestLogParseDateOnly(fromValue, false);
+  const to = requestLogParseDateOnly(toValue, true);
   return {
-    from_ms: Number.isFinite(from.getTime()) ? from.getTime() : 0,
-    to_ms: Number.isFinite(to.getTime()) ? to.getTime() : 0,
+    from_ms: Number.isFinite(from) ? from : 0,
+    to_ms: Number.isFinite(to) ? to : 0,
   };
 }
 
@@ -107,7 +127,7 @@ function requestLogRelativeTime(timestamp, now) {
   if (hours < 24) return `${hours} 小时前`;
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days} 天前`;
-  return new Date(Number(timestamp || 0)).toLocaleDateString('zh-CN');
+  return requestLogFormatDate(Number(timestamp || 0));
 }
 
 function requestLogStatusClass(status) {
@@ -120,9 +140,8 @@ function requestLogStatusClass(status) {
 function renderRequestLogs() {
   const page = document.getElementById('page-request-logs');
   requestLogApplyUAWidth();
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
+  const today = Date.now();
+  const yesterday = today - 24 * 60 * 60 * 1000;
   requestLogCategoryFilter = 'all';
   requestLogStatusFilter = 'all';
 
@@ -252,7 +271,10 @@ function renderRequestLogs() {
     uaWidthInput.oninput = applyUAWidth;
     uaWidthInput.onchange = applyUAWidth;
   }
-  if (API.getSystemSettings) API.getSystemSettings().then(requestLogApplyDisplaySettings).catch(() => requestLogApplyDisplaySettings(null));
+  if (API.getSystemSettings) API.getSystemSettings().then(settings => {
+    if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(settings?.schedule_timezone_offset);
+    requestLogApplyDisplaySettings(settings);
+  }).catch(() => requestLogApplyDisplaySettings(null));
   loadRequestLogs({ showLoading: true });
   if (requestLogRefreshTimer) clearInterval(requestLogRefreshTimer);
   requestLogRefreshTimer = setInterval(() => {
@@ -346,7 +368,7 @@ function renderRequestLogRows(logs) {
   body.innerHTML = logs.map(entry => {
     const status = Number(entry.status_code || 0);
     const recordedAtMS = Number(entry.recorded_at_ms || 0);
-    const exactTime = recordedAtMS ? new Date(recordedAtMS).toLocaleString('zh-CN', { hour12: false }) : '未写入时间线';
+    const exactTime = recordedAtMS ? requestLogFormatDateTime(recordedAtMS) : '未写入时间线';
     const requestTitle = `${String(entry.method || 'GET')} ${String(entry.path || '/')}`;
     return `
       <tr data-log-id="${esc(entry.id || '')}" title="${esc(requestTitle)}">
