@@ -4658,6 +4658,7 @@ html {
 .settings-field > div { position: relative; }
 .settings-field input { width: 100%; min-height: 48px; padding-right: 70px; font-size: 18px; }
 .settings-field em { position: absolute; right: 15px; top: 14px; color: var(--white-38); font-size: 15px; font-style: normal; }
+.settings-reset-select { width: 100%; }
 .settings-choice { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
 .settings-choice button { min-height: 46px; padding: 0 24px; border: 1px solid var(--panel-border); border-radius: 999px; color: var(--white-87); font-size: 16px; }
 .settings-choice button.active { border-color: #60a5fa; background: var(--surface-active); color: var(--blue); }
@@ -4680,6 +4681,17 @@ html {
 .dashboard-trend-wrap { width: 100%; }
 #dashboardRequestTrend { display: block; width: 100%; }
 .dashboard-trend-note { margin-top: 10px; color: var(--white-60); font-size: 14px; }
+.dashboard-trend-toolbar { display: flex; justify-content: space-between; align-items: end; gap: 18px; margin-top: 18px; padding: 18px 20px; border: 1px solid var(--panel-border); border-radius: var(--ui-radius); background: var(--panel); box-shadow: var(--page-shadow); }
+.dashboard-trend-help { margin-top: 5px; color: var(--white-60); font-size: 13px; }
+.dashboard-trend-controls { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+.dashboard-trend-controls label { display: grid; gap: 5px; color: var(--white-60); font-size: 12px; font-weight: 650; }
+.dashboard-trend-controls .form-select { min-width: 150px; min-height: 42px; }
+.dashboard-trend-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.dashboard-trend-grid .dashboard-trend-card { min-width: 0; margin-top: 0; padding: 16px; }
+.dashboard-trend-grid .dashboard-trend-wrap { position: relative; height: clamp(210px, 22vw, 290px); min-height: 210px; }
+.dashboard-trend-grid canvas { display: block; width: 100%; height: 100%; max-width: 100%; cursor: default; touch-action: none; }
+.dashboard-chart-tooltip { position: absolute; left: 0; top: 0; transform: none; z-index: 2; max-width: 210px; padding: 8px 10px; border: 1px solid var(--panel-border); border-radius: 8px; background: var(--panel); color: var(--white-87); box-shadow: var(--page-shadow); font-size: 12px; line-height: 1.5; pointer-events: none; white-space: nowrap; }
+.dashboard-site-status { margin-top: 18px; }
 @media (max-width: 768px) {
   .sidebar-drawer-close { position: absolute; top: 16px; right: 10px; z-index: 3; display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid var(--panel-border); border-radius: 9px; background: var(--panel); color: var(--white-60); }
   #app-shell.sidebar-expanded .sidebar-brand { padding-right: 48px; }
@@ -4687,6 +4699,10 @@ html {
   .settings-panel { padding: 20px 16px; }
   .settings-panel header h2 { font-size: 21px; }
   .settings-section-nav { padding: 14px; position: static; max-height: none; overflow: visible; }
+  .dashboard-trend-toolbar { align-items: stretch; flex-direction: column; padding: 15px; }
+  .dashboard-trend-controls { display: grid; grid-template-columns: 1fr 1fr; }
+  .dashboard-trend-controls label, .dashboard-trend-controls .form-select { min-width: 0; width: 100%; }
+  .dashboard-trend-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 1100px) {
@@ -4721,6 +4737,30 @@ html {
   font-weight: 600;
   white-space: nowrap;
 }
+
+.dashboard-trend-summary {
+  color: var(--white-87);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.dashboard-trend-legend {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin-top: 2px;
+  color: var(--white-60);
+  font-size: 12px;
+}
+
+.dashboard-trend-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.dashboard-trend-legend i { width: 9px; height: 9px; display: inline-block; border-radius: 3px; background: #10b981; }
+.dashboard-trend-legend i.download { background: #3b9cff; }
+.dashboard-trend-legend i.upload { background: #a78bfa; }
+.dashboard-trend-legend i.requests { background: #3b82f6; }
 
 .account-page {
   width: min(980px, 100%);

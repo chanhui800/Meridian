@@ -43,9 +43,14 @@ type ProxyInstance struct {
 	bytesOut           atomic.Int64
 	cumulativeBytesIn  atomic.Int64
 	cumulativeBytesOut atomic.Int64
+	persistedBytesIn   atomic.Int64
+	persistedBytesOut  atomic.Int64
 	reqCount           atomic.Int64
 	pendingRequests    atomic.Int64
 	persistedTraffic   atomic.Int64
+	trafficCycleStart  time.Time
+	trafficCycleMode   string
+	trafficCycleUsage  int64
 	trustedProxies     []*net.IPNet
 	dynamicState       *dynamicSiteState
 	failoverState      *upstreamFailoverState

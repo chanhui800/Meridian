@@ -566,7 +566,7 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			defer db.Close()
 
-			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "client_ip_mode", "public_host", "ingress_mode", "upstream_headers"} {
+			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "client_ip_mode", "public_host", "ingress_mode", "upstream_headers", "traffic_used_in", "traffic_used_out"} {
 				var count int
 				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
 					t.Fatalf("inspect %s: %v", column, err)
@@ -591,6 +591,10 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			if site.PublicHost != "" || site.IngressMode != ingressModePort || site.ClientIPMode != clientIPModeBoth || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
 				t.Fatalf("migrated site ingress config = %#v", site)
+			}
+			settings := db.currentSystemSettings()
+			if settings.TrafficBillingMode != trafficBillingModeBidirectional || settings.TrafficResetDay != 1 {
+				t.Fatalf("migrated traffic settings = %+v, want bidirectional/day 1", settings)
 			}
 		})
 	}
@@ -1398,7 +1402,8 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
 		t.Error("app must reveal the authenticated shell or login form after the auth check")
 	}
-	for _, asset := range []string{"/js/theme.js?v=1.8.39", "/css/style.css?v=1.8.39", "/js/pages/sites.js?v=1.8.39", "/js/pages/request-logs.js?v=1.8.39", "/js/app.js?v=1.8.39"} {
+	cacheVersion := strings.TrimPrefix(appVersion, "v")
+	for _, asset := range []string{"/js/theme.js?v=" + cacheVersion, "/css/style.css?v=" + cacheVersion, "/js/pages/sites.js?v=" + cacheVersion, "/js/pages/request-logs.js?v=" + cacheVersion, "/js/app.js?v=" + cacheVersion} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -4833,8 +4838,8 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		t.Fatalf("GET /api/sites status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 
-	// The response rows keep exactly the Site JSON fields plus "running": the
-	// overlay may only change traffic_used, never add per-component fields.
+	// The response rows keep the Site JSON fields plus live status, cache size,
+	// and the current-month traffic value used by the dashboard.
 	var raw []map[string]json.RawMessage
 	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode /api/sites: %v", err)
@@ -4853,6 +4858,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"dynamic_policy_revision": true,
 		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
 		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,
+		"monthly_traffic": true,
 	}
 	if len(raw) != 2 {
 		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())

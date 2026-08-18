@@ -43,9 +43,6 @@
       try {
         if (window.localStorage) window.localStorage.setItem(sidebarStorageKey, String(expanded));
       } catch (_) {}
-      if (typeof loadTrafficChart === 'function' && typeof Router !== 'undefined' && Router.current === 'traffic') {
-        setTimeout(loadTrafficChart, 240);
-      }
     }
   }
 
@@ -186,6 +183,8 @@
   function teardownAppRuntime() {
     stopDashboardRefresh();
     if (typeof stopDashSSE === 'function') stopDashSSE();
+    // Keep cleanup compatible with cached clients that still have the retired
+    // traffic page script loaded; the page is no longer registered or linked.
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
   }
 
@@ -263,7 +262,6 @@
     if (!appBootstrapped) {
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
-      Router.register('traffic', renderTraffic);
       Router.register('request-logs', renderRequestLogs);
       Router.register('telegram-report', renderTelegramReport);
       Router.register('settings-tls', renderTLSSettings);

@@ -116,6 +116,8 @@ func (d *DB) migrateOnce() error {
 		enabled INTEGER DEFAULT 1,
 		traffic_quota BIGINT DEFAULT 0,
 		traffic_used BIGINT DEFAULT 0,
+		traffic_used_in BIGINT NOT NULL DEFAULT 0,
+		traffic_used_out BIGINT NOT NULL DEFAULT 0,
 		speed_limit INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -177,6 +179,7 @@ func (d *DB) migrateOnce() error {
 	CREATE TABLE IF NOT EXISTS system_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		ui_mode TEXT NOT NULL DEFAULT 'novice', ui_radius INTEGER NOT NULL DEFAULT 10,
+		traffic_billing_mode TEXT NOT NULL DEFAULT 'bidirectional', traffic_reset_day INTEGER NOT NULL DEFAULT 1,
 		probe_timeout_ms INTEGER NOT NULL DEFAULT 5000, ping_cache_minutes INTEGER NOT NULL DEFAULT 10,
 		schedule_timezone_offset INTEGER NOT NULL DEFAULT 480,
 		log_enabled INTEGER NOT NULL DEFAULT 1, log_level TEXT NOT NULL DEFAULT 'info',
@@ -254,6 +257,8 @@ func (d *DB) migrateOnce() error {
 		}
 	}
 	for _, migration := range []struct{ column, sql string }{
+		{"traffic_billing_mode", "ALTER TABLE system_settings ADD COLUMN traffic_billing_mode TEXT NOT NULL DEFAULT 'bidirectional'"},
+		{"traffic_reset_day", "ALTER TABLE system_settings ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_playback", "ALTER TABLE system_settings ADD COLUMN log_write_playback INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_video", "ALTER TABLE system_settings ADD COLUMN log_write_video INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_api", "ALTER TABLE system_settings ADD COLUMN log_write_api INTEGER NOT NULL DEFAULT 1"},
@@ -284,6 +289,23 @@ func (d *DB) migrateOnce() error {
 				return err
 			}
 		}
+	}
+	for _, migration := range []struct{ column, sql string }{
+		{"traffic_used_in", "ALTER TABLE sites ADD COLUMN traffic_used_in BIGINT NOT NULL DEFAULT -1"},
+		{"traffic_used_out", "ALTER TABLE sites ADD COLUMN traffic_used_out BIGINT NOT NULL DEFAULT -1"},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", migration.column).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE sites SET traffic_used_in=traffic_used/2, traffic_used_out=traffic_used-(traffic_used/2) WHERE traffic_used_in<0 OR traffic_used_out<0"); err != nil {
+		return err
 	}
 	var logResourceTaxonomyVersion int
 	if err := conn.QueryRowContext(ctx, "SELECT log_resource_taxonomy_version FROM system_settings WHERE id=1").Scan(&logResourceTaxonomyVersion); err != nil {

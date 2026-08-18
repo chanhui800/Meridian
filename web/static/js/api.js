@@ -58,6 +58,10 @@ const API = {
   // Dashboard
   dashboard() { return this.request('GET', '/api/dashboard'); },
   dashboardInsights() { return this.request('GET', '/api/dashboard-insights'); },
+  dashboardTrends(siteId, range) {
+    const params = new URLSearchParams({ site_id: siteId || 'all', range: range || 'realtime' });
+    return this.request('GET', '/api/dashboard-trends?' + params.toString());
+  },
   getSystemSettings() { return this.request('GET', '/api/system-settings'); },
   saveSystemSettings(data) { return this.request('POST', '/api/system-settings', data); },
 

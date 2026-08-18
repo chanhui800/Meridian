@@ -134,8 +134,49 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	}
 	delta := in + out
 	inst.persistedTraffic.Add(delta)
+	inst.persistedBytesIn.Add(in)
+	inst.persistedBytesOut.Add(out)
 	inst.Site.TrafficUsed += delta
+	inst.Site.TrafficUsedIn += in
+	inst.Site.TrafficUsedOut += out
+	settings := pm.database.currentSystemSettings()
+	cycleStart := trafficCycleStart(time.Now(), settings.TrafficResetDay)
+	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
+	if inst.trafficCycleMode == cycleMode && inst.trafficCycleStart.Equal(cycleStart) {
+		inst.trafficCycleUsage += trafficBillableBytes(cycleMode, in, out)
+	}
 	return nil
+}
+
+// currentTrafficCycleUsage returns one consistent view of the persisted and
+// pending usage for the active billing cycle. The persisted portion is loaded
+// once per reset boundary or billing-mode change, then advanced by successful
+// traffic flushes while trafficMu prevents a swap/query race.
+func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.Time) (int64, error) {
+	settings := pm.database.currentSystemSettings()
+	cycleStart := trafficCycleStart(now, settings.TrafficResetDay)
+	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
+
+	inst.trafficMu.Lock()
+	defer inst.trafficMu.Unlock()
+	if inst.trafficCycleMode != cycleMode || !inst.trafficCycleStart.Equal(cycleStart) {
+		persisted, err := pm.database.SumTrafficSinceForSite(inst.Site.ID, cycleStart, cycleMode)
+		if err != nil {
+			return 0, err
+		}
+		inst.trafficCycleStart = cycleStart
+		inst.trafficCycleMode = cycleMode
+		inst.trafficCycleUsage = persisted
+	}
+	return inst.trafficCycleUsage + trafficBillableBytes(cycleMode, inst.bytesIn.Load(), inst.bytesOut.Load()), nil
+}
+
+func (inst *ProxyInstance) persistedDirections() (int64, int64) {
+	in, out := inst.persistedBytesIn.Load(), inst.persistedBytesOut.Load()
+	if in == 0 && out == 0 && inst.persistedTraffic.Load() > 0 {
+		return legacyTrafficDirections(inst.persistedTraffic.Load())
+	}
+	return in, out
 }
 
 // sameTrafficMinute reports whether a persisted recorded_at value falls in the
@@ -209,12 +250,14 @@ func mergePendingIntoLogsAt(logs []TrafficLog, siteID, pendingIn, pendingOut, pe
 // inst.trafficMu (with pm.mu held read-only to pin the instance), so the view
 // never interleaves with a concurrent flush.
 func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistory, error) {
+	billingMode := pm.database.currentSystemSettings().TrafficBillingMode
+	persistedIn, persistedOut := siteTrafficDirections(site)
 	snap := SiteTraffic{
 		ID:               site.ID,
 		Name:             site.Name,
 		TrafficQuota:     site.TrafficQuota,
-		PersistedTraffic: site.TrafficUsed,
-		TrafficUsed:      site.TrafficUsed,
+		PersistedTraffic: trafficBillableBytes(billingMode, persistedIn, persistedOut),
+		TrafficUsed:      trafficBillableBytes(billingMode, persistedIn, persistedOut),
 	}
 
 	pm.mu.RLock()
@@ -225,7 +268,7 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 		if err != nil {
 			return nil, err
 		}
-		return &TrafficHistory{Snapshot: snap, Logs: logs}, nil
+		return &TrafficHistory{Snapshot: snap, Logs: logs, BillingMode: billingMode}, nil
 	}
 	// pm.mu -> trafficMu lock order. trafficMu stays held across the DB read
 	// so the logs and the live counters describe the same instant.
@@ -238,15 +281,16 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 		return nil, err
 	}
 	snap.Running = inst.isOperational()
-	snap.PersistedTraffic = inst.persistedTraffic.Load()
+	persistedIn, persistedOut = inst.persistedDirections()
+	snap.PersistedTraffic = trafficBillableBytes(billingMode, persistedIn, persistedOut)
 	snap.BytesIn = inst.bytesIn.Load()
 	snap.BytesOut = inst.bytesOut.Load()
 	snap.CumulativeBytesIn = inst.cumulativeBytesIn.Load()
 	snap.CumulativeBytesOut = inst.cumulativeBytesOut.Load()
-	snap.TrafficUsed = snap.PersistedTraffic + snap.BytesIn + snap.BytesOut
+	snap.TrafficUsed = snap.PersistedTraffic + trafficBillableBytes(billingMode, snap.BytesIn, snap.BytesOut)
 	snap.Requests = inst.reqCount.Load()
 	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut, inst.pendingRequests.Load())
-	return &TrafficHistory{Snapshot: snap, Logs: logs}, nil
+	return &TrafficHistory{Snapshot: snap, Logs: logs, BillingMode: billingMode}, nil
 }
 
 // overlaySiteTrafficLocked fills st with the authoritative live per-instance
@@ -259,12 +303,14 @@ func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
 	if inst, ok := pm.proxies[s.ID]; ok {
 		inst.trafficMu.Lock()
 		st.Running = inst.isOperational()
-		st.PersistedTraffic = inst.persistedTraffic.Load()
+		persistedIn, persistedOut := inst.persistedDirections()
+		billingMode := pm.database.currentSystemSettings().TrafficBillingMode
+		st.PersistedTraffic = trafficBillableBytes(billingMode, persistedIn, persistedOut)
 		st.BytesIn = inst.bytesIn.Load()
 		st.BytesOut = inst.bytesOut.Load()
 		st.CumulativeBytesIn = inst.cumulativeBytesIn.Load()
 		st.CumulativeBytesOut = inst.cumulativeBytesOut.Load()
-		st.TrafficUsed = st.PersistedTraffic + st.BytesIn + st.BytesOut
+		st.TrafficUsed = st.PersistedTraffic + trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
 		st.Requests = inst.reqCount.Load()
 		inst.trafficMu.Unlock()
 	}
@@ -277,17 +323,27 @@ func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
 // churn; the lock order is pm.mu -> trafficMu.
 func (pm *ProxyManager) LiveSiteTraffic(sites []Site) map[int64]SiteTraffic {
 	live := make(map[int64]SiteTraffic, len(sites))
+	settings := pm.database.currentSystemSettings()
+	billingMode := settings.TrafficBillingMode
+	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay), billingMode)
+	if err != nil {
+		log.Printf("[traffic] failed to load monthly site totals: %v", err)
+		monthlyBySite = map[int64]int64{}
+	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	for _, s := range sites {
+		persistedIn, persistedOut := siteTrafficDirections(s)
 		st := SiteTraffic{
 			ID:               s.ID,
 			Name:             s.Name,
 			TrafficQuota:     s.TrafficQuota,
-			PersistedTraffic: s.TrafficUsed,
-			TrafficUsed:      s.TrafficUsed,
+			MonthlyTraffic:   monthlyBySite[s.ID],
+			PersistedTraffic: trafficBillableBytes(billingMode, persistedIn, persistedOut),
+			TrafficUsed:      trafficBillableBytes(billingMode, persistedIn, persistedOut),
 		}
 		pm.overlaySiteTrafficLocked(s, &st)
+		st.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
 		live[s.ID] = st
 	}
 	return live
@@ -301,9 +357,22 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	settings := pm.database.currentSystemSettings()
+	billingMode := settings.TrafficBillingMode
+	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay), billingMode)
+	if err != nil {
+		return nil, err
+	}
+	var monthlyTraffic int64
+	for _, value := range monthlyBySite {
+		monthlyTraffic += value
+	}
 	snap := &TrafficSnapshot{
-		TotalSites: len(sites),
-		LiveSites:  make([]SiteTraffic, 0, len(sites)),
+		TotalSites:      len(sites),
+		LiveSites:       make([]SiteTraffic, 0, len(sites)),
+		MonthlyTraffic:  monthlyTraffic,
+		BillingMode:     trafficBillingModeLabel(billingMode),
+		TrafficResetDay: settings.TrafficResetDay,
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -313,18 +382,22 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 		}
 	}
 	for _, s := range sites {
+		persistedIn, persistedOut := siteTrafficDirections(s)
 		st := SiteTraffic{
 			ID:               s.ID,
 			Name:             s.Name,
 			TrafficQuota:     s.TrafficQuota,
-			PersistedTraffic: s.TrafficUsed,
-			TrafficUsed:      s.TrafficUsed,
+			MonthlyTraffic:   monthlyBySite[s.ID],
+			PersistedTraffic: trafficBillableBytes(billingMode, persistedIn, persistedOut),
+			TrafficUsed:      trafficBillableBytes(billingMode, persistedIn, persistedOut),
 		}
 		if s.Enabled {
 			snap.OnlineSites++
 		}
 		pm.overlaySiteTrafficLocked(s, &st)
+		st.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
 		snap.TotalTraffic += st.TrafficUsed
+		snap.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
 		snap.TotalRequests += st.Requests
 		snap.LiveSites = append(snap.LiveSites, st)
 	}

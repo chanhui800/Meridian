@@ -119,6 +119,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 	}()
 	inst.persistedTraffic.Store(site.TrafficUsed)
+	inst.persistedBytesIn.Store(site.TrafficUsedIn)
+	inst.persistedBytesOut.Store(site.TrafficUsedOut)
+	if inst.persistedBytesIn.Load() == 0 && inst.persistedBytesOut.Load() == 0 && site.TrafficUsed > 0 {
+		legacyIn, legacyOut := legacyTrafficDirections(site.TrafficUsed)
+		inst.persistedBytesIn.Store(legacyIn)
+		inst.persistedBytesOut.Store(legacyOut)
+	}
 
 	isRedirectMode := playbackTarget != nil && site.PlaybackMode == "redirect"
 	proxyTransport := http.DefaultTransport.(*http.Transport).Clone()
@@ -312,8 +319,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		inst.pendingRequests.Add(1)
 
 		if site.TrafficQuota > 0 {
-			currentUsed := inst.persistedTraffic.Load() + inst.bytesIn.Load() + inst.bytesOut.Load()
-			if currentUsed >= site.TrafficQuota {
+			currentUsed, usageErr := pm.currentTrafficCycleUsage(inst, time.Now())
+			if usageErr != nil {
+				log.Printf("[%s] failed to calculate current traffic cycle usage: %v", site.Name, usageErr)
+			} else if currentUsed >= site.TrafficQuota {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				w.Write([]byte(`{"error":"traffic quota exceeded"}`))
@@ -501,6 +510,8 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 		if flushed := existing.Site.TrafficUsed; flushed > inst.persistedTraffic.Load() {
 			inst.persistedTraffic.Store(flushed)
+			inst.persistedBytesIn.Store(existing.Site.TrafficUsedIn)
+			inst.persistedBytesOut.Store(existing.Site.TrafficUsedOut)
 			inst.Site.TrafficUsed = flushed
 		}
 	}
