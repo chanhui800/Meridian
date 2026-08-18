@@ -16,6 +16,24 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestValidateEphemeralRestoreCredentials(t *testing.T) {
+	original := jwtSecretEphemeral
+	t.Cleanup(func() { jwtSecretEphemeral = original })
+	jwtSecretEphemeral = true
+	if err := validateEphemeralRestoreCredentials(false, nil); err != nil {
+		t.Fatalf("empty ephemeral restore rejected: %v", err)
+	}
+	if err := validateEphemeralRestoreCredentials(true, nil); err == nil {
+		t.Fatal("backup credentials were accepted with an ephemeral JWT secret")
+	}
+	if err := validateEphemeralRestoreCredentials(false, &backupPanelSettings{ACMETokenCiphertext: "ciphertext"}); err == nil {
+		t.Fatal("preserved ACME credentials were accepted with an ephemeral JWT secret")
+	}
+	jwtSecretEphemeral = false
+	if err := validateEphemeralRestoreCredentials(true, &backupPanelSettings{ACMETokenCiphertext: "ciphertext"}); err != nil {
+		t.Fatalf("stable restore rejected: %v", err)
+	}
+}
 func TestBackupEncryptionRejectsWrongPasswordAndTampering(t *testing.T) {
 	plain := []byte("private meridian backup")
 	sealed, err := sealBackup(plain, "correct horse battery staple")

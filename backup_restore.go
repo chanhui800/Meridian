@@ -594,6 +594,16 @@ func backupHasTelegramToken(database []byte) (bool, error) {
 	return telegramCiphertext != "" || acmeCiphertext != "", nil
 }
 
+func validateEphemeralRestoreCredentials(hasStoredCredentials bool, preservedPanelSettings *backupPanelSettings) error {
+	if !jwtSecretEphemeral {
+		return nil
+	}
+	if hasStoredCredentials || (preservedPanelSettings != nil && strings.TrimSpace(preservedPanelSettings.ACMETokenCiphertext) != "") {
+		return errors.New("当前 JWT_SECRET 不是持久密钥，无法安全恢复 Telegram 或 ACME 凭据；请先配置稳定密钥")
+	}
+	return nil
+}
+
 func readBackupPanelSettings(db *sql.DB) (*backupPanelSettings, error) {
 	if db == nil {
 		return nil, errors.New("当前数据库不可用")
@@ -1058,14 +1068,12 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	hasStoredCredentials := false
 	if jwtSecretEphemeral {
-		hasToken, tokenErr := backupHasTelegramToken(entries[backupDatabaseEntry])
+		var tokenErr error
+		hasStoredCredentials, tokenErr = backupHasTelegramToken(entries[backupDatabaseEntry])
 		if tokenErr != nil {
 			a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查已保存凭据")
-			return
-		}
-		if hasToken {
-			a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全恢复 Telegram 或 ACME 凭据；请先配置稳定密钥")
 			return
 		}
 	}
@@ -1117,6 +1125,10 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, "恢复校验失败：无法读取当前 TLS 设置")
 			return
 		}
+	}
+	if err := validateEphemeralRestoreCredentials(hasStoredCredentials, preservedPanelSettings); err != nil {
+		a.jsonErr(w, http.StatusConflict, err.Error())
+		return
 	}
 	targetHostIngressWithoutTLS := a.panelBindLoopback || len(a.trustedProxies) > 0
 	resetIngressCount, err := writeRestorePending(a.dbPath, manifest, entries, jwtSecret, activeStoredCredentialSecret(), targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
