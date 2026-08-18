@@ -158,7 +158,7 @@ func (p dynamicRedirectPolicy) validateTarget(previous, target *url.URL, selfTar
 			return dynamicObservationReasonPortDenied
 		}
 	}
-	if p.profile == dynamicProfileSafe && !dynamicDomainRuleMatches(target.Hostname(), p.domainRules) {
+	if p.profile == dynamicProfileSafe && !dynamicSafeDomainAllowed(target.Hostname(), p.domainRules) {
 		return dynamicObservationReasonDomainDenied
 	}
 	if previous != nil && strings.EqualFold(previous.Scheme, "https") && target.Scheme == "http" && !p.allowHTTPSDowngrade {

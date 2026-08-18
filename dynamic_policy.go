@@ -396,6 +396,37 @@ func decodeDynamicDomainRules(raw string) ([]DynamicDomainRule, error) {
 	return rules, nil
 }
 
+func decodeOptionalBoolAPI(raw json.RawMessage, field string) (bool, bool, error) {
+	if len(raw) == 0 {
+		return false, false, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(string(raw)), "null") {
+		return false, true, fmt.Errorf("%s must be a JSON boolean, not null", field)
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, true, fmt.Errorf("%s must be a JSON boolean", field)
+	}
+	return value, true, nil
+}
+
+func decodeDynamicDomainRulesAPI(raw json.RawMessage) ([]DynamicDomainRule, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(string(raw)), "null") {
+		return nil, true, fmt.Errorf("dynamic_domain_rules must be a JSON array, not null")
+	}
+	rules, err := decodeDynamicDomainRules(string(raw))
+	if err != nil {
+		return nil, true, err
+	}
+	if rules == nil {
+		return nil, true, fmt.Errorf("dynamic_domain_rules must be a JSON array, not null")
+	}
+	return rules, true, nil
+}
+
 func allDynamicDiscoverySources() []string {
 	return []string{
 		dynamicDiscoverySourceRedirect,
@@ -596,6 +627,9 @@ func normalizeDynamicSitePolicy(site *Site) error {
 	}
 	site.DynamicProfile = profile
 	if profile == dynamicProfileSafe {
+		if site.DynamicAllowHTTPSDowngrade {
+			return fmt.Errorf("safe dynamic profile must not allow HTTPS downgrade")
+		}
 		site.DynamicAllowHTTPSDowngrade = false
 	} else if profile == dynamicProfileCompatible {
 		site.DynamicAllowHTTPSDowngrade = true

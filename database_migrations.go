@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -216,6 +217,9 @@ func (d *DB) migrateOnce() error {
 	}
 	if err := validateDynamicObservationSchema(ctx, conn); err != nil {
 		return err
+	}
+	if err := pruneDynamicObservationRows(ctx, conn, time.Now()); err != nil {
+		return fmt.Errorf("prune dynamic observations during migration: %w", err)
 	}
 
 	for _, migration := range []struct {

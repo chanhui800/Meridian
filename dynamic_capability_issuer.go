@@ -65,12 +65,20 @@ func (i *dynamicCapabilityIssuer) observe(source, decision, reasonCode, authorit
 	if i == nil || i.database == nil || authority == "" {
 		return
 	}
+	targetKind := dynamicObservationTargetDiscovered
+	if authority == i.primaryAuthority || strings.TrimSuffix(authority, ":443") == strings.TrimSuffix(i.primaryAuthority, ":443") || strings.TrimSuffix(authority, ":80") == strings.TrimSuffix(i.primaryAuthority, ":80") {
+		targetKind = dynamicObservationTargetSameAuthority
+	} else if i.configuredAuthorities[authority] {
+		targetKind = dynamicObservationTargetConfigured
+	}
 	i.database.EnqueueDynamicObservation(dynamicObservationEvent{
 		SiteID:             i.siteID,
 		CanonicalAuthority: authority,
 		Source:             source,
+		TargetKind:         targetKind,
 		Decision:           decision,
 		ReasonCode:         reasonCode,
+		RedirectStatus:     0,
 	})
 }
 

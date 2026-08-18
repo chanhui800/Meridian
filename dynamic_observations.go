@@ -250,9 +250,6 @@ func isCanonicalDynamicObservationAuthority(value string) bool {
 }
 
 func (d *DB) EnqueueDynamicObservation(event dynamicObservationEvent) {
-	if d == nil {
-		return
-	}
 	stage, stageOK := dynamicObservationStageForReason(event.ReasonCode)
 	if event.SiteID <= 0 || !validDynamicObservationEnums(event.Source, event.Decision, event.ReasonCode) || !stageOK || !validDynamicObservationRouteDimensions(event.Source, event.TargetKind, event.RedirectStatus) || !isCanonicalDynamicObservationAuthority(event.CanonicalAuthority) {
 		d.droppedDynamicObservations.Add(1)

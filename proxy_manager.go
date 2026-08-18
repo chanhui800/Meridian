@@ -109,6 +109,18 @@ func (e *siteIngressClosedError) Error() string {
 	}
 }
 
+func (e *siteIngressClosedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	if e.drainErr != nil && e.flushErr != nil {
+		return errors.Join(e.drainErr, e.flushErr)
+	}
+	if e.drainErr != nil {
+		return e.drainErr
+	}
+	return e.flushErr
+}
 func isSiteIngressClosedError(err error) bool {
 	var closedErr *siteIngressClosedError
 	return errors.As(err, &closedErr)
@@ -187,6 +199,9 @@ func (inst *ProxyInstance) untrackHijackedConn(conn net.Conn) {
 }
 
 func (inst *ProxyInstance) shutdown(ctx context.Context) error {
+	if err := inst.drainProgress(ctx); err != nil {
+		return err
+	}
 	inst.lifecycleMu.Lock()
 	if !inst.closing {
 		inst.closing = true
@@ -222,9 +237,6 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 		_ = conn.Close()
 	}
 
-	if err := inst.drainProgress(ctx); err != nil {
-		return err
-	}
 	drained := make(chan struct{})
 	go func() {
 		inst.activeRequests.Wait()
@@ -234,6 +246,9 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 	case <-drained:
 		if inst.dynamicState != nil {
 			inst.dynamicState.close()
+		}
+		if inst.pingCache != nil {
+			inst.pingCache.invalidate()
 		}
 		if inst.imageCache != nil {
 			inst.imageCache.close()

@@ -98,10 +98,10 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomVersion              string                `json:"custom_version"`
 			ClientIPMode               string                `json:"client_ip_mode"`
 			UpstreamHeaders            []UpstreamHeaderInput `json:"upstream_headers"`
-			DynamicDiscoveryEnabled    bool                  `json:"dynamic_discovery_enabled"`
+			DynamicDiscoveryEnabled    optionalJSONBool      `json:"dynamic_discovery_enabled"`
 			DynamicProfile             string                `json:"dynamic_profile"`
 			DynamicDiscoverySources    json.RawMessage       `json:"dynamic_discovery_sources"`
-			DynamicDomainRules         []DynamicDomainRule   `json:"dynamic_domain_rules"`
+			DynamicDomainRules         json.RawMessage       `json:"dynamic_domain_rules"`
 			DynamicAllowHTTPSDowngrade bool                  `json:"dynamic_allow_https_downgrade"`
 			PingCacheEnabled           bool                  `json:"ping_cache_enabled"`
 			ImageCacheEnabled          bool                  `json:"image_cache_enabled"`
@@ -117,7 +117,20 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
+		dynamicEnabled := false
+		if req.DynamicDiscoveryEnabled.Present {
+			if req.DynamicDiscoveryEnabled.Null {
+				a.jsonErr(w, http.StatusBadRequest, "dynamic_discovery_enabled must be a JSON boolean, not null")
+				return
+			}
+			dynamicEnabled = req.DynamicDiscoveryEnabled.Value
+		}
 		dynamicSources, _, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		dynamicRules, _, err := decodeDynamicDomainRulesAPI(req.DynamicDomainRules)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -127,10 +140,10 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dynamicPolicy := Site{
-			DynamicDiscoveryEnabled:    req.DynamicDiscoveryEnabled,
+			DynamicDiscoveryEnabled:    dynamicEnabled,
 			DynamicProfile:             req.DynamicProfile,
 			DynamicDiscoverySources:    dynamicSources,
-			DynamicDomainRules:         req.DynamicDomainRules,
+			DynamicDomainRules:         dynamicRules,
 			DynamicAllowHTTPSDowngrade: req.DynamicAllowHTTPSDowngrade,
 		}
 		if err := normalizeDynamicSitePolicy(&dynamicPolicy); err != nil {
@@ -417,8 +430,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			a.jsonOK(w, DynamicObservationsResponse{
-				Observations:        make([]DynamicObservation, 0),
-				DroppedObservations: a.db.DroppedDynamicObservations(),
+				Observations:              make([]DynamicObservation, 0),
+				DroppedObservations:       a.db.DroppedDynamicObservations(),
+				DroppedObservationsGlobal: a.db.DroppedDynamicObservations(),
+				RetentionDays:             dynamicObservationRetentionDays,
+				PerSiteRowLimit:           dynamicObservationPerSiteRowLimit,
+				GlobalRowLimit:            dynamicObservationGlobalRowLimit,
 			})
 			return
 		}
@@ -428,8 +445,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.jsonOK(w, DynamicObservationsResponse{
-			Observations:        observations,
-			DroppedObservations: a.db.DroppedDynamicObservations(),
+			Observations:              observations,
+			DroppedObservations:       a.db.DroppedDynamicObservations(),
+			DroppedObservationsGlobal: a.db.DroppedDynamicObservations(),
+			RetentionDays:             dynamicObservationRetentionDays,
+			PerSiteRowLimit:           dynamicObservationPerSiteRowLimit,
+			GlobalRowLimit:            dynamicObservationGlobalRowLimit,
 		})
 
 	case action == "toggle" && r.Method == "POST":
@@ -536,10 +557,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			CustomVersion              *string                `json:"custom_version"`
 			ClientIPMode               *string                `json:"client_ip_mode"`
 			UpstreamHeaders            *[]UpstreamHeaderInput `json:"upstream_headers"`
-			DynamicDiscoveryEnabled    *bool                  `json:"dynamic_discovery_enabled"`
+			DynamicDiscoveryEnabled    optionalJSONBool       `json:"dynamic_discovery_enabled"`
 			DynamicProfile             *string                `json:"dynamic_profile"`
-			DynamicDiscoverySources    json.RawMessage        `json:"dynamic_discovery_sources"`
-			DynamicDomainRules         *[]DynamicDomainRule   `json:"dynamic_domain_rules"`
+			DynamicDiscoverySources    optionalJSONRaw        `json:"dynamic_discovery_sources"`
+			DynamicDomainRules         optionalJSONRaw        `json:"dynamic_domain_rules"`
 			DynamicAllowHTTPSDowngrade *bool                  `json:"dynamic_allow_https_downgrade"`
 			PingCacheEnabled           *bool                  `json:"ping_cache_enabled"`
 			ImageCacheEnabled          *bool                  `json:"image_cache_enabled"`
@@ -555,10 +576,27 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
-		requestedDynamicSources, dynamicSourcesProvided, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
-		if err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
+		dynamicEnabledValue := false
+		dynamicEnabledProvided := req.DynamicDiscoveryEnabled.Present
+		if req.DynamicDiscoveryEnabled.Present {
+			if req.DynamicDiscoveryEnabled.Null {
+				a.jsonErr(w, http.StatusBadRequest, "dynamic_discovery_enabled must be a JSON boolean, not null")
+				return
+			}
+			dynamicEnabledValue = req.DynamicDiscoveryEnabled.Value
+		}
+		requestedDynamicSources := []string(nil)
+		dynamicSourcesProvided := req.DynamicDiscoverySources.Present
+		if dynamicSourcesProvided {
+			if req.DynamicDiscoverySources.Null {
+				a.jsonErr(w, http.StatusBadRequest, "dynamic_discovery_sources must be a JSON array, not null")
+				return
+			}
+			requestedDynamicSources, _, err = decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources.Raw)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		playbackTargetURL := oldSite.PlaybackTargetURL
 		if req.PlaybackTargetURL != nil {
@@ -787,17 +825,34 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		candidate.StoredUpstreamHeaders = storedHeaders
-		if req.DynamicDiscoveryEnabled != nil {
-			candidate.DynamicDiscoveryEnabled = *req.DynamicDiscoveryEnabled
+		if dynamicEnabledProvided {
+			candidate.DynamicDiscoveryEnabled = dynamicEnabledValue
 		}
 		if req.DynamicProfile != nil {
 			candidate.DynamicProfile = *req.DynamicProfile
 		}
+		profileChanged := req.DynamicProfile != nil && strings.EqualFold(strings.TrimSpace(*req.DynamicProfile), oldSite.DynamicProfile) == false
+		enabling := !oldSite.DynamicDiscoveryEnabled && candidate.DynamicDiscoveryEnabled
+		if profileChanged && strings.EqualFold(strings.TrimSpace(candidate.DynamicProfile), dynamicProfileSafe) && req.DynamicAllowHTTPSDowngrade == nil {
+			candidate.DynamicAllowHTTPSDowngrade = false
+		}
+		if (profileChanged || enabling) && !dynamicSourcesProvided {
+			candidate.DynamicDiscoverySources, _ = dynamicDiscoverySourcesForProfile(candidate.DynamicProfile)
+		}
 		if dynamicSourcesProvided {
 			candidate.DynamicDiscoverySources = requestedDynamicSources
 		}
-		if req.DynamicDomainRules != nil {
-			candidate.DynamicDomainRules = *req.DynamicDomainRules
+		if req.DynamicDomainRules.Present {
+			if req.DynamicDomainRules.Null {
+				a.jsonErr(w, http.StatusBadRequest, "dynamic_domain_rules must be a JSON array, not null")
+				return
+			}
+			rules, _, decodeErr := decodeDynamicDomainRulesAPI(req.DynamicDomainRules.Raw)
+			if decodeErr != nil {
+				a.jsonErr(w, http.StatusBadRequest, decodeErr.Error())
+				return
+			}
+			candidate.DynamicDomainRules = rules
 		}
 		if req.DynamicAllowHTTPSDowngrade != nil {
 			candidate.DynamicAllowHTTPSDowngrade = *req.DynamicAllowHTTPSDowngrade
@@ -830,6 +885,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		if err := normalizeDynamicSitePolicy(&candidate); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		if dynamicSourcesProvided {
+			if err := validateSelectableDynamicDiscoverySources(candidate.DynamicProfile, candidate.DynamicDiscoverySources); err != nil && !dynamicDiscoverySourcesEqual(candidate.DynamicDiscoverySources, oldSite.DynamicDiscoverySources) {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		if err := validateDynamicDiscoveryAPIEnablement(candidate, len(a.dynamicRouteKey) == sha256.Size, oldSite.DynamicDiscoveryEnabled); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())

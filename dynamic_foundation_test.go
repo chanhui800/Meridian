@@ -140,6 +140,12 @@ func TestStoredDynamicPolicyCorruptionFailsStartupAndReopen(t *testing.T) {
 				db.Close()
 				t.Fatalf("create site: %v", err)
 			}
+			if tc.name == "safe HTTPS downgrade" {
+				if _, err := db.db.Exec("UPDATE sites SET dynamic_profile='safe' WHERE id=?", site.ID); err != nil {
+					db.Close()
+					t.Fatalf("prepare safe corruption: %v", err)
+				}
+			}
 			query := fmt.Sprintf("UPDATE sites SET %s=?, enabled=0 WHERE id=?", tc.column)
 			if _, err := db.db.Exec(query, tc.value, site.ID); err != nil {
 				db.Close()
@@ -189,7 +195,7 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	for name, dynamicFields := range map[string]map[string]interface{}{
 		"server revision":          {"dynamic_policy_revision": 1},
 		"enabled without key":      {"dynamic_discovery_enabled": true},
-		"safe public exact IP":     {"dynamic_domain_rules": []map[string]string{{"type": "exact", "value": "8.8.8.8"}}},
+		"safe public exact IP":     {"dynamic_profile": "safe", "dynamic_domain_rules": []map[string]string{{"type": "exact", "value": "8.8.8.8"}}},
 		"null rules":               {"dynamic_domain_rules": nil},
 		"compatible redirect only": {"dynamic_profile": "compatible", "dynamic_discovery_sources": []string{"redirect"}},
 		"missing redirect":         {"dynamic_profile": "compatible", "dynamic_discovery_sources": []string{"playback_info", "hls", "dash"}},
@@ -397,7 +403,7 @@ func TestDynamicSiteAPIPresenceAndDomainRuleSemantics(t *testing.T) {
 	withKey := newTestApp(t)
 	withKey.dynamicRouteKey = bytes.Repeat([]byte{0x5a}, 32)
 	defaulted := post(withKey, basePayload("omitted-with-key"), http.StatusCreated)
-	if !defaulted.DynamicDiscoveryEnabled || defaulted.DynamicProfile != dynamicProfileSafe || len(defaulted.DynamicDomainRules) != 0 || !dynamicDiscoverySourcesEqual(defaulted.DynamicDiscoverySources, []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}) || defaulted.DynamicAllowHTTPSDowngrade {
+	if defaulted.DynamicDiscoveryEnabled || defaulted.DynamicProfile != dynamicProfileCompatible || len(defaulted.DynamicDomainRules) != 0 || !dynamicDiscoverySourcesEqual(defaulted.DynamicDiscoverySources, allDynamicDiscoverySources()) || !defaulted.DynamicAllowHTTPSDowngrade {
 		t.Fatalf("key-backed POST defaults = %#v", defaulted)
 	}
 	explicitFalseWithKey := basePayload("false-with-key")
@@ -442,11 +448,11 @@ func TestDynamicSiteAPIPresenceAndDomainRuleSemantics(t *testing.T) {
 		t.Fatalf("explicit PUT rules = %#v", defaulted)
 	}
 	update(map[string]interface{}{"name": "omitted-rules-preserved"}, http.StatusOK)
-	if !defaulted.DynamicDiscoveryEnabled || len(defaulted.DynamicDomainRules) != 1 || defaulted.DynamicDomainRules[0] != exactRule || defaulted.DynamicPolicyRevision != 2 {
+	if defaulted.DynamicDiscoveryEnabled || len(defaulted.DynamicDomainRules) != 1 || defaulted.DynamicDomainRules[0] != exactRule || defaulted.DynamicPolicyRevision != 2 {
 		t.Fatalf("omitted PUT rules/discovery changed policy = %#v", defaulted)
 	}
 	update(map[string]interface{}{"dynamic_discovery_enabled": nil}, http.StatusBadRequest)
-	if reloaded, err := withKey.db.GetSite(defaulted.ID); err != nil || !reloaded.DynamicDiscoveryEnabled || reloaded.DynamicPolicyRevision != 2 {
+	if reloaded, err := withKey.db.GetSite(defaulted.ID); err != nil || reloaded.DynamicDiscoveryEnabled || reloaded.DynamicPolicyRevision != 2 {
 		t.Fatalf("null PUT discovery switch changed policy: site=%#v err=%v", reloaded, err)
 	}
 	update(map[string]interface{}{"dynamic_domain_rules": nil}, http.StatusBadRequest)
@@ -755,7 +761,7 @@ func TestDynamicProfilesEndpointIsAuthenticatedAndDoesNotDiscloseKey(t *testing.
 		t.Fatalf("empty rule semantics = %q", body.EmptyRulesSemantics)
 	}
 	defaultPolicy := body.DefaultPolicy
-	if !defaultPolicy.DynamicDiscoveryEnabled || defaultPolicy.DynamicProfile != dynamicProfileSafe || !dynamicDiscoverySourcesEqual(defaultPolicy.DynamicDiscoverySources, []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}) || len(defaultPolicy.DynamicDomainRules) != 0 || defaultPolicy.DynamicAllowHTTPSDowngrade {
+	if !defaultPolicy.DynamicDiscoveryEnabled || defaultPolicy.DynamicProfile != dynamicProfileCompatible || !dynamicDiscoverySourcesEqual(defaultPolicy.DynamicDiscoverySources, allDynamicDiscoverySources()) || len(defaultPolicy.DynamicDomainRules) != 0 || !defaultPolicy.DynamicAllowHTTPSDowngrade {
 		t.Fatalf("default dynamic policy = %#v", defaultPolicy)
 	}
 	if body.RollbackReadiness != (DynamicRollbackReadiness{}) {

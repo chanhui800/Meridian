@@ -271,12 +271,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
 		},
 	}
-	if isRedirectMode || redirectPolicy.configured {
+	if isRedirectMode || redirectPolicy.configured || len(playbackHostsSet) > 0 {
 		proxy.Transport = &redirectFollowTransport{
 			base:                    proxy.Transport,
 			playbackHosts:           playbackHostsSet,
 			configuredAuthorities:   configuredAuthorities,
-			disableLegacyRedirects:  !isRedirectMode,
+			disableLegacyRedirects:  !isRedirectMode && len(playbackHostsSet) == 0,
 			followUnknownRedirects:  redirectPolicy.configured,
 			policy:                  policy,
 			clientIPMode:            site.ClientIPMode,

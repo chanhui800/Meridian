@@ -140,6 +140,9 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 		delta.Requests += requests - bucketRequests
 		buckets[minute] = delta
 	}
+	if in == 0 && out == 0 && requests == 0 && len(buckets) == 0 {
+		return nil
+	}
 	if pm.database == nil {
 		inst.bytesIn.Add(in)
 		inst.bytesOut.Add(out)

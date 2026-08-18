@@ -668,6 +668,9 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		issuer.observe(observationSource, dynamicObservationDecisionDenied, reasonCode, authority)
 		return newDynamicProxyError(reasonCode)
 	}
+	if expectedSource != "" && rewriteRelative && !required && !issuer.policy.sourceEnabled(expectedSource) {
+		return nil
+	}
 	if expectedSource != "" && rewriteRelative && resp != nil && resp.StatusCode < http.StatusBadRequest && (source != expectedSource || !contentTypeAllowed) {
 		if resp.Body != nil {
 			_ = resp.Body.Close()
@@ -691,6 +694,9 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		return recordFailure(dynamicObservationReasonRequestUnclassified)
 	}
 	if rewriteRelative && resp != nil && resp.StatusCode < http.StatusBadRequest && source != "" && contentTypeAllowed && !issuer.policy.sourceEnabled(source) {
+		if expectedSource == source && !required {
+			return nil
+		}
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}

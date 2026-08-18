@@ -391,15 +391,34 @@ func crossAuthorityWebSocketHeadersWithClientIPMode(source http.Header, mode str
 }
 
 func (t *redirectFollowTransport) observe(decision, reasonCode, authority string) {
+	t.observeWithStatus(decision, reasonCode, authority, 0)
+}
+
+func (t *redirectFollowTransport) observeWithStatus(decision, reasonCode, authority string, redirectStatus int) {
 	if t.database == nil || authority == "" {
 		return
+	}
+	targetKind := dynamicObservationTargetDiscovered
+	configured := t.configuredAuthorities[authority]
+	if !configured {
+		for candidate := range t.configuredAuthorities {
+			if strings.TrimSuffix(candidate, ":80") == strings.TrimSuffix(authority, ":80") || strings.TrimSuffix(candidate, ":443") == strings.TrimSuffix(authority, ":443") {
+				configured = true
+				break
+			}
+		}
+	}
+	if configured {
+		targetKind = dynamicObservationTargetConfigured
 	}
 	t.database.EnqueueDynamicObservation(dynamicObservationEvent{
 		SiteID:             t.siteID,
 		CanonicalAuthority: authority,
 		Source:             dynamicObservationSourceRedirect,
+		TargetKind:         targetKind,
 		Decision:           decision,
 		ReasonCode:         reasonCode,
+		RedirectStatus:     redirectStatus,
 	})
 }
 
@@ -418,12 +437,26 @@ func dynamicRedirectURLKey(target *url.URL) string {
 	return target.String()
 }
 
+func isManualRedirectEligibleRequest(req *http.Request) bool {
+	return req != nil && (req.Method == http.MethodGet || req.Method == http.MethodHead) && !hasUpgradeIntent(req) && req.URL != nil && !isReservedDynamicRoute(req.URL.Path)
+}
+
+func manualHandledRedirectStatus(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *redirectFollowTransport) roundTripLegacy(req *http.Request, resp *http.Response) (*http.Response, error) {
-	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+	if !isManualRedirectEligibleRequest(req) {
 		return resp, nil
 	}
-	for range 3 {
-		if resp.StatusCode != 301 && resp.StatusCode != 302 && resp.StatusCode != 307 && resp.StatusCode != 308 {
+	visited := map[string]struct{}{dynamicRedirectURLKey(req.URL): {}}
+	for followed := 0; followed < manualRedirectMaxHops; followed++ {
+		if !manualHandledRedirectStatus(resp.StatusCode) {
 			break
 		}
 		loc := resp.Header.Get("Location")
@@ -436,9 +469,19 @@ func (t *redirectFollowTransport) roundTripLegacy(req *http.Request, resp *http.
 		}
 		locURL = req.URL.ResolveReference(locURL)
 		locURL.Scheme = strings.ToLower(locURL.Scheme)
-		if (locURL.Scheme != "http" && locURL.Scheme != "https") || locURL.User != nil || !t.playbackHosts[redirectHostKey(locURL)] {
+		if (locURL.Scheme != "http" && locURL.Scheme != "https") || locURL.User != nil || locURL.Fragment != "" || locURL.RawFragment != "" || !t.playbackHosts[redirectHostKey(locURL)] {
+			if authority := dynamicCanonicalAuthority(locURL); authority != "" {
+				t.observeWithStatus(dynamicObservationDecisionDenied, dynamicObservationReasonInvalidLocation, authority, resp.StatusCode)
+			}
 			break
 		}
+		key := dynamicRedirectURLKey(locURL)
+		if followed > 0 {
+			if _, seen := visited[key]; seen {
+				break
+			}
+		}
+		redirectStatus := resp.StatusCode
 		resp.Body.Close()
 		// #nosec G704 -- the redirect authority must match an administrator-configured playback authority.
 		newReq, err := http.NewRequestWithContext(req.Context(), req.Method, locURL.String(), nil)
@@ -460,6 +503,8 @@ func (t *redirectFollowTransport) roundTripLegacy(req *http.Request, resp *http.
 		if err != nil {
 			return nil, err
 		}
+		visited[key] = struct{}{}
+		t.observeWithStatus(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, dynamicCanonicalAuthority(locURL), redirectStatus)
 		req = newReq
 	}
 	return resp, nil
@@ -567,8 +612,8 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			if _, seen := visited[key]; seen {
 				return fail(dynamicObservationReasonRedirectLoop, observationAuthority)
 			}
-			if redirectsFollowed >= manualRedirectMaxHops {
-				return resp, nil
+			if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
+				return fail(dynamicObservationReasonHopLimit, observationAuthority)
 			}
 			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, resp.StatusCode, locationURL)
 			if reasonCode != "" {
@@ -598,7 +643,7 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 
 		if !dynamicActive && !unknownAuthority {
-			if t.disableLegacyRedirects || !t.playbackHosts[manualAuthority] || redirectsFollowed >= 3 {
+			if t.disableLegacyRedirects || !t.playbackHosts[manualAuthority] || redirectsFollowed >= manualRedirectMaxHops {
 				return resp, nil
 			}
 			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, resp.StatusCode, locationURL)
@@ -858,6 +903,14 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return newMainVideoDirectFallbackResponse(req, directFallback), nil
 		}
+		if t.database != nil && req != nil && req.URL != nil && t.dynamicPolicy.configured {
+			authority := dynamicCanonicalAuthority(req.URL)
+			t.database.EnqueueDynamicObservation(dynamicObservationEvent{
+				SiteID: t.siteID, CanonicalAuthority: authority, Source: dynamicObservationSourceRedirect,
+				TargetKind: dynamicObservationTargetSameAuthority, Decision: dynamicObservationDecisionDenied,
+				ReasonCode: dynamicObservationReasonResponseFailure, RedirectStatus: 0,
+			})
+		}
 		return nil, err
 	}
 	if t.mainVideoDirect && directFallback != nil {
@@ -877,11 +930,18 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 		return replaceResponseWithMainVideoDirectTarget(resp, directFallback), nil
 	}
 	eligible, _ := req.Context().Value(dynamicRequestEligibleContextKey{}).(bool)
-	if !t.dynamicPolicy.configured {
-		if t.disableLegacyRedirects {
-			return resp, nil
+	if (req.Method != http.MethodGet && req.Method != http.MethodHead) && len(t.playbackHosts) > 0 {
+		return resp, nil
+	}
+	manualAllowed := len(t.playbackHosts) > 0 && (!eligible || !t.dynamicPolicy.configured || !t.dynamicPolicy.sourceEnabled(dynamicDiscoverySourceRedirect))
+	if manualAllowed {
+		resp, err = t.roundTripLegacy(req, resp)
+		if err != nil {
+			return nil, err
 		}
-		return t.roundTripLegacy(req, resp)
+	}
+	if !t.dynamicPolicy.configured {
+		return resp, nil
 	}
 	if !eligible || !t.dynamicPolicy.sourceEnabled(dynamicDiscoverySourceRedirect) {
 		return resp, nil

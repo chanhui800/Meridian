@@ -1,11 +1,40 @@
 package main
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type optionalJSONBool struct {
+	Present bool
+	Null    bool
+	Value   bool
+}
+
+func (b *optionalJSONBool) UnmarshalJSON(raw []byte) error {
+	b.Present = true
+	if string(raw) == "null" {
+		b.Null = true
+		return nil
+	}
+	return json.Unmarshal(raw, &b.Value)
+}
+
+type optionalJSONRaw struct {
+	Present bool
+	Null    bool
+	Raw     json.RawMessage
+}
+
+func (r *optionalJSONRaw) UnmarshalJSON(raw []byte) error {
+	r.Present = true
+	r.Null = string(raw) == "null"
+	r.Raw = append(r.Raw[:0], raw...)
+	return nil
+}
 
 const manualRedirectMaxHops = 5
 
-// dynamicDiscoverySourcesEqual compares canonical source lists without sorting;
-// profile normalization already defines their order.
 func dynamicDiscoverySourcesEqual(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

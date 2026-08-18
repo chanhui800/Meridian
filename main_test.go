@@ -4856,6 +4856,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"dynamic_discovery_sources": true,
 		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
 		"dynamic_policy_revision": true,
+		"ping_cache_enabled": true, "image_cache_enabled": true, "progress_coalescing_enabled": true,
 		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
 		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,
 		"monthly_traffic": true,
