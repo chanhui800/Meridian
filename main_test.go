@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,7 +26,6 @@ import (
 	"testing"
 	"time"
 
-	xhtml "golang.org/x/net/html"
 	"meridian/web"
 )
 
@@ -31,6 +33,58 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestRoutePrefixHostRoundTrip(t *testing.T) {
+	host, err := routeHostForPrefix(" Node-01 ", "ABC.example.com")
+	if err != nil || host != "node-01.abc.example.com" {
+		t.Fatalf("routeHostForPrefix = %q, %v", host, err)
+	}
+	if got := routePrefixFromHost(host, "abc.example.com"); got != "node-01" {
+		t.Fatalf("routePrefixFromHost = %q, want node-01", got)
+	}
+	for _, prefix := range []string{"", "a.b", "-bad", "bad-", "bad_"} {
+		if _, err := routeHostForPrefix(prefix, "abc.example.com"); err == nil {
+			t.Fatalf("route prefix %q unexpectedly accepted", prefix)
+		}
+	}
+}
+
+func TestPanelTLSConfigFromEnvRequiresFiles(t *testing.T) {
+	t.Setenv("PANEL_TLS_ENABLED", "true")
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	if _, enabled, err := panelTLSConfigFromEnv(":memory:"); err == nil || enabled {
+		t.Fatalf("missing TLS files returned enabled=%v err=%v", enabled, err)
+	}
+}
+
+func TestPanelCertificateRequestValidation(t *testing.T) {
+	if err := validatePanelCertificateRequest("admin@example.com", strings.Repeat("a", 32)); err != nil {
+		t.Fatalf("valid certificate request rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		email string
+		token string
+	}{
+		{"bad", strings.Repeat("a", 32)},
+		{"admin@example.com", "short"},
+		{"admin@example.com", strings.Repeat("a", 10) + "\n" + strings.Repeat("a", 10)},
+	} {
+		if err := validatePanelCertificateRequest(tc.email, tc.token); err == nil {
+			t.Fatalf("invalid request email=%q token_len=%d accepted", tc.email, len(tc.token))
+		}
+	}
+}
+
+func TestPanelTLSPathsDefaultBesideDatabase(t *testing.T) {
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	databasePath := filepath.Join(t.TempDir(), "meridian.db")
+	certFile, keyFile := panelTLSPaths(databasePath)
+	if certFile != filepath.Join(filepath.Dir(databasePath), "tls", "fullchain.pem") || keyFile != filepath.Join(filepath.Dir(databasePath), "tls", "privkey.pem") {
+		t.Fatalf("panelTLSPaths = %q, %q", certFile, keyFile)
+	}
 }
 
 func newTestApp(t *testing.T) *App {
@@ -81,6 +135,51 @@ func freePort(t *testing.T) int {
 func releasePort(port int) {
 	if v, ok := reservedPorts.LoadAndDelete(port); ok {
 		_ = v.(net.Listener).Close()
+	}
+}
+
+func TestDedicatedPortUsesPanelTLSWhenConfigured(t *testing.T) {
+	app := newTestApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("tls-upstream"))
+	}))
+	defer upstream.Close()
+
+	certificateServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer certificateServer.Close()
+	app.pm.SetSiteTLSConfig(&tls.Config{Certificates: certificateServer.TLS.Certificates})
+
+	port := freePort(t)
+	releasePort(port)
+	site, err := app.db.CreateSiteRecord(Site{
+		Name:         "tls-port",
+		ListenPort:   port,
+		IngressMode:  ingressModePort,
+		TargetURL:    upstream.URL,
+		PlaybackMode: "direct",
+		StreamHosts:  "[]",
+		UAMode:       "infuse",
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	client := certificateServer.Client()
+	resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/System/Info/Public", port))
+	if err != nil {
+		t.Fatalf("dedicated TLS request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read dedicated TLS response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "tls-upstream" {
+		t.Fatalf("dedicated TLS response status=%d body=%q", resp.StatusCode, body)
 	}
 }
 
@@ -469,7 +568,7 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			defer db.Close()
 
-			for _, column := range []string{"playback_target_url", "playback_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "public_host", "ingress_mode", "upstream_headers"} {
+			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "client_ip_mode", "public_host", "ingress_mode", "upstream_headers", "traffic_used_in", "traffic_used_out"} {
 				var count int
 				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
 					t.Fatalf("inspect %s: %v", column, err)
@@ -492,8 +591,89 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			if site.UAMode != "infuse" || site.CustomUserAgent != "" || site.CustomClient != "" || site.CustomVersion != "" {
 				t.Fatalf("migrated site UA config = %#v", site)
 			}
-			if site.PublicHost != "" || site.IngressMode != ingressModePort || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
+			if site.PublicHost != "" || site.IngressMode != ingressModePort || site.ClientIPMode != clientIPModeBoth || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
 				t.Fatalf("migrated site ingress config = %#v", site)
+			}
+			settings := db.currentSystemSettings()
+			if settings.TrafficBillingMode != trafficBillingModeBidirectional || settings.TrafficResetDay != 1 {
+				t.Fatalf("migrated traffic settings = %+v, want bidirectional/day 1", settings)
+			}
+		})
+	}
+}
+
+func TestMigrateTrafficLogsAddsRequestsAndPreservesHourlyRows(t *testing.T) {
+	for _, withHourlyIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hourly index=%v", withHourlyIndex), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "legacy-traffic.db")
+			createLegacySiteDatabase(t, dbPath, withHourlyIndex)
+
+			legacy, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("reopen legacy database: %v", err)
+			}
+			rows := []struct {
+				in, out int64
+				at      string
+			}{
+				{10, 20, "2026-08-06 08:00:00"},
+				{30, 40, "2026-08-06 09:00:00"},
+			}
+			for _, row := range rows {
+				if _, err := legacy.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at) VALUES (1,?,?,?)", row.in, row.out, row.at); err != nil {
+					legacy.Close()
+					t.Fatalf("insert legacy hourly row: %v", err)
+				}
+			}
+			if err := legacy.Close(); err != nil {
+				t.Fatalf("close populated legacy database: %v", err)
+			}
+
+			db, err := openDB(dbPath)
+			if err != nil {
+				t.Fatalf("migrate legacy traffic database: %v", err)
+			}
+			defer db.Close()
+
+			var requestsColumn int
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('traffic_logs') WHERE name='requests'").Scan(&requestsColumn); err != nil {
+				t.Fatalf("inspect requests column: %v", err)
+			}
+			if requestsColumn != 1 {
+				t.Fatalf("requests column count=%d, want 1", requestsColumn)
+			}
+			var minuteIndex, hourlyIndex int
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_minute'").Scan(&minuteIndex); err != nil {
+				t.Fatalf("inspect minute index: %v", err)
+			}
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_traffic_site_hour'").Scan(&hourlyIndex); err != nil {
+				t.Fatalf("inspect legacy hourly index: %v", err)
+			}
+			if minuteIndex != 1 || hourlyIndex != 0 {
+				t.Fatalf("traffic bucket indexes minute=%d hourly=%d, want 1/0", minuteIndex, hourlyIndex)
+			}
+
+			queryRows, err := db.db.Query("SELECT bytes_in, bytes_out, requests, recorded_at FROM traffic_logs WHERE site_id=1 ORDER BY recorded_at")
+			if err != nil {
+				t.Fatalf("query migrated traffic rows: %v", err)
+			}
+			defer queryRows.Close()
+			var got []TrafficLog
+			for queryRows.Next() {
+				var row TrafficLog
+				if err := queryRows.Scan(&row.BytesIn, &row.BytesOut, &row.Requests, &row.RecordedAt); err != nil {
+					t.Fatalf("scan migrated traffic row: %v", err)
+				}
+				got = append(got, row)
+			}
+			if err := queryRows.Err(); err != nil {
+				t.Fatalf("iterate migrated traffic rows: %v", err)
+			}
+			if len(got) != 2 || got[0].BytesIn != 10 || got[0].BytesOut != 20 || got[1].BytesIn != 30 || got[1].BytesOut != 40 {
+				t.Fatalf("migrated hourly rows = %+v, want both rows and original byte totals", got)
+			}
+			if got[0].Requests != 0 || got[1].Requests != 0 {
+				t.Fatalf("legacy request counts = %+v, want zero defaults", got)
 			}
 		})
 	}
@@ -993,14 +1173,141 @@ func TestTrustedProxyForwardingUsesOnlyNormalizedEdgeValues(t *testing.T) {
 	}
 }
 
+func TestClientIPModeFiltersNormalizedForwardingHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://media.example.com/Videos/1/stream", nil)
+	request.RemoteAddr = "198.51.100.25:43210"
+	request.Header.Set("X-Real-IP", "203.0.113.10")
+	request.Header.Set("X-Forwarded-For", "203.0.113.11, 10.0.0.1")
+
+	for _, tc := range []struct {
+		mode      string
+		realIP    string
+		forwarded string
+	}{
+		{mode: clientIPModeBoth, realIP: "198.51.100.25", forwarded: "198.51.100.25"},
+		{mode: clientIPModeRealIP, realIP: "198.51.100.25"},
+		{mode: clientIPModeNone},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			header := request.Header.Clone()
+			prepareUpstreamHeadersWithClientIPMode(header, request, UAHeaderPolicy{}, tc.mode)
+			if got := header.Get("X-Real-IP"); got != tc.realIP {
+				t.Fatalf("X-Real-IP=%q, want %q", got, tc.realIP)
+			}
+			if got := header.Get("X-Forwarded-For"); got != tc.forwarded {
+				t.Fatalf("X-Forwarded-For=%q, want %q", got, tc.forwarded)
+			}
+			if got := header.Get("X-Forwarded-Proto"); got != "http" {
+				t.Fatalf("X-Forwarded-Proto=%q, want http", got)
+			}
+		})
+	}
+
+	target, err := normalizeTargetURL("http://origin.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsHeader := prepareWebSocketUpstreamHeadersWithClientIPMode(request, target, UAHeaderPolicy{}, nil, clientIPModeNone)
+	if wsHeader.Get("X-Real-IP") != "" || wsHeader.Get("X-Forwarded-For") != "" {
+		t.Fatalf("WebSocket forwarding headers were not removed: %v", wsHeader)
+	}
+
+	normalized := make(http.Header)
+	normalized.Set("X-Real-IP", "198.51.100.25")
+	normalized.Set("X-Forwarded-For", "198.51.100.25")
+	normalized.Set("Authorization", "Bearer must-not-cross")
+	crossAuthority := crossAuthorityRedirectHeadersWithClientIPMode(normalized, clientIPModeBoth)
+	if crossAuthority.Get("X-Real-IP") != "198.51.100.25" || crossAuthority.Get("X-Forwarded-For") != "198.51.100.25" {
+		t.Fatalf("normalized cross-authority client IP headers were not preserved: %v", crossAuthority)
+	}
+	if crossAuthority.Get("Authorization") != "" {
+		t.Fatalf("cross-authority authorization leaked: %q", crossAuthority.Get("Authorization"))
+	}
+
+	for _, mode := range []string{"", "both", "REAL_IP", "none"} {
+		if _, err := normalizeClientIPMode(mode); err != nil {
+			t.Fatalf("normalizeClientIPMode(%q): %v", mode, err)
+		}
+	}
+	if _, err := normalizeClientIPMode("inherit"); err == nil {
+		t.Fatal("inherit client_ip_mode unexpectedly accepted")
+	}
+}
+
+func TestClientIPModeAppliesToLiveReverseProxyRequests(t *testing.T) {
+	for _, tc := range []struct {
+		mode          string
+		wantRealIP    bool
+		wantForwarded bool
+	}{
+		{mode: clientIPModeBoth, wantRealIP: true, wantForwarded: true},
+		{mode: clientIPModeRealIP, wantRealIP: true},
+		{mode: clientIPModeNone},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			received := make(chan http.Header, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Header.Clone()
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+
+			app := newTestApp(t)
+			port := freePort(t)
+			releasePort(port)
+			site, err := app.db.CreateSiteRecord(Site{
+				Name:         "client-ip-" + tc.mode,
+				ListenPort:   port,
+				IngressMode:  ingressModePort,
+				TargetURL:    upstream.URL,
+				UAMode:       passthroughUAMode,
+				ClientIPMode: tc.mode,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := app.pm.StartSite(*site); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/System/Info/Public", port), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Real-IP", "203.0.113.10")
+			req.Header.Set("X-Forwarded-For", "203.0.113.11, 10.0.0.1")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+
+			select {
+			case header := <-received:
+				if got := header.Get("X-Real-IP"); (got != "") != tc.wantRealIP {
+					t.Fatalf("X-Real-IP=%q, want present=%v", got, tc.wantRealIP)
+				}
+				if got := header.Get("X-Forwarded-For"); (got != "") != tc.wantForwarded {
+					t.Fatalf("X-Forwarded-For=%q, want present=%v", got, tc.wantForwarded)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("upstream request was not received")
+			}
+		})
+	}
+}
+
 func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
 	var siteTraffic atomic.Int64
+	var cumulativeTraffic atomic.Int64
 	siteTraffic.Store(10 << 20)
 	recorder := httptest.NewRecorder()
 	writer := &rateLimitedWriter{
 		ResponseWriter: recorder,
 		bytesPerSec:    1024,
 		written:        &siteTraffic,
+		cumulative:     &cumulativeTraffic,
 		start:          time.Now().Add(-time.Second),
 	}
 	payload := bytes.Repeat([]byte("x"), 512)
@@ -1017,6 +1324,29 @@ func TestRateLimitedWriterUsesPerRequestProgress(t *testing.T) {
 	if got := siteTraffic.Load(); got != (10<<20)+int64(len(payload)) {
 		t.Fatalf("site traffic = %d, want %d", got, (10<<20)+len(payload))
 	}
+	if got := cumulativeTraffic.Load(); got != int64(len(payload)) {
+		t.Fatalf("cumulative traffic = %d, want %d", got, len(payload))
+	}
+}
+
+func TestRateLimitedWriterStopsWaitingWhenRequestIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var siteTraffic atomic.Int64
+	writer := &rateLimitedWriter{
+		ResponseWriter: httptest.NewRecorder(),
+		bytesPerSec:    1,
+		written:        &siteTraffic,
+		start:          time.Now(),
+		ctx:            ctx,
+	}
+	n, err := writer.Write([]byte("stream"))
+	if !errors.Is(err, context.Canceled) || n != 0 {
+		t.Fatalf("Write after cancellation = (%d, %v), want (0, context canceled)", n, err)
+	}
+	if siteTraffic.Load() != 0 {
+		t.Fatalf("canceled writer accounted %d bytes", siteTraffic.Load())
+	}
 }
 
 func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
@@ -1026,8 +1356,11 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	}
 	for _, rule := range []string{
 		"max-height: calc(100dvh - 48px)",
+		"align-items: flex-start",
 		"overflow-y: auto",
 		"-webkit-overflow-scrolling: touch",
+		".form-select:not(.modal-select)",
+		".form-select.modal-select",
 		".btn-modal { flex: 1; min-height: 44px",
 	} {
 		if !strings.Contains(string(css), rule) {
@@ -1050,7 +1383,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(sitesJS), "openModal({ closeOnBackdrop: false })") {
 		t.Error("site add/edit form must not close when its backdrop is clicked")
 	}
-	for _, snippet := range []string{`id="m-speed"`, "...buildRequestLimitPayload("} {
+	for _, snippet := range []string{`id="m-speed"`, "speed_limit: parseInt(document.getElementById('m-speed').value || 0)"} {
 		if !strings.Contains(string(sitesJS), snippet) {
 			t.Errorf("site form must expose and submit speed limit; missing %q", snippet)
 		}
@@ -1065,51 +1398,20 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.9.1", "/js/pages/sites.js?v=1.9.1", "/js/app.js?v=1.9.1"} {
+	if !strings.Contains(string(indexHTML), `<body class="auth-checking">`) {
+		t.Error("index must hide the login page until session restoration finishes")
+	}
+	if !strings.Contains(string(appJS), "document.body.classList.remove('auth-checking')") {
+		t.Error("app must reveal the authenticated shell or login form after the auth check")
+	}
+	cacheVersion := strings.TrimPrefix(appVersion, "v")
+	for _, asset := range []string{"/js/theme.js?v=" + cacheVersion, "/css/style.css?v=" + cacheVersion, "/js/pages/sites.js?v=" + cacheVersion, "/js/pages/request-logs.js?v=" + cacheVersion, "/js/app.js?v=" + cacheVersion} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
 	}
 	if strings.Contains(string(indexHTML), "fonts.googleapis.com") || strings.Contains(string(indexHTML), "fonts.gstatic.com") {
 		t.Error("index must not request fonts blocked by the Content-Security-Policy")
-	}
-}
-
-func TestLoginFeedbackAvailableBeforeAuthentication(t *testing.T) {
-	indexHTML, err := web.StaticFiles.ReadFile("static/index.html")
-	if err != nil {
-		t.Fatalf("read embedded index HTML: %v", err)
-	}
-	document, err := xhtml.Parse(bytes.NewReader(indexHTML))
-	if err != nil {
-		t.Fatalf("parse embedded index HTML: %v", err)
-	}
-
-	var findByID func(*xhtml.Node, string) *xhtml.Node
-	findByID = func(node *xhtml.Node, id string) *xhtml.Node {
-		for _, attribute := range node.Attr {
-			if attribute.Key == "id" && attribute.Val == id {
-				return node
-			}
-		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			if match := findByID(child, id); match != nil {
-				return match
-			}
-		}
-		return nil
-	}
-
-	toastContainer := findByID(document, "toast-container")
-	appShell := findByID(document, "app-shell")
-	passwordHelp := findByID(document, "admin-password-help")
-	if toastContainer == nil || appShell == nil || passwordHelp == nil {
-		t.Fatalf("login feedback elements missing: toast=%v appShell=%v passwordHelp=%v", toastContainer != nil, appShell != nil, passwordHelp != nil)
-	}
-	for ancestor := toastContainer.Parent; ancestor != nil; ancestor = ancestor.Parent {
-		if ancestor == appShell {
-			t.Fatal("toast container must not be inside the app shell hidden before authentication")
-		}
 	}
 }
 
@@ -1422,6 +1724,28 @@ func TestLoginCookieAuthAndCSRFProtection(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsBadCredentialsWithChineseMessage(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+
+	for _, body := range []string{
+		`{"username":"admin","password":"incorrect password"}`,
+		`{"username":"missing-admin","password":"incorrect password"}`,
+	} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(body))
+		app.handleLogin(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("bad login status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		if got := mustStringValue(t, decodeBody(t, rr), "error"); got != "用户名或密码错误" {
+			t.Fatalf("bad login error=%q", got)
+		}
+	}
+}
+
 func TestLogoutClearsSessionCookie(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.csrfMiddleware(app.handleLogout)
@@ -1523,6 +1847,96 @@ func TestResetAdminPasswordUpdatesOnlyConfiguredAdministrator(t *testing.T) {
 	}
 }
 
+func TestUpdateAdminAccountRequiresCurrentPasswordAndPersistsChanges(t *testing.T) {
+	app := newTestApp(t)
+	const oldPassword = "correct horse battery staple"
+	const newPassword = "a newer correct horse battery staple"
+	userID, err := app.db.CreateInitialUser("admin", oldPassword)
+	if err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+
+	if _, err := app.db.UpdateAdminAccount(userID, "wrong current password", "renamed-admin", newPassword); !errors.Is(err, errInvalidCredentials) {
+		t.Fatalf("wrong current password error = %v, want invalid credentials", err)
+	}
+	if _, err := app.db.VerifyUser("admin", oldPassword); err != nil {
+		t.Fatalf("rejected unchanged credentials after failed update: %v", err)
+	}
+
+	account, err := app.db.UpdateAdminAccount(userID, oldPassword, " renamed-admin ", newPassword)
+	if err != nil {
+		t.Fatalf("UpdateAdminAccount: %v", err)
+	}
+	if account.Username != "renamed-admin" || account.Role != "管理员" || account.CreatedAt == "" {
+		t.Fatalf("updated account = %#v", account)
+	}
+	if _, err := app.db.VerifyUser("admin", oldPassword); !errors.Is(err, errInvalidCredentials) {
+		t.Fatalf("old credentials error = %v, want invalid credentials", err)
+	}
+	if gotID, err := app.db.VerifyUser("renamed-admin", newPassword); err != nil || gotID != userID {
+		t.Fatalf("new credentials id=%d err=%v, want id=%d", gotID, err, userID)
+	}
+	if _, err := app.db.UpdateAdminAccount(userID, newPassword, "renamed-admin", ""); !errors.Is(err, errNoAccountChanges) {
+		t.Fatalf("unchanged account error = %v, want no changes", err)
+	}
+}
+
+func TestHandleAccountReadsAndUpdatesAuthenticatedAdministrator(t *testing.T) {
+	app := newTestApp(t)
+	const oldPassword = "correct horse battery staple"
+	const newPassword = "another correct horse battery staple"
+	userID, err := app.db.CreateInitialUser("admin", oldPassword)
+	if err != nil {
+		t.Fatalf("CreateInitialUser: %v", err)
+	}
+	token, err := generateToken(userID, "admin")
+	if err != nil {
+		t.Fatalf("generateToken: %v", err)
+	}
+	cookie := &http.Cookie{Name: sessionCookieName, Value: token}
+	handler := app.authMiddleware(app.handleAccount)
+
+	read := httptest.NewRecorder()
+	readRequest := httptest.NewRequest(http.MethodGet, "https://panel.example/api/account", nil)
+	readRequest.AddCookie(cookie)
+	handler(read, readRequest)
+	if read.Code != http.StatusOK {
+		t.Fatalf("account GET status=%d body=%s", read.Code, read.Body.String())
+	}
+	readBody := decodeBody(t, read)
+	if mustStringValue(t, readBody, "username") != "admin" || mustStringValue(t, readBody, "role") != "管理员" || mustStringValue(t, readBody, "created_at") == "" {
+		t.Fatalf("account GET body=%v", readBody)
+	}
+
+	update := httptest.NewRecorder()
+	updateRequest := httptest.NewRequest(http.MethodPut, "https://panel.example/api/account", strings.NewReader(`{
+		"username":"renamed-admin",
+		"current_password":"correct horse battery staple",
+		"new_password":"another correct horse battery staple"
+	}`))
+	updateRequest.Header.Set("Origin", "https://panel.example")
+	updateRequest.AddCookie(cookie)
+	handler(update, updateRequest)
+	if update.Code != http.StatusOK {
+		t.Fatalf("account PUT status=%d body=%s", update.Code, update.Body.String())
+	}
+	updateBody := decodeBody(t, update)
+	if mustStringValue(t, updateBody, "username") != "renamed-admin" {
+		t.Fatalf("account PUT body=%v", updateBody)
+	}
+	cookies := update.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != sessionCookieName || cookies[0].Value == token || !cookies[0].HttpOnly || !cookies[0].Secure {
+		t.Fatalf("account PUT session cookie=%#v", cookies)
+	}
+	updatedUserID, updatedUsername, err := validateToken(cookies[0].Value)
+	if err != nil || updatedUserID != userID || updatedUsername != "renamed-admin" {
+		t.Fatalf("updated session identity id=%d username=%q err=%v", updatedUserID, updatedUsername, err)
+	}
+	if _, err := app.db.VerifyUser("renamed-admin", newPassword); err != nil {
+		t.Fatalf("new credentials rejected: %v", err)
+	}
+}
+
 func TestResetAdminPasswordRejectsInvalidDatabaseStateAndLength(t *testing.T) {
 	app := newTestApp(t)
 	if err := app.db.ResetAdminPassword("long enough password"); !errors.Is(err, errAdminNotConfigured) {
@@ -1560,6 +1974,60 @@ func TestResetAdminPasswordAcceptsLengthBoundaries(t *testing.T) {
 		if _, err := app.db.VerifyUser("admin", password); err != nil {
 			t.Fatalf("length %d password did not verify: %v", length, err)
 		}
+	}
+}
+
+func TestInternalHealthcheckUsesTLSWithoutExternalHelpers(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/auth/check" {
+			t.Fatalf("healthcheck path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse TLS server URL: %v", err)
+	}
+	_, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("split TLS server address: %v", err)
+	}
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "panel-port"), []byte(port), 0600); err != nil {
+		t.Fatalf("write panel port marker: %v", err)
+	}
+	t.Setenv("DB_PATH", filepath.Join(dataDir, "meridian.db"))
+	cert, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
+	if err != nil || len(cert.DNSNames) == 0 {
+		t.Fatalf("parse test TLS certificate: %v", err)
+	}
+	certDir := filepath.Join(dataDir, "tls")
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		t.Fatalf("create TLS test directory: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.TLS.Certificates[0].Certificate[0]})
+	if err := os.WriteFile(filepath.Join(certDir, "fullchain.pem"), certPEM, 0600); err != nil {
+		t.Fatalf("write TLS test certificate: %v", err)
+	}
+	t.Setenv("PANEL_DOMAIN", cert.DNSNames[0])
+
+	handled, err := runCommandLine([]string{"--healthcheck"}, strings.NewReader(""), io.Discard)
+	if err != nil || !handled {
+		t.Fatalf("healthcheck handled=%v err=%v", handled, err)
+	}
+
+	dockerfile, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	contents := string(dockerfile)
+	if !strings.Contains(contents, `CMD ["/app/meridian", "--healthcheck"]`) {
+		t.Fatal("Docker healthcheck must execute Meridian directly")
+	}
+	if strings.Contains(contents, "wget --no-check-certificate") {
+		t.Fatal("Docker healthcheck must not spawn BusyBox ssl_client zombies")
 	}
 }
 
@@ -1686,6 +2154,30 @@ func TestPanelListenAddressSeparatesPanelFromSiteListeners(t *testing.T) {
 	} {
 		if _, err := panelListenAddress(tc.bind, tc.port); err == nil {
 			t.Fatalf("panelListenAddress(%q, %d) unexpectedly succeeded", tc.bind, tc.port)
+		}
+	}
+}
+
+func TestPanelListenerSpecsUseBothIPVersionsForWildcard(t *testing.T) {
+	for _, bind := range []string{"", "0.0.0.0", "::"} {
+		specs, err := panelListenerSpecs(bind, 9090)
+		if err != nil {
+			t.Fatalf("panelListenerSpecs(%q): %v", bind, err)
+		}
+		if len(specs) != 2 || specs[0].network != "tcp4" || specs[1].network != "tcp6" {
+			t.Fatalf("panelListenerSpecs(%q) = %#v, want tcp4 and tcp6", bind, specs)
+		}
+	}
+	for _, tc := range []struct {
+		bind    string
+		network string
+	}{
+		{bind: "127.0.0.1", network: "tcp4"},
+		{bind: "::1", network: "tcp6"},
+	} {
+		specs, err := panelListenerSpecs(tc.bind, 9090)
+		if err != nil || len(specs) != 1 || specs[0].network != tc.network {
+			t.Fatalf("panelListenerSpecs(%q) = %#v, %v; want one %s listener", tc.bind, specs, err, tc.network)
 		}
 	}
 }
@@ -2387,7 +2879,7 @@ func TestRedirectFollowKeepsHeadersSameOrigin(t *testing.T) {
 			if calls == 1 {
 				return &http.Response{
 					StatusCode: http.StatusFound,
-					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream/redirected"}},
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
 					Body:       io.NopCloser(strings.NewReader("")),
 					Request:    request,
 				}, nil
@@ -2733,7 +3225,7 @@ func TestRedirectFollowPassthroughSameOriginKeepsAuth(t *testing.T) {
 			if calls == 1 {
 				return &http.Response{
 					StatusCode: http.StatusFound,
-					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream/redirected"}},
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
 					Body:       io.NopCloser(strings.NewReader("")),
 					Request:    request,
 				}, nil
@@ -3071,7 +3563,7 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	if reloaded.ListenPort != initialPort {
 		t.Fatalf("listen_port = %d, want %d", reloaded.ListenPort, initialPort)
 	}
-	if reloaded.DynamicDiscoveryEnabled != site.DynamicDiscoveryEnabled || reloaded.DynamicProfile != site.DynamicProfile || reloaded.StoredDynamicDiscoverySources != site.StoredDynamicDiscoverySources || reloaded.StoredDynamicDomainRules != site.StoredDynamicDomainRules || reloaded.DynamicAllowHTTPSDowngrade != site.DynamicAllowHTTPSDowngrade || reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
+	if reloaded.DynamicDiscoveryEnabled != site.DynamicDiscoveryEnabled || reloaded.DynamicProfile != site.DynamicProfile || reloaded.StoredDynamicDomainRules != site.StoredDynamicDomainRules || reloaded.DynamicAllowHTTPSDowngrade != site.DynamicAllowHTTPSDowngrade || reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
 		t.Fatalf("rolled-back dynamic policy = %#v, want original %#v", reloaded, site)
 	}
 	if !app.pm.IsRunning(site.ID) {
@@ -3230,6 +3722,8 @@ func TestFlushTrafficUpdatesBaselineAndStopPersistsPendingUsage(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.cumulativeBytesIn.Store(120)
+	inst.cumulativeBytesOut.Store(80)
 	app.pm.proxies[site.ID] = inst
 
 	app.pm.FlushTraffic()
@@ -3250,15 +3744,22 @@ func TestFlushTrafficUpdatesBaselineAndStopPersistsPendingUsage(t *testing.T) {
 	}
 }
 
-func TestAddTrafficAggregatesSameHour(t *testing.T) {
+func TestAddTrafficAggregatesSameMinuteWithRequests(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("aggregate", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
 
-	app.db.AddTraffic(site.ID, 10, 20)
-	app.db.AddTraffic(site.ID, 5, 7)
+	// Anchor the sample inside the current minute so the test cannot cross a
+	// minute boundary while it is running in CI, while staying in the query window.
+	bucketTime := time.Now().Truncate(time.Minute).Add(10 * time.Second)
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 10, 20, 2, bucketTime); err != nil {
+		t.Fatalf("first addTrafficWithRequests: %v", err)
+	}
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 5, 7, 3, bucketTime.Add(3*time.Second)); err != nil {
+		t.Fatalf("second addTrafficWithRequests: %v", err)
+	}
 
 	logs, err := app.db.GetTrafficLogs(site.ID, 1)
 	if err != nil {
@@ -3267,8 +3768,15 @@ func TestAddTrafficAggregatesSameHour(t *testing.T) {
 	if len(logs) != 1 {
 		t.Fatalf("len(logs) = %d, want 1", len(logs))
 	}
-	if logs[0].BytesIn != 15 || logs[0].BytesOut != 27 {
-		t.Fatalf("aggregated log = in:%d out:%d", logs[0].BytesIn, logs[0].BytesOut)
+	if logs[0].BytesIn != 15 || logs[0].BytesOut != 27 || logs[0].Requests != 5 {
+		t.Fatalf("aggregated log = in:%d out:%d requests:%d", logs[0].BytesIn, logs[0].BytesOut, logs[0].Requests)
+	}
+	recordedAt, err := time.Parse(time.RFC3339Nano, logs[0].RecordedAt)
+	if err != nil {
+		t.Fatalf("parse minute bucket %q: %v", logs[0].RecordedAt, err)
+	}
+	if recordedAt.Second() != 0 || recordedAt.Nanosecond() != 0 {
+		t.Fatalf("recorded_at = %q, want a minute-aligned bucket", logs[0].RecordedAt)
 	}
 }
 
@@ -3308,9 +3816,9 @@ func findLiveSite(t *testing.T, snap *TrafficSnapshot, id int64) SiteTraffic {
 	return SiteTraffic{}
 }
 
-// Pending bytes are flushed to the DB exactly once, the authoritative total
+// Pending bytes and requests are flushed to the DB exactly once, the authoritative total
 // traffic_used = persisted + pending is conserved across flushes, and the
-// current-hour log bucket aggregates without double counting.
+// current-minute log bucket aggregates without double counting.
 func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("conservation", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
@@ -3321,6 +3829,10 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.cumulativeBytesIn.Store(120)
+	inst.cumulativeBytesOut.Store(80)
+	inst.reqCount.Store(5)
+	inst.pendingRequests.Store(5)
 	app.pm.proxies[site.ID] = inst
 
 	// Before any flush the live total already includes the pending bytes.
@@ -3329,7 +3841,7 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
 	live := findLiveSite(t, snap, site.ID)
-	if live.TrafficUsed != 200 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 {
+	if live.TrafficUsed != 200 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 || live.CumulativeBytesIn != 120 || live.CumulativeBytesOut != 80 {
 		t.Fatalf("pre-flush live state = %+v, want used=200 persisted=0 in=120 out=80", live)
 	}
 
@@ -3345,6 +3857,15 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	if got := inst.bytesOut.Load(); got != 0 {
 		t.Fatalf("bytesOut after flush = %d, want 0", got)
 	}
+	if got := inst.cumulativeBytesIn.Load(); got != 120 {
+		t.Fatalf("cumulativeBytesIn after flush = %d, want 120", got)
+	}
+	if got := inst.cumulativeBytesOut.Load(); got != 80 {
+		t.Fatalf("cumulativeBytesOut after flush = %d, want 80", got)
+	}
+	if got := inst.pendingRequests.Load(); got != 0 {
+		t.Fatalf("pendingRequests after flush = %d, want 0", got)
+	}
 	reloaded, err := app.db.GetSite(site.ID)
 	if err != nil {
 		t.Fatalf("GetSite: %v", err)
@@ -3356,13 +3877,15 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTrafficLogs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 {
-		t.Fatalf("logs after flush = %+v, want one row with 120/80", logs)
+	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 || logs[0].Requests != 5 {
+		t.Fatalf("logs after flush = %+v, want one row with 120/80 and 5 requests", logs)
 	}
 
 	// A second flush with fresh pending accumulates; nothing is double counted.
 	inst.bytesIn.Store(30)
 	inst.bytesOut.Store(10)
+	inst.reqCount.Add(3)
+	inst.pendingRequests.Store(3)
 	app.pm.FlushTraffic()
 	if got := inst.persistedTraffic.Load(); got != 240 {
 		t.Fatalf("persistedTraffic after second flush = %d, want 240", got)
@@ -3371,16 +3894,16 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTrafficLogs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].BytesIn != 150 || logs[0].BytesOut != 90 {
-		t.Fatalf("logs after second flush = %+v, want one aggregated row 150/90", logs)
+	if len(logs) != 1 || logs[0].BytesIn != 150 || logs[0].BytesOut != 90 || logs[0].Requests != 8 {
+		t.Fatalf("logs after second flush = %+v, want one aggregated row 150/90 with 8 requests", logs)
 	}
 	snap, err = app.pm.TrafficSnapshot()
 	if err != nil {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
 	live = findLiveSite(t, snap, site.ID)
-	if live.TrafficUsed != 240 || snap.TotalTraffic != 240 {
-		t.Fatalf("post-flush total = site:%d snapshot:%d, want 240/240", live.TrafficUsed, snap.TotalTraffic)
+	if live.TrafficUsed != 240 || snap.TotalTraffic != 240 || live.Requests != 8 || snap.TotalRequests != 8 {
+		t.Fatalf("post-flush totals = site:%d snapshot:%d requests:%d/%d, want 240/240 and 8/8", live.TrafficUsed, snap.TotalTraffic, live.Requests, snap.TotalRequests)
 	}
 }
 
@@ -3396,6 +3919,8 @@ func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(120)
 	inst.bytesOut.Store(80)
+	inst.reqCount.Store(5)
+	inst.pendingRequests.Store(5)
 	app.pm.proxies[site.ID] = inst
 
 	setDBReadonly(t, app, true)
@@ -3408,6 +3933,9 @@ func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
 	}
 	if got := inst.bytesOut.Load(); got != 80 {
 		t.Fatalf("bytesOut after failed flush = %d, want 80 restored", got)
+	}
+	if got := inst.pendingRequests.Load(); got != 5 {
+		t.Fatalf("pendingRequests after failed flush = %d, want 5 restored", got)
 	}
 	if got := inst.persistedTraffic.Load(); got != 0 {
 		t.Fatalf("persistedTraffic after failed flush = %d, want 0", got)
@@ -3439,22 +3967,23 @@ func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTrafficLogs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 {
-		t.Fatalf("logs after retry = %+v, want one row 120/80", logs)
+	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 || logs[0].Requests != 5 {
+		t.Fatalf("logs after retry = %+v, want one row 120/80 with 5 requests", logs)
 	}
 }
 
 // The single-site history snapshot reads DB logs, persisted baseline and
-// pending under one lock: pending bytes land in the current-hour bucket of the
-// returned copy (synthetic ID=0 bucket when absent, no-op when pending is 0).
-func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
+// pending under one lock: pending bytes and requests land in the current-minute
+// bucket of the returned copy (synthetic ID=0 bucket when absent, no-op when all
+// pending values are zero).
+func TestSiteTrafficHistoryMergesPendingIntoCurrentMinuteBucket(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("merge", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
 	pastHour := time.Now().Add(-2 * time.Hour).Truncate(time.Hour).Format("2006-01-02 15:04:05")
-	if _, err := app.db.db.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at) VALUES (?,?,?,?)", site.ID, 100, 50, pastHour); err != nil {
+	if _, err := app.db.db.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at) VALUES (?,?,?,?,?)", site.ID, 100, 50, 2, pastHour); err != nil {
 		t.Fatalf("insert past log: %v", err)
 	}
 	if _, err := app.db.db.Exec("UPDATE sites SET traffic_used=150 WHERE id=?", site.ID); err != nil {
@@ -3465,6 +3994,8 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 	inst.persistedTraffic.Store(150)
 	inst.bytesIn.Store(30)
 	inst.bytesOut.Store(20)
+	inst.reqCount.Store(9)
+	inst.pendingRequests.Store(4)
 	app.pm.proxies[site.ID] = inst
 
 	history, err := app.pm.SiteTrafficHistory(*site, 24)
@@ -3472,27 +4003,28 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		t.Fatalf("SiteTrafficHistory: %v", err)
 	}
 	if len(history.Logs) != 2 {
-		t.Fatalf("logs = %+v, want past row plus synthetic current-hour bucket", history.Logs)
+		t.Fatalf("logs = %+v, want past row plus synthetic current-minute bucket", history.Logs)
 	}
-	if history.Logs[0].ID == 0 || history.Logs[0].BytesIn != 100 || history.Logs[0].BytesOut != 50 {
-		t.Fatalf("past bucket mutated = %+v, want 100/50 untouched", history.Logs[0])
+	if history.Logs[0].ID == 0 || history.Logs[0].BytesIn != 100 || history.Logs[0].BytesOut != 50 || history.Logs[0].Requests != 2 {
+		t.Fatalf("past bucket mutated = %+v, want 100/50 and 2 requests untouched", history.Logs[0])
 	}
 	current := history.Logs[1]
-	hourBefore := time.Now()
+	minuteBefore := time.Now()
 	if _, err := time.Parse(time.RFC3339, current.RecordedAt); err != nil {
 		t.Fatalf("synthetic recorded_at %q is not RFC3339: %v", current.RecordedAt, err)
 	}
-	hourAfter := time.Now()
-	if current.ID != 0 || current.BytesIn != 30 || current.BytesOut != 20 || !(sameTrafficHour(current.RecordedAt, hourBefore) || sameTrafficHour(current.RecordedAt, hourAfter)) {
-		t.Fatalf("synthetic current bucket = %+v, want ID=0 30/20 at the current hour", current)
+	minuteAfter := time.Now()
+	if current.ID != 0 || current.BytesIn != 30 || current.BytesOut != 20 || current.Requests != 4 || !(sameTrafficMinute(current.RecordedAt, minuteBefore) || sameTrafficMinute(current.RecordedAt, minuteAfter)) {
+		t.Fatalf("synthetic current bucket = %+v, want ID=0 30/20 and 4 requests at the current minute", current)
 	}
-	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 150 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 200 {
-		t.Fatalf("snapshot = %+v, want running persisted=150 in=30 out=20 used=200", history.Snapshot)
+	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 150 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 200 || history.Snapshot.Requests != 9 {
+		t.Fatalf("snapshot = %+v, want running persisted=150 in=30 out=20 used=200 requests=9", history.Snapshot)
 	}
 
-	// pending = 0 is a no-op: no synthetic bucket is appended.
+	// All pending values at zero is a no-op: no synthetic bucket is appended.
 	inst.bytesIn.Store(0)
 	inst.bytesOut.Store(0)
+	inst.pendingRequests.Store(0)
 	history, err = app.pm.SiteTrafficHistory(*site, 24)
 	if err != nil {
 		t.Fatalf("SiteTrafficHistory: %v", err)
@@ -3501,23 +4033,24 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		t.Fatalf("logs with zero pending = %+v, want only the past row", history.Logs)
 	}
 
-	// When the current hour already has a bucket, pending merges into it.
+	// When the current minute already has a bucket, pending merges into it.
 	// Use the synchronous addTraffic so the bucket is committed before the
 	// immediate read below (AddTraffic only logs errors and races the read).
 	// The bucket is identified by its bytes and real ID, never by a recorded_at
 	// string layout: the SQLite driver re-serializes DATETIME columns as
 	// RFC3339, so the persisted value must be matched by time semantics.
-	if err := app.db.addTraffic(site.ID, 10, 5); err != nil {
+	if err := app.db.addTrafficWithRequests(site.ID, 10, 5, 2); err != nil {
 		t.Fatalf("addTraffic: %v", err)
 	}
 	inst.bytesIn.Store(7)
 	inst.bytesOut.Store(3)
+	inst.pendingRequests.Store(3)
 	history, err = app.pm.SiteTrafficHistory(*site, 24)
 	if err != nil {
 		t.Fatalf("SiteTrafficHistory: %v", err)
 	}
 	if len(history.Logs) != 2 {
-		t.Fatalf("logs after merge = %+v, want past row plus one current-hour bucket, no synthetic duplicate", history.Logs)
+		t.Fatalf("logs after merge = %+v, want past row plus one current-minute bucket, no synthetic duplicate", history.Logs)
 	}
 	var merged *TrafficLog
 	for i := range history.Logs {
@@ -3525,7 +4058,7 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		if l.ID == 0 {
 			t.Fatalf("synthetic ID=0 bucket present although the real row exists: %+v", l)
 		}
-		if l.BytesIn == 17 && l.BytesOut == 8 {
+		if l.BytesIn == 17 && l.BytesOut == 8 && l.Requests == 5 {
 			if merged != nil {
 				t.Fatalf("two buckets carry 17/8: %+v and %+v", *merged, *l)
 			}
@@ -3533,68 +4066,71 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
 		}
 	}
 	if merged == nil {
-		t.Fatalf("no 17/8 bucket in %+v; pending must merge into the real addTraffic row", history.Logs)
+		t.Fatalf("no 17/8 and 5-request bucket in %+v; pending must merge into the real addTraffic row", history.Logs)
 	}
 }
 
-// The merge identifies the current hour by time semantics, across every
+// The merge identifies the current minute by time semantics, across every
 // format persisted rows carry: RFC3339 / RFC3339Nano (what the modernc
 // SQLite driver re-serializes DATETIME columns as) and the legacy
-// "2006-01-02 15:04:05" SQL layout. Rows from other hours and values that
-// parse as neither never absorb pending bytes; zero pending is a no-op.
-func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
+// "2006-01-02 15:04:05" SQL layout. Rows from other minutes and values that
+// parse as neither never absorb pending values; all-zero pending is a no-op.
+func TestMergePendingIntoLogsMinuteRecognition(t *testing.T) {
 	tests := []struct {
-		name       string
-		recordedAt string
-		pendingIn  int64
-		pendingOut int64
-		wantMerge  bool // pending lands in the existing bucket
-		wantAppend bool // synthetic ID=0 bucket is appended
+		name            string
+		recordedAt      string
+		pendingIn       int64
+		pendingOut      int64
+		pendingRequests int64
+		wantMerge       bool // pending lands in the existing bucket
+		wantAppend      bool // synthetic ID=0 bucket is appended
 	}{
-		{"RFC3339 current hour", "", 8, 4, true, false},
-		{"RFC3339Nano current hour", "", 8, 4, true, false},
-		{"RFC3339Nano current hour with fraction", "", 8, 4, true, false},
-		{"legacy SQL layout current hour", "", 8, 4, true, false},
-		{"RFC3339 other hour", "", 8, 4, false, true},
-		{"legacy SQL layout other hour", "", 8, 4, false, true},
-		{"unparseable value", "not-a-timestamp", 8, 4, false, true},
-		{"empty value", "", 8, 4, false, true},
-		{"zero pending no-op", "", 0, 0, false, false},
+		{"RFC3339 current minute", "", 8, 4, 3, true, false},
+		{"RFC3339Nano current minute", "", 8, 4, 3, true, false},
+		{"RFC3339Nano current minute with fraction", "", 8, 4, 3, true, false},
+		{"legacy SQL layout current minute", "", 8, 4, 3, true, false},
+		{"RFC3339 other minute in same hour", "", 8, 4, 3, false, true},
+		{"legacy SQL layout other minute", "", 8, 4, 3, false, true},
+		{"unparseable value", "not-a-timestamp", 8, 4, 3, false, true},
+		{"empty value", "", 8, 4, 3, false, true},
+		{"requests-only pending appends", "", 0, 0, 3, false, true},
+		{"zero pending no-op", "", 0, 0, 0, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			now := time.Now()
+			now := time.Date(2026, time.August, 6, 12, 34, 45, 0, time.Local)
 			nowLocal := now.In(time.Local)
-			// wallHour is the current local wall hour stamped as UTC, the exact
-			// shape the SQLite driver returns for a stored local-hour row.
-			wallHour := func(h int) time.Time {
-				return time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), h, 0, 0, 0, time.UTC)
+			// wallMinute is the local wall minute stamped as UTC, the exact shape
+			// the SQLite driver returns for a stored local-minute row.
+			wallMinute := func(offset time.Duration) time.Time {
+				wall := nowLocal.Add(offset)
+				return time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, time.UTC)
 			}
 			recordedAt := tt.recordedAt
 			switch tt.name {
-			case "RFC3339 current hour":
-				recordedAt = wallHour(nowLocal.Hour()).Format(time.RFC3339)
-			case "RFC3339Nano current hour":
-				recordedAt = wallHour(nowLocal.Hour()).Format(time.RFC3339Nano)
-			case "RFC3339Nano current hour with fraction":
-				recordedAt = wallHour(nowLocal.Hour()).Add(250 * time.Millisecond).Format(time.RFC3339Nano)
-			case "legacy SQL layout current hour":
+			case "RFC3339 current minute":
+				recordedAt = wallMinute(0).Format(time.RFC3339)
+			case "RFC3339Nano current minute":
+				recordedAt = wallMinute(0).Format(time.RFC3339Nano)
+			case "RFC3339Nano current minute with fraction":
+				recordedAt = wallMinute(0).Add(250 * time.Millisecond).Format(time.RFC3339Nano)
+			case "legacy SQL layout current minute":
 				recordedAt = nowLocal.Format("2006-01-02 15:04:05")
-			case "RFC3339 other hour":
-				recordedAt = wallHour(nowLocal.Hour() - 1).Format(time.RFC3339)
-			case "legacy SQL layout other hour":
-				recordedAt = nowLocal.Add(-time.Hour).Format("2006-01-02 15:04:05")
+			case "RFC3339 other minute in same hour":
+				recordedAt = wallMinute(-time.Minute).Format(time.RFC3339)
+			case "legacy SQL layout other minute":
+				recordedAt = nowLocal.Add(-time.Minute).Format("2006-01-02 15:04:05")
 			}
 
-			in := []TrafficLog{{ID: 7, SiteID: 3, BytesIn: 10, BytesOut: 5, RecordedAt: recordedAt}}
-			out := mergePendingIntoLogs(in, 3, tt.pendingIn, tt.pendingOut)
+			in := []TrafficLog{{ID: 7, SiteID: 3, BytesIn: 10, BytesOut: 5, Requests: 2, RecordedAt: recordedAt}}
+			out := mergePendingIntoLogsAt(in, 3, tt.pendingIn, tt.pendingOut, tt.pendingRequests, now)
 
 			if tt.wantMerge {
 				if len(out) != 1 {
 					t.Fatalf("len(out) = %d, want the existing bucket merged; got %+v", len(out), out)
 				}
-				if out[0].ID != 7 || out[0].BytesIn != 18 || out[0].BytesOut != 9 {
-					t.Fatalf("merged bucket = %+v, want ID=7 18/9", out[0])
+				if out[0].ID != 7 || out[0].BytesIn != 18 || out[0].BytesOut != 9 || out[0].Requests != 5 {
+					t.Fatalf("merged bucket = %+v, want ID=7 18/9 with 5 requests", out[0])
 				}
 				return
 			}
@@ -3602,18 +4138,18 @@ func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
 				if len(out) != 2 {
 					t.Fatalf("len(out) = %d, want original plus synthetic bucket; got %+v", len(out), out)
 				}
-				if out[0].ID != 7 || out[0].BytesIn != 10 || out[0].BytesOut != 5 {
-					t.Fatalf("existing bucket mutated = %+v, want 10/5 untouched", out[0])
+				if out[0].ID != 7 || out[0].BytesIn != 10 || out[0].BytesOut != 5 || out[0].Requests != 2 {
+					t.Fatalf("existing bucket mutated = %+v, want 10/5 and 2 requests untouched", out[0])
 				}
 				syn := out[1]
-				if syn.ID != 0 || syn.SiteID != 3 || syn.BytesIn != 8 || syn.BytesOut != 4 {
-					t.Fatalf("synthetic bucket = %+v, want ID=0 site=3 8/4", syn)
+				if syn.ID != 0 || syn.SiteID != 3 || syn.BytesIn != tt.pendingIn || syn.BytesOut != tt.pendingOut || syn.Requests != tt.pendingRequests {
+					t.Fatalf("synthetic bucket = %+v, want ID=0 site=3 pending values %d/%d/%d", syn, tt.pendingIn, tt.pendingOut, tt.pendingRequests)
 				}
 				if _, err := time.Parse(time.RFC3339, syn.RecordedAt); err != nil {
 					t.Fatalf("synthetic recorded_at %q is not RFC3339: %v", syn.RecordedAt, err)
 				}
-				if !sameTrafficHour(syn.RecordedAt, time.Now()) {
-					t.Fatalf("synthetic recorded_at %q is not the current hour", syn.RecordedAt)
+				if !sameTrafficMinute(syn.RecordedAt, now) {
+					t.Fatalf("synthetic recorded_at %q is not the current minute", syn.RecordedAt)
 				}
 				return
 			}
@@ -3630,72 +4166,74 @@ func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
 func TestMergePendingIntoLogsOnlyMutatesPrivateCopy(t *testing.T) {
 	now := time.Now()
 	nowLocal := now.In(time.Local)
-	wallHour := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), 0, 0, 0, time.UTC)
+	wallMinute := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), nowLocal.Minute(), 0, 0, time.UTC)
 	src := []TrafficLog{
-		{ID: 1, SiteID: 3, BytesIn: 10, BytesOut: 5, RecordedAt: wallHour.Format(time.RFC3339)},
-		{ID: 2, SiteID: 3, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour.Add(-3 * time.Hour).Format(time.RFC3339)},
+		{ID: 1, SiteID: 3, BytesIn: 10, BytesOut: 5, Requests: 2, RecordedAt: wallMinute.Format(time.RFC3339)},
+		{ID: 2, SiteID: 3, BytesIn: 1, BytesOut: 1, Requests: 1, RecordedAt: wallMinute.Add(-3 * time.Minute).Format(time.RFC3339)},
 	}
 	work := append([]TrafficLog(nil), src...)
-	out := mergePendingIntoLogs(work, 3, 8, 4)
-	// Pending lands in the current-hour element of the returned copy.
-	if len(out) != 2 || out[0].BytesIn != 18 || out[0].BytesOut != 9 {
-		t.Fatalf("merged result = %+v, want current-hour bucket 18/9", out)
+	out := mergePendingIntoLogsAt(work, 3, 8, 4, 3, now)
+	// Pending lands in the current-minute element of the returned copy.
+	if len(out) != 2 || out[0].BytesIn != 18 || out[0].BytesOut != 9 || out[0].Requests != 5 {
+		t.Fatalf("merged result = %+v, want current-minute bucket 18/9 with 5 requests", out)
 	}
 	// Caller-side mutation of the result must not touch the caller's original.
 	out[0].BytesIn = 999
 	out[0].BytesOut = 999
-	if src[0].BytesIn != 10 || src[0].BytesOut != 5 || src[1].BytesIn != 1 {
+	out[0].Requests = 999
+	if src[0].BytesIn != 10 || src[0].BytesOut != 5 || src[0].Requests != 2 || src[1].BytesIn != 1 {
 		t.Fatalf("source slice mutated through the result: %+v", src)
 	}
 }
 
-// In a non-UTC deployment the DB stores local wall-clock hours and the driver
+// In a non-UTC deployment the DB stores local wall-clock minutes and the driver
 // stamps them as UTC on read, so matching must compare wall-clock components
-// and the synthetic bucket must carry the current local wall hour as Z. This
+// and the synthetic bucket must carry the current local wall minute as Z. This
 // pins that behavior with the process zone fixed to UTC+8: an RFC3339 row
-// whose hour reads 08:00Z matches a now of 08:30+08, a different wall hour
-// does not, and the synthetic bucket is exactly the local 08:00Z row the next
+// whose time reads 08:30Z matches a now of 08:30+08, a different wall minute
+// does not, and the synthetic bucket is exactly the local 08:30Z row the next
 // addTraffic will persist.
 func TestMergePendingIntoLogsFixedZoneUTC8(t *testing.T) {
 	savedLocal := time.Local
 	time.Local = time.FixedZone("UTC+8", 8*3600)
 	defer func() { time.Local = savedLocal }()
 
-	now := time.Now().In(time.Local)
-	wallHour := func(h int) time.Time {
-		return time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.August, 6, 8, 30, 45, 0, time.Local)
+	wallMinute := func(offset time.Duration) time.Time {
+		wall := now.Add(offset)
+		return time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), 0, 0, time.UTC)
 	}
-	// RFC3339 08:00Z matches a now of 08:30+08: the stored local hour 08 read
+	// RFC3339 08:30Z matches a now of 08:30+08: the stored local minute read
 	// back as Z is the same wall clock, even though the instants differ.
-	if !sameTrafficHour(wallHour(now.Hour()).Format(time.RFC3339), now) {
-		t.Fatalf("RFC3339 %q must match local wall hour %s", wallHour(now.Hour()).Format(time.RFC3339), now.Format(time.RFC3339))
+	if !sameTrafficMinute(wallMinute(0).Format(time.RFC3339), now) {
+		t.Fatalf("RFC3339 %q must match local wall minute %s", wallMinute(0).Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 	// The legacy local wall-clock row matches by the same wall-clock rule.
-	if !sameTrafficHour(now.Format("2006-01-02 15:04:05"), now) {
-		t.Fatalf("legacy %q must match local wall hour %s", now.Format("2006-01-02 15:04:05"), now.Format(time.RFC3339))
+	if !sameTrafficMinute(now.Format("2006-01-02 15:04:05"), now) {
+		t.Fatalf("legacy %q must match local wall minute %s", now.Format("2006-01-02 15:04:05"), now.Format(time.RFC3339))
 	}
-	// A different wall hour never matches, regardless of instant proximity.
-	if sameTrafficHour(wallHour(now.Hour()-1).Format(time.RFC3339), now) {
-		t.Fatalf("RFC3339 %q must not match local wall hour %s", wallHour(now.Hour()-1).Format(time.RFC3339), now.Format(time.RFC3339))
-	}
-
-	// A real current-hour RFC3339 row absorbs pending bytes.
-	in := []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour(now.Hour()).Format(time.RFC3339)}}
-	out := mergePendingIntoLogs(in, 2, 9, 3)
-	if len(out) != 1 || out[0].ID != 5 || out[0].BytesIn != 10 || out[0].BytesOut != 4 {
-		t.Fatalf("merged bucket = %+v, want ID=5 10/4", out)
+	// A different wall minute never matches, regardless of instant proximity.
+	if sameTrafficMinute(wallMinute(-time.Minute).Format(time.RFC3339), now) {
+		t.Fatalf("RFC3339 %q must not match local wall minute %s", wallMinute(-time.Minute).Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 
-	// The synthetic bucket is the current local wall hour stamped as UTC,
+	// A real current-minute RFC3339 row absorbs pending values.
+	in := []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, Requests: 2, RecordedAt: wallMinute(0).Format(time.RFC3339)}}
+	out := mergePendingIntoLogsAt(in, 2, 9, 3, 4, now)
+	if len(out) != 1 || out[0].ID != 5 || out[0].BytesIn != 10 || out[0].BytesOut != 4 || out[0].Requests != 6 {
+		t.Fatalf("merged bucket = %+v, want ID=5 10/4 with 6 requests", out)
+	}
+
+	// The synthetic bucket is the current local wall minute stamped as UTC,
 	// byte-identical to the row the next addTraffic will persist and read back.
-	in = []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour(now.Hour() - 1).Format(time.RFC3339)}}
-	out = mergePendingIntoLogs(in, 2, 9, 3)
+	in = []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, Requests: 2, RecordedAt: wallMinute(-time.Minute).Format(time.RFC3339)}}
+	out = mergePendingIntoLogsAt(in, 2, 9, 3, 4, now)
 	if len(out) != 2 {
 		t.Fatalf("len(out) = %d, want original plus synthetic bucket; got %+v", len(out), out)
 	}
-	want := wallHour(now.Hour()).Format(time.RFC3339)
+	want := wallMinute(0).Format(time.RFC3339)
 	if out[1].RecordedAt != want {
-		t.Fatalf("synthetic recorded_at = %q, want %q (local wall hour as Z)", out[1].RecordedAt, want)
+		t.Fatalf("synthetic recorded_at = %q, want %q (local wall minute as Z)", out[1].RecordedAt, want)
 	}
 }
 
@@ -3740,7 +4278,7 @@ func TestTrafficSnapshotUnifiedPayloadAndTotals(t *testing.T) {
 }
 
 // The legacy endpoint keeps the plain TrafficLog[] shape (with live-merged
-// current hour) and returns [] for unknown sites; the /snapshot endpoint
+// current minute) and returns [] for unknown sites; the /snapshot endpoint
 // returns the {snapshot, logs} envelope and 404 for unknown sites.
 func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	app := newTestApp(t)
@@ -3751,9 +4289,11 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
 	inst.bytesIn.Store(40)
 	inst.bytesOut.Store(10)
+	inst.reqCount.Store(6)
+	inst.pendingRequests.Store(6)
 	app.pm.proxies[site.ID] = inst
 
-	// Legacy: plain array, live-merged current hour.
+	// Legacy: plain array, live-merged current minute.
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/traffic/"+jsonNumber64(site.ID)+"?hours=24", nil)
 	app.handleTraffic(rr, req)
@@ -3764,8 +4304,8 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &logs); err != nil {
 		t.Fatalf("legacy body is not a TrafficLog array: %v body=%s", err, rr.Body.String())
 	}
-	if len(logs) != 1 || logs[0].ID != 0 || logs[0].BytesIn != 40 || logs[0].BytesOut != 10 {
-		t.Fatalf("legacy logs = %+v, want synthetic current-hour bucket 40/10", logs)
+	if len(logs) != 1 || logs[0].ID != 0 || logs[0].BytesIn != 40 || logs[0].BytesOut != 10 || logs[0].Requests != 6 {
+		t.Fatalf("legacy logs = %+v, want synthetic current-minute bucket 40/10 with 6 requests", logs)
 	}
 
 	// Envelope: {snapshot, logs} with the same live state.
@@ -3777,8 +4317,8 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	}
 	body := decodeBody(t, rr)
 	snap := mustMapValue(t, body, "snapshot")
-	if mustNumberValue(t, snap, "traffic_used") != 50 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 {
-		t.Fatalf("envelope snapshot = %v, want used=50 persisted=0 in=40 out=10", snap)
+	if mustNumberValue(t, snap, "traffic_used") != 50 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 || mustNumberValue(t, snap, "requests") != 6 {
+		t.Fatalf("envelope snapshot = %v, want used=50 persisted=0 in=40 out=10 requests=6", snap)
 	}
 	if !mustBoolValue(t, snap, "running") {
 		t.Fatal("envelope snapshot must report the site as running")
@@ -3786,6 +4326,10 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	envLogs, ok := body["logs"].([]interface{})
 	if !ok || len(envLogs) != 1 {
 		t.Fatalf("envelope logs = %v, want one merged bucket", body["logs"])
+	}
+	envLog, ok := envLogs[0].(map[string]interface{})
+	if !ok || mustNumberValue(t, envLog, "requests") != 6 {
+		t.Fatalf("envelope log = %v, want requests=6", envLogs[0])
 	}
 
 	// Legacy unknown site: empty array, not an error.
@@ -4250,6 +4794,36 @@ func TestSiteUpdateAbortsWhenPreStopFlushFails(t *testing.T) {
 // for running sites while preserving the exact Site JSON shape plus the
 // running flag; the read never writes the database, so pending bytes appear
 // before any flush.
+func TestHandleUpstreamTestReportsReachableTarget(t *testing.T) {
+	app := newTestApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/System/Info/Public" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Version":"4.8.0"}`))
+	}))
+	defer upstream.Close()
+
+	body, _ := json.Marshal(map[string]string{"target_url": upstream.URL})
+	rr := httptest.NewRecorder()
+	app.handleUpstreamTest(rr, httptest.NewRequest(http.MethodPost, "/api/upstream-test", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upstream test status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var result struct {
+		Status     string `json:"status"`
+		HTTPStatus int    `json:"http_status"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode upstream test: %v", err)
+	}
+	if result.Status != "online" || result.HTTPStatus != http.StatusOK {
+		t.Fatalf("upstream test result=%+v", result)
+	}
+}
+
 func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 	app := newTestApp(t)
 	running, err := app.db.CreateSite("live", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
@@ -4279,24 +4853,28 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		t.Fatalf("GET /api/sites status = %d; body=%s", rr.Code, rr.Body.String())
 	}
 
-	// The response rows keep exactly the Site JSON fields plus "running": the
-	// overlay may only change traffic_used, never add per-component fields.
+	// The response rows keep the Site JSON fields plus live status, cache size,
+	// and the current-month traffic value used by the dashboard.
 	var raw []map[string]json.RawMessage
 	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode /api/sites: %v", err)
 	}
 	expectedKeys := map[string]bool{
-		"id": true, "name": true, "listen_port": true, "public_host": true, "ingress_mode": true, "target_url": true,
-		"playback_target_url": true, "playback_mode": true, "stream_hosts": true,
+		"id": true, "sort_order": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
+		"primary_line_name":   true,
+		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
-		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
+		"custom_version": true, "client_ip_mode": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
-		"ping_cache_enabled": true, "image_cache_enabled": true, "progress_coalescing_enabled": true,
 		"updated_at": true, "running": true,
 		"dynamic_discovery_enabled": true, "dynamic_profile": true,
 		"dynamic_discovery_sources": true,
 		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
 		"dynamic_policy_revision": true,
+		"ping_cache_enabled":      true, "image_cache_enabled": true, "progress_coalescing_enabled": true,
+		"asset_cache_enabled": true, "asset_cache_ttl_sec": true,
+		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,
+		"monthly_traffic": true,
 	}
 	if len(raw) != 2 {
 		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())
@@ -4537,6 +5115,170 @@ func TestHandleSitesCreatePersistsPlaybackTargetURL(t *testing.T) {
 	}
 	if reloaded.PlaybackTargetURL != "https://media.example.com" {
 		t.Fatalf("persisted playback_target_url = %q, want %q", reloaded.PlaybackTargetURL, "https://media.example.com")
+	}
+}
+
+func TestHandleSitesPersistsAndUpdatesFailoverTargets(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	createPayload := []byte(`{"name":"failover-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096/emby","failover_targets":["https://backup-one.example.com/emby","https://backup-two.example.com/emby"]}`)
+	created := httptest.NewRecorder()
+	app.handleSites(created, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(createPayload)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var site Site
+	if err := json.Unmarshal(created.Body.Bytes(), &site); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	if got, want := strings.Join(site.FailoverTargetList, ","), "https://backup-one.example.com/emby,https://backup-two.example.com/emby"; got != want {
+		t.Fatalf("create failover_targets=%q, want %q", got, want)
+	}
+
+	// Omitted fields preserve the existing backup list during an update.
+	preservePayload := []byte(`{"name":"failover-site-renamed","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096/emby"}`)
+	preserved := httptest.NewRecorder()
+	app.handleSiteByID(preserved, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(preservePayload)))
+	if preserved.Code != http.StatusOK {
+		t.Fatalf("preserve update status=%d body=%s", preserved.Code, preserved.Body.String())
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.FailoverTargetList) != 2 {
+		t.Fatalf("omitted failover_targets did not persist: %#v", reloaded.FailoverTargetList)
+	}
+
+	// An explicit empty list removes every backup line.
+	clearPayload := []byte(`{"name":"failover-site-renamed","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096/emby","failover_targets":[]}`)
+	cleared := httptest.NewRecorder()
+	app.handleSiteByID(cleared, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(clearPayload)))
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("clear update status=%d body=%s", cleared.Code, cleared.Body.String())
+	}
+	reloaded, err = app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.FailoverTargetList) != 0 {
+		t.Fatalf("explicit empty failover_targets=%#v, want none", reloaded.FailoverTargetList)
+	}
+}
+
+func TestHandleSitesPersistsAndUpdatesClientIPMode(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	createPayload := []byte(`{"name":"client-ip-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","client_ip_mode":"real_ip"}`)
+	created := httptest.NewRecorder()
+	app.handleSites(created, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(createPayload)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var site Site
+	if err := json.Unmarshal(created.Body.Bytes(), &site); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	if site.ClientIPMode != clientIPModeRealIP {
+		t.Fatalf("created client_ip_mode=%q, want %q", site.ClientIPMode, clientIPModeRealIP)
+	}
+
+	updatePayload := []byte(`{"name":"client-ip-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","client_ip_mode":"none"}`)
+	updated := httptest.NewRecorder()
+	app.handleSiteByID(updated, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(updatePayload)))
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ClientIPMode != clientIPModeNone {
+		t.Fatalf("updated client_ip_mode=%q, want %q", reloaded.ClientIPMode, clientIPModeNone)
+	}
+
+	invalidPayload := []byte(`{"name":"client-ip-site","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","client_ip_mode":"inherit"}`)
+	invalid := httptest.NewRecorder()
+	app.handleSiteByID(invalid, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), bytes.NewReader(invalidPayload)))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid update status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestHandleSitesPersistsDisabledFailoverLineWithoutActivatingIt(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload := []byte(`{"name":"structured-lines","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","failover_lines":[{"name":"香港备用","url":"https://backup-one.example.com","enabled":true},{"name":"维护中","url":"https://backup-two.example.com","enabled":false}]}`)
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+	reloaded, err := app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.FailoverLines) != 2 || reloaded.FailoverLines[1].Name != "维护中" || reloaded.FailoverLines[1].Enabled {
+		t.Fatalf("stored failover lines=%+v", reloaded.FailoverLines)
+	}
+	if len(reloaded.FailoverTargetList) != 1 || reloaded.FailoverTargetList[0] != "https://backup-one.example.com" {
+		t.Fatalf("runtime failover targets=%+v", reloaded.FailoverTargetList)
+	}
+}
+
+func TestHandleSitesPersistsEditablePrimaryLineName(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload := []byte(`{"name":"named-primary","listen_port":` + jsonNumber(port) + `,"target_url":"https://primary.example.com:443/emby","primary_line_name":"香港主线"}`)
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+	if created.PrimaryLineName != "香港主线" {
+		t.Fatalf("primary_line_name=%q", created.PrimaryLineName)
+	}
+
+	update := []byte(`{"name":"named-primary","listen_port":` + jsonNumber(port) + `,"target_url":"https://primary.example.com:443/emby","primary_line_name":"东京主线"}`)
+	updated := httptest.NewRecorder()
+	app.handleSiteByID(updated, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(created.ID), bytes.NewReader(update)))
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	reloaded, err := app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.PrimaryLineName != "东京主线" {
+		t.Fatalf("updated primary_line_name=%q", reloaded.PrimaryLineName)
+	}
+}
+
+func TestHandleSitesRejectsFailoverTargetsWithFixedUpstreamHeaders(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	payload := []byte(`{"name":"incompatible-failover","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","failover_targets":["https://backup.example.com"],"upstream_headers":[{"name":"X-Origin-Secret","value":"do-not-forward"}]}`)
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "failover_targets cannot be combined") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -5446,11 +6188,14 @@ func TestNormalizeIngressMode(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "legacy port", want: ingressModePort},
+		{name: "restored unset", mode: ingressModeUnset, want: ingressModeUnset},
 		{name: "secure shared default", publicHost: "media.example.com", want: ingressModeHost},
 		{name: "host", mode: ingressModeHost, publicHost: "media.example.com", want: ingressModeHost},
 		{name: "both", mode: ingressModeBoth, publicHost: "media.example.com", want: ingressModeBoth},
+		{name: "path", mode: ingressModePath, want: ingressModePath},
 		{name: "port rejects host", mode: ingressModePort, publicHost: "media.example.com", wantErr: true},
 		{name: "host requires domain", mode: ingressModeHost, wantErr: true},
+		{name: "unset rejects host", mode: ingressModeUnset, publicHost: "media.example.com", wantErr: true},
 		{name: "unknown", mode: "unsafe", wantErr: true},
 	}
 	for _, tt := range tests {
@@ -5463,6 +6208,212 @@ func TestNormalizeIngressMode(t *testing.T) {
 				t.Fatalf("normalizeIngressMode(%q, %q)=%q, want %q", tt.mode, tt.publicHost, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPathIngressNormalizationAndPrefixHelpers(t *testing.T) {
+	for _, tt := range []struct {
+		input string
+		want  string
+		err   bool
+	}{
+		{input: " /Emby/ ", want: "/emby"},
+		{input: "api", err: true},
+		{input: "a/b", err: true},
+	} {
+		got, err := normalizePathPrefix(tt.input)
+		if (err != nil) != tt.err || got != tt.want {
+			t.Fatalf("normalizePathPrefix(%q)=(%q,%v), want (%q,%v)", tt.input, got, err, tt.want, tt.err)
+		}
+	}
+	u, err := url.Parse("https://panel.example/emby/Videos/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripIngressPathPrefix(u, "/emby")
+	if u.Path != "/Videos/1" {
+		t.Fatalf("stripped path=%q", u.Path)
+	}
+	if got := addIngressPathPrefix("/Videos/1", "/emby"); got != "/emby/Videos/1" {
+		t.Fatalf("prefixed path=%q", got)
+	}
+	for _, tt := range []struct {
+		route  string
+		prefix string
+		want   string
+	}{
+		{route: "/emby/sntp/videos/1/original.mkv", prefix: "/sntp", want: "/sntp/emby/videos/1/original.mkv"},
+		{route: "/Jellyfin/SNTP/Videos/1?api_key=value", prefix: "/sntp", want: "/sntp/Jellyfin/Videos/1?api_key=value"},
+		{route: "/emby/sntp-other/videos/1", prefix: "/sntp", want: "/sntp/emby/sntp-other/videos/1"},
+		{route: "/emby/videos/1", prefix: "/videos", want: "/videos/emby/videos/1"},
+		{route: "/emby/emos/emya/video", prefix: "/emos", want: "/emos/emby/emya/video"},
+	} {
+		if got := addIngressPathPrefix(tt.route, tt.prefix); got != tt.want {
+			t.Fatalf("addIngressPathPrefix(%q, %q)=%q, want %q", tt.route, tt.prefix, got, tt.want)
+		}
+	}
+	if got := stripUpstreamBasePath("/jellyfin/Videos/1", "/jellyfin"); got != "/Videos/1" {
+		t.Fatalf("stripped upstream base path=%q", got)
+	}
+	if got := pathIngressCookiePath("/jellyfin/", "/jellyfin", "/emby"); got != "/emby/" {
+		t.Fatalf("mapped cookie path=%q", got)
+	}
+}
+
+func TestPathIngressResponseNormalizesEmbeddedBaseLocation(t *testing.T) {
+	requestURL, err := url.Parse("https://panel.example/sntp/Items/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{Header: make(http.Header), Request: &http.Request{URL: requestURL}}
+	resp.Header.Set("Location", "/emby/sntp/videos/1/original.mkv?token=ok")
+	prefixPathIngressResponse(resp, "/sntp", "")
+	if got := resp.Header.Get("Location"); got != "/sntp/emby/videos/1/original.mkv?token=ok" {
+		t.Fatalf("normalized Location=%q", got)
+	}
+}
+
+func TestPathIngressAcceptsEmbeddedBaseRequestPath(t *testing.T) {
+	requestURL, err := url.Parse("https://panel.example/emby/sntp/videos/1/original.mkv?token=ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !normalizeEmbeddedIngressRequestPath(requestURL, "/sntp") || requestURL.Path != "/sntp/emby/videos/1/original.mkv" {
+		t.Fatalf("normalized embedded request path=%q", requestURL.Path)
+	}
+	stripIngressPathPrefix(requestURL, "/sntp")
+	if requestURL.Path != "/emby/videos/1/original.mkv" {
+		t.Fatalf("upstream embedded request path=%q", requestURL.Path)
+	}
+}
+
+func TestPathIngressRoutesThroughPanelAndStripsPrefix(t *testing.T) {
+	app := newTestApp(t)
+	upstreamPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath <- r.URL.RequestURI()
+		if got := r.Header.Get("X-Forwarded-Prefix"); got != "/emby" {
+			t.Errorf("X-Forwarded-Prefix=%q", got)
+		}
+		w.Header().Set("Location", "/jellyfin/Videos/2/stream")
+		w.Header().Add("Set-Cookie", "emby_session=keep; Path=/jellyfin/; HttpOnly")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	site := Site{
+		ID: 701, Name: "path-entry", ListenPort: freePort(t), PathPrefix: "/emby",
+		IngressMode: ingressModePath, TargetURL: upstream.URL + "/jellyfin", PlaybackMode: "direct",
+		MainVideoStreamMode: mainVideoStreamModeProxy, StreamHosts: "[]", UAMode: passthroughUAMode,
+	}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	panel := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	router := app.publicHostRouter(panel)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "http://panel.example/emby/Items/1?x=1", nil)
+	router.ServeHTTP(recorder, request)
+	if got := <-upstreamPath; got != "/jellyfin/Items/1?x=1" {
+		t.Fatalf("upstream request URI=%q", got)
+	}
+	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/emby/Videos/2/stream" {
+		t.Fatalf("path response=%d Location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if cookie := recorder.Header().Get("Set-Cookie"); !strings.Contains(cookie, "Path=/emby/") {
+		t.Fatalf("path response cookie=%q", cookie)
+	}
+
+	panelRecorder := httptest.NewRecorder()
+	router.ServeHTTP(panelRecorder, httptest.NewRequest(http.MethodGet, "http://panel.example/api/auth/check", nil))
+	if panelRecorder.Code != http.StatusTeapot {
+		t.Fatalf("panel API was shadowed: %d", panelRecorder.Code)
+	}
+
+	redirectRecorder := httptest.NewRecorder()
+	router.ServeHTTP(redirectRecorder, httptest.NewRequest(http.MethodGet, "http://panel.example/emby?x=1", nil))
+	if redirectRecorder.Code != http.StatusPermanentRedirect || redirectRecorder.Header().Get("Location") != "/emby/?x=1" {
+		t.Fatalf("path root redirect=%d Location=%q", redirectRecorder.Code, redirectRecorder.Header().Get("Location"))
+	}
+}
+
+func TestPathIngressEmbeddedClientRouteStripsBothPrefixes(t *testing.T) {
+	app := newTestApp(t)
+	upstreamPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath <- r.URL.RequestURI()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	site := Site{
+		ID: 702, Name: "embedded-path-entry", ListenPort: freePort(t), PathPrefix: "/sntp",
+		IngressMode: ingressModePath, TargetURL: upstream.URL, PlaybackMode: "direct",
+		MainVideoStreamMode: mainVideoStreamModeProxy, StreamHosts: "[]", UAMode: passthroughUAMode,
+	}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+
+	router := app.publicHostRouter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://panel.example/sntp/emby/sntp/videos/1/original.mkv?token=ok", nil))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("embedded path response status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := <-upstreamPath; got != "/emby/videos/1/original.mkv?token=ok" {
+		t.Fatalf("embedded path upstream URI=%q", got)
+	}
+}
+
+func TestHandleSitesPathIngressRejectsDuplicatePrefix(t *testing.T) {
+	app := newTestApp(t)
+	app.panelListenPort = 9090
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	create := func(name, prefix string) *httptest.ResponseRecorder {
+		payload, err := json.Marshal(map[string]any{
+			"name":          name,
+			"ingress_mode":  ingressModePath,
+			"path_prefix":   prefix,
+			"target_url":    upstream.URL,
+			"ua_mode":       passthroughUAMode,
+			"playback_mode": "direct",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder := httptest.NewRecorder()
+		app.handleSites(recorder, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+		return recorder
+	}
+
+	first := create("path-one", " /Emby/ ")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first path create status=%d body=%s", first.Code, first.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(created.ID) })
+	if created.PathPrefix != "/emby" || created.IngressMode != ingressModePath || created.ListenPort == 0 {
+		t.Fatalf("created path site=%#v", created)
+	}
+
+	duplicate := create("path-two", "EMBY")
+	if duplicate.Code != http.StatusBadRequest || !strings.Contains(duplicate.Body.String(), "path_prefix") {
+		t.Fatalf("duplicate path create status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	sites, err := app.db.ListSites()
+	if err != nil || len(sites) != 1 {
+		t.Fatalf("sites after duplicate=%#v err=%v", sites, err)
 	}
 }
 

@@ -24,3 +24,10 @@ meridian.exe
 # OS
 .DS_Store
 Thumbs.db
+
+# Codex / local build artifacts
+.codex-remote-attachments/
+.tmp/
+.tmp-*.patch
+.tmp-*.log
+COLLABORATION_RULES.md

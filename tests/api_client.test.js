@@ -11,7 +11,7 @@ const STATIC_JS = path.join(__dirname, '..', 'web', 'static', 'js');
 // Loads api.js into a sandbox where fetch/window are injected per test, the
 // same way a browser page provides them.
 function loadAPIClient() {
-  const sandbox = { window: {} };
+  const sandbox = { window: {}, URLSearchParams };
   vm.createContext(sandbox);
   vm.runInContext(
     fs.readFileSync(path.join(STATIC_JS, 'api.js'), 'utf8'),
@@ -97,11 +97,61 @@ test('dynamic discovery API calls use the exact authenticated paths and verbs', 
   }
 });
 
+test('account API reads and updates the authenticated administrator', async () => {
+  const sandbox = loadAPIClient();
+  const requests = [];
+  sandbox.fetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    return {
+      status: 200,
+      ok: true,
+      statusText: 'OK',
+      json: async () => ({ username: 'renamed-admin', role: '管理员' }),
+    };
+  };
+
+  await vm.runInContext('API.getAccount()', sandbox);
+  await vm.runInContext(`API.updateAccount({
+    username: "renamed-admin",
+    current_password: "current password",
+    new_password: "new password value"
+  })`, sandbox);
+
+  assert.deepEqual(requests.map(request => [request.options.method, request.url]), [
+    ['GET', '/api/account'],
+    ['PUT', '/api/account'],
+  ]);
+  assert.equal(requests[0].options.body, undefined);
+  assert.deepEqual(JSON.parse(requests[1].options.body), {
+    username: 'renamed-admin',
+    current_password: 'current password',
+    new_password: 'new password value',
+  });
+});
+
+test('dashboard trends API encodes a custom minute-precision time range', async () => {
+  const sandbox = loadAPIClient();
+  const requests = [];
+  sandbox.fetch = async (url) => {
+    requests.push(String(url));
+    return { status: 200, ok: true, json: async () => ({ points: [] }) };
+  };
+
+  await vm.runInContext('API.dashboardTrends("all", "custom", "2026-08-18T09:05", "2026-08-18T12:34")', sandbox);
+  assert.equal(
+    requests[0],
+    '/api/dashboard-trends?site_id=all&range=custom&start=2026-08-18T09%3A05&end=2026-08-18T12%3A34',
+  );
+});
+
 test('mobile credential inputs disable keyboard text transformations', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'index.html'), 'utf8');
 
-  for (const id of ['inp-username', 'inp-password', 'inp-setup-token']) {
-    const input = html.match(new RegExp(`<input\\b(?=[^>]*\\bid="${id}")[^>]*>`));
+  for (const id of ['inp-username', 'inp-password', 'inp-setup-token', 'account-username', 'account-current-password', 'account-new-password', 'account-confirm-password']) {
+    const source = id.startsWith('account-')
+      ? fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'account.js'), 'utf8')
+      : html;
+    const input = source.match(new RegExp(`<input\\b(?=[^>]*\\bid="${id}")[^>]*>`));
     assert.ok(input, `missing ${id} input`);
     assert.match(input[0], /\bautocapitalize="none"/);
     assert.match(input[0], /\bautocorrect="off"/);

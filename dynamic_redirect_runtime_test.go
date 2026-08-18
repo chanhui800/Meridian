@@ -182,12 +182,16 @@ func TestDynamicRedirectRuntimeEligibilityIsNarrow(t *testing.T) {
 		{name: "audio HEAD", method: http.MethodHead, path: "/emby/Audio/42/file.mp3", want: true},
 		{name: "live TV GET", method: http.MethodGet, path: "/LiveTv/LiveStreamFiles/42/stream.ts", want: true},
 		{name: "item download", method: http.MethodGet, path: "/Items/42/Download", want: true},
+		{name: "Emya video GET", method: http.MethodGet, path: "/emby/emya/video?server=emos", want: true},
+		{name: "Emya video HEAD", method: http.MethodHead, path: "/emya/video", want: true},
 		{name: "exact PlaybackInfo", method: http.MethodGet, path: "/Items/42/PlaybackInfo?UserId=7", want: true},
 		{name: "exact emby PlaybackInfo", method: http.MethodHead, path: "/emby/Items/42/PlaybackInfo", want: true},
 		{name: "HLS manifest", method: http.MethodGet, path: "/custom/live.m3u8", want: true},
 		{name: "DASH manifest", method: http.MethodHead, path: "/custom/manifest.mpd", want: true},
 		{name: "ordinary API", method: http.MethodGet, path: "/Users/AuthenticateByName", want: false},
 		{name: "POST media", method: http.MethodPost, path: "/Videos/42/stream", want: false},
+		{name: "POST Emya video", method: http.MethodPost, path: "/emby/emya/video", want: false},
+		{name: "Emya video trailing slash", method: http.MethodGet, path: "/emby/emya/video/", want: false},
 		{name: "PlaybackInfo POST", method: http.MethodPost, path: "/Items/42/PlaybackInfo", want: false},
 		{name: "empty item id", method: http.MethodGet, path: "/Items//PlaybackInfo", want: false},
 		{name: "PlaybackInfo trailing slash", method: http.MethodGet, path: "/Items/42/PlaybackInfo/", want: false},
@@ -209,6 +213,59 @@ func TestDynamicRedirectRuntimeEligibilityIsNarrow(t *testing.T) {
 	}
 	if isDynamicRedirectEligibleRequest(nil) {
 		t.Fatal("nil request was eligible")
+	}
+}
+
+func TestDynamicRedirectRuntimeUsesOnlyLiveLearnedPlaybackPaths(t *testing.T) {
+	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
+	if !ok {
+		t.Fatal("compatible limits are unavailable")
+	}
+	_, state := redirectRuntimeState(t, limits, nil)
+	defer state.close()
+	now := time.Now()
+	state.learnPlaybackPath("/vendor/playback-entry", now)
+
+	for name, test := range map[string]struct {
+		method string
+		path   string
+		want   bool
+	}{
+		"learned GET":   {method: http.MethodGet, path: "/vendor/playback-entry?token=client", want: true},
+		"learned HEAD":  {method: http.MethodHead, path: "/vendor/playback-entry", want: true},
+		"learned POST":  {method: http.MethodPost, path: "/vendor/playback-entry"},
+		"similar path":  {method: http.MethodGet, path: "/vendor/playback-entry/extra"},
+		"unrelated API": {method: http.MethodGet, path: "/Users/AuthenticateByName"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, "https://origin.example.com"+test.path, nil)
+			if got := isDynamicRedirectEligibleRequestForState(req, state); got != test.want {
+				t.Fatalf("learned eligibility for %s %s = %t, want %t", test.method, test.path, got, test.want)
+			}
+		})
+	}
+
+	state.learnPlaybackPath("/vendor/expired", now.Add(-dynamicLearnedPlaybackPathTTL-time.Second))
+	if state.hasLearnedPlaybackPath("/vendor/expired", now) {
+		t.Fatal("expired learned path remained eligible")
+	}
+	for _, unsafe := range []string{"", "vendor/no-leading-slash", "/vendor/../admin", "/vendor/path?query", `/vendor\\path`} {
+		state.learnPlaybackPath(unsafe, now)
+		if state.hasLearnedPlaybackPath(unsafe, now) {
+			t.Fatalf("unsafe learned path %q was accepted", unsafe)
+		}
+	}
+
+	_, bounded := redirectRuntimeState(t, limits, nil)
+	defer bounded.close()
+	for index := 0; index <= dynamicLearnedPlaybackPathLimit; index++ {
+		bounded.learnPlaybackPath(fmt.Sprintf("/vendor/entry-%03d", index), now.Add(time.Duration(index)*time.Millisecond))
+	}
+	bounded.mu.Lock()
+	entryCount := len(bounded.learnedPlaybackPaths)
+	bounded.mu.Unlock()
+	if entryCount != dynamicLearnedPlaybackPathLimit || bounded.hasLearnedPlaybackPath("/vendor/entry-000", now.Add(time.Second)) || !bounded.hasLearnedPlaybackPath(fmt.Sprintf("/vendor/entry-%03d", dynamicLearnedPlaybackPathLimit), now.Add(time.Second)) {
+		t.Fatalf("learned path capacity state count=%d", entryCount)
 	}
 }
 
@@ -744,6 +801,167 @@ func TestDynamicRedirectRuntimeAcceptsPercentEncodedSpaces(t *testing.T) {
 	}
 }
 
+func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	runtime, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "cdn.example.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	}))
+	issuer := &dynamicCapabilityIssuer{
+		key:                   []byte("01234567890123456789012345678901"),
+		siteID:                7,
+		policyRevision:        3,
+		policy:                policy,
+		state:                 state,
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		primaryAuthority:      "https://origin.example.net:443",
+	}
+	redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("upstream redirect")}
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp := redirectRuntimeResponse(req, http.StatusFound, []string{"https://cdn.example.com/media/movie.mkv?sig=secret"}, redirectBody)
+			resp.Header.Set("Set-Cookie", "upstream-secret=yes")
+			return resp, nil
+		}),
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		dynamicPolicy:         policy,
+		dynamicState:          state,
+		capabilityIssuer:      issuer,
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream"))
+	if err != nil {
+		t.Fatalf("rewrite redirect as capability: %v", err)
+	}
+	if resp.StatusCode != http.StatusFound || !responseIsDynamic(resp) || !redirectBody.closed.Load() {
+		t.Fatalf("response status/dynamic/bodyClosed=%d/%t/%t", resp.StatusCode, responseIsDynamic(resp), redirectBody.closed.Load())
+	}
+	location := resp.Header.Get("Location")
+	if !strings.HasPrefix(location, dynamicRoutePrefix) || strings.Contains(location, "cdn.example.com") || strings.Contains(location, "secret") {
+		t.Fatalf("unsafe rewritten Location %q", location)
+	}
+	token := strings.TrimPrefix(location, dynamicRoutePrefix)
+	claims, err := openDynamicCapability(issuer.key, token)
+	if err != nil {
+		t.Fatalf("open redirect capability: %v", err)
+	}
+	if claims.Source != dynamicDiscoverySourceRedirect || claims.Kind != dynamicCapabilityKindResource || claims.Target != "https://cdn.example.com:443/media/movie.mkv?sig=secret" {
+		t.Fatalf("redirect capability claims=%#v", claims)
+	}
+	if !state.hasCapability(token, time.Now()) || runtime.authorities["https://cdn.example.com:443"] != 1 {
+		t.Fatalf("published capability state=%t authorities=%v", state.hasCapability(token, time.Now()), runtime.authorities)
+	}
+	rebuildDynamicResponseHeaders(resp)
+	if resp.Header.Get("Location") != location || resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Content-Length") != "0" {
+		t.Fatalf("sanitized redirect headers=%v", resp.Header)
+	}
+}
+
+func TestDynamicRedirectRuntimeDirectModeExposesValidatedMainVideoTarget(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "cdn.example.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	}))
+	redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("upstream redirect")}
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp := redirectRuntimeResponse(req, http.StatusFound, []string{"https://cdn.example.com/media/movie.mkv?sig=client-target"}, redirectBody)
+			resp.Header.Set("Set-Cookie", "origin=must-not-cross")
+			return resp, nil
+		}),
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		mainVideoDirect:       true,
+		dynamicPolicy:         policy,
+		dynamicState:          state,
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream"))
+	if err != nil {
+		t.Fatalf("return direct main-video redirect: %v", err)
+	}
+	if resp.StatusCode != http.StatusTemporaryRedirect || !redirectBody.closed.Load() {
+		t.Fatalf("direct response status/bodyClosed=%d/%t", resp.StatusCode, redirectBody.closed.Load())
+	}
+	if got := resp.Header.Get("Location"); got != "https://cdn.example.com:443/media/movie.mkv?sig=client-target" {
+		t.Fatalf("direct Location = %q", got)
+	}
+	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Content-Length") != "0" || resp.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("direct response headers = %#v", resp.Header)
+	}
+}
+
+func TestDynamicRedirectRuntimeDirectModeDoesNotExposeRedirectUserInfo(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	_, state := redirectRuntimeState(t, policy.limits, nil)
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return redirectRuntimeResponse(req, http.StatusFound, []string{"https://user:secret@origin.example.net/media/movie.mkv"}, http.NoBody), nil
+		}),
+		configuredAuthorities: map[string]bool{"https://origin.example.net:443": true},
+		mainVideoDirect:       true,
+		dynamicPolicy:         policy,
+		dynamicState:          state,
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream"))
+	if err == nil || resp != nil {
+		t.Fatalf("userinfo redirect response/error = %#v/%v, want rejection", resp, err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("userinfo rejection exposed credentials: %v", err)
+	}
+}
+
+func TestDynamicRedirectRuntimeInternallyFollowsMediaRedirects(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "cdn.example.com" {
+			return nil, fmt.Errorf("unexpected DNS host %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	}))
+	initialBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
+	captures := make(chan redirectRuntimeDialCapture, 1)
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return redirectRuntimeResponse(req, http.StatusPermanentRedirect, []string{"https://cdn.example.com/media/movie.mkv"}, initialBody), nil
+		}),
+		configuredAuthorities:  map[string]bool{"https://origin.example.net:443": true},
+		followUnknownRedirects: true,
+		dynamicPolicy:          policy,
+		dynamicState:           state,
+		dynamicTransportFactory: redirectRuntimeFactory(captures, func(*http.Request) string {
+			return "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nContent-Length: 8\r\n\r\nmovie-ok"
+		}),
+	}
+
+	resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/emby/emya/video"))
+	if err != nil {
+		t.Fatalf("internally follow media redirect: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read internally followed media response: %v", err)
+	}
+	if resp.StatusCode != http.StatusPartialContent || string(body) != "movie-ok" || !responseIsDynamic(resp) || !initialBody.closed.Load() {
+		t.Fatalf("status/body/dynamic/closed=%d/%q/%t/%t", resp.StatusCode, body, responseIsDynamic(resp), initialBody.closed.Load())
+	}
+	select {
+	case capture := <-captures:
+		if capture.err != nil || capture.request.Host != "cdn.example.com:443" || capture.request.RequestURI != "/media/movie.mkv" {
+			t.Fatalf("dynamic capture=%#v host=%q requestURI=%q", capture, capture.request.Host, capture.request.RequestURI)
+		}
+	default:
+		t.Fatal("internal media redirect did not reach the validated target")
+	}
+}
+
 func TestDynamicRedirectRuntimeSeeOtherIsExtremeOnly(t *testing.T) {
 	for _, test := range []struct {
 		profile     string
@@ -1185,6 +1403,8 @@ func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *t
 	}
 	request := redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Items/1/PlaybackInfo")
 	request = request.WithContext(context.WithValue(request.Context(), dynamicExpectedStructuredSourceContextKey{}, dynamicDiscoverySourcePlaybackInfo))
+	clientBase := httptest.NewRequest(http.MethodGet, "https://public.example.com/Items/1/PlaybackInfo", nil).URL
+	request = request.WithContext(context.WithValue(request.Context(), dynamicPlaybackInfoBaseContextKey{}, clientBase))
 	resp, err := transport.RoundTrip(request)
 	if err != nil {
 		t.Fatalf("redirected PlaybackInfo RoundTrip: %v", err)
@@ -1204,23 +1424,11 @@ func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *t
 		t.Fatalf("read redirected PlaybackInfo: %v", err)
 	}
 	text := string(rewritten)
-	if strings.Contains(text, "relative-secret") {
-		t.Fatalf("redirected PlaybackInfo leaked relative target: %s", text)
+	if !strings.Contains(text, "/Videos/1/master.m3u8?api_key=relative-secret") {
+		t.Fatalf("redirected PlaybackInfo changed relative target: %s", text)
 	}
-	start := strings.Index(text, dynamicRoutePrefix)
-	if start < 0 {
-		t.Fatalf("redirected PlaybackInfo has no capability: %s", text)
-	}
-	end := strings.IndexByte(text[start:], '"')
-	if end < 0 {
-		t.Fatalf("redirected PlaybackInfo capability is unterminated: %s", text)
-	}
-	claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, text[start:start+end]))
-	if err != nil {
-		t.Fatalf("open redirected PlaybackInfo capability: %v", err)
-	}
-	if claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || claims.Target != "https://cdn.example.com:443/Videos/1/master.m3u8?api_key=relative-secret" {
-		t.Fatalf("redirected relative claims = %#v", claims)
+	if strings.Contains(text, dynamicRoutePrefix) || !state.hasLearnedPlaybackPath("/Videos/1/master.m3u8", time.Now()) {
+		t.Fatalf("redirected relative target was not learned without minting a capability: %s", text)
 	}
 	commitDynamicResponseAuthorities(resp)
 	_ = resp.Body.Close()
@@ -1427,7 +1635,7 @@ func TestDynamicRedirectRuntimeRebuildsHeadersAndCleansResponse(t *testing.T) {
 		"Accept-Encoding": {"identity"},
 		"Range":           {"bytes=100-199"},
 		"If-Range":        {"strong-etag"},
-		"User-Agent":      {dynamicRedirectUserAgent},
+		"User-Agent":      {"untrusted-client/9"},
 	} {
 		got := capture.request.Header.Values(name)
 		if strings.Join(got, "\x00") != strings.Join(want, "\x00") {

@@ -1,4 +1,6 @@
 .git
+.codex-remote-attachments
+COLLABORATION_RULES.md
 .github
 .gitignore
 .env
@@ -8,6 +10,8 @@
 *.db-journal
 *.db-shm
 *.db-wal
+data
+*.pem
 meridian
 meridian.exe
 *.exe

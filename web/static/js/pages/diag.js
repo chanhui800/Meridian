@@ -2,21 +2,27 @@
 function renderDiag() {
   const page = document.getElementById('page-diagnostics');
   page.innerHTML = `
-    <h1 class="section-title fade-up">故障诊断</h1>
-    <p class="section-sub fade-up stagger-1">查看主回源、播放回源、上游证书和代理配置状态</p>
-    <div class="diag-toolbar fade-up stagger-1">
-      <select class="form-select" id="diag-select">
-        <option value="">加载中...</option>
-      </select>
-      <button class="btn-scan" id="btn-scan">开始诊断</button>
-    </div>
-    <div class="diag-grid" id="diag-grid">
-      <div class="diag-card diag-card-wide fade-up stagger-2">
-        <div class="diag-empty">选择站点后开始诊断</div>
-      </div>
+    <div class="settings-layout fade-up">
+      ${globalSettingsNav('diagnostics')}
+      <main class="settings-content">
+        <h1 class="section-title fade-up">故障诊断</h1>
+        <p class="section-sub fade-up stagger-1">查看主回源、播放回源、上游证书和代理配置状态</p>
+        <div class="diag-toolbar fade-up stagger-1">
+          <select class="form-select" id="diag-select">
+            <option value="">加载中...</option>
+          </select>
+          <button class="btn-scan" id="btn-scan">开始诊断</button>
+        </div>
+        <div class="diag-grid" id="diag-grid">
+          <div class="diag-card diag-card-wide fade-up stagger-2">
+            <div class="diag-empty">选择站点后开始诊断</div>
+          </div>
+        </div>
+      </main>
     </div>
   `;
 
+  bindGlobalSettingsNav(page);
   loadDiagSites();
   document.getElementById('btn-scan').onclick = runDiag;
 }
@@ -51,6 +57,7 @@ async function runDiag() {
     const upstreams = result.upstreams || {};
     const primary = upstreams.primary || {};
     const playback = upstreams.playback || {};
+		const failovers = Array.isArray(upstreams.failovers) ? upstreams.failovers : [];
     const headers = result.headers || {};
     const proxy = result.proxy || {};
 
@@ -73,6 +80,9 @@ async function runDiag() {
     if (playback.show_tls) {
       cards.push(renderTLSCard('播放回源 TLS', '播放回源上游站点证书信息', playback, 'stagger-5'));
     }
+		if (failovers.length) {
+			cards.push(renderFailoverCard(failovers, 'stagger-5'));
+		}
 
     cards.push(renderHeadersCard(headers, 'stagger-5'));
     cards.push(renderProxyCard(proxy, 'stagger-6'));
@@ -84,6 +94,29 @@ async function runDiag() {
     btn.classList.remove('running');
     btn.textContent = '开始诊断';
   }
+}
+
+function renderFailoverCard(failovers, staggerClass) {
+  return `
+    <div class="diag-card diag-card-wide fade-up ${staggerClass}">
+      <div class="diag-head">
+        <div class="diag-icon" style="background:var(--blue-dim)">
+          <svg viewBox="0 0 24 24" style="stroke:var(--blue)"><path d="M7 7h11l-3-3"/><path d="M18 17H7l3 3"/><path d="M18 7v4a3 3 0 0 1-3 3H7"/><path d="M7 17v-4a3 3 0 0 1 3-3h8"/></svg>
+        </div>
+        <div>
+          <div class="diag-title">备用线路健康</div>
+          <div class="diag-subtitle">按站点配置顺序探测；实际请求会在失败后临时优先使用可用线路</div>
+        </div>
+      </div>
+      <div class="diag-rows">
+        ${failovers.map((upstream, index) => {
+          const health = upstream.health || {};
+          const latency = typeof health.latency_ms === 'number' ? `${health.latency_ms}ms` : '--';
+          return `<div class="diag-row"><span class="diag-key">备用 ${index + 1}</span><span class="diag-val diag-wrap">${diagText(upstream.effective_url)}</span><span class="diag-val ${statusClass(health.status)}">${statusText(health.status)} ${latency}</span></div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
 }
 
 function renderDiagNotes(notes) {
@@ -207,7 +240,10 @@ function renderHeadersCard(headers, staggerClass) {
 
 function renderProxyCard(proxy, staggerClass) {
 	const mode = String(proxy.ingress_mode || (proxy.public_host ? 'host' : 'port')).toLowerCase();
-	const modeLabel = { port: '仅独立端口', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+	const modeLabel = { port: '仅独立端口', path: '共享路径', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+	const pathRow = proxy.path_prefix
+	  ? `<div class="diag-row"><span class="diag-key">路径前缀</span><span class="diag-val">${esc(proxy.path_prefix)}</span></div>`
+	  : '';
 	const hostRow = proxy.public_host
 	  ? `<div class="diag-row"><span class="diag-key">共享域名</span><span class="diag-val">${esc(proxy.public_host)}</span></div>`
 	  : '';
@@ -228,7 +264,8 @@ function renderProxyCard(proxy, staggerClass) {
       <div class="diag-rows">
 		<div class="diag-row"><span class="diag-key">代理运行</span><span class="diag-val ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></div>
 			<div class="diag-row"><span class="diag-key">入口模式</span><span class="diag-val">${esc(modeLabel)}</span></div>
-		${hostRow}
+	  ${hostRow}
+	  ${pathRow}
 		<div class="diag-row"><span class="diag-key">端口状态</span><span class="diag-val">${portValue}</span></div>
         <div class="diag-row"><span class="diag-key">总请求数</span><span class="diag-val">${typeof proxy.total_requests === 'number' ? proxy.total_requests : '--'}</span></div>
       </div>
