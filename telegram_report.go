@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -24,10 +25,11 @@ import (
 )
 
 const (
-	telegramReportDefaultTime     = "20:00"
-	telegramReportDefaultWeekday  = 1
-	telegramReportMaxMessageBytes = 4096
-	telegramReportCipherPrefix    = "v1:"
+	telegramReportDefaultTime        = "20:00"
+	telegramReportDefaultWeekday     = 1
+	telegramReportMaxMessageBytes    = 4096
+	telegramReportCipherPrefix       = "v2:"
+	telegramReportLegacyCipherPrefix = "v1:"
 )
 
 var telegramReportTimePattern = regexp.MustCompile(`^(?:[01][0-9]|2[0-3]):[0-5][0-9]$`)
@@ -92,6 +94,13 @@ func telegramReportKey() []byte {
 }
 
 func telegramReportKeyForSecret(secret []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte("meridian telegram report bot token v2\x00"))
+	return mac.Sum(nil)
+}
+
+func legacyTelegramReportKeyForSecret(secret []byte) []byte {
+	// codeql[go/weak-sensitive-data-hashing] -- legacy v1 ciphertext compatibility; new writes use HMAC-SHA256 v2.
 	h := sha256.New()
 	_, _ = h.Write([]byte("meridian telegram report bot token v1\x00"))
 	_, _ = h.Write(secret)
@@ -137,14 +146,19 @@ func decryptTelegramBotToken(ciphertext string) (string, error) {
 }
 
 func decryptTelegramBotTokenWithSecret(ciphertext string, secret []byte) (string, error) {
-	if !strings.HasPrefix(ciphertext, telegramReportCipherPrefix) {
+	keyForSecret := telegramReportKeyForSecret
+	prefix := telegramReportCipherPrefix
+	if strings.HasPrefix(ciphertext, telegramReportLegacyCipherPrefix) {
+		keyForSecret = legacyTelegramReportKeyForSecret
+		prefix = telegramReportLegacyCipherPrefix
+	} else if !strings.HasPrefix(ciphertext, telegramReportCipherPrefix) {
 		return "", fmt.Errorf("invalid Telegram bot token ciphertext")
 	}
-	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(ciphertext, telegramReportCipherPrefix))
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(ciphertext, prefix))
 	if err != nil {
 		return "", fmt.Errorf("decode Telegram bot token: %w", err)
 	}
-	block, err := aes.NewCipher(telegramReportKeyForSecret(secret))
+	block, err := aes.NewCipher(keyForSecret(secret))
 	if err != nil {
 		return "", err
 	}

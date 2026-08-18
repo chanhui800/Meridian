@@ -280,7 +280,8 @@ func probeTargetHealth(plan diagProbePlan) DiagHealth {
 		}
 
 		start := time.Now()
-		resp, err := client.Do(req) // #nosec G704 -- diagnostics probe only the administrator-configured, validated upstream.
+		// codeql[go/request-forgery] -- diagnostics only probes the authenticated administrator's normalized site target; it is not derived from an unauthenticated request URL.
+		resp, err := client.Do(req)
 		latency := time.Since(start).Milliseconds()
 		health.LatencyMs = latency
 		if err != nil {

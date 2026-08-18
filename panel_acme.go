@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -33,11 +34,12 @@ import (
 )
 
 const (
-	letsEncryptProductionDirectory  = "https://acme-v02.api.letsencrypt.org/directory"
-	letsEncryptStagingDirectory     = "https://acme-staging-v02.api.letsencrypt.org/directory"
-	panelCertificateRenewalWindow   = 30 * 24 * time.Hour
-	panelCertificateRenewalInterval = 12 * time.Hour
-	panelACMETokenCipherPrefix      = "v1:"
+	letsEncryptProductionDirectory   = "https://acme-v02.api.letsencrypt.org/directory"
+	letsEncryptStagingDirectory      = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	panelCertificateRenewalWindow    = 30 * 24 * time.Hour
+	panelCertificateRenewalInterval  = 12 * time.Hour
+	panelACMETokenCipherPrefix       = "v2:"
+	panelACMETokenLegacyCipherPrefix = "v1:"
 )
 
 var errCertificateIssuanceBusy = errors.New("a certificate request is already running")
@@ -199,6 +201,13 @@ func certificateCanBeReused(status panelCertificateStatus) bool {
 }
 
 func panelACMETokenKeyForSecret(secret []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte("meridian panel acme dns token v2\x00"))
+	return mac.Sum(nil)
+}
+
+func legacyPanelACMETokenKeyForSecret(secret []byte) []byte {
+	// codeql[go/weak-sensitive-data-hashing] -- legacy v1 ciphertext compatibility; new writes use HMAC-SHA256 v2.
 	h := sha256.New()
 	_, _ = h.Write([]byte("meridian panel acme dns token v1\x00"))
 	_, _ = h.Write(secret)
@@ -208,7 +217,6 @@ func panelACMETokenKeyForSecret(secret []byte) []byte {
 func encryptPanelACMEToken(token string) (string, error) {
 	return encryptPanelACMETokenWithSecret(token, activeStoredCredentialSecret())
 }
-
 
 func encryptPanelACMETokenWithSecret(token string, secret []byte) (string, error) {
 	token = strings.TrimSpace(token)
@@ -243,16 +251,20 @@ func decryptPanelACMEToken(ciphertext string) (string, error) {
 	return "", lastErr
 }
 
-
 func decryptPanelACMETokenWithSecret(ciphertext string, secret []byte) (string, error) {
-	if !strings.HasPrefix(ciphertext, panelACMETokenCipherPrefix) {
+	keyForSecret := panelACMETokenKeyForSecret
+	prefix := panelACMETokenCipherPrefix
+	if strings.HasPrefix(ciphertext, panelACMETokenLegacyCipherPrefix) {
+		keyForSecret = legacyPanelACMETokenKeyForSecret
+		prefix = panelACMETokenLegacyCipherPrefix
+	} else if !strings.HasPrefix(ciphertext, panelACMETokenCipherPrefix) {
 		return "", errors.New("invalid Cloudflare DNS API token ciphertext")
 	}
-	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(ciphertext, panelACMETokenCipherPrefix))
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(ciphertext, prefix))
 	if err != nil {
 		return "", fmt.Errorf("decode Cloudflare DNS API token: %w", err)
 	}
-	block, err := aes.NewCipher(panelACMETokenKeyForSecret(secret))
+	block, err := aes.NewCipher(keyForSecret(secret))
 	if err != nil {
 		return "", err
 	}

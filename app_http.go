@@ -257,6 +257,7 @@ func (a *App) jsonErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	// codeql[go/cookie-secure-not-set] -- documented HTTP panel compatibility; Secure is enabled automatically for HTTPS requests.
 	// #nosec G124 -- direct HTTP panel access is a documented compatibility mode;
 	// requestIsHTTPS only accepts X-Forwarded-Proto from configured proxies.
 	http.SetCookie(w, &http.Cookie{
@@ -272,6 +273,7 @@ func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token str
 }
 
 func (a *App) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	// codeql[go/cookie-secure-not-set] -- documented HTTP panel compatibility; Secure is enabled automatically for HTTPS requests.
 	// #nosec G124 -- must match setSessionCookie so HTTP sessions can be cleared.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
