@@ -31,14 +31,28 @@
     setup_token_required: false,
   };
 
+  function resetModalScroll() {
+    const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    const body = document.getElementById('modal-body');
+    if (overlay) overlay.scrollTop = 0;
+    if (modal) modal.scrollTop = 0;
+    if (body) body.scrollTop = 0;
+    document.getElementById('modal-body').scrollTop = 0;
+  }
+
   window.openModal = function(options) {
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
     modalPreviousFocus = document.activeElement;
     const overlay = document.getElementById('modal-overlay');
-    document.getElementById('modal-body').scrollTop = 0;
+    resetModalScroll();
     overlay.classList.add('active');
     overlay.setAttribute('aria-hidden', 'false');
     document.body.classList.add('modal-open');
+    // Reset after layout as well: replacing modal content can restore the
+    // previous scroll position in some browsers after the overlay is shown.
+    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(resetModalScroll);
+    if (typeof window.setTimeout === 'function') window.setTimeout(resetModalScroll, 0);
   };
 
   window.closeModal = function() {

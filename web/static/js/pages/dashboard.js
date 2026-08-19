@@ -311,6 +311,27 @@ function dashboardRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
+function dashboardTraceSmoothLine(ctx, points) {
+  if (!points.length) return;
+  if (points.length === 1) {
+    ctx.moveTo(points[0].x, points[0].y);
+    return;
+  }
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let index = 0; index < points.length - 1; index++) {
+    const previous = points[index - 1] || points[index];
+    const current = points[index];
+    const next = points[index + 1];
+    const following = points[index + 2] || next;
+    const tension = 1 / 6;
+    const control1X = current.x + (next.x - previous.x) * tension;
+    const control1Y = current.y + (next.y - previous.y) * tension;
+    const control2X = next.x - (following.x - current.x) * tension;
+    const control2Y = next.y - (following.y - current.y) * tension;
+    ctx.bezierCurveTo(control1X, control1Y, control2X, control2Y, next.x, next.y);
+  }
+}
+
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
   const points = dashboardTrendPoints();
@@ -354,12 +375,12 @@ function drawDashboardTrendChart(metric) {
   canvasSeries.forEach(item => {
     const pointsOnCanvas = item.points;
     ctx.beginPath();
-    pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+    dashboardTraceSmoothLine(ctx, pointsOnCanvas);
     if (metric !== 'speed') {
       ctx.lineTo(pointsOnCanvas[pointsOnCanvas.length - 1].x, top + plotH); ctx.lineTo(pointsOnCanvas[0].x, top + plotH); ctx.closePath();
       ctx.globalAlpha = .12; ctx.fillStyle = item.color; ctx.fill(); ctx.globalAlpha = 1;
       ctx.beginPath();
-      pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+      dashboardTraceSmoothLine(ctx, pointsOnCanvas);
     }
     ctx.strokeStyle = item.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
   });

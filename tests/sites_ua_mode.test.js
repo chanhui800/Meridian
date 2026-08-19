@@ -131,7 +131,7 @@ test('site management exposes latency tests and safe asset cache controls', () =
   assert.match(source, /asset_cache_rules:/);
   assert.match(source, /\*\/file\/\*/);
   assert.match(source, /\*\/emby\/Items\/\*\/Images\/\*/);
-  assert.match(source, /视频、音频、HLS、DASH、Range 请求/);
+  assert.match(source, /视频、音频、HLS\/DASH、Range/);
 });
 
 test('upstream header payload keeps configured rows write-only', () => {

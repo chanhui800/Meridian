@@ -1330,7 +1330,7 @@ async function showSiteModal(site) {
 	</div>
 	<div class="form-group upstream-lines-card">
 	  <div class="upstream-lines-head">
-	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。备用线路沿用主线路的反代、自动发现和请求策略。</div></div>
+	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。</div></div>
 	    <div class="upstream-lines-buttons">
 	      <button type="button" class="btn-ghost upstream-test-all" id="m-test-all-lines">线路测速</button>
 	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
@@ -1349,13 +1349,13 @@ async function showSiteModal(site) {
 	    </div>
 	    <div id="m-failover-lines"></div>
 	  </div>
-	  <div class="form-help">域名栏可包含协议和 Base URL 路径；端口单独填写。443 默认 HTTPS，其他端口默认 HTTP。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
+	  <div class="form-help">域名可包含协议和 Base URL 路径；端口单独填写。最多 7 条备用线路。</div>
 	</div>
 		<div class="form-group site-form-wide">
 		  <label>主回源固定请求头（可选）</label>
 		  <div id="m-upstream-headers"></div>
 		  <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
-		  <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
+		  <div class="form-help">使用 UPSTREAM_HEADER_KEY 加密保存，不会回显；仅发送到主回源。</div>
 		  ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
 		</div>
     <details class="site-advanced-card site-form-wide" open>
@@ -1380,7 +1380,7 @@ async function showSiteModal(site) {
       <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
       <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
       <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-      <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
+      <div class="form-help">只改写 User-Agent、Client、Version；Device 与 DeviceId 保持不变。</div>
     </div>
     <div class="form-group">
       <label>真实客户端 IP 透传</label>
@@ -1389,7 +1389,7 @@ async function showSiteModal(site) {
         <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
         <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
       </select>
-      <div class="form-help">仅控制发送给回源的 X-Real-IP 与 X-Forwarded-For；客户端来源仍按可信代理规则识别，日志中的客户端 IP 不受影响。</div>
+      <div class="form-help">仅影响发往回源的 X-Real-IP 与 X-Forwarded-For。</div>
     </div>
     <div class="form-group">
       <label>主视频流策略</label>
@@ -1397,8 +1397,8 @@ async function showSiteModal(site) {
         <option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option>
         <option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option>
       </select>
-      <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
-      <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
+      <div class="form-help">直连仅适用于主视频文件；面板、API、HLS/DASH 等仍由 Meridian 代理。</div>
+      <div class="form-help">自动发现保持启用；私网、回环和链路本地目标始终拒绝。</div>
     </div>
     <div class="form-group">
       <label for="m-asset-cache">缓存图片与静态资源</label>
@@ -1406,7 +1406,7 @@ async function showSiteModal(site) {
         <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
         <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
       </select>
-      <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
+      <div class="form-help">仅缓存图片与静态资源；视频、音频、HLS/DASH、Range 和私有响应不缓存。</div>
     </div>
     <div class="form-group">
       <label>缓存规则（每行一条，支持 * 通配）</label>
@@ -1431,7 +1431,7 @@ async function showSiteModal(site) {
     <div class="form-group">
       <label>单连接限速 (Mbps, 0=不限)</label>
       <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
-      <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
+      <div class="form-help">限制单个连接的下行速度，上传不受影响。</div>
       </div>
       </div>
     </details>

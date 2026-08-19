@@ -442,8 +442,8 @@ test('site modal presents proxy and direct main-video choices without discovery 
   assert.match(body, /主视频流策略/);
   assert.match(body, /反代/);
   assert.match(body, /直连/);
-  assert.match(body, /网盘或 CDN 的 302/);
-  assert.match(body, /面板、API、PlaybackInfo、HLS \/ DASH、字幕、图片和必要静态资源/);
+  assert.match(body, /直连仅适用于主视频文件/);
+  assert.match(body, /面板、API、HLS\/DASH 等仍由 Meridian 代理/);
   assert.equal(document.getElementById('m-main-video-mode').value, 'proxy');
   assert.doesNotMatch(body, /播放回源/);
   assert.equal(document.getElementById('m-dynamic-enabled'), null);

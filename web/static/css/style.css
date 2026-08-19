@@ -4642,6 +4642,138 @@ html {
 }
 
 :root { --ui-radius: 10px; }
+
+/* UI polish: keep dense configuration rows aligned and avoid browser-default
+   fieldset framing around the fixed-header editor. */
+.form-list-row.upstream-header-row,
+.upstream-header-row {
+  min-inline-size: 0;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.site-config-modal .upstream-line-labels,
+.site-config-modal .upstream-line {
+  grid-template-columns: 76px minmax(150px, .8fr) minmax(280px, 1.7fr) 90px 70px 112px;
+  column-gap: 12px;
+}
+
+.site-config-modal .upstream-line-labels {
+  padding: 0 12px 7px;
+  letter-spacing: .01em;
+}
+
+.site-config-modal .upstream-line-labels span,
+.site-config-modal .upstream-line > * {
+  min-width: 0;
+}
+
+.site-config-modal .upstream-line-labels span:nth-child(2),
+.site-config-modal .upstream-line-labels span:nth-child(3) {
+  padding-left: 0;
+}
+
+.site-config-modal .upstream-line-labels span:nth-child(4),
+.site-config-modal .upstream-line-labels span:nth-child(5) {
+  text-align: center;
+}
+
+.site-config-modal .upstream-line {
+  padding: 10px 12px;
+  border-radius: 10px;
+}
+
+.site-config-modal .upstream-line .form-input {
+  width: 100%;
+  font-size: .82rem;
+}
+
+.site-card .site-row:not(.site-access-row) > .site-row-label {
+  flex: 0 0 96px;
+}
+
+.site-card .site-row:not(.site-access-row) > span:not(.site-row-label) {
+  min-width: 0;
+  max-width: calc(100% - 108px);
+  overflow: hidden;
+  color: var(--white-87);
+  font-size: .82rem;
+  font-weight: 600;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-form-columns {
+  column-gap: 20px;
+  row-gap: 18px;
+}
+
+.site-form-columns > .form-group {
+  display: flex;
+  min-height: 108px;
+  flex-direction: column;
+}
+
+.site-form-columns > .form-group > .form-help {
+  min-height: 2.9em;
+  margin-top: 6px;
+  font-size: .72rem;
+  line-height: 1.45;
+}
+
+.site-form-columns > .form-group:has(> #m-main-video-mode) > .form-help {
+  min-height: 0;
+}
+
+.site-advanced-body {
+  padding: 18px 20px 20px;
+}
+
+.dashboard-trend-help {
+  max-width: 560px;
+  line-height: 1.45;
+}
+
+.dashboard-trend-grid .dashboard-trend-card {
+  padding: 18px;
+}
+
+@media (max-width: 768px) {
+  .site-config-modal .upstream-line {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    padding: 14px;
+  }
+
+  .site-config-modal .upstream-line-enabled {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+
+  .site-config-modal .upstream-line-name,
+  .site-config-modal .upstream-line-address,
+  .site-config-modal .upstream-line-port {
+    grid-column: 1 / -1;
+  }
+
+  .site-config-modal .upstream-line-name { grid-row: 2; }
+  .site-config-modal .upstream-line-address { grid-row: 3; }
+  .site-config-modal .upstream-line-port { grid-row: 4; }
+  .site-config-modal .upstream-line-latency { grid-column: 1; grid-row: 5; }
+  .site-config-modal .upstream-line-actions { grid-column: 2; grid-row: 5; }
+
+  .site-form-columns > .form-group {
+    min-height: 0;
+  }
+
+  .site-form-columns > .form-group > .form-help {
+    min-height: 0;
+  }
+}
+
 .stat-card, .glass-card, .site-card, .chart-wrap, .total-card, .request-log-controls, .request-log-table-card, .diag-card { border-radius: var(--ui-radius); }
 .sidebar-drawer-close { display: none; }
 .global-settings-link { margin-top: auto; border-top: 1px solid var(--panel-border) !important; border-radius: 0 !important; padding-top: 12px !important; }
