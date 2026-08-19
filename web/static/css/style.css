@@ -5907,14 +5907,49 @@ html[data-theme="light"] {
 .site-cache-rules-group[hidden] { display: none !important; }
 
 @media (min-width: 769px) {
+  .site-config-modal .site-form-columns {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    grid-template-areas: none !important;
+    align-items: start;
+  }
+  .site-config-modal .site-form-columns > .form-group {
+    display: block !important;
+    width: auto !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+  }
+  .site-config-modal .site-form-columns > .form-group > label {
+    display: block !important;
+    width: auto !important;
+    max-width: none !important;
+    writing-mode: horizontal-tb !important;
+    word-break: keep-all !important;
+    white-space: normal !important;
+  }
+  .site-config-modal .site-form-columns > .form-group > .form-help {
+    width: auto !important;
+    max-width: none !important;
+    writing-mode: horizontal-tb !important;
+    word-break: normal !important;
+    white-space: normal !important;
+  }
+}
+
+@media (min-width: 769px) {
   .site-config-modal .upstream-lines-card { overflow-x: auto; }
   .site-config-modal .upstream-line-labels,
   .site-config-modal .upstream-line {
-    min-width: 780px;
-    grid-template-columns: 54px minmax(150px, 1fr) minmax(280px, 2fr) 88px 72px 124px;
+    min-width: 860px;
+    grid-template-columns: 54px 150px minmax(300px, 1fr) 96px 96px 170px;
     gap: 10px;
   }
-  .site-config-modal .upstream-line-labels { white-space: nowrap; }
+  .site-config-modal .upstream-line-labels {
+    white-space: nowrap;
+    word-break: keep-all;
+  }
+  .site-config-modal .upstream-line > input[type="hidden"] { display: none !important; }
+  .site-config-modal .upstream-line-actions { min-width: 0; white-space: nowrap; }
 }
 
 .telegram-report-card,
@@ -5936,6 +5971,10 @@ html[data-theme="light"] {
 }
 
 @media (max-width: 768px) {
+  .site-config-modal .upstream-line-port { width: 100%; min-width: 0; }
+  .site-config-modal .upstream-line {
+    grid-template-columns: minmax(0, 1fr) 120px;
+  }
   .site-config-modal .upstream-lines-card { overflow-x: visible; }
   .site-config-modal .upstream-line { min-width: 0; }
   .site-config-modal .upstream-line-labels { min-width: 0; }
