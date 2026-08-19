@@ -6715,7 +6715,7 @@ func TestReservedDynamicRouteReturnsNotFoundWithoutProxying(t *testing.T) {
 	if !configured || handler == nil {
 		t.Fatal("host handler not registered")
 	}
-	for _, requestPath := range []string{"/_meridian/d", "/_meridian/d/stale-token"} {
+	for _, requestPath := range []string{"/_meridian/d", "/_meridian/d/stale-token", "/emby/_meridian/d", "/emby/_meridian/d/stale-token"} {
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, requestPath, nil))
 		if rr.Code != http.StatusNotFound {

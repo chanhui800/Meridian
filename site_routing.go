@@ -512,8 +512,22 @@ func nextAvailableInternalSitePort(sites []Site, panelPort int) (int, error) {
 	return 0, fmt.Errorf("no internal site port is available")
 }
 
+func normalizeDynamicCapabilityPath(requestPath string) string {
+	if requestPath == strings.TrimSuffix(dynamicRoutePrefix, "/") || strings.HasPrefix(requestPath, dynamicRoutePrefix) {
+		return requestPath
+	}
+	embyDynamicPrefix := "/emby" + dynamicRoutePrefix
+	if requestPath == strings.TrimSuffix(embyDynamicPrefix, "/") {
+		return strings.TrimSuffix(dynamicRoutePrefix, "/")
+	}
+	if strings.HasPrefix(requestPath, embyDynamicPrefix) {
+		return dynamicRoutePrefix + strings.TrimPrefix(requestPath, embyDynamicPrefix)
+	}
+	return ""
+}
+
 func isReservedDynamicRoute(requestPath string) bool {
-	return requestPath == strings.TrimSuffix(dynamicRoutePrefix, "/") || strings.HasPrefix(requestPath, dynamicRoutePrefix)
+	return normalizeDynamicCapabilityPath(requestPath) != ""
 }
 
 func requestPublicHost(hostport string) string {
