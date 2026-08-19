@@ -5982,3 +5982,175 @@ html[data-theme="light"] {
   .site-cache-rules-body { padding: 10px; }
   .site-cache-rules-body textarea { min-height: 88px; }
 }
+
+/* Rebuilt site advanced-settings layout: each cache control owns one stable
+   card instead of participating in the legacy area-based form grid. */
+.site-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 20px;
+  align-items: start;
+  min-width: 0;
+}
+.site-settings-grid > .form-group {
+  display: block !important;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+}
+.site-settings-grid > .form-group > label,
+.site-settings-grid > .form-group > .form-help {
+  writing-mode: horizontal-tb;
+  word-break: normal;
+  white-space: normal;
+}
+.site-settings-grid > .cache-limit-group {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.site-cache-panel-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 190px);
+  gap: 18px;
+  align-items: start;
+  min-width: 0;
+}
+.site-cache-panel-heading h3 { margin: 0 0 4px; color: var(--white-87); font-size: .92rem; font-weight: 650; }
+.site-cache-panel-heading p { margin: 0; color: var(--white-60); font-size: .76rem; line-height: 1.5; }
+.site-cache-panel-heading .form-select { width: 100%; min-width: 0; }
+.site-cache-rules-group {
+  display: block !important;
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+}
+.site-cache-rules-group[hidden] { display: none !important; }
+.site-cache-rules-group > summary { padding: 11px 13px; }
+.site-cache-rules-body { min-width: 0; padding: 12px 13px 13px; }
+.site-cache-rules-body textarea { display: block; width: 100%; min-width: 0; min-height: 92px; resize: vertical; }
+.site-cache-limits {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px 12px;
+  align-items: center;
+  min-width: 0;
+}
+.site-cache-limits label { margin: 0; color: var(--white-60); font-size: .75rem; }
+.site-cache-limits .form-input { min-width: 0; width: 100%; }
+
+/* Rebuilt upstream rows: labels live inside each cell, so a header can never
+   wrap independently from the data row. */
+.site-config-modal .upstream-line-labels { display: none !important; }
+.site-config-modal .upstream-lines {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.site-config-modal #m-failover-lines { display: contents; }
+.site-config-modal .upstream-line {
+  display: grid;
+  grid-template-columns: 54px minmax(145px, .85fr) minmax(260px, 1.65fr) 96px 88px 156px;
+  grid-template-areas: "enabled name address port latency actions";
+  gap: 10px;
+  align-items: end;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.site-config-modal .upstream-line-enabled { grid-area: enabled; align-self: end; }
+.site-config-modal .upstream-line-field { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.site-config-modal .upstream-line-field:nth-child(2) { grid-area: name; }
+.site-config-modal .upstream-line-field:nth-child(3) { grid-area: address; }
+.site-config-modal .upstream-line-field:nth-child(4) { grid-area: port; }
+.site-config-modal .upstream-line-field::before,
+.site-config-modal .upstream-line-latency::before,
+.site-config-modal .upstream-line-actions::before {
+  content: attr(data-label);
+  display: block;
+  min-height: 1.1em;
+  color: var(--white-38);
+  font-size: .68rem;
+  font-weight: 600;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.site-config-modal .upstream-line-field .form-input { width: 100%; min-width: 0; }
+.site-config-modal .upstream-line-latency {
+  grid-area: latency;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+  color: var(--white-60);
+  font-size: .78rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.site-config-modal .upstream-line-actions {
+  grid-area: actions;
+  display: grid;
+  grid-template-columns: repeat(3, 34px);
+  grid-template-rows: auto 34px;
+  justify-content: end;
+  gap: 4px;
+  min-width: 0;
+}
+.site-config-modal .upstream-line-actions::before { grid-column: 1 / -1; }
+.site-config-modal .upstream-line-actions.primary-actions { grid-template-columns: 1fr; grid-template-rows: auto 34px; justify-items: end; }
+.site-config-modal .upstream-line-actions.primary-actions::before { justify-self: stretch; }
+.site-config-modal .upstream-line-actions .icon-button { width: 34px; height: 34px; }
+.site-config-modal .upstream-line-primary-note { align-self: center; color: var(--white-60); font-size: .78rem; }
+
+/* Keep page scrolling available on desktop; only an active modal locks the
+   document, while its own overlay/body remain independently scrollable. */
+html, body { min-height: 100%; overflow-y: auto !important; }
+body.modal-open { overflow-y: hidden !important; }
+#app-shell.active { min-height: 100vh; height: auto; overflow: visible !important; }
+.main { min-height: calc(100vh - 72px); overflow: visible; }
+
+@media (max-width: 768px) {
+  .site-settings-grid { display: block; }
+  .site-settings-grid > .form-group { margin-bottom: 16px; }
+  .site-settings-grid > .cache-limit-group { margin-bottom: 16px; padding: 13px; }
+  .site-cache-panel-heading { grid-template-columns: minmax(0, 1fr) 128px; gap: 10px; }
+  .site-cache-panel-heading h3 { font-size: .86rem; }
+  .site-cache-panel-heading p { font-size: .72rem; }
+  .site-cache-limits { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .site-config-modal .upstream-line {
+    grid-template-columns: minmax(0, 1fr) 132px;
+    grid-template-areas:
+      "enabled enabled"
+      "name port"
+      "address address"
+      "latency actions";
+    align-items: end;
+    padding: 13px;
+  }
+  .site-config-modal .upstream-line-enabled { grid-area: enabled; }
+  .site-config-modal .upstream-line-field:nth-child(2) { grid-area: name; }
+  .site-config-modal .upstream-line-field:nth-child(3) { grid-area: address; }
+  .site-config-modal .upstream-line-field:nth-child(4) { grid-area: port; }
+  .site-config-modal .upstream-line-latency { grid-area: latency; }
+  .site-config-modal .upstream-line-actions { grid-area: actions; }
+  .site-config-modal .upstream-line-actions.primary-actions { grid-template-columns: 1fr; }
+  .site-config-modal .upstream-line-port { width: 100%; min-width: 0; }
+}
+
+@media (min-width: 769px) {
+  html { scrollbar-width: auto; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: rgba(255,255,255,.03); }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.28); }
+}

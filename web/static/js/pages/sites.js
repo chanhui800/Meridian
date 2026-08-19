@@ -1338,15 +1338,14 @@ async function showSiteModal(site) {
 	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
 	    </div>
 	  </div>
-	  <div class="upstream-line-labels" aria-hidden="true"><span>启用</span><span>线路名称</span><span>协议与域名 / 路径</span><span>端口</span><span>延迟</span><span>排序 / 删除</span></div>
 	  <div class="upstream-lines" id="m-upstream-lines">
 	    <div class="upstream-line is-primary" data-line="primary">
 	      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
-	      <input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称">
-	      <input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址">
-	      <input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口">
-	      <span class="upstream-line-latency">--</span>
-	      <div class="upstream-line-actions primary-actions"><span class="upstream-line-primary-note">主线路</span></div>
+	      <div class="upstream-line-field" data-label="线路名称"><input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称"></div>
+	      <div class="upstream-line-field" data-label="协议与域名 / 路径"><input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址"></div>
+	      <div class="upstream-line-field" data-label="端口"><input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口"></div>
+	      <span class="upstream-line-latency" data-label="延迟">--</span>
+	      <div class="upstream-line-actions primary-actions" data-label="线路状态"><span class="upstream-line-primary-note">主线路</span></div>
 	      <input type="hidden" id="m-target">
 	    </div>
 	    <div id="m-failover-lines"></div>
@@ -1392,7 +1391,7 @@ async function showSiteModal(site) {
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
       </summary>
       <div class="site-advanced-body">
-      <div class="site-form-columns">
+      <div class="site-settings-grid">
     <div class="form-group">
       <label>UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
@@ -1428,33 +1427,31 @@ async function showSiteModal(site) {
       <div class="form-help">直连仅适用于主视频文件；面板、API、HLS/DASH 等仍由 Meridian 代理。</div>
       <div class="form-help">自动发现保持启用；私网、回环和链路本地目标始终拒绝。</div>
     </div>
-    <div class="form-group">
-      <label for="m-asset-cache">缓存图片与静态资源</label>
-      <select class="form-select modal-select" id="m-asset-cache">
-        <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
-        <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
-      </select>
-      <div class="form-help">仅缓存图片与静态资源；视频、音频、HLS/DASH、Range 和私有响应不缓存。</div>
-    </div>
-    <details class="form-group site-cache-rules-group" id="m-cache-rules-group">
-      <summary>自定义缓存规则（可选）</summary>
-      <div class="site-cache-rules-body">
-        <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
-        <div class="form-help">仅在需要覆盖默认的图片和静态资源路径时修改；每行一条，支持 * 通配。</div>
+    <section class="form-group cache-limit-group" data-cache-panel aria-labelledby="m-cache-panel-title">
+      <div class="site-cache-panel-heading">
+        <div>
+          <h3 id="m-cache-panel-title">缓存图片与静态资源</h3>
+          <p>仅缓存图片与静态资源；视频、音频、HLS/DASH、Range 和私有响应不缓存。</p>
+        </div>
+        <select class="form-select modal-select" id="m-asset-cache" aria-label="缓存图片与静态资源">
+          <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
+          <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
+        </select>
       </div>
-    </details>
-    <div class="form-group cache-limit-group">
+      <details class="site-cache-rules-group" id="m-cache-rules-group">
+        <summary>自定义缓存规则（可选）</summary>
+        <div class="site-cache-rules-body">
+          <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
+          <div class="form-help">仅在需要覆盖默认的图片和静态资源路径时修改；每行一条，支持 * 通配。</div>
+        </div>
+      </details>
       <div class="cache-limit-grid">
-        <div>
-          <label for="m-cache-ttl">缓存时间（小时）</label>
-          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
-        </div>
-        <div>
-          <label for="m-cache-max">容量上限（MB）</label>
-          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
-        </div>
+        <label for="m-cache-ttl">缓存时间（小时）</label>
+        <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+        <label for="m-cache-max">容量上限（MB）</label>
+        <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
       </div>
-    </div>
+    </section>
     <div class="form-group">
       <label>流量额度 (GB, 0=不限)</label>
       <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
@@ -1493,11 +1490,11 @@ async function showSiteModal(site) {
 		failoverLinesContainer.innerHTML = failoverLines.map((line, index) => `
 		  <div class="upstream-line" data-line-index="${index}">
 		    <label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '开' : '关'}</span></label>
-		    <input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称">
-		    <input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址">
-		    <input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口">
-		    <span class="upstream-line-latency">--</span>
-		    <div class="upstream-line-actions">
+		    <div class="upstream-line-field" data-label="线路名称"><input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称"></div>
+		    <div class="upstream-line-field" data-label="协议与域名 / 路径"><input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址"></div>
+		    <div class="upstream-line-field" data-label="端口"><input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口"></div>
+		    <span class="upstream-line-latency" data-label="延迟">--</span>
+		    <div class="upstream-line-actions" data-label="排序 / 删除">
 		      <button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button>
 		      <button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button>
 		      <button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button>
