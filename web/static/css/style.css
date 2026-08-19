@@ -6109,6 +6109,9 @@ html[data-theme="light"] {
   text-align: left;
   white-space: nowrap;
 }
+.site-config-modal .upstream-line-latency.good { color: var(--green); }
+.site-config-modal .upstream-line-latency.warn { color: var(--orange); }
+.site-config-modal .upstream-line-latency.bad { color: var(--red); }
 .site-config-modal .upstream-line-actions {
   grid-area: actions;
   display: grid;
@@ -6513,4 +6516,35 @@ body {
   min-height: 100%;
   overflow-x: hidden;
   overflow-y: visible !important;
+}
+
+/* Final desktop trend-field contract: reserve a real text line box instead
+   of combining the legacy fixed height with oversized vertical padding. */
+.dashboard-trend-control > label {
+  min-height: 20px;
+  line-height: 1.5;
+}
+.dashboard-trend-controls .form-select {
+  height: auto !important;
+  min-height: 48px !important;
+  padding: 10px 52px 10px 16px !important;
+  line-height: 1.5 !important;
+  text-align: left !important;
+  overflow: visible !important;
+  text-overflow: ellipsis;
+}
+
+/* Keep the line-list actions compact on desktop; the mobile contract below
+   still expands each action to the available row width. */
+@media (min-width: 769px) {
+  .site-config-modal .upstream-lines-buttons > button {
+    min-height: 36px;
+    height: 36px;
+    padding: 8px 12px;
+    font-size: .78rem;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+  .site-config-modal .upstream-test-all { min-width: 88px; }
+  .site-config-modal .upstream-add-line { min-width: 104px; }
 }

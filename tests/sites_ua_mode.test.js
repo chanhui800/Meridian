@@ -142,6 +142,12 @@ test('site management exposes latency tests and safe asset cache controls', () =
   assert.match(source, /视频、音频、HLS\/DASH、Range/);
 });
 
+test('upstream line latency uses green, yellow, and red thresholds', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /latencyMs < 200 \? 'good' : latencyMs < 800 \? 'warn' : 'bad'/);
+  assert.match(source, /!Number\.isFinite\(latencyMs\) \|\| latencyMs < 0/);
+});
+
 test('upstream header payload keeps configured rows write-only', () => {
 	const { buildUpstreamHeaderPayload } = loadSiteHelpers();
 	const payload = buildUpstreamHeaderPayload([

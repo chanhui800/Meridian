@@ -1543,8 +1543,10 @@ async function showSiteModal(site) {
 		try {
 			const result = await API.testUpstream(targetURL);
 			if (result && result.status === 'online') {
-				latency.textContent = `${Number(result.latency_ms) || 0} ms`;
-				latency.className = `upstream-line-latency ${(Number(result.latency_ms) || 0) < 800 ? 'good' : 'warn'}`;
+				const latencyMs = Number(result.latency_ms);
+				if (!Number.isFinite(latencyMs) || latencyMs < 0) throw new Error('测速结果无效');
+				latency.textContent = `${latencyMs} ms`;
+				latency.className = `upstream-line-latency ${latencyMs < 200 ? 'good' : latencyMs < 800 ? 'warn' : 'bad'}`;
 			} else {
 				throw new Error((result && result.error) || '线路不可用');
 			}

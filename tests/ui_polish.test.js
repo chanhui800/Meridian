@@ -46,7 +46,7 @@ test('upstream header rows do not inherit the browser fieldset frame', () => {
 });
 
 test('dashboard assets use a cache-busting revision after chart and mobile fixes', () => {
-  assert.match(indexSource, /1\.9\.3-ui22/);
+  assert.match(indexSource, /1\.9\.3-ui23/);
 });
 
 test('desktop sidebar uses the state variable for real width changes', () => {
@@ -74,4 +74,16 @@ test('dashboard selectors retain a visible dropdown affordance after theme overr
 test('document scrolling stays on the root for iOS status-bar tap-to-top', () => {
   assert.match(cssSource, /Keep document scrolling on the root element[\s\S]*?html \{[\s\S]*?overflow-y: auto !important;[\s\S]*?-webkit-overflow-scrolling: touch;/);
   assert.match(cssSource, /Keep document scrolling on the root element[\s\S]*?body \{[\s\S]*?overflow-y: visible !important;/);
+});
+
+test('desktop trend text and line actions keep readable dimensions', () => {
+  assert.match(cssSource, /Final desktop trend-field contract[\s\S]*?min-height: 48px !important;/);
+  assert.match(cssSource, /Final desktop trend-field contract[\s\S]*?padding: 10px 52px 10px 16px !important;/);
+  assert.match(cssSource, /@media \(min-width: 769px\)[\s\S]*?\.site-config-modal \.upstream-lines-buttons > button[\s\S]*?height: 36px;/);
+});
+
+test('site editor latency colors survive the modal value override', () => {
+  assert.match(cssSource, /\.site-config-modal \.upstream-line-latency\.good \{ color: var\(--green\); \}/);
+  assert.match(cssSource, /\.site-config-modal \.upstream-line-latency\.warn \{ color: var\(--orange\); \}/);
+  assert.match(cssSource, /\.site-config-modal \.upstream-line-latency\.bad \{ color: var\(--red\); \}/);
 });
