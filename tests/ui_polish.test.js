@@ -29,6 +29,10 @@ test('dashboard trends trace smooth curves instead of only straight segments', (
   assert.match(dashboardSource, /dashboardTraceSmoothLine\(ctx, pointsOnCanvas\)/);
 });
 
+test('mobile navigation keeps the header and drawer available', () => {
+  assert.match(cssSource, /@media \(max-width: 768px\)[\s\S]*?\.app-header \{[\s\S]*?display: flex;[\s\S]*?\.sidebar \{[\s\S]*?display: flex;/);
+  assert.match(cssSource, /#app-shell\.sidebar-expanded \.sidebar \{ transform: translateX\(0\); \}/);
+});
 test('upstream header rows do not inherit the browser fieldset frame', () => {
   assert.match(cssSource, /\.form-list-row\.upstream-header-row[\s\S]*?border: 0;/);
   assert.match(cssSource, /\.site-config-modal \.upstream-line-labels,[\s\S]*?grid-template-columns: 76px minmax\(150px, \.8fr\)/);
