@@ -469,8 +469,15 @@ func applyHLSCapabilityDirectives(target *url.URL, claims dynamicCapabilityClaim
 	if rawQuery == "" {
 		return target, nil
 	}
-	if target == nil || claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || len(claims.Template) != 0 || len(claims.TemplateFixed) != 0 || len(rawQuery) > 2048 {
-		return nil, fmt.Errorf("capability query is not allowed")
+	if target == nil {
+		return nil, fmt.Errorf("capability target is missing")
+	}
+	// Some Emby clients append their normal API authentication query parameters
+	// to every request, including capability URLs. Those parameters must not
+	// alter or cross into the signed target; only LL-HLS manifests may add the
+	// explicitly validated delivery directives below.
+	if claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || len(claims.Template) != 0 || len(claims.TemplateFixed) != 0 || len(rawQuery) > 2048 {
+		return target, nil
 	}
 	directives, err := url.ParseQuery(rawQuery)
 	if err != nil || len(directives) == 0 {
@@ -532,11 +539,12 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		writeDynamicCapabilityUnavailable(w)
 		return
 	}
-	remainder := strings.TrimPrefix(r.URL.Path, dynamicRoutePrefix)
-	if remainder == r.URL.Path || remainder == "" {
+	requestPath := normalizeDynamicCapabilityPath(r.URL.Path)
+	if requestPath == "" {
 		writeDynamicCapabilityUnavailable(w)
 		return
 	}
+	remainder := strings.TrimPrefix(requestPath, dynamicRoutePrefix)
 	token, suffix, hasSuffix := strings.Cut(remainder, "/")
 	if token == "" || hasSuffix && suffix == "" {
 		writeDynamicCapabilityUnavailable(w)

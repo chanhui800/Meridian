@@ -829,12 +829,13 @@ func TestCapabilityRouteDirectModeRedirectsPlaybackInfoMainVideo(t *testing.T) {
 		t.Fatalf("mint direct capability: %v", discoveryErr)
 	}
 
-	recorder := httptest.NewRecorder()
-	issuer.serve(recorder, httptest.NewRequest(http.MethodGet, "https://site.example.com"+route, nil))
-	if recorder.Code != http.StatusTemporaryRedirect || recorder.Header().Get("Location") != target.String() || recorder.Header().Get("Content-Length") != "0" {
-		t.Fatalf("direct capability response = %d %#v", recorder.Code, recorder.Header())
+	for _, path := range []string{route, "/emby" + route + "?X-Emby-Token=client-query"} {
+		recorder := httptest.NewRecorder()
+		issuer.serve(recorder, httptest.NewRequest(http.MethodGet, "https://site.example.com"+path, nil))
+		if recorder.Code != http.StatusTemporaryRedirect || recorder.Header().Get("Location") != target.String() || recorder.Header().Get("Content-Length") != "0" {
+			t.Fatalf("direct capability response for %q = %d %#v", path, recorder.Code, recorder.Header())
+		}
 	}
-
 }
 
 func TestHLSCapabilityDeliveryDirectivesAreConstrained(t *testing.T) {
