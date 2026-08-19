@@ -1416,7 +1416,7 @@ async function showSiteModal(site) {
         <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
         <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
       </select>
-      <div class="form-help">仅影响发往回源的 X-Real-IP 与 X-Forwarded-For。</div>
+      <div class="form-help">与 UA 模式独立；仅影响发往回源的 X-Real-IP 与 X-Forwarded-For。</div>
     </div>
     <div class="form-group">
       <label>主视频流策略</label>

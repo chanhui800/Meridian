@@ -6155,7 +6155,9 @@ body.modal-open { overflow-y: hidden !important; }
   ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.28); }
 }
 
-[hidden] { display: none !important; }
+[hidden],
+.site-settings-grid > .form-group[hidden],
+.site-settings-grid > [hidden] { display: none !important; }
 .site-cache-options {
   display: grid;
   gap: 14px;
@@ -6182,6 +6184,28 @@ body.modal-open { overflow-y: hidden !important; }
   overflow: visible;
 }
 
+
+/* Restore the desktop application header after the compact shell reset. */
+@media (min-width: 1181px) {
+  .app-header {
+    display: flex !important;
+    position: sticky;
+    top: 0;
+    z-index: 900;
+    min-height: 64px;
+    margin-left: 260px;
+  }
+}
+@media (min-width: 769px) and (max-width: 1180px) {
+  .app-header {
+    display: flex !important;
+    position: sticky;
+    top: 0;
+    z-index: 900;
+    min-height: 64px;
+    margin-left: 220px;
+  }
+}
 @media (max-width: 768px) {
   .dashboard-trend-controls .form-select {
     width: 100%;
