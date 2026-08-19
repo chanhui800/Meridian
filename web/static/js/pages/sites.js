@@ -1399,7 +1399,7 @@ async function showSiteModal(site) {
         <option value="infuse" ${isEdit && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
         <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
         <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
-        <option value="custom">自定义</option>
+        <option value="custom">自定义客户端</option>
       </select>
     </div>
     <div class="form-group" id="m-custom-ua-group" hidden>
@@ -1644,8 +1644,18 @@ async function showSiteModal(site) {
   function toggleCustomUAFields() {
     const state = customUAFormState(uaSelect.value);
     customUAGroup.hidden = !state.visible;
+    if (state.visible) {
+      if (typeof customUAGroup.style?.removeProperty === 'function') customUAGroup.style.removeProperty('display');
+      else if (customUAGroup.style) customUAGroup.style.display = '';
+    } else if (typeof customUAGroup.style?.setProperty === 'function') {
+      customUAGroup.style.setProperty('display', 'none', 'important');
+    } else if (customUAGroup.style) {
+      customUAGroup.style.display = 'none';
+    }
+    if (typeof customUAGroup.setAttribute === 'function') customUAGroup.setAttribute('aria-hidden', state.visible ? 'false' : 'true');
     customUAInputs.forEach(input => {
       input.required = state.required;
+      if (!state.visible) input.value = '';
     });
   }
   toggleCustomUAFields();

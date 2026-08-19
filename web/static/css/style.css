@@ -6171,11 +6171,15 @@ body.modal-open { overflow-y: hidden !important; }
 .site-cache-options .cache-limit-grid .form-input { width: 100%; min-width: 0; }
 
 .dashboard-trend-controls .form-select {
-  width: 184px;
-  min-width: 184px;
+  width: 220px;
+  min-width: 220px;
   max-width: 100%;
-  padding-right: 38px;
+  padding-right: 40px;
+  font-size: .95rem;
+  line-height: 1.3;
   white-space: nowrap;
+  text-overflow: clip;
+  overflow: visible;
 }
 
 @media (max-width: 768px) {
