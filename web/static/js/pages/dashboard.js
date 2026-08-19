@@ -525,6 +525,14 @@ function setupDashboardTrendControls() {
     const tooltip = canvas.parentElement.querySelector('.dashboard-chart-tooltip');
     const chart = { canvas, tooltip, hoverIndex: -1, hoverX: null, hoverY: null, pointerActive: false, geometry: null };
     dashboardTrendCharts.set(metric, chart);
+    const clearHover = () => {
+      chart.pointerActive = false;
+      chart.hoverIndex = -1;
+      chart.hoverX = null;
+      chart.hoverY = null;
+      if (tooltip) tooltip.hidden = true;
+      drawDashboardTrendChart(metric);
+    };
     const updateHover = event => {
       const points = dashboardTrendPoints();
       if (!points.length) return;
@@ -563,10 +571,10 @@ function setupDashboardTrendControls() {
       if (event.pointerType === 'mouse' || chart.pointerActive) updateHover(event);
     });
     canvas.addEventListener('pointerup', event => {
-      chart.pointerActive = false;
       if (canvas.releasePointerCapture && canvas.hasPointerCapture?.(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      clearHover();
     });
-    canvas.addEventListener('pointercancel', () => { chart.pointerActive = false; });
+    canvas.addEventListener('pointercancel', clearHover);
     canvas.addEventListener('pointerleave', event => {
       if (event.pointerType !== 'mouse') return;
       chart.hoverIndex = -1; chart.hoverX = null; chart.hoverY = null;

@@ -510,7 +510,9 @@ test('dashboard trends use pointer interaction and dashed crosshairs', () => {
   const source = readScript('pages/dashboard.js');
   const css = readScript('../css/style.css');
   assert.match(source, /addEventListener\('pointermove'/);
-  assert.match(source, /addEventListener\('pointerdown'/);
+  assert.match(source, /addEventListener\('pointerup'/);
+  assert.match(source, /const clearHover = \(\) =>/);
+  assert.match(source, /pointercancel', clearHover/);
   assert.match(source, /setLineDash\(\[5, 4\]\)/);
   assert.match(source, /const ticks = 6/);
   assert.match(source, /dashboardRoundRect/);

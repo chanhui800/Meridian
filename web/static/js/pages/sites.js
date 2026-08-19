@@ -1436,10 +1436,13 @@ async function showSiteModal(site) {
       </select>
       <div class="form-help">仅缓存图片与静态资源；视频、音频、HLS/DASH、Range 和私有响应不缓存。</div>
     </div>
-    <div class="form-group">
-      <label>缓存规则（每行一条，支持 * 通配）</label>
-      <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
-    </div>
+    <details class="form-group site-cache-rules-group" id="m-cache-rules-group">
+      <summary>自定义缓存规则（可选）</summary>
+      <div class="site-cache-rules-body">
+        <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
+        <div class="form-help">仅在需要覆盖默认的图片和静态资源路径时修改；每行一条，支持 * 通配。</div>
+      </div>
+    </details>
     <div class="form-group cache-limit-group">
       <div class="cache-limit-grid">
         <div>
@@ -1611,6 +1614,8 @@ async function showSiteModal(site) {
 	const uaSelect = document.getElementById('m-ua');
   const clientIPModeSelect = document.getElementById('m-client-ip-mode');
   const mainVideoModeSelect = document.getElementById('m-main-video-mode');
+  const assetCacheSelect = document.getElementById('m-asset-cache');
+  const cacheRulesGroup = document.getElementById('m-cache-rules-group');
   const customUAGroup = document.getElementById('m-custom-ua-group');
   const customUAInputs = [
     document.getElementById('m-custom-ua'),
@@ -1624,6 +1629,16 @@ async function showSiteModal(site) {
   customUAInputs[0].value = initialUAState.customUserAgent;
   customUAInputs[1].value = initialUAState.customClient;
   customUAInputs[2].value = initialUAState.customVersion;
+
+  const syncAssetCacheFields = () => {
+    const enabled = assetCacheSelect?.value === 'on';
+    if (cacheRulesGroup) {
+      cacheRulesGroup.hidden = !enabled;
+      if (!enabled) cacheRulesGroup.open = false;
+    }
+  };
+  syncAssetCacheFields();
+  assetCacheSelect?.addEventListener('change', syncAssetCacheFields);
 
   function toggleCustomUAFields() {
     const state = customUAFormState(uaSelect.value);

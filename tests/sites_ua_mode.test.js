@@ -75,6 +75,14 @@ test('hidden semantics override display utilities for the custom identity group'
   assert.match(source, /input\.required = state\.required/);
 });
 
+test('asset cache rules stay optional and follow the asset cache switch', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  const css = fs.readFileSync(STYLE_CSS, 'utf8');
+  assert.match(source, /id="m-cache-rules-group"/);
+  assert.match(source, /自定义缓存规则（可选）/);
+  assert.match(source, /cacheRulesGroup\.hidden = !enabled/);
+  assert.match(css, /\.site-cache-rules-group\[hidden\]\s*\{\s*display:\s*none\s*!important;/);
+});
 test('custom UA payload trims custom values and preset payload clears them', () => {
   const { buildCustomUAPayload } = loadSiteHelpers();
   const custom = buildCustomUAPayload('custom', ' UA ', ' Client ', ' 1.2.3 ');
