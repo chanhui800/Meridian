@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.9.1"
+var appVersion = "v1.9.3"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {

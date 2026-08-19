@@ -215,10 +215,11 @@ export SETUP_TOKEN="$(openssl rand -hex 32)"
 | `TRUSTED_PROXY_CIDRS` | 空 | 可信入口代理的精确 CIDR 列表，逗号分隔 |
 | `JWT_SECRET` | 启动时随机 | 至少 32 字节；生产环境必须固定，否则重启后所有会话失效 |
 | `UPSTREAM_HEADER_KEY` | 空 | 至少 32 字节；加密固定上游 Header |
+| `MERIDIAN_SECRET_KEY` | 空 | 至少 32 字节；独立加密 Cloudflare/Telegram 凭据，生产环境建议固定 |
 | `DYNAMIC_ROUTE_KEY` | 空 | 至少 32 字节；签发自动发现 capability |
 | `SETUP_TOKEN` | 无 | 首次创建管理员前必须提供的一次性初始化凭据 |
 
-三个长期密钥必须两两不同，并与 SQLite 数据一起备份。丢失 `UPSTREAM_HEADER_KEY` 会让已有加密 Header 无法解密；轮换 `DYNAMIC_ROUTE_KEY` 会让正在使用的 capability 立即失效。一键安装器会生成并维护这些值。
+四个长期密钥必须两两不同，并与 SQLite 数据一起备份。丢失 `UPSTREAM_HEADER_KEY` 会让已有加密 Header 无法解密；丢失 `MERIDIAN_SECRET_KEY` 会让已保存的 Cloudflare/Telegram 凭据无法解密；轮换 `DYNAMIC_ROUTE_KEY` 会让正在使用的 capability 立即失效。一键安装器会生成并维护这些值。
 
 <details>
 <summary><strong>离线重置管理员密码</strong></summary>
@@ -257,7 +258,8 @@ systemd 部署优先使用安装器的 `password` 操作；它会先备份数据
 - 私网、回环、链路本地、CGNAT、metadata 和已知自身目标都会被拒绝。
 - DNS 校验通过的 IP 会固定到实际拨号；动态请求不使用环境代理或二次 DNS。
 - 跨 authority 时会删除 Cookie、Authorization、Emby token、固定上游 Header 和转发头。
-- 外部 URL 会改写为同源、加密认证的 `/_meridian/d/<capability>`，不是客户端可指定目标的开放代理。
+- 外部 URL 会改写为同源、加密认证的 `/_meridian/d/<capability>`，不是客户端可指定目标的开放代理；兼容会自动补加 `/emby` 前缀的客户端，请求 `/emby/_meridian/d/<capability>` 也会被识别。
+- 非 HLS capability 请求上的客户端附加 query（例如 `X-Emby-Token`）不会改变或转发到签名目标；LL-HLS query 只接受经过严格校验的 `_HLS_*` 指令。
 - capability 是 bearer；第三方 CDN、负载均衡器和 Nginx 必须对该路径脱敏，不能记录完整 URL。
 
 完整的协议范围、资源上限、Header 规则、SSRF 边界和日志要求见 [SECURITY.md](SECURITY.md)。
@@ -303,7 +305,7 @@ flowchart LR
 安装器执行 `update` 或 `password` 前会在 `/opt/meridian-backups` 创建一致性备份；systemd 更新还会健康检查并在失败时自动回滚。手工部署至少应备份：
 
 - `meridian.db`、`meridian.db-wal`、`meridian.db-shm`
-- 保存 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY` 的环境配置
+- 保存 `JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`MERIDIAN_SECRET_KEY`、`DYNAMIC_ROUTE_KEY` 的环境配置
 
 手工备份和恢复前先停止 Meridian，恢复数据库和原密钥后再启动，并验证管理员登录、站点配置和关键代理入口。
 
