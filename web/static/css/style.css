@@ -6154,3 +6154,33 @@ body.modal-open { overflow-y: hidden !important; }
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 999px; }
   ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.28); }
 }
+
+[hidden] { display: none !important; }
+.site-cache-options {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.site-cache-options[hidden] { display: none !important; }
+.site-cache-options .cache-limit-grid {
+  min-width: 0;
+  align-items: center;
+  gap: 8px 12px;
+}
+.site-cache-options .cache-limit-grid label { margin: 0; color: var(--white-60); font-size: .75rem; }
+.site-cache-options .cache-limit-grid .form-input { width: 100%; min-width: 0; }
+
+.dashboard-trend-controls .form-select {
+  width: 184px;
+  min-width: 184px;
+  max-width: 100%;
+  padding-right: 38px;
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .dashboard-trend-controls .form-select {
+    width: 100%;
+    min-width: 0;
+  }
+}

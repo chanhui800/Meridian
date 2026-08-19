@@ -1438,18 +1438,20 @@ async function showSiteModal(site) {
           <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
         </select>
       </div>
-      <details class="site-cache-rules-group" id="m-cache-rules-group">
-        <summary>自定义缓存规则（可选）</summary>
-        <div class="site-cache-rules-body">
-          <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
-          <div class="form-help">仅在需要覆盖默认的图片和静态资源路径时修改；每行一条，支持 * 通配。</div>
+      <div class="site-cache-options" id="m-cache-options" hidden>
+        <details class="site-cache-rules-group" id="m-cache-rules-group">
+          <summary>自定义缓存规则（可选）</summary>
+          <div class="site-cache-rules-body">
+            <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
+            <div class="form-help">仅在需要覆盖默认的图片和静态资源路径时修改；每行一条，支持 * 通配。</div>
+          </div>
+        </details>
+        <div class="cache-limit-grid">
+          <label for="m-cache-ttl">缓存时间（小时）</label>
+          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+          <label for="m-cache-max">容量上限（MB）</label>
+          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
         </div>
-      </details>
-      <div class="cache-limit-grid">
-        <label for="m-cache-ttl">缓存时间（小时）</label>
-        <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
-        <label for="m-cache-max">容量上限（MB）</label>
-        <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
       </div>
     </section>
     <div class="form-group">
@@ -1612,6 +1614,7 @@ async function showSiteModal(site) {
   const clientIPModeSelect = document.getElementById('m-client-ip-mode');
   const mainVideoModeSelect = document.getElementById('m-main-video-mode');
   const assetCacheSelect = document.getElementById('m-asset-cache');
+  const cacheOptionsGroup = document.getElementById('m-cache-options');
   const cacheRulesGroup = document.getElementById('m-cache-rules-group');
   const customUAGroup = document.getElementById('m-custom-ua-group');
   const customUAInputs = [
@@ -1629,6 +1632,7 @@ async function showSiteModal(site) {
 
   const syncAssetCacheFields = () => {
     const enabled = assetCacheSelect?.value === 'on';
+    if (cacheOptionsGroup) cacheOptionsGroup.hidden = !enabled;
     if (cacheRulesGroup) {
       cacheRulesGroup.hidden = !enabled;
       if (!enabled) cacheRulesGroup.open = false;
