@@ -6147,15 +6147,41 @@ body.modal-open { overflow-y: hidden !important; }
   .site-config-modal .upstream-line-port { width: 100%; min-width: 0; }
 }
 
-@media (min-width: 769px) {
-  html { scrollbar-width: auto; }
-  ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: rgba(255,255,255,.03); }
-  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 999px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.28); }
+@media (max-width: 600px) {
+  .dashboard-trend-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
-[hidden],
+@media (max-width: 768px) {
+  /* Keep the mobile editor's line-list surface and every line field visible. */
+  .site-config-modal .upstream-lines-card {
+    display: block !important;
+    width: 100%;
+    visibility: visible !important;
+  }
+  .site-config-modal .upstream-lines-head {
+    display: flex !important;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .site-config-modal .upstream-lines-buttons {
+    display: grid !important;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .site-config-modal .upstream-lines-buttons > button {
+    min-width: 0;
+    width: 100%;
+  }
+  .site-config-modal .upstream-line-field,
+  .site-config-modal .upstream-line-address {
+    display: flex !important;
+    visibility: visible !important;
+  }
+}
+
 .site-settings-grid > .form-group[hidden],
 .site-settings-grid > [hidden] { display: none !important; }
 .site-cache-options {
