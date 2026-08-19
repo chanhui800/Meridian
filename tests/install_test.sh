@@ -78,6 +78,8 @@ assert_not_contains() {
     fi
 }
 
+assert_eq 'snnabb/Meridian' "$REPO" 'default repository owner'
+
 write_legacy_systemd_service() {
     cat > "$SERVICE_FILE" <<'UNIT'
 [Unit]
