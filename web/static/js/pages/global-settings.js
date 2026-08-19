@@ -24,7 +24,7 @@ function globalSettingsNav(active) {
   const button = (id, label) => `<button type="button" class="settings-nav-item ${active === id ? 'active' : ''}" data-settings-section="${id}">${label}</button>`;
   return `<aside class="settings-section-nav">
     <span>SETTINGS</span><strong>全局设置导航</strong>
-    ${button('system-ui', '系统 UI')}${button('logs', '日志设置')}
+    ${button('system-ui', '系统设置')}${button('logs', '日志设置')}
     <a href="#settings-tls" class="settings-nav-item ${active === 'tls' ? 'active' : ''}">TLS 设置</a>
     <a href="#telegram-report" class="settings-nav-item ${active === 'telegram' ? 'active' : ''}">Telegram 通知</a>
     <a href="#diagnostics" class="settings-nav-item ${active === 'diagnostics' ? 'active' : ''}">故障诊断</a>
@@ -196,7 +196,7 @@ function paintGlobalSettings(page = document.getElementById('page-global-setting
 }
 
 function renderSystemUIForm(s) {
-  return `<section class="settings-panel"><header><span>TRAFFIC</span><h2>流量计费模式</h2><b>全局统计与额度</b></header>
+  return `<section class="settings-panel"><header><span>SYSTEM</span><h2>系统设置</h2><b>全局运行参数</b></header>
     <p class="settings-panel-help">单向仅计 VPS 发给客户端的出站流量；双向同时计源站回到 VPS 的入站与 VPS 发给客户端的出站流量。</p>
     <span class="settings-label">计费方向</span><div class="settings-choice" id="traffic-billing-mode-choice"><button data-setting-choice="outbound" class="${s.traffic_billing_mode === 'outbound' ? 'active' : ''}">单向（仅下载）</button><button data-setting-choice="bidirectional" class="${s.traffic_billing_mode !== 'outbound' ? 'active' : ''}">双向（下载 + 上传）</button></div>
   </section>
@@ -226,16 +226,28 @@ function renderLogSettingsForm(s) {
     ${settingsNumber('setting-log-retries', '写入重试次数', s.log_retry_count, 0, 10, '次')}${settingsNumber('setting-log-backoff', '重试退避', s.log_retry_backoff_ms, 0, 5000, 'ms')}
     ${settingsNumber('setting-log-lease', '定时任务租约时长', s.log_task_lease_ms, 1000, 900000, 'ms')}
   </div></section>
-  <section class="settings-panel"><header><span>RESOURCE CATEGORIES</span><h2>资源类别写入</h2><b>默认按需写入</b></header><p class="settings-panel-help">图片海报与媒体元数据默认不写入。勾选后，后续命中的请求才会写入日志，并自然出现在日志页中。</p><div class="settings-grid">
-    ${settingsCheck('setting-write-playback', '播放信息与状态同步', s.log_write_playback !== false, 'PlaybackInfo，以及 Sessions/Playing、Progress、Stopped、Ping 等播放状态同步请求。')}${settingsCheck('setting-write-video', '视频流', s.log_write_video !== false, '主视频或音频流、HLS/DASH 清单与媒体分片。')}
-    ${settingsCheck('setting-write-image', '图片海报', s.log_write_image === true, 'Images、Icons、Branding、封面与常见图片文件。')}${settingsCheck('setting-write-metadata', '媒体元数据', s.log_write_metadata === true, 'Items、Shows、Movies 与 Users 等媒体资料请求。')}
-    ${settingsCheck('setting-write-api', '常规 API', s.log_write_api !== false, '不属于其他明确类别的普通 API 与状态查询请求。')}${settingsCheck('setting-write-auth', '用户认证', s.log_write_auth !== false, 'Authenticate 与 QuickConnect 等登录认证请求。')}
-    ${settingsCheck('setting-write-subtitle', '字幕', s.log_write_subtitle !== false, '字幕路径以及 SRT、ASS、VTT 等字幕文件。')}${settingsCheck('setting-write-asset', '静态资源', s.log_write_asset !== false, 'JavaScript、CSS、字体、Source Map 与 Web Manifest。')}
-    ${settingsCheck('setting-write-websocket', 'WebSocket', s.log_write_websocket !== false, '带 Upgrade 意图的实时连接请求。')}
-  </div></section>
-  <div class="settings-two-column"><section class="settings-panel"><header><span>WRITE</span><h2>日志字段写入</h2><b>仅影响后续新日志</b></header><p class="settings-panel-help">关闭后，新写入日志会直接省略对应字段；旧日志不会被回收或改写。</p>${settingsCheck('setting-write-node', '写入节点', s.log_write_node !== false, '保存请求命中的站点节点名称。')}${settingsCheck('setting-write-category', '写入资源类别', s.log_write_category !== false, '保存媒体元数据、视频流、图片海报、API 或认证类别。')}${settingsCheck('setting-write-status', '写入状态', s.log_write_status !== false, '保存请求返回的 HTTP 状态码。')}${settingsCheck('setting-write-ip', '写入客户端 IP', s.log_write_client_ip !== false, '保存访问来源 IP，便于区分客户端。')}${settingsCheck('setting-write-ua', '写入客户端 UA', s.log_write_ua !== false, '保存客户端发给 Meridian 的原始 UA，用于识别实际播放客户端。')}${settingsCheck('setting-write-upstream-ua', '写入上游 UA', s.log_write_upstream_ua !== false, '保存 Meridian 最终发给 Emby 或 Jellyfin 后端的 UA；透传模式下与客户端 UA 相同。')}${settingsCheck('setting-write-backend-address', '写入后端地址', s.log_write_backend_address !== false, '保存该请求实际连接的推流后端 authority，不写入路径、查询参数或令牌。')}${settingsCheck('setting-write-timeline', '写入时间线', s.log_write_timeline !== false, '保存日志页展示的请求发生时间；内部清理与统计时间不受影响。')}</section>
-  <section class="settings-panel"><header><span>DISPLAY</span><h2>日志字段展示</h2><b>仅影响日志页</b></header><p class="settings-panel-help">关闭后，字段仍可按写入设置保留在新日志里，但日志表格会隐藏对应列。</p>${settingsCheck('setting-display-node', '展示节点', s.log_display_node !== false, '在日志表格中显示节点名称。')}${settingsCheck('setting-display-category', '展示资源类别', s.log_display_category !== false, '在日志表格中显示资源类别。')}${settingsCheck('setting-display-status', '展示状态', s.log_display_status !== false, '在日志表格中显示 HTTP 状态码。')}${settingsCheck('setting-display-ip', '展示客户端 IP', s.log_display_client_ip !== false, '在日志表格中显示客户端 IP 列。')}${settingsCheck('setting-display-ua', '展示客户端 UA', s.log_display_ua !== false, '在日志表格中显示客户端传入的原始 UA。')}${settingsCheck('setting-display-upstream-ua', '展示上游 UA', s.log_display_upstream_ua !== false, '在日志表格中显示 Meridian 实际发给后端的 UA。')}${settingsCheck('setting-display-backend-address', '展示后端地址', s.log_display_backend_address !== false, '在日志表格中显示该请求最终使用的推流后端。')}${settingsCheck('setting-display-timeline', '展示时间线', s.log_display_timeline !== false, '在日志表格中显示请求相对时间。')}</section></div>
-  <section class="settings-panel"><header><span>SEARCH</span><h2>日志搜索模式</h2><b>LIKE / FTS</b></header><div class="settings-choice" id="log-search-choice"><button data-setting-choice="like" class="${s.log_search_mode === 'like' ? 'active' : ''}">LIKE 模糊匹配</button><button data-setting-choice="fts" class="${s.log_search_mode === 'fts' ? 'active' : ''}">FTS 分词查询</button></div></section>${settingsSaveBar()}`;
+  <section class="settings-panel"><header><span>RESOURCE CATEGORIES</span><h2>记录哪些请求</h2><b>按需写入</b></header><p class="settings-panel-help">只开启排查时需要的类别，减少日志噪音。</p><div class="settings-check-grid">
+    ${settingsCheck('setting-write-playback', '播放信息', s.log_write_playback !== false)}${settingsCheck('setting-write-video', '视频与流媒体', s.log_write_video !== false)}
+    ${settingsCheck('setting-write-api', '常规 API', s.log_write_api !== false)}${settingsCheck('setting-write-auth', '用户认证', s.log_write_auth !== false)}
+    ${settingsCheck('setting-write-asset', '静态资源', s.log_write_asset !== false)}
+  </div><details class="settings-more"><summary>更多类别</summary><div class="settings-check-grid">
+    ${settingsCheck('setting-write-image', '图片海报', s.log_write_image === true)}${settingsCheck('setting-write-metadata', '媒体元数据', s.log_write_metadata === true)}
+    ${settingsCheck('setting-write-subtitle', '字幕', s.log_write_subtitle !== false)}${settingsCheck('setting-write-websocket', 'WebSocket', s.log_write_websocket !== false)}
+  </div></details></section>
+  <div class="settings-two-column"><section class="settings-panel"><header><span>WRITE</span><h2>日志字段写入</h2><b>仅影响新日志</b></header><p class="settings-panel-help">关闭不需要的字段可减少存储和页面噪音。</p><div class="settings-check-grid">
+    ${settingsCheck('setting-write-node', '节点', s.log_write_node !== false)}${settingsCheck('setting-write-status', '状态码', s.log_write_status !== false)}
+    ${settingsCheck('setting-write-ip', '客户端 IP', s.log_write_client_ip !== false)}${settingsCheck('setting-write-ua', '客户端 UA', s.log_write_ua !== false)}
+    ${settingsCheck('setting-write-backend-address', '后端地址', s.log_write_backend_address !== false)}
+  </div><details class="settings-more"><summary>更多字段</summary><div class="settings-check-grid">
+    ${settingsCheck('setting-write-category', '资源类别', s.log_write_category !== false)}${settingsCheck('setting-write-upstream-ua', '上游 UA', s.log_write_upstream_ua !== false)}${settingsCheck('setting-write-timeline', '时间线', s.log_write_timeline !== false)}
+  </div></details></section>
+  <section class="settings-panel"><header><span>DISPLAY</span><h2>日志字段展示</h2><b>仅影响日志页</b></header><p class="settings-panel-help">只保留排查时真正需要的列，其他字段可在“更多字段”中打开。</p><div class="settings-check-grid">
+    ${settingsCheck('setting-display-node', '节点', s.log_display_node !== false)}${settingsCheck('setting-display-status', '状态码', s.log_display_status !== false)}
+    ${settingsCheck('setting-display-ip', '客户端 IP', s.log_display_client_ip !== false)}${settingsCheck('setting-display-ua', '客户端 UA', s.log_display_ua !== false)}
+    ${settingsCheck('setting-display-backend-address', '后端地址', s.log_display_backend_address !== false)}
+  </div><details class="settings-more"><summary>更多字段</summary><div class="settings-check-grid">
+    ${settingsCheck('setting-display-category', '资源类别', s.log_display_category !== false)}${settingsCheck('setting-display-upstream-ua', '上游 UA', s.log_display_upstream_ua !== false)}${settingsCheck('setting-display-timeline', '时间线', s.log_display_timeline !== false)}
+  </div></details></section></div>${settingsSaveBar()}`;
 }
 
 function settingsSaveBar() { return '<div class="settings-save-bar"><button class="telegram-btn primary" type="button" id="settings-save">保存设置</button></div>'; }
@@ -301,7 +313,7 @@ async function saveGlobalSettings() {
     s.log_display_category = checkedSetting('setting-display-category', true);
     s.log_display_status = checkedSetting('setting-display-status', true);
     s.log_display_timeline = checkedSetting('setting-display-timeline', true);
-    s.log_search_mode = activeSettingChoice('log-search-choice', s.log_search_mode);
+    // Search mode is intentionally kept at its server default; the log page uses one simple search box.
   }
   const button = document.getElementById('settings-save');
   button.disabled = true;

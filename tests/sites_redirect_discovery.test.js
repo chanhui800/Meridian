@@ -374,11 +374,7 @@ test('structured-discovery status reports delivered sources and only unavailable
 
   assert.match(status, /自动发现/);
   assert.match(status, /默认处理 HTTP 30x 和 PlaybackInfo/);
-  assert.match(status, /高级选项中开启 HLS、DASH/);
-  assert.match(status, /Extreme 扩展兼容模式/);
-  assert.match(status, /DYNAMIC_ROUTE_KEY：已配置/);
-  assert.ok(!status.includes('raw-secret-must-not-render'));
-  assert.ok(!status.includes('target-must-not-render'));
+  assert.doesNotMatch(status, /raw-secret-must-not-render|target-must-not-render/);
 });
 
 test('profile risk notices and transition confirmations match the approved product gates', () => {
@@ -434,7 +430,7 @@ test('profile risk notices and transition confirmations match the approved produ
   assert.equal(unchangedExtreme.requirement, 'none');
 });
 
-test('site modal presents proxy and direct main-video choices without discovery or security controls', async () => {
+test('site modal presents proxy, direct main-video, and automatic discovery controls', async () => {
   const { sandbox, document } = loadModalHarness();
   await sandbox.showSiteModal(null);
   const body = document.getElementById('modal-body').innerHTML;
@@ -445,13 +441,13 @@ test('site modal presents proxy and direct main-video choices without discovery 
   assert.match(body, /直连仅适用于主视频文件/);
   assert.match(body, /面板、API、HLS\/DASH 等仍由 Meridian 代理/);
   assert.equal(document.getElementById('m-main-video-mode').value, 'proxy');
+  assert.ok(document.getElementById('m-dynamic-enabled'));
+  assert.ok(document.getElementById('m-dynamic-profile'));
+  assert.ok(document.getElementById('m-dynamic-source-hls'));
+  assert.ok(document.getElementById('m-dynamic-source-dash'));
+  assert.match(body, /自动发现/);
+  assert.match(body, /Compatible|兼容/);
   assert.doesNotMatch(body, /播放回源/);
-  assert.equal(document.getElementById('m-dynamic-enabled'), null);
-  assert.equal(document.getElementById('m-dynamic-profile'), null);
-  assert.equal(document.getElementById('m-dynamic-source-hls'), null);
-  assert.equal(document.getElementById('m-dynamic-source-dash'), null);
-  assert.equal(document.getElementById('m-playback-list'), null);
-  assert.doesNotMatch(body, /Safe|Compatible|Extreme|高级选项/);
 });
 
 test('new site submission enables every automatic proxy source without manual playback origins', async () => {
@@ -750,7 +746,7 @@ test('dynamic rendering escapes values and never renders sensitive observation d
   }
 });
 
-test('edit modal hides legacy dynamic observations and configuration controls', async () => {
+test('edit modal exposes discovery policy and observation controls', async () => {
   const { sandbox, document, state } = loadModalHarness();
   const site = {
     id: 17,
@@ -775,10 +771,10 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
 
   await sandbox.showSiteModal(site);
   assert.equal(state.opened, 1);
-  assert.equal(document.getElementById('m-refresh-dynamic-observations'), null);
-  assert.equal(document.getElementById('m-clear-dynamic-observations'), null);
-  assert.equal(document.getElementById('m-dynamic-observations'), null);
-  assert.deepEqual(state.observationGets, []);
+  assert.ok(document.getElementById('m-refresh-dynamic-observations'));
+  assert.ok(document.getElementById('m-clear-dynamic-observations'));
+  assert.ok(document.getElementById('m-dynamic-observations'));
+  assert.deepEqual(state.observationGets, [17]);
   assert.deepEqual(state.observationDeletes, []);
   assert.deepEqual(state.confirmations, []);
   assert.deepEqual(state.errors, []);

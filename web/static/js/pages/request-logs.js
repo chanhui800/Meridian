@@ -168,31 +168,28 @@ function renderRequestLogs() {
       </div>
 
       <div class="request-log-filter-row">
-        <span class="request-log-filter-label">筛选模式</span>
-        <div class="request-log-pills" id="request-log-category-pills">
-          <button type="button" class="request-log-pill active" data-category="all">全部</button>
-          <button type="button" class="request-log-pill" data-category="playback">播放信息</button>
-          <button type="button" class="request-log-pill" data-category="playback_sync">播放状态同步</button>
-          <button type="button" class="request-log-pill" data-category="stream">主视频流</button>
-          <button type="button" class="request-log-pill" data-category="manifest">播放清单</button>
-          <button type="button" class="request-log-pill" data-category="segment">媒体分片</button>
-          <button type="button" class="request-log-pill" data-category="image">图片海报</button>
-          <button type="button" class="request-log-pill" data-category="metadata">媒体元数据</button>
-          <button type="button" class="request-log-pill" data-category="subtitle">字幕</button>
-          <button type="button" class="request-log-pill" data-category="asset">静态资源</button>
-          <button type="button" class="request-log-pill" data-category="websocket">WebSocket</button>
-          <button type="button" class="request-log-pill" data-category="api">常规 API</button>
-          <button type="button" class="request-log-pill" data-category="auth">用户认证</button>
-        </div>
+        <label class="request-log-filter-label" for="request-log-category">资源类别</label>
+        <select class="form-select request-log-filter-select" id="request-log-category">
+          <option value="all">全部资源</option>
+          <option value="playback">播放信息</option>
+          <option value="playback_sync">播放状态同步</option>
+          <option value="video">视频与流媒体</option>
+          <option value="image">图片海报</option>
+          <option value="asset">静态资源</option>
+          <option value="api">常规 API</option>
+          <option value="auth">用户认证</option>
+        </select>
       </div>
 
       <div class="request-log-filter-row">
-        <span class="request-log-filter-label">状态筛选</span>
-        <div class="request-log-pills" id="request-log-status-pills">
-          <button type="button" class="request-log-pill active" data-status="all">全部状态</button>
-          <button type="button" class="request-log-pill" data-status="4xx">只看 4XX</button>
-          <button type="button" class="request-log-pill" data-status="5xx">只看 5XX</button>
-        </div>
+        <label class="request-log-filter-label" for="request-log-status">状态</label>
+        <select class="form-select request-log-filter-select" id="request-log-status">
+          <option value="all">全部状态</option>
+          <option value="2xx">正常 2xx</option>
+          <option value="3xx">正常 3xx</option>
+          <option value="4xx">客户端错误 4xx</option>
+          <option value="5xx">服务端错误 5xx</option>
+        </select>
       </div>
 
       <div class="request-log-ua-width-control">
@@ -237,20 +234,16 @@ function renderRequestLogs() {
   `;
   requestLogApplyUAWidth();
 
-  document.querySelectorAll('#request-log-category-pills .request-log-pill').forEach(button => {
-    button.onclick = () => {
-      requestLogCategoryFilter = button.dataset.category;
-      setRequestLogActivePill('request-log-category-pills', button);
-      loadRequestLogs();
-    };
-  });
-  document.querySelectorAll('#request-log-status-pills .request-log-pill').forEach(button => {
-    button.onclick = () => {
-      requestLogStatusFilter = button.dataset.status;
-      setRequestLogActivePill('request-log-status-pills', button);
-      loadRequestLogs();
-    };
-  });
+  const categorySelect = document.getElementById('request-log-category');
+  if (categorySelect) categorySelect.onchange = event => {
+    requestLogCategoryFilter = event.target.value;
+    loadRequestLogs();
+  };
+  const statusSelect = document.getElementById('request-log-status');
+  if (statusSelect) statusSelect.onchange = event => {
+    requestLogStatusFilter = event.target.value;
+    loadRequestLogs();
+  };
   document.getElementById('request-log-from').onchange = loadRequestLogs;
   document.getElementById('request-log-to').onchange = loadRequestLogs;
   document.getElementById('request-log-search').oninput = () => {

@@ -208,7 +208,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		return nil, fmt.Errorf("invalid request log category")
 	}
 	switch filter.StatusGroup {
-	case "", "all", "4xx", "5xx":
+	case "", "all", "2xx", "3xx", "4xx", "5xx":
 	default:
 		return nil, fmt.Errorf("invalid request log status filter")
 	}
@@ -253,6 +253,10 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		}
 	}
 	switch filter.StatusGroup {
+	case "2xx":
+		conditions = append(conditions, "status_code BETWEEN 200 AND 299")
+	case "3xx":
+		conditions = append(conditions, "status_code BETWEEN 300 AND 399")
 	case "4xx":
 		conditions = append(conditions, "status_code BETWEEN 400 AND 499")
 	case "5xx":

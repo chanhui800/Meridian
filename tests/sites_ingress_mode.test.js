@@ -132,7 +132,7 @@ test('site modal always loads deployment capabilities for create and edit flows'
   const end = source.indexOf('// Global actions', start);
   const modalSource = source.slice(start, end);
 
-  assert.match(modalSource, /normalizeSiteCapabilities\(await API\.ingressCapabilities\(\)\)/);
+  assert.match(modalSource, /API\.ingressCapabilities\(\)\.then\(normalizeSiteCapabilities\)/);
   assert.doesNotMatch(modalSource, /if \(!isEdit\)[\s\S]{0,200}ingressCapabilities/);
 	assert.doesNotMatch(modalSource, /id="m-port"[^>]*\srequired(?:\s|>)/);
 	assert.match(modalSource, /portInput\.required = state\.requireListenPort/);

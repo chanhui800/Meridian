@@ -56,7 +56,7 @@ function renderTelegramReport() {
           <label class="telegram-field">
             <span>发送时间</span>
             <input class="form-input" type="time" id="telegram-schedule-time" value="20:00">
-            <small>默认使用北京时间（UTC+8），可在“全局设置 → 系统 UI”中调整调度时区。</small>
+            <small>默认使用北京时间（UTC+8），可在“全局设置 → 系统设置”中调整调度时区。</small>
           </label>
         </div>
 

@@ -107,11 +107,14 @@ test('request log panel exposes only concrete resource-category filters and live
     path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'request-logs.js'),
     'utf8',
   );
-  for (const category of ['playback', 'playback_sync', 'stream', 'manifest', 'segment', 'image', 'metadata', 'subtitle', 'asset', 'websocket', 'api', 'auth']) {
-    assert.match(source, new RegExp(`data-category="${category}"`));
+  for (const category of ['playback', 'playback_sync', 'video', 'image', 'asset', 'api', 'auth']) {
+    assert.match(source, new RegExp(`value="${category}"`));
   }
-  assert.doesNotMatch(source, /data-category="video"/);
-  assert.doesNotMatch(source, /request-log-advanced-filters|<details|高级分类/);
+  assert.match(source, /value="2xx"/);
+  assert.match(source, /value="3xx"/);
+  assert.match(source, /value="4xx"/);
+  assert.match(source, /value="5xx"/);
+  assert.doesNotMatch(source, /request-log-category-pills|request-log-status-pills/);
   assert.match(source, /requestLogRefreshTimer = setInterval/);
   assert.match(source, /Router\.current === 'request-logs'/);
   assert.match(source, /class="request-log-ip mono"/);
