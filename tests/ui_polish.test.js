@@ -70,3 +70,8 @@ test('dashboard selectors retain a visible dropdown affordance after theme overr
   assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?padding: 10px 52px 10px 16px !important;/);
   assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?line-height: 1\.5 !important;/);
 });
+
+test('document scrolling stays on the root for iOS status-bar tap-to-top', () => {
+  assert.match(cssSource, /Keep document scrolling on the root element[\s\S]*?html \{[\s\S]*?overflow-y: auto !important;[\s\S]*?-webkit-overflow-scrolling: touch;/);
+  assert.match(cssSource, /Keep document scrolling on the root element[\s\S]*?body \{[\s\S]*?overflow-y: visible !important;/);
+});

@@ -6500,3 +6500,17 @@ body.modal-open { overflow-y: hidden !important; }
     min-width: 0;
   }
 }
+
+/* Keep document scrolling on the root element. iOS Safari's status-bar
+   tap-to-top gesture targets the document scroller; making both html and
+   body independently scrollable prevents that gesture from reaching it. */
+html {
+  min-height: 100%;
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch;
+}
+body {
+  min-height: 100%;
+  overflow-x: hidden;
+  overflow-y: visible !important;
+}
