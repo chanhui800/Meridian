@@ -161,7 +161,12 @@
     if (loginFooterEl) loginFooterEl.hidden = true;
   }
 
+  function revealAuthScreen() {
+    if (document.body && document.body.classList) document.body.classList.remove('auth-checking');
+  }
+
   function showAuthCheckError() {
+    revealAuthScreen();
     authMode = 'error';
     loginFormEl.setAttribute('aria-busy', 'false');
     loginButtonEl.disabled = true;
@@ -219,6 +224,7 @@
   }
 
   function showSetupMode() {
+    revealAuthScreen();
     authMode = 'setup';
     loginFormEl.setAttribute('aria-busy', 'false');
     if (authCheckStatusEl) authCheckStatusEl.hidden = true;
@@ -239,6 +245,7 @@
   }
 
   function showLoginMode() {
+    revealAuthScreen();
     authMode = 'login';
     loginFormEl.setAttribute('aria-busy', 'false');
     if (authCheckStatusEl) authCheckStatusEl.hidden = true;

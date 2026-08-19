@@ -85,6 +85,7 @@ class FakeDocument {
     this.activeElement = null;
     this.body = new FakeElement('body');
     this.body.ownerDocument = this;
+    this.body.classList.add('auth-checking');
 
     const ids = [
       'page-login', 'app-shell', 'loginForm', 'login-footer', 'btn-login',
@@ -286,6 +287,7 @@ test('auth check is authoritative and a failed check can be retried', async () =
   assert.equal(harness.get('btn-login').textContent, '正在检查...');
   assert.equal(harness.get('loginForm').getAttribute('aria-busy'), 'true');
   assert.equal(harness.get('auth-check-status').hidden, false);
+  assert.equal(harness.document.body.classList.contains('auth-checking'), true);
 
   firstCheck.reject(new Error('offline'));
   await flushTasks();
@@ -295,6 +297,7 @@ test('auth check is authoritative and a failed check can be retried', async () =
   assert.equal(harness.get('auth-check-status').getAttribute('role'), 'alert');
   assert.equal(harness.get('btn-auth-retry').hidden, false);
   assert.equal(harness.get('btn-auth-retry').disabled, false);
+  assert.equal(harness.document.body.classList.contains('auth-checking'), false);
   assert.equal(harness.get('setup-token-group').hidden, true);
 
   const retry = harness.get('btn-auth-retry').dispatch('click');
@@ -320,6 +323,7 @@ test('setup and existing-admin login remain separate with no manual register pat
   assert.equal(setup.get('setup-token-group').hidden, false);
   assert.equal(setup.get('inp-setup-token').required, true);
   assert.equal(setup.get('inp-password').autocomplete, 'new-password');
+  assert.equal(setup.document.body.classList.contains('auth-checking'), false);
 
   const login = loadAuthHarness({
     checks: [{ needs_setup: false, authenticated: false, mode: 'single_admin' }],
@@ -331,6 +335,7 @@ test('setup and existing-admin login remain separate with no manual register pat
   assert.equal(login.get('setup-token-group').hidden, true);
   assert.equal(login.get('inp-setup-token').required, false);
   assert.equal(login.get('inp-password').autocomplete, 'current-password');
+  assert.equal(login.document.body.classList.contains('auth-checking'), false);
   assert.doesNotMatch(login.get('login-footer').innerHTML, /创建管理员|link-register|<a\b/);
 
   login.get('inp-username').value = 'u'.repeat(65);
