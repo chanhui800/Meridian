@@ -15,6 +15,12 @@ meridian.exe
 *.db-wal
 *.db-shm
 
+# Environment / local secrets
+.env
+.env.*
+*.env
+!.env.example
+
 # IDE
 .idea/
 .vscode/

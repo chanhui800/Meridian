@@ -23,6 +23,12 @@ test('site modal resets overlay and content scroll on every open', () => {
   assert.match(appSource, /requestAnimationFrame\(resetModalScroll\)/);
 });
 
+test('site modal applies and removes its responsive modal class', () => {
+  assert.match(appSource, /activeModalClass/);
+  assert.match(appSource, /modal\.classList\.add\(activeModalClass\)/);
+  assert.match(appSource, /modal\.classList\.remove\(activeModalClass\)/);
+});
+
 test('dashboard trends trace smooth curves instead of only straight segments', () => {
   assert.match(dashboardSource, /function dashboardTraceSmoothLine\(ctx, points\)/);
   assert.match(dashboardSource, /ctx\.bezierCurveTo\(/);
@@ -36,4 +42,31 @@ test('mobile navigation keeps the header and drawer available', () => {
 test('upstream header rows do not inherit the browser fieldset frame', () => {
   assert.match(cssSource, /\.form-list-row\.upstream-header-row[\s\S]*?border: 0;/);
   assert.match(cssSource, /\.site-config-modal \.upstream-line-labels,[\s\S]*?grid-template-columns: 76px minmax\(150px, \.8fr\)/);
+  assert.match(cssSource, /grid-template-areas: "enabled" "name" "address" "port" "latency" "actions"/);
+});
+
+test('dashboard assets use a cache-busting revision after chart and mobile fixes', () => {
+  assert.match(indexSource, /1\.9\.3-ui22/);
+});
+
+test('desktop sidebar uses the state variable for real width changes', () => {
+  assert.match(cssSource, /@media \(min-width: 769px\)[\s\S]*?#app-shell\.sidebar-expanded \{[\s\S]*?--sidebar-w: 208px;/);
+  assert.match(cssSource, /#app-shell\.active \.sidebar \{[\s\S]*?width: var\(--sidebar-w\) !important;/);
+  assert.match(cssSource, /#app-shell\.active \.main \{[\s\S]*?margin-left: var\(--sidebar-w\) !important;/);
+  assert.match(cssSource, /\.app-header-copy h1 \{[\s\S]*?font-size: 17px !important;/);
+});
+
+test('mobile upstream rows give address and port separate full-width rows', () => {
+  assert.match(cssSource, /grid-template-areas: "enabled" "name" "address" "port" "latency" "actions" !important;/);
+  assert.match(cssSource, /\.site-config-modal \.upstream-line-field:nth-child\(3\) \{ grid-area: address !important;/);
+  assert.match(cssSource, /\.site-config-modal \.upstream-line-field:nth-child\(4\) \{ grid-area: port !important;/);
+});
+
+test('dashboard selectors retain a visible dropdown affordance after theme overrides', () => {
+  assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?background-image: url\(/);
+  assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?background-position: right 14px center/);
+  assert.match(cssSource, /\.dashboard-trend-toolbar \{[\s\S]*?padding-bottom: 30px !important;/);
+  assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?min-height: 48px !important;/);
+  assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?padding: 10px 52px 10px 16px !important;/);
+  assert.match(cssSource, /\.dashboard-trend-controls \.form-select \{[\s\S]*?line-height: 1\.5 !important;/);
 });

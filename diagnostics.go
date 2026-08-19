@@ -471,7 +471,9 @@ func displayTargetURL(raw string) string {
 	if err != nil || parsed.Host == "" {
 		return raw
 	}
+	parsed.User = nil
 	parsed.RawQuery = ""
+	parsed.Fragment = ""
 	return parsed.String()
 }
 

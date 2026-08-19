@@ -23,6 +23,7 @@ type dashboardTrendsResponse struct {
 	Range          string                `json:"range"`
 	BillingMode    string                `json:"billing_mode"`
 	TimezoneOffset int                   `json:"timezone_offset_minutes"`
+	Timezone       string                `json:"timezone"`
 	StartMS        int64                 `json:"start_ms"`
 	EndMS          int64                 `json:"end_ms"`
 	BucketSeconds  int64                 `json:"bucket_seconds"`
@@ -80,11 +81,15 @@ func dashboardTrendWindowWithLocation(name string, now, customStart, customEnd t
 		if elapsed < time.Minute {
 			elapsed = time.Minute
 		}
-		candidates := []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
-		bucket = 24 * time.Hour
-		for _, candidate := range candidates {
-			count := (elapsed + candidate - time.Nanosecond) / candidate
-			if count <= 720 {
+			// Keep month samples fine enough to expose short traffic spikes. A
+			// 15-minute bucket is preferred for the first three weeks; longer
+			// months fall back to 30 minutes so the response stays compact.
+			const maxMonthPoints = 2048
+			candidates := []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
+			bucket = 24 * time.Hour
+			for _, candidate := range candidates {
+				count := (elapsed + candidate - time.Nanosecond) / candidate
+				if count <= maxMonthPoints {
 				bucket = candidate
 				break
 			}
@@ -168,18 +173,30 @@ func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName 
 		if index < 0 || index >= len(points) {
 			continue
 		}
-		points[index].BytesIn += logRow.BytesIn
-		points[index].BytesOut += logRow.BytesOut
-		points[index].Requests += logRow.Requests
+		if logRow.BytesIn > 0 {
+			points[index].BytesIn += logRow.BytesIn
+		}
+		if logRow.BytesOut > 0 {
+			points[index].BytesOut += logRow.BytesOut
+		}
+		if logRow.Requests > 0 {
+			points[index].Requests += logRow.Requests
+		}
 	}
 	if len(points) > 0 {
 		last := &points[len(points)-1]
-		last.BytesIn += pending.BytesIn
-		last.BytesOut += pending.BytesOut
-		last.Requests += pending.Requests
+		if pending.BytesIn > 0 {
+			last.BytesIn += pending.BytesIn
+		}
+		if pending.BytesOut > 0 {
+			last.BytesOut += pending.BytesOut
+		}
+		if pending.Requests > 0 {
+			last.Requests += pending.Requests
+		}
 	}
 	for i := range points {
-		points[i].Traffic = trafficBillableBytes(billingMode, points[i].BytesIn, points[i].BytesOut)
+		points[i].Traffic = maxInt64(0, trafficBillableBytes(billingMode, points[i].BytesIn, points[i].BytesOut))
 		seconds := bucket.Seconds()
 		if rangeName == "custom" {
 			bucketStart := start.Add(time.Duration(i) * bucket)
@@ -191,16 +208,30 @@ func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName 
 		if seconds <= 0 {
 			seconds = bucket.Seconds()
 		}
-		points[i].DownloadBPS = float64(points[i].BytesOut) / seconds
-		points[i].UploadBPS = float64(points[i].BytesIn) / seconds
+		points[i].DownloadBPS = maxFloat64(0, float64(points[i].BytesOut)/seconds)
+		points[i].UploadBPS = maxFloat64(0, float64(points[i].BytesIn)/seconds)
 	}
 	return points
+}
+
+func maxInt64(value, floor int64) int64 {
+	if value < floor {
+		return floor
+	}
+	return value
+}
+
+func maxFloat64(value, floor float64) float64 {
+	if value < floor || value != value {
+		return floor
+	}
+	return value
 }
 
 func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customWindow ...time.Time) (*dashboardTrendsResponse, error) {
 	settings := pm.database.currentSystemSettings()
 	billingMode := settings.TrafficBillingMode
-	trendLocation := timezoneLocation(settings.ScheduleTimezone)
+	trendLocation := timezoneLocationByName(settings.ScheduleTimezoneName, settings.ScheduleTimezone)
 	var customStart, customEnd time.Time
 	if len(customWindow) > 0 {
 		if len(customWindow) != 2 {
@@ -256,6 +287,7 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 		Range:          name,
 		BillingMode:    trafficBillingModeLabel(billingMode),
 		TimezoneOffset: settings.ScheduleTimezone,
+		Timezone:       settings.ScheduleTimezoneName,
 		StartMS:        start.UnixMilli(),
 		EndMS:          end.UnixMilli(),
 		BucketSeconds:  int64(bucket / time.Second),
@@ -302,7 +334,8 @@ func (a *App) handleDashboardTrends(w http.ResponseWriter, r *http.Request) {
 	}
 	var customWindow []time.Time
 	if strings.EqualFold(strings.TrimSpace(rangeName), "custom") {
-		location := timezoneLocation(a.db.currentSystemSettings().ScheduleTimezone)
+		settings := a.db.currentSystemSettings()
+		location := timezoneLocationByName(settings.ScheduleTimezoneName, settings.ScheduleTimezone)
 		start, startErr := parseDashboardTrendCustomTime(r.URL.Query().Get("start"), location)
 		end, endErr := parseDashboardTrendCustomTime(r.URL.Query().Get("end"), location)
 		if startErr != nil || endErr != nil {

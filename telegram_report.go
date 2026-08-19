@@ -271,7 +271,7 @@ func parseTelegramReportTime(value string) (hour, minute int, err error) {
 }
 
 func telegramReportDue(now time.Time, settings telegramReportSettingsView) (string, bool) {
-	now = now.In(timezoneLocation(settings.Timezone))
+	now = now.In(timezoneLocationByName(settings.TimezoneName, settings.Timezone))
 	hour, minute, err := parseTelegramReportTime(settings.ScheduleTime)
 	if err != nil || !settings.Enabled || !settings.Configured {
 		return "", false
@@ -298,6 +298,7 @@ type telegramReportSettingsView struct {
 	Weekday      int
 	LastSentKey  string
 	Timezone     int
+	TimezoneName string
 }
 
 func (d *DB) telegramReportSettingsView() (telegramReportSettingsView, telegramReportStoredSettings, error) {
@@ -309,11 +310,13 @@ func (d *DB) telegramReportSettingsView() (telegramReportSettingsView, telegramR
 		Enabled: stored.Enabled, Configured: stored.Configured, ScheduleTime: stored.ScheduleTime,
 		Frequency: stored.Frequency, Weekday: stored.Weekday, LastSentKey: stored.LastSentKey,
 		Timezone: d.currentSystemSettings().ScheduleTimezone,
+		TimezoneName: d.currentSystemSettings().ScheduleTimezoneName,
 	}, stored, nil
 }
 
 func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error) {
-	location := timezoneLocation(d.currentSystemSettings().ScheduleTimezone)
+	settings := d.currentSystemSettings()
+	location := timezoneLocationByName(settings.ScheduleTimezoneName, settings.ScheduleTimezone)
 	localNow := now.In(location)
 	todayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
 	tomorrow := todayStart.AddDate(0, 0, 1)

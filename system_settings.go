@@ -7,9 +7,58 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	_ "time/tzdata"
 )
 
 const beijingTimezoneOffsetMinutes = 480
+const defaultTimezoneName = "Asia/Shanghai"
+
+var commonTimezoneAllowlist = map[string]struct{}{
+	"UTC": {}, "Asia/Shanghai": {}, "Asia/Tokyo": {}, "Asia/Seoul": {}, "Asia/Singapore": {}, "Asia/Hong_Kong": {},
+	"Asia/Bangkok": {}, "Asia/Kolkata": {}, "Asia/Dubai": {}, "Asia/Jakarta": {},
+	"Europe/London": {}, "Europe/Paris": {}, "Europe/Berlin": {}, "Europe/Moscow": {},
+	"America/New_York": {}, "America/Chicago": {}, "America/Denver": {}, "America/Los_Angeles": {},
+	"America/Toronto": {}, "America/Vancouver": {}, "Australia/Perth": {}, "Australia/Sydney": {},
+	"Pacific/Auckland": {},
+}
+
+var legacyTimezoneNames = map[int]string{
+	-480: "America/Los_Angeles", -420: "America/Denver", -360: "America/Chicago", -300: "America/New_York",
+	0: "UTC", 330: "Asia/Kolkata", 420: "Asia/Bangkok", 480: defaultTimezoneName, 540: "Asia/Tokyo",
+	600: "Australia/Sydney", 660: "Pacific/Auckland",
+}
+
+func timezoneNameForOffset(offsetMinutes int) string {
+	if name, ok := legacyTimezoneNames[offsetMinutes]; ok {
+		return name
+	}
+	return defaultTimezoneName
+}
+
+func validTimezoneName(name string) bool {
+	_, ok := commonTimezoneAllowlist[strings.TrimSpace(name)]
+	return ok
+}
+
+func timezoneLocationByName(name string, legacyOffset int) *time.Location {
+	name = strings.TrimSpace(name)
+	if !validTimezoneName(name) {
+		name = timezoneNameForOffset(legacyOffset)
+	}
+	if location, err := time.LoadLocation(name); err == nil {
+		return location
+	}
+	return timezoneLocation(legacyOffset)
+}
+
+func timezoneOffsetAt(location *time.Location, now time.Time) int {
+	if location == nil {
+		location = time.UTC
+	}
+	_, offset := now.In(location).Zone()
+	return offset / 60
+}
 
 func timezoneLocation(offsetMinutes int) *time.Location {
 	if offsetMinutes < -720 || offsetMinutes > 840 {
@@ -25,7 +74,7 @@ func timezoneLocation(offsetMinutes int) *time.Location {
 }
 
 func timezoneLabel(offsetMinutes int) string {
-	return timezoneLocation(offsetMinutes).String()
+	return timezoneNameForOffset(offsetMinutes)
 }
 
 type SystemSettings struct {
@@ -36,6 +85,7 @@ type SystemSettings struct {
 	ProbeTimeoutMS           int    `json:"probe_timeout_ms"`
 	PingCacheMinutes         int    `json:"ping_cache_minutes"`
 	ScheduleTimezone         int    `json:"schedule_timezone_offset"`
+	ScheduleTimezoneName     string `json:"schedule_timezone"`
 	LogEnabled               bool   `json:"log_enabled"`
 	LogLevel                 string `json:"log_level"`
 	LogRetentionDays         int    `json:"log_retention_days"`
@@ -78,7 +128,8 @@ type SystemSettings struct {
 func defaultSystemSettings() SystemSettings {
 	return SystemSettings{
 		UIMode: "novice", UIRadius: 10, TrafficBillingMode: trafficBillingModeBidirectional, TrafficResetDay: 1, ProbeTimeoutMS: 5000, PingCacheMinutes: 10,
-		ScheduleTimezone: beijingTimezoneOffsetMinutes,
+		ScheduleTimezone:     beijingTimezoneOffsetMinutes,
+		ScheduleTimezoneName: defaultTimezoneName,
 		LogEnabled:       true, LogLevel: "info", LogRetentionDays: 30, LogFlushThreshold: 1,
 		LogBatchSize: 50, LogRetryCount: 2, LogRetryBackoffMS: 75, LogTaskLeaseMS: 300000,
 		LogWriteImage: false, LogWritePlayback: true, LogWriteMetadata: false, LogWriteVideo: true, LogWriteSubtitle: true, LogWriteAsset: true, LogWriteWebSocket: true, LogWriteAPI: true, LogWriteAuth: true,
@@ -95,6 +146,17 @@ func normalizeSystemSettings(settings SystemSettings) (SystemSettings, error) {
 	}
 	settings.LogLevel = strings.ToLower(strings.TrimSpace(settings.LogLevel))
 	settings.LogSearchMode = strings.ToLower(strings.TrimSpace(settings.LogSearchMode))
+	settings.ScheduleTimezoneName = strings.TrimSpace(settings.ScheduleTimezoneName)
+	legacyOffsetMode := settings.ScheduleTimezoneName == "" || (settings.ScheduleTimezoneName == defaultTimezoneName && settings.ScheduleTimezone != beijingTimezoneOffsetMinutes)
+	if settings.ScheduleTimezoneName == "" || (settings.ScheduleTimezoneName == defaultTimezoneName && settings.ScheduleTimezone != beijingTimezoneOffsetMinutes) {
+		settings.ScheduleTimezoneName = timezoneNameForOffset(settings.ScheduleTimezone)
+	}
+	if !validTimezoneName(settings.ScheduleTimezoneName) {
+		return settings, fmt.Errorf("schedule_timezone must be a supported IANA timezone")
+	}
+	if !legacyOffsetMode {
+		settings.ScheduleTimezone = timezoneOffsetAt(timezoneLocationByName(settings.ScheduleTimezoneName, settings.ScheduleTimezone), time.Now())
+	}
 	if settings.UIMode != "novice" && settings.UIMode != "expert" {
 		return settings, fmt.Errorf("ui_mode must be novice or expert")
 	}
@@ -125,12 +187,12 @@ func normalizeSystemSettings(settings SystemSettings) (SystemSettings, error) {
 func (d *DB) loadSystemSettings() (SystemSettings, error) {
 	settings := defaultSystemSettings()
 	var enabled, writeImage, writePlayback, writeMetadata, writeVideo, writeSubtitle, writeAsset, writeWebSocket, writeAPI, writeAuth, writeNode, writeCategory, writeStatus, writeIP, writeColo, writeUA, writeUpstreamUA, writeBackendAddress, writeTimeline, displayIP, displayColo, displayUA, displayUpstreamUA, displayBackendAddress, displayNode, displayCategory, displayStatus, displayTimeline int
-	err := d.db.QueryRow(`SELECT ui_mode, ui_radius, traffic_billing_mode, traffic_reset_day, probe_timeout_ms, ping_cache_minutes, schedule_timezone_offset,
+	err := d.db.QueryRow(`SELECT ui_mode, ui_radius, traffic_billing_mode, traffic_reset_day, probe_timeout_ms, ping_cache_minutes, schedule_timezone_offset, schedule_timezone,
 		log_enabled, log_level, log_retention_days, log_write_delay_minutes, log_flush_threshold, log_batch_size,
 		log_retry_count, log_retry_backoff_ms, log_task_lease_ms, log_write_image, log_write_playback, log_write_metadata, log_write_video, log_write_subtitle, log_write_asset, log_write_websocket, log_write_api, log_write_auth,
 		log_write_node, log_write_category, log_write_status, log_write_client_ip, log_write_colo, log_write_ua, log_write_upstream_ua, log_write_backend_address, log_write_timeline, log_display_client_ip, log_display_colo,
 		log_display_ua, log_display_upstream_ua, log_display_backend_address, log_display_node, log_display_category, log_display_status, log_display_timeline, log_search_mode FROM system_settings WHERE id=1`).Scan(
-		&settings.UIMode, &settings.UIRadius, &settings.TrafficBillingMode, &settings.TrafficResetDay, &settings.ProbeTimeoutMS, &settings.PingCacheMinutes, &settings.ScheduleTimezone,
+		&settings.UIMode, &settings.UIRadius, &settings.TrafficBillingMode, &settings.TrafficResetDay, &settings.ProbeTimeoutMS, &settings.PingCacheMinutes, &settings.ScheduleTimezone, &settings.ScheduleTimezoneName,
 		&enabled, &settings.LogLevel, &settings.LogRetentionDays, &settings.LogWriteDelayMinutes, &settings.LogFlushThreshold, &settings.LogBatchSize,
 		&settings.LogRetryCount, &settings.LogRetryBackoffMS, &settings.LogTaskLeaseMS, &writeImage, &writePlayback, &writeMetadata, &writeVideo, &writeSubtitle, &writeAsset, &writeWebSocket, &writeAPI, &writeAuth,
 		&writeNode, &writeCategory, &writeStatus, &writeIP, &writeColo, &writeUA, &writeUpstreamUA, &writeBackendAddress, &writeTimeline, &displayIP, &displayColo, &displayUA, &displayUpstreamUA, &displayBackendAddress, &displayNode, &displayCategory, &displayStatus, &displayTimeline, &settings.LogSearchMode)
@@ -163,12 +225,12 @@ func (d *DB) saveSystemSettings(settings SystemSettings) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.db.Exec(`UPDATE system_settings SET ui_mode=?, ui_radius=?, traffic_billing_mode=?, traffic_reset_day=?, probe_timeout_ms=?, ping_cache_minutes=?, schedule_timezone_offset=?,
+	_, err = d.db.Exec(`UPDATE system_settings SET ui_mode=?, ui_radius=?, traffic_billing_mode=?, traffic_reset_day=?, probe_timeout_ms=?, ping_cache_minutes=?, schedule_timezone_offset=?, schedule_timezone=?,
 		log_enabled=?, log_level=?, log_retention_days=?, log_write_delay_minutes=?, log_flush_threshold=?, log_batch_size=?,
 		log_retry_count=?, log_retry_backoff_ms=?, log_task_lease_ms=?, log_write_image=?, log_write_playback=?, log_write_metadata=?, log_write_video=?, log_write_subtitle=?, log_write_asset=?, log_write_websocket=?, log_write_api=?, log_write_auth=?,
 		log_write_node=?, log_write_category=?, log_write_status=?, log_write_client_ip=?, log_write_colo=?, log_write_ua=?, log_write_upstream_ua=?, log_write_backend_address=?, log_write_timeline=?, log_display_client_ip=?, log_display_colo=?,
 		log_display_ua=?, log_display_upstream_ua=?, log_display_backend_address=?, log_display_node=?, log_display_category=?, log_display_status=?, log_display_timeline=?, log_search_mode=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
-		settings.UIMode, settings.UIRadius, settings.TrafficBillingMode, settings.TrafficResetDay, settings.ProbeTimeoutMS, settings.PingCacheMinutes, settings.ScheduleTimezone,
+		settings.UIMode, settings.UIRadius, settings.TrafficBillingMode, settings.TrafficResetDay, settings.ProbeTimeoutMS, settings.PingCacheMinutes, settings.ScheduleTimezone, settings.ScheduleTimezoneName,
 		sqliteBool(settings.LogEnabled), settings.LogLevel, settings.LogRetentionDays, settings.LogWriteDelayMinutes, settings.LogFlushThreshold, settings.LogBatchSize,
 		settings.LogRetryCount, settings.LogRetryBackoffMS, settings.LogTaskLeaseMS, sqliteBool(settings.LogWriteImage), sqliteBool(settings.LogWritePlayback), sqliteBool(settings.LogWriteMetadata), sqliteBool(settings.LogWriteVideo), sqliteBool(settings.LogWriteSubtitle), sqliteBool(settings.LogWriteAsset), sqliteBool(settings.LogWriteWebSocket), sqliteBool(settings.LogWriteAPI), sqliteBool(settings.LogWriteAuth),
 		sqliteBool(settings.LogWriteNode), sqliteBool(settings.LogWriteCategory), sqliteBool(settings.LogWriteStatus), sqliteBool(settings.LogWriteClientIP), sqliteBool(settings.LogWriteColo), sqliteBool(settings.LogWriteUA), sqliteBool(settings.LogWriteUpstreamUA), sqliteBool(settings.LogWriteBackendAddress), sqliteBool(settings.LogWriteTimeline), sqliteBool(settings.LogDisplayClientIP), sqliteBool(settings.LogDisplayColo),
@@ -191,11 +253,14 @@ func (a *App) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, "invalid system settings")
 			return
 		}
-		if err := a.db.saveSystemSettings(settings); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		a.jsonOK(w, settings)
+			if err := a.db.saveSystemSettings(settings); err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			// Return the normalized persisted value (including the current legacy
+			// offset compatibility field) so clients immediately render the same
+			// timezone the server will use for trends, logs, and scheduling.
+			a.jsonOK(w, a.db.currentSystemSettings())
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -219,7 +284,8 @@ func (a *App) handleDashboardInsights(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	location := timezoneLocation(a.db.currentSystemSettings().ScheduleTimezone)
+	currentSettings := a.db.currentSystemSettings()
+	location := timezoneLocationByName(currentSettings.ScheduleTimezoneName, currentSettings.ScheduleTimezone)
 	now := time.Now().In(location)
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
 	insights := dashboardInsights{HourlyRequests: make([]int64, 24), LogHealthy: a.db.currentSystemSettings().LogEnabled}
@@ -239,7 +305,7 @@ func (a *App) handleDashboardInsights(w http.ResponseWriter, r *http.Request) {
 	if stored, err := a.db.telegramReportSettings(); err == nil {
 		insights.ScheduleEnabled = stored.Enabled
 		insights.LastSentKey = stored.LastSentKey
-		insights.ScheduleLabel = stored.ScheduleTime + " " + timezoneLabel(a.db.currentSystemSettings().ScheduleTimezone)
+		insights.ScheduleLabel = stored.ScheduleTime + " " + currentSettings.ScheduleTimezoneName
 		if stored.Frequency == "weekly" {
 			insights.ScheduleLabel = "每周 " + insights.ScheduleLabel
 		} else {

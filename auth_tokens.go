@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +17,7 @@ var jwtSecret []byte
 var jwtSecretEphemeral bool
 var meridianSecretKey []byte
 var meridianSecretKeyConfigured bool
+var sessionGeneration atomic.Uint64
 
 const (
 	sessionCookieName = "meridian_session"
@@ -23,6 +25,7 @@ const (
 )
 
 func init() {
+	sessionGeneration.Store(1)
 	var err error
 	jwtSecret, jwtSecretEphemeral, err = resolveJWTSecret(os.Getenv("JWT_SECRET"))
 	if err != nil {
@@ -57,10 +60,12 @@ func generateToken(userID int64, username string) (string, error) {
 		Sub  int64  `json:"sub"`
 		Name string `json:"name"`
 		Exp  int64  `json:"exp"`
+		Ver  uint64 `json:"ver"`
 	}{
 		Sub:  userID,
 		Name: username,
 		Exp:  time.Now().Add(72 * time.Hour).Unix(),
+		Ver:  sessionGeneration.Load(),
 	})
 	if err != nil {
 		return "", err
@@ -90,6 +95,7 @@ func validateToken(token string) (int64, string, error) {
 		Sub  int64  `json:"sub"`
 		Name string `json:"name"`
 		Exp  int64  `json:"exp"`
+		Ver  uint64 `json:"ver"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return 0, "", err
@@ -97,7 +103,14 @@ func validateToken(token string) (int64, string, error) {
 	if time.Now().Unix() > claims.Exp {
 		return 0, "", fmt.Errorf("token expired")
 	}
+	if claims.Ver == 0 || claims.Ver != sessionGeneration.Load() {
+		return 0, "", fmt.Errorf("session invalidated")
+	}
 	return claims.Sub, claims.Name, nil
+}
+
+func invalidateAllSessions() {
+	sessionGeneration.Add(1)
 }
 
 var jwtHeaderEncoded = base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))

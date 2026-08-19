@@ -565,6 +565,7 @@ test('dashboard zero-value trend scales never render negative or invalid labels'
   assert.deepEqual({ max: scale.max, step: scale.step, ticks: scale.ticks }, { max: 6, step: 1, ticks: 6 });
   assert.equal(vm.runInContext('formatBytes(-5)', sandbox), '0 B');
   assert.equal(vm.runInContext('formatBytes(Number.NaN)', sandbox), '0 B');
+  assert.equal(vm.runInContext('formatBytes(Number.POSITIVE_INFINITY)', sandbox), '0 B');
   assert.equal(vm.runInContext('dashboardTrendValueLabel(0, "requests")', sandbox), '0');
 });
 

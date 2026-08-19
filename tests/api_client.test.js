@@ -21,6 +21,18 @@ function loadAPIClient() {
   return sandbox;
 }
 
+test('named timezone formatting handles DST while retaining offset compatibility', () => {
+  const sandbox = loadAPIClient();
+  sandbox.meridianSetTimezoneName('America/New_York');
+  assert.equal(sandbox.meridianFormatDateTime(Date.UTC(2026, 6, 1, 16, 0, 0), false), '2026-07-01 12:00');
+  assert.equal(sandbox.meridianParseDateOnly('2026-07-01'), Date.UTC(2026, 6, 1, 4, 0, 0));
+  assert.equal(sandbox.meridianParseDateOnly('2026-07-01', true), Date.UTC(2026, 6, 2, 3, 59, 59, 999));
+  assert.match(sandbox.meridianTimezoneLabel(), /America\/New_York/);
+  const legacy = loadAPIClient();
+  legacy.meridianSetTimezoneOffset(480);
+  assert.equal(legacy.meridianFormatDateTime(Date.UTC(2026, 0, 1, 0, 0, 0), false), '2026-01-01 08:00');
+});
+
 test('401 on a protected call logs out, reloads, and stops the request flow', async () => {
   const sandbox = loadAPIClient();
   let reloads = 0;

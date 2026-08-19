@@ -5,6 +5,7 @@ let globalSettingsLoadGeneration = 0;
 
 function applySystemUISettings(settings) {
   if (!settings) return;
+  if (typeof meridianSetTimezoneName === 'function' && settings.schedule_timezone) meridianSetTimezoneName(settings.schedule_timezone);
   if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(settings.schedule_timezone_offset);
   const radius = Math.max(0, Math.min(24, Number(settings.ui_radius || 0)));
   document.documentElement.style.setProperty('--ui-radius', `${radius}px`);
@@ -133,6 +134,22 @@ function trafficResetDaySelect(value) {
   return `<label class="settings-field"><span>流量周期</span><div><select class="form-select settings-reset-select" id="setting-traffic-reset-day">${options.join('')}</select></div><small>默认每月 1 日；选择不重置后，额度和流量统计使用全部累计值。</small></label>`;
 }
 
+const COMMON_TIMEZONES = [
+  ['UTC', 'UTC'], ['Asia/Shanghai', '中国标准时间（上海）'], ['Asia/Tokyo', '日本标准时间（东京）'], ['Asia/Seoul', '韩国标准时间（首尔）'],
+  ['Asia/Singapore', '新加坡标准时间'], ['Asia/Hong_Kong', '香港时间'], ['Asia/Bangkok', '曼谷时间'], ['Asia/Kolkata', '印度标准时间'], ['Asia/Dubai', '海湾标准时间'],
+  ['Europe/London', '英国时间（含夏令时）'], ['Europe/Paris', '中欧时间（含夏令时）'], ['Europe/Berlin', '德国时间（含夏令时）'], ['Europe/Moscow', '莫斯科时间'],
+  ['America/New_York', '美国东部时间（含夏令时）'], ['America/Chicago', '美国中部时间（含夏令时）'], ['America/Denver', '美国山地时间（含夏令时）'], ['America/Los_Angeles', '美国太平洋时间（含夏令时）'],
+  ['Australia/Sydney', '澳大利亚东部时间（含夏令时）'], ['Pacific/Auckland', '新西兰时间（含夏令时）'],
+];
+
+function timezoneSelect(value, legacyOffset) {
+  const selected = String(value || 'Asia/Shanghai');
+  const numericOffset = Number(legacyOffset);
+  const offset = Number.isFinite(numericOffset) ? Math.trunc(numericOffset) : 480;
+  const options = COMMON_TIMEZONES.map(([name, label]) => `<option value="${name}" ${name === selected ? 'selected' : ''}>${label} · ${name}</option>`);
+  return `<label class="settings-field"><span>时区</span><div><select class="form-select" id="setting-schedule-timezone">${options.join('')}</select><input type="hidden" id="setting-schedule-timezone-offset" value="${offset}"></div><small>使用标准 IANA 时区；夏令时由服务端和浏览器自动处理。旧版 UTC 偏移仍会兼容读取。</small></label>`;
+}
+
 function settingsCheck(id, label, checked, help) {
   return `<label class="settings-check"><input id="${id}" type="checkbox" ${checked ? 'checked' : ''}><span class="settings-check-copy"><strong>${label}</strong>${help ? `<small>${help}</small>` : ''}</span></label>`;
 }
@@ -210,8 +227,8 @@ function renderSystemUIForm(s) {
   <section class="settings-panel"><header><span>PROBE</span><h2>健康检查探测</h2><b>1000-180000 ms</b></header>
     <div class="settings-grid">${settingsNumber('setting-probe-timeout', 'GET 超时时间', s.probe_timeout_ms, 1000, 180000, 'ms', '限制健康探测等待时间。')}${settingsNumber('setting-ping-cache', 'Ping 缓存时间', s.ping_cache_minutes, 0, 1440, '分钟', '设置为 0 可关闭短期复用。')}</div>
   </section>
-  <section class="settings-panel"><header><span>SCHEDULE</span><h2>调度时区</h2><b>默认 UTC+08:00</b></header>
-    ${settingsNumber('setting-schedule-timezone', 'UTC 时区偏移', s.schedule_timezone_offset, -720, 840, '分钟', '默认 480 分钟，即北京时间（UTC+8）；可按实际地区手动调整。')}
+  <section class="settings-panel"><header><span>SCHEDULE</span><h2>调度时区</h2><b>默认 Asia/Shanghai</b></header>
+    ${timezoneSelect(s.schedule_timezone, s.schedule_timezone_offset)}
   </section>${settingsSaveBar()}`;
 }
 
@@ -275,7 +292,9 @@ async function saveGlobalSettings() {
     s.ui_radius = numericSetting('setting-ui-radius', s.ui_radius);
     s.probe_timeout_ms = numericSetting('setting-probe-timeout', s.probe_timeout_ms);
     s.ping_cache_minutes = numericSetting('setting-ping-cache', s.ping_cache_minutes);
-    s.schedule_timezone_offset = numericSetting('setting-schedule-timezone', s.schedule_timezone_offset);
+    const timezoneInput = document.getElementById('setting-schedule-timezone');
+    s.schedule_timezone = timezoneInput ? timezoneInput.value : (s.schedule_timezone || 'Asia/Shanghai');
+    s.schedule_timezone_offset = numericSetting('setting-schedule-timezone-offset', s.schedule_timezone_offset);
   } else {
     s.log_enabled = checkedSetting('setting-log-enabled', s.log_enabled);
     s.log_level = activeSettingChoice('log-level-choice', s.log_level);

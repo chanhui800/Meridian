@@ -140,6 +140,7 @@ func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPass
 	if rows != 1 {
 		return AdminAccount{}, errors.New("administrator account changed concurrently")
 	}
+	invalidateAllSessions()
 	return AdminAccount{Username: username, Role: "管理员", CreatedAt: createdAt}, nil
 }
 
@@ -228,5 +229,9 @@ func (d *DB) ResetAdminPassword(password string) error {
 	if rows != 1 {
 		return fmt.Errorf("updated %d administrator rows, want 1", rows)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	invalidateAllSessions()
+	return nil
 }

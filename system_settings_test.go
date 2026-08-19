@@ -11,6 +11,9 @@ func TestSystemSettingsDefaultsUseBeijingSchedule(t *testing.T) {
 	if settings.ScheduleTimezone != 480 {
 		t.Fatalf("schedule timezone = %d, want 480", settings.ScheduleTimezone)
 	}
+	if settings.ScheduleTimezoneName != defaultTimezoneName {
+		t.Fatalf("schedule timezone name = %q, want %q", settings.ScheduleTimezoneName, defaultTimezoneName)
+	}
 	if settings.LogEnabled != true || settings.LogBatchSize != 50 || !settings.LogDisplayUA || !settings.LogDisplayUpstreamUA || settings.LogWriteImage || !settings.LogWritePlayback || settings.LogWriteMetadata || !settings.LogWriteVideo || !settings.LogWriteSubtitle || !settings.LogWriteAsset || !settings.LogWriteWebSocket || !settings.LogWriteAPI || !settings.LogWriteAuth || !settings.LogWriteNode || !settings.LogWriteCategory || !settings.LogWriteStatus || !settings.LogWriteClientIP || !settings.LogWriteUA || !settings.LogWriteUpstreamUA || !settings.LogWriteTimeline {
 		t.Fatalf("unexpected defaults: %+v", settings)
 	}
@@ -31,6 +34,19 @@ func TestSystemSettingsAllowManualScheduleTimezone(t *testing.T) {
 	normalized, err := normalizeSystemSettings(settings)
 	if err != nil || normalized.ScheduleTimezone != -300 {
 		t.Fatalf("manual timezone = %d, err = %v", normalized.ScheduleTimezone, err)
+	}
+}
+
+func TestSystemSettingsCanonicalTimezoneAndAllowlist(t *testing.T) {
+	settings := defaultSystemSettings()
+	settings.ScheduleTimezoneName = "America/New_York"
+	normalized, err := normalizeSystemSettings(settings)
+	if err != nil || normalized.ScheduleTimezoneName != "America/New_York" {
+		t.Fatalf("canonical timezone = %#v, err = %v", normalized, err)
+	}
+	settings.ScheduleTimezoneName = "Not/IANA"
+	if _, err := normalizeSystemSettings(settings); err == nil {
+		t.Fatal("unsupported timezone was accepted")
 	}
 }
 

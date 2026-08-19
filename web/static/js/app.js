@@ -22,6 +22,7 @@
   let appBootstrapped = false;
   let modalBackdropClosable = false;
   let modalPreviousFocus = null;
+  let activeModalClass = '';
   let authMode = 'checking';
   let authSubmissionInFlight = false;
   let authStatus = {
@@ -45,6 +46,13 @@
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
     modalPreviousFocus = document.activeElement;
     const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    if (modal) {
+      if (activeModalClass) modal.classList.remove(activeModalClass);
+      const requestedClass = String(options && options.modalClass || '').trim();
+      activeModalClass = /^[A-Za-z][A-Za-z0-9_-]*$/.test(requestedClass) ? requestedClass : '';
+      if (activeModalClass) modal.classList.add(activeModalClass);
+    }
     resetModalScroll();
     overlay.classList.add('active');
     overlay.setAttribute('aria-hidden', 'false');
@@ -58,6 +66,9 @@
   window.closeModal = function() {
     modalBackdropClosable = false;
     const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    if (modal && activeModalClass) modal.classList.remove(activeModalClass);
+    activeModalClass = '';
     overlay.classList.remove('active');
     overlay.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('modal-open');

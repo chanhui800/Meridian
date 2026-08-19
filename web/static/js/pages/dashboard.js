@@ -60,10 +60,10 @@ function renderDashboard() {
         <div class="dashboard-trend-help" id="dashboard-trend-help">默认显示全部站点；“本月”按自然月 1 日至当前时间统计 · 数据时间 <span id="dashboard-trend-timezone">UTC+08:00</span></div>
       </div>
       <div class="dashboard-trend-controls">
-        <label>站点<select id="dashboard-trend-site" class="form-select" aria-label="选择趋势站点"><option value="all">全部站点</option></select></label>
-        <label>时间<select id="dashboard-trend-range" class="form-select" aria-label="选择趋势时间范围">
+        <div class="dashboard-trend-control"><label for="dashboard-trend-site">站点</label><select id="dashboard-trend-site" class="form-select" aria-label="选择趋势站点"><option value="all">全部站点</option></select></div>
+        <div class="dashboard-trend-control"><label for="dashboard-trend-range">时间</label><select id="dashboard-trend-range" class="form-select" aria-label="选择趋势时间范围">
           <option value="realtime">实时</option><option value="hour">1 小时</option><option value="6h">6 小时</option><option value="day">1 天</option><option value="7d">7 天</option><option value="month">本月</option><option value="custom">自定义</option>
-        </select></label>
+        </select></div>
         <div class="dashboard-trend-custom" id="dashboard-trend-custom" hidden>
           <label>开始时间<input type="datetime-local" id="dashboard-trend-start" class="form-input" step="60" aria-label="趋势开始时间"></label>
           <span class="dashboard-trend-custom-separator" aria-hidden="true">至</span>
@@ -148,9 +148,14 @@ function dashboardTimeLabelIndexes(pointCount, plotWidth, range) {
 }
 
 function dashboardTrendMetricValue(point, metric) {
-  if (metric === 'speed') return Math.max(0, Number(point.download_bps || 0), Number(point.upload_bps || 0));
-  if (metric === 'traffic') return Math.max(0, Number(point.traffic_bytes || 0));
-  return Math.max(0, Number(point.requests || 0));
+  if (metric === 'speed') return Math.max(dashboardSafeNonNegative(point?.download_bps), dashboardSafeNonNegative(point?.upload_bps));
+  if (metric === 'traffic') return dashboardSafeNonNegative(point?.traffic_bytes);
+  return dashboardSafeNonNegative(point?.requests);
+}
+
+function dashboardSafeNonNegative(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
 }
 
 function dashboardTrendValueLabel(value, metric) {
@@ -194,7 +199,11 @@ function dashboardTooltipPosition(pointerX, pointerY, wrapWidth, wrapHeight, too
 function dashboardTrendTimeLabel(timestamp, range) {
   const date = meridianTimezoneDate(timestamp);
   const pad = value => String(value).padStart(2, '0');
-  if (range === '7d' || range === 'day' || range === 'month') return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:00`;
+  if (range === '7d' || range === 'day' || range === 'month') {
+    const bucketSeconds = Number(dashboardTrendData?.bucket_seconds || 0);
+    const minute = bucketSeconds > 0 && bucketSeconds < 3600 ? `:${pad(date.getUTCMinutes())}` : ':00';
+    return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}${minute}`;
+  }
   if (range === 'realtime') return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
   if (range === 'custom') return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
   return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
@@ -203,8 +212,8 @@ function dashboardTrendTimeLabel(timestamp, range) {
 function dashboardTrendMetricLine(point, metric) {
   if (!point) return '暂无数据';
   if (metric === 'speed') return `↓ ${formatRate(point.download_bps)} · ↑ ${formatRate(point.upload_bps)}`;
-  if (metric === 'requests') return `请求 ${formatNumber(point.requests || 0)} 次`;
-  if (metric === 'traffic') return `流量 ${formatBytes(point.traffic_bytes || 0)}`;
+  if (metric === 'requests') return `请求 ${formatNumber(dashboardSafeNonNegative(point.requests))} 次`;
+  if (metric === 'traffic') return `流量 ${formatBytes(dashboardSafeNonNegative(point.traffic_bytes))}`;
   return '';
 }
 
@@ -266,10 +275,10 @@ function dashboardTrendPoints() {
 
 function dashboardTrendSummary(data) {
   const points = dashboardTrendPoints();
-  const downloadPeak = points.reduce((max, point) => Math.max(max, Number(point.download_bps || 0)), 0);
-  const uploadPeak = points.reduce((max, point) => Math.max(max, Number(point.upload_bps || 0)), 0);
-  const requests = points.reduce((sum, point) => sum + Math.max(0, Number(point.requests || 0)), 0);
-  const traffic = points.reduce((sum, point) => sum + Math.max(0, Number(point.traffic_bytes || 0)), 0);
+  const downloadPeak = points.reduce((max, point) => Math.max(max, dashboardSafeNonNegative(point.download_bps)), 0);
+  const uploadPeak = points.reduce((max, point) => Math.max(max, dashboardSafeNonNegative(point.upload_bps)), 0);
+  const requests = points.reduce((sum, point) => sum + dashboardSafeNonNegative(point.requests), 0);
+  const traffic = points.reduce((sum, point) => sum + dashboardSafeNonNegative(point.traffic_bytes), 0);
   const speed = document.getElementById('dashboard-speed-summary');
   const request = document.getElementById('dashboard-requests-summary');
   const trafficEl = document.getElementById('dashboard-traffic-summary');
@@ -324,10 +333,14 @@ function dashboardTraceSmoothLine(ctx, points) {
     const next = points[index + 1];
     const following = points[index + 2] || next;
     const tension = 1 / 6;
-    const control1X = current.x + (next.x - previous.x) * tension;
-    const control1Y = current.y + (next.y - previous.y) * tension;
-    const control2X = next.x - (following.x - current.x) * tension;
-    const control2Y = next.y - (following.y - current.y) * tension;
+    const minX = Math.min(current.x, next.x);
+    const maxX = Math.max(current.x, next.x);
+    const minY = Math.min(current.y, next.y);
+    const maxY = Math.max(current.y, next.y);
+    const control1X = Math.max(minX, Math.min(maxX, current.x + (next.x - previous.x) * tension));
+    const control1Y = Math.max(minY, Math.min(maxY, current.y + (next.y - previous.y) * tension));
+    const control2X = Math.max(minX, Math.min(maxX, next.x - (following.x - current.x) * tension));
+    const control2Y = Math.max(minY, Math.min(maxY, next.y - (following.y - current.y) * tension));
     ctx.bezierCurveTo(control1X, control1Y, control2X, control2Y, next.x, next.y);
   }
 }
@@ -347,7 +360,7 @@ function drawDashboardTrendChart(metric) {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
   const series = metric === 'speed'
-    ? [{ values: points.map(point => Math.max(0, Number(point.download_bps || 0))), color: '#3b9cff' }, { values: points.map(point => Math.max(0, Number(point.upload_bps || 0))), color: '#a78bfa' }]
+    ? [{ values: points.map(point => dashboardSafeNonNegative(point.download_bps)), color: '#3b9cff' }, { values: points.map(point => dashboardSafeNonNegative(point.upload_bps)), color: '#a78bfa' }]
     : [{ values: points.map(point => dashboardTrendMetricValue(point, metric)), color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
   const scale = dashboardRequestScale(Math.max(0, ...series.flatMap(item => item.values)));
   ctx.font = `${width < 360 ? 10 : 11}px system-ui`;
@@ -593,6 +606,7 @@ async function loadDashboardTrends() {
       dashboardTrendState.customEnd,
     );
     if (!data || Router.current !== 'dashboard') return;
+    if (typeof meridianSetTimezoneName === 'function' && data.timezone) meridianSetTimezoneName(data.timezone);
     if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(data.timezone_offset_minutes);
     const timezone = document.getElementById('dashboard-trend-timezone');
     if (timezone && typeof meridianTimezoneLabel === 'function') timezone.textContent = meridianTimezoneLabel(data.timezone_offset_minutes);
@@ -753,10 +767,10 @@ function updateDashboardSiteSpeeds(liveSites) {
     if (!Number.isFinite(siteID)) continue;
     liveMap.set(siteID, site);
     const current = {
-      trafficUsed: Number(site.monthly_traffic != null ? site.monthly_traffic : (site.traffic_used || 0)),
-      bytesIn: Number(site.cumulative_bytes_in != null ? site.cumulative_bytes_in : (site.bytes_in || site.bytes_in_total || 0)),
-      bytesOut: Number(site.cumulative_bytes_out != null ? site.cumulative_bytes_out : (site.bytes_out || site.bytes_out_total || 0)),
-      requests: Number(site.requests || 0),
+      trafficUsed: dashboardSafeNonNegative(site.monthly_traffic != null ? site.monthly_traffic : site.traffic_used),
+      bytesIn: dashboardSafeNonNegative(site.cumulative_bytes_in != null ? site.cumulative_bytes_in : (site.bytes_in || site.bytes_in_total)),
+      bytesOut: dashboardSafeNonNegative(site.cumulative_bytes_out != null ? site.cumulative_bytes_out : (site.bytes_out || site.bytes_out_total)),
+      requests: dashboardSafeNonNegative(site.requests),
       timestamp: now,
     };
     const previous = dashboardSpeedSamples.get(siteID);
@@ -789,22 +803,22 @@ function updateDashboardSiteSpeeds(liveSites) {
   const sampledAt = now;
   const appendRealtimeTrendSample = (key, sample) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
-    const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));
-    const bytesOut = Math.max(0, Number(sample?.bytesOut || 0));
+    const bytesIn = dashboardSafeNonNegative(sample?.bytesIn);
+    const bytesOut = dashboardSafeNonNegative(sample?.bytesOut);
     samples.push({
       timestamp_ms: sampledAt,
-      download_bps: Math.max(0, Number(sample?.download_bps || 0)),
-      upload_bps: Math.max(0, Number(sample?.upload_bps || 0)),
+      download_bps: dashboardSafeNonNegative(sample?.download_bps),
+      upload_bps: dashboardSafeNonNegative(sample?.upload_bps),
       bytes_in: bytesIn,
       bytes_out: bytesOut,
-      requests: Math.max(0, Number(sample?.requests || 0)),
+      requests: dashboardSafeNonNegative(sample?.requests),
       traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? bytesOut : bytesIn + bytesOut,
     });
     // Keep the active dashboard session responsive without imposing a time
     // window; the X axis adapts to however many samples are available.
     dashboardRealtimeTrendSamples.set(key, samples.slice(-1800));
   };
-  appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests });
+  if (liveMap.size > 0) appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests });
   for (const siteID of liveMap.keys()) {
     const rate = rateSamples.get(String(siteID)) || {};
     const delta = trendDeltas.get(siteID) || {};
@@ -812,12 +826,12 @@ function updateDashboardSiteSpeeds(liveSites) {
     const siteSamples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
     siteSamples.push({
       timestamp_ms: sampledAt,
-      download_bps: Math.max(0, Number(rate.download_bps || 0)),
-      upload_bps: Math.max(0, Number(rate.upload_bps || 0)),
-      bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
-      bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
-      requests: Math.max(0, Number(delta.requests || 0)),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? Math.max(0, Number(delta.bytesOut || 0)) : Math.max(0, Number(delta.bytesIn || 0)) + Math.max(0, Number(delta.bytesOut || 0)),
+      download_bps: dashboardSafeNonNegative(rate.download_bps),
+      upload_bps: dashboardSafeNonNegative(rate.upload_bps),
+      bytes_in: dashboardSafeNonNegative(delta.bytesIn),
+      bytes_out: dashboardSafeNonNegative(delta.bytesOut),
+      requests: dashboardSafeNonNegative(delta.requests),
+      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? dashboardSafeNonNegative(delta.bytesOut) : dashboardSafeNonNegative(delta.bytesIn) + dashboardSafeNonNegative(delta.bytesOut),
     });
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples.slice(-1800));
   }
@@ -941,7 +955,7 @@ function dashboardSpeedMarkup(speed) {
 }
 
 function formatRate(bytesPerSecond) {
-  return `${formatBytes(Math.max(0, Number(bytesPerSecond) || 0))}/s`;
+  return `${formatBytes(dashboardSafeNonNegative(bytesPerSecond))}/s`;
 }
 
 function dashboardIngressLabel(site) {
@@ -961,9 +975,10 @@ const uaClassMap = { infuse: 'pill-blue', web: 'pill-green', client: 'pill-orang
 const uaNameMap = { infuse: 'Infuse', web: 'Web', client: '客户端', custom: '自定义', passthrough: '透传' };
 
 function formatBytes(bytes) {
-	const value = Math.max(0, Number(bytes) || 0);
+	const value = dashboardSafeNonNegative(bytes);
 	if (value === 0) return '0 B';
 	const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
 	const i = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
-	return (value / Math.pow(1024, i)).toFixed(i > 1 ? 1 : 0) + ' ' + units[i];
+	const unit = units[i] || units[0];
+	return (value / Math.pow(1024, i)).toFixed(i > 1 ? 1 : 0) + ' ' + unit;
 }

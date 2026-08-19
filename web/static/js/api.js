@@ -1,10 +1,37 @@
 // Meridian API Client
 let meridianTimezoneOffsetMinutes = 480;
+let meridianTimezoneName = 'Asia/Shanghai';
+let meridianTimezoneFormatter = null;
+let meridianTimezoneNameExplicit = false;
+
+function meridianTimezoneSupported(name) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: name }).format();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function meridianSetTimezoneName(value) {
+  const name = String(value || '').trim();
+  if (name && meridianTimezoneSupported(name)) {
+    meridianTimezoneName = name;
+    meridianTimezoneNameExplicit = true;
+    meridianTimezoneFormatter = null;
+  }
+  return meridianTimezoneName;
+}
+
+function meridianGetTimezoneName() {
+  return meridianTimezoneName;
+}
 
 function meridianSetTimezoneOffset(value) {
   const numeric = Number(value);
   if (Number.isFinite(numeric) && numeric >= -720 && numeric <= 840) {
     meridianTimezoneOffsetMinutes = Math.trunc(numeric);
+    if (!meridianTimezoneNameExplicit) meridianTimezoneName = 'UTC' + (numeric < 0 ? '-' : '+') + String(Math.floor(Math.abs(numeric) / 60)).padStart(2, '0') + ':' + String(Math.abs(numeric) % 60).padStart(2, '0');
   }
   return meridianTimezoneOffsetMinutes;
 }
@@ -17,12 +44,26 @@ function meridianTimezoneLabel(offset) {
   const value = Number.isFinite(Number(offset)) ? Number(offset) : meridianTimezoneOffsetMinutes;
   const sign = value < 0 ? '-' : '+';
   const absolute = Math.abs(value);
-  return `UTC${sign}${String(Math.floor(absolute / 60)).padStart(2, '0')}:${String(absolute % 60).padStart(2, '0')}`;
+  return `${meridianTimezoneName} (UTC${sign}${String(Math.floor(absolute / 60)).padStart(2, '0')}:${String(absolute % 60).padStart(2, '0')})`;
+}
+
+function meridianTimezoneParts(timestamp) {
+  const value = Number(timestamp);
+  const instant = new Date(Number.isFinite(value) ? value : Date.now());
+  if (!meridianTimezoneFormatter) meridianTimezoneFormatter = new Intl.DateTimeFormat('en-CA-u-ca-gregory-nu-latn', { timeZone: meridianTimezoneName, calendar: 'gregory', numberingSystem: 'latn', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3, hourCycle: 'h23' });
+  const parts = Object.create(null);
+  for (const part of meridianTimezoneFormatter.formatToParts(instant)) if (part.type !== 'literal') parts[part.type] = part.value;
+  return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day), hour: Number(parts.hour), minute: Number(parts.minute), second: Number(parts.second), millisecond: Number(parts.fractionalSecond || 0) };
 }
 
 function meridianTimezoneDate(timestamp) {
   const value = Number(timestamp);
-  return new Date((Number.isFinite(value) ? value : Date.now()) + meridianTimezoneOffsetMinutes * 60000);
+  const instant = Number.isFinite(value) ? value : Date.now();
+  if (meridianTimezoneNameExplicit && meridianTimezoneSupported(meridianTimezoneName)) {
+    const parts = meridianTimezoneParts(instant);
+    return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second));
+  }
+  return new Date(instant + meridianTimezoneOffsetMinutes * 60000);
 }
 
 function meridianFormatDateTime(timestamp, includeSeconds = true) {
@@ -47,16 +88,26 @@ function meridianDateTimeLocalValue(dateOrTimestamp) {
 function meridianParseDateTimeLocal(value) {
   const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
   if (!match) return NaN;
-  const timestamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]));
-  return timestamp - meridianTimezoneOffsetMinutes * 60000;
+  return meridianParseTimezoneWallTime(Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]), 0);
 }
 
 function meridianParseDateTimeText(value) {
   const normalized = String(value || '').trim().replace(' ', 'T');
   const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
   if (!match) return NaN;
-  const timestamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6] || 0));
-  return timestamp - meridianTimezoneOffsetMinutes * 60000;
+  return meridianParseTimezoneWallTime(Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6] || 0));
+}
+
+function meridianParseTimezoneWallTime(year, month, day, hour, minute, second, millisecond = 0) {
+  const wall = Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
+  if (!meridianTimezoneNameExplicit) return wall - meridianTimezoneOffsetMinutes * 60000;
+  let candidate = wall - meridianTimezoneOffsetMinutes * 60000;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const parts = meridianTimezoneParts(candidate);
+    const observedWall = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, parts.millisecond);
+    candidate += wall - observedWall;
+  }
+  return candidate;
 }
 
 function meridianDateOnlyValue(dateOrTimestamp) {
@@ -69,8 +120,7 @@ function meridianDateOnlyValue(dateOrTimestamp) {
 function meridianParseDateOnly(value, endOfDay = false) {
   const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return NaN;
-  const timestamp = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0);
-  return timestamp - meridianTimezoneOffsetMinutes * 60000;
+  return meridianParseTimezoneWallTime(Number(match[1]), Number(match[2]), Number(match[3]), endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0);
 }
 
 const API = {

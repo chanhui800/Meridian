@@ -265,6 +265,7 @@ function renderRequestLogs() {
     uaWidthInput.onchange = applyUAWidth;
   }
   if (API.getSystemSettings) API.getSystemSettings().then(settings => {
+    if (typeof meridianSetTimezoneName === 'function' && settings?.schedule_timezone) meridianSetTimezoneName(settings.schedule_timezone);
     if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(settings?.schedule_timezone_offset);
     requestLogApplyDisplaySettings(settings);
   }).catch(() => requestLogApplyDisplaySettings(null));

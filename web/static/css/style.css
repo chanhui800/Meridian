@@ -4821,7 +4821,19 @@ html {
 .dashboard-trend-help { margin-top: 5px; color: var(--white-60); font-size: 13px; }
 .dashboard-trend-controls { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
 .dashboard-trend-controls label { display: grid; gap: 5px; color: var(--white-60); font-size: 12px; font-weight: 650; }
+.dashboard-trend-control { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 150px; align-content: start; }
+.dashboard-trend-control > label { display: block; min-height: 18px; margin: 0; color: var(--white-60); font-size: 13px; font-weight: 650; line-height: 1.4; overflow: visible; white-space: nowrap; }
 .dashboard-trend-controls .form-select { min-width: 150px; min-height: 42px; }
+.dashboard-trend-controls .form-select {
+  min-height: 42px !important;
+  padding-right: 42px !important;
+  line-height: 1.25 !important;
+  background-color: var(--surface) !important;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23666' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 14px center !important;
+  background-size: 10px 6px !important;
+}
 .dashboard-trend-custom { display: flex; align-items: end; gap: 8px; }
 .dashboard-trend-custom label { min-width: 196px; }
 .dashboard-trend-custom .form-input { min-height: 42px; }
@@ -6268,6 +6280,222 @@ body.modal-open { overflow-y: hidden !important; }
 }
 @media (max-width: 768px) {
   .dashboard-trend-controls .form-select {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+/* Final site-line contract: the address absorbs desktop width, while the
+   compact port stays usable beside the line name on phones. */
+.site-config-modal .modal-body { min-width: 0; overflow-y: auto; overscroll-behavior: contain; }
+.site-config-modal .modal-footer { flex-wrap: wrap; }
+@media (min-width: 769px) {
+  .site-config-modal .upstream-line {
+    grid-template-columns: 54px minmax(140px, .8fr) minmax(0, 1fr) 76px 88px 156px;
+  }
+  .site-config-modal .upstream-line-field:nth-child(3) { min-width: 0; }
+}
+@media (max-width: 768px) {
+  .site-config-modal .upstream-line {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "enabled" "name" "address" "port" "latency" "actions";
+  }
+  .site-config-modal .upstream-line-field:nth-child(2) { grid-area: name; }
+  .site-config-modal .upstream-line-field:nth-child(3) { grid-area: address; min-width: 0; }
+  .site-config-modal .upstream-line-field:nth-child(4) { grid-area: port; }
+  .site-config-modal .upstream-line-field .form-input { min-width: 0; width: 100%; }
+  .site-config-modal .upstream-line-actions { justify-content: flex-start; }
+}
+
+/* Final desktop shell contract. The legacy theme block above intentionally
+   restyles the shell, so keep the sidebar state authoritative at the end of
+   the cascade. */
+@media (min-width: 769px) {
+  #app-shell {
+    --sidebar-w: 72px;
+  }
+  #app-shell.sidebar-expanded {
+    --sidebar-w: 208px;
+  }
+  #app-shell.active {
+    display: block !important;
+    min-height: 100vh;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  #app-shell.active .sidebar {
+    position: fixed !important;
+    inset: 0 auto 0 0 !important;
+    width: var(--sidebar-w) !important;
+    min-width: var(--sidebar-w) !important;
+    height: 100vh !important;
+    padding: 10px 8px !important;
+    overflow: visible !important;
+    transition: width .22s cubic-bezier(.22, 1, .36, 1), min-width .22s cubic-bezier(.22, 1, .36, 1);
+  }
+  #app-shell.active .app-header {
+    display: flex !important;
+    position: sticky !important;
+    top: 0;
+    z-index: 900;
+    width: auto;
+    min-height: 64px;
+    margin-left: var(--sidebar-w) !important;
+    transition: margin-left .22s cubic-bezier(.22, 1, .36, 1);
+  }
+  #app-shell.active .main {
+    margin-left: var(--sidebar-w) !important;
+    transition: margin-left .22s cubic-bezier(.22, 1, .36, 1);
+  }
+  #app-shell:not(.sidebar-expanded) .sidebar-brand {
+    min-height: 66px;
+    padding-inline: 0;
+    justify-content: center;
+  }
+  #app-shell:not(.sidebar-expanded) .sidebar-brand-name,
+  #app-shell:not(.sidebar-expanded) .sidebar-account-copy,
+  #app-shell:not(.sidebar-expanded) .sidebar-account > svg,
+  #app-shell:not(.sidebar-expanded) .sidebar-version {
+    display: none !important;
+  }
+  #app-shell:not(.sidebar-expanded) .sidebar .topnav-link {
+    width: 46px;
+    min-height: 44px;
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+  }
+  #app-shell:not(.sidebar-expanded) .sidebar .topnav-link > span {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    clip: rect(0 0 0 0) !important;
+    white-space: nowrap !important;
+  }
+  #app-shell:not(.sidebar-expanded) .sidebar-account {
+    width: 46px;
+    min-height: 44px;
+    padding: 0;
+    justify-content: center;
+  }
+  #app-shell.sidebar-expanded .sidebar-brand-name,
+  #app-shell.sidebar-expanded .sidebar-account-copy,
+  #app-shell.sidebar-expanded .sidebar-account > svg {
+    display: block;
+  }
+  #app-shell.sidebar-expanded .sidebar-version { display: inline-block; }
+  #app-shell.sidebar-expanded .sidebar .topnav-link {
+    width: 100%;
+    min-height: 42px;
+    padding: 0 12px;
+    justify-content: flex-start;
+    gap: 10px;
+  }
+  #app-shell.sidebar-expanded .sidebar .topnav-link > span {
+    position: static !important;
+    width: auto !important;
+    height: auto !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    clip: auto !important;
+    font-size: 15px !important;
+    line-height: 1.35;
+    opacity: 1;
+    white-space: nowrap;
+  }
+  .app-header-copy h1 {
+    font-size: 17px !important;
+    line-height: 1.25 !important;
+    white-space: nowrap;
+  }
+  .app-header-copy p { white-space: nowrap; }
+}
+
+/* Keep the two trend selectors readable on narrow screens. */
+@media (max-width: 768px) {
+  .dashboard-trend-toolbar,
+  .dashboard-trend-toolbar > *,
+  .dashboard-trend-controls,
+  .dashboard-trend-controls > label,
+  .dashboard-trend-control {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .dashboard-trend-controls {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    width: 100%;
+    row-gap: 14px;
+  }
+  .dashboard-trend-toolbar {
+    padding-bottom: 30px !important;
+    margin-bottom: 20px;
+    overflow: visible !important;
+  }
+  .dashboard-trend-controls > label,
+  .dashboard-trend-control {
+    display: grid;
+    width: 100%;
+    overflow: visible;
+  }
+  .dashboard-trend-control {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    min-height: 74px;
+    white-space: nowrap;
+  }
+  .dashboard-trend-control > label {
+    display: block;
+    min-width: 100%;
+    min-height: 19px;
+    margin: 0;
+    color: var(--white-60);
+    font-size: 13px;
+    font-weight: 650;
+    line-height: 1.4;
+    overflow: visible;
+    white-space: nowrap;
+  }
+  .dashboard-trend-controls .form-select {
+    display: block;
+    height: auto !important;
+    min-height: 48px !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box;
+    padding: 10px 52px 10px 16px !important;
+    font-size: 16px !important;
+    line-height: 1.5 !important;
+    text-align: left !important;
+    vertical-align: middle;
+    overflow: visible;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dashboard-trend-help { overflow-wrap: anywhere; }
+}
+
+/* On phones each line field gets its own full-width row. This prevents the
+   address from being squeezed by the port and action controls. */
+@media (max-width: 768px) {
+  .site-config-modal .upstream-line {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-areas: "enabled" "name" "address" "port" "latency" "actions" !important;
+    gap: 10px;
+    min-width: 0;
+  }
+  .site-config-modal .upstream-line-enabled { grid-area: enabled !important; }
+  .site-config-modal .upstream-line-field:nth-child(2) { grid-area: name !important; }
+  .site-config-modal .upstream-line-field:nth-child(3) { grid-area: address !important; min-width: 0; }
+  .site-config-modal .upstream-line-field:nth-child(4) { grid-area: port !important; min-width: 0; }
+  .site-config-modal .upstream-line-latency { grid-area: latency !important; }
+  .site-config-modal .upstream-line-actions { grid-area: actions !important; justify-content: flex-start; }
+  .site-config-modal .upstream-line-field,
+  .site-config-modal .upstream-line-field .form-input {
     width: 100%;
     min-width: 0;
   }

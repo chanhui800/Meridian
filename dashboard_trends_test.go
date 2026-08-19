@@ -106,6 +106,9 @@ func TestDashboardTrendRangesAndMonthlyTraffic(t *testing.T) {
 	if monthName != "month" || monthStart.Day() != 1 || monthStart.Hour() != 0 || !monthEnd.After(now) || monthBucket <= 0 {
 		t.Fatalf("month window = name %q start %s end %s bucket %s", monthName, monthStart, monthEnd, monthBucket)
 	}
+	if monthBucket > 30*time.Minute {
+		t.Fatalf("month bucket = %s, want at most 30 minutes for precise peaks", monthBucket)
+	}
 	monthTrend, err := app.pm.dashboardTrends(nil, "month")
 	if err != nil {
 		t.Fatalf("month dashboardTrends: %v", err)

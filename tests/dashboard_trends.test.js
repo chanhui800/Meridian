@@ -37,3 +37,12 @@ test('dashboard realtime trend keeps historical points after a page refresh', ()
   assert.match(dashboardSource, /historicalPoints\.slice\(0, offset\)\.concat\(realtimePoints\)/);
   assert.match(dashboardSource, /if \(!realtimePoints\.length \|\| !historicalPoints\.length\) return realtimePoints\.length \? realtimePoints : historicalPoints/);
 });
+
+test('dashboard trend rendering clamps invalid values and bounds smoothing controls', () => {
+  assert.match(dashboardSource, /function dashboardSafeNonNegative\(value\)/);
+  assert.match(dashboardSource, /Number\.isFinite\(numeric\)/);
+  assert.match(dashboardSource, /Math\.max\(minY, Math\.min\(maxY/);
+  assert.match(dashboardSource, /if \(liveMap\.size > 0\) appendRealtimeTrendSample/);
+  assert.match(dashboardSource, /const unit = units\[i\] \|\| units\[0\]/);
+  assert.match(dashboardSource, /bucketSeconds > 0 && bucketSeconds < 3600/);
+});

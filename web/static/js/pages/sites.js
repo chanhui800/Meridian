@@ -962,7 +962,10 @@ function siteAccessAddress(site, capabilities) {
 		return `${protocol}://${host}:${Number(site.listen_port) || ''}`;
 	}
 	if (mode === 'path') {
-		const base = String(capabilities && capabilities.panel_access_url || '').replace(/\/$/, '') || `${protocol}://${locationObject.host || locationObject.hostname || '127.0.0.1'}`;
+		// Path ingress is reached through the same public origin the operator is
+		// currently using. The configured panel listener may be loopback or an
+		// internal reverse-proxy upstream and must never leak into the address.
+		const base = `${locationObject.protocol || `${protocol}:`}//${locationObject.host || locationObject.hostname || '127.0.0.1'}`.replace(/\/$/, '');
 		const prefix = String(site.path_prefix || '').trim().replace(/^\/+|\/+$/g, '');
 		return prefix ? `${base}/${prefix}/` : '';
 	}

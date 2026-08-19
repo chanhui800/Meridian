@@ -37,7 +37,7 @@ func (a *App) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		"status":        health.Status,
 		"http_status":   health.Probe.HTTPStatus,
 		"latency_ms":    health.LatencyMs,
-		"effective_url": health.Probe.URL,
+		"effective_url": displayTargetURL(health.Probe.URL),
 		"error":         health.Error,
 	})
 }

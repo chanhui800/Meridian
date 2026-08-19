@@ -190,7 +190,7 @@ func (d *DB) migrateOnce() error {
 		ui_mode TEXT NOT NULL DEFAULT 'novice', ui_radius INTEGER NOT NULL DEFAULT 10,
 		traffic_billing_mode TEXT NOT NULL DEFAULT 'bidirectional', traffic_reset_day INTEGER NOT NULL DEFAULT 1,
 		probe_timeout_ms INTEGER NOT NULL DEFAULT 5000, ping_cache_minutes INTEGER NOT NULL DEFAULT 10,
-		schedule_timezone_offset INTEGER NOT NULL DEFAULT 480,
+		schedule_timezone_offset INTEGER NOT NULL DEFAULT 480, schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
 		log_enabled INTEGER NOT NULL DEFAULT 1, log_level TEXT NOT NULL DEFAULT 'info',
 		log_retention_days INTEGER NOT NULL DEFAULT 30, log_write_delay_minutes INTEGER NOT NULL DEFAULT 0,
 		log_flush_threshold INTEGER NOT NULL DEFAULT 1, log_batch_size INTEGER NOT NULL DEFAULT 50,
@@ -274,6 +274,7 @@ func (d *DB) migrateOnce() error {
 	for _, migration := range []struct{ column, sql string }{
 		{"traffic_billing_mode", "ALTER TABLE system_settings ADD COLUMN traffic_billing_mode TEXT NOT NULL DEFAULT 'bidirectional'"},
 		{"traffic_reset_day", "ALTER TABLE system_settings ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 1"},
+		{"schedule_timezone", "ALTER TABLE system_settings ADD COLUMN schedule_timezone TEXT NOT NULL DEFAULT ''"},
 		{"log_write_playback", "ALTER TABLE system_settings ADD COLUMN log_write_playback INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_video", "ALTER TABLE system_settings ADD COLUMN log_write_video INTEGER NOT NULL DEFAULT 1"},
 		{"log_write_api", "ALTER TABLE system_settings ADD COLUMN log_write_api INTEGER NOT NULL DEFAULT 1"},
@@ -303,6 +304,19 @@ func (d *DB) migrateOnce() error {
 			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
 				return err
 			}
+		}
+	}
+	// Older databases only stored a numeric offset. Select the closest
+	// canonical IANA zone once and retain the offset field for API clients
+	// that still send/consume it.
+	var legacyOffset int
+	var timezoneName string
+	if err := conn.QueryRowContext(ctx, "SELECT schedule_timezone_offset, schedule_timezone FROM system_settings WHERE id=1").Scan(&legacyOffset, &timezoneName); err != nil {
+		return err
+	}
+	if !validTimezoneName(timezoneName) {
+		if _, err := conn.ExecContext(ctx, "UPDATE system_settings SET schedule_timezone=? WHERE id=1", timezoneNameForOffset(legacyOffset)); err != nil {
+			return err
 		}
 	}
 	for _, migration := range []struct{ column, sql string }{
