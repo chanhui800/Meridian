@@ -6161,6 +6161,30 @@ body.modal-open { overflow-y: hidden !important; }
     width: 100% !important;
     min-width: 0 !important;
   }
+}@media (max-width: 768px) {
+  .dashboard-trend-controls {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .dashboard-trend-controls .form-select {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+  }
+  .site-card .site-upstream-row {
+    display: block;
+  }
+  .site-card .site-upstream-row > .site-row-label {
+    display: block;
+    margin-bottom: 6px;
+  }
+  .site-card .site-upstream-row > .mono {
+    display: block;
+    width: 100%;
+    max-width: 100% !important;
+    overflow-wrap: anywhere;
+    text-align: left;
+    white-space: normal;
+  }
 }
 
 

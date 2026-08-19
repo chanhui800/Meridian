@@ -65,7 +65,7 @@ async function loadSites() {
 		    <span class="site-row-label">访问地址</span>
 		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" title="显示访问地址">◉</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path></svg></button></span>
 		  </div>
-          <div class="site-row">
+          <div class="site-row site-upstream-row">
             <span class="site-row-label">主回源地址</span>
             <span class="mono">${esc(s.target_url)}</span>
           </div>
