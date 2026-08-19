@@ -6147,13 +6147,23 @@ body.modal-open { overflow-y: hidden !important; }
   .site-config-modal .upstream-line-port { width: 100%; min-width: 0; }
 }
 
+.dashboard-trend-controls .form-select {
+  width: 220px !important;
+  min-width: 220px !important;
+  padding-right: 52px;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
 @media (max-width: 600px) {
-  .dashboard-trend-controls {
-    grid-template-columns: minmax(0, 1fr);
+  .dashboard-trend-controls .form-select {
+    width: 100% !important;
+    min-width: 0 !important;
   }
 }
 
-@media (max-width: 768px) {
+
   /* Keep the mobile editor's line-list surface and every line field visible. */
   .site-config-modal .upstream-lines-card {
     display: block !important;
