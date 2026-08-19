@@ -5871,13 +5871,19 @@ html[data-theme="light"] .request-log-table-card { background: rgba(255,255,255,
    compact controls pill-shaped. */
 :root,
 html[data-theme="light"] {
+  --radius: 24px;
   --radius-lg: 28px;
   --ui-radius: 24px;
 }
 
+/* HTML's hidden attribute must win over the dense form display rules below. */
+[hidden] { display: none !important; }
+
 .site-cache-rules-group {
+  display: block !important;
   grid-area: cache-rules;
   min-width: 0;
+  min-height: 0 !important;
   margin: 0;
   padding: 0;
   border: 1px solid var(--glass-border);
@@ -5900,7 +5906,39 @@ html[data-theme="light"] {
 .site-cache-rules-body .form-help { margin-top: 6px; font-size: .72rem; line-height: 1.45; }
 .site-cache-rules-group[hidden] { display: none !important; }
 
+@media (min-width: 769px) {
+  .site-config-modal .upstream-lines-card { overflow-x: auto; }
+  .site-config-modal .upstream-line-labels,
+  .site-config-modal .upstream-line {
+    min-width: 780px;
+    grid-template-columns: 54px minmax(150px, 1fr) minmax(280px, 2fr) 88px 72px 124px;
+    gap: 10px;
+  }
+  .site-config-modal .upstream-line-labels { white-space: nowrap; }
+}
+
+.telegram-report-card,
+.telegram-report-form-grid,
+.telegram-field,
+.telegram-field input,
+.telegram-field select {
+  min-width: 0;
+  max-width: 100%;
+}
+.telegram-field input[type="time"] {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0 !important;
+  max-width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
 @media (max-width: 768px) {
+  .site-config-modal .upstream-lines-card { overflow-x: visible; }
+  .site-config-modal .upstream-line { min-width: 0; }
+  .site-config-modal .upstream-line-labels { min-width: 0; }
   .site-cache-rules-group { margin-bottom: 16px; }
   .site-cache-rules-body { padding: 10px; }
   .site-cache-rules-body textarea { min-height: 88px; }
