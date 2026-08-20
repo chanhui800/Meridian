@@ -31,7 +31,12 @@ func TestPanelACMETokenEncryptionRoundTripAndIsolation(t *testing.T) {
 	if _, err := decryptPanelACMETokenWithSecret(ciphertext, otherSecret); err == nil {
 		t.Fatal("ciphertext decrypted with a different JWT secret")
 	}
-	tampered := ciphertext[:len(ciphertext)-1] + "A"
+	tamperIndex := len(panelACMETokenCipherPrefix) + 1
+	replacement := byte('A')
+	if ciphertext[tamperIndex] == replacement {
+		replacement = 'B'
+	}
+	tampered := ciphertext[:tamperIndex] + string(replacement) + ciphertext[tamperIndex+1:]
 	if _, err := decryptPanelACMETokenWithSecret(tampered, secret); err == nil {
 		t.Fatal("tampered ciphertext was accepted")
 	}
