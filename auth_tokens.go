@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -111,6 +112,30 @@ func validateToken(token string) (int64, string, error) {
 
 func invalidateAllSessions() {
 	sessionGeneration.Add(1)
+}
+
+func setSessionGeneration(value uint64) {
+	if value == 0 {
+		value = 1
+	}
+	sessionGeneration.Store(value)
+}
+
+func validateCredentialKeySeparation(credential []byte, configured bool, effectiveJWT, dynamicKey, upstreamKey []byte) error {
+	if !configured || len(credential) == 0 {
+		return nil
+	}
+	if len(effectiveJWT) > 0 && subtle.ConstantTimeCompare(credential, effectiveJWT) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from JWT_SECRET")
+	}
+	digest := sha256.Sum256(credential)
+	if len(dynamicKey) == len(digest) && subtle.ConstantTimeCompare(digest[:], dynamicKey) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY")
+	}
+	if len(upstreamKey) == len(digest) && subtle.ConstantTimeCompare(digest[:], upstreamKey) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from UPSTREAM_HEADER_KEY")
+	}
+	return nil
 }
 
 var jwtHeaderEncoded = base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))

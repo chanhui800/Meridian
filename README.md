@@ -56,11 +56,11 @@ Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进�
 bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh)
 ```
 
-脚本会进入四项菜单：安装、更新、修改管理员密码、卸载。首次安装从最新 GitHub Release 下载二进制并强制校验 `SHA256SUMS`；Linux systemd 部署默认使用独立的非 root 用户。
+脚本会进入四项菜单：安装、更新、修改管理员密码、卸载。首次安装从最新 GitHub Release 下载二进制，校验 `SHA256SUMS` 及其 Sigstore/cosign 签名（旧版 Release 仅保留 SHA-256 兼容校验）；Linux systemd 部署默认使用独立的非 root 用户。
 
 安装完成后：
 
-1. 未配置域名时访问 `http://服务器IP:9090`；配置域名后访问对应的 HTTPS 地址。
+1. 未配置域名时，安装器默认只绑定 `127.0.0.1`，请通过 HTTPS 反向代理访问；配置域名后访问对应的 HTTPS 地址。若确需临时直接暴露明文 HTTP，必须显式设置 `ALLOW_INSECURE_HTTP=true`，不建议用于生产环境。
 2. 输入 1–64 个 UTF-8 字节的管理员账号、12–72 个 UTF-8 字节的密码并再次确认，以及安装时显示的初始化令牌。
 3. 创建站点并选择入口模式、回源和播放策略。
 
@@ -105,16 +105,18 @@ umask 077
 JWT_SECRET="$(openssl rand -hex 32)"
 UPSTREAM_HEADER_KEY="$(openssl rand -hex 32)"
 DYNAMIC_ROUTE_KEY="$(openssl rand -hex 32)"
+MERIDIAN_SECRET_KEY="$(openssl rand -hex 32)"
 SETUP_TOKEN="$(openssl rand -hex 32)"
 cat > .env <<EOF
 JWT_SECRET=$JWT_SECRET
 UPSTREAM_HEADER_KEY=$UPSTREAM_HEADER_KEY
 DYNAMIC_ROUTE_KEY=$DYNAMIC_ROUTE_KEY
+MERIDIAN_SECRET_KEY=$MERIDIAN_SECRET_KEY
 SETUP_TOKEN=$SETUP_TOKEN
 EOF
 chmod 600 .env
 printf '首次初始化令牌：%s\n' "$SETUP_TOKEN"
-unset JWT_SECRET UPSTREAM_HEADER_KEY DYNAMIC_ROUTE_KEY SETUP_TOKEN
+unset JWT_SECRET UPSTREAM_HEADER_KEY DYNAMIC_ROUTE_KEY MERIDIAN_SECRET_KEY SETUP_TOKEN
 ```
 
 创建 `compose.yaml`：
@@ -214,7 +216,7 @@ export SETUP_TOKEN="$(openssl rand -hex 32)"
 |---|---|---|
 | `PORT` | `9090` | 管理面板和共享 Host 入口的端口 |
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
-| `PANEL_BIND_ADDR` | `0.0.0.0` | 面板与共享入口的绑定地址；同机反代推荐 `127.0.0.1` |
+| `PANEL_BIND_ADDR` | `127.0.0.1` | 面板与共享入口的绑定地址；公网绑定必须启用 HTTPS，或显式设置 `ALLOW_INSECURE_HTTP=true` |
 | `PANEL_DOMAIN` | 空 | 管理面板唯一允许域名；设置后未知 Host 返回 `421` |
 | `TRUSTED_PROXY_CIDRS` | 空 | 可信入口代理的精确 CIDR 列表，逗号分隔 |
 | `JWT_SECRET` | 启动时随机 | 至少 32 字节；生产环境必须固定，否则重启后所有会话失效 |
@@ -222,6 +224,7 @@ export SETUP_TOKEN="$(openssl rand -hex 32)"
 | `MERIDIAN_SECRET_KEY` | 空 | 至少 32 字节；独立加密 Cloudflare/Telegram 凭据，生产环境建议固定 |
 | `DYNAMIC_ROUTE_KEY` | 空 | 至少 32 字节；签发自动发现 capability |
 | `SETUP_TOKEN` | 无 | 首次创建管理员前必须提供的一次性初始化凭据 |
+| `ALLOW_INSECURE_HTTP` | `false` | 仅用于明确接受风险的公网明文 HTTP 兼容部署；默认拒绝 |
 
 四个长期密钥必须两两不同，并与 SQLite 数据一起备份。丢失 `UPSTREAM_HEADER_KEY` 会让已有加密 Header 无法解密；丢失 `MERIDIAN_SECRET_KEY` 会让已保存的 Cloudflare/Telegram 凭据无法解密；轮换 `DYNAMIC_ROUTE_KEY` 会让正在使用的 capability 立即失效。一键安装器会生成并维护这些值。
 
@@ -326,7 +329,7 @@ Meridian v1 专注于单管理员、轻量部署：
 
 - 仅支持一个管理员，不提供多用户或角色权限。
 - 暂无审计日志和 Webhook 通知；Telegram 日报可在全局设置中配置。
-- 管理面板不终止 TLS；公网部署必须放在 HTTPS 反向代理之后。
+- 管理面板支持配置 TLS；未启用 TLS 时默认只监听回环地址，公网明文 HTTP 必须显式设置 `ALLOW_INSECURE_HTTP=true`。
 - 共享入口只支持精确 Host，不支持通配符或 URL 路径前缀。
 - TLS 诊断不负责证书签发和续期；UA 诊断不是远端回显验证。
 

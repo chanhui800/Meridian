@@ -309,7 +309,7 @@ func (d *DB) telegramReportSettingsView() (telegramReportSettingsView, telegramR
 	return telegramReportSettingsView{
 		Enabled: stored.Enabled, Configured: stored.Configured, ScheduleTime: stored.ScheduleTime,
 		Frequency: stored.Frequency, Weekday: stored.Weekday, LastSentKey: stored.LastSentKey,
-		Timezone: d.currentSystemSettings().ScheduleTimezone,
+		Timezone:     d.currentSystemSettings().ScheduleTimezone,
 		TimezoneName: d.currentSystemSettings().ScheduleTimezoneName,
 	}, stored, nil
 }
@@ -324,7 +324,7 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if err := d.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(enabled),0) FROM sites`).Scan(&stats.SiteCount, &stats.RunningSiteCount); err != nil {
 		return stats, err
 	}
-	if err := d.db.QueryRow(`SELECT COUNT(DISTINCT client_ip), COALESCE(SUM(CASE WHEN resource_category='video' THEN 1 ELSE 0 END),0) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.UniqueClients, &stats.VideoRequests); err != nil {
+	if err := d.db.QueryRow(`SELECT COUNT(DISTINCT client_ip), COALESCE(SUM(CASE WHEN resource_category IN ('video','stream','manifest','segment') THEN 1 ELSE 0 END),0) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.UniqueClients, &stats.VideoRequests); err != nil {
 		return stats, err
 	}
 	if err := d.db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.Requests); err != nil {
@@ -333,9 +333,13 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if err := d.db.QueryRow(`SELECT COALESCE(MAX(active_clients),0) FROM (SELECT COUNT(DISTINCT client_ip) AS active_clients FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? GROUP BY CAST(recorded_at_ms/60000 AS INTEGER))`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.ActivePeak); err != nil {
 		return stats, err
 	}
+	trafficExpression := "bytes_in + bytes_out"
+	if trafficBillingModeLabel(settings.TrafficBillingMode) == trafficBillingModeOutbound {
+		trafficExpression = "bytes_out"
+	}
 	trafficSum := func(start time.Time) (int64, error) {
 		var value sql.NullInt64
-		err := d.db.QueryRow(`SELECT SUM(bytes_in + bytes_out) FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?`, trafficMinuteBucket(start), trafficMinuteBucket(tomorrow)).Scan(&value)
+		err := d.db.QueryRow("SELECT SUM("+trafficExpression+") FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?", trafficMinuteBucket(start), trafficMinuteBucket(tomorrow)).Scan(&value)
 		if err != nil || !value.Valid {
 			return 0, err
 		}
@@ -351,7 +355,7 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if stats.ThirtyDayTraffic, err = trafficSum(todayStart.AddDate(0, 0, -29)); err != nil {
 		return stats, err
 	}
-	if err := d.db.QueryRow(`SELECT COALESCE(SUM(bytes_in + bytes_out),0) FROM traffic_logs`).Scan(&stats.HistoryTraffic); err != nil {
+	if err := d.db.QueryRow("SELECT COALESCE(SUM(" + trafficExpression + "),0) FROM traffic_logs").Scan(&stats.HistoryTraffic); err != nil {
 		return stats, err
 	}
 
@@ -374,7 +378,7 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 		return stats, err
 	}
 	requestRows.Close()
-	trafficRows, err := d.db.Query(`SELECT traffic_logs.site_id, COALESCE(NULLIF(sites.name,''), '站点 ' || traffic_logs.site_id), COALESCE(SUM(traffic_logs.bytes_in + traffic_logs.bytes_out),0) FROM traffic_logs LEFT JOIN sites ON sites.id=traffic_logs.site_id WHERE traffic_logs.recorded_at>=? AND traffic_logs.recorded_at<? GROUP BY traffic_logs.site_id, sites.name`, trafficMinuteBucket(todayStart), trafficMinuteBucket(tomorrow))
+	trafficRows, err := d.db.Query("SELECT traffic_logs.site_id, COALESCE(NULLIF(sites.name,''), '站点 ' || traffic_logs.site_id), COALESCE(SUM(traffic_logs."+trafficExpression+"),0) FROM traffic_logs LEFT JOIN sites ON sites.id=traffic_logs.site_id WHERE traffic_logs.recorded_at>=? AND traffic_logs.recorded_at<? GROUP BY traffic_logs.site_id, sites.name", trafficMinuteBucket(todayStart), trafficMinuteBucket(tomorrow))
 	if err != nil {
 		return stats, err
 	}
