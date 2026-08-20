@@ -7,14 +7,14 @@
 
 Meridian 是一个轻量的 Emby / Jellyfin 多节点反向代理面板。它把站点入口、自动回源、线路切换、流量统计、请求日志、TLS 和备份恢复放在同一个面板里，安装后即可添加站点使用。
 
-本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，界面与部分交互参考了 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)。当前正式版本为 `v1.8.43`，基于正式版 `v1.8.42`。
+本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，界面与部分交互参考了 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)。当前正式版本为 `v1.8.44`，基于正式版 `v1.8.43`。
 
 ## 这次更新了什么
 
-`v1.8.43` 主要修复移动端趋势图触摸边界交互：
+`v1.8.44` 修复 Emby/Jellyfin Base URL 拼接动态播放路由导致的 404，并调整日志筛选选项的居中与边距。
 
-- 手指拖出趋势图范围后，立即关闭悬浮窗和准线，不再停留在图表边缘跟随。
-- 手指重新进入趋势图后恢复数据点选中和悬浮窗跟随；鼠标交互保持不变。
+- `/emby/_meridian/d/` 与 `/jellyfin/_meridian/d/` 会安全归一为 Meridian 保留的动态播放路由，普通 API 路径保持不变。
+- 日志页筛选模式和状态筛选的选项增加均衡留白，文字在按钮内水平、垂直居中。
 
 ## 主要功能
 
