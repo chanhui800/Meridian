@@ -79,6 +79,7 @@ func (d *DB) migrateOnce() error {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		username TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
+		session_version INTEGER NOT NULL DEFAULT 1,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 		CREATE TABLE IF NOT EXISTS sites (
@@ -208,6 +209,15 @@ func (d *DB) migrateOnce() error {
 	}
 	if err := validateDynamicObservationSchema(ctx, conn); err != nil {
 		return err
+	}
+	var hasSessionVersion int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='session_version'").Scan(&hasSessionVersion); err != nil {
+		return err
+	}
+	if hasSessionVersion == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return err
+		}
 	}
 
 	for _, migration := range []struct {

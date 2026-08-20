@@ -41,25 +41,28 @@ func trafficBillingModeLabel(mode string) string {
 }
 
 // trafficCycleStart returns the start of the active billing cycle in the
-// server's local timezone. Reset days beyond a month's length use that
+// configured panel scheduling timezone. Reset days beyond a month's length use that
 // month's last day (for example, day 31 becomes February 28/29).
-func trafficCycleStart(now time.Time, resetDay int) time.Time {
+func trafficCycleStart(now time.Time, resetDay int, location *time.Location) time.Time {
 	if resetDay == 0 {
 		return time.Time{}
 	}
 	if resetDay < 0 || resetDay > 31 {
 		resetDay = 1
 	}
-	local := now.In(time.Local)
-	monthStart := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, time.Local)
+	if location == nil {
+		location = time.Local
+	}
+	local := now.In(location)
+	monthStart := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, location)
 	dayInMonth := func(month time.Time) int {
-		return time.Date(month.Year(), month.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
+		return time.Date(month.Year(), month.Month()+1, 0, 0, 0, 0, 0, location).Day()
 	}
 	currentDay := resetDay
 	if currentDay > dayInMonth(monthStart) {
 		currentDay = dayInMonth(monthStart)
 	}
-	candidate := time.Date(monthStart.Year(), monthStart.Month(), currentDay, 0, 0, 0, 0, time.Local)
+	candidate := time.Date(monthStart.Year(), monthStart.Month(), currentDay, 0, 0, 0, 0, location)
 	if !local.Before(candidate) {
 		return candidate
 	}
@@ -68,7 +71,7 @@ func trafficCycleStart(now time.Time, resetDay int) time.Time {
 	if previousDay > dayInMonth(previousMonth) {
 		previousDay = dayInMonth(previousMonth)
 	}
-	return time.Date(previousMonth.Year(), previousMonth.Month(), previousDay, 0, 0, 0, 0, time.Local)
+	return time.Date(previousMonth.Year(), previousMonth.Month(), previousDay, 0, 0, 0, 0, location)
 }
 
 func siteTrafficDirections(site Site) (int64, int64) {

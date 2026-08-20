@@ -62,17 +62,18 @@ func validateAdminUsername(username string) error {
 }
 
 type AdminAccount struct {
-	Username  string `json:"username"`
-	Role      string `json:"role"`
-	CreatedAt string `json:"created_at"`
+	Username       string `json:"username"`
+	Role           string `json:"role"`
+	CreatedAt      string `json:"created_at"`
+	SessionVersion int64  `json:"-"`
 }
 
 func (d *DB) AdminAccountByID(userID int64) (AdminAccount, error) {
 	var account AdminAccount
 	err := d.db.QueryRow(`
-		SELECT username, COALESCE(CAST(created_at AS TEXT), '')
+		SELECT username, COALESCE(CAST(created_at AS TEXT), ''), session_version
 		FROM users
-		WHERE id=?`, userID).Scan(&account.Username, &account.CreatedAt)
+		WHERE id=?`, userID).Scan(&account.Username, &account.CreatedAt, &account.SessionVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminAccount{}, errAdminNotConfigured
 	}
@@ -81,6 +82,16 @@ func (d *DB) AdminAccountByID(userID int64) (AdminAccount, error) {
 	}
 	account.Role = "管理员"
 	return account, nil
+}
+
+func (d *DB) AdminSessionState(userID int64) (string, int64, error) {
+	var username string
+	var version int64
+	err := d.db.QueryRow("SELECT username, session_version FROM users WHERE id=?", userID).Scan(&username, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, errAdminNotConfigured
+	}
+	return username, version, err
 }
 
 func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPassword string) (AdminAccount, error) {
@@ -98,10 +109,11 @@ func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPass
 	}
 
 	var currentUsername, currentHash, createdAt string
+	var currentSessionVersion int64
 	err := d.db.QueryRow(`
-		SELECT username, password_hash, COALESCE(CAST(created_at AS TEXT), '')
+		SELECT username, password_hash, COALESCE(CAST(created_at AS TEXT), ''), session_version
 		FROM users
-		WHERE id=?`, userID).Scan(&currentUsername, &currentHash, &createdAt)
+		WHERE id=?`, userID).Scan(&currentUsername, &currentHash, &createdAt, &currentSessionVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminAccount{}, errAdminNotConfigured
 	}
@@ -125,8 +137,8 @@ func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPass
 	}
 	result, err := d.db.Exec(`
 		UPDATE users
-		SET username=?, password_hash=?
-		WHERE id=? AND username=? AND password_hash=?`, username, nextHash, userID, currentUsername, currentHash)
+		SET username=?, password_hash=?, session_version=session_version+1
+		WHERE id=? AND username=? AND password_hash=? AND session_version=?`, username, nextHash, userID, currentUsername, currentHash, currentSessionVersion)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
 			return AdminAccount{}, errInvalidAdminUsername
@@ -140,7 +152,7 @@ func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPass
 	if rows != 1 {
 		return AdminAccount{}, errors.New("administrator account changed concurrently")
 	}
-	return AdminAccount{Username: username, Role: "管理员", CreatedAt: createdAt}, nil
+	return AdminAccount{Username: username, Role: "管理员", CreatedAt: createdAt, SessionVersion: currentSessionVersion + 1}, nil
 }
 
 func (d *DB) CreateInitialUser(username, password string) (int64, error) {
@@ -175,20 +187,26 @@ var invalidUserPasswordHash = func() []byte {
 }()
 
 func (d *DB) VerifyUser(username, password string) (int64, error) {
+	id, _, err := d.VerifyUserSession(username, password)
+	return id, err
+}
+
+func (d *DB) VerifyUserSession(username, password string) (int64, int64, error) {
 	var id int64
+	var sessionVersion int64
 	var hash string
-	err := d.db.QueryRow("SELECT id, password_hash FROM users WHERE username=?", username).Scan(&id, &hash)
+	err := d.db.QueryRow("SELECT id, password_hash, session_version FROM users WHERE username=?", username).Scan(&id, &hash, &sessionVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = bcrypt.CompareHashAndPassword(invalidUserPasswordHash, []byte(password))
-		return 0, errInvalidCredentials
+		return 0, 0, errInvalidCredentials
 	}
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
-		return 0, errInvalidCredentials
+		return 0, 0, errInvalidCredentials
 	}
-	return id, nil
+	return id, sessionVersion, nil
 }
 
 func (d *DB) ResetAdminPassword(password string) error {
@@ -217,7 +235,7 @@ func (d *DB) ResetAdminPassword(password string) error {
 		return errMultipleAdmins
 	}
 
-	result, err := tx.Exec("UPDATE users SET password_hash=?", string(hash))
+	result, err := tx.Exec("UPDATE users SET password_hash=?, session_version=session_version+1", string(hash))
 	if err != nil {
 		return err
 	}

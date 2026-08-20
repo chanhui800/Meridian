@@ -359,14 +359,6 @@ func playbackInfoField(object map[string]any, field string) (string, any, bool, 
 	return "", nil, false, nil
 }
 
-func rewritePlaybackInfoField(object map[string]any, field string, session *dynamicRewriteSession) error {
-	return rewritePlaybackInfoFieldAs(object, field, session, dynamicDiscoverySourcePlaybackInfo, dynamicCapabilityKindResource)
-}
-
-func rewritePlaybackInfoFieldAs(object map[string]any, field string, session *dynamicRewriteSession, source, kind string) error {
-	return rewritePlaybackInfoFieldAsWithRequiredHeaders(object, field, session, source, kind, nil)
-}
-
 func rewritePlaybackInfoFieldAsWithRequiredHeaders(object map[string]any, field string, session *dynamicRewriteSession, source, kind string, requiredHeaders []dynamicCapabilityHeaderClaim) error {
 	key, value, exists, err := playbackInfoField(object, field)
 	if err != nil || !exists || value == nil {

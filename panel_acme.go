@@ -695,7 +695,7 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 	request.Header.Set("Content-Type", "application/json")
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("Cloudflare DNS request failed: %w", err)
+		return nil, fmt.Errorf("cloudflare DNS request failed: %w", err)
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
@@ -704,10 +704,10 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 	}
 	var envelope cloudflareResponse
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return nil, errors.New("Cloudflare DNS returned an invalid response")
+		return nil, errors.New("cloudflare DNS returned an invalid response")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
-		message := "Cloudflare DNS request was rejected"
+		message := "cloudflare DNS request was rejected"
 		if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
 			message += ": " + strings.TrimSpace(envelope.Errors[0].Message)
 		}
@@ -725,7 +725,7 @@ func (c *cloudflareClient) findZone(ctx context.Context, zoneName string) (strin
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(result, &zones); err != nil || len(zones) == 0 || zones[0].ID == "" {
-		return "", fmt.Errorf("Cloudflare DNS zone %s was not found", zoneName)
+		return "", fmt.Errorf("cloudflare DNS zone %s was not found", zoneName)
 	}
 	return zones[0].ID, nil
 }
@@ -743,7 +743,7 @@ func (c *cloudflareClient) createTXTRecord(ctx context.Context, zoneID, name, va
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(result, &record); err != nil || record.ID == "" {
-		return "", errors.New("Cloudflare DNS did not return the challenge record ID")
+		return "", errors.New("cloudflare DNS did not return the challenge record ID")
 	}
 	return record.ID, nil
 }

@@ -349,16 +349,3 @@ func parseFailoverTargets(primary string, raw []string) ([]*url.URL, error) {
 	}
 	return targets, nil
 }
-
-func failoverTargetStrings(targets []*url.URL) []string {
-	if len(targets) <= 1 {
-		return []string{}
-	}
-	values := make([]string, 0, len(targets)-1)
-	for _, target := range targets[1:] {
-		if target != nil {
-			values = append(values, target.String())
-		}
-	}
-	return values
-}

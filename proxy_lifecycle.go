@@ -140,7 +140,7 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	inst.Site.TrafficUsedIn += in
 	inst.Site.TrafficUsedOut += out
 	settings := pm.database.currentSystemSettings()
-	cycleStart := trafficCycleStart(time.Now(), settings.TrafficResetDay)
+	cycleStart := trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
 	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
 	if inst.trafficCycleMode == cycleMode && inst.trafficCycleStart.Equal(cycleStart) {
 		inst.trafficCycleUsage += trafficBillableBytes(cycleMode, in, out)
@@ -154,7 +154,7 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 // traffic flushes while trafficMu prevents a swap/query race.
 func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.Time) (int64, error) {
 	settings := pm.database.currentSystemSettings()
-	cycleStart := trafficCycleStart(now, settings.TrafficResetDay)
+	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
 	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
 
 	inst.trafficMu.Lock()
@@ -325,7 +325,7 @@ func (pm *ProxyManager) LiveSiteTraffic(sites []Site) map[int64]SiteTraffic {
 	live := make(map[int64]SiteTraffic, len(sites))
 	settings := pm.database.currentSystemSettings()
 	billingMode := settings.TrafficBillingMode
-	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay), billingMode)
+	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)), billingMode)
 	if err != nil {
 		log.Printf("[traffic] failed to load monthly site totals: %v", err)
 		monthlyBySite = map[int64]int64{}
@@ -359,7 +359,7 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 	}
 	settings := pm.database.currentSystemSettings()
 	billingMode := settings.TrafficBillingMode
-	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay), billingMode)
+	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)), billingMode)
 	if err != nil {
 		return nil, err
 	}

@@ -86,10 +86,6 @@ type telegramReportStats struct {
 	}
 }
 
-func telegramReportKey() []byte {
-	return telegramReportKeyForSecret(jwtSecret)
-}
-
 func telegramReportKeyForSecret(secret []byte) []byte {
 	h := sha256.New()
 	_, _ = h.Write([]byte("meridian telegram report bot token v1\x00"))
@@ -303,7 +299,7 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if err := d.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(enabled),0) FROM sites`).Scan(&stats.SiteCount, &stats.RunningSiteCount); err != nil {
 		return stats, err
 	}
-	if err := d.db.QueryRow(`SELECT COUNT(DISTINCT client_ip), COALESCE(SUM(CASE WHEN resource_category='video' THEN 1 ELSE 0 END),0) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.UniqueClients, &stats.VideoRequests); err != nil {
+	if err := d.db.QueryRow(`SELECT COUNT(DISTINCT client_ip), COALESCE(SUM(CASE WHEN resource_category IN ('video','stream','manifest','segment') THEN 1 ELSE 0 END),0) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.UniqueClients, &stats.VideoRequests); err != nil {
 		return stats, err
 	}
 	if err := d.db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.Requests); err != nil {
@@ -336,7 +332,13 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	}
 	stats.HistoryTraffic = trafficBillableBytes(billingMode, historyIn, historyOut)
 
-	requestRows, err := d.db.Query(`SELECT site_id, site_name, COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? GROUP BY site_id, site_name`, todayStart.UnixMilli(), tomorrow.UnixMilli())
+	requestRows, err := d.db.Query(`SELECT request_logs.site_id,
+		COALESCE(NULLIF(sites.name,''), NULLIF(MAX(request_logs.site_name),''), '站点 ' || request_logs.site_id),
+		COUNT(*)
+		FROM request_logs
+		LEFT JOIN sites ON sites.id=request_logs.site_id
+		WHERE request_logs.recorded_at_ms>=? AND request_logs.recorded_at_ms<?
+		GROUP BY request_logs.site_id, sites.name`, todayStart.UnixMilli(), tomorrow.UnixMilli())
 	if err != nil {
 		return stats, err
 	}
@@ -481,7 +483,7 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 	botToken = strings.TrimSpace(botToken)
 	chatID = strings.TrimSpace(chatID)
 	if botToken == "" || chatID == "" {
-		return fmt.Errorf("Telegram bot token and chat ID are required")
+		return fmt.Errorf("telegram bot token and chat ID are required")
 	}
 	payload, err := json.Marshal(map[string]any{"chat_id": chatID, "text": message, "disable_web_page_preview": true})
 	if err != nil {
@@ -496,7 +498,7 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("Telegram request failed: %w", err)
+		return fmt.Errorf("telegram request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	var result struct {
@@ -505,7 +507,7 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 	}
 	_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !result.OK {
-		return fmt.Errorf("Telegram API rejected message: %s", result.Description)
+		return fmt.Errorf("telegram API rejected message: %s", result.Description)
 	}
 	return nil
 }
@@ -620,38 +622,58 @@ func (a *App) handleTelegramReport(w http.ResponseWriter, r *http.Request) {
 func runTelegramReportScheduler(ctx context.Context, db *DB) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	state := &telegramReportSchedulerState{}
 	for {
 		select {
 		case <-ticker.C:
-			view, stored, err := db.telegramReportSettingsView()
-			if err != nil || !view.Enabled || !view.Configured {
-				continue
-			}
-			key, due := telegramReportDue(time.Now(), view)
-			if !due || key == view.LastSentKey {
-				continue
-			}
-			token, err := decryptTelegramBotToken(stored.BotTokenCiphertext)
-			if err != nil {
-				log.Printf("[telegram-report] bot token decrypt failed: %v", err)
-				continue
-			}
-			stats, err := db.buildTelegramReportStats(time.Now())
-			if err != nil {
-				log.Printf("[telegram-report] build report failed: %v", err)
-				continue
-			}
-			if err := sendTelegramReport(ctx, token, stored.ChatID, buildTelegramReportMessage(stats)); err != nil {
-				log.Printf("[telegram-report] send failed: %v", err)
-				continue
-			}
-			if err := db.markTelegramReportSent(key); err != nil {
-				log.Printf("[telegram-report] mark sent failed: %v", err)
-				continue
-			}
-			log.Printf("[telegram-report] sent %s", key)
+			runTelegramReportSchedulerTick(ctx, db, state, time.Now(), sendTelegramReport)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+type telegramReportSchedulerState struct {
+	lastDeliveredFingerprint string
+}
+
+type telegramReportSender func(context.Context, string, string, string) error
+
+func runTelegramReportSchedulerTick(ctx context.Context, db *DB, state *telegramReportSchedulerState, now time.Time, send telegramReportSender) {
+	if db == nil || state == nil || send == nil {
+		return
+	}
+	view, stored, err := db.telegramReportSettingsView()
+	if err != nil || !view.Enabled || !view.Configured {
+		return
+	}
+	key, due := telegramReportDue(now, view)
+	fingerprint := strings.Join([]string{key, view.ScheduleTime, view.Frequency, strconv.Itoa(view.Weekday), stored.ChatID, stored.BotTokenCiphertext}, "\x00")
+	if !due || key == view.LastSentKey || fingerprint == state.lastDeliveredFingerprint {
+		return
+	}
+	token, err := decryptTelegramBotToken(stored.BotTokenCiphertext)
+	if err != nil {
+		log.Printf("[telegram-report] bot token decrypt failed: %v", err)
+		return
+	}
+	stats, err := db.buildTelegramReportStats(now)
+	if err != nil {
+		log.Printf("[telegram-report] build report failed: %v", err)
+		return
+	}
+	if err := send(ctx, token, stored.ChatID, buildTelegramReportMessage(stats)); err != nil {
+		log.Printf("[telegram-report] send failed: %v", err)
+		return
+	}
+	// Remember successful external delivery before persisting the marker. This
+	// prevents a read-only/full SQLite database from causing a notification
+	// storm every 15 seconds. A configuration change produces a new fingerprint
+	// and intentionally rearms the current schedule period.
+	state.lastDeliveredFingerprint = fingerprint
+	if err := db.markTelegramReportSent(key); err != nil {
+		log.Printf("[telegram-report] mark sent failed after delivery; suppressing duplicate in this process: %v", err)
+		return
+	}
+	log.Printf("[telegram-report] sent %s", key)
 }

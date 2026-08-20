@@ -339,7 +339,11 @@ func TestDynamicProfilesEndpointIsAuthenticatedAndDoesNotDiscloseKey(t *testing.
 		t.Fatalf("unauthenticated status=%d, want 401", unauthenticated.Code)
 	}
 
-	token, err := generateToken(1, "admin")
+	userID, err := app.db.CreateInitialUser("admin", "correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := generateTokenWithVersion(userID, "admin", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

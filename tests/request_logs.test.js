@@ -236,6 +236,19 @@ test('request log UA width slider stays compact', () => {
   assert.match(source, /\.request-log-ua-width-control input\[type="range"\]\s*\{[^}]*max-width:\s*220px;/s);
 });
 
+test('global log settings expose only runtime-backed storage controls', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'global-settings.js'),
+    'utf8',
+  );
+  for (const control of ['setting-log-retention', 'setting-log-batch', 'setting-log-retries', 'setting-log-backoff']) {
+    assert.match(source, new RegExp(control));
+  }
+  for (const retired of ['setting-log-delay', 'setting-log-threshold', 'setting-log-lease', 'log-search-choice', 'FTS 分词查询']) {
+    assert.doesNotMatch(source, new RegExp(retired));
+  }
+});
+
 test('request log filter chips keep centered labels and balanced spacing', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'),

@@ -1424,6 +1424,7 @@ async function showSiteModal(site) {
     <div class="form-group">
       <label>流量额度 (GB, 0=不限)</label>
       <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
+      <div class="form-help">达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div>
     </div>
     <div class="form-group">
       <label>单连接限速 (Mbps, 0=不限)</label>

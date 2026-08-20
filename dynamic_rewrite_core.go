@@ -216,10 +216,6 @@ func normalizeTrustedCapabilityURL(value string) (*url.URL, error) {
 	return target, nil
 }
 
-func (s *dynamicRewriteSession) rewriteAgainst(raw string, base *url.URL) (string, error) {
-	return s.rewriteAgainstKind(raw, base, dynamicCapabilityKindResource)
-}
-
 func (s *dynamicRewriteSession) rewriteAgainstKind(raw string, base *url.URL, kind string) (string, error) {
 	return s.rewriteAgainstSourceKind(raw, base, s.source, kind)
 }
@@ -821,11 +817,6 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 	session.publishLearnedPlaybackPaths()
 	installDynamicStructuredBody(resp, rewritten)
 	return nil
-}
-
-func validateDynamicJSONStructure(ctx context.Context, payload []byte, maxTokens int) error {
-	_, err := validateDynamicJSONStructureWithin(ctx, payload, maxTokens, globalDynamicMaxParseDepth)
-	return err
 }
 
 func validateDynamicJSONStructureWithin(ctx context.Context, payload []byte, maxTokens, maxDepth int) (int, error) {

@@ -286,20 +286,45 @@ func (a *App) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 }
 
 func sessionIdentity(r *http.Request) (int64, string, error) {
+	claims, err := sessionClaims(r)
+	if err != nil {
+		return 0, "", err
+	}
+	return claims.Sub, claims.Name, nil
+}
+
+func sessionClaims(r *http.Request) (sessionTokenClaims, error) {
 	for _, cookie := range r.Cookies() {
 		if cookie.Name != sessionCookieName || cookie.Value == "" {
 			continue
 		}
-		userID, username, err := validateToken(cookie.Value)
+		claims, err := validateTokenClaims(cookie.Value)
 		if err == nil {
 			// Accept the signed management value even if an untrusted sibling
 			// origin managed to prepend an invalid same-name cookie. The attacker
 			// cannot forge a second valid token, so this avoids cookie-shadowing
 			// logout/DoS without weakening authentication.
-			return userID, username, nil
+			return claims, nil
 		}
 	}
-	return 0, "", errors.New("missing or invalid session")
+	return sessionTokenClaims{}, errors.New("missing or invalid session")
+}
+
+func (a *App) authenticatedSessionIdentity(r *http.Request) (int64, string, error) {
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != sessionCookieName || cookie.Value == "" {
+			continue
+		}
+		claims, err := validateTokenClaims(cookie.Value)
+		if err != nil {
+			continue
+		}
+		username, version, err := a.db.AdminSessionState(claims.Sub)
+		if err == nil && version == claims.Version && username == claims.Name {
+			return claims.Sub, claims.Name, nil
+		}
+	}
+	return 0, "", errors.New("missing, invalid, or revoked session")
 }
 
 func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -314,7 +339,7 @@ func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, _, err := sessionIdentity(r); err != nil {
+		if _, _, err := a.authenticatedSessionIdentity(r); err != nil {
 			a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
 			return
 		}
@@ -379,7 +404,7 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.limiter().reset(client)
-	token, err := generateToken(id, req.Username)
+	token, err := generateTokenWithVersion(id, req.Username, 1)
 	if err != nil {
 		a.jsonErr(w, 500, err.Error())
 		return
@@ -417,7 +442,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
-	id, err := a.db.VerifyUser(username, req.Password)
+	id, sessionVersion, err := a.db.VerifyUserSession(username, req.Password)
 	if err != nil {
 		a.limiter().recordFailure(client, time.Now())
 		if errors.Is(err, errInvalidCredentials) {
@@ -428,7 +453,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.limiter().reset(client)
-	token, err := generateToken(id, username)
+	token, err := generateTokenWithVersion(id, username, sessionVersion)
 	if err != nil {
 		a.jsonErr(w, 500, err.Error())
 		return
@@ -465,7 +490,7 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 	username := ""
 	if !needsSetup {
-		if _, sessionUsername, err := sessionIdentity(r); err == nil {
+		if _, sessionUsername, err := a.authenticatedSessionIdentity(r); err == nil {
 			authenticated = true
 			username = sessionUsername
 		}
@@ -482,7 +507,7 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 
 // GET/PUT /api/account
 func (a *App) handleAccount(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := sessionIdentity(r)
+	userID, _, err := a.authenticatedSessionIdentity(r)
 	if err != nil {
 		a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
 		return
@@ -519,7 +544,7 @@ func (a *App) handleAccount(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		token, err := generateToken(userID, account.Username)
+		token, err := generateTokenWithVersion(userID, account.Username, account.SessionVersion)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "unable to refresh session")
 			return

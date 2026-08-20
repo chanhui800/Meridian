@@ -25,9 +25,7 @@ type PanelSettings struct {
 // concrete hosts such as movie.example.com.
 func normalizeWildcardDomain(value string) (string, error) {
 	value = strings.TrimSpace(value)
-	if strings.HasPrefix(value, "*.") {
-		value = strings.TrimPrefix(value, "*.")
-	}
+	value = strings.TrimPrefix(value, "*.")
 	return normalizeRouteDomain(value)
 }
 
@@ -307,18 +305,5 @@ func (d *DB) SetPanelTLSEnabled(enabled bool) error {
 		UPDATE panel_settings
 		SET tls_enabled=?, updated_at=CURRENT_TIMESTAMP
 		WHERE id=?`, sqliteBool(enabled), panelSettingsRowID)
-	return err
-}
-
-func (d *DB) restorePanelSettings(settings PanelSettings) error {
-	if d == nil || d.db == nil {
-		return errors.New("panel settings database is unavailable")
-	}
-	_, err := d.db.Exec(`
-		UPDATE panel_settings
-		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=?,
-			acme_email=?, acme_dns_provider=?, acme_token_ciphertext=?, acme_staging=?, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, sqliteBool(settings.TLSEnabled), sqliteBool(settings.Configured),
-		settings.ACMEEmail, settings.ACMEDNSProvider, settings.ACMETokenCiphertext, sqliteBool(settings.ACMEStaging), panelSettingsRowID)
 	return err
 }

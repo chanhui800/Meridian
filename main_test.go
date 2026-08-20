@@ -554,6 +554,51 @@ func TestOpenDBPreservesDataAndConnectionPragmas(t *testing.T) {
 	}
 }
 
+func TestMigrateAddsSessionVersionToLegacyUsersIdempotently(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-users.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy users database: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		INSERT INTO users (username, password_hash) VALUES ('legacy-admin', 'hash');
+	`); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy users database: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy users database: %v", err)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("migrate legacy users database: %v", err)
+	}
+	defer db.Close()
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := db.migrate(); err != nil {
+			t.Fatalf("repeat users migration %d: %v", attempt+1, err)
+		}
+	}
+
+	var columnCount, sessionVersion int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='session_version'").Scan(&columnCount); err != nil {
+		t.Fatalf("inspect session_version column: %v", err)
+	}
+	if err := db.db.QueryRow("SELECT session_version FROM users WHERE username='legacy-admin'").Scan(&sessionVersion); err != nil {
+		t.Fatalf("read migrated session version: %v", err)
+	}
+	if columnCount != 1 || sessionVersion != 1 {
+		t.Fatalf("session migration column=%d version=%d, want 1/1", columnCount, sessionVersion)
+	}
+}
+
 func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 	for _, withHourlyIndex := range []bool{false, true} {
 		t.Run(fmt.Sprintf("hourly index=%v", withHourlyIndex), func(t *testing.T) {
@@ -1879,6 +1924,58 @@ func TestUpdateAdminAccountRequiresCurrentPasswordAndPersistsChanges(t *testing.
 	}
 }
 
+func TestAccountUpdateRevokesPreviouslyIssuedSessions(t *testing.T) {
+	app := newTestApp(t)
+	const oldPassword = "correct horse battery staple"
+	const newPassword = "a newer correct horse battery staple"
+	userID, err := app.db.CreateInitialUser("admin", oldPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := generateTokenWithVersion(userID, "admin", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.UpdateAdminAccount(userID, oldPassword, "renamed-admin", newPassword); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/dashboard", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: oldToken})
+	response := httptest.NewRecorder()
+	app.authMiddleware(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("old session status = %d, want 401", response.Code)
+	}
+}
+
+func TestAuthenticatedSessionSkipsRevokedCookieShadowingCurrentSession(t *testing.T) {
+	app := newTestApp(t)
+	userID, err := app.db.CreateInitialUser("admin", "correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedToken, err := generateTokenWithVersion(userID, "admin", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := app.db.UpdateAdminAccount(userID, "correct horse battery staple", "admin", "a newer correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentToken, err := generateTokenWithVersion(userID, account.Username, account.SessionVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/dashboard", nil)
+	request.Header.Set("Cookie", sessionCookieName+"="+revokedToken+"; "+sessionCookieName+"="+currentToken)
+	response := httptest.NewRecorder()
+	app.authMiddleware(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("current session shadowed by revoked cookie: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestHandleAccountReadsAndUpdatesAuthenticatedAdministrator(t *testing.T) {
 	app := newTestApp(t)
 	const oldPassword = "correct horse battery staple"
@@ -2022,9 +2119,15 @@ func TestAdminResetPasswordCommandReadsPasswordOnlyFromStdin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
-	if _, err := db.CreateInitialUser("admin", "correct horse battery staple"); err != nil {
+	userID, err := db.CreateInitialUser("admin", "correct horse battery staple")
+	if err != nil {
 		db.Close()
 		t.Fatalf("CreateInitialUser: %v", err)
+	}
+	oldToken, err := generateTokenWithVersion(userID, "admin", 1)
+	if err != nil {
+		db.Close()
+		t.Fatalf("generate old session: %v", err)
 	}
 	db.Close()
 
@@ -2052,6 +2155,18 @@ func TestAdminResetPasswordCommandReadsPasswordOnlyFromStdin(t *testing.T) {
 	defer verifyDB.Close()
 	if _, err := verifyDB.VerifyUser("admin", newPassword); err != nil {
 		t.Fatalf("new password rejected: %v", err)
+	}
+	_, sessionVersion, err := verifyDB.AdminSessionState(userID)
+	if err != nil || sessionVersion != 2 {
+		t.Fatalf("reset session version = %d, err=%v, want 2", sessionVersion, err)
+	}
+	app := &App{db: verifyDB}
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/dashboard", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: oldToken})
+	response := httptest.NewRecorder()
+	app.authMiddleware(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-reset session status=%d, want 401", response.Code)
 	}
 }
 
@@ -2095,6 +2210,25 @@ func TestJWTSecretRotationInvalidatesExistingToken(t *testing.T) {
 	jwtSecret = []byte("new-test-signing-secret-000000000000")
 	if _, _, err := validateToken(token); err == nil {
 		t.Fatal("token signed before JWT secret rotation remained valid")
+	}
+}
+
+func TestLegacyTokenWithoutSessionVersionMapsToVersionOne(t *testing.T) {
+	payload, err := json.Marshal(struct {
+		Sub  int64  `json:"sub"`
+		Name string `json:"name"`
+		Exp  int64  `json:"exp"`
+	}{Sub: 7, Name: "admin", Exp: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingInput := jwtHeaderEncoded + "." + base64url(payload)
+	claims, err := validateTokenClaims(signingInput + "." + hmacSHA256(signingInput, jwtSecret))
+	if err != nil {
+		t.Fatalf("legacy token rejected: %v", err)
+	}
+	if claims.Sub != 7 || claims.Name != "admin" || claims.Version != 1 {
+		t.Fatalf("legacy claims = %+v, want version 1", claims)
 	}
 }
 

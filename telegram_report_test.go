@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,67 @@ func TestTelegramReportTokenRoundTrip(t *testing.T) {
 	})
 	if public.BotToken != "123456:example-token" {
 		t.Fatalf("public settings token = %q", public.BotToken)
+	}
+}
+
+func TestTelegramReportStatsCountCurrentVideoCategoriesAndMergeRenamedSite(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("current-name", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for index, category := range []string{requestLogCategoryStream, requestLogCategoryManifest, requestLogCategorySegment, requestLogCategoryVideo, requestLogCategoryAPI} {
+		name := "old-name"
+		if index > 1 {
+			name = ""
+		}
+		_, err := app.db.db.Exec(`INSERT INTO request_logs
+			(site_id, site_name, resource_category, status_code, client_ip, user_agent, method, path, recorded_at_ms, timeline_at_ms)
+			VALUES (?, ?, ?, 200, '127.0.0.1', 'test', 'GET', ?, ?, ?)`, site.ID, name, category, fmt.Sprintf("/request/%d", index), now.UnixMilli(), now.UnixMilli())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := app.db.buildTelegramReportStats(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.VideoRequests != 4 || stats.Requests != 5 {
+		t.Fatalf("requests total/video = %d/%d, want 5/4", stats.Requests, stats.VideoRequests)
+	}
+	if len(stats.TopRequests) != 1 || stats.TopRequests[0].Name != "current-name" || stats.TopRequests[0].Requests != 5 {
+		t.Fatalf("top requests = %+v, want one merged current-name row with 5", stats.TopRequests)
+	}
+}
+
+func TestTelegramSchedulerSuppressesDuplicateAfterSentMarkerFailure(t *testing.T) {
+	app := newTestApp(t)
+	settings := TelegramReportSettings{Enabled: true, ChatID: "123456", ScheduleTime: "00:00", Frequency: "daily", Weekday: 1}
+	ciphertext, err := encryptTelegramBotToken("123456:example-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.saveTelegramReportSettings(settings, ciphertext, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`CREATE TRIGGER fail_telegram_sent_marker
+		BEFORE UPDATE OF last_sent_key ON telegram_report_settings
+		WHEN NEW.last_sent_key <> OLD.last_sent_key
+		BEGIN SELECT RAISE(ABORT, 'forced sent marker failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	state := &telegramReportSchedulerState{}
+	sends := 0
+	sender := func(context.Context, string, string, string) error {
+		sends++
+		return nil
+	}
+	now := time.Now()
+	runTelegramReportSchedulerTick(context.Background(), app.db, state, now, sender)
+	runTelegramReportSchedulerTick(context.Background(), app.db, state, now.Add(15*time.Second), sender)
+	if sends != 1 {
+		t.Fatalf("successful sends = %d, want 1 despite marker failure", sends)
 	}
 }
 

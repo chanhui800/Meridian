@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,6 +35,50 @@ func TestSystemSettingsAllowManualScheduleTimezone(t *testing.T) {
 	normalized, err := normalizeSystemSettings(settings)
 	if err != nil || normalized.ScheduleTimezone != -300 {
 		t.Fatalf("manual timezone = %d, err = %v", normalized.ScheduleTimezone, err)
+	}
+}
+
+func TestSystemSettingsAPIDoesNotExposeOrAcceptUnimplementedLogOptions(t *testing.T) {
+	app := newTestApp(t)
+	hidden := []string{
+		"log_write_delay_minutes",
+		"log_flush_threshold",
+		"log_task_lease_ms",
+		"log_search_mode",
+	}
+	requests := []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/system-settings", nil),
+		httptest.NewRequest(http.MethodPost, "/api/system-settings", bytes.NewBufferString(`{
+			"log_write_delay_minutes": 99,
+			"log_flush_threshold": 99,
+			"log_task_lease_ms": 99,
+			"log_search_mode": "fts"
+		}`)),
+	}
+	for _, request := range requests {
+		response := httptest.NewRecorder()
+		app.handleSystemSettings(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s system settings status=%d body=%s", request.Method, response.Code, response.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode %s system settings: %v", request.Method, err)
+		}
+		for _, key := range hidden {
+			if _, exists := payload[key]; exists {
+				t.Fatalf("%s system settings exposed %q: %s", request.Method, key, response.Body.String())
+			}
+		}
+	}
+
+	var delay, threshold, lease int
+	var searchMode string
+	if err := app.db.db.QueryRow(`SELECT log_write_delay_minutes, log_flush_threshold, log_task_lease_ms, log_search_mode FROM system_settings WHERE id=1`).Scan(&delay, &threshold, &lease, &searchMode); err != nil {
+		t.Fatalf("read legacy log columns: %v", err)
+	}
+	if delay != 0 || threshold != 1 || lease != 300000 || searchMode != "like" {
+		t.Fatalf("hidden log options changed through API: delay=%d threshold=%d lease=%d search=%q", delay, threshold, lease, searchMode)
 	}
 }
 
