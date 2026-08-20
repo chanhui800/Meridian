@@ -809,7 +809,7 @@ function updateDashboardSiteSpeeds(liveSites) {
       bytes_in: bytesIn,
       bytes_out: bytesOut,
       requests: Math.max(0, Number(sample?.requests || 0)),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? bytesOut : bytesIn + bytesOut,
+      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut),
     });
     // Keep the active dashboard session responsive without imposing a time
     // window; the X axis adapts to however many samples are available.
@@ -828,7 +828,7 @@ function updateDashboardSiteSpeeds(liveSites) {
       bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
       bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
       requests: Math.max(0, Number(delta.requests || 0)),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? Math.max(0, Number(delta.bytesOut || 0)) : Math.max(0, Number(delta.bytesIn || 0)) + Math.max(0, Number(delta.bytesOut || 0)),
+      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? Math.max(0, Number(delta.bytesOut || 0)) : 2 * (Math.max(0, Number(delta.bytesIn || 0)) + Math.max(0, Number(delta.bytesOut || 0))),
     });
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples.slice(-1800));
   }

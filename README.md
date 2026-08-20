@@ -7,14 +7,14 @@
 
 Meridian 是一个轻量的 Emby / Jellyfin 多节点反向代理面板。它把站点入口、自动回源、线路切换、流量统计、请求日志、TLS 和备份恢复放在同一个面板里，安装后即可添加站点使用。
 
-本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，界面与部分交互参考了 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)。当前正式版本为 `v1.8.44`，基于正式版 `v1.8.43`。
+本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，界面与部分交互参考了 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)。当前正式版本为 `v1.8.45`。
 
 ## 这次更新了什么
 
-`v1.8.44` 修复 Emby/Jellyfin Base URL 拼接动态播放路由导致的 404，并调整日志筛选选项的居中与边距。
+`v1.8.45` 修复双向流量计费只显示单份媒体流量的问题。
 
-- `/emby/_meridian/d/` 与 `/jellyfin/_meridian/d/` 会安全归一为 Meridian 保留的动态播放路由，普通 API 路径保持不变。
-- 日志页筛选模式和状态筛选的选项增加均衡留白，文字在按钮内水平、垂直居中。
+- 双向模式按经过 Meridian 的代理载荷同时计算 VPS 接收与发送流量，反代 1 GB 视频约计 2 GB。
+- 单向模式继续只统计 VPS 发给客户端的响应方向；302/直连媒体未经过 VPS 时不会计入媒体传输流量。
 
 ## 主要功能
 

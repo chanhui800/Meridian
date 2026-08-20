@@ -467,6 +467,8 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   const html = elements['dash-table'].innerHTML;
   assert.ok(html.includes('↓ 512 KB/s'), html);
   assert.ok(html.includes('↑ 1 KB/s'), html);
+  const billedSample = vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1).traffic_bytes", sandbox);
+  assert.equal(billedSample, 2 * (2048 + 1048576), 'bidirectional realtime traffic must count both VPS network legs');
 
   await vm.runInContext('loadDashboardTable()', sandbox);
   const refreshedHTML = elements['dash-table'].innerHTML;
