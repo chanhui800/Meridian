@@ -7,14 +7,17 @@
 
 Meridian 是一个轻量的 Emby / Jellyfin 多节点反向代理面板。它把站点入口、自动回源、线路切换、流量统计、请求日志、TLS 和备份恢复放在同一个面板里，安装后即可添加站点使用。
 
-本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，界面与部分交互参考了 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)。当前正式版本为 `v1.8.45`。
+本仓库基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) 修改，界面与部分交互参考了 [CF-EMBY-PROXY-UI](https://github.com/axuitomo/CF-EMBY-PROXY-UI)。当前正式版本为 `v1.8.46`。
 
 ## 这次更新了什么
 
-`v1.8.45` 修复双向流量计费只显示单份媒体流量的问题。
+`v1.8.46` 修复 `v1.8.45` 全项目 Review 中确认的问题。
 
-- 双向模式按经过 Meridian 的代理载荷同时计算 VPS 接收与发送流量，反代 1 GB 视频约计 2 GB。
-- 单向模式继续只统计 VPS 发给客户端的响应方向；302/直连媒体未经过 VPS 时不会计入媒体传输流量。
+- 修改管理员账户名或密码后，其他浏览器的旧登录会话立即失效。
+- 流量额度周期统一使用全局设置中的调度时区；额度达到后拒绝后续新请求，不中途截断已经开始的媒体流。
+- 日志设置只保留实际生效的保存期、批大小和重试选项，不再展示未实现的延迟、阈值、租约和 FTS 配置。
+- Telegram 日报正确统计主视频流、播放清单和媒体分片，合并站点改名前后的请求数，并避免发送标记落库失败时重复通知。
+- 清理未使用兼容函数和静态检查风格问题。
 
 ## 主要功能
 

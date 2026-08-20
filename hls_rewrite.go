@@ -175,10 +175,6 @@ func validateHLSURIAttributes(tag, value string, attributes []hlsAttributeSpan) 
 	}
 }
 
-func rewriteHLSURI(value string, session *dynamicRewriteSession) (string, error) {
-	return rewriteHLSURIKind(value, session, dynamicCapabilityKindResource)
-}
-
 func rewriteHLSURIKind(value string, session *dynamicRewriteSession, kind string) (string, error) {
 	if value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) {
 		return "", fmt.Errorf("invalid HLS URI")

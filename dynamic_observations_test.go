@@ -977,7 +977,11 @@ func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 		requireNoObservationSecrets(t, rr.Body.Bytes(), secret, "unauthenticated-query-secret", "unauthenticated-header-secret", "site-url-secret", "site-query-secret")
 	}
 
-	token, err := generateToken(1, "observation-admin")
+	userID, err := app.db.CreateInitialUser("observation-admin", "correct horse battery staple")
+	if err != nil {
+		t.Fatalf("create observation API administrator: %v", err)
+	}
+	token, err := generateTokenWithVersion(userID, "observation-admin", 1)
 	if err != nil {
 		t.Fatalf("generate observation API session: %v", err)
 	}

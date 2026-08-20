@@ -6,8 +6,9 @@ import (
 )
 
 func TestTrafficCycleStartUsesConfiguredResetDay(t *testing.T) {
+	location := time.FixedZone("UTC+08:00", 8*60*60)
 	date := func(year int, month time.Month, day int) time.Time {
-		return time.Date(year, month, day, 12, 0, 0, 0, time.Local)
+		return time.Date(year, month, day, 12, 0, 0, 0, location)
 	}
 	for _, tc := range []struct {
 		name     string
@@ -23,11 +24,67 @@ func TestTrafficCycleStartUsesConfiguredResetDay(t *testing.T) {
 		{name: "short current month", now: date(2027, time.February, 28), resetDay: 31, want: date(2027, time.February, 28)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := trafficCycleStart(tc.now, tc.resetDay)
+			got := trafficCycleStart(tc.now, tc.resetDay, location)
 			if !got.Equal(tc.want) && (got.Year() != tc.want.Year() || got.Month() != tc.want.Month() || got.Day() != tc.want.Day() || got.Hour() != 0) {
 				t.Fatalf("trafficCycleStart(%s, %d) = %s, want %s", tc.now, tc.resetDay, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestTrafficCycleStartUsesSchedulingTimezoneInsteadOfServerTimezone(t *testing.T) {
+	beijing := time.FixedZone("UTC+08:00", 8*60*60)
+	nowUTC := time.Date(2026, time.September, 30, 16, 30, 0, 0, time.UTC)
+	got := trafficCycleStart(nowUTC, 1, beijing)
+	want := time.Date(2026, time.October, 1, 0, 0, 0, 0, beijing)
+	if !got.Equal(want) || got.Location().String() != beijing.String() {
+		t.Fatalf("traffic cycle start = %s, want %s", got, want)
+	}
+}
+
+func TestTrafficCycleSnapshotsUseSchedulingTimezoneAgainstUTCStorage(t *testing.T) {
+	originalLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = originalLocal })
+
+	app := newTestApp(t)
+	settings := app.db.currentSystemSettings()
+	settings.ScheduleTimezone = beijingTimezoneOffsetMinutes
+	settings.TrafficResetDay = 1
+	settings.TrafficBillingMode = trafficBillingModeBidirectional
+	if err := app.db.saveSystemSettings(settings); err != nil {
+		t.Fatalf("save scheduling timezone: %v", err)
+	}
+
+	site, err := app.db.CreateSite("timezone-cycle", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	cycleStart := trafficCycleStart(time.Now(), 1, timezoneLocation(beijingTimezoneOffsetMinutes))
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 10, 20, 1, cycleStart.Add(-time.Minute)); err != nil {
+		t.Fatalf("add pre-cycle traffic: %v", err)
+	}
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 30, 40, 1, cycleStart.Add(time.Minute)); err != nil {
+		t.Fatalf("add current-cycle traffic: %v", err)
+	}
+
+	snapshot, err := app.pm.TrafficSnapshot()
+	if err != nil {
+		t.Fatalf("TrafficSnapshot: %v", err)
+	}
+	if snapshot.MonthlyTraffic != 140 {
+		t.Fatalf("monthly traffic = %d, want only post-boundary traffic 140", snapshot.MonthlyTraffic)
+	}
+	if live := findLiveSite(t, snapshot, site.ID); live.MonthlyTraffic != 140 {
+		t.Fatalf("site monthly traffic = %d, want 140", live.MonthlyTraffic)
+	}
+
+	usage, err := app.pm.currentTrafficCycleUsage(&ProxyInstance{Site: *site}, time.Now())
+	if err != nil {
+		t.Fatalf("currentTrafficCycleUsage: %v", err)
+	}
+	if usage != 140 {
+		t.Fatalf("quota cycle usage = %d, want 140", usage)
 	}
 }
 
@@ -89,7 +146,7 @@ func TestDisabledTrafficResetUsesAllPersistedUsage(t *testing.T) {
 	if err := app.db.addTrafficWithRequestsAt(site.ID, 120, 280, 1, time.Date(2024, time.January, 1, 0, 0, 0, 0, time.Local)); err != nil {
 		t.Fatalf("add historical traffic: %v", err)
 	}
-	usage, err := app.db.SumTrafficSinceForSite(site.ID, trafficCycleStart(time.Now(), 0), trafficBillingModeBidirectional)
+	usage, err := app.db.SumTrafficSinceForSite(site.ID, trafficCycleStart(time.Now(), 0, time.UTC), trafficBillingModeBidirectional)
 	if err != nil {
 		t.Fatalf("sum no-reset usage: %v", err)
 	}

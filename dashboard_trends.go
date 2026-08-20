@@ -45,10 +45,6 @@ type dashboardPendingTraffic struct {
 	Requests int64
 }
 
-func dashboardTrendWindow(name string, now time.Time) (string, time.Time, time.Time, time.Duration, error) {
-	return dashboardTrendWindowWithLocation(name, now, time.Time{}, time.Time{}, time.Local)
-}
-
 func dashboardTrendWindowWithCustom(name string, now, customStart, customEnd time.Time) (string, time.Time, time.Time, time.Duration, error) {
 	return dashboardTrendWindowWithLocation(name, now, customStart, customEnd, time.Local)
 }

@@ -42,16 +42,27 @@ func resolveJWTSecret(value string) ([]byte, bool, error) {
 	return secret, true, nil
 }
 
+type sessionTokenClaims struct {
+	Sub     int64  `json:"sub"`
+	Name    string `json:"name"`
+	Version int64  `json:"ver,omitempty"`
+	Exp     int64  `json:"exp"`
+}
+
 func generateToken(userID int64, username string) (string, error) {
+	return generateTokenWithVersion(userID, username, 1)
+}
+
+func generateTokenWithVersion(userID int64, username string, version int64) (string, error) {
+	if version < 1 {
+		version = 1
+	}
 	header := jwtHeaderEncoded
-	payload, err := json.Marshal(struct {
-		Sub  int64  `json:"sub"`
-		Name string `json:"name"`
-		Exp  int64  `json:"exp"`
-	}{
-		Sub:  userID,
-		Name: username,
-		Exp:  time.Now().Add(72 * time.Hour).Unix(),
+	payload, err := json.Marshal(sessionTokenClaims{
+		Sub:     userID,
+		Name:    username,
+		Version: version,
+		Exp:     time.Now().Add(sessionDuration).Unix(),
 	})
 	if err != nil {
 		return "", err
@@ -62,33 +73,43 @@ func generateToken(userID int64, username string) (string, error) {
 }
 
 func validateToken(token string) (int64, string, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return 0, "", fmt.Errorf("invalid token")
-	}
-	if parts[0] != jwtHeaderEncoded {
-		return 0, "", fmt.Errorf("invalid token header")
-	}
-	expectedSig := hmacSHA256(parts[0]+"."+parts[1], jwtSecret)
-	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
-		return 0, "", fmt.Errorf("invalid signature")
-	}
-	payload, err := base64urlDecode(parts[1])
+	claims, err := validateTokenClaims(token)
 	if err != nil {
 		return 0, "", err
 	}
-	var claims struct {
-		Sub  int64  `json:"sub"`
-		Name string `json:"name"`
-		Exp  int64  `json:"exp"`
+	return claims.Sub, claims.Name, nil
+}
+
+func validateTokenClaims(token string) (sessionTokenClaims, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return sessionTokenClaims{}, fmt.Errorf("invalid token")
 	}
+	if parts[0] != jwtHeaderEncoded {
+		return sessionTokenClaims{}, fmt.Errorf("invalid token header")
+	}
+	expectedSig := hmacSHA256(parts[0]+"."+parts[1], jwtSecret)
+	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
+		return sessionTokenClaims{}, fmt.Errorf("invalid signature")
+	}
+	payload, err := base64urlDecode(parts[1])
+	if err != nil {
+		return sessionTokenClaims{}, err
+	}
+	var claims sessionTokenClaims
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return 0, "", err
+		return sessionTokenClaims{}, err
 	}
 	if time.Now().Unix() > claims.Exp {
-		return 0, "", fmt.Errorf("token expired")
+		return sessionTokenClaims{}, fmt.Errorf("token expired")
 	}
-	return claims.Sub, claims.Name, nil
+	// Tokens created before session versions were introduced did not carry a
+	// ver claim. Treat them as generation 1 so upgrades do not log out every
+	// administrator, while the next account change still revokes them.
+	if claims.Version < 1 {
+		claims.Version = 1
+	}
+	return claims, nil
 }
 
 var jwtHeaderEncoded = base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))

@@ -89,14 +89,6 @@ func (i *dynamicCapabilityIssuer) mintTracked(ctx context.Context, previous, tar
 	return i.mintValidatedTracked(ctx, previous, target, source, target.String(), nil)
 }
 
-func (i *dynamicCapabilityIssuer) mintValidated(ctx context.Context, previous, validationTarget *url.URL, source, claimTarget string, template []string) (string, *dynamicProxyError) {
-	route, acquired, err := i.mintValidatedTracked(ctx, previous, validationTarget, source, claimTarget, template)
-	if err == nil && acquired && !i.state.settleCapabilities([]string{i.capabilityToken(route)}, true, time.Now()) {
-		return "", newDynamicProxyError(dynamicObservationReasonCapacityLimit)
-	}
-	return route, err
-}
-
 func (i *dynamicCapabilityIssuer) mintValidatedTracked(ctx context.Context, previous, validationTarget *url.URL, source, claimTarget string, template []string) (string, bool, *dynamicProxyError) {
 	return i.mintValidatedResourceTracked(ctx, previous, validationTarget, source, claimTarget, template, nil, dynamicCapabilityKindResource, 0)
 }
@@ -215,13 +207,6 @@ func (i *dynamicCapabilityIssuer) mintValidatedResourceWithRequiredHeadersTracke
 	}
 	i.observe(source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, authority)
 	return i.clientRoute(dynamicRoutePrefix + registeredToken), true, nil
-}
-
-func (i *dynamicCapabilityIssuer) mintTrustedTracked(target *url.URL, source, kind string, depth int) (string, bool, *dynamicProxyError) {
-	if target == nil {
-		return "", false, newDynamicProxyError(dynamicObservationReasonInvalidLocation)
-	}
-	return i.mintTrustedValidatedTracked(target, target.String(), nil, nil, source, kind, depth)
 }
 
 func (i *dynamicCapabilityIssuer) mintTrustedValidatedTracked(validationTarget *url.URL, claimTarget string, template, templateFixed []string, source, kind string, depth int) (string, bool, *dynamicProxyError) {

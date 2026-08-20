@@ -29,22 +29,25 @@ func timezoneLabel(offsetMinutes int) string {
 }
 
 type SystemSettings struct {
-	UIMode                   string `json:"ui_mode"`
-	UIRadius                 int    `json:"ui_radius"`
-	TrafficBillingMode       string `json:"traffic_billing_mode"`
-	TrafficResetDay          int    `json:"traffic_reset_day"`
-	ProbeTimeoutMS           int    `json:"probe_timeout_ms"`
-	PingCacheMinutes         int    `json:"ping_cache_minutes"`
-	ScheduleTimezone         int    `json:"schedule_timezone_offset"`
-	LogEnabled               bool   `json:"log_enabled"`
-	LogLevel                 string `json:"log_level"`
-	LogRetentionDays         int    `json:"log_retention_days"`
-	LogWriteDelayMinutes     int    `json:"log_write_delay_minutes"`
-	LogFlushThreshold        int    `json:"log_flush_threshold"`
+	UIMode             string `json:"ui_mode"`
+	UIRadius           int    `json:"ui_radius"`
+	TrafficBillingMode string `json:"traffic_billing_mode"`
+	TrafficResetDay    int    `json:"traffic_reset_day"`
+	ProbeTimeoutMS     int    `json:"probe_timeout_ms"`
+	PingCacheMinutes   int    `json:"ping_cache_minutes"`
+	ScheduleTimezone   int    `json:"schedule_timezone_offset"`
+	LogEnabled         bool   `json:"log_enabled"`
+	LogLevel           string `json:"log_level"`
+	LogRetentionDays   int    `json:"log_retention_days"`
+	// Legacy storage columns retained for database compatibility. They were
+	// never consumed by the single-process writer and are intentionally no
+	// longer exposed as configurable API fields.
+	LogWriteDelayMinutes     int    `json:"-"`
+	LogFlushThreshold        int    `json:"-"`
 	LogBatchSize             int    `json:"log_batch_size"`
 	LogRetryCount            int    `json:"log_retry_count"`
 	LogRetryBackoffMS        int    `json:"log_retry_backoff_ms"`
-	LogTaskLeaseMS           int    `json:"log_task_lease_ms"`
+	LogTaskLeaseMS           int    `json:"-"`
 	LogWriteImage            bool   `json:"log_write_image"`
 	LogWritePlayback         bool   `json:"log_write_playback"`
 	LogWriteMetadata         bool   `json:"log_write_metadata"`
@@ -72,7 +75,7 @@ type SystemSettings struct {
 	LogDisplayCategory       bool   `json:"log_display_category"`
 	LogDisplayStatus         bool   `json:"log_display_status"`
 	LogDisplayTimeline       bool   `json:"log_display_timeline"`
-	LogSearchMode            string `json:"log_search_mode"`
+	LogSearchMode            string `json:"-"`
 }
 
 func defaultSystemSettings() SystemSettings {

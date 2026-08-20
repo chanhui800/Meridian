@@ -262,13 +262,6 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 	a.jsonOK(w, status)
 }
 
-func normalizePanelCertificateDomains(panelPrefix, wildcardDomain, legacyPanelDomain, legacyRouteDomain string) (PanelSettings, error) {
-	if strings.TrimSpace(panelPrefix) != "" || strings.TrimSpace(wildcardDomain) != "" {
-		return normalizeManagedPanelPrefix(panelPrefix, wildcardDomain)
-	}
-	return normalizeManagedPanelSettings(legacyPanelDomain, legacyRouteDomain)
-}
-
 func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
