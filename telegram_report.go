@@ -66,6 +66,12 @@ type telegramReportSiteStat struct {
 	Traffic  int64
 }
 
+type telegramReportRetentionStat struct {
+	Name           string
+	RemainingDays  int
+	CompletedToday bool
+}
+
 type telegramReportStats struct {
 	GeneratedAt      time.Time
 	UniqueClients    int64
@@ -80,6 +86,7 @@ type telegramReportStats struct {
 	RunningSiteCount int
 	TopRequests      []telegramReportSiteStat
 	TopTraffic       []telegramReportSiteStat
+	RetentionSites   []telegramReportRetentionStat
 	TopUserAgents    []struct {
 		Name  string
 		Count int64
@@ -409,6 +416,48 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 		}{Name: ua, Count: count})
 	}
 	uaRows.Close()
+	retentionRows, err := d.db.Query(`SELECT name, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms
+		FROM sites WHERE account_retention_days>0 ORDER BY sort_order, id`)
+	if err != nil {
+		return stats, err
+	}
+	var retentionScanErr error
+	for retentionRows.Next() {
+		var site Site
+		if err := retentionRows.Scan(&site.Name, &site.AccountRetentionDays, &site.AccountRetentionStartedMS, &site.AccountRetentionCompletedMS); err != nil {
+			retentionScanErr = err
+			break
+		}
+		status := accountRetentionStatusAt(site, localNow, location)
+		if !status.Enabled {
+			continue
+		}
+		stats.RetentionSites = append(stats.RetentionSites, telegramReportRetentionStat{
+			Name:           site.Name,
+			RemainingDays:  status.RemainingDays,
+			CompletedToday: status.CompletedToday,
+		})
+	}
+	retentionRowsErr := retentionRows.Err()
+	retentionRowsCloseErr := retentionRows.Close()
+	if retentionScanErr != nil {
+		return stats, retentionScanErr
+	}
+	if retentionRowsErr != nil {
+		return stats, retentionRowsErr
+	}
+	if retentionRowsCloseErr != nil {
+		return stats, retentionRowsCloseErr
+	}
+	sort.SliceStable(stats.RetentionSites, func(i, j int) bool {
+		if stats.RetentionSites[i].CompletedToday != stats.RetentionSites[j].CompletedToday {
+			return !stats.RetentionSites[i].CompletedToday
+		}
+		if stats.RetentionSites[i].RemainingDays != stats.RetentionSites[j].RemainingDays {
+			return stats.RetentionSites[i].RemainingDays < stats.RetentionSites[j].RemainingDays
+		}
+		return stats.RetentionSites[i].Name < stats.RetentionSites[j].Name
+	})
 	return stats, nil
 }
 
@@ -454,6 +503,22 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	} else {
 		for _, item := range stats.TopUserAgents {
 			fmt.Fprintf(&b, "• %s：%d 次\n", truncateTelegramText(item.Name, 72), item.Count)
+		}
+	}
+	if len(stats.RetentionSites) > 0 {
+		b.WriteString("\n🔔 保号提醒\n")
+		for _, item := range stats.RetentionSites {
+			name := truncateTelegramText(item.Name, 72)
+			switch {
+			case item.CompletedToday:
+				fmt.Fprintf(&b, "• %s：✅ 完成保号\n", name)
+			case item.RemainingDays <= 0:
+				fmt.Fprintf(&b, "• %s：🔴 已到期\n", name)
+			case item.RemainingDays <= 7:
+				fmt.Fprintf(&b, "• %s：🔴 剩余 %d 天\n", name, item.RemainingDays)
+			default:
+				fmt.Fprintf(&b, "• %s：剩余 %d 天\n", name, item.RemainingDays)
+			}
 		}
 	}
 	b.WriteString("\n✅ System Status: Operational")

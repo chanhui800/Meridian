@@ -8,6 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +18,8 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+const testTMDBReadToken = "eyJhbGciOiJIUzI1NiJ9.meridian-backup-test-token-value"
 
 func TestBackupEncryptionRejectsWrongPasswordAndTampering(t *testing.T) {
 	plain := []byte("private meridian backup")
@@ -214,6 +219,15 @@ func makeBackupDatabase(t *testing.T, path string, jwt, upstreamKey []byte) {
 		db.Close()
 		t.Fatal(err)
 	}
+	tmdbToken, err := encryptTMDBReadTokenWithSecret(testTMDBReadToken, jwt)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`UPDATE tmdb_settings SET enabled=1, token_ciphertext=?, credential_state='ready' WHERE id=1`, tmdbToken); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
 	if _, err := db.db.Exec(`INSERT INTO users (username, password_hash) VALUES ('admin', 'hash')`); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -286,6 +300,231 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	}
 	if _, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldJWT); err == nil {
 		t.Fatal("old JWT secret still decrypts migrated ACME token")
+	}
+	var tmdbCiphertext string
+	if err := db.QueryRow("SELECT token_ciphertext FROM tmdb_settings WHERE id=1").Scan(&tmdbCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	value, err = decryptTMDBReadTokenWithSecret(tmdbCiphertext, newJWT)
+	if err != nil || value != testTMDBReadToken {
+		t.Fatalf("TMDB token = %q, %v", value, err)
+	}
+	if _, err := decryptTMDBReadTokenWithSecret(tmdbCiphertext, oldJWT); err == nil {
+		t.Fatal("old JWT secret still decrypts migrated TMDB token")
+	}
+}
+
+func TestReencryptRestoredSecretsSupportsBackupWithoutTMDBSettings(t *testing.T) {
+	oldJWT := bytes.Repeat([]byte("j"), 32)
+	newJWT := bytes.Repeat([]byte("n"), 32)
+	oldHeader := sha256.Sum256([]byte("old-upstream-header-key-material"))
+	newHeader := sha256.Sum256([]byte("new-upstream-header-key-material"))
+	path := filepath.Join(t.TempDir(), "legacy-backup.db")
+	makeBackupDatabase(t, path, oldJWT, oldHeader[:])
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DROP TABLE tmdb_settings"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reencryptRestoredSecrets(path, oldJWT, oldHeader[:], newJWT, newHeader[:]); err != nil {
+		t.Fatalf("legacy backup migration failed: %v", err)
+	}
+}
+
+func TestReencryptRestoredSecretsContinuesAfterCurrentACMEToken(t *testing.T) {
+	oldJWT := bytes.Repeat([]byte("j"), 32)
+	newJWT := bytes.Repeat([]byte("n"), 32)
+	oldHeader := sha256.Sum256([]byte("old-upstream-header-key-material"))
+	newHeader := sha256.Sum256([]byte("new-upstream-header-key-material"))
+	path := filepath.Join(t.TempDir(), "mixed-token-backup.db")
+	makeBackupDatabase(t, path, oldJWT, oldHeader[:])
+	currentACME, err := encryptPanelACMETokenWithSecret("target-cloudflare-token-value", newJWT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE panel_settings SET acme_token_ciphertext=? WHERE id=1", currentACME); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reencryptRestoredSecrets(path, oldJWT, oldHeader[:], newJWT, newHeader[:]); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var acmeCiphertext, tmdbCiphertext string
+	if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if acmeCiphertext != currentACME {
+		t.Fatal("ACME token already encrypted with the target key was rewritten")
+	}
+	if err := db.QueryRow("SELECT token_ciphertext FROM tmdb_settings WHERE id=1").Scan(&tmdbCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := decryptTMDBReadTokenWithSecret(tmdbCiphertext, newJWT); err != nil || value != testTMDBReadToken {
+		t.Fatalf("TMDB migration after current ACME token = %q, %v", value, err)
+	}
+}
+
+func TestReencryptRestoredSecretsKeepsCurrentTMDBToken(t *testing.T) {
+	oldJWT := bytes.Repeat([]byte("j"), 32)
+	newJWT := bytes.Repeat([]byte("n"), 32)
+	oldHeader := sha256.Sum256([]byte("old-upstream-header-key-material"))
+	newHeader := sha256.Sum256([]byte("new-upstream-header-key-material"))
+	path := filepath.Join(t.TempDir(), "current-tmdb-token.db")
+	makeBackupDatabase(t, path, oldJWT, oldHeader[:])
+	currentTMDB, err := encryptTMDBReadTokenWithSecret(testTMDBReadToken, newJWT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE tmdb_settings SET token_ciphertext=? WHERE id=1", currentTMDB); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reencryptRestoredSecrets(path, oldJWT, oldHeader[:], newJWT, newHeader[:]); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var ciphertext string
+	if err := db.QueryRow("SELECT token_ciphertext FROM tmdb_settings WHERE id=1").Scan(&ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if ciphertext != currentTMDB {
+		t.Fatal("TMDB token already encrypted with the target key was rewritten")
+	}
+}
+
+func makeBackupTokenDatabase(t *testing.T, telegramToken, tmdbToken string, dropTMDB bool) []byte {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "backup.db")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE telegram_report_settings SET bot_token_ciphertext=? WHERE id=1", telegramToken); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if dropTMDB {
+		if _, err := db.db.Exec("DROP TABLE tmdb_settings"); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	} else if _, err := db.db.Exec("UPDATE tmdb_settings SET token_ciphertext=? WHERE id=1", tmdbToken); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestEphemeralJWTBackupPreflightDetectsTelegramOrTMDBToken(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		telegram  string
+		tmdb      string
+		dropTMDB  bool
+		wantToken bool
+	}{
+		{name: "no token"},
+		{name: "legacy backup without TMDB settings", dropTMDB: true},
+		{name: "Telegram token", telegram: "encrypted-telegram-token", wantToken: true},
+		{name: "TMDB token", tmdb: "encrypted-tmdb-token", wantToken: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hasToken, err := backupHasJWTProtectedToken(makeBackupTokenDatabase(t, test.telegram, test.tmdb, test.dropTMDB))
+			if err != nil || hasToken != test.wantToken {
+				t.Fatalf("preflight token=%v, err=%v; want %v", hasToken, err, test.wantToken)
+			}
+		})
+	}
+}
+
+func TestHandleBackupRestoreRejectsTMDBTokenWithEphemeralJWT(t *testing.T) {
+	originalEphemeral := jwtSecretEphemeral
+	jwtSecretEphemeral = true
+	t.Cleanup(func() { jwtSecretEphemeral = originalEphemeral })
+
+	oldJWT := bytes.Repeat([]byte("j"), 32)
+	oldHeader := bytes.Repeat([]byte("h"), 32)
+	tmdbCiphertext, err := encryptTMDBReadTokenWithSecret(testTMDBReadToken, oldJWT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	includeTLS := false
+	manifest := backupManifest{
+		Format:            "meridian-backup",
+		FormatVersion:     backupFormatVersion,
+		Files:             []string{backupDatabaseEntry},
+		IncludeTLS:        &includeTLS,
+		JWTSecret:         base64.RawStdEncoding.EncodeToString(oldJWT),
+		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(oldHeader),
+	}
+	archive := testBackupArchive(t, manifest, map[string][]byte{
+		backupDatabaseEntry: makeBackupTokenDatabase(t, "", tmdbCiphertext, false),
+	})
+	const password = "correct horse battery staple"
+	payload, err := sealBackup(archive, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var form bytes.Buffer
+	writer := multipart.NewWriter(&form)
+	if err := writer.WriteField("password", password); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("confirm", "恢复"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := writer.CreateFormFile("backup", "backup.mrbak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{dbPath: filepath.Join(t.TempDir(), "target.db")}
+	request := httptest.NewRequest(http.MethodPost, "/api/backup/restore", &form)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	app.handleBackupRestore(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "TMDB") {
+		t.Fatalf("ephemeral JWT restore status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

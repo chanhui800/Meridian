@@ -527,17 +527,44 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 		if acmeCiphertext != "" {
 			token, err := decryptPanelACMETokenWithSecret(acmeCiphertext, oldJWT)
 			if err != nil {
-				if _, currentErr := decryptPanelACMETokenWithSecret(acmeCiphertext, newJWT); currentErr == nil {
-					return tx.Commit()
+				if _, currentErr := decryptPanelACMETokenWithSecret(acmeCiphertext, newJWT); currentErr != nil {
+					return fmt.Errorf("无法解密 DNS API Token: %w", err)
 				}
-				return fmt.Errorf("无法解密 DNS API Token: %w", err)
+			} else {
+				migrated, err := encryptPanelACMETokenWithSecret(token, newJWT)
+				if err != nil {
+					return fmt.Errorf("无法迁移 DNS API Token: %w", err)
+				}
+				if _, err := tx.Exec("UPDATE panel_settings SET acme_token_ciphertext=? WHERE id=1", migrated); err != nil {
+					return err
+				}
 			}
-			migrated, err := encryptPanelACMETokenWithSecret(token, newJWT)
+		}
+	}
+	hasTMDBToken, err := backupSQLiteColumnExists(tx, "tmdb_settings", "token_ciphertext")
+	if err != nil {
+		return err
+	}
+	if hasTMDBToken {
+		var tmdbCiphertext string
+		err = tx.QueryRow("SELECT token_ciphertext FROM tmdb_settings WHERE id=1").Scan(&tmdbCiphertext)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if tmdbCiphertext != "" {
+			token, err := decryptTMDBReadTokenWithSecret(tmdbCiphertext, oldJWT)
 			if err != nil {
-				return fmt.Errorf("无法迁移 DNS API Token: %w", err)
-			}
-			if _, err := tx.Exec("UPDATE panel_settings SET acme_token_ciphertext=? WHERE id=1", migrated); err != nil {
-				return err
+				if _, currentErr := decryptTMDBReadTokenWithSecret(tmdbCiphertext, newJWT); currentErr != nil {
+					return fmt.Errorf("无法解密 TMDB Read Access Token: %w", err)
+				}
+			} else {
+				migrated, err := encryptTMDBReadTokenWithSecret(token, newJWT)
+				if err != nil {
+					return fmt.Errorf("无法迁移 TMDB Read Access Token: %w", err)
+				}
+				if _, err := tx.Exec("UPDATE tmdb_settings SET token_ciphertext=? WHERE id=1", migrated); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -566,7 +593,7 @@ func backupSQLiteColumnExists(queryer interface {
 	return false, rows.Err()
 }
 
-func backupHasTelegramToken(database []byte) (bool, error) {
+func backupHasJWTProtectedToken(database []byte) (bool, error) {
 	dir, err := os.MkdirTemp("", ".meridian-backup-check-*")
 	if err != nil {
 		return false, err
@@ -581,8 +608,29 @@ func backupHasTelegramToken(database []byte) (bool, error) {
 		return false, err
 	}
 	defer db.Close()
+	hasTelegramColumn, err := backupSQLiteColumnExists(db, "telegram_report_settings", "bot_token_ciphertext")
+	if err != nil {
+		return false, err
+	}
+	if hasTelegramColumn {
+		var ciphertext string
+		if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&ciphertext); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return false, err
+			}
+		} else if ciphertext != "" {
+			return true, nil
+		}
+	}
+	hasTMDBColumn, err := backupSQLiteColumnExists(db, "tmdb_settings", "token_ciphertext")
+	if err != nil {
+		return false, err
+	}
+	if !hasTMDBColumn {
+		return false, nil
+	}
 	var ciphertext string
-	if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&ciphertext); err != nil {
+	if err := db.QueryRow("SELECT token_ciphertext FROM tmdb_settings WHERE id=1").Scan(&ciphertext); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
@@ -1049,13 +1097,13 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if jwtSecretEphemeral {
-		hasToken, tokenErr := backupHasTelegramToken(entries[backupDatabaseEntry])
+		hasToken, tokenErr := backupHasJWTProtectedToken(entries[backupDatabaseEntry])
 		if tokenErr != nil {
-			a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查 Telegram 配置")
+			a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查加密 Token 配置")
 			return
 		}
 		if hasToken {
-			a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全恢复 Telegram Token；请先配置稳定密钥")
+			a.jsonErr(w, http.StatusConflict, "当前 JWT_SECRET 不是持久密钥，无法安全恢复 Telegram 或 TMDB Token；请先配置稳定密钥")
 			return
 		}
 	}

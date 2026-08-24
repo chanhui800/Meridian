@@ -107,6 +107,8 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			AssetCacheTTLSec           int                   `json:"asset_cache_ttl_sec"`
 			AssetCacheMaxBytes         int64                 `json:"asset_cache_max_bytes"`
 			AssetCacheRules            string                `json:"asset_cache_rules"`
+			WatchHistoryEnabled        bool                  `json:"watch_history_enabled"`
+			AccountRetentionDays       int                   `json:"account_retention_days"`
 			Quota                      int64                 `json:"traffic_quota"`
 			SpeedLimit                 int                   `json:"speed_limit"`
 		}
@@ -146,6 +148,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		assetCacheConfig := Site{AssetCacheEnabled: req.AssetCacheEnabled, AssetCacheTTLSec: req.AssetCacheTTLSec, AssetCacheMaxBytes: req.AssetCacheMaxBytes, AssetCacheRules: req.AssetCacheRules}
 		if err := normalizeAssetCacheConfig(&assetCacheConfig); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		accountRetentionDays, err := normalizeAccountRetentionDays(req.AccountRetentionDays)
+		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -316,6 +323,8 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			AssetCacheTTLSec:              assetCacheConfig.AssetCacheTTLSec,
 			AssetCacheMaxBytes:            assetCacheConfig.AssetCacheMaxBytes,
 			AssetCacheRules:               assetCacheConfig.AssetCacheRules,
+			WatchHistoryEnabled:           req.WatchHistoryEnabled,
+			AccountRetentionDays:          accountRetentionDays,
 			TrafficQuota:                  req.Quota,
 			SpeedLimit:                    req.SpeedLimit,
 		})
@@ -535,6 +544,8 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			AssetCacheTTLSec           *int                   `json:"asset_cache_ttl_sec"`
 			AssetCacheMaxBytes         *int64                 `json:"asset_cache_max_bytes"`
 			AssetCacheRules            *string                `json:"asset_cache_rules"`
+			WatchHistoryEnabled        *bool                  `json:"watch_history_enabled"`
+			AccountRetentionDays       *int                   `json:"account_retention_days"`
 			Quota                      *int64                 `json:"traffic_quota"`
 			SpeedLimit                 *int                   `json:"speed_limit"`
 		}
@@ -800,6 +811,16 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.AssetCacheRules != nil {
 			candidate.AssetCacheRules = *req.AssetCacheRules
+		}
+		if req.WatchHistoryEnabled != nil {
+			candidate.WatchHistoryEnabled = *req.WatchHistoryEnabled
+		}
+		if req.AccountRetentionDays != nil {
+			candidate.AccountRetentionDays, err = normalizeAccountRetentionDays(*req.AccountRetentionDays)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		if err := normalizeAssetCacheConfig(&candidate); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())

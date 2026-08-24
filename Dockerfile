@@ -1,4 +1,4 @@
-﻿# Build stage
+# Build stage
 FROM golang:1.26.6-alpine AS builder
 
 WORKDIR /app
@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=v1.8.46
+ARG VERSION=v1.8.47
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION}" -o meridian .
 
 # Runtime stage

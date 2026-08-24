@@ -22,7 +22,10 @@ type DB struct {
 	dynamicObservationClosed    atomic.Bool
 	droppedDynamicObservations  atomic.Uint64
 	droppedRequestLogs          atomic.Uint64
+	droppedWatchHistory         atomic.Uint64
 	systemSettings              atomic.Pointer[SystemSettings]
+	watchHistoryMetadataMu      sync.Mutex
+	watchHistoryMetadata        map[watchHistoryMetadataKey]watchHistoryMetadataEntry
 }
 
 func openDB(path string) (*DB, error) {
@@ -52,7 +55,7 @@ func openDB(path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("validate stored dynamic policies: %w", err)
 	}
-	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity+requestLogQueueCapacity)
+	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity+requestLogQueueCapacity+watchHistoryQueueCapacity)
 	d.dynamicObservationDone = make(chan struct{})
 	go d.runDynamicObservationWriter()
 	return d, nil

@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.46"
+var appVersion = "v1.8.47"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -191,6 +191,8 @@ func main() {
 		}
 	}()
 	go runTelegramReportScheduler(ctx, db)
+	tmdb := newTMDBService(db, nil)
+	go tmdb.Run(ctx)
 
 	if panelHost != "" {
 		if _, configured := pm.PublicHostHandler(panelHost); configured {
@@ -213,6 +215,7 @@ func main() {
 		panelListenPort:   port,
 		dynamicRouteKey:   dynamicRouteKey,
 		restartCh:         make(chan struct{}),
+		tmdb:              tmdb,
 	}
 	go runPanelCertificateRenewalScheduler(ctx, db, panelCertificates, app.requestRestart)
 
@@ -244,6 +247,15 @@ func main() {
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
 	mux.HandleFunc("/api/asset-cache", cors(app.authMiddleware(app.handleAssetCache)))
 	mux.HandleFunc("/api/request-logs", cors(app.authMiddleware(app.handleRequestLogs)))
+	mux.HandleFunc("/api/watch-history", cors(app.authMiddleware(app.handleWatchHistory)))
+	mux.HandleFunc("/api/watch-history/", cors(app.authMiddleware(app.handleWatchHistoryItem)))
+	mux.HandleFunc("/api/watch-history/posters/", cors(app.authMiddleware(app.handleWatchHistoryPoster)))
+	mux.HandleFunc("/api/watch-history/backdrops/", cors(app.authMiddleware(app.handleWatchHistoryBackdrop)))
+	mux.HandleFunc("/api/watch-history/stills/", cors(app.authMiddleware(app.handleWatchHistoryStill)))
+	mux.HandleFunc("/api/watch-history/cast/", cors(app.authMiddleware(app.handleWatchHistoryCast)))
+	mux.HandleFunc("/api/tmdb-settings/test", cors(app.authMiddleware(app.handleTMDBTest)))
+	mux.HandleFunc("/api/tmdb-settings/cache/clear", cors(app.authMiddleware(app.handleTMDBCacheClear)))
+	mux.HandleFunc("/api/tmdb-settings", cors(app.authMiddleware(app.handleTMDBSettings)))
 	mux.HandleFunc("/api/telegram-report", cors(app.authMiddleware(app.handleTelegramReport)))
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
 	mux.HandleFunc("/api/dynamic-profiles", cors(app.authMiddleware(app.handleDynamicProfiles)))

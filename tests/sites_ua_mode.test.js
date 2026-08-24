@@ -100,6 +100,18 @@ test('new site form defaults UA mode to passthrough', () => {
   assert.match(source, /uaSelect\.value = isEdit && site\.ua_mode \? site\.ua_mode : 'passthrough'/);
 });
 
+test('custom identity fields stay inside the UA grid cell', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
+
+  assert.match(source, /class="form-group site-ua-group site-field-ua"[\s\S]*?id="m-ua"[\s\S]*?class="site-custom-ua-fields" id="m-custom-ua-group"/);
+  assert.doesNotMatch(source, /<\/div>\s*<div class="form-group" id="m-custom-ua-group"/);
+  assert.match(source, /class="site-form-column site-form-column-policy"[\s\S]*?class="form-group site-ua-group site-field-ua"[\s\S]*?id="m-custom-ua-group"/);
+  assert.match(source, /advancedColumns\.classList\?\.toggle\('site-form-columns-custom-ua', state\.visible\)/);
+  assert.match(css, /\.site-form-column\s*\{[\s\S]*?display:\s*flex;[\s\S]*?flex-direction:\s*column;[\s\S]*?gap:\s*16px/);
+  assert.match(css, /\.site-custom-ua-fields\s*\{\s*margin-top:\s*12px/);
+});
+
 test('site management exposes latency tests and safe asset cache controls', () => {
   const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
   assert.match(source, /id="btn-test-all-sites"[^>]*>.*全部测速/);

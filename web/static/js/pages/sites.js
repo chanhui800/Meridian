@@ -1,5 +1,57 @@
 // Sites management page
 let siteSortingCleanup = null;
+
+function normalizedMediaLibraryCount(value) {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+function renderSiteMediaLibraryCounts(site) {
+  const items = [
+    ['电影', normalizedMediaLibraryCount(site && site.media_movie_count)],
+    ['剧集', normalizedMediaLibraryCount(site && site.media_series_count)],
+    ['集', normalizedMediaLibraryCount(site && site.media_episode_count)],
+  ];
+  if (items.some(([, count]) => count === null)) {
+    return '<div class="site-media-counts is-pending"><span class="site-media-icon" aria-hidden="true">🎬</span><span>媒体库</span><strong>待同步</strong></div>';
+  }
+  return `<div class="site-media-counts" aria-label="媒体库数量"><span class="site-media-icon" aria-hidden="true">🎬</span>${items.map(([label, count]) => `<span>${label} <strong>${count.toLocaleString('zh-CN')}</strong></span>`).join('')}</div>`;
+}
+
+function siteAccountRetentionStatus(site, nowMS = Date.now()) {
+  const days = Number(site && site.account_retention_days);
+  const startedAtMS = Number(site && site.account_retention_started_at_ms);
+  if (!Number.isSafeInteger(days) || days <= 0 || !Number.isFinite(startedAtMS) || startedAtMS <= 0) {
+    return { enabled: false, remainingDays: 0, urgent: false, overdue: false };
+  }
+  const remainingMS = startedAtMS + days * 86400000 - Number(nowMS);
+  const remainingDays = Math.max(0, Math.ceil(remainingMS / 86400000));
+  return {
+    enabled: true,
+    remainingDays,
+    urgent: remainingDays <= 7,
+    overdue: remainingMS <= 0,
+  };
+}
+
+function renderSiteAccountRetention(site) {
+  const status = siteAccountRetentionStatus(site);
+  if (!status.enabled) return '';
+  const value = status.overdue ? '已到期' : `剩余 ${status.remainingDays} 天`;
+  return `
+    <div class="site-row site-retention-row ${status.urgent ? 'is-urgent' : ''}">
+      <span class="site-row-label">保号提醒</span>
+      <span class="site-retention-value"><strong>${value}</strong></span>
+    </div>`;
+}
+
+function renderSiteAccessVisibilityIcon(hidden) {
+	if (hidden) {
+		return '<svg class="site-access-eye site-access-eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.8 10.8 0 0 1-1.444 2.49"></path><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"></path><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"></path><path d="m2 2 20 20"></path></svg>';
+	}
+	return '<svg class="site-access-eye site-access-eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"></path><circle cx="12" cy="12" r="3"></circle></svg>';
+}
+
 function renderSites() {
   const page = document.getElementById('page-sites');
   page.innerHTML = `
@@ -44,12 +96,15 @@ async function loadSites() {
 
       return `
       <div class="site-card" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
+        <button type="button" class="site-drag-handle" data-site-drag-handle aria-label="拖拽调整 ${esc(s.name)} 的顺序" title="拖拽调整顺序">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"></circle><circle cx="13" cy="5" r="1.25"></circle><circle cx="7" cy="10" r="1.25"></circle><circle cx="13" cy="10" r="1.25"></circle><circle cx="7" cy="15" r="1.25"></circle><circle cx="13" cy="15" r="1.25"></circle></svg>
+        </button>
         <div class="site-top">
           <div class="site-heading">
-            <button type="button" class="site-drag-handle" data-site-drag-handle aria-label="拖拽调整 ${esc(s.name)} 的顺序" title="拖拽调整顺序">
-              <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"></circle><circle cx="13" cy="5" r="1.25"></circle><circle cx="7" cy="10" r="1.25"></circle><circle cx="13" cy="10" r="1.25"></circle><circle cx="7" cy="15" r="1.25"></circle><circle cx="13" cy="15" r="1.25"></circle></svg>
-            </button>
-            <div class="site-heading-content"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
+            <div class="site-heading-content">
+              <div class="site-heading-title-row"><div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
+              ${renderSiteMediaLibraryCounts(s)}
+            </div>
           </div>
           <div class="site-card-state">
             <span class="site-mode-badge">${siteIngressModeLabel(s)}</span>
@@ -63,7 +118,7 @@ async function loadSites() {
 		<div class="site-rows">
 		  <div class="site-row site-access-row">
 		    <span class="site-row-label">访问地址</span>
-		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" title="显示访问地址">◉</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path></svg></button></span>
+		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false" title="显示访问地址">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path></svg></button></span>
 		  </div>
           <div class="site-row">
             <span class="site-row-label">主回源地址</span>
@@ -90,6 +145,7 @@ async function loadSites() {
             <span>${formatBytes(s.traffic_used)}</span>
           </div>
           `}
+          ${renderSiteAccountRetention(s)}
         </div>
         <div class="site-actions">
           <button class="btn-ghost site-action-test" data-site-action="latency" data-site-id="${s.id}">测速</button>
@@ -985,7 +1041,9 @@ function toggleSiteAccessAddress(button) {
 	if (!value) return;
 	const hidden = value.classList.toggle('is-hidden');
 	value.textContent = hidden ? '********' : value.dataset.accessAddress;
+	button.innerHTML = renderSiteAccessVisibilityIcon(hidden);
 	button.setAttribute('aria-label', hidden ? '显示访问地址' : '隐藏访问地址');
+	button.setAttribute('aria-pressed', String(!hidden));
 	button.setAttribute('title', hidden ? '显示访问地址' : '隐藏访问地址');
 }
 
@@ -1361,9 +1419,10 @@ async function showSiteModal(site) {
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
       </summary>
       <div class="site-advanced-body">
-      <div class="site-form-columns">
-    <div class="form-group">
-      <label>UA 模式</label>
+      <div class="site-form-columns" id="m-site-form-columns">
+    <div class="site-form-column site-form-column-policy">
+    <div class="form-group site-ua-group site-field-ua">
+      <label for="m-ua">UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
         <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
         <option value="infuse" ${isEdit && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
@@ -1371,15 +1430,15 @@ async function showSiteModal(site) {
         <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
         <option value="custom">自定义</option>
       </select>
+      <div class="site-custom-ua-fields" id="m-custom-ua-group" hidden>
+        <label for="m-custom-ua">自定义身份</label>
+        <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
+        <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
+        <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
+        <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
+      </div>
     </div>
-    <div class="form-group" id="m-custom-ua-group" hidden>
-      <label>自定义身份</label>
-      <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
-      <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-      <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-      <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
-    </div>
-    <div class="form-group">
+    <div class="form-group site-field-client-ip">
       <label>真实客户端 IP 透传</label>
       <select class="form-select modal-select" id="m-client-ip-mode">
         <option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
@@ -1388,7 +1447,7 @@ async function showSiteModal(site) {
       </select>
       <div class="form-help">仅控制发送给回源的 X-Real-IP 与 X-Forwarded-For；客户端来源仍按可信代理规则识别，日志中的客户端 IP 不受影响。</div>
     </div>
-    <div class="form-group">
+    <div class="form-group site-field-video">
       <label>主视频流策略</label>
       <select class="form-select modal-select" id="m-main-video-mode">
         <option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option>
@@ -1397,7 +1456,18 @@ async function showSiteModal(site) {
       <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
       <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
     </div>
-    <div class="form-group">
+    <div class="form-group site-field-history">
+      <label for="m-watch-history">观看历史记录</label>
+      <select class="form-select modal-select" id="m-watch-history">
+        <option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option>
+        <option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option>
+      </select>
+      <div class="form-help">仅记录后续成功的播放状态同步；不保存用户名、令牌、客户端 IP、DeviceId、PlaySessionId 或原始请求正文。关闭后不会删除已有历史。</div>
+    </div>
+    </div>
+    <div class="site-form-column-secondary">
+    <div class="site-form-column site-form-column-cache">
+    <div class="form-group site-field-cache-toggle">
       <label for="m-asset-cache">缓存图片与静态资源</label>
       <select class="form-select modal-select" id="m-asset-cache">
         <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
@@ -1405,11 +1475,11 @@ async function showSiteModal(site) {
       </select>
       <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
     </div>
-    <div class="form-group">
+    <div class="form-group site-field-cache-rules">
       <label>缓存规则（每行一条，支持 * 通配）</label>
       <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
     </div>
-    <div class="form-group cache-limit-group">
+    <div class="form-group cache-limit-group site-field-cache-limits">
       <div class="cache-limit-grid">
         <div>
           <label for="m-cache-ttl">缓存时间（小时）</label>
@@ -1421,15 +1491,25 @@ async function showSiteModal(site) {
         </div>
       </div>
     </div>
-    <div class="form-group">
+    </div>
+    <div class="site-form-column site-form-column-limits">
+    <div class="form-group site-field-quota">
       <label>流量额度 (GB, 0=不限)</label>
       <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
       <div class="form-help">达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div>
     </div>
-    <div class="form-group">
+    <div class="form-group site-field-speed">
       <label>单连接限速 (Mbps, 0=不限)</label>
       <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
       <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
+    </div>
+    <div class="form-group site-field-retention">
+      <label for="m-account-retention-days">保号周期（天，留空=关闭）</label>
+      <input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="如：30" min="1" max="3650" step="1" inputmode="numeric">
+      <div class="form-help">填写 1–3650 天即开启，留空即关闭。同一播放身份完成 5 次有效播放状态同步后，自动完成保号并重置倒计时。剩余不多于 7 天时卡片显示红色提醒；Telegram 日报会同步结果。</div>
+    </div>
+    </div>
+    </div>
       </div>
       </div>
     </details>
@@ -1581,7 +1661,10 @@ async function showSiteModal(site) {
 	const uaSelect = document.getElementById('m-ua');
   const clientIPModeSelect = document.getElementById('m-client-ip-mode');
   const mainVideoModeSelect = document.getElementById('m-main-video-mode');
+  const watchHistorySelect = document.getElementById('m-watch-history');
+  const accountRetentionDaysInput = document.getElementById('m-account-retention-days');
   const customUAGroup = document.getElementById('m-custom-ua-group');
+  const advancedColumns = document.getElementById('m-site-form-columns');
   const customUAInputs = [
     document.getElementById('m-custom-ua'),
     document.getElementById('m-custom-client'),
@@ -1591,6 +1674,7 @@ async function showSiteModal(site) {
   uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'passthrough';
   clientIPModeSelect.value = isEdit && ['both', 'real_ip', 'none'].includes(site.client_ip_mode) ? site.client_ip_mode : 'both';
   mainVideoModeSelect.value = isEdit && site.main_video_stream_mode === 'direct' ? 'direct' : 'proxy';
+  watchHistorySelect.value = isEdit && site.watch_history_enabled ? 'on' : 'off';
   customUAInputs[0].value = initialUAState.customUserAgent;
   customUAInputs[1].value = initialUAState.customClient;
   customUAInputs[2].value = initialUAState.customVersion;
@@ -1598,6 +1682,7 @@ async function showSiteModal(site) {
   function toggleCustomUAFields() {
     const state = customUAFormState(uaSelect.value);
     customUAGroup.hidden = !state.visible;
+    advancedColumns.classList?.toggle('site-form-columns-custom-ua', state.visible);
     customUAInputs.forEach(input => {
       input.required = state.required;
     });
@@ -1664,6 +1749,8 @@ async function showSiteModal(site) {
 			document.getElementById('m-target-port').value,
 		);
 		document.getElementById('m-target').value = primaryTargetURL;
+		const accountRetentionRaw = String(accountRetentionDaysInput.value || '').trim();
+		const accountRetentionDays = accountRetentionRaw === '' ? 0 : Number(accountRetentionRaw);
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
 	      target_url: primaryTargetURL,
@@ -1677,6 +1764,7 @@ async function showSiteModal(site) {
       playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
       playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
 		main_video_stream_mode: mainVideoModeSelect.value,
+		watch_history_enabled: watchHistorySelect.value === 'on',
 		stream_hosts: isEdit ? normalizeStreamHosts(site.stream_hosts) : [],
 			...ingressPayload,
 		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),
@@ -1692,6 +1780,7 @@ async function showSiteModal(site) {
       asset_cache_ttl_sec: parseInt(document.getElementById('m-cache-ttl').value || 24) * 3600,
       asset_cache_max_bytes: parseInt(document.getElementById('m-cache-max').value || 512) * 1048576,
       asset_cache_rules: document.getElementById('m-cache-rules').value.trim(),
+      account_retention_days: accountRetentionDays,
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
@@ -1707,6 +1796,10 @@ async function showSiteModal(site) {
 	    }
 	  if (uaMode === 'custom' && (!data.custom_user_agent || !data.custom_client || !data.custom_version)) {
       Toast.error('请完整填写自定义 User-Agent、Client 和 Version');
+		return;
+	  }
+	  if (!Number.isSafeInteger(data.account_retention_days) || (accountRetentionRaw !== '' && (data.account_retention_days < 1 || data.account_retention_days > 3650))) {
+		Toast.error('保号周期必须为 1 到 3650 天的整数');
 		return;
 	  }
 	  const invalidHeader = upstreamHeaders.some(header => {

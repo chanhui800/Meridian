@@ -25,6 +25,7 @@ function globalSettingsNav(active) {
   return `<aside class="settings-section-nav">
     <span>SETTINGS</span><strong>全局设置导航</strong>
     ${button('system-ui', '系统 UI')}${button('logs', '日志设置')}
+    <a href="#settings-tmdb" class="settings-nav-item ${active === 'tmdb' ? 'active' : ''}">TMDB 设置</a>
     <a href="#settings-tls" class="settings-nav-item ${active === 'tls' ? 'active' : ''}">TLS 设置</a>
     <a href="#telegram-report" class="settings-nav-item ${active === 'telegram' ? 'active' : ''}">Telegram 通知</a>
     <a href="#diagnostics" class="settings-nav-item ${active === 'diagnostics' ? 'active' : ''}">故障诊断</a>

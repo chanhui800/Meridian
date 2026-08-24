@@ -77,6 +77,7 @@ type ProxyManager struct {
 	dynamicInterfaceAddrs   dynamicInterfaceAddrsFunc
 	assetCache              *assetCache
 	siteTLSConfig           *tls.Config
+	accountRetention        *accountRetentionTracker
 }
 
 // siteIngressClosedError means StopSite passed the irreversible boundary: new
@@ -237,6 +238,7 @@ func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 		database:        db,
 	}
 	pm.upstreamHeaderKey = append([]byte(nil), upstreamHeaderKey...)
+	pm.accountRetention = newAccountRetentionTracker(db)
 	return pm
 }
 

@@ -31,6 +31,14 @@ test('global settings navigation and router include backup and restore', () => {
   assert.match(index, /id="page-backup-restore"/);
 });
 
+test('backup and restore content uses the full available settings column', () => {
+  const css = loadSource('web/static/css/style.css');
+  const rule = css.match(/\.backup-restore-content\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(rule, /width:\s*100%/);
+  assert.match(rule, /max-width:\s*none/);
+  assert.doesNotMatch(rule, /max-width:\s*980px/);
+});
+
 test('backup filename parser only returns the attachment filename', () => {
   const source = loadSource('web/static/js/pages/global-settings.js');
   const context = { console, Date, URL, setTimeout, document: {}, API: {}, Toast: {}, Router: {} };

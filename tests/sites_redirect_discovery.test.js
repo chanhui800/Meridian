@@ -263,6 +263,7 @@ function loadModalHarness() {
     sandbox,
     { filename: 'pages/sites.js' },
   );
+  sandbox.loadSites = () => {};
   return { sandbox, document, state };
 }
 
@@ -445,6 +446,11 @@ test('site modal presents proxy and direct main-video choices without discovery 
   assert.match(body, /网盘或 CDN 的 302/);
   assert.match(body, /面板、API、PlaybackInfo、HLS \/ DASH、字幕、图片和必要静态资源/);
   assert.equal(document.getElementById('m-main-video-mode').value, 'proxy');
+  assert.equal(document.getElementById('m-account-retention-days').value, '');
+  assert.equal(document.getElementById('m-account-retention-days').required, false);
+  assert.equal(document.getElementById('m-account-retention'), null);
+  assert.doesNotMatch(body, /视频连续播放|1 分钟/);
+  assert.match(body, /5 次有效播放状态同步/);
   assert.doesNotMatch(body, /播放回源/);
   assert.equal(document.getElementById('m-dynamic-enabled'), null);
   assert.equal(document.getElementById('m-dynamic-profile'), null);
@@ -472,11 +478,30 @@ test('new site submission enables every automatic proxy source without manual pl
   assert.equal(state.creates[0].playback_mode, 'direct');
   assert.equal(state.creates[0].main_video_stream_mode, 'proxy');
   assert.equal(state.creates[0].client_ip_mode, 'both');
+  assert.equal(state.creates[0].account_retention_days, 0);
   assert.deepEqual(state.creates[0].stream_hosts, []);
   assert.equal(state.creates[0].dynamic_discovery_enabled, true);
   assert.equal(state.creates[0].dynamic_profile, 'compatible');
   assert.deepEqual(state.creates[0].dynamic_discovery_sources, ['redirect', 'playback_info', 'hls', 'dash']);
   assert.equal(state.creates[0].dynamic_allow_https_downgrade, true);
+});
+
+test('site retention period is enabled by a value and disabled by an empty field', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  document.getElementById('m-name').value = 'Retention';
+  document.getElementById('m-target-address').value = 'https://origin.example';
+  document.getElementById('m-target-port').value = '443';
+  document.getElementById('m-ingress-mode').value = 'port';
+  document.getElementById('m-ingress-mode').onchange();
+  document.getElementById('m-port').value = '8097';
+  document.getElementById('m-account-retention-days').value = '45';
+
+  await document.getElementById('m-submit').onclick();
+
+  assert.equal(state.errors.length, 0, state.errors.join('; '));
+  assert.equal(state.creates.length, 1);
+  assert.equal(state.creates[0].account_retention_days, 45);
 });
 
 test('enabled discovery policy normalizes sources and rules and omits the response-only revision', () => {
@@ -771,6 +796,7 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
     dynamic_domain_rules: [{ type: 'exact', value: 'media.example' }],
     dynamic_allow_https_downgrade: false,
     dynamic_policy_revision: 2,
+    account_retention_days: 30,
   };
 
   await sandbox.showSiteModal(site);
@@ -784,6 +810,8 @@ test('edit modal hides legacy dynamic observations and configuration controls', 
   assert.deepEqual(state.errors, []);
   assert.equal(document.getElementById('m-main-video-mode').value, 'direct');
   assert.equal(document.getElementById('m-client-ip-mode').value, 'real_ip');
+  assert.equal(document.getElementById('m-account-retention-days').value, '30');
+  assert.equal(document.getElementById('m-account-retention'), null);
 });
 
 test('client IP forwarding selector exposes only the three node-level modes', () => {
@@ -806,11 +834,15 @@ test('main video strategy uses a compact selector and defaults to proxy', () => 
   assert.match(source, /main_video_stream_mode: mainVideoModeSelect\.value/);
 });
 
-test('advanced settings align main video with the separate cache limit row', () => {
+test('advanced settings use independent policy, cache, and limits columns', () => {
   const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
   const style = fs.readFileSync(path.join(STATIC_JS, '..', 'css', 'style.css'), 'utf8');
-  assert.match(source, /class="form-group cache-limit-group"/);
+  assert.match(source, /class="site-form-column site-form-column-policy"/);
+  assert.match(source, /class="site-form-column site-form-column-cache"/);
+  assert.match(source, /class="site-form-column site-form-column-limits"/);
+  assert.match(source, /class="form-group cache-limit-group site-field-cache-limits"/);
   assert.match(source, /class="cache-limit-grid"/);
-  assert.match(style, /"video cache-limits \."/);
-  assert.match(style, /\.cache-limit-group \{ grid-area: cache-limits; \}/);
+  assert.match(style, /\.site-form-columns\s*\{[\s\S]*?grid-template-columns:\s*repeat\(3,/);
+  assert.match(style, /\.site-form-column\s*\{[\s\S]*?flex-direction:\s*column/);
+  assert.doesNotMatch(style, /\.cache-limit-group\s*\{\s*grid-area:/);
 });

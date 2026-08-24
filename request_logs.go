@@ -455,8 +455,23 @@ func requestLogPathHasSuffix(path string, suffixes ...string) bool {
 
 func isRequestLogPlaybackActivityPath(path string) bool {
 	path = strings.TrimSuffix(strings.ToLower(path), "/")
+	_, legacyProgress := legacyPlaybackProgressItemID(path)
 	return path == "/sessions/playing" || strings.HasPrefix(path, "/sessions/playing/") ||
-		path == "/emby/sessions/playing" || strings.HasPrefix(path, "/emby/sessions/playing/")
+		path == "/emby/sessions/playing" || strings.HasPrefix(path, "/emby/sessions/playing/") || legacyProgress
+}
+
+// legacyPlaybackProgressItemID recognizes the old Emby/Jellyfin progress route
+// without returning or retaining its user-id segment.
+func legacyPlaybackProgressItemID(path string) (string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) > 0 && strings.EqualFold(parts[0], "emby") {
+		parts = parts[1:]
+	}
+	if len(parts) != 5 || !strings.EqualFold(parts[0], "users") || strings.TrimSpace(parts[1]) == "" ||
+		!strings.EqualFold(parts[2], "playingitems") || strings.TrimSpace(parts[3]) == "" || !strings.EqualFold(parts[4], "progress") {
+		return "", false
+	}
+	return parts[3], true
 }
 
 func isRequestLogMetadataPath(path string) bool {

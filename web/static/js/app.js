@@ -263,8 +263,10 @@
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
       Router.register('request-logs', renderRequestLogs);
+      Router.register('watch-history', renderWatchHistory);
       Router.register('telegram-report', renderTelegramReport);
       Router.register('settings-tls', renderTLSSettings);
+      Router.register('settings-tmdb', renderTMDBSettings);
       Router.register('global-settings', renderGlobalSettings);
       Router.register('backup-restore', renderBackupRestore);
       Router.register('account', renderAccount);
