@@ -611,7 +611,13 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			defer db.Close()
 
-			for _, column := range []string{"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "client_ip_mode", "public_host", "ingress_mode", "upstream_headers", "traffic_used_in", "traffic_used_out"} {
+			for _, column := range []string{
+				"playback_target_url", "playback_mode", "main_video_stream_mode", "stream_hosts",
+				"custom_user_agent", "custom_client", "custom_version", "client_ip_mode", "public_host", "ingress_mode", "upstream_headers",
+				"watch_history_enabled",
+				"traffic_used_in", "traffic_used_out", "account_retention_days", "account_retention_started_at_ms",
+				"account_retention_last_completed_at_ms", "media_movie_count", "media_series_count", "media_episode_count", "media_count_updated_at_ms",
+			} {
 				var count int
 				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
 					t.Fatalf("inspect %s: %v", column, err)
@@ -636,6 +642,22 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			if site.PublicHost != "" || site.IngressMode != ingressModePort || site.ClientIPMode != clientIPModeBoth || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
 				t.Fatalf("migrated site ingress config = %#v", site)
+			}
+			if site.AccountRetentionDays != 0 || site.AccountRetentionStartedMS != 0 || site.AccountRetentionCompletedMS != 0 ||
+				site.MediaMovieCount != -1 || site.MediaSeriesCount != -1 || site.MediaEpisodeCount != -1 || site.MediaCountUpdatedMS != 0 {
+				t.Fatalf("migrated site retention/library config = %#v", site)
+			}
+			if site.WatchHistoryEnabled {
+				t.Fatal("legacy site unexpectedly enabled viewing history")
+			}
+			for _, table := range []string{"media_items", "watch_sessions", "tmdb_jobs", "tmdb_cache", "tmdb_settings"} {
+				var count int
+				if err := db.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count); err != nil || count != 1 {
+					t.Fatalf("migrated table %s count=%d err=%v", table, count, err)
+				}
+			}
+			if err := db.migrate(); err != nil {
+				t.Fatalf("repeat watch history migration: %v", err)
 			}
 			settings := db.currentSystemSettings()
 			if settings.TrafficBillingMode != trafficBillingModeBidirectional || settings.TrafficResetDay != 1 {
@@ -4992,7 +5014,12 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"dynamic_policy_revision": true,
 		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
 		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,
-		"monthly_traffic": true,
+		"watch_history_enabled":  true,
+		"account_retention_days": true, "account_retention_started_at_ms": true,
+		"account_retention_last_completed_at_ms": true,
+		"media_movie_count":                      true, "media_series_count": true, "media_episode_count": true,
+		"media_count_updated_at_ms": true,
+		"monthly_traffic":           true,
 	}
 	if len(raw) != 2 {
 		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())

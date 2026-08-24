@@ -114,6 +114,27 @@ func TestTelegramReportMessageIsBoundedAtUTF8Boundary(t *testing.T) {
 	}
 }
 
+func TestTelegramReportIncludesAccountRetentionCompletionAndCountdown(t *testing.T) {
+	message := buildTelegramReportMessage(telegramReportStats{
+		GeneratedAt: time.Date(2026, time.August, 24, 20, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+		RetentionSites: []telegramReportRetentionStat{
+			{Name: "已观看", RemainingDays: 30, CompletedToday: true},
+			{Name: "即将到期", RemainingDays: 7},
+			{Name: "已超期", RemainingDays: 0},
+		},
+	})
+	for _, expected := range []string{
+		"🔔 保号提醒",
+		"已观看：✅ 完成保号",
+		"即将到期：🔴 剩余 7 天",
+		"已超期：🔴 已到期",
+	} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("report missing %q:\n%s", expected, message)
+		}
+	}
+}
+
 func TestTelegramReportScheduleChangeRearmsCurrentPeriod(t *testing.T) {
 	app := newTestApp(t)
 	settings := TelegramReportSettings{

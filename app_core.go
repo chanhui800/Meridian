@@ -31,6 +31,20 @@ type App struct {
 	dynamicRouteKey   []byte
 	restartCh         chan struct{}
 	restartOnce       sync.Once
+	tmdb              *tmdbService
+	tmdbOnce          sync.Once
+}
+
+func (a *App) tmdbService() *tmdbService {
+	if a == nil {
+		return nil
+	}
+	a.tmdbOnce.Do(func() {
+		if a.tmdb == nil && a.db != nil {
+			a.tmdb = newTMDBService(a.db, nil)
+		}
+	})
+	return a.tmdb
 }
 
 func (a *App) requestRestart() {

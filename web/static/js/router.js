@@ -6,14 +6,16 @@ const Router = {
     dashboard: ['仪表盘', '反代服务运行概览'],
     sites: ['站点管理', '管理入口、回源与站点策略'],
     'request-logs': ['日志记录', '检索客户端请求与视频流记录'],
+    'watch-history': ['观看历史', '查看各站点最近播放记录与媒体信息'],
     'telegram-report': ['Telegram 日报', '配置请求与流量数据的定时通知'],
     'settings-tls': ['TLS 设置', '管理面板域名、监听端口与证书'],
+    'settings-tmdb': ['TMDB 设置', '配置媒体资料与海报补全'],
     'global-settings': ['全局设置', ''],
     'backup-restore': ['备份与恢复', '创建加密备份或恢复 Meridian 数据'],
     account: ['账户', '查看账户信息并修改用户名或密码'],
     diagnostics: ['故障诊断', '检查入口、回源与运行状态'],
   },
-  parentRoutes: new Set(['settings-tls', 'telegram-report', 'diagnostics', 'backup-restore']),
+  parentRoutes: new Set(['settings-tls', 'settings-tmdb', 'telegram-report', 'diagnostics', 'backup-restore']),
 
   register(path, handler) {
     this.routes[path] = handler;
@@ -36,6 +38,9 @@ const Router = {
     }
     if (previous === 'request-logs' && hash !== 'request-logs' && typeof stopRequestLogRefresh === 'function') {
       stopRequestLogRefresh();
+    }
+    if (previous === 'watch-history' && hash !== 'watch-history' && typeof stopWatchHistoryRefresh === 'function') {
+      stopWatchHistoryRefresh();
     }
 
     this.current = hash;

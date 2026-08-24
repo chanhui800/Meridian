@@ -216,6 +216,55 @@ const API = {
   },
   clearRequestLogs() { return this.request('DELETE', '/api/request-logs'); },
 
+  // Viewing history
+  getWatchHistory(filters) {
+    const params = new URLSearchParams();
+    Object.entries(filters || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+    });
+    const query = params.toString();
+    return this.request('GET', '/api/watch-history' + (query ? '?' + query : ''));
+  },
+  clearWatchHistory(siteId) {
+    const params = new URLSearchParams();
+    if (siteId !== undefined && siteId !== null && siteId !== '') params.set('site_id', String(siteId));
+    const query = params.toString();
+    return this.request('DELETE', '/api/watch-history' + (query ? '?' + query : ''));
+  },
+  deleteWatchHistory(id) {
+    const value = Number(id);
+    if (!Number.isSafeInteger(value) || value <= 0) return Promise.reject(new Error('观看记录无效'));
+    return this.request('DELETE', '/api/watch-history/' + value);
+  },
+  watchHistoryPosterURL(mediaItemId) {
+    const id = Number(mediaItemId);
+    if (!Number.isSafeInteger(id) || id <= 0) return '';
+    return '/api/watch-history/posters/' + id;
+  },
+  watchHistoryBackdropURL(mediaItemId) {
+    const id = Number(mediaItemId);
+    if (!Number.isSafeInteger(id) || id <= 0) return '';
+    return '/api/watch-history/backdrops/' + id;
+  },
+  watchHistoryStillURL(mediaItemId, index) {
+    const id = Number(mediaItemId);
+    const position = Number(index);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(position) || position < 0 || position >= 12) return '';
+    return '/api/watch-history/stills/' + id + '/' + position;
+  },
+  watchHistoryCastURL(mediaItemId, index) {
+    const id = Number(mediaItemId);
+    const position = Number(index);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(position) || position < 0 || position >= 20) return '';
+    return '/api/watch-history/cast/' + id + '/' + position;
+  },
+
+  // TMDB metadata enrichment
+  getTMDBSettings() { return this.request('GET', '/api/tmdb-settings'); },
+  saveTMDBSettings(data) { return this.request('POST', '/api/tmdb-settings', data); },
+  testTMDBSettings(data) { return this.request('POST', '/api/tmdb-settings/test', data || {}); },
+  clearTMDBCache(scope) { return this.request('POST', '/api/tmdb-settings/cache/clear', { scope: scope || 'stale' }); },
+
   // Telegram daily report
   getTelegramReportSettings() { return this.request('GET', '/api/telegram-report'); },
   saveTelegramReportSettings(data) { return this.request('POST', '/api/telegram-report', data); },

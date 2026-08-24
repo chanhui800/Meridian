@@ -114,6 +114,14 @@ func (d *DB) migrateOnce() error {
 		asset_cache_ttl_sec INTEGER NOT NULL DEFAULT 86400,
 		asset_cache_max_bytes BIGINT NOT NULL DEFAULT 536870912,
 		asset_cache_rules TEXT NOT NULL DEFAULT '*/file/*\n*/emby/Items/*/Images/*',
+		watch_history_enabled INTEGER NOT NULL DEFAULT 0,
+		account_retention_days INTEGER NOT NULL DEFAULT 0,
+		account_retention_started_at_ms INTEGER NOT NULL DEFAULT 0,
+		account_retention_last_completed_at_ms INTEGER NOT NULL DEFAULT 0,
+		media_movie_count INTEGER NOT NULL DEFAULT -1,
+		media_series_count INTEGER NOT NULL DEFAULT -1,
+		media_episode_count INTEGER NOT NULL DEFAULT -1,
+		media_count_updated_at_ms INTEGER NOT NULL DEFAULT 0,
 		enabled INTEGER DEFAULT 1,
 		traffic_quota BIGINT DEFAULT 0,
 		traffic_used BIGINT DEFAULT 0,
@@ -151,6 +159,114 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(recorded_at_ms DESC, id DESC);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_category_status ON request_logs(resource_category, status_code, recorded_at_ms DESC);
+	CREATE TABLE IF NOT EXISTS media_items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		upstream_item_id TEXT NOT NULL,
+		media_type TEXT NOT NULL DEFAULT '',
+		title TEXT NOT NULL DEFAULT '',
+		original_title TEXT NOT NULL DEFAULT '',
+		production_year INTEGER NOT NULL DEFAULT 0,
+		series_name TEXT NOT NULL DEFAULT '',
+		season_number INTEGER NOT NULL DEFAULT -1,
+		episode_number INTEGER NOT NULL DEFAULT -1,
+		tmdb_type TEXT NOT NULL DEFAULT '',
+		tmdb_id INTEGER NOT NULL DEFAULT 0,
+		imdb_id TEXT NOT NULL DEFAULT '',
+		tvdb_id TEXT NOT NULL DEFAULT '',
+		overview TEXT NOT NULL DEFAULT '',
+		poster_path TEXT NOT NULL DEFAULT '',
+		cast_json TEXT NOT NULL DEFAULT '[]',
+		details_version INTEGER NOT NULL DEFAULT 0,
+		backdrop_path TEXT NOT NULL DEFAULT '',
+		release_date TEXT NOT NULL DEFAULT '',
+		vote_average REAL NOT NULL DEFAULT 0,
+		genres_json TEXT NOT NULL DEFAULT '[]',
+		status TEXT NOT NULL DEFAULT '',
+		last_air_date TEXT NOT NULL DEFAULT '',
+		next_air_date TEXT NOT NULL DEFAULT '',
+		next_season_number INTEGER NOT NULL DEFAULT -1,
+		next_episode_number INTEGER NOT NULL DEFAULT -1,
+		next_episode_name TEXT NOT NULL DEFAULT '',
+		season_count INTEGER NOT NULL DEFAULT 0,
+		episode_count INTEGER NOT NULL DEFAULT 0,
+		stills_json TEXT NOT NULL DEFAULT '[]',
+		match_status TEXT NOT NULL DEFAULT 'pending',
+		metadata_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		created_at_ms INTEGER NOT NULL,
+		updated_at_ms INTEGER NOT NULL,
+		UNIQUE(site_id, upstream_item_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_media_items_site_updated ON media_items(site_id, updated_at_ms DESC, id DESC);
+	CREATE TABLE IF NOT EXISTS watch_sessions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		media_item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+		session_hash TEXT NOT NULL,
+		started_at_ms INTEGER NOT NULL,
+		last_seen_at_ms INTEGER NOT NULL,
+		stopped_at_ms INTEGER NOT NULL DEFAULT 0,
+		position_ticks INTEGER NOT NULL DEFAULT 0,
+		runtime_ticks INTEGER NOT NULL DEFAULT 0,
+		play_method TEXT NOT NULL DEFAULT '',
+		completed INTEGER NOT NULL DEFAULT 0,
+		UNIQUE(site_id, session_hash)
+	);
+	CREATE INDEX IF NOT EXISTS idx_watch_sessions_time ON watch_sessions(last_seen_at_ms DESC, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_watch_sessions_site_time ON watch_sessions(site_id, last_seen_at_ms DESC, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_watch_sessions_media_time ON watch_sessions(media_item_id, last_seen_at_ms DESC);
+	CREATE TABLE IF NOT EXISTS tmdb_jobs (
+		media_item_id INTEGER PRIMARY KEY REFERENCES media_items(id) ON DELETE CASCADE,
+		state TEXT NOT NULL DEFAULT 'pending',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+		lease_until_ms INTEGER NOT NULL DEFAULT 0,
+		last_error_code TEXT NOT NULL DEFAULT '',
+		revision INTEGER NOT NULL DEFAULT 0,
+		updated_at_ms INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_tmdb_jobs_due ON tmdb_jobs(state, next_attempt_at_ms, lease_until_ms);
+	CREATE TABLE IF NOT EXISTS tmdb_cache (
+		tmdb_type TEXT NOT NULL,
+		tmdb_id INTEGER NOT NULL,
+		language TEXT NOT NULL,
+		title TEXT NOT NULL DEFAULT '',
+		original_title TEXT NOT NULL DEFAULT '',
+		overview TEXT NOT NULL DEFAULT '',
+		release_year INTEGER NOT NULL DEFAULT 0,
+		poster_path TEXT NOT NULL DEFAULT '',
+		cast_json TEXT NOT NULL DEFAULT '[]',
+		details_version INTEGER NOT NULL DEFAULT 0,
+		backdrop_path TEXT NOT NULL DEFAULT '',
+		release_date TEXT NOT NULL DEFAULT '',
+		vote_average REAL NOT NULL DEFAULT 0,
+		genres_json TEXT NOT NULL DEFAULT '[]',
+		status TEXT NOT NULL DEFAULT '',
+		last_air_date TEXT NOT NULL DEFAULT '',
+		next_air_date TEXT NOT NULL DEFAULT '',
+		next_season_number INTEGER NOT NULL DEFAULT -1,
+		next_episode_number INTEGER NOT NULL DEFAULT -1,
+		next_episode_name TEXT NOT NULL DEFAULT '',
+		season_count INTEGER NOT NULL DEFAULT 0,
+		episode_count INTEGER NOT NULL DEFAULT 0,
+		stills_json TEXT NOT NULL DEFAULT '[]',
+		updated_at_ms INTEGER NOT NULL,
+		expires_at_ms INTEGER NOT NULL,
+		PRIMARY KEY(tmdb_type, tmdb_id, language)
+	) WITHOUT ROWID;
+	CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(expires_at_ms);
+	CREATE TABLE IF NOT EXISTS tmdb_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		enabled INTEGER NOT NULL DEFAULT 0,
+		token_ciphertext TEXT NOT NULL DEFAULT '',
+		language TEXT NOT NULL DEFAULT 'zh-CN',
+		history_retention_days INTEGER NOT NULL DEFAULT 90,
+		credential_state TEXT NOT NULL DEFAULT 'unconfigured',
+		last_error_code TEXT NOT NULL DEFAULT '',
+		last_tested_at_ms INTEGER NOT NULL DEFAULT 0,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	INSERT OR IGNORE INTO tmdb_settings (id) VALUES (1);
 	CREATE TABLE IF NOT EXISTS panel_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		panel_domain TEXT NOT NULL DEFAULT '',
@@ -210,6 +326,15 @@ func (d *DB) migrateOnce() error {
 	if err := validateDynamicObservationSchema(ctx, conn); err != nil {
 		return err
 	}
+	var hasTMDBJobRevision int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('tmdb_jobs') WHERE name='revision'").Scan(&hasTMDBJobRevision); err != nil {
+		return err
+	}
+	if hasTMDBJobRevision == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE tmdb_jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
 	var hasSessionVersion int
 	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='session_version'").Scan(&hasSessionVersion); err != nil {
 		return err
@@ -249,6 +374,14 @@ func (d *DB) migrateOnce() error {
 		{"asset_cache_ttl_sec", "ALTER TABLE sites ADD COLUMN asset_cache_ttl_sec INTEGER NOT NULL DEFAULT 86400"},
 		{"asset_cache_max_bytes", "ALTER TABLE sites ADD COLUMN asset_cache_max_bytes BIGINT NOT NULL DEFAULT 536870912"},
 		{"asset_cache_rules", "ALTER TABLE sites ADD COLUMN asset_cache_rules TEXT NOT NULL DEFAULT '*/file/*\n*/emby/Items/*/Images/*'"},
+		{"watch_history_enabled", "ALTER TABLE sites ADD COLUMN watch_history_enabled INTEGER NOT NULL DEFAULT 0"},
+		{"account_retention_days", "ALTER TABLE sites ADD COLUMN account_retention_days INTEGER NOT NULL DEFAULT 0"},
+		{"account_retention_started_at_ms", "ALTER TABLE sites ADD COLUMN account_retention_started_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"account_retention_last_completed_at_ms", "ALTER TABLE sites ADD COLUMN account_retention_last_completed_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"media_movie_count", "ALTER TABLE sites ADD COLUMN media_movie_count INTEGER NOT NULL DEFAULT -1"},
+		{"media_series_count", "ALTER TABLE sites ADD COLUMN media_series_count INTEGER NOT NULL DEFAULT -1"},
+		{"media_episode_count", "ALTER TABLE sites ADD COLUMN media_episode_count INTEGER NOT NULL DEFAULT -1"},
+		{"media_count_updated_at_ms", "ALTER TABLE sites ADD COLUMN media_count_updated_at_ms INTEGER NOT NULL DEFAULT 0"},
 		{"sort_order", "ALTER TABLE sites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 	} {
 		exists, err := sqliteColumnExists(ctx, conn, migration.column)
@@ -265,6 +398,101 @@ func (d *DB) migrateOnce() error {
 				}
 			}
 		}
+	}
+	for _, migration := range []struct {
+		table, column, sql string
+	}{
+		{"media_items", "cast_json", "ALTER TABLE media_items ADD COLUMN cast_json TEXT NOT NULL DEFAULT '[]'"},
+		{"tmdb_cache", "cast_json", "ALTER TABLE tmdb_cache ADD COLUMN cast_json TEXT NOT NULL DEFAULT '[]'"},
+		{"media_items", "details_version", "ALTER TABLE media_items ADD COLUMN details_version INTEGER NOT NULL DEFAULT 0"},
+		{"tmdb_cache", "details_version", "ALTER TABLE tmdb_cache ADD COLUMN details_version INTEGER NOT NULL DEFAULT 0"},
+		{"media_items", "backdrop_path", "ALTER TABLE media_items ADD COLUMN backdrop_path TEXT NOT NULL DEFAULT ''"},
+		{"media_items", "release_date", "ALTER TABLE media_items ADD COLUMN release_date TEXT NOT NULL DEFAULT ''"},
+		{"media_items", "vote_average", "ALTER TABLE media_items ADD COLUMN vote_average REAL NOT NULL DEFAULT 0"},
+		{"media_items", "genres_json", "ALTER TABLE media_items ADD COLUMN genres_json TEXT NOT NULL DEFAULT '[]'"},
+		{"media_items", "status", "ALTER TABLE media_items ADD COLUMN status TEXT NOT NULL DEFAULT ''"},
+		{"media_items", "last_air_date", "ALTER TABLE media_items ADD COLUMN last_air_date TEXT NOT NULL DEFAULT ''"},
+		{"media_items", "next_air_date", "ALTER TABLE media_items ADD COLUMN next_air_date TEXT NOT NULL DEFAULT ''"},
+		{"media_items", "next_season_number", "ALTER TABLE media_items ADD COLUMN next_season_number INTEGER NOT NULL DEFAULT -1"},
+		{"media_items", "next_episode_number", "ALTER TABLE media_items ADD COLUMN next_episode_number INTEGER NOT NULL DEFAULT -1"},
+		{"media_items", "next_episode_name", "ALTER TABLE media_items ADD COLUMN next_episode_name TEXT NOT NULL DEFAULT ''"},
+		{"media_items", "season_count", "ALTER TABLE media_items ADD COLUMN season_count INTEGER NOT NULL DEFAULT 0"},
+		{"media_items", "episode_count", "ALTER TABLE media_items ADD COLUMN episode_count INTEGER NOT NULL DEFAULT 0"},
+		{"media_items", "stills_json", "ALTER TABLE media_items ADD COLUMN stills_json TEXT NOT NULL DEFAULT '[]'"},
+		{"tmdb_cache", "backdrop_path", "ALTER TABLE tmdb_cache ADD COLUMN backdrop_path TEXT NOT NULL DEFAULT ''"},
+		{"tmdb_cache", "release_date", "ALTER TABLE tmdb_cache ADD COLUMN release_date TEXT NOT NULL DEFAULT ''"},
+		{"tmdb_cache", "vote_average", "ALTER TABLE tmdb_cache ADD COLUMN vote_average REAL NOT NULL DEFAULT 0"},
+		{"tmdb_cache", "genres_json", "ALTER TABLE tmdb_cache ADD COLUMN genres_json TEXT NOT NULL DEFAULT '[]'"},
+		{"tmdb_cache", "status", "ALTER TABLE tmdb_cache ADD COLUMN status TEXT NOT NULL DEFAULT ''"},
+		{"tmdb_cache", "last_air_date", "ALTER TABLE tmdb_cache ADD COLUMN last_air_date TEXT NOT NULL DEFAULT ''"},
+		{"tmdb_cache", "next_air_date", "ALTER TABLE tmdb_cache ADD COLUMN next_air_date TEXT NOT NULL DEFAULT ''"},
+		{"tmdb_cache", "next_season_number", "ALTER TABLE tmdb_cache ADD COLUMN next_season_number INTEGER NOT NULL DEFAULT -1"},
+		{"tmdb_cache", "next_episode_number", "ALTER TABLE tmdb_cache ADD COLUMN next_episode_number INTEGER NOT NULL DEFAULT -1"},
+		{"tmdb_cache", "next_episode_name", "ALTER TABLE tmdb_cache ADD COLUMN next_episode_name TEXT NOT NULL DEFAULT ''"},
+		{"tmdb_cache", "season_count", "ALTER TABLE tmdb_cache ADD COLUMN season_count INTEGER NOT NULL DEFAULT 0"},
+		{"tmdb_cache", "episode_count", "ALTER TABLE tmdb_cache ADD COLUMN episode_count INTEGER NOT NULL DEFAULT 0"},
+		{"tmdb_cache", "stills_json", "ALTER TABLE tmdb_cache ADD COLUMN stills_json TEXT NOT NULL DEFAULT '[]'"},
+	} {
+		var found int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", migration.table, migration.column).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	// Detail payloads are copied into media_items for fast history rendering.
+	// Keep a schema marker so a richer TMDB payload (cast avatars, stills, etc.)
+	// can invalidate old copies exactly once instead of serving them forever.
+	var tmdbDetailsSchemaVersion int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('tmdb_settings') WHERE name='details_schema_version'").Scan(&tmdbDetailsSchemaVersion); err != nil {
+		return err
+	}
+	if tmdbDetailsSchemaVersion == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE tmdb_settings ADD COLUMN details_schema_version INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT details_schema_version FROM tmdb_settings WHERE id=1").Scan(&tmdbDetailsSchemaVersion); err != nil {
+		return err
+	}
+	if tmdbDetailsSchemaVersion < tmdbDetailsVersion {
+		if _, err := conn.ExecContext(ctx, `UPDATE media_items SET overview='', poster_path='', backdrop_path='', release_date='',
+			vote_average=0, genres_json='[]', status='', last_air_date='', next_air_date='', next_season_number=-1,
+			next_episode_number=-1, next_episode_name='', season_count=0, episode_count=0, stills_json='[]', cast_json='[]',
+			details_version=0, match_status='pending', metadata_updated_at_ms=0,
+			updated_at_ms=MAX(updated_at_ms,strftime('%s','now')*1000)`); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO tmdb_jobs
+			(media_item_id, state, attempts, next_attempt_at_ms, lease_until_ms, last_error_code, revision, updated_at_ms)
+			SELECT id, 'pending', 0, 0, 0, '', 0, strftime('%s','now')*1000 FROM media_items`); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE tmdb_jobs SET state='pending', attempts=0,
+			next_attempt_at_ms=0, lease_until_ms=0, last_error_code='', revision=revision+1,
+			updated_at_ms=strftime('%s','now')*1000`); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "DELETE FROM tmdb_cache"); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "UPDATE tmdb_settings SET details_schema_version=? WHERE id=1", tmdbDetailsVersion); err != nil {
+			return err
+		}
+	}
+	// Existing records were enriched before the extended detail fields existed.
+	// Queue them once for a fresh TMDB detail fetch while keeping the marker
+	// stable across subsequent startups.
+	if _, err := conn.ExecContext(ctx, `UPDATE tmdb_jobs SET state='pending', attempts=0,
+		next_attempt_at_ms=0, lease_until_ms=0, last_error_code='', updated_at_ms=strftime('%s','now')*1000
+		WHERE media_item_id IN (SELECT id FROM media_items WHERE metadata_updated_at_ms>0 AND details_version=0)`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE media_items SET details_version=1 WHERE metadata_updated_at_ms>0 AND details_version=0`); err != nil {
+		return err
 	}
 	for _, migration := range []struct{ column, sql string }{
 		{"traffic_billing_mode", "ALTER TABLE system_settings ADD COLUMN traffic_billing_mode TEXT NOT NULL DEFAULT 'bidirectional'"},

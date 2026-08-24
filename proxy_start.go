@@ -172,6 +172,16 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			applySiteForwardedHost(proxyReq.Out.Header, proxyReq.In, site)
 			configuredHeaders.apply(proxyReq.Out.Header, upstream)
+			if proxyReq.In != nil && proxyReq.In.URL != nil && isMediaLibraryCountsPath(proxyReq.In.URL.Path) {
+				// Keep the small count response directly inspectable without ever
+				// storing or replaying the client's authentication material.
+				proxyReq.Out.Header.Set("Accept-Encoding", "identity")
+			}
+			if proxyReq.In != nil && isWatchHistoryMetadataRequest(proxyReq.In) {
+				// Metadata observation only accepts identity-encoded JSON; preserve
+				// the original response while making the bounded observer reliable.
+				proxyReq.Out.Header.Set("Accept-Encoding", "identity")
+			}
 			// Backup lines apply to the configured main upstream, including proxied
 			// playback reads and replayable PlaybackInfo requests. Separate playback
 			// targets, direct video, redirects and WebSockets keep their own routes.
@@ -206,6 +216,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			if err := captureMediaLibraryCounts(resp, pm.database, site.ID); err != nil {
+				return err
+			}
+			if site.WatchHistoryEnabled {
+				if err := captureWatchHistoryMetadata(resp, pm.database, site.ID); err != nil {
+					return err
+				}
+			}
 			dynamicResponse := responseIsDynamic(resp)
 			expectedSource := dynamicResponseExpectedStructuredSource(resp)
 			rewriteRelative := ingressUsesPath(site.IngressMode) && dynamicIssuer != nil
@@ -286,10 +304,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 		defer inst.endHTTPRequest(requestController)
 		normalizeEmbeddedDynamicCapabilityRequestPath(r.URL)
+		requestStartedAt := time.Now()
 		clientRequestContext := r.Context()
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
 		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies, policy)
+		watchHistoryCapture := startWatchHistoryCapture(site, r, requestLogEntry.ResourceCategory, pm.database)
 		defer func() {
+			requestEndedAt := time.Now()
 			requestLogEntry.StatusCode = requestLogWriter.StatusCode()
 			if errors.Is(clientRequestContext.Err(), context.Canceled) {
 				requestLogEntry.StatusCode = clientClosedRequestStatus
@@ -298,6 +319,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
 				requestLogEntry.BackendAddress = tracker.Get()
 			}
+			if event, ok := watchHistoryEventFromCapture(watchHistoryCapture, pm.database, site, r, inst.trustedProxies, requestLogEntry.StatusCode, requestEndedAt); ok {
+				pm.database.EnqueueWatchHistory(event)
+			}
+			pm.accountRetention.Observe(site, r, inst.trustedProxies, requestLogEntry.ResourceCategory, requestLogEntry.StatusCode, requestStartedAt, requestEndedAt)
 			pm.database.EnqueueRequestLog(requestLogEntry)
 		}()
 		w = requestLogWriter
