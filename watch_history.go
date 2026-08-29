@@ -1542,6 +1542,8 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 		args = append(args, filter.Query, filter.Query, filter.Query)
 	}
 	args = append(args, watchHistoryActiveLimit)
+	// #nosec G202 -- conditions contains only fixed SQL fragments selected by
+	// validated filters; every caller-supplied value remains a bound parameter.
 	rows, err := d.db.Query(`SELECT ws.id, ws.site_id, s.name, mi.id, mi.upstream_item_id, mi.media_type,
 		mi.title, mi.original_title, mi.production_year, mi.series_name, mi.season_number, mi.episode_number,
 		mi.tmdb_type, mi.tmdb_id, mi.overview, mi.poster_path, mi.backdrop_path, mi.release_date, mi.vote_average,
