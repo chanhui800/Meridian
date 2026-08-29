@@ -1,17 +1,21 @@
 // Viewing history page
 const WATCH_HISTORY_PAGE_SIZE = 24;
-const WATCH_HISTORY_REFRESH_INTERVAL_MS = 15000;
+const WATCH_HISTORY_REFRESH_INTERVAL_MS = 5000;
 const WATCH_HISTORY_TICKS_PER_SECOND = 10000000;
 let watchHistoryLoadGeneration = 0;
 let watchHistoryRefreshTimer = 0;
 let watchHistoryKeydownHandler = null;
 let watchHistoryDetailItemID = '';
+let watchHistoryDetailSource = 'history';
 let watchHistorySitesCache = [];
+let watchHistoryRenderedItemsSignature = '';
+let watchHistoryRenderedLiveSignature = '';
 let watchHistoryState = {
   siteId: 'all',
   mediaType: 'all',
   range: 'all',
   items: [],
+  liveItems: [],
   nextCursor: '',
   hasMore: false,
   loading: false,
@@ -19,6 +23,7 @@ let watchHistoryState = {
   tmdbInvalid: false,
   sitesLoadError: '',
   tmdbLoadError: '',
+  liveLoadError: '',
 };
 
 function watchHistoryTypeLabel(value) {
@@ -132,6 +137,13 @@ function watchHistoryCardImageURL(item) {
   return watchHistoryPosterURL(item) || watchHistoryBackdropURL(item) || watchHistoryStillURLs(item)[0] || '';
 }
 
+// Live playback is presented as a horizontal media moment. Match the detail
+// view's image priority so the card uses a backdrop first, rather than the
+// portrait artwork reserved for library cards.
+function watchHistoryLiveCardImageURLs(item) {
+  return watchHistoryBackgroundURLs(item);
+}
+
 function watchHistoryStillURLs(item) {
   if (!item) return [];
   const mediaItemID = Number(item.media_item_id);
@@ -163,7 +175,13 @@ function watchHistoryEpisodeLabel(item) {
   return [series, index].filter(Boolean).join(' · ');
 }
 
-function watchHistoryCardHTML(item, index) {
+function watchHistoryIdentityLabel(item) {
+  const user = String((item && (item.user_name || item.user_id)) || '').trim();
+  const client = String((item && item.client_name) || '').trim();
+  return [user, client].filter(Boolean).join(' · ');
+}
+
+function watchHistoryCardHTML(item, index, context = {}) {
   const title = String((item && (item.title || item.name)) || '').trim() || '未知媒体';
   const mediaType = String((item && (item.media_type || item.item_type)) || '').toLowerCase();
   const episodeLabel = watchHistoryEpisodeLabel(item);
@@ -177,14 +195,19 @@ function watchHistoryCardHTML(item, index) {
   const progressRounded = Math.round(progress);
   const elapsedLabel = watchHistoryElapsedLabel(item);
   const playCount = Number(item && item.play_count);
-  const posterURL = watchHistoryCardImageURL(item);
+  const source = context && context.source === 'live' ? 'live' : 'history';
+  const live = context && context.live === true;
+  const imageURLs = live ? watchHistoryLiveCardImageURLs(item) : [watchHistoryCardImageURL(item)].filter(Boolean);
+  const posterURL = imageURLs[0] || '';
+  const imageFallbacks = imageURLs.slice(1);
   const pending = watchHistoryState.tmdbConfigured === true && String(item && (item.match_status || item.metadata_status) || '').toLowerCase() === 'pending';
   const safeIndex = Number.isSafeInteger(Number(index)) ? Number(index) : 0;
-  const titleID = `watch-history-title-${safeIndex}`;
+  const titleID = `watch-history-title-${source}-${safeIndex}`;
+  const identity = watchHistoryIdentityLabel(item);
 
-  return `<article class="watch-history-card" role="button" tabindex="0" data-history-index="${safeIndex}" aria-labelledby="${titleID}" aria-haspopup="dialog">
+  return `<article class="watch-history-card${live ? ' is-live' : ''}" role="button" tabindex="0" data-history-index="${safeIndex}" data-history-source="${source}" aria-labelledby="${titleID}" aria-haspopup="dialog">
     <div class="watch-history-poster">
-      ${posterURL ? `<img src="${posterURL}" alt="" loading="lazy" decoding="async">` : ''}
+      ${posterURL ? `<img src="${posterURL}"${imageFallbacks.length ? ` data-watch-history-card-fallbacks="${esc(JSON.stringify(imageFallbacks))}"` : ''} alt="" loading="lazy" decoding="async">` : ''}
       <span class="watch-history-poster-fallback" aria-hidden="true">
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m8 10 3 2-3 2z"/><path d="M15 8h3M15 12h3M15 16h3"/></svg>
       </span>
@@ -195,11 +218,12 @@ function watchHistoryCardHTML(item, index) {
     <div class="watch-history-card-body">
       <div class="watch-history-card-heading">
         <h2 id="${titleID}">${esc(title)}</h2>
-        ${pending ? '<span class="watch-history-pending">补全中</span>' : ''}
+        ${live ? '<span class="watch-history-live-badge"><i></i>正在观看</span>' : (pending ? '<span class="watch-history-pending">补全中</span>' : '')}
       </div>
       ${secondary ? `<p class="watch-history-secondary">${esc(secondary)}</p>` : ''}
       <p class="watch-history-site"><span>${esc(siteName)}</span>${Number.isInteger(playCount) && playCount > 1 ? `<b>播放 ${playCount} 次</b>` : ''}</p>
-      <time class="watch-history-time" ${isoTime ? `datetime="${isoTime}"` : ''}>${esc(timeText)}</time>
+      ${identity ? `<p class="watch-history-identity">${esc(identity)}</p>` : ''}
+      <time class="watch-history-time" ${isoTime ? `datetime="${isoTime}"` : ''}>${live ? `同步于 ${esc(timeText)}` : esc(timeText)}</time>
     </div>
     <button class="watch-history-card-delete" type="button" hidden aria-label="删除${esc(title)}">删除</button>
   </article>`;
@@ -295,6 +319,8 @@ function watchHistoryDetailsHTML(item) {
   const ratingText = Number.isFinite(rating) && rating > 0 ? `${Math.min(10, Math.max(0, rating)).toFixed(1)} / 10` : '';
   const episodeInfo = watchHistoryEpisodeInfo(item, mediaType);
   const updateInfo = watchHistoryUpdateInfo(item, mediaType);
+  const viewerName = String((item && (item.user_name || item.user_id)) || '').trim();
+  const clientName = String((item && item.client_name) || '').trim();
   const stillURLs = watchHistoryStillURLs(item);
   const cast = watchHistoryCast(item);
   const castHTML = cast.length
@@ -311,7 +337,7 @@ function watchHistoryDetailsHTML(item) {
       <div class="watch-history-detail-main">
       <div class="watch-history-detail-heading"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><h2 id="watch-history-detail-title">${esc(title)}</h2></div>
       ${secondary ? `<p class="watch-history-detail-secondary">${esc(secondary)}</p>` : ''}
-      <dl class="watch-history-detail-meta"><div><dt>站点</dt><dd>${esc(siteName)}</dd></div><div><dt>观看时间</dt><dd>${esc(watchHistoryFormatTime(item && (item.last_seen_at_ms || item.started_at_ms)))}</dd></div>${releaseDate ? `<div><dt>上映时间</dt><dd>${esc(releaseDate)}</dd></div>` : ''}${genres.length ? `<div><dt>影片类型</dt><dd>${esc(genres.join(' · '))}</dd></div>` : ''}${ratingText ? `<div><dt>评分</dt><dd class="watch-history-detail-rating">★ ${esc(ratingText)}</dd></div>` : ''}${episodeInfo ? `<div><dt>集数信息</dt><dd>${esc(episodeInfo)}</dd></div>` : ''}<div><dt>观看进度</dt><dd>${timeProgress ? `${esc(timeProgress)} · ` : ''}${progress}%</dd></div>${playMethod ? `<div><dt>播放方式</dt><dd>${esc(playMethod)}</dd></div>` : ''}</dl>
+      <dl class="watch-history-detail-meta"><div><dt>站点</dt><dd>${esc(siteName)}</dd></div><div><dt>观看时间</dt><dd>${esc(watchHistoryFormatTime(item && (item.last_seen_at_ms || item.started_at_ms)))}</dd></div>${viewerName ? `<div><dt>观看用户</dt><dd>${esc(viewerName)}</dd></div>` : ''}${clientName ? `<div><dt>播放客户端</dt><dd>${esc(clientName)}</dd></div>` : ''}${releaseDate ? `<div><dt>上映时间</dt><dd>${esc(releaseDate)}</dd></div>` : ''}${genres.length ? `<div><dt>影片类型</dt><dd>${esc(genres.join(' · '))}</dd></div>` : ''}${ratingText ? `<div><dt>评分</dt><dd class="watch-history-detail-rating">★ ${esc(ratingText)}</dd></div>` : ''}${episodeInfo ? `<div><dt>集数信息</dt><dd>${esc(episodeInfo)}</dd></div>` : ''}<div><dt>观看进度</dt><dd>${timeProgress ? `${esc(timeProgress)} · ` : ''}${progress}%</dd></div>${playMethod ? `<div><dt>播放方式</dt><dd>${esc(playMethod)}</dd></div>` : ''}</dl>
       ${updateInfo ? `<section class="watch-history-detail-section watch-history-detail-update"><h3>更新信息</h3><p>${esc(updateInfo)}</p></section>` : ''}
       <section class="watch-history-detail-section"><h3>简介</h3><p>${overview ? esc(overview) : '暂无简介，等待 TMDB 资料补全。'}</p></section>
       <section class="watch-history-detail-section"><h3>演员表</h3>${castHTML}</section>
@@ -321,13 +347,19 @@ function watchHistoryDetailsHTML(item) {
   </div>`;
 }
 
-function watchHistoryOpenDetails(index) {
+function watchHistoryItemsForSource(source) {
+  return source === 'live' ? watchHistoryState.liveItems : watchHistoryState.items;
+}
+
+function watchHistoryOpenDetails(index, source = 'history') {
   const modal = document.getElementById('watch-history-detail-modal');
   const content = document.getElementById('watch-history-detail-content');
-  const item = watchHistoryState.items[Number(index)];
+  const normalizedSource = source === 'live' ? 'live' : 'history';
+  const item = watchHistoryItemsForSource(normalizedSource)[Number(index)];
   if (!modal || !content || !item) return;
   watchHistoryCloseImageViewer();
   watchHistoryDetailItemID = String(item && item.id || '');
+  watchHistoryDetailSource = normalizedSource;
   content.innerHTML = watchHistoryDetailsHTML(item);
   watchHistoryBindDetailImages(content);
   modal.hidden = false;
@@ -343,6 +375,7 @@ function watchHistoryCloseDetails() {
   modal.hidden = true;
   document.body.classList.remove('watch-history-dialog-open');
   watchHistoryDetailItemID = '';
+  watchHistoryDetailSource = 'history';
 }
 
 function watchHistoryOpenImageViewer(source, alt) {
@@ -374,7 +407,7 @@ function watchHistoryRefreshOpenDetails() {
   const modal = document.getElementById('watch-history-detail-modal');
   const content = document.getElementById('watch-history-detail-content');
   if (!modal || modal.hidden || !content || !watchHistoryDetailItemID) return;
-  const item = watchHistoryState.items.find(candidate => String(candidate && candidate.id || '') === watchHistoryDetailItemID);
+  const item = watchHistoryItemsForSource(watchHistoryDetailSource).find(candidate => String(candidate && candidate.id || '') === watchHistoryDetailItemID);
   if (!item) {
     watchHistoryCloseImageViewer();
     watchHistoryCloseDetails();
@@ -446,6 +479,7 @@ async function watchHistoryDeleteItem(item) {
     const result = typeof API !== 'undefined' && typeof API.deleteWatchHistory === 'function' ? await API.deleteWatchHistory(historyID) : null;
     if (!result) return;
     watchHistoryState.items = watchHistoryState.items.filter(candidate => Number(candidate && candidate.id) !== historyID);
+    watchHistoryState.liveItems = watchHistoryState.liveItems.filter(candidate => Number(candidate && candidate.id) !== historyID);
     if (watchHistoryDetailItemID === String(historyID)) watchHistoryCloseDetails();
     watchHistoryRenderItems();
     Toast.success('观看记录已删除');
@@ -468,11 +502,12 @@ function watchHistoryCancelLongPress() {
   watchHistoryLongPressTimer = 0;
 }
 
-function watchHistoryBindCards() {
-  const grid = document.getElementById('watch-history-grid');
+function watchHistoryBindCards(grid) {
+  grid = grid || document.getElementById('watch-history-grid');
   if (!grid) return;
+  watchHistoryBindCardImages(grid);
   grid.querySelectorAll('.watch-history-card[data-history-index]').forEach(card => {
-    const open = () => watchHistoryOpenDetails(card.dataset.historyIndex);
+    const open = () => watchHistoryOpenDetails(card.dataset.historyIndex, card.dataset.historySource);
     const deleteButton = card.querySelector('.watch-history-card-delete');
     card.addEventListener('pointerdown', () => watchHistoryStartLongPress(card), { passive: true });
     card.addEventListener('pointerup', watchHistoryCancelLongPress, { passive: true });
@@ -512,6 +547,26 @@ function watchHistoryBindCards() {
         open();
       }
     });
+  });
+}
+
+function watchHistoryBindCardImages(root) {
+  if (!root) return;
+  root.querySelectorAll('.watch-history-poster img').forEach(image => {
+    const markLoaded = () => image.closest('.watch-history-poster')?.classList.add('has-image');
+    image.addEventListener('load', markLoaded, { once: true });
+    image.addEventListener('error', () => {
+      let fallbacks = [];
+      try { fallbacks = JSON.parse(image.getAttribute('data-watch-history-card-fallbacks') || '[]'); } catch (_) { fallbacks = []; }
+      const next = String(fallbacks.shift() || '');
+      if (next) {
+        image.setAttribute('data-watch-history-card-fallbacks', JSON.stringify(fallbacks));
+        image.src = next;
+        return;
+      }
+      image.remove();
+    });
+    if (image.complete && image.naturalWidth > 0) markLoaded();
   });
 }
 
@@ -616,38 +671,87 @@ function watchHistoryRenderNotice() {
   notice.hidden = messages.length === 0;
 }
 
-function watchHistoryRenderItems(errorMessage) {
+function watchHistoryItemsRenderSignature(items, context = '') {
+  const source = Array.isArray(items) ? items : [];
+  return JSON.stringify([context, source.map(item => [
+    item && item.id, item && item.site_id, item && item.media_item_id, item && item.upstream_item_id,
+    item && item.media_type, item && item.title, item && item.series_name,
+    item && item.last_seen_at_ms, item && item.position_ticks, item && item.runtime_ticks,
+    item && item.completed, item && item.poster_path, item && item.backdrop_path,
+    item && item.match_status, item && item.user_name, item && item.client_name,
+  ])]);
+}
+
+function watchHistoryRenderLive() {
+  const section = document.getElementById('watch-history-live-section');
+  const grid = document.getElementById('watch-history-live-grid');
+  const count = document.getElementById('watch-history-live-count');
+  const description = document.getElementById('watch-history-live-description');
+  if (!section || !grid || !count || !description) return;
+  const items = Array.isArray(watchHistoryState.liveItems) ? watchHistoryState.liveItems : [];
+  count.textContent = String(items.length);
+  if (watchHistoryState.liveLoadError) {
+    section.hidden = false;
+    description.textContent = `正在观看读取失败：${watchHistoryState.liveLoadError}`;
+    const signature = `error:${watchHistoryState.liveLoadError}`;
+    if (signature !== watchHistoryRenderedLiveSignature) grid.innerHTML = '';
+    watchHistoryRenderedLiveSignature = signature;
+    return;
+  }
+  section.hidden = items.length === 0;
+  description.textContent = items.length === 1 ? '有 1 个播放会话正在同步。' : `有 ${items.length} 个播放会话正在同步。`;
+  const signature = watchHistoryItemsRenderSignature(items, 'live');
+  if (signature === watchHistoryRenderedLiveSignature) return;
+  grid.innerHTML = items.map((item, index) => watchHistoryCardHTML(item, index, { source: 'live', live: true })).join('');
+  watchHistoryRenderedLiveSignature = signature;
+  watchHistoryBindCards(grid);
+}
+
+function watchHistoryRenderItems(errorMessage, options = {}) {
   const grid = document.getElementById('watch-history-grid');
   const status = document.getElementById('watch-history-status');
   const more = document.getElementById('watch-history-more');
   if (!grid || !status || !more) return;
-  grid.setAttribute('aria-busy', String(watchHistoryState.loading));
+  // A timer refresh must stay visually silent. In particular, replacing an
+  // empty state with skeleton cards every five seconds is perceived as a page
+  // flash even when the response has not changed.
+  const showLoading = watchHistoryState.loading && options.background !== true;
+  grid.setAttribute('aria-busy', String(showLoading));
 
+  let signature = '';
+  let html = '';
+  let bindCards = false;
   if (errorMessage && watchHistoryState.items.length === 0) {
-    grid.innerHTML = `<div class="watch-history-empty watch-history-error"><strong>观看历史读取失败</strong><span>${esc(errorMessage)}</span><button type="button" class="btn-ghost" id="watch-history-retry">重新加载</button></div>`;
-    document.getElementById('watch-history-retry').onclick = () => loadWatchHistory(true);
-  } else if (watchHistoryState.loading && watchHistoryState.items.length === 0) {
-    grid.innerHTML = Array.from({ length: 8 }, () => '<div class="watch-history-card watch-history-skeleton" aria-hidden="true"><div class="watch-history-poster"></div><div class="watch-history-card-body"><span></span><span></span><span></span></div></div>').join('');
+    signature = `error:${errorMessage}`;
+    html = `<div class="watch-history-empty watch-history-error"><strong>观看历史读取失败</strong><span>${esc(errorMessage)}</span><button type="button" class="btn-ghost" id="watch-history-retry">重新加载</button></div>`;
+  } else if (showLoading && watchHistoryState.items.length === 0) {
+    signature = 'loading';
+    html = Array.from({ length: 8 }, () => '<div class="watch-history-card watch-history-skeleton" aria-hidden="true"><div class="watch-history-poster"></div><div class="watch-history-card-body"><span></span><span></span><span></span></div></div>').join('');
   } else if (watchHistoryState.items.length === 0) {
-    grid.innerHTML = `<div class="watch-history-empty"><strong>暂无观看历史</strong><span>${esc(watchHistoryEmptyMessage())}</span></div>`;
+    signature = `empty:${watchHistoryEmptyMessage()}`;
+    html = `<div class="watch-history-empty"><strong>暂无观看历史</strong><span>${esc(watchHistoryEmptyMessage())}</span></div>`;
   } else {
-    grid.innerHTML = watchHistoryState.items.map((item, index) => watchHistoryCardHTML(item, index)).join('');
-    watchHistoryBindCards();
-    grid.querySelectorAll('.watch-history-poster img').forEach(image => {
-      image.addEventListener('load', () => image.closest('.watch-history-poster')?.classList.add('has-image'), { once: true });
-      image.addEventListener('error', () => {
-        image.remove();
-      }, { once: true });
-      if (image.complete && image.naturalWidth > 0) image.closest('.watch-history-poster')?.classList.add('has-image');
-    });
+    signature = watchHistoryItemsRenderSignature(watchHistoryState.items, `history:${watchHistoryState.tmdbConfigured}:${watchHistoryState.tmdbInvalid}`);
+    html = watchHistoryState.items.map((item, index) => watchHistoryCardHTML(item, index)).join('');
+    bindCards = true;
+  }
+  if (signature !== watchHistoryRenderedItemsSignature) {
+    grid.innerHTML = html;
+    watchHistoryRenderedItemsSignature = signature;
+    if (errorMessage && watchHistoryState.items.length === 0) {
+      const retry = document.getElementById('watch-history-retry');
+      if (retry) retry.onclick = () => loadWatchHistory(true);
+    } else if (bindCards) {
+      watchHistoryBindCards(grid);
+    }
   }
 
   more.hidden = !watchHistoryState.hasMore || watchHistoryState.items.length === 0;
-  more.disabled = watchHistoryState.loading;
-  more.textContent = watchHistoryState.loading && watchHistoryState.items.length > 0 ? '正在加载…' : '加载更多';
+  more.disabled = showLoading;
+  more.textContent = showLoading && watchHistoryState.items.length > 0 ? '正在加载…' : '加载更多';
   status.textContent = errorMessage
     ? `读取失败：${errorMessage}`
-    : (watchHistoryState.loading ? '正在读取观看历史…' : `当前显示 ${watchHistoryState.items.length} 条记录`);
+    : (showLoading ? '正在读取观看历史…' : `当前显示 ${watchHistoryState.items.length} 条记录`);
   watchHistoryRenderNotice();
   watchHistoryRefreshOpenDetails();
 }
@@ -659,6 +763,13 @@ function watchHistoryFilters(reset = false) {
   const fromMS = watchHistoryRangeStart(watchHistoryState.range);
   if (fromMS > 0) filters.from_ms = Math.trunc(fromMS);
   if (!reset && watchHistoryState.nextCursor) filters.cursor = watchHistoryState.nextCursor;
+  return filters;
+}
+
+function watchHistoryLiveFilters() {
+  const filters = {};
+  if (watchHistoryState.siteId !== 'all') filters.site_id = watchHistoryState.siteId;
+  if (watchHistoryState.mediaType !== 'all') filters.media_type = watchHistoryState.mediaType;
   return filters;
 }
 
@@ -692,6 +803,7 @@ async function loadWatchHistory(reset, options = {}) {
   const generation = ++watchHistoryLoadGeneration;
   if (reset && !background) {
     watchHistoryState.items = [];
+    watchHistoryState.liveItems = [];
     watchHistoryState.nextCursor = '';
     watchHistoryState.hasMore = false;
   } else if (reset) {
@@ -701,7 +813,7 @@ async function loadWatchHistory(reset, options = {}) {
     // timer ticked.
   }
   watchHistoryState.loading = true;
-  watchHistoryRenderItems();
+  watchHistoryRenderItems(undefined, { background });
 
   try {
     const siteRequest = reset || watchHistorySitesCache.length === 0
@@ -722,10 +834,14 @@ async function loadWatchHistory(reset, options = {}) {
         invalid: watchHistoryState.tmdbInvalid,
         error: watchHistoryState.tmdbLoadError,
       });
-    const [siteResult, response, tmdbResult] = await Promise.all([
+    const liveRequest = API.getActiveWatchHistory(watchHistoryLiveFilters())
+      .then(response => ({ response, error: '' }))
+      .catch(error => ({ response: null, error: watchHistoryAuxiliaryError(error, '请求失败') }));
+    const [siteResult, response, tmdbResult, liveResult] = await Promise.all([
       siteRequest,
       API.getWatchHistory(watchHistoryFilters(reset)),
       tmdbRequest,
+      liveRequest,
     ]);
     if (generation !== watchHistoryLoadGeneration || Router.current !== 'watch-history' || !page.isConnected) return;
     // siteResult.sites is already normalized by the request promise. A second
@@ -755,12 +871,16 @@ async function loadWatchHistory(reset, options = {}) {
     if (typeof tmdbResult.available === 'boolean') watchHistoryState.tmdbConfigured = tmdbResult.available;
     watchHistoryState.tmdbInvalid = tmdbResult.invalid === true;
     watchHistoryState.tmdbLoadError = tmdbResult.error;
+    watchHistoryState.liveLoadError = liveResult.error;
+    if (liveResult.response) watchHistoryState.liveItems = watchHistoryNormalizeItems(liveResult.response);
     watchHistoryState.loading = false;
+    watchHistoryRenderLive();
     watchHistoryRenderItems();
     scheduleWatchHistoryRefresh();
   } catch (error) {
     if (generation !== watchHistoryLoadGeneration || Router.current !== 'watch-history' || !page.isConnected) return;
     watchHistoryState.loading = false;
+    watchHistoryRenderLive();
     watchHistoryRenderItems(error && error.message ? error.message : '请求失败');
     scheduleWatchHistoryRefresh();
   }
@@ -789,6 +909,8 @@ function stopWatchHistoryRefresh() {
   watchHistoryRefreshTimer = 0;
   watchHistoryLoadGeneration += 1;
   watchHistoryState.loading = false;
+  watchHistoryRenderedItemsSignature = '';
+  watchHistoryRenderedLiveSignature = '';
   watchHistoryCancelLongPress();
   watchHistoryLongPressTriggered = false;
   watchHistoryCloseDetails();
@@ -804,14 +926,21 @@ function renderWatchHistory() {
   if (!page) return;
   stopWatchHistoryRefresh();
   watchHistoryState.items = [];
+  watchHistoryState.liveItems = [];
   watchHistoryState.nextCursor = '';
   watchHistoryState.hasMore = false;
   watchHistoryState.tmdbConfigured = null;
   watchHistoryState.tmdbInvalid = false;
   watchHistoryState.sitesLoadError = '';
   watchHistoryState.tmdbLoadError = '';
-  page.innerHTML = `<h1 class="section-title fade-up">观看历史</h1>
-    <p class="section-sub fade-up">按站点查看后续成功播放状态同步形成的本地记录；TMDB 仅用于异步补全海报与影片资料。</p>
+  watchHistoryState.liveLoadError = '';
+  watchHistoryRenderedItemsSignature = '';
+  watchHistoryRenderedLiveSignature = '';
+  page.innerHTML = `<div class="watch-history-page">
+    <header class="watch-history-hero fade-up">
+      <div><p class="watch-history-eyebrow">PLAYBACK ARCHIVE</p><h1 class="section-title">观看历史</h1><p class="section-sub">把正在发生的播放与已看内容放在同一个清爽的观看空间。</p></div>
+      <div class="watch-history-hero-signal" aria-label="自动刷新中"><span></span><b>自动刷新</b><small>${WATCH_HISTORY_REFRESH_INTERVAL_MS / 1000} 秒</small></div>
+    </header>
     <section class="watch-history-toolbar fade-up" aria-label="观看历史筛选">
       <div class="watch-history-filters">
         <label><span>站点</span><select class="form-select" id="watch-history-site">${watchHistorySiteOptionsHTML()}</select></label>
@@ -829,7 +958,11 @@ function renderWatchHistory() {
       <p class="watch-history-status" id="watch-history-status" role="status" aria-live="polite">正在读取观看历史…</p>
     </section>
     <div class="watch-history-notice" id="watch-history-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
-    <section class="watch-history-grid fade-up" id="watch-history-grid" aria-label="观看历史列表" aria-busy="true"></section>
+    <section class="watch-history-live-section fade-up" id="watch-history-live-section" aria-labelledby="watch-history-live-title" hidden>
+      <header class="watch-history-section-heading"><div><p class="watch-history-eyebrow">LIVE NOW</p><h2 id="watch-history-live-title">正在观看 <b id="watch-history-live-count">0</b></h2><p id="watch-history-live-description">正在读取播放会话…</p></div><span class="watch-history-live-mark" aria-hidden="true"><i></i>LIVE</span></header>
+      <div class="watch-history-grid watch-history-live-grid" id="watch-history-live-grid" aria-label="正在观看列表"></div>
+    </section>
+    <section class="watch-history-library fade-up" aria-labelledby="watch-history-library-title"><header class="watch-history-section-heading"><div><p class="watch-history-eyebrow">YOUR LIBRARY</p><h2 id="watch-history-library-title">观看记录</h2></div></header><div class="watch-history-grid" id="watch-history-grid" aria-label="观看历史列表" aria-busy="true"></div></section>
     <div class="watch-history-more-wrap"><button type="button" class="btn-ghost" id="watch-history-more" hidden>加载更多</button></div>
     <div class="watch-history-detail-modal" id="watch-history-detail-modal" hidden>
       <div class="watch-history-detail-backdrop" data-watch-history-close></div>
@@ -846,7 +979,8 @@ function renderWatchHistory() {
         <img id="watch-history-image-viewer-image" alt="" decoding="async">
       </div>
     </div>
-    <footer class="watch-history-attribution">This product uses the TMDB API but is not endorsed or certified by TMDB. <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">了解 TMDB</a></footer>`;
+    <footer class="watch-history-attribution">This product uses the TMDB API but is not endorsed or certified by TMDB. <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">了解 TMDB</a></footer>
+  </div>`;
 
   const siteSelect = document.getElementById('watch-history-site');
   const typeSelect = document.getElementById('watch-history-type');

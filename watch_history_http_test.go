@@ -75,3 +75,37 @@ func TestWatchHistoryAPIRejectsInvalidCursor(t *testing.T) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
+
+func TestWatchHistoryActiveAPIReturnsCurrentSessionWithoutToken(t *testing.T) {
+	app := newTestApp(t)
+	result, err := app.db.db.Exec("INSERT INTO sites (name, listen_port, target_url, watch_history_enabled) VALUES ('直播站点', 19012, 'http://127.0.0.1:8096', 1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	siteID, _ := result.LastInsertId()
+	event := watchHistoryTestEvent(siteID, "active-http", time.Now().UnixMilli(), 200)
+	event.UserName = "Viewer"
+	event.ClientName = "Emby Web"
+	event.DeviceName = "Web client"
+	event.PlaySessionID = "raw-play-session"
+	event.TokenCiphertext = "wh1:encrypted-not-a-token"
+	if _, err := app.db.writeWatchHistoryBatch([]watchHistoryEvent{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	app.handleWatchHistoryItem(response, httptest.NewRequest(http.MethodGet, "/api/watch-history/active?site_id="+strconv.FormatInt(siteID, 10), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET active status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page watchHistoryActiveResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].UserName != "Viewer" || page.Items[0].ClientName != "Emby Web" || page.Items[0].PlaySessionID != "raw-play-session" || !page.Items[0].TokenStored {
+		t.Fatalf("active response = %+v", page)
+	}
+	if strings.Contains(response.Body.String(), "encrypted-not-a-token") || strings.Contains(response.Body.String(), "token_ciphertext") {
+		t.Fatalf("active response exposed token material: %s", response.Body.String())
+	}
+}

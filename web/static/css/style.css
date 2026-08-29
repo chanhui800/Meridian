@@ -717,6 +717,15 @@ tr:hover td { background: var(--surface); }
   flex: 0 0 100%;
 }
 
+.site-access-heading {
+  display: flex;
+  flex: 0 0 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
 .site-row.site-access-row > .site-access-value {
   width: 100%;
   max-width: 100%;
@@ -5810,7 +5819,7 @@ body.is-site-dragging * {
   padding: 2px 6px;
   border-radius: 999px;
   background: var(--blue-glow);
-  color: var(--blue);
+  color: var(--green);
   font-size: 10px;
   font-weight: 700;
   white-space: nowrap;
@@ -6258,4 +6267,704 @@ html[data-theme="light"] .watch-history-detail-meta dt { color: #475569; }
   .watch-history-poster-fallback { transition: none; }
   .watch-history-skeleton .watch-history-poster,
   .watch-history-skeleton .watch-history-card-body span { animation: none; }
+}
+
+/* Viewing history refresh: flat content shelf with restrained glass only for controls. */
+.watch-history-page {
+  --history-accent: #38bdf8;
+  --history-live: #22c55e;
+  --history-surface: color-mix(in srgb, var(--panel) 94%, transparent);
+  --history-muted: var(--white-60);
+  position: relative;
+  max-width: 1520px;
+  margin: 0 auto;
+  padding: 8px 0 28px;
+}
+
+.watch-history-page::before {
+  position: absolute;
+  inset: 24px 16% auto;
+  z-index: 0;
+  height: 180px;
+  content: '';
+  pointer-events: none;
+  background: radial-gradient(ellipse, color-mix(in srgb, var(--history-accent) 14%, transparent), transparent 68%);
+  filter: blur(26px);
+}
+
+.watch-history-page > :not(.watch-history-detail-modal):not(.watch-history-image-modal) { position: relative; z-index: 1; }
+
+.watch-history-hero,
+.watch-history-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.watch-history-hero {
+  min-height: 132px;
+  padding: 20px 4px 26px;
+}
+
+.watch-history-page .section-title { margin: 3px 0 6px; font-size: clamp(28px, 3.2vw, 42px); letter-spacing: -.055em; }
+.watch-history-page .section-sub { max-width: 560px; margin: 0; color: var(--history-muted); font-size: 14px; line-height: 1.7; }
+.watch-history-eyebrow { margin: 0; color: var(--history-accent); font-size: 10px; font-weight: 800; letter-spacing: .16em; line-height: 1.2; }
+
+.watch-history-hero-signal,
+.watch-history-live-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--panel-border) 78%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel) 62%, transparent);
+  color: var(--white-60);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  font-size: 11px;
+}
+.watch-history-hero-signal span,
+.watch-history-live-mark i,
+.watch-history-live-badge i { width: 7px; height: 7px; border-radius: 50%; background: var(--history-live); box-shadow: 0 0 0 3px color-mix(in srgb, var(--history-live) 16%, transparent); }
+.watch-history-hero-signal b { color: var(--white-87); font-weight: 700; }
+.watch-history-hero-signal small { color: var(--white-38); font-size: 10px; }
+
+.watch-history-page .watch-history-toolbar {
+  align-items: center;
+  margin-bottom: 18px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--panel-border) 80%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  box-shadow: 0 12px 32px color-mix(in srgb, var(--black) 8%, transparent);
+  backdrop-filter: blur(18px) saturate(1.12);
+  -webkit-backdrop-filter: blur(18px) saturate(1.12);
+}
+.watch-history-page .watch-history-filters { gap: 8px; }
+.watch-history-page .watch-history-filters label { gap: 4px; color: var(--white-38); font-size: 10px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.watch-history-page .watch-history-filters .form-select { min-height: 38px; border-color: color-mix(in srgb, var(--panel-border) 88%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--panel-raised) 72%, transparent); }
+.watch-history-page .watch-history-toolbar-actions { gap: 8px; }
+.watch-history-page .watch-history-toolbar-actions .request-log-action { min-height: 38px; border-radius: 10px; box-shadow: none; }
+.watch-history-page .watch-history-status { margin: 0; color: var(--white-38); font-size: 11px; }
+
+.watch-history-live-section,
+.watch-history-library { margin-top: 28px; }
+.watch-history-section-heading { margin: 0 2px 12px; }
+.watch-history-section-heading h2 { margin: 4px 0 0; color: var(--white-87); font-size: 19px; letter-spacing: -.035em; }
+.watch-history-section-heading h2 b { display: inline-grid; min-width: 24px; min-height: 24px; place-items: center; margin-left: 5px; border-radius: 8px; background: color-mix(in srgb, var(--history-live) 14%, transparent); color: var(--history-live); font-size: 12px; vertical-align: 2px; }
+.watch-history-section-heading p:not(.watch-history-eyebrow) { margin: 5px 0 0; color: var(--white-38); font-size: 12px; }
+.watch-history-live-mark { border-color: color-mix(in srgb, var(--history-live) 30%, var(--panel-border)); color: var(--history-live); font-size: 10px; font-weight: 800; letter-spacing: .12em; }
+.watch-history-live-grid { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+.watch-history-live-grid .watch-history-poster { aspect-ratio: 16 / 7; }
+.watch-history-live-grid .watch-history-poster-fallback { width: 42px; height: 42px; }
+
+.watch-history-page .watch-history-grid { gap: 16px; }
+.watch-history-page .watch-history-card {
+  border: 1px solid color-mix(in srgb, var(--panel-border) 86%, transparent);
+  border-radius: 14px;
+  background: var(--history-surface);
+  box-shadow: none;
+  transition: border-color .2s ease, transform .2s ease, background .2s ease;
+}
+.watch-history-page .watch-history-card.is-live { border-color: color-mix(in srgb, var(--history-live) 35%, var(--panel-border)); }
+@media (hover: hover) and (pointer: fine) {
+  .watch-history-page .watch-history-card:not(.watch-history-skeleton):hover { border-color: color-mix(in srgb, var(--history-accent) 58%, var(--panel-border)); background: color-mix(in srgb, var(--panel-raised) 78%, transparent); transform: translateY(-3px); }
+}
+.watch-history-page .watch-history-poster { background: color-mix(in srgb, var(--panel-soft) 92%, transparent); }
+.watch-history-page .watch-history-card-body { gap: 6px; padding: 12px 13px 13px; }
+.watch-history-page .watch-history-card-heading h2 { font-size: 15px; line-height: 1.35; }
+.watch-history-live-badge { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; padding: 4px 6px; border-radius: 7px; background: color-mix(in srgb, var(--history-live) 12%, transparent); color: var(--history-live); font-size: 10px; font-weight: 750; white-space: nowrap; }
+.watch-history-live-badge i { width: 5px; height: 5px; box-shadow: none; }
+.watch-history-page .watch-history-site { margin: 0; font-size: 11px; }
+.watch-history-identity { overflow: hidden; margin: -2px 0 0; color: var(--history-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.watch-history-page .watch-history-time { font-size: 11px; font-variant-numeric: tabular-nums; }
+.watch-history-page .watch-history-progress { height: 3px; }
+.watch-history-page .watch-history-progress span { background: linear-gradient(90deg, var(--history-accent), color-mix(in srgb, var(--history-accent) 72%, white)); }
+.watch-history-page .watch-history-card.is-live .watch-history-progress span { background: linear-gradient(90deg, var(--history-live), color-mix(in srgb, var(--history-live) 66%, white)); }
+.watch-history-page .watch-history-empty { min-height: 210px; border: 1px dashed color-mix(in srgb, var(--panel-border) 85%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--panel) 72%, transparent); box-shadow: none; }
+.watch-history-page .watch-history-more-wrap { padding-top: 20px; }
+
+.watch-history-page .watch-history-detail-dialog { border-radius: 18px; background: color-mix(in srgb, var(--panel) 88%, transparent); box-shadow: 0 24px 80px color-mix(in srgb, var(--black) 40%, transparent); backdrop-filter: blur(22px) saturate(1.08); -webkit-backdrop-filter: blur(22px) saturate(1.08); }
+.watch-history-page .watch-history-detail-shell { border-radius: 16px; }
+.watch-history-page .watch-history-detail-meta dd { overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
+
+html[data-theme="light"] .watch-history-page { --history-accent: #0284c7; --history-live: #15803d; --history-surface: rgb(255 255 255 / .88); --history-muted: #475569; }
+html[data-theme="light"] .watch-history-page::before { opacity: .62; }
+html[data-theme="light"] .watch-history-page .watch-history-card-heading h2,
+html[data-theme="light"] .watch-history-page .watch-history-section-heading h2,
+html[data-theme="light"] .watch-history-page .watch-history-hero-signal b { color: #0f172a; }
+html[data-theme="light"] .watch-history-page .watch-history-site { color: #334155; }
+
+@media (max-width: 768px) {
+  .watch-history-page { padding-top: 0; }
+  .watch-history-hero { min-height: 0; align-items: flex-start; padding: 16px 2px 20px; }
+  .watch-history-hero-signal { flex: 0 0 auto; margin-top: 3px; padding: 0 9px; }
+  .watch-history-hero-signal small { display: none; }
+  .watch-history-page .section-title { font-size: 30px; }
+  .watch-history-page .watch-history-toolbar { padding: 10px; border-radius: 14px; }
+  .watch-history-live-section,
+  .watch-history-library { margin-top: 22px; }
+  .watch-history-page .watch-history-grid,
+  .watch-history-live-grid { gap: 10px; }
+  .watch-history-section-heading { align-items: flex-start; }
+  .watch-history-live-mark { min-height: 30px; padding: 0 9px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .watch-history-page .watch-history-card { transition: none; }
+}
+
+/* Panel-wide visual language: a calm, flat data surface; blur is reserved for controls. */
+.page:not(#page-watch-history) {
+  --panel-page-accent: #38bdf8;
+  --panel-page-surface: color-mix(in srgb, var(--panel) 96%, transparent);
+  background:
+    radial-gradient(ellipse 48% 230px at 22% 0%, color-mix(in srgb, var(--panel-page-accent) 8%, transparent), transparent 72%),
+    transparent;
+}
+
+.page:not(#page-watch-history) .section-title,
+.page:not(#page-watch-history) .settings-content > .section-title {
+  letter-spacing: -.05em;
+}
+
+.page:not(#page-watch-history) .section-sub {
+  color: var(--white-60);
+  line-height: 1.65;
+}
+
+/* Cards deliberately remain opaque enough for dense data and status colors. */
+.page:not(#page-watch-history) .stat-card,
+.page:not(#page-watch-history) .glass-card,
+.page:not(#page-watch-history) .site-card,
+.page:not(#page-watch-history) .chart-wrap,
+.page:not(#page-watch-history) .total-card,
+.page:not(#page-watch-history) .request-log-table-card,
+.page:not(#page-watch-history) .request-log-list-card,
+.page:not(#page-watch-history) .dashboard-insight-card,
+.page:not(#page-watch-history) .dashboard-trend-card,
+.page:not(#page-watch-history) .settings-panel,
+.page:not(#page-watch-history) .telegram-report-card,
+.page:not(#page-watch-history) .account-profile-card,
+.page:not(#page-watch-history) .account-settings-card,
+.page:not(#page-watch-history) .account-session-card,
+.page:not(#page-watch-history) .diag-card {
+  border-radius: 16px;
+  background: var(--panel-page-surface);
+  box-shadow: none;
+}
+
+.page:not(#page-watch-history) .glass-card,
+.page:not(#page-watch-history) .site-card,
+.page:not(#page-watch-history) .chart-wrap,
+.page:not(#page-watch-history) .total-card,
+.page:not(#page-watch-history) .request-log-table-card,
+.page:not(#page-watch-history) .request-log-list-card,
+.page:not(#page-watch-history) .dashboard-insight-card,
+.page:not(#page-watch-history) .dashboard-trend-card,
+.page:not(#page-watch-history) .settings-panel,
+.page:not(#page-watch-history) .telegram-report-card,
+.page:not(#page-watch-history) .account-profile-card,
+.page:not(#page-watch-history) .account-settings-card,
+.page:not(#page-watch-history) .account-session-card,
+.page:not(#page-watch-history) .diag-card {
+  border-color: color-mix(in srgb, var(--panel-border) 88%, transparent);
+}
+
+.page:not(#page-watch-history) .stat-card {
+  border-radius: 14px;
+  box-shadow: none;
+}
+
+.page:not(#page-watch-history) .stat-card::after {
+  opacity: .3;
+}
+
+.page:not(#page-watch-history) .site-card,
+.page:not(#page-watch-history) .request-log-table-card,
+.page:not(#page-watch-history) .settings-panel,
+.page:not(#page-watch-history) .account-profile-card,
+.page:not(#page-watch-history) .account-settings-card,
+.page:not(#page-watch-history) .account-session-card,
+.page:not(#page-watch-history) .diag-card {
+  overflow: clip;
+}
+
+/* Filter and navigation areas are the only regular glass layer. */
+.page:not(#page-watch-history) .page-toolbar,
+.page:not(#page-watch-history) .request-log-controls,
+.page:not(#page-watch-history) .dashboard-trend-toolbar,
+.page:not(#page-watch-history) .diag-toolbar,
+.page:not(#page-watch-history) .settings-section-nav {
+  border-color: color-mix(in srgb, var(--panel-border) 82%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--black) 8%, transparent);
+  backdrop-filter: blur(18px) saturate(1.1);
+  -webkit-backdrop-filter: blur(18px) saturate(1.1);
+}
+
+.page:not(#page-watch-history) .settings-section-nav {
+  padding: 12px;
+}
+
+.page:not(#page-watch-history) .settings-section-nav > strong {
+  color: var(--white-87);
+}
+
+.page:not(#page-watch-history) .settings-nav-item {
+  min-height: 40px;
+  border-color: transparent;
+  border-radius: 10px;
+  text-align: left;
+  justify-content: flex-start;
+}
+
+.page:not(#page-watch-history) .settings-nav-item:hover,
+.page:not(#page-watch-history) .settings-nav-item.active {
+  border-color: color-mix(in srgb, var(--blue) 28%, var(--panel-border));
+  background: color-mix(in srgb, var(--blue) 10%, transparent);
+}
+
+.page:not(#page-watch-history) .settings-panel header,
+.page:not(#page-watch-history) .account-card-head {
+  border-color: color-mix(in srgb, var(--panel-border) 82%, transparent);
+}
+
+.page:not(#page-watch-history) .settings-panel header b,
+.page:not(#page-watch-history) .dashboard-trend-unit,
+.page:not(#page-watch-history) .request-log-summary {
+  border-radius: 9px;
+}
+
+.page:not(#page-watch-history) .account-profile-meta > div,
+.page:not(#page-watch-history) .site-advanced-card,
+.page:not(#page-watch-history) .upstream-lines-card,
+.page:not(#page-watch-history) .telegram-report-items > div,
+.page:not(#page-watch-history) .diag-row {
+  border-color: color-mix(in srgb, var(--panel-border) 84%, transparent);
+  background: color-mix(in srgb, var(--panel-soft) 78%, transparent);
+  box-shadow: none;
+}
+
+.page:not(#page-watch-history) .form-input,
+.page:not(#page-watch-history) .form-select,
+.page:not(#page-watch-history) .request-log-date-field input,
+.page:not(#page-watch-history) .request-log-search-field input {
+  min-height: 40px;
+  border-color: color-mix(in srgb, var(--panel-border) 88%, transparent);
+  border-radius: 10px;
+  background-color: color-mix(in srgb, var(--panel-soft) 88%, transparent);
+}
+
+.page:not(#page-watch-history) .form-input:focus,
+.page:not(#page-watch-history) .form-select:focus,
+.page:not(#page-watch-history) .request-log-date-field input:focus,
+.page:not(#page-watch-history) .request-log-search-field input:focus {
+  border-color: var(--blue);
+  background-color: var(--panel-raised);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 18%, transparent);
+}
+
+.page:not(#page-watch-history) .request-log-table thead th {
+  border-bottom-color: color-mix(in srgb, var(--panel-border) 82%, transparent);
+  background: color-mix(in srgb, var(--panel-soft) 74%, transparent);
+}
+
+.page:not(#page-watch-history) .request-log-table tbody tr + tr td {
+  border-top-color: color-mix(in srgb, var(--panel-border) 70%, transparent);
+}
+
+.page:not(#page-watch-history) .request-log-table tbody tr:hover td {
+  background: color-mix(in srgb, var(--blue) 4%, transparent);
+}
+
+.page:not(#page-watch-history) .dashboard-chart-tooltip {
+  border-color: color-mix(in srgb, var(--panel-border) 82%, transparent);
+  background: color-mix(in srgb, var(--panel) 90%, transparent);
+  box-shadow: 0 16px 32px color-mix(in srgb, var(--black) 18%, transparent);
+  backdrop-filter: blur(14px) saturate(1.08);
+  -webkit-backdrop-filter: blur(14px) saturate(1.08);
+}
+
+.page:not(#page-watch-history) .btn-primary,
+.page:not(#page-watch-history) .telegram-btn.primary,
+.page:not(#page-watch-history) .btn-modal.primary {
+  box-shadow: none;
+}
+
+.page:not(#page-watch-history) .btn-ghost,
+.page:not(#page-watch-history) .request-log-action,
+.page:not(#page-watch-history) .telegram-btn.secondary,
+.page:not(#page-watch-history) .btn-modal.secondary {
+  border-radius: 10px;
+  box-shadow: none;
+}
+
+/* Site configuration dialogs follow the same restrained glass control layer. */
+.modal,
+html[data-theme="light"] .modal {
+  border-color: color-mix(in srgb, var(--panel-border) 88%, transparent);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  box-shadow: 0 24px 72px color-mix(in srgb, var(--black) 34%, transparent);
+  backdrop-filter: blur(22px) saturate(1.08);
+  -webkit-backdrop-filter: blur(22px) saturate(1.08);
+}
+
+.modal-header,
+.modal-footer {
+  border-color: color-mix(in srgb, var(--panel-border) 82%, transparent);
+}
+
+.modal .form-input,
+.modal .modal-select {
+  border-radius: 10px;
+}
+
+html[data-theme="light"] .page:not(#page-watch-history) {
+  --panel-page-accent: #0284c7;
+  --panel-page-surface: rgb(255 255 255 / .9);
+}
+
+html[data-theme="light"] .page:not(#page-watch-history) .section-title,
+html[data-theme="light"] .page:not(#page-watch-history) .settings-panel header h2,
+html[data-theme="light"] .page:not(#page-watch-history) .account-profile-main h2,
+html[data-theme="light"] .page:not(#page-watch-history) .account-card-head h2,
+html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2 {
+  color: #0f172a;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .page:not(#page-watch-history) .site-card,
+  .page:not(#page-watch-history) .stat-card,
+  .page:not(#page-watch-history) .dashboard-insight-card,
+  .page:not(#page-watch-history) .dashboard-trend-card,
+  .page:not(#page-watch-history) .telegram-report-card,
+  .page:not(#page-watch-history) .diag-card {
+    transition: border-color .2s ease, background-color .2s ease, transform .2s ease;
+  }
+
+  .page:not(#page-watch-history) .site-card:hover,
+  .page:not(#page-watch-history) .dashboard-insight-card:hover,
+  .page:not(#page-watch-history) .telegram-report-card:hover {
+    border-color: color-mix(in srgb, var(--panel-page-accent) 42%, var(--panel-border));
+    transform: translateY(-2px);
+  }
+}
+
+.page:not(#page-watch-history) :is(button, a, input, select):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--blue) 78%, white);
+  outline-offset: 2px;
+}
+
+@media (max-width: 768px) {
+  .page:not(#page-watch-history) .page-toolbar,
+  .page:not(#page-watch-history) .request-log-controls,
+  .page:not(#page-watch-history) .dashboard-trend-toolbar,
+  .page:not(#page-watch-history) .diag-toolbar,
+  .page:not(#page-watch-history) .settings-section-nav {
+    border-radius: 14px;
+  }
+
+  .page:not(#page-watch-history) .settings-section-nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 8px;
+  }
+
+  .page:not(#page-watch-history) .settings-section-nav > span,
+  .page:not(#page-watch-history) .settings-section-nav > strong {
+    grid-column: 1 / -1;
+  }
+
+  .page:not(#page-watch-history) .settings-nav-item {
+    min-height: 44px;
+  }
+
+  .page:not(#page-watch-history) .stat-card,
+  .page:not(#page-watch-history) .glass-card,
+  .page:not(#page-watch-history) .site-card,
+  .page:not(#page-watch-history) .request-log-table-card,
+  .page:not(#page-watch-history) .settings-panel,
+  .page:not(#page-watch-history) .telegram-report-card,
+  .page:not(#page-watch-history) .account-profile-card,
+  .page:not(#page-watch-history) .account-settings-card,
+  .page:not(#page-watch-history) .account-session-card,
+  .page:not(#page-watch-history) .diag-card {
+    border-radius: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page:not(#page-watch-history) .site-card,
+  .page:not(#page-watch-history) .stat-card,
+  .page:not(#page-watch-history) .dashboard-insight-card,
+  .page:not(#page-watch-history) .dashboard-trend-card,
+  .page:not(#page-watch-history) .telegram-report-card,
+  .page:not(#page-watch-history) .diag-card {
+    transition: none;
+  }
+}
+
+/* Application frame: keep the page surface continuous around content, navigation and header. */
+#app-shell,
+#app-shell.active .sidebar,
+#app-shell.active .app-header,
+#app-shell.active .main {
+  background: var(--black);
+}
+
+#app-shell.active .sidebar {
+  border-right-color: color-mix(in srgb, var(--panel-border) 72%, transparent);
+}
+
+#app-shell.active .app-header {
+  border-bottom-color: color-mix(in srgb, var(--panel-border) 72%, transparent);
+}
+
+/* A quieter outline icon layer keeps the compact rail deliberately flat. */
+.sidebar .topnav-link,
+.nav-group-toggle {
+  color: var(--white-60);
+  font-weight: 500;
+}
+
+.sidebar .topnav-link svg,
+.nav-group-toggle > svg:first-child,
+#app-shell.sidebar-expanded .nav-group-chevron {
+  stroke-width: 1.5;
+}
+
+.sidebar .topnav-link:hover {
+  color: var(--white-87);
+  border-color: color-mix(in srgb, var(--panel-border) 76%, transparent);
+  background: color-mix(in srgb, var(--surface) 74%, transparent);
+}
+
+.sidebar .topnav-link.active {
+  color: var(--blue);
+  border-color: color-mix(in srgb, var(--blue) 22%, transparent);
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+  box-shadow: none;
+}
+
+.nav-group-toggle:hover,
+.nav-group.active > .nav-group-toggle {
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+}
+
+/* The fixed-state control follows the supplied thin, split-panel glyph. */
+.sidebar-toggle {
+  width: 42px;
+  height: 42px;
+  flex-basis: 42px;
+  border: 1px solid color-mix(in srgb, var(--panel-border) 72%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel-soft) 76%, var(--black));
+  color: var(--white-87);
+  transition: border-color .18s ease, background-color .18s ease, color .18s ease;
+}
+
+.sidebar-toggle svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.45;
+}
+
+.sidebar-toggle-divider {
+  transition: opacity .16s ease, transform .16s ease;
+}
+
+.sidebar-toggle-divider-expanded {
+  opacity: 0;
+  transform: translateX(-2px);
+}
+
+.sidebar-toggle.is-expanded .sidebar-toggle-divider-collapsed {
+  opacity: 0;
+  transform: translateX(2px);
+}
+
+.sidebar-toggle.is-expanded .sidebar-toggle-divider-expanded {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.sidebar-toggle:hover,
+.sidebar-toggle.is-pinned {
+  border-color: color-mix(in srgb, var(--blue) 32%, var(--panel-border));
+  background: color-mix(in srgb, var(--blue) 9%, var(--black));
+  color: var(--blue);
+}
+
+.sidebar-toggle:active { background: color-mix(in srgb, var(--blue) 14%, var(--black)); }
+
+/* Keep navigation labels out of the rail-width transition to prevent text ghosting on collapse. */
+#app-shell.sidebar-expanded .sidebar .topnav-link > span,
+#app-shell:not(.sidebar-expanded) .sidebar .topnav-link > span {
+  transition: none;
+}
+
+/* Top-level icons remain full-size controls, but no longer carry visible container chrome. */
+.app-header-icon,
+.sidebar-toggle,
+.sidebar-toggle:hover,
+.sidebar-toggle.is-pinned,
+.sidebar-toggle:active {
+  border-color: transparent;
+  border-radius: 0;
+  background: transparent;
+}
+
+.app-header-icon {
+  width: 28px;
+  height: 42px;
+  flex-basis: 28px;
+}
+
+.app-header-icon svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.55;
+}
+
+.sidebar-toggle:hover,
+.sidebar-toggle.is-pinned,
+.sidebar-toggle:active {
+  color: var(--blue);
+}
+
+@media (max-width: 768px) {
+  .sidebar-toggle {
+    display: grid;
+    border-color: transparent;
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #app-shell.active,
+  .sidebar,
+  .sidebar-toggle,
+  .sidebar-toggle-divider {
+    transition: none;
+  }
+}
+
+/* The application frame already provides the page surface; a page-only glow created a visible seam below the header. */
+.page:not(#page-watch-history) {
+  background: transparent;
+}
+
+/* Keep the watch-history landing area compact and give active playback room to breathe. */
+.watch-history-hero {
+  min-height: 88px;
+  align-items: center;
+  padding: 12px 4px 14px;
+}
+
+.watch-history-live-grid {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 360px));
+  gap: 18px;
+}
+
+.watch-history-live-grid .watch-history-card {
+  min-height: 0;
+}
+
+.watch-history-live-grid .watch-history-poster {
+  aspect-ratio: 16 / 9;
+}
+
+.watch-history-live-grid .watch-history-poster img {
+  object-fit: cover;
+  object-position: center top;
+}
+
+.site-live-link {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  margin-left: auto;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--green);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .04em;
+  line-height: 1;
+  text-decoration: none;
+  text-transform: lowercase;
+  cursor: pointer;
+}
+
+.site-live-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 54%, transparent);
+  animation: site-live-heartbeat 1.5s ease-in-out infinite;
+}
+
+@keyframes site-live-heartbeat {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 46%, transparent); transform: scale(1); }
+  40% { box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 0%, transparent); transform: scale(1.16); }
+  58% { box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 18%, transparent); transform: scale(.94); }
+}
+
+.site-live-link:hover,
+.site-live-link:focus-visible { color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent); }
+.site-live-link:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.site-live-link:disabled { cursor: wait; opacity: .58; }
+
+.site-live-modal { width: min(68vw, 1080px); max-width: calc(100vw - var(--sidebar-w) - 40px); height: 84dvh; max-height: calc(100dvh - var(--nav-h) - 32px); padding: 0; overflow: hidden; }
+.site-live-modal .modal-header { position: absolute; inset: 0 0 auto; z-index: 3; min-height: 0; padding: 12px 58px 10px 20px; border-bottom: 0; background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 76%, transparent), transparent); }
+.site-live-modal .modal-header h3 { color: var(--white-87); font-size: 14px; }
+.site-live-modal .modal-close { position: absolute; top: 12px; right: 12px; z-index: 4; }
+.site-live-modal .modal-body { height: 100%; max-height: none; padding: 0; overflow: auto; }
+.site-live-modal .modal-footer { display: none; }
+.site-live-modal .watch-history-detail-shell { min-height: 100%; }
+
+@media (max-width: 768px) {
+  .site-live-modal { width: 100%; max-width: none; height: calc(100dvh - var(--nav-h) - 16px); max-height: none; }
+  .site-live-modal .watch-history-detail-background img { height: 300px; }
+  .site-live-modal .watch-history-detail-shell > .watch-history-detail-layout { padding: 194px max(18px, env(safe-area-inset-right)) 24px max(18px, env(safe-area-inset-left)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .site-live-pulse { animation: none; }
+}
+
+.watch-history-live-grid .watch-history-card-body {
+  gap: 7px;
+  padding: 15px 16px 16px;
+}
+
+.watch-history-live-grid .watch-history-card-heading h2 {
+  font-size: 17px;
+}
+
+@media (max-width: 768px) {
+  .watch-history-hero {
+    min-height: 0;
+    padding: 10px 2px 14px;
+  }
+
+  .watch-history-live-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .watch-history-live-grid .watch-history-card-body {
+    padding: 14px;
+  }
 }

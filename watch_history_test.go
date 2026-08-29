@@ -137,6 +137,10 @@ func TestWatchHistoryMigrationAndSiteDefault(t *testing.T) {
 }
 
 func TestWatchHistoryLegacyProgressUsesOnlyWhitelistedQueryValues(t *testing.T) {
+	previousSecret, previousEphemeral := jwtSecret, jwtSecretEphemeral
+	jwtSecret = bytes.Repeat([]byte("l"), 32)
+	jwtSecretEphemeral = false
+	t.Cleanup(func() { jwtSecret, jwtSecretEphemeral = previousSecret, previousEphemeral })
 	site := Site{ID: 77, WatchHistoryEnabled: true}
 	request := httptest.NewRequest(http.MethodPost,
 		"http://media.example/emby/Users/raw-user-id/PlayingItems/item-legacy/Progress?PositionTicks=420000000&RunTimeTicks=1000000000&PlaySessionId=raw-play-session&PlayMethod=DirectPlay&api_key=raw-token",
@@ -148,11 +152,11 @@ func TestWatchHistoryLegacyProgressUsesOnlyWhitelistedQueryValues(t *testing.T) 
 	if event.UpstreamItemID != "item-legacy" || event.PositionTicks != 420000000 || event.RunTimeTicks != 1000000000 || event.PlayMethod != "DirectPlay" {
 		t.Fatalf("legacy event = %+v", event)
 	}
-	serialized := fmt.Sprintf("%+v", event)
-	for _, secret := range []string{"raw-user-id", "raw-play-session", "raw-token", "api_key"} {
-		if strings.Contains(serialized, secret) {
-			t.Fatalf("legacy event retained private value %q: %s", secret, serialized)
-		}
+	if event.PlaySessionID != "raw-play-session" {
+		t.Fatalf("legacy event did not retain the requested raw session identifier: %+v", event)
+	}
+	if strings.Contains(event.TokenCiphertext, "raw-token") || event.TokenCiphertext == "" {
+		t.Fatalf("legacy token was not encrypted: %+v", event)
 	}
 
 	malformed := httptest.NewRequest(http.MethodPost,
@@ -162,6 +166,83 @@ func TestWatchHistoryLegacyProgressUsesOnlyWhitelistedQueryValues(t *testing.T) 
 	}
 	if _, ok := watchHistoryEventFromCapture(nil, nil, site, request, nil, http.StatusBadGateway, time.Now()); ok {
 		t.Fatal("failed legacy progress response was recorded")
+	}
+}
+
+func TestWatchHistoryAuthorizationCapturesPlaybackClientSeparatelyFromDevice(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "http://media.example/emby/Sessions/Playing/Progress", http.NoBody)
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Emby Web", Device="Living Room TV", DeviceId="device-living-room", UserName="Alice"`)
+	identity := watchHistoryClientIdentityFromRequest(request, watchHistoryPlaybackPayload{})
+	if identity.clientName != "Emby Web" || identity.deviceName != "Living Room TV" || identity.userName != "Alice" {
+		t.Fatalf("authorization identity = %+v", identity)
+	}
+}
+
+func TestWatchHistoryPersistsAuthorizedIdentityWithoutExposingToken(t *testing.T) {
+	previousSecret, previousEphemeral := jwtSecret, jwtSecretEphemeral
+	jwtSecret = bytes.Repeat([]byte("i"), 32)
+	jwtSecretEphemeral = false
+	t.Cleanup(func() { jwtSecret, jwtSecretEphemeral = previousSecret, previousEphemeral })
+
+	database := openWatchHistoryTestDB(t)
+	site := createWatchHistoryTestSite(t, database, true)
+	event := watchHistoryTestEvent(site.ID, "identity-session", time.Now().UnixMilli(), 300)
+	event.UserName = "Alice"
+	event.UserID = "user-alice"
+	event.ClientName = "Emby for Apple TV"
+	event.DeviceID = "device-living-room"
+	event.DeviceName = "Apple TV"
+	event.PlaySessionID = "play-session-raw"
+	var err error
+	event.TokenCiphertext, err = encryptWatchHistoryToken("raw-token-must-not-escape")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.writeWatchHistoryBatch([]watchHistoryEvent{event}); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+
+	entries, err := database.ListWatchHistory(WatchHistoryFilter{SiteID: site.ID})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list history: entries=%+v err=%v", entries, err)
+	}
+	entry := entries[0]
+	if entry.UserName != "Alice" || entry.UserID != "user-alice" || entry.ClientName != "Emby for Apple TV" || entry.DeviceID != "device-living-room" || entry.DeviceName != "Apple TV" || entry.PlaySessionID != "play-session-raw" || !entry.TokenStored {
+		t.Fatalf("saved identity = %+v", entry)
+	}
+	var ciphertext string
+	if err := database.db.QueryRow("SELECT token_ciphertext FROM watch_sessions WHERE id=?", entry.ID).Scan(&ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if ciphertext == "raw-token-must-not-escape" || strings.Contains(ciphertext, "raw-token-must-not-escape") {
+		t.Fatalf("token stored in plaintext: %q", ciphertext)
+	}
+	if token, err := decryptWatchHistoryToken(ciphertext); err != nil || token != "raw-token-must-not-escape" {
+		t.Fatalf("token decrypt = %q, %v", token, err)
+	}
+}
+
+func TestListActiveWatchHistoryExcludesStaleStoppedAndCompletedSessions(t *testing.T) {
+	database := openWatchHistoryTestDB(t)
+	site := createWatchHistoryTestSite(t, database, true)
+	now := time.UnixMilli(1_760_000_000_000)
+	active := watchHistoryTestEvent(site.ID, "active", now.Add(-30*time.Second).UnixMilli(), 200)
+	active.UserName = "Active viewer"
+	active.PlaySessionID = "active-play-session"
+	stale := watchHistoryTestEvent(site.ID, "stale", now.Add(-watchHistoryActiveWindow-time.Second).UnixMilli(), 200)
+	stopped := watchHistoryTestEvent(site.ID, "stopped", now.Add(-20*time.Second).UnixMilli(), 200)
+	stopped.EventType = "stopped"
+	completed := watchHistoryTestEvent(site.ID, "completed", now.Add(-10*time.Second).UnixMilli(), 1_000)
+	if _, err := database.writeWatchHistoryBatch([]watchHistoryEvent{active, stale, stopped, completed}); err != nil {
+		t.Fatalf("write history: %v", err)
+	}
+
+	entries, err := database.listActiveWatchHistoryAt(WatchHistoryFilter{SiteID: site.ID}, now)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("active history: entries=%+v err=%v", entries, err)
+	}
+	if entries[0].PlaySessionID != "active-play-session" || entries[0].UserName != "Active viewer" {
+		t.Fatalf("active entry = %+v", entries[0])
 	}
 }
 
@@ -425,9 +506,14 @@ func TestWatchHistoryMetadataUpdateRequeuesPreviousUnmatchedTMDBJob(t *testing.T
 }
 
 func TestWatchHistoryCapturePassesBodyThroughAndHashesSession(t *testing.T) {
+	previousSecret, previousEphemeral := jwtSecret, jwtSecretEphemeral
+	jwtSecret = bytes.Repeat([]byte("w"), 32)
+	jwtSecretEphemeral = false
+	t.Cleanup(func() { jwtSecret, jwtSecretEphemeral = previousSecret, previousEphemeral })
 	body := []byte(`{
 		"ItemId":"item-episode-7",
 		"PlaySessionId":"raw-secret-session-id",
+		"ClientName":"Emby Web",
 		"PositionTicks":420000000,
 		"RunTimeTicks":1000000000,
 		"PlayMethod":"DirectPlay",
@@ -456,7 +542,7 @@ func TestWatchHistoryCapturePassesBodyThroughAndHashesSession(t *testing.T) {
 	if !ok {
 		t.Fatal("complete successful playback sync did not create an event")
 	}
-	if event.UpstreamItemID != "item-episode-7" || event.MediaType != "episode" || event.Title != "Episode Seven" ||
+	if event.UpstreamItemID != "item-episode-7" || event.MediaType != "episode" || event.Title != "Episode Seven" || event.ClientName != "Emby Web" ||
 		event.SeriesName != "Example Series" || event.SeasonNumber != 1 || event.EpisodeNumber != 7 || event.TMDBID != 0 ||
 		event.IMDBID != "" || event.TVDBID != "" {
 		t.Fatalf("unexpected whitelisted event: %+v", event)
@@ -464,8 +550,11 @@ func TestWatchHistoryCapturePassesBodyThroughAndHashesSession(t *testing.T) {
 	if len(event.SessionHash) != 64 || strings.Contains(event.SessionHash, "raw-secret") {
 		t.Fatalf("session identifier was not safely digested: %q", event.SessionHash)
 	}
-	if fmt.Sprintf("%+v", event) == string(body) || strings.Contains(fmt.Sprintf("%+v", event), "raw-secret-token") || strings.Contains(fmt.Sprintf("%+v", event), "raw-secret-session-id") {
-		t.Fatal("event retained a raw credential, session identifier, or request body")
+	if event.PlaySessionID != "raw-secret-session-id" || strings.Contains(event.TokenCiphertext, "raw-secret-token") || event.TokenCiphertext == "" {
+		t.Fatalf("event did not retain authorized session identity safely: %+v", event)
+	}
+	if token, err := decryptWatchHistoryToken(event.TokenCiphertext); err != nil || token != "raw-secret-token" {
+		t.Fatalf("stored token cannot be safely decrypted: token=%q err=%v", token, err)
 	}
 }
 
@@ -578,6 +667,37 @@ func TestWatchHistoryBatchDoesNotRegressSameMillisecondProgress(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].PositionTicks != 900 || entries[0].LastSeenAtMS != 2_000 {
 		t.Fatalf("same-millisecond progress regressed: %+v", entries)
+	}
+}
+
+func TestListWatchHistoryMergesMovieSessionsByMedia(t *testing.T) {
+	database := openWatchHistoryTestDB(t)
+	site := createWatchHistoryTestSite(t, database, true)
+	older := watchHistoryTestEvent(site.ID, "movie-session-old", 1_000, 250)
+	older.UpstreamItemID = "same-movie"
+	older.Title = "Same Movie"
+	newer := watchHistoryTestEvent(site.ID, "movie-session-new", 2_000, 750)
+	newer.UpstreamItemID = "same-movie"
+	newer.Title = "Same Movie"
+	other := watchHistoryTestEvent(site.ID, "other-movie-session", 1_500, 500)
+	other.UpstreamItemID = "other-movie"
+	other.Title = "Other Movie"
+	if skipped, err := database.writeWatchHistoryBatch([]watchHistoryEvent{older, newer, other}); err != nil || skipped != 0 {
+		t.Fatalf("write history: skipped=%d err=%v", skipped, err)
+	}
+
+	entries, err := database.ListWatchHistory(WatchHistoryFilter{SiteID: site.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("history length=%d, want 2: %+v", len(entries), entries)
+	}
+	if entries[0].Title != "Same Movie" || entries[0].LastSeenAtMS != 2_000 || entries[0].PositionTicks != 750 {
+		t.Fatalf("latest movie session = %+v", entries[0])
+	}
+	if entries[1].Title != "Other Movie" {
+		t.Fatalf("other movie missing: %+v", entries)
 	}
 }
 

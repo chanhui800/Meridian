@@ -1,5 +1,8 @@
 // Sites management page
+const SITE_REFRESH_INTERVAL_MS = 5000;
 let siteSortingCleanup = null;
+let siteRefreshTimer = 0;
+let siteLoadGeneration = 0;
 
 function normalizedMediaLibraryCount(value) {
   const count = Number(value);
@@ -52,8 +55,23 @@ function renderSiteAccessVisibilityIcon(hidden) {
 	return '<svg class="site-access-eye site-access-eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"></path><circle cx="12" cy="12" r="3"></circle></svg>';
 }
 
+function siteCardsRenderSignature(sites, activeSiteIDs) {
+  const active = activeSiteIDs instanceof Set ? activeSiteIDs : new Set();
+  return JSON.stringify((Array.isArray(sites) ? sites : []).map(site => [
+    site && site.id, site && site.name, site && site.target_url, site && site.public_host,
+    site && site.ingress_mode, site && site.listen_port, site && site.ua_mode,
+    site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used,
+    site && site.media_movie_count, site && site.media_series_count, site && site.media_episode_count,
+    site && site.account_retention_days, site && site.account_retention_started_at_ms,
+    site && site.account_retention_last_completed_at_ms,
+    Array.isArray(site && site.upstream_headers) ? site.upstream_headers.length : 0,
+    active.has(String(site && site.id)),
+  ]));
+}
+
 function renderSites() {
   const page = document.getElementById('page-sites');
+  stopSitesRefresh();
   page.innerHTML = `
     <div class="sites-page-head fade-up">
       <div><h1 class="section-title">站点管理</h1><p class="section-sub">管理所有 Emby 反代站点与回源配置</p></div>
@@ -73,18 +91,61 @@ function renderSites() {
   document.getElementById('btn-add-site').onclick = () => showSiteModal();
   document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
   document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
-  loadSites();
+  void loadSites();
 }
 
-async function loadSites() {
+function scheduleSitesRefresh() {
+  if (siteRefreshTimer) window.clearTimeout(siteRefreshTimer);
+  siteRefreshTimer = 0;
+  if (typeof Router === 'undefined' || Router.current !== 'sites') return;
+  siteRefreshTimer = window.setTimeout(() => {
+    siteRefreshTimer = 0;
+    if (typeof Router === 'undefined' || Router.current !== 'sites') return;
+    void loadSites({ background: true });
+  }, SITE_REFRESH_INTERVAL_MS);
+}
+
+function stopSitesRefresh() {
+  if (siteRefreshTimer) window.clearTimeout(siteRefreshTimer);
+  siteRefreshTimer = 0;
+  siteLoadGeneration += 1;
+  if (typeof siteSortingCleanup === 'function') siteSortingCleanup();
+}
+
+async function loadSites(options = {}) {
+  const page = document.getElementById('page-sites');
+  const background = options && options.background === true;
+  if (!page || typeof Router === 'undefined' || Router.current !== 'sites') return;
+  const generation = ++siteLoadGeneration;
+  const searchInput = document.getElementById('sites-search');
+  const preservedSearch = String((searchInput && searchInput.value) || '');
   try {
-	const [sites, capabilities] = await Promise.all([API.listSites(), API.ingressCapabilities()]);
+	// The active-history read establishes the latest playback snapshot. Read
+	// the site list afterwards: its server-side queue barrier then includes
+	// media totals observed just before this page was opened.
+	const [capabilities, activeResponse] = await Promise.all([
+		API.ingressCapabilities(),
+		API.getActiveWatchHistory({}).catch(() => ({ items: [] })),
+	]);
+	const sites = await API.listSites();
+	if (generation !== siteLoadGeneration || Router.current !== 'sites' || !page.isConnected) return;
 	siteIngressCapabilities = normalizeSiteCapabilities(capabilities);
-    document.getElementById('sites-count').innerHTML = `共 <strong>${sites.length}</strong> 个站点`;
+    const activeItems = Array.isArray(activeResponse && activeResponse.items)
+      ? activeResponse.items
+      : (Array.isArray(activeResponse && activeResponse.sessions) ? activeResponse.sessions : []);
+	const activeSiteIDs = new Set(activeItems
+		.map(item => String(item && item.site_id || '').trim())
+		.filter(Boolean));
+    const count = document.getElementById('sites-count');
+    if (count) count.innerHTML = `共 <strong>${sites.length}</strong> 个站点`;
 
     const grid = document.getElementById('sites-grid');
+    if (!grid) return;
+    const renderSignature = siteCardsRenderSignature(sites, activeSiteIDs);
+    if (renderSignature === String(grid.dataset.siteRenderSignature || '')) return;
     if (!sites || sites.length === 0) {
       grid.innerHTML = '<div style="text-align:center;color:var(--white-38);padding:60px;grid-column:1/-1">暂无站点，点击右上角添加</div>';
+      grid.dataset.siteRenderSignature = renderSignature;
       return;
     }
 
@@ -93,6 +154,7 @@ async function loadSites() {
       const pctClass = pct > 85 ? 'danger' : pct > 50 ? 'warn' : 'normal';
 		const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
 		const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
+		const hasActivePlayback = activeSiteIDs.has(String(s.id));
 
       return `
       <div class="site-card" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
@@ -117,8 +179,8 @@ async function loadSites() {
         <div class="site-latency-line"><span class="status-led ${s.running ? 'on' : 'off'}"></span><span>回源延迟：</span><strong class="site-latency" id="site-latency-${s.id}">未测试</strong></div>
 		<div class="site-rows">
 		  <div class="site-row site-access-row">
-		    <span class="site-row-label">访问地址</span>
-		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false" title="显示访问地址">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"></path></svg></button></span>
+		    <div class="site-access-heading"><span class="site-row-label">访问地址</span>${hasActivePlayback ? `<button type="button" class="site-live-link" data-site-action="live" data-site-id="${s.id}" aria-label="查看 ${esc(s.name)} 当前正在播放的详情"><i class="site-live-pulse" aria-hidden="true"></i><span>正在播放</span></button>` : ''}</div>
+		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false" title="显示访问地址">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2 2v1"></path></svg></button></span>
 		  </div>
           <div class="site-row">
             <span class="site-row-label">主回源地址</span>
@@ -155,6 +217,7 @@ async function loadSites() {
         </div>
       </div>`;
     }).join('');
+    grid.dataset.siteRenderSignature = renderSignature;
 
     const sitesById = new Map(sites.map(site => [site.id, site]));
     grid.querySelectorAll('[data-site-action]').forEach(button => {
@@ -165,14 +228,24 @@ async function loadSites() {
 		if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
 		if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
 		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
+		if (button.dataset.siteAction === 'live') showSiteLiveDetails(site, button);
 		if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
         if (button.dataset.siteAction === 'edit') showSiteModal(site);
         if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
       });
     });
     setupSiteSorting(grid);
+    const currentSearch = document.getElementById('sites-search');
+    if (currentSearch && preservedSearch) {
+      currentSearch.value = preservedSearch;
+      filterSiteCards(preservedSearch);
+    }
   } catch (e) {
-    Toast.error('加载站点失败: ' + e.message);
+    if (generation !== siteLoadGeneration || Router.current !== 'sites' || !page.isConnected) return;
+    if (background) console.warn('Sites refresh error', e);
+    else Toast.error('加载站点失败: ' + e.message);
+  } finally {
+    if (generation === siteLoadGeneration && Router.current === 'sites' && page.isConnected) scheduleSitesRefresh();
   }
 }
 
@@ -1078,6 +1151,39 @@ async function copySiteAccessAddress(button) {
 	}
 }
 
+async function showSiteLiveDetails(site, button) {
+	const siteID = Number(site && site.id);
+	if (!Number.isSafeInteger(siteID) || siteID <= 0) return;
+	const previousText = button && button.textContent;
+	if (button) {
+		button.disabled = true;
+		button.textContent = '…';
+	}
+	try {
+		const response = await API.getActiveWatchHistory({ site_id: siteID });
+		const items = typeof watchHistoryNormalizeItems === 'function' ? watchHistoryNormalizeItems(response) : [];
+		if (!items.length) {
+			Toast.info('该站点当前没有正在播放的媒体');
+			return;
+		}
+		if (typeof watchHistoryDetailsHTML !== 'function' || typeof watchHistoryBindDetailImages !== 'function') {
+			throw new Error('播放详情组件尚未就绪');
+		}
+		document.getElementById('modal-title').textContent = `${site.name} · 正在播放`;
+		document.getElementById('modal-body').innerHTML = watchHistoryDetailsHTML(items[0]);
+		document.getElementById('modal-footer').innerHTML = '';
+		openModal({ closeOnBackdrop: true, modalClass: 'site-live-modal' });
+		watchHistoryBindDetailImages(document.getElementById('modal-body'));
+	} catch (error) {
+		Toast.error(error && error.message ? error.message : '读取正在播放失败');
+	} finally {
+		if (button && button.isConnected) {
+			button.disabled = false;
+			button.textContent = previousText || 'live';
+		}
+	}
+}
+
 let siteIngressCapabilities = normalizeSiteCapabilities({});
 
 function siteIngressModeLabel(site) {
@@ -1462,7 +1568,7 @@ async function showSiteModal(site) {
         <option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option>
         <option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option>
       </select>
-      <div class="form-help">仅记录后续成功的播放状态同步；不保存用户名、令牌、客户端 IP、DeviceId、PlaySessionId 或原始请求正文。关闭后不会删除已有历史。</div>
+      <div class="form-help">仅记录后续成功的播放状态同步；保存用户名、设备与原始 PlaySessionId 供管理员排查，令牌仅加密保存且绝不显示或回传。不会保存客户端 IP 或原始请求正文。关闭后不会删除已有历史。</div>
     </div>
     </div>
     <div class="site-form-column-secondary">

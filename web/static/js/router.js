@@ -42,6 +42,9 @@ const Router = {
     if (previous === 'watch-history' && hash !== 'watch-history' && typeof stopWatchHistoryRefresh === 'function') {
       stopWatchHistoryRefresh();
     }
+    if (previous === 'sites' && hash !== 'sites' && typeof stopSitesRefresh === 'function') {
+      stopSitesRefresh();
+    }
 
     this.current = hash;
 

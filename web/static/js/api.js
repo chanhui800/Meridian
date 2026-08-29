@@ -225,6 +225,14 @@ const API = {
     const query = params.toString();
     return this.request('GET', '/api/watch-history' + (query ? '?' + query : ''));
   },
+  getActiveWatchHistory(filters) {
+    const params = new URLSearchParams();
+    Object.entries(filters || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+    });
+    const query = params.toString();
+    return this.request('GET', '/api/watch-history/active' + (query ? '?' + query : ''));
+  },
   clearWatchHistory(siteId) {
     const params = new URLSearchParams();
     if (siteId !== undefined && siteId !== null && siteId !== '') params.set('site_id', String(siteId));
