@@ -9,7 +9,7 @@
   const setupTokenInputEl = document.getElementById('inp-setup-token');
   const sidebarToggleEl = document.getElementById('sidebar-toggle');
   const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
-  const sidebarEl = document.querySelector('.sidebar');
+  const sidebarEl = typeof document.querySelector === 'function' ? document.querySelector('.sidebar') : null;
   const sidebarStorageKey = 'meridian-sidebar-expanded';
   let sidebarPinned = false;
   let dashboardRefreshTimer = null;
