@@ -112,8 +112,9 @@ function stopSitesRefresh() {
   if (typeof siteSortingCleanup === 'function') siteSortingCleanup();
 }
 
-async function loadSites(options = {}) {
+async function loadSites() {
   const page = document.getElementById('page-sites');
+  const options = arguments[0] || {};
   const background = options && options.background === true;
   if (!page || typeof Router === 'undefined' || Router.current !== 'sites') return;
   const generation = ++siteLoadGeneration;
