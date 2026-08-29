@@ -93,6 +93,7 @@ test('watch history and TMDB API methods use encoded authenticated same-origin p
   };
 
   await vm.runInContext('API.getWatchHistory({ site_id: "site/42 ?", media_type: "movie", from_ms: 123, limit: 24 })', sandbox);
+  await vm.runInContext('API.getActiveWatchHistory({ site_id: "site/42 ?", media_type: "movie" })', sandbox);
   await vm.runInContext('API.clearWatchHistory("site/42 ?")', sandbox);
   await vm.runInContext('API.getTMDBSettings()', sandbox);
   await vm.runInContext('API.saveTMDBSettings({ language: "zh-CN", history_retention_days: 90 })', sandbox);
@@ -102,6 +103,7 @@ test('watch history and TMDB API methods use encoded authenticated same-origin p
 
   assert.deepEqual(requests.map(request => [request.options.method, request.url]), [
     ['GET', '/api/watch-history?site_id=site%2F42+%3F&media_type=movie&from_ms=123&limit=24'],
+    ['GET', '/api/watch-history/active?site_id=site%2F42+%3F&media_type=movie'],
     ['DELETE', '/api/watch-history?site_id=site%2F42+%3F'],
     ['GET', '/api/tmdb-settings'],
     ['POST', '/api/tmdb-settings'],
@@ -110,9 +112,9 @@ test('watch history and TMDB API methods use encoded authenticated same-origin p
     ['POST', '/api/tmdb-settings/cache/clear'],
   ]);
   assert.equal(requests.every(request => request.options.credentials === 'same-origin'), true);
-  assert.deepEqual(JSON.parse(requests[3].options.body), { language: 'zh-CN', history_retention_days: 90 });
-  assert.deepEqual(JSON.parse(requests[4].options.body), { token: 'typed-only' });
-  assert.deepEqual(JSON.parse(requests[6].options.body), { scope: 'stale' });
+  assert.deepEqual(JSON.parse(requests[4].options.body), { language: 'zh-CN', history_retention_days: 90 });
+  assert.deepEqual(JSON.parse(requests[5].options.body), { token: 'typed-only' });
+  assert.deepEqual(JSON.parse(requests[7].options.body), { scope: 'stale' });
 });
 
 test('poster URLs accept only positive numeric media IDs and remain same-origin', () => {
@@ -166,6 +168,24 @@ test('watch history card escapes media data and never interpolates a remote post
   assert.doesNotMatch(html, /12:34 \/ 1:00:00/);
 });
 
+test('live watch cards match the detail view by preferring a horizontal backdrop', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const html = sandbox.watchHistoryCardHTML({
+    id: 2,
+    media_item_id: 8,
+    poster_available: true,
+    poster_path: '/portrait.jpg',
+    backdrop_path: '/landscape.jpg',
+    stills: ['/still.jpg'],
+    title: '正在播放',
+    media_type: 'movie',
+  }, 0, { source: 'live', live: true });
+
+  assert.match(html, /src="\/api\/watch-history\/backdrops\/8"/);
+  assert.match(html, /data-watch-history-card-fallbacks=/);
+  assert.match(html, /watch-history-live-badge/);
+});
+
 test('watch history details escape synopsis and cast data while exposing the requested metadata', () => {
   const sandbox = loadWatchHistoryHelpers();
   const attack = '<script>alert(1)</script>';
@@ -188,6 +208,29 @@ test('watch history details escape synopsis and cast data while exposing the req
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>alert/);
   assert.match(html, /\/api\/watch-history\/posters\/12/);
+});
+
+test('watch history details show the playback client without exposing session credentials or device data', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const token = 'token-must-never-render';
+  const html = sandbox.watchHistoryDetailsHTML({
+    title: '正在播放的影片',
+    site_name: '测试站点',
+    user_name: 'Alice',
+    user_id: 'alice-id',
+    client_name: 'Emby for Android TV',
+    device_name: 'Living Room TV',
+    device_id: 'device-1',
+    play_session_id: 'raw-play-session',
+    token_stored: true,
+    token_ciphertext: token,
+  });
+  assert.match(html, /观看用户/);
+  assert.match(html, /Alice/);
+  assert.match(html, /播放客户端/);
+  assert.match(html, /Emby for Android TV/);
+  assert.doesNotMatch(html, /设备名称|设备 ID|播放会话 ID|认证令牌|Living Room TV|raw-play-session/);
+  assert.doesNotMatch(html, new RegExp(token));
 });
 
 test('watch history details expose bounded TMDB media facts and same-origin gallery URLs', () => {
@@ -347,6 +390,31 @@ test('site viewing-history flags accept JSON booleans and legacy SQLite scalar v
   ]);
 });
 
+test('site cards show the playback entry only for active sessions and expose reduced-motion-safe heartbeat styling', () => {
+  const sites = source('web/static/js/pages/sites.js');
+  const css = source('web/static/css/style.css');
+  assert.match(sites, /API\.getActiveWatchHistory\(\{\}\)\.catch/);
+  assert.match(sites, /const sites = await API\.listSites\(\);/);
+  assert.ok(sites.indexOf('API.getActiveWatchHistory({})') < sites.indexOf('const sites = await API.listSites();'));
+  assert.match(sites, /const hasActivePlayback = activeSiteIDs\.has\(String\(s\.id\)\)/);
+  assert.match(sites, /hasActivePlayback \? `<button[^`]*正在播放/);
+  assert.match(css, /\.site-live-pulse\s*\{[\s\S]*?animation:\s*site-live-heartbeat/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.site-live-pulse\s*\{\s*animation:\s*none;/);
+});
+
+test('watch history and sites stay fresh while their pages are open and cancel timers on navigation', () => {
+  const history = source('web/static/js/pages/watch-history.js');
+  const sites = source('web/static/js/pages/sites.js');
+  const router = source('web/static/js/router.js');
+  assert.match(history, /const WATCH_HISTORY_REFRESH_INTERVAL_MS = 5000;/);
+  assert.match(sites, /const SITE_REFRESH_INTERVAL_MS = 5000;/);
+  assert.match(sites, /function scheduleSitesRefresh\(\)/);
+  assert.match(sites, /void loadSites\(\{ background: true \}\);/);
+  assert.match(sites, /function stopSitesRefresh\(\)/);
+  assert.match(sites, /generation !== siteLoadGeneration \|\| Router\.current !== 'sites' \|\| !page\.isConnected/);
+  assert.match(router, /previous === 'sites' && hash !== 'sites' && typeof stopSitesRefresh/);
+});
+
 test('watch history loader keeps the normalized enabled flag instead of normalizing twice', () => {
   const history = source('web/static/js/pages/watch-history.js');
   assert.match(history, /watchHistorySitesCache = Array\.isArray\(siteResult\.sites\) \? siteResult\.sites : \[\];/);
@@ -418,7 +486,8 @@ test('site advanced settings default viewing history off and submit a boolean', 
   assert.match(sites, /option value="off" \$\{!isEdit \|\| !site\.watch_history_enabled \? 'selected' : ''\}>关闭/);
   assert.match(sites, /watchHistorySelect\.value = isEdit && site\.watch_history_enabled \? 'on' : 'off'/);
   assert.match(sites, /watch_history_enabled: watchHistorySelect\.value === 'on'/);
-  assert.match(sites, /不保存用户名、令牌、客户端 IP、DeviceId、PlaySessionId 或原始请求正文/);
+  assert.match(sites, /保存用户名、设备与原始 PlaySessionId 供管理员排查/);
+  assert.match(sites, /令牌仅加密保存且绝不显示或回传/);
 });
 
 test('viewing history layout reuses theme tokens and keeps a two-column mobile poster grid', () => {
@@ -483,12 +552,17 @@ test('watch history async loads are scoped to the active route and generation', 
   const history = source('web/static/js/pages/watch-history.js');
   assert.match(history, /generation !== watchHistoryLoadGeneration \|\| Router\.current !== 'watch-history'/);
   assert.match(history, /function stopWatchHistoryRefresh\(\)/);
+  assert.match(history, /function watchHistoryItemsRenderSignature\(items, context = ''\)/);
+  assert.match(history, /signature !== watchHistoryRenderedItemsSignature/);
+  assert.match(history, /const showLoading = watchHistoryState\.loading && options\.background !== true;/);
+  assert.match(history, /watchHistoryRenderItems\(undefined, \{ background \}\);/);
   assert.match(history, /role="status" aria-live="polite"/);
   assert.match(history, /aria-busy="true"/);
   assert.match(history, /loading="lazy" decoding="async"/);
   assert.match(history, /reset \|\| watchHistorySitesCache\.length === 0/);
   assert.match(history, /reset \|\| watchHistoryState\.tmdbConfigured === null/);
-  assert.match(history, /WATCH_HISTORY_REFRESH_INTERVAL_MS = 15000/);
+  assert.match(history, /WATCH_HISTORY_REFRESH_INTERVAL_MS = 5000/);
+  assert.match(history, /\$\{WATCH_HISTORY_REFRESH_INTERVAL_MS \/ 1000\} 秒/);
   assert.match(history, /scheduleWatchHistoryRefresh\(\)/);
   assert.match(history, /loadWatchHistory\(true, \{ background: true \}\)/);
   assert.match(history, /watch-history-detail-modal/);

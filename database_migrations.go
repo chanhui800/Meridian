@@ -210,6 +210,13 @@ func (d *DB) migrateOnce() error {
 		runtime_ticks INTEGER NOT NULL DEFAULT 0,
 		play_method TEXT NOT NULL DEFAULT '',
 		completed INTEGER NOT NULL DEFAULT 0,
+		user_name TEXT NOT NULL DEFAULT '',
+		user_id TEXT NOT NULL DEFAULT '',
+		device_id TEXT NOT NULL DEFAULT '',
+		device_name TEXT NOT NULL DEFAULT '',
+		client_name TEXT NOT NULL DEFAULT '',
+		play_session_id TEXT NOT NULL DEFAULT '',
+		token_ciphertext TEXT NOT NULL DEFAULT '',
 		UNIQUE(site_id, session_hash)
 	);
 	CREATE INDEX IF NOT EXISTS idx_watch_sessions_time ON watch_sessions(last_seen_at_ms DESC, id DESC);
@@ -432,6 +439,13 @@ func (d *DB) migrateOnce() error {
 		{"tmdb_cache", "season_count", "ALTER TABLE tmdb_cache ADD COLUMN season_count INTEGER NOT NULL DEFAULT 0"},
 		{"tmdb_cache", "episode_count", "ALTER TABLE tmdb_cache ADD COLUMN episode_count INTEGER NOT NULL DEFAULT 0"},
 		{"tmdb_cache", "stills_json", "ALTER TABLE tmdb_cache ADD COLUMN stills_json TEXT NOT NULL DEFAULT '[]'"},
+		{"watch_sessions", "user_name", "ALTER TABLE watch_sessions ADD COLUMN user_name TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "user_id", "ALTER TABLE watch_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "device_id", "ALTER TABLE watch_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "device_name", "ALTER TABLE watch_sessions ADD COLUMN device_name TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "client_name", "ALTER TABLE watch_sessions ADD COLUMN client_name TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "play_session_id", "ALTER TABLE watch_sessions ADD COLUMN play_session_id TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "token_ciphertext", "ALTER TABLE watch_sessions ADD COLUMN token_ciphertext TEXT NOT NULL DEFAULT ''"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", migration.table, migration.column).Scan(&found); err != nil {

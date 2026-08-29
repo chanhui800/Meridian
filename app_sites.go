@@ -46,6 +46,14 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		w.Header().Set("Cache-Control", "no-store")
+		// Library totals are collected from proxied Emby responses and committed
+		// through the dynamic-observation writer. Drain that queue before taking
+		// the site snapshot so the first page load is as current as a manual
+		// refresh, rather than relying on a later request to make totals appear.
+		if err := a.db.flushDynamicObservations(); err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "刷新站点统计失败")
+			return
+		}
 		sites, err := a.db.ListSites()
 		if err != nil {
 			a.jsonErr(w, 500, err.Error())

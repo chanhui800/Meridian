@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type watchHistoryResponseEntry struct {
@@ -21,6 +22,12 @@ type watchHistoryResponse struct {
 	NextCursor    string                      `json:"next_cursor"`
 	HasMore       bool                        `json:"has_more"`
 	DroppedEvents uint64                      `json:"dropped_events"`
+}
+
+type watchHistoryActiveResponse struct {
+	Items               []watchHistoryResponseEntry `json:"items"`
+	ObservedAtMS        int64                       `json:"observed_at_ms"`
+	ActiveWindowSeconds int64                       `json:"active_window_seconds"`
 }
 
 func encodeWatchHistoryCursor(lastSeenMS, id int64) string {
@@ -160,6 +167,10 @@ func (a *App) handleWatchHistory(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleWatchHistoryItem(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	rawID := strings.TrimPrefix(r.URL.Path, "/api/watch-history/")
+	if rawID == "active" {
+		a.handleActiveWatchHistory(w, r)
+		return
+	}
 	if rawID == "" || strings.Contains(rawID, "/") {
 		http.NotFound(w, r)
 		return
@@ -183,4 +194,40 @@ func (a *App) handleWatchHistoryItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.jsonOK(w, map[string]any{"deleted": true, "id": historyID})
+}
+
+func (a *App) handleActiveWatchHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	query := r.URL.Query()
+	siteID, err := parseNonNegativeQueryInt64(query.Get("site_id"))
+	if err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "站点筛选无效")
+		return
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(query.Get("media_type")))
+	if mediaType != "" && mediaType != "movie" && mediaType != "episode" && mediaType != "series" {
+		a.jsonErr(w, http.StatusBadRequest, "媒体类型无效")
+		return
+	}
+	entries, err := a.db.ListActiveWatchHistory(WatchHistoryFilter{SiteID: siteID, MediaType: mediaType, Query: query.Get("q")})
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "读取正在观看失败")
+		return
+	}
+	items := make([]watchHistoryResponseEntry, 0, len(entries))
+	for _, entry := range entries {
+		progress := 0.0
+		if entry.RunTimeTicks > 0 && entry.PositionTicks > 0 {
+			progress = float64(entry.PositionTicks) * 100 / float64(entry.RunTimeTicks)
+			if progress > 100 {
+				progress = 100
+			}
+		}
+		items = append(items, watchHistoryResponseEntry{WatchHistoryEntry: entry, PosterAvailable: validTMDBPosterPath(entry.PosterPath), ProgressPercent: progress})
+	}
+	a.jsonOK(w, watchHistoryActiveResponse{Items: items, ObservedAtMS: time.Now().UnixMilli(), ActiveWindowSeconds: int64(watchHistoryActiveWindow / time.Second)})
 }

@@ -9,7 +9,9 @@
   const setupTokenInputEl = document.getElementById('inp-setup-token');
   const sidebarToggleEl = document.getElementById('sidebar-toggle');
   const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
+  const sidebarEl = document.querySelector('.sidebar');
   const sidebarStorageKey = 'meridian-sidebar-expanded';
+  let sidebarPinned = false;
   let dashboardRefreshTimer = null;
   let appBootstrapped = false;
   let modalBackdropClosable = false;
@@ -33,26 +35,46 @@
   function setSidebarExpanded(expanded, persist) {
     expanded = !!expanded;
     shellEl.classList.toggle('sidebar-expanded', expanded);
-    if (sidebarToggleEl) {
-      const label = expanded ? '折叠导航栏' : '展开导航栏';
-      sidebarToggleEl.setAttribute('aria-expanded', String(expanded));
-      sidebarToggleEl.setAttribute('aria-label', label);
-      sidebarToggleEl.title = label;
-    }
-    if (persist) {
+    if (persist && !isMobileSidebar()) {
+      sidebarPinned = expanded;
       try {
         if (window.localStorage) window.localStorage.setItem(sidebarStorageKey, String(expanded));
       } catch (_) {}
     }
+    updateSidebarToggleState();
   }
 
-  setSidebarExpanded(storedSidebarExpanded(), false);
+  sidebarPinned = storedSidebarExpanded();
+  setSidebarExpanded(sidebarPinned, false);
   if (sidebarToggleEl) {
     sidebarToggleEl.addEventListener('click', function() {
-      setSidebarExpanded(!shellEl.classList.contains('sidebar-expanded'), true);
+      if (isMobileSidebar()) {
+        setSidebarExpanded(!shellEl.classList.contains('sidebar-expanded'), false);
+        return;
+      }
+      sidebarPinned = !sidebarPinned;
+      setSidebarExpanded(sidebarPinned, true);
     });
   }
   if (sidebarDrawerCloseEl) sidebarDrawerCloseEl.addEventListener('click', () => setSidebarExpanded(false, true));
+
+  if (sidebarEl) {
+    sidebarEl.addEventListener('pointerenter', function() {
+      if (supportsSidebarHover()) setSidebarExpanded(true, false);
+    });
+    sidebarEl.addEventListener('pointerleave', function() {
+      if (supportsSidebarHover()) setSidebarExpanded(sidebarPinned, false);
+    });
+  }
+
+  window.addEventListener('resize', function() {
+    if (isMobileSidebar()) {
+      setSidebarExpanded(false, false);
+      return;
+    }
+    const hovered = supportsSidebarHover() && !!(sidebarEl && sidebarEl.matches(':hover'));
+    setSidebarExpanded(sidebarPinned || hovered, false);
+  });
 
   const dismissMobileDrawer = () => {
     if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches && shellEl.classList.contains('sidebar-expanded')) {
@@ -183,9 +205,34 @@
   function teardownAppRuntime() {
     stopDashboardRefresh();
     if (typeof stopDashSSE === 'function') stopDashSSE();
+    if (typeof stopSitesRefresh === 'function') stopSitesRefresh();
+    if (typeof stopWatchHistoryRefresh === 'function') stopWatchHistoryRefresh();
     // Keep cleanup compatible with cached clients that still have the retired
     // traffic page script loaded; the page is no longer registered or linked.
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
+  }
+
+  function isMobileSidebar() {
+    return !!(window.matchMedia && window.matchMedia('(max-width: 768px)').matches);
+  }
+
+  function supportsSidebarHover() {
+    return !isMobileSidebar() && !!(window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches);
+  }
+
+  function updateSidebarToggleState() {
+    if (!sidebarToggleEl) return;
+    const expanded = shellEl.classList.contains('sidebar-expanded');
+    const mobile = isMobileSidebar();
+    const label = mobile
+      ? (expanded ? '关闭导航栏' : '打开导航栏')
+      : (sidebarPinned ? '取消固定导航栏' : '固定展开导航栏');
+    sidebarToggleEl.setAttribute('aria-expanded', String(expanded));
+    sidebarToggleEl.setAttribute('aria-pressed', String(mobile ? expanded : sidebarPinned));
+    sidebarToggleEl.setAttribute('aria-label', label);
+    sidebarToggleEl.removeAttribute('title');
+    sidebarToggleEl.classList.toggle('is-expanded', expanded);
+    sidebarToggleEl.classList.toggle('is-pinned', !mobile && sidebarPinned);
   }
 
   function loginErrorMessage(error) {
