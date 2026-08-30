@@ -33,7 +33,7 @@ const maxAgentEventBodyBytes = 32 << 10
 
 // Keep the complete report comfortably below the controller request limit
 // when several metadata events are acknowledged in one heartbeat.
-const maxAgentEventResponseBodyBytes = 16 << 10
+const maxAgentEventResponseBodyBytes = 64 << 10
 const maxAgentEventsPerReport = 16
 
 type state struct {

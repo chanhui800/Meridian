@@ -171,8 +171,12 @@ type NodeRequestEvent struct {
 	SkipRequestLog          bool   `json:"skip_request_log,omitempty"`
 }
 
+// Metadata responses from Emby-compatible backends can include provider and
+// image fields large enough to exceed the old 8 KiB event cap. Keep the event
+// bounded, but leave enough room for a complete item response.
 const maxNodeRequestEventBodyBytes = 8 << 10
-const maxNodeRequestEventResponseBodyBytes = 8 << 10
+const maxNodeRequestEventResponseBodyBytes = 64 << 10
+const maxAgentReportBodyBytes = 2 << 20
 const maxNodeRequestEventsPerReport = 32
 const maxNodeTelemetryItemsPerReport = 128
 

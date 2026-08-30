@@ -122,7 +122,14 @@ func (a *App) limiter() *loginRateLimiter {
 }
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}) error {
-	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	return decodeJSONBodyWithLimit(w, r, dst, maxJSONBodyBytes)
+}
+
+func decodeJSONBodyWithLimit(w http.ResponseWriter, r *http.Request, dst interface{}, limit int64) error {
+	if limit <= 0 {
+		limit = maxJSONBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
