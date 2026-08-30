@@ -97,6 +97,21 @@ func TestControlNodePortValidation(t *testing.T) {
 	}
 }
 
+func TestNodeMetadataEventResponseLimit(t *testing.T) {
+	event := NodeRequestEvent{
+		EventID: 1, SiteID: 1, Host: "media.example.test", Method: "GET",
+		Path: "/Items/123", StatusCode: 200, ResponseBody: strings.Repeat("x", 32<<10),
+		RecordedAtMS: time.Now().UnixMilli(),
+	}
+	if err := validateNodeRequestEvent(event); err != nil {
+		t.Fatalf("metadata response below limit rejected: %v", err)
+	}
+	event.ResponseBody = strings.Repeat("x", maxNodeRequestEventResponseBodyBytes+1)
+	if err := validateNodeRequestEvent(event); err == nil {
+		t.Fatal("metadata response above limit accepted")
+	}
+}
+
 func TestControlNodeManualTrafficOffsetAndSiteStats(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)

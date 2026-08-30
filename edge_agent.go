@@ -29,7 +29,7 @@ import (
 
 const (
 	edgeEventBodyLimit     = 8 << 10
-	edgeEventResponseLimit = 8 << 10
+	edgeEventResponseLimit = maxNodeRequestEventResponseBodyBytes
 	edgeReportEventLimit   = 32
 	edgeEventQueueLimit    = 1024
 )

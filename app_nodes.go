@@ -411,7 +411,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var report NodeReport
-	if err := decodeJSONBody(w, r, &report); err != nil {
+	if err := decodeJSONBodyWithLimit(w, r, &report, maxAgentReportBodyBytes); err != nil {
 		a.jsonErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
