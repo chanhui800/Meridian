@@ -217,7 +217,7 @@ func normalizeController(value string) (string, error) {
 }
 
 func loadState(path string) (state, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- administrator-selected local Agent state path.
 	if errors.Is(err, os.ErrNotExist) {
 		return state{}, nil
 	}
@@ -308,7 +308,7 @@ func request(ctx context.Context, client *http.Client, method, endpoint, token s
 }
 
 func enroll(ctx context.Context, client *http.Client, controller, tokenFile, statePath string) (state, error) {
-	data, err := os.ReadFile(tokenFile)
+	data, err := os.ReadFile(tokenFile) // #nosec G304 -- administrator-selected enrollment file.
 	if err != nil {
 		return state{}, fmt.Errorf("read enrollment token: %w", err)
 	}
@@ -364,7 +364,7 @@ func counter(interfaceName, name string) (int64, error) {
 	if name != "rx_bytes" && name != "tx_bytes" {
 		return 0, errors.New("invalid counter")
 	}
-	data, err := os.ReadFile(filepath.Join("/sys/class/net", interfaceName, "statistics", name))
+	data, err := os.ReadFile(filepath.Join("/sys/class/net", interfaceName, "statistics", name)) // #nosec G304 -- interface is discovered from the kernel route table.
 	if err != nil {
 		return 0, err
 	}
