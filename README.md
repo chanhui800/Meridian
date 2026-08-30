@@ -156,7 +156,7 @@ sudo systemctl daemon-reload
 
 ## 发布和开发
 
-最新正式版和校验文件见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。容器镜像为 `ghcr.io/chanhui800/meridian:latest`，固定版本可使用 `ghcr.io/chanhui800/meridian:v1.9.0`。
+最新正式版和校验文件见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。容器镜像为 `ghcr.io/chanhui800/meridian:latest`，固定版本可使用 `ghcr.io/chanhui800/meridian:v1.9.1`。
 
 本地检查：
 
