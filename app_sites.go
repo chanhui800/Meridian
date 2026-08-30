@@ -972,6 +972,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, stopErr.Error())
 			return
 		}
+		if err := a.removeSiteNodeSchedule(r.Context(), id); err != nil {
+			a.jsonErr(w, http.StatusBadGateway, "scheduled DNS cleanup failed: "+err.Error())
+			return
+		}
 		if err := a.db.DeleteSite(id); err != nil {
 			// The row survived the delete, so an enabled site must not be left
 			// without a running instance: restart it from a fresh read (which

@@ -59,9 +59,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	if err != nil {
 		return fmt.Errorf("invalid UA profile: %w", err)
 	}
-	configuredHeaders, err := resolveUpstreamHeaderPolicy(site.StoredUpstreamHeaders, pm.upstreamHeaderKey, target)
-	if err != nil {
-		return fmt.Errorf("invalid upstream headers: %w", err)
+	configuredHeaders := upstreamHeaderPolicy{}
+	if site.RuntimeUpstreamHeaders != nil {
+		configuredHeaders = upstreamHeaderPolicy{authority: redirectHostKey(target), values: make(http.Header, len(site.RuntimeUpstreamHeaders))}
+		for name, values := range site.RuntimeUpstreamHeaders {
+			configuredHeaders.values[name] = append([]string(nil), values...)
+		}
+	} else {
+		configuredHeaders, err = resolveUpstreamHeaderPolicy(site.StoredUpstreamHeaders, pm.upstreamHeaderKey, target)
+		if err != nil {
+			return fmt.Errorf("invalid upstream headers: %w", err)
+		}
 	}
 	redirectPolicy, err := newDynamicRedirectPolicy(site, pm.DynamicDiscoveryAvailable())
 	if err != nil {

@@ -310,6 +310,17 @@ func (d *DB) EnqueueAccountRetentionCompletion(event accountRetentionCompletionE
 	if d == nil || event.SiteID <= 0 || event.ExpectedStartedAtMS <= 0 || event.CompletedAtMS < event.ExpectedStartedAtMS {
 		return false
 	}
+	if d.edgeEphemeral {
+		if d.edgeTelemetrySink != nil {
+			d.edgeTelemetrySink(edgeTelemetryEvent{Kind: "retention", Retention: event})
+		}
+		// Observe holds its tracker mutex while enqueueing; complete the local
+		// session asynchronously so the callback cannot self-deadlock.
+		if event.Done != nil {
+			go event.Done(true)
+		}
+		return true
+	}
 	command := dynamicObservationCommand{kind: dynamicObservationCommandAccountRetentionComplete, retention: event}
 	if !d.dynamicObservationGate.TryRLock() {
 		return false
@@ -330,6 +341,12 @@ func (d *DB) EnqueueMediaLibraryCounts(event mediaLibraryCountEvent) bool {
 	if d == nil || event.SiteID <= 0 || event.ObservedAtMS <= 0 || event.MovieCount < 0 || event.SeriesCount < 0 || event.EpisodeCount < 0 ||
 		event.MovieCount > mediaLibraryCountMaxValue || event.SeriesCount > mediaLibraryCountMaxValue || event.EpisodeCount > mediaLibraryCountMaxValue {
 		return false
+	}
+	if d.edgeEphemeral {
+		if d.edgeTelemetrySink != nil {
+			d.edgeTelemetrySink(edgeTelemetryEvent{Kind: "media_counts", Media: event})
+		}
+		return true
 	}
 	command := dynamicObservationCommand{kind: dynamicObservationCommandMediaCountsUpdate, mediaCounts: event}
 	if !d.dynamicObservationGate.TryRLock() {

@@ -1,0 +1,57 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = path.resolve(__dirname, '..');
+const html = fs.readFileSync(path.join(root, 'web/static/index.html'), 'utf8');
+const api = fs.readFileSync(path.join(root, 'web/static/js/api.js'), 'utf8');
+const page = fs.readFileSync(path.join(root, 'web/static/js/pages/nodes.js'), 'utf8');
+const router = fs.readFileSync(path.join(root, 'web/static/js/router.js'), 'utf8');
+
+test('node scheduling is a first-level page with refresh cleanup', () => {
+  assert.match(html, /data-page="nodes"/);
+  assert.match(html, /id="page-nodes"/);
+  assert.match(html, /pages\/nodes\.js/);
+  assert.match(router, /previous === 'nodes'.*stopNodesRefresh/s);
+});
+
+test('node API exposes CRUD, enrollment refresh, and scheduler verbs', () => {
+  assert.match(api, /getNodes\(\).*'GET', '\/api\/nodes'/s);
+  assert.match(api, /createNode\(data\).*'POST', '\/api\/nodes'/s);
+  assert.match(api, /updateNode\(id, data\).*'PUT'/s);
+  assert.match(api, /deleteNode\(id\).*'DELETE'/s);
+  assert.match(api, /refreshNodeEnrollment.*'POST'.*\/enrollment/s);
+  assert.match(api, /saveNodeScheduler\(data\).*'PUT', '\/api\/node-scheduler'/s);
+});
+
+test('node page wires selectable manual mode, deletion, and DNS safety', () => {
+  assert.match(page, /name="manual-node"/);
+  assert.match(page, /请选择一个节点/);
+  assert.match(page, /API\.deleteNode/);
+  assert.match(page, /DNS 仅在 Agent 应用配置并通过域名证书与入口健康检查后切换/);
+  assert.match(page, /已有连接不会被强制迁移/);
+});
+
+test('node form exposes one HTTPS port without entry or gateway modes', () => {
+  assert.doesNotMatch(page, /入口模式|Agent 本地端口|共享现有 Nginx\/Caddy|gateway_snippets|网关配置/);
+  assert.match(page, /<label>端口<input[^>]+id="node-port"/);
+  assert.match(page, /location\.port \|\| 443/);
+  assert.match(page, /Agent 仅提供 TLS\/HTTPS/);
+  assert.match(page, /所有调度站点共用此端口并按域名区分/);
+  assert.match(page, /port: Number\(document\.getElementById\('node-port'\)\.value\)/);
+  assert.doesNotMatch(page, /entry_mode:|http_port:|https_port:/);
+});
+
+test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {
+  assert.match(api, /getSiteNodeSchedules\(\).*'GET', '\/api\/node-scheduler\/sites'/s);
+  assert.match(api, /saveSiteNodeSchedule\(id, data\).*'PUT'/s);
+  assert.match(page, /data-field="enabled"/);
+  assert.match(page, /跟随全局调度/);
+  assert.match(page, /固定节点/);
+  assert.match(page, /创建或更新精确 DNS 记录/);
+  assert.match(page, /未启用节点调度，继续使用原面板入口/);
+  assert.match(page, /原面板模式 · 节点调度未启用/);
+  assert.match(page, /syncSiteScheduleRow/);
+  assert.match(page, /enabled && mode === 'fixed'/);
+});

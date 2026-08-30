@@ -65,6 +65,7 @@ type Site struct {
 	SpeedLimit                    int                  `json:"speed_limit"`
 	CreatedAt                     string               `json:"created_at"`
 	UpdatedAt                     string               `json:"updated_at"`
+	RuntimeUpstreamHeaders        map[string][]string  `json:"-"`
 }
 
 func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade, assetCacheEnabled, watchHistoryEnabled int) error {
@@ -547,6 +548,9 @@ func (d *DB) DeleteSite(id int64) error {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM media_items WHERE site_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM site_node_schedules WHERE site_id=?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM tmdb_cache WHERE NOT EXISTS (

@@ -80,6 +80,28 @@ type ProxyManager struct {
 	accountRetention        *accountRetentionTracker
 }
 
+// ProxyRuntimeStat is a non-persistent edge snapshot. Node scheduling quotas
+// continue to use NIC totals; these per-site counters are telemetry only.
+type ProxyRuntimeStat struct {
+	SiteID             int64
+	CumulativeBytesIn  int64
+	CumulativeBytesOut int64
+	Requests           int64
+}
+
+func (pm *ProxyManager) ProxyRuntimeStats() []ProxyRuntimeStat {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	stats := make([]ProxyRuntimeStat, 0, len(pm.proxies))
+	for _, inst := range pm.proxies {
+		if inst == nil || inst.Site.ID <= 0 {
+			continue
+		}
+		stats = append(stats, ProxyRuntimeStat{SiteID: inst.Site.ID, CumulativeBytesIn: inst.cumulativeBytesIn.Load(), CumulativeBytesOut: inst.cumulativeBytesOut.Load(), Requests: inst.reqCount.Load()})
+	}
+	return stats
+}
+
 // siteIngressClosedError means StopSite passed the irreversible boundary: new
 // requests are rejected and listeners are closed, but draining and/or the final
 // traffic checkpoint did not finish. Callers must not leave the DB row enabled

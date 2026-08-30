@@ -13,7 +13,10 @@ import (
 )
 
 type DB struct {
-	db *sql.DB
+	db                 *sql.DB
+	edgeEphemeral      bool
+	edgeRequestLogSink func(requestLogEvent)
+	edgeTelemetrySink  func(edgeTelemetryEvent)
 
 	dynamicObservationQueue     chan dynamicObservationCommand
 	dynamicObservationDone      chan struct{}

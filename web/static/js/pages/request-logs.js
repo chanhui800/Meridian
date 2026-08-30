@@ -222,14 +222,14 @@ function renderRequestLogs() {
       <div class="request-log-table-scroll">
         <table class="request-log-table">
           <colgroup>
-            <col class="request-log-col-node"><col class="request-log-col-category"><col class="request-log-col-status">
+            <col class="request-log-col-site"><col class="request-log-col-node"><col class="request-log-col-category"><col class="request-log-col-status">
             <col class="request-log-col-ip"><col class="request-log-col-ua"><col class="request-log-col-upstream-ua"><col class="request-log-col-backend"><col class="request-log-col-time">
           </colgroup>
           <thead><tr>
-            <th data-log-field="node">节点</th><th data-log-field="category">资源类别</th><th data-log-field="status">状态</th><th data-log-field="ip">客户端 IP</th><th data-log-field="ua">客户端 UA</th><th data-log-field="upstream-ua">上游 UA</th><th data-log-field="backend-address">后端地址</th><th data-log-field="timeline">时间线</th>
+            <th data-log-field="site">站点</th><th data-log-field="node">节点</th><th data-log-field="category">资源类别</th><th data-log-field="status">状态</th><th data-log-field="ip">客户端 IP</th><th data-log-field="ua">客户端 UA</th><th data-log-field="upstream-ua">上游 UA</th><th data-log-field="backend-address">后端地址</th><th data-log-field="timeline">时间线</th>
           </tr></thead>
           <tbody id="request-log-body">
-            <tr><td colspan="8" class="request-log-empty">正在加载…</td></tr>
+            <tr><td colspan="9" class="request-log-empty">正在加载…</td></tr>
           </tbody>
         </table>
       </div>
@@ -323,7 +323,7 @@ async function loadRequestLogs(options = {}) {
   const preserveViewport = previousScrollTop > 0;
   requestLogLoading = true;
   if (options.showLoading === true && !body.querySelector('tr[data-log-id]')) {
-    body.innerHTML = '<tr><td colspan="8" class="request-log-empty">正在加载…</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="request-log-empty">正在加载…</td></tr>';
   }
   try {
     const response = await API.getRequestLogs({
@@ -346,7 +346,7 @@ async function loadRequestLogs(options = {}) {
   } catch (error) {
     if (generation !== requestLogLoadGeneration) return;
     if (!body.querySelector('tr[data-log-id]')) {
-      body.innerHTML = '<tr><td colspan="8" class="request-log-empty request-log-error">日志读取失败</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="request-log-empty request-log-error">日志读取失败</td></tr>';
     }
     Toast.error(error.message);
   } finally {
@@ -362,7 +362,7 @@ function renderRequestLogRows(logs) {
   const body = document.getElementById('request-log-body');
   if (!body) return;
   if (!logs.length) {
-    body.innerHTML = '<tr><td colspan="8" class="request-log-empty">当前条件下暂无日志</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="request-log-empty">当前条件下暂无日志</td></tr>';
     return;
   }
   body.innerHTML = logs.map(entry => {
@@ -372,7 +372,8 @@ function renderRequestLogRows(logs) {
     const requestTitle = `${String(entry.method || 'GET')} ${String(entry.path || '/')}`;
     return `
       <tr data-log-id="${esc(entry.id || '')}" title="${esc(requestTitle)}">
-        <td data-log-field="node"><span class="request-log-node">${esc(entry.site_name || '—')}</span></td>
+        <td data-log-field="site"><span class="request-log-node">${esc(entry.site_name || '—')}</span></td>
+        <td data-log-field="node"><span class="request-log-node">${esc(entry.final_node || '—')}</span></td>
         <td data-log-field="category"><span class="request-log-category">${esc(requestLogCategoryLabel(entry.resource_category))}</span></td>
         <td data-log-field="status"><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
         <td data-log-field="ip"><span class="request-log-ip mono">${esc(entry.client_ip || '—')}</span><small class="request-log-region">${esc(entry.client_region || '')}</small></td>

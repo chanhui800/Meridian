@@ -35,9 +35,16 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.48-watch-live-test.12"
+var appVersion = "v1.8.48-node-agent-test.4"
 
 func main() {
+	if strings.EqualFold(filepath.Base(os.Args[0]), "meridian-agent") {
+		if err := runEdgeAgent(); err != nil {
+			fmt.Fprintf(os.Stderr, "meridian-agent: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "meridian: %v\n", err)
@@ -109,6 +116,9 @@ func main() {
 		log.Fatalf("invalid panel settings: %v", err)
 	}
 	port = panelSettings.ListenPort
+	if err := db.MigrateControlNodesToSinglePort(port, time.Now()); err != nil {
+		log.Fatalf("migrate node ports: %v", err)
+	}
 	if marker := panelPortMarkerPath(dbPath); marker != "" {
 		if err := writePrivateFileAtomic(marker, []byte(strconv.Itoa(port)+"\n")); err != nil {
 			log.Fatalf("write panel port marker: %v", err)
@@ -218,6 +228,7 @@ func main() {
 		tmdb:              tmdb,
 	}
 	go runPanelCertificateRenewalScheduler(ctx, db, panelCertificates, app.requestRestart)
+	go runSiteNodeScheduler(ctx, app)
 
 	mux := http.NewServeMux()
 
@@ -226,6 +237,11 @@ func main() {
 	mux.HandleFunc("/api/auth/login", cors(app.csrfMiddleware(app.handleLogin)))
 	mux.HandleFunc("/api/auth/logout", cors(app.csrfMiddleware(app.handleLogout)))
 	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
+	mux.HandleFunc("/api/agent/binary", app.handleAgentBinary)
+	mux.HandleFunc("/api/agent/install.sh", app.handleAgentInstallScript)
+	mux.HandleFunc("/api/agent/enroll", app.handleAgentEnroll)
+	mux.HandleFunc("/api/agent/report", app.handleAgentReport)
+	mux.HandleFunc("/api/agent/config", app.handleAgentConfig)
 
 	// Protected routes
 	mux.HandleFunc("/api/account", cors(app.authMiddleware(app.handleAccount)))
@@ -260,6 +276,11 @@ func main() {
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
 	mux.HandleFunc("/api/dynamic-profiles", cors(app.authMiddleware(app.handleDynamicProfiles)))
 	mux.HandleFunc("/api/events", cors(app.authMiddleware(app.handleSSE)))
+	mux.HandleFunc("/api/nodes", cors(app.authMiddleware(app.handleNodes)))
+	mux.HandleFunc("/api/nodes/", cors(app.authMiddleware(app.handleNodeByID)))
+	mux.HandleFunc("/api/node-scheduler", cors(app.authMiddleware(app.handleNodeScheduler)))
+	mux.HandleFunc("/api/node-scheduler/sites", cors(app.authMiddleware(app.handleSiteNodeSchedules)))
+	mux.HandleFunc("/api/node-scheduler/sites/", cors(app.authMiddleware(app.handleSiteNodeScheduleByID)))
 	mux.HandleFunc("/api/", cors(func(w http.ResponseWriter, _ *http.Request) {
 		app.jsonErr(w, http.StatusNotFound, "API route not found")
 	}))

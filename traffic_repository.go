@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sort"
 	"time"
 )
 
@@ -160,6 +161,23 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	if logs == nil {
 		logs = []TrafficLog{}
 	}
+	nodeRows, err := d.db.Query("SELECT id,site_id,bytes_in,bytes_out,requests,recorded_at_ms FROM node_site_traffic_logs WHERE site_id=? AND recorded_at_ms>=? ORDER BY recorded_at_ms", siteID, time.Now().Add(-time.Duration(hours)*time.Hour).UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer nodeRows.Close()
+	for nodeRows.Next() {
+		var l TrafficLog
+		if err := nodeRows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAtMS); err != nil {
+			return nil, err
+		}
+		l.RecordedAt = time.UnixMilli(l.RecordedAtMS).In(time.Local).Format("2006-01-02 15:04:05")
+		logs = append(logs, l)
+	}
+	if err := nodeRows.Err(); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(logs, func(i, j int) bool { return logs[i].RecordedAtMS < logs[j].RecordedAtMS })
 	return logs, nil
 }
 
@@ -242,5 +260,29 @@ func (d *DB) GetTrafficTrendLogs(siteID *int64, start, end time.Time) ([]Traffic
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	nodeQuery := "SELECT site_id,bytes_in,bytes_out,requests,recorded_at_ms FROM node_site_traffic_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?"
+	nodeArgs := []interface{}{start.UnixMilli(), end.UnixMilli()}
+	if siteID != nil {
+		nodeQuery += " AND site_id=?"
+		nodeArgs = append(nodeArgs, *siteID)
+	}
+	nodeQuery += " ORDER BY recorded_at_ms"
+	nodeRows, err := d.db.Query(nodeQuery, nodeArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer nodeRows.Close()
+	for nodeRows.Next() {
+		var l TrafficLog
+		if err := nodeRows.Scan(&l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAtMS); err != nil {
+			return nil, err
+		}
+		l.RecordedAt = time.UnixMilli(l.RecordedAtMS).In(time.Local).Format("2006-01-02 15:04:05")
+		logs = append(logs, l)
+	}
+	if err := nodeRows.Err(); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(logs, func(i, j int) bool { return logs[i].RecordedAtMS < logs[j].RecordedAtMS })
 	return logs, nil
 }

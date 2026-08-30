@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
-<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.8.48-watch-live-test.12">
-<script src="/js/theme.js?v=1.8.48-watch-live-test.12"></script>
-<link rel="stylesheet" href="/css/style.css?v=1.8.48-watch-live-test.12">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.8.48-node-agent-test.4">
+<script src="/js/theme.js?v=1.8.48-node-agent-test.4"></script>
+<link rel="stylesheet" href="/css/style.css?v=1.8.48-node-agent-test.4">
 </head>
 <body class="auth-checking">
 
@@ -46,7 +46,7 @@
     <div class="sidebar-brand">
       <img src="/favicon.svg" alt="" class="sidebar-logo">
       <span class="sidebar-brand-name">Meridian</span>
-      <span class="sidebar-version" id="sidebar-version">v1.8.48-watch-live-test.12</span>
+      <span class="sidebar-version" id="sidebar-version">v1.8.48-node-agent-test.4</span>
     </div>
     <nav class="sidebar-nav" aria-label="功能菜单">
       <a href="#dashboard" class="topnav-link active" data-page="dashboard">
@@ -56,6 +56,10 @@
       <a href="#sites" class="topnav-link" data-page="sites">
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><circle cx="7" cy="7" r="1"/><circle cx="7" cy="17" r="1"/></svg>
         <span>站点管理</span>
+      </a>
+      <a href="#nodes" class="topnav-link" data-page="nodes">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 12h5M14 11l3.3-3.5M14 13l3.3 3.5"/></svg>
+        <span>节点调度</span>
       </a>
       <a href="#request-logs" class="topnav-link" data-page="request-logs">
         <svg viewBox="0 0 24 24"><polyline points="3 12 6.5 12 9 5 13 19 16 12 21 12"/></svg>
@@ -107,6 +111,7 @@
   <div class="main">
     <div id="page-dashboard" class="page active"></div>
     <div id="page-sites" class="page"></div>
+    <div id="page-nodes" class="page"></div>
     <div id="page-diagnostics" class="page"></div>
     <div id="page-request-logs" class="page"></div>
     <div id="page-watch-history" class="page"></div>
@@ -135,18 +140,19 @@
 <!-- Login errors must remain visible while the application shell is hidden. -->
 <div id="toast-container" aria-live="polite"></div>
 
-<script src="/js/api.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/toast.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/router.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/dashboard.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/sites.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/diag.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/request-logs.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/watch-history.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/telegram-report.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/global-settings.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/tmdb-settings.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/pages/account.js?v=1.8.48-watch-live-test.12"></script>
-<script src="/js/app.js?v=1.8.48-watch-live-test.12"></script>
+<script src="/js/api.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/toast.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/router.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/dashboard.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/sites.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/nodes.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/diag.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/request-logs.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/watch-history.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/telegram-report.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/global-settings.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/tmdb-settings.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/pages/account.js?v=1.8.48-node-agent-test.4"></script>
+<script src="/js/app.js?v=1.8.48-node-agent-test.4"></script>
 </body>
 </html>

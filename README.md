@@ -36,6 +36,8 @@ Meridian 是一个轻量的 Emby / Jellyfin 多节点反向代理面板。它把
 | ![Telegram 日报](docs/images/telegram-report.png) | ![TLS 设置](docs/images/tls-certificate.png) |
 | 观看历史 | — |
 | ![观看历史](docs/images/watch-history.png) | |
+| 节点调度 | — |
+| ![节点调度](docs/images/node-scheduling.png) | |
 
 ## Docker 安装
 
@@ -199,6 +201,18 @@ TLS 设置与证书默认不勾选。需要迁移面板域名、证书、ACME �
 
 若目标服务器不支持备份中的入口模式，站点数据仍会保留，但入口会被清空并暂时停用。用户选择当前服务器支持的入口并保存后即可重新启用。
 
+## 分布式节点调度
+
+完整操作手册见：[节点调度](docs/node-scheduling.md) · [Agent 安装与卸载](docs/agent-installation.md)。
+
+“节点调度”页面可以创建轻量 Agent 节点，并为每个节点设置独立流量上限、单向或双向计费、每月重置日和调度优先级。创建节点后，面板只显示一次包含短期注册令牌的一键安装脚本；Agent 注册成功后会换取独立令牌，自动识别 Linux 默认路由网卡，并每 15 秒上报累计收发字节、已应用配置和监听错误。Agent 与主控使用同一套反代引擎，后续站点路由、动态后端发现、播放线路、日志和观看记录通过配置轮询自动同步；控制器二进制更新会先校验 SHA-256，再由 Agent 原子替换并重启，正常情况下不需要重复安装节点。
+
+每个节点只配置一个 HTTPS `端口`。新建时默认采用当前主控端口，但节点保存独立的自定义值；例如 443 被 Xray 占用时可使用 9090。主控后续改端口不会改写节点端口。Agent 不提供 HTTP、共享网关或 Nginx/Caddy 配置。
+
+站点默认不参与节点调度。管理员需在同一页面逐个启用站点，并选择跟随全局自动/手动节点或固定节点。控制器通过每节点 Bearer 凭据下发 Host 路由和现有泛域名证书；Agent 应用成功后，控制器使用节点 IP 发起带站点 SNI/Host 的 HTTPS 健康检查，只有检查通过才创建或更新 Cloudflare 精确 A/AAAA 记录。停用或删除调度时只删除 Meridian 自己记录的 DNS ID，不覆盖或删除用户自行创建的同名记录。DNS 切换只影响新连接，已经建立的播放连接不会强制迁移。
+
+Agent 当前支持 Linux x86_64，公网控制器地址必须使用有效 HTTPS 证书。分配到同一节点的所有站点共用该节点端口，并通过 TLS SNI 和 HTTP Host 区分，不会为每个站点重复监听端口。该端口不能被节点上的 Xray 或其他进程占用；客户端访问地址必须带上非标准端口，例如 `https://tz.example.com:9090`。
+
 ## 常用环境变量
 
 | 变量 | 默认值 | 用途 |
@@ -233,4 +247,4 @@ Linux 原生安装可重新运行安装脚本，然后选择“更新到最新�
 
 ## 项目说明
 
-安全策略见 [SECURITY.md](SECURITY.md)，贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。项目继续使用仓库中的 [LICENSE](LICENSE)。
+安全策略见 [SECURITY.md](SECURITY.md)。项目继续使用仓库中的 [LICENSE](LICENSE)。

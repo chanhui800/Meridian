@@ -168,6 +168,12 @@ func (d *DB) EnqueueDynamicObservation(event dynamicObservationEvent) {
 		d.droppedDynamicObservations.Add(1)
 		return
 	}
+	if d.edgeEphemeral {
+		if d.edgeTelemetrySink != nil {
+			d.edgeTelemetrySink(edgeTelemetryEvent{Kind: "observation", Observation: event})
+		}
+		return
+	}
 	command := dynamicObservationCommand{
 		kind: dynamicObservationCommandWrite,
 		event: queuedDynamicObservation{
