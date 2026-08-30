@@ -402,7 +402,7 @@ func edgeMetadataPath(method, path string) bool {
 	if method != http.MethodGet {
 		return false
 	}
-	request, err := http.NewRequest(method, "https://edge.invalid"+path, nil)
+	request, err := http.NewRequest(method, "https://edge.invalid"+path, nil) // #nosec G704 -- fixed non-routable host is used only for local path classification.
 	return err == nil && isWatchHistoryMetadataRequest(request)
 }
 
