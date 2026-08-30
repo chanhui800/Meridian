@@ -247,4 +247,4 @@ Linux 原生安装可重新运行安装脚本，然后选择“更新到最新�
 
 ## 项目说明
 
-安全策略见 [SECURITY.md](SECURITY.md)。项目继续使用仓库中的 [LICENSE](LICENSE)。
+项目继续使用仓库中的 [LICENSE](LICENSE)。
