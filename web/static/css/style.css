@@ -7053,3 +7053,82 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
   .node-site-status { grid-column: 1 / 4; }
   .node-site-row > .node-button { grid-column: 4; grid-row: 2; }
 }
+
+@media (max-width: 680px) {
+  .nodes-page,
+  .node-scheduler-card,
+  .node-card,
+  .node-site-section,
+  .node-site-list,
+  .node-site-row {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .nodes-page { gap: 12px; }
+  .node-test-banner,
+  .node-scheduler-card,
+  .node-card,
+  .node-empty,
+  .node-site-section { padding: 14px; }
+
+  .node-section-head,
+  .node-card-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+  }
+
+  .node-section-head > div,
+  .node-card-head > div,
+  .node-choice,
+  .node-entry-state > * { min-width: 0; }
+
+  .node-section-head > .node-button { width: 100%; }
+  .node-status { justify-self: start; }
+  .node-mode,
+  .node-choices,
+  .node-actions { flex-wrap: wrap; }
+  .node-choice { max-width: 100%; }
+
+  .node-site-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .node-site-row .form-input {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .node-site-status,
+  .node-site-row > .node-button {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .node-site-row .node-check {
+    min-height: 44px;
+    white-space: normal;
+  }
+
+  .node-site-row > .node-button {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .node-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .node-actions button {
+    min-width: 0;
+    min-height: 44px;
+    white-space: normal;
+  }
+
+  .node-actions .is-danger { grid-column: 1 / -1; }
+}
