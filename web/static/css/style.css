@@ -7009,3 +7009,47 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
     padding: 14px;
   }
 }
+
+/* Final node scheduling overrides. Keep wide desktop layouts useful and
+   prevent form checkboxes from inheriting the stacked label grid. */
+.nodes-page {
+  width: 100%;
+  max-width: none;
+  margin-inline: 0;
+}
+
+.node-form .node-check,
+.node-site-row .node-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 38px;
+  white-space: nowrap;
+}
+
+.node-check input[type="checkbox"],
+.node-check input[type="radio"] {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--blue);
+}
+
+.node-list {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+}
+
+.node-site-row {
+  grid-template-columns: minmax(220px, 1.25fr) minmax(170px, auto) minmax(180px, .9fr) minmax(180px, .9fr) minmax(280px, 1.5fr) auto;
+}
+
+@media (max-width: 1200px) {
+  .node-site-row {
+    grid-template-columns: minmax(190px, 1fr) auto minmax(160px, 1fr) minmax(160px, 1fr);
+  }
+
+  .node-site-status { grid-column: 1 / 4; }
+  .node-site-row > .node-button { grid-column: 4; grid-row: 2; }
+}
