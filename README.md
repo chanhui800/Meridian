@@ -17,6 +17,20 @@ Meridian 是 Emby / Jellyfin 的多站点反向代理面板。它负责入口、
 - ACME 泛域名证书、自动续签、加密备份与恢复。
 - 可选节点调度：一台主控管理多台 Agent，DNS 只切换新连接。
 
+## 界面预览
+
+以下截图来自当前前端，使用演示数据，不包含生产环境域名、IP 或令牌。
+
+| 仪表盘 | 站点管理 |
+| --- | --- |
+| ![仪表盘](docs/images/dashboard.png) | ![站点管理](docs/images/sites.png) |
+| 节点调度 | 请求日志 |
+| ![节点调度](docs/images/node-scheduling.png) | ![请求日志](docs/images/request-logs.png) |
+| 观看历史 | 流量统计 |
+| ![观看历史](docs/images/watch-history.png) | ![流量统计](docs/images/traffic.png) |
+| TLS 设置 | Telegram 日报 |
+| ![TLS 设置](docs/images/tls-certificate.png) | ![Telegram 日报](docs/images/telegram-report.png) |
+
 ## 快速安装
 
 ### Docker
