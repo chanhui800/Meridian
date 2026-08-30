@@ -5,6 +5,7 @@ const Router = {
   pageMeta: {
     dashboard: ['仪表盘', '反代服务运行概览'],
     sites: ['站点管理', '管理入口、回源与站点策略'],
+    nodes: ['节点调度', '管理独立 Agent、流量周期与调度选择'],
     'request-logs': ['日志记录', '检索客户端请求与视频流记录'],
     'watch-history': ['观看历史', '查看各站点最近播放记录与媒体信息'],
     'telegram-report': ['Telegram 日报', '配置请求与流量数据的定时通知'],
@@ -44,6 +45,9 @@ const Router = {
     }
     if (previous === 'sites' && hash !== 'sites' && typeof stopSitesRefresh === 'function') {
       stopSitesRefresh();
+    }
+    if (previous === 'nodes' && hash !== 'nodes' && typeof stopNodesRefresh === 'function') {
+      stopNodesRefresh();
     }
 
     this.current = hash;

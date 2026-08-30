@@ -324,6 +324,70 @@ func (d *DB) migrateOnce() error {
 		log_search_mode TEXT NOT NULL DEFAULT 'like', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO system_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS control_nodes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		guid TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+		address TEXT NOT NULL DEFAULT '',
+		entry_mode TEXT NOT NULL DEFAULT 'direct' CHECK(entry_mode IN ('direct','shared')),
+		http_port INTEGER NOT NULL DEFAULT 0,
+		https_port INTEGER NOT NULL DEFAULT 443,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		priority INTEGER NOT NULL DEFAULT 100,
+		traffic_quota BIGINT NOT NULL DEFAULT 0,
+		billing_mode TEXT NOT NULL DEFAULT 'outbound' CHECK(billing_mode IN ('outbound','bidirectional')),
+		reset_day INTEGER NOT NULL DEFAULT 1 CHECK(reset_day BETWEEN 0 AND 31),
+		cycle_started_at_ms INTEGER NOT NULL DEFAULT 0,
+		period_rx_bytes BIGINT NOT NULL DEFAULT 0,
+		period_tx_bytes BIGINT NOT NULL DEFAULT 0,
+		lifetime_rx_bytes BIGINT NOT NULL DEFAULT 0,
+		lifetime_tx_bytes BIGINT NOT NULL DEFAULT 0,
+		last_raw_rx_bytes BIGINT NOT NULL DEFAULT 0,
+		last_raw_tx_bytes BIGINT NOT NULL DEFAULT 0,
+		last_boot_id TEXT NOT NULL DEFAULT '',
+		last_sequence BIGINT NOT NULL DEFAULT 0,
+		interface_name TEXT NOT NULL DEFAULT '',
+		agent_version TEXT NOT NULL DEFAULT '',
+		desired_config_hash TEXT NOT NULL DEFAULT '',
+		applied_config_hash TEXT NOT NULL DEFAULT '',
+		agent_listener_error TEXT NOT NULL DEFAULT '',
+		enrollment_token_hash TEXT NOT NULL DEFAULT '',
+		enrollment_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		agent_token_hash TEXT NOT NULL DEFAULT '',
+		enrolled_at_ms INTEGER NOT NULL DEFAULT 0,
+		last_seen_at_ms INTEGER NOT NULL DEFAULT 0,
+		created_at_ms INTEGER NOT NULL,
+		updated_at_ms INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_control_nodes_last_seen ON control_nodes(last_seen_at_ms DESC);
+	CREATE INDEX IF NOT EXISTS idx_control_nodes_enrollment_token ON control_nodes(enrollment_token_hash);
+	CREATE INDEX IF NOT EXISTS idx_control_nodes_agent_token ON control_nodes(agent_token_hash);
+	CREATE TABLE IF NOT EXISTS node_scheduler_settings (
+		id INTEGER PRIMARY KEY CHECK(id = 1),
+		mode TEXT NOT NULL DEFAULT 'auto' CHECK(mode IN ('auto','manual')),
+		manual_node_id INTEGER,
+		active_node_id INTEGER,
+		updated_at_ms INTEGER NOT NULL DEFAULT 0
+	);
+	INSERT OR IGNORE INTO node_scheduler_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS site_node_schedules (
+		site_id INTEGER PRIMARY KEY,
+		enabled INTEGER NOT NULL DEFAULT 0,
+		mode TEXT NOT NULL DEFAULT 'global' CHECK(mode IN ('global','fixed')),
+		fixed_node_id INTEGER,
+		desired_node_id INTEGER,
+		applied_node_id INTEGER,
+		cf_zone_id TEXT NOT NULL DEFAULT '',
+		cf_record_id TEXT NOT NULL DEFAULT '',
+		cf_record_type TEXT NOT NULL DEFAULT '',
+		applied_address TEXT NOT NULL DEFAULT '',
+		dns_status TEXT NOT NULL DEFAULT 'disabled',
+		config_hash TEXT NOT NULL DEFAULT '',
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at_ms INTEGER NOT NULL DEFAULT 0,
+		updated_at_ms INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_site_node_schedules_desired ON site_node_schedules(desired_node_id,enabled);
 	`); err != nil {
 		return err
 	}
@@ -349,6 +413,24 @@ func (d *DB) migrateOnce() error {
 	if hasSessionVersion == 0 {
 		if _, err := conn.ExecContext(ctx, "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1"); err != nil {
 			return err
+		}
+	}
+	for _, migration := range []struct{ column, sql string }{
+		{"entry_mode", "ALTER TABLE control_nodes ADD COLUMN entry_mode TEXT NOT NULL DEFAULT 'direct'"},
+		{"http_port", "ALTER TABLE control_nodes ADD COLUMN http_port INTEGER NOT NULL DEFAULT 0"},
+		{"https_port", "ALTER TABLE control_nodes ADD COLUMN https_port INTEGER NOT NULL DEFAULT 443"},
+		{"desired_config_hash", "ALTER TABLE control_nodes ADD COLUMN desired_config_hash TEXT NOT NULL DEFAULT ''"},
+		{"applied_config_hash", "ALTER TABLE control_nodes ADD COLUMN applied_config_hash TEXT NOT NULL DEFAULT ''"},
+		{"agent_listener_error", "ALTER TABLE control_nodes ADD COLUMN agent_listener_error TEXT NOT NULL DEFAULT ''"},
+	} {
+		var found int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('control_nodes') WHERE name=?", migration.column).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -556,6 +638,56 @@ func (d *DB) migrateOnce() error {
 			}
 		}
 	}
+	for _, migration := range []struct{ table, column, sql string }{
+		{"control_nodes", "traffic_manual_offset_bytes", "ALTER TABLE control_nodes ADD COLUMN traffic_manual_offset_bytes BIGINT NOT NULL DEFAULT 0"},
+		{"site_node_schedules", "agent_boot_id", "ALTER TABLE site_node_schedules ADD COLUMN agent_boot_id TEXT NOT NULL DEFAULT ''"},
+		{"site_node_schedules", "agent_request_count", "ALTER TABLE site_node_schedules ADD COLUMN agent_request_count BIGINT NOT NULL DEFAULT 0"},
+		{"site_node_schedules", "agent_last_request_at_ms", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_request_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"site_node_schedules", "agent_last_status", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_status INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", migration.table, migration.column).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_request_events (
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		agent_boot_id TEXT NOT NULL,
+		event_id BIGINT NOT NULL,
+		received_at_ms INTEGER NOT NULL,
+		PRIMARY KEY(node_id, agent_boot_id, event_id)
+	) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS idx_node_request_events_received ON node_request_events(received_at_ms);`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_site_counters (
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		boot_id TEXT NOT NULL,
+		last_bytes_in BIGINT NOT NULL DEFAULT 0,
+		last_bytes_out BIGINT NOT NULL DEFAULT 0,
+		last_request_count BIGINT NOT NULL DEFAULT 0,
+		updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(node_id, site_id)
+	) WITHOUT ROWID;
+	CREATE TABLE IF NOT EXISTS node_site_traffic_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		bytes_in BIGINT NOT NULL DEFAULT 0,
+		bytes_out BIGINT NOT NULL DEFAULT 0,
+		requests BIGINT NOT NULL DEFAULT 0,
+		recorded_at_ms INTEGER NOT NULL,
+		UNIQUE(node_id, site_id, recorded_at_ms)
+	);
+	CREATE INDEX IF NOT EXISTS idx_node_site_traffic_site_time ON node_site_traffic_logs(site_id, recorded_at_ms);
+	CREATE INDEX IF NOT EXISTS idx_node_site_traffic_node_time ON node_site_traffic_logs(node_id, recorded_at_ms);`); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, "UPDATE sites SET traffic_used_in=traffic_used/2, traffic_used_out=traffic_used-(traffic_used/2) WHERE traffic_used_in<0 OR traffic_used_out<0"); err != nil {
 		return err
 	}
@@ -580,6 +712,7 @@ func (d *DB) migrateOnce() error {
 		{"outbound_colo", "ALTER TABLE request_logs ADD COLUMN outbound_colo TEXT NOT NULL DEFAULT ''"},
 		{"upstream_user_agent", "ALTER TABLE request_logs ADD COLUMN upstream_user_agent TEXT NOT NULL DEFAULT ''"},
 		{"backend_address", "ALTER TABLE request_logs ADD COLUMN backend_address TEXT NOT NULL DEFAULT ''"},
+		{"final_node", "ALTER TABLE request_logs ADD COLUMN final_node TEXT NOT NULL DEFAULT ''"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name=?", migration.column).Scan(&exists); err != nil {

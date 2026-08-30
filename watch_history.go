@@ -1130,7 +1130,7 @@ func validWatchHistoryEvent(event watchHistoryEvent) bool {
 }
 
 func (d *DB) EnqueueWatchHistory(event watchHistoryEvent) bool {
-	if d == nil || !validWatchHistoryEvent(event) {
+	if d == nil || d.edgeEphemeral || !validWatchHistoryEvent(event) {
 		return false
 	}
 	command := dynamicObservationCommand{kind: dynamicObservationCommandWatchHistoryWrite, watchHistory: event}

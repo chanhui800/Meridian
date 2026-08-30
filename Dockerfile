@@ -6,8 +6,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=v1.8.48-watch-live-test.12
+ARG VERSION=v1.8.48-node-agent-test.11
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION}" -o meridian .
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION}" -o meridian-agent .
 
 # Runtime stage
 FROM alpine:3.24
@@ -21,6 +22,7 @@ RUN addgroup -S meridian && \
     chown meridian:meridian /app/data && \
     chmod 0700 /app/data
 COPY --from=builder --chown=root:root --chmod=0555 /app/meridian /app/meridian
+COPY --from=builder --chown=root:root --chmod=0555 /app/meridian-agent /app/meridian-agent
 COPY --chown=root:root --chmod=0555 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN setcap cap_net_bind_service=+ep /app/meridian && \
     getcap /app/meridian | grep -Fq 'cap_net_bind_service=ep'
@@ -29,6 +31,7 @@ EXPOSE 9090
 
 ENV PORT=9090
 ENV DB_PATH=/app/data/meridian.db
+ENV MERIDIAN_AGENT_BINARY=/app/meridian-agent
 
 VOLUME ["/app/data"]
 

@@ -207,6 +207,7 @@
     if (typeof stopDashSSE === 'function') stopDashSSE();
     if (typeof stopSitesRefresh === 'function') stopSitesRefresh();
     if (typeof stopWatchHistoryRefresh === 'function') stopWatchHistoryRefresh();
+    if (typeof stopNodesRefresh === 'function') stopNodesRefresh();
     // Keep cleanup compatible with cached clients that still have the retired
     // traffic page script loaded; the page is no longer registered or linked.
     if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
@@ -309,6 +310,7 @@
     if (!appBootstrapped) {
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
+      Router.register('nodes', renderNodes);
       Router.register('request-logs', renderRequestLogs);
       Router.register('watch-history', renderWatchHistory);
       Router.register('telegram-report', renderTelegramReport);

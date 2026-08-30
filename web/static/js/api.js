@@ -293,6 +293,20 @@ const API = {
     return this.request('DELETE', '/api/sites/' + encodeURIComponent(siteId) + '/dynamic-observations');
   },
 
+  // Distributed nodes
+  getNodes() { return this.request('GET', '/api/nodes'); },
+  createNode(data) { return this.request('POST', '/api/nodes', data); },
+  updateNode(id, data) { return this.request('PUT', '/api/nodes/' + encodeURIComponent(id), data); },
+  deleteNode(id) { return this.request('DELETE', '/api/nodes/' + encodeURIComponent(id)); },
+  refreshNodeEnrollment(id, controllerURL) {
+    return this.request('POST', '/api/nodes/' + encodeURIComponent(id) + '/enrollment', { controller_url: controllerURL });
+  },
+  saveNodeScheduler(data) { return this.request('PUT', '/api/node-scheduler', data); },
+  getSiteNodeSchedules() { return this.request('GET', '/api/node-scheduler/sites'); },
+  saveSiteNodeSchedule(id, data) {
+    return this.request('PUT', '/api/node-scheduler/sites/' + encodeURIComponent(id), data);
+  },
+
   async logout() {
     this.clearSession();
     try {

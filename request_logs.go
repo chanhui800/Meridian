@@ -48,6 +48,7 @@ const (
 type requestLogEvent struct {
 	SiteID            int64
 	SiteName          string
+	FinalNode         string
 	ResourceCategory  string
 	StatusCode        int
 	ClientIP          string
@@ -64,6 +65,7 @@ type RequestLog struct {
 	ID                int64  `json:"id"`
 	SiteID            int64  `json:"site_id"`
 	SiteName          string `json:"site_name"`
+	FinalNode         string `json:"final_node"`
 	ResourceCategory  string `json:"resource_category"`
 	StatusCode        int    `json:"status_code"`
 	ClientIP          string `json:"client_ip"`
@@ -116,6 +118,12 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	if d == nil {
 		return
 	}
+	if d.edgeEphemeral {
+		if d.edgeRequestLogSink != nil {
+			d.edgeRequestLogSink(event)
+		}
+		return
+	}
 	settings := d.currentSystemSettings()
 	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode < 400) ||
 		(!settings.LogWriteImage && event.ResourceCategory == requestLogCategoryImage) ||
@@ -143,6 +151,7 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	}
 	if !settings.LogWriteNode {
 		event.SiteName = ""
+		event.FinalNode = ""
 	}
 	if !settings.LogWriteCategory {
 		event.ResourceCategory = ""
@@ -155,7 +164,7 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	}
 	if event.SiteID <= 0 || event.ResourceCategory != "" && !validRequestLogCategory(event.ResourceCategory) ||
 		event.StatusCode != 0 && (event.StatusCode < 100 || event.StatusCode > 599) ||
-		len(event.SiteName) > requestLogMaxSiteNameBytes || len(event.ClientIP) > requestLogMaxClientIPBytes ||
+		len(event.SiteName) > requestLogMaxSiteNameBytes || len(event.FinalNode) > requestLogMaxSiteNameBytes || len(event.ClientIP) > requestLogMaxClientIPBytes ||
 		len(event.UserAgent) > requestLogMaxUserAgentBytes || len(event.UpstreamUserAgent) > requestLogMaxUserAgentBytes || len(event.BackendAddress) > maxDynamicTargetURLBytes || event.Method == "" || len(event.Method) > 16 || event.Path == "" || len(event.Path) > requestLogMaxPathBytes {
 		d.droppedRequestLogs.Add(1)
 		return
@@ -264,7 +273,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 			args = append(args, filter.Query)
 		}
 	}
-	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.upstream_user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
+	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.final_node, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.upstream_user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- conditions are fixed SQL fragments selected from validated filters; values remain parameters.
 	}
@@ -278,7 +287,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	logs := make([]RequestLog, 0)
 	for rows.Next() {
 		var entry RequestLog
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.UpstreamUserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.FinalNode, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.UpstreamUserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
 			return nil, err
 		}
 		if entry.ResourceCategory == requestLogCategoryPlayback && isRequestLogPlaybackActivityPath(entry.Path) {
@@ -300,6 +309,9 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 		if !settings.LogDisplayBackendAddress {
 			logs[i].BackendAddress = "hidden"
 		}
+		if !settings.LogDisplayNode {
+			logs[i].FinalNode = "hidden"
+		}
 		if !settings.LogDisplayColo {
 			logs[i].InboundColo, logs[i].OutboundColo = "hidden", "hidden"
 		}
@@ -318,8 +330,8 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 	defer tx.Rollback()
 	statement, err := tx.Prepare(`
 		INSERT INTO request_logs
-			(site_id, site_name, resource_category, status_code, client_ip, user_agent, upstream_user_agent, backend_address, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			(site_id, site_name, final_node, resource_category, status_code, client_ip, user_agent, upstream_user_agent, backend_address, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM sites WHERE id=?)`)
 	if err != nil {
 		return 0, err
@@ -331,6 +343,7 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 		result, err := statement.Exec(
 			event.SiteID,
 			event.SiteName,
+			event.FinalNode,
 			event.ResourceCategory,
 			event.StatusCode,
 			event.ClientIP,
@@ -517,6 +530,7 @@ func newRequestLogEvent(site Site, r *http.Request, trustedProxies []*net.IPNet,
 	return requestLogEvent{
 		SiteID:            site.ID,
 		SiteName:          requestLogSafeText(site.Name, requestLogMaxSiteNameBytes),
+		FinalNode:         requestLogSafeText("主控", requestLogMaxSiteNameBytes),
 		ResourceCategory:  classifyRequestLogResource(r),
 		ClientIP:          clientIP,
 		InboundColo:       inboundColo,
