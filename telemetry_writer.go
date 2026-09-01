@@ -78,6 +78,16 @@ func (d *DB) flushDynamicObservations() error {
 	return d.sendDynamicObservationControl(dynamicObservationCommandFlush, 0)
 }
 
+// flushDynamicObservationsIfSmall keeps interactive reads fresh when only a
+// handful of events are pending, while avoiding a synchronous database drain
+// during normal playback bursts.
+func (d *DB) flushDynamicObservationsIfSmall() error {
+	if d == nil || d.dynamicObservationQueue == nil || len(d.dynamicObservationQueue) > 32 {
+		return nil
+	}
+	return d.flushDynamicObservations()
+}
+
 func (d *DB) runDynamicObservationWriter() {
 	defer close(d.dynamicObservationDone)
 	ticker := time.NewTicker(dynamicObservationMaintenanceInterval)

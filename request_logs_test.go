@@ -105,6 +105,28 @@ func TestRequestLogQueueFiltersAndClear(t *testing.T) {
 	}
 }
 
+func TestRequestLogCursorUsesWriteTimeWhenTimelineIsHidden(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "request-log-cursor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	site, err := db.CreateSite("cursor", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.EnqueueRequestLog(requestLogEvent{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAPI, StatusCode: 200, Method: http.MethodGet, Path: "/one"})
+	db.EnqueueRequestLog(requestLogEvent{SiteID: site.ID, SiteName: site.Name, ResourceCategory: requestLogCategoryAPI, StatusCode: 200, Method: http.MethodGet, Path: "/two"})
+	logs, err := db.ListRequestLogs(RequestLogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 || logs[0].CursorAtMS <= 0 || logs[0].RecordedAtMS == 0 {
+		t.Fatalf("first page = %#v err=%v", logs, err)
+	}
+	second, err := db.ListRequestLogs(RequestLogFilter{BeforeMS: logs[0].CursorAtMS, BeforeID: logs[0].ID, Limit: 1})
+	if err != nil || len(second) != 1 || second[0].ID == logs[0].ID {
+		t.Fatalf("second page = %#v err=%v", second, err)
+	}
+}
+
 func TestRequestLogWriteFieldSettingsOmitOnlyNewLogValues(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "request-log-write-fields.db"))
 	if err != nil {

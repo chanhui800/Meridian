@@ -2,11 +2,46 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+type dashboardTrendCacheEntry struct {
+	ExpiresAt time.Time
+	Response  *dashboardTrendsResponse
+}
+
+func (pm *ProxyManager) dashboardTrendCached(key string, now time.Time) *dashboardTrendsResponse {
+	pm.trendCacheMu.Lock()
+	defer pm.trendCacheMu.Unlock()
+	entry, ok := pm.trendCache[key]
+	if !ok || entry.Response == nil || !now.Before(entry.ExpiresAt) {
+		if ok {
+			delete(pm.trendCache, key)
+		}
+		return nil
+	}
+	return entry.Response
+}
+
+func (pm *ProxyManager) cacheDashboardTrend(key string, response *dashboardTrendsResponse, expiresAt time.Time) {
+	pm.trendCacheMu.Lock()
+	defer pm.trendCacheMu.Unlock()
+	if pm.trendCache == nil {
+		pm.trendCache = make(map[string]dashboardTrendCacheEntry)
+	}
+	if len(pm.trendCache) > 128 {
+		for cacheKey, entry := range pm.trendCache {
+			if !time.Now().Before(entry.ExpiresAt) {
+				delete(pm.trendCache, cacheKey)
+			}
+		}
+	}
+	pm.trendCache[key] = dashboardTrendCacheEntry{ExpiresAt: expiresAt, Response: response}
+}
 
 type dashboardTrendPoint struct {
 	TimestampMS int64   `json:"timestamp_ms"`
@@ -208,7 +243,20 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 	if err != nil {
 		return nil, err
 	}
-	logs, err := pm.database.GetTrafficTrendLogs(siteID, start, end)
+	now := time.Now()
+	siteKey := "all"
+	if siteID != nil {
+		siteKey = strconv.FormatInt(*siteID, 10)
+	}
+	cacheKey := fmt.Sprintf("%p|%s|%s|%d|%d|%d|%d", pm.database, siteKey, name, start.UnixMilli(), end.UnixMilli(), bucket/time.Second, settings.ScheduleTimezone)
+	cacheTTL := 30 * time.Second
+	if strings.EqualFold(name, "realtime") {
+		cacheTTL = 3 * time.Second
+	}
+	if cached := pm.dashboardTrendCached(cacheKey, now); cached != nil {
+		return cached, nil
+	}
+	logs, err := pm.database.GetTrafficTrendLogsGrouped(siteID, start, end, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +290,7 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 			Points:   dashboardTrendPoints(start, end, bucket, name, billingMode, logsBySite[site.ID], pendingBySite[site.ID]),
 		})
 	}
-	return &dashboardTrendsResponse{
+	response := &dashboardTrendsResponse{
 		SiteID: func() string {
 			if siteID == nil {
 				return "all"
@@ -257,7 +305,9 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 		BucketSeconds:  int64(bucket / time.Second),
 		Points:         points,
 		SiteSeries:     siteSeries,
-	}, nil
+	}
+	pm.cacheDashboardTrend(cacheKey, response, now.Add(cacheTTL))
+	return response, nil
 }
 
 func parseDashboardTrendCustomTime(value string, location *time.Location) (time.Time, error) {

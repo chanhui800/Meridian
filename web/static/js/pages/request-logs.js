@@ -5,7 +5,10 @@ let requestLogRefreshTimer = null;
 let requestLogLoadGeneration = 0;
 let requestLogLoading = false;
 let requestLogReloadQueued = false;
+let requestLogLatestID = 0;
+let requestLogLatestCursor = '';
 let requestLogDisplaySettings = { node: true, category: true, status: true, client_ip: true, ua: true, upstream_ua: true, backend_address: true, timeline: true };
+let requestLogLastDisplaySettings = null;
 const requestLogUAWidthStorageKey = 'meridian-request-log-ua-width';
 
 function requestLogDateOnlyValue(value) {
@@ -65,6 +68,7 @@ function requestLogApplyUAWidth() {
 }
 
 function requestLogApplyDisplaySettings(settings) {
+  requestLogLastDisplaySettings = settings || requestLogLastDisplaySettings;
   requestLogDisplaySettings = {
     node: settings?.log_display_node !== false,
     category: settings?.log_display_category !== false,
@@ -140,6 +144,8 @@ function requestLogStatusClass(status) {
 function renderRequestLogs() {
   const page = document.getElementById('page-request-logs');
   requestLogApplyUAWidth();
+  requestLogLatestID = 0;
+  requestLogLatestCursor = '';
   const today = Date.now();
   const yesterday = today - 24 * 60 * 60 * 1000;
   requestLogCategoryFilter = 'all';
@@ -278,7 +284,7 @@ function renderRequestLogs() {
   loadRequestLogs({ showLoading: true });
   if (requestLogRefreshTimer) clearInterval(requestLogRefreshTimer);
   requestLogRefreshTimer = setInterval(() => {
-    if (Router.current === 'request-logs') loadRequestLogs({ showLoading: false });
+    if (Router.current === 'request-logs') loadRequestLogs({ showLoading: false, incremental: true });
   }, 5000);
 }
 
@@ -316,6 +322,8 @@ async function loadRequestLogs(options = {}) {
     Toast.error('请选择有效的日志日期范围');
     return;
   }
+  const incremental = options.incremental === true && requestLogLatestID > 0;
+  if (!incremental) requestLogLatestID = 0;
   const generation = ++requestLogLoadGeneration;
   const scroller = body.closest('.request-log-table-scroll');
   const previousScrollTop = scroller ? scroller.scrollTop : 0;
@@ -331,18 +339,35 @@ async function loadRequestLogs(options = {}) {
       category: requestLogCategoryFilter,
       status: requestLogStatusFilter,
       q: document.getElementById('request-log-search').value.trim(),
-      limit: 500,
+      limit: incremental ? 100 : 500,
+      ...(incremental ? (requestLogLatestCursor ? { after_cursor: requestLogLatestCursor } : { after_id: requestLogLatestID }) : {}),
     });
     if (generation !== requestLogLoadGeneration || Router.current !== 'request-logs' || !response) return;
-    renderRequestLogRows(response.logs || []);
+    const incoming = response.logs || [];
+    if (incremental) {
+      if (incoming.length) {
+        body.insertAdjacentHTML('afterbegin', incoming.map(requestLogRowHTML).join(''));
+        while (body.querySelectorAll('tr[data-log-id]').length > 500) body.lastElementChild?.remove();
+        requestLogApplyDisplaySettings(requestLogLastDisplaySettings);
+      }
+    } else {
+      renderRequestLogRows(incoming);
+    }
+    for (const entry of incoming) requestLogLatestID = Math.max(requestLogLatestID, Number(entry.id || 0));
+    const newest = incoming[0];
+    const newestCursorAt = Number(newest?.cursor_at_ms || 0);
+    if (newestCursorAt > 0 && Number(newest?.id || 0) > 0) {
+      requestLogLatestCursor = btoa(`${newestCursorAt}:${Number(newest.id)}`).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
     if (scroller && preserveViewport) {
       const addedHeight = Math.max(0, scroller.scrollHeight - previousScrollHeight);
       scroller.scrollTop = previousScrollTop + addedHeight;
     }
     const dropped = Number(response.dropped_logs || 0);
+    const visibleCount = body.querySelectorAll('tr[data-log-id]').length;
     document.getElementById('request-log-summary').textContent = dropped > 0
-      ? `显示 ${response.logs.length} 条，繁忙时已丢弃 ${dropped} 条`
-      : `显示 ${response.logs.length} 条（最多 500 条）`;
+      ? `显示 ${visibleCount} 条，繁忙时已丢弃 ${dropped} 条`
+      : `显示 ${visibleCount} 条（最多 500 条）`;
   } catch (error) {
     if (generation !== requestLogLoadGeneration) return;
     if (!body.querySelector('tr[data-log-id]')) {
@@ -365,7 +390,10 @@ function renderRequestLogRows(logs) {
     body.innerHTML = '<tr><td colspan="9" class="request-log-empty">当前条件下暂无日志</td></tr>';
     return;
   }
-  body.innerHTML = logs.map(entry => {
+  body.innerHTML = logs.map(requestLogRowHTML).join('');
+}
+
+function requestLogRowHTML(entry) {
     const status = Number(entry.status_code || 0);
     const recordedAtMS = Number(entry.recorded_at_ms || 0);
     const exactTime = recordedAtMS ? requestLogFormatDateTime(recordedAtMS) : '未写入时间线';
@@ -383,7 +411,6 @@ function renderRequestLogRows(logs) {
         <td data-log-field="timeline"><time class="request-log-time"${recordedAtMS ? ` datetime="${new Date(recordedAtMS).toISOString()}"` : ''} title="${esc(exactTime)}">${esc(requestLogRelativeTime(recordedAtMS))}</time></td>
       </tr>
     `;
-  }).join('');
 }
 
 async function clearRequestLogs() {
@@ -391,6 +418,8 @@ async function clearRequestLogs() {
   try {
     await API.clearRequestLogs();
     Toast.success('请求日志已清空');
+    requestLogLatestID = 0;
+    requestLogLatestCursor = '';
     loadRequestLogs();
   } catch (error) {
     Toast.error(error.message);

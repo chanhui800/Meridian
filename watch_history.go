@@ -1409,7 +1409,7 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 	if filter.Limit > 101 {
 		filter.Limit = 101
 	}
-	if err := d.flushDynamicObservations(); err != nil {
+	if err := d.flushDynamicObservationsIfSmall(); err != nil {
 		return nil, err
 	}
 	conditions := []string{"1=1"}
@@ -1524,9 +1524,6 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 		return nil, fmt.Errorf("invalid watch history media type")
 	}
 	filter.Query = requestLogSafeText(filter.Query, watchHistoryMaxTitleBytes)
-	if err := d.flushDynamicObservations(); err != nil {
-		return nil, err
-	}
 	conditions := []string{"ws.stopped_at_ms=0", "ws.completed=0", "ws.last_seen_at_ms>=?"}
 	args := []any{now.Add(-watchHistoryActiveWindow).UnixMilli()}
 	if filter.SiteID > 0 {
