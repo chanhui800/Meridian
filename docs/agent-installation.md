@@ -2,21 +2,21 @@
 
 ## 安装脚本从哪里获取
 
-Agent 安装器由每个 Meridian 主控实例公开提供：
+Agent 安装器保存在 Meridian GitHub 仓库的 `scripts/agent-install.sh`，面板生成的命令会从该公开脚本地址获取：
 
 ```text
-https://你的主控域名:端口/api/agent/install.sh
+https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh
 ```
 
-GitHub 仓库保存源码和版本；运行中的主控提供实际安装入口，并从自己的 `/api/agent/binary` 返回匹配版本的 Agent。这样用户部署自己的 Meridian 后，不需要访问项目作者的面板，也不会把节点注册到其他人的主控。
+运行中的主控提供实际的 `/api/agent/binary` 下载和注册接口。这样用户部署自己的 Meridian 后，只使用公开安装脚本，不需要访问项目作者的面板，也不会把节点注册到其他人的主控。
 
 ## 一键安装
 
 在自己的主控面板中创建节点，复制面板生成的完整命令，在目标 Linux x86_64 VPS 以 root 执行：
 
 ```bash
-wget -qO- https://panel.example.com:9090/api/agent/install.sh | sudo bash -s -- \
-  -c https://panel.example.com:9090 \
+wget -qO- https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh | sudo bash -s -- \
+  -e https://panel.example.com:9090 \
   -t ONE_TIME_ENROLLMENT_TOKEN
 ```
 
@@ -63,4 +63,3 @@ sudo ss -lntp | grep ':9090' || true
 - 不要让不可信用户获得主控管理员账号，否则对方可以创建、删除或刷新节点。
 - `/api/agent/install.sh` 不包含节点凭据；真正的二进制下载、注册、配置和上报接口都需要 Bearer 令牌。
 - 需要重新绑定主控时，应先删除旧节点，再从新主控生成新的安装命令。
-

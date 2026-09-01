@@ -14,6 +14,7 @@ SERVICE_NAME="${MERIDIAN_SERVICE_NAME:-meridian}"
 NGINX_CONFIG="${MERIDIAN_NGINX_CONFIG:-/etc/nginx/conf.d/meridian-panel.conf}"
 NGINX_ROOT="${MERIDIAN_NGINX_ROOT:-/etc/nginx}"
 BIN_NAME="meridian"
+AGENT_BIN_NAME="meridian-agent"
 SERVICE_USER="meridian"
 SERVICE_GROUP="meridian"
 SYSTEMD_RESTRICT_ADDRESS_FAMILIES="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
@@ -26,6 +27,7 @@ while [ "$DATA_DIR" != "/" ] && [[ "$DATA_DIR" == */ ]]; do DATA_DIR="${DATA_DIR
 while [ "$BACKUP_DIR" != "/" ] && [[ "$BACKUP_DIR" == */ ]]; do BACKUP_DIR="${BACKUP_DIR%/}"; done
 
 PREVIOUS_BIN="${INSTALL_DIR}/${BIN_NAME}.previous"
+PREVIOUS_AGENT_BIN="${INSTALL_DIR}/${AGENT_BIN_NAME}.previous"
 ASSUME_YES="${MERIDIAN_ASSUME_YES:-0}"
 PURGE_DATA=0
 DOMAIN_MODE="ask"
@@ -37,6 +39,8 @@ ROOT_PREFIX=()
 UPDATE_TMP_DIR=""
 UPDATE_WAS_ACTIVE=0
 UPDATE_BINARY_CHANGED=0
+UPDATE_AGENT_CHANGED=0
+UPDATE_AGENT_WAS_PRESENT=0
 UPDATE_TRANSACTION=0
 UPDATE_SNAPSHOT_DIR=""
 UPDATE_SNAPSHOT_RESTORED=0
@@ -435,14 +439,18 @@ get_current_version() {
 }
 
 download_release_binary() {
-    local version="$1" tmp_dir="$2" suffix asset binary_file checksum_file expected actual
+    local version="$1" tmp_dir="$2" suffix asset agent_asset binary_file agent_file checksum_file expected actual
     suffix=$(detect_platform)
     asset="${BIN_NAME}-${suffix}"
+    agent_asset="${AGENT_BIN_NAME}-${suffix}"
     binary_file="${tmp_dir}/${asset}"
+    agent_file="${tmp_dir}/${agent_asset}"
     checksum_file="${tmp_dir}/SHA256SUMS"
     info "下载 Meridian ${version} (${suffix})..."
     download "https://github.com/${REPO}/releases/download/${version}/${asset}" "$binary_file" \
         || fail "二进制下载失败，请检查网络和 Release"
+    download "https://github.com/${REPO}/releases/download/${version}/${agent_asset}" "$agent_file" \
+        || fail "Agent 二进制下载失败，请检查网络和 Release"
     download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS" "$checksum_file" \
         || fail "SHA256SUMS 下载失败；已停止安装"
     expected=$(awk -v file="$asset" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
@@ -453,8 +461,17 @@ download_release_binary() {
     actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
     [ "$expected" = "$actual" ] || fail "下载文件 SHA-256 校验失败"
     chmod 0755 "$binary_file"
+    expected=$(awk -v file="$agent_asset" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
+    printf '%s' "$expected" | grep -Eq '^[[:xdigit:]]{64}$' \
+        || fail "SHA256SUMS 中缺少 ${agent_asset} 的有效校验值"
+    actual=$(sha256_file "$agent_file")
+    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+    actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+    [ "$expected" = "$actual" ] || fail "Agent 下载文件 SHA-256 校验失败"
+    chmod 0755 "$agent_file"
     DOWNLOADED_BINARY="$binary_file"
-    ok "SHA-256 校验通过"
+    DOWNLOADED_AGENT_BINARY="$agent_file"
+    ok "主控与 Agent SHA-256 校验通过"
 }
 
 env_file_path() {
@@ -823,6 +840,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 UMask=0077
 EnvironmentFile=${DATA_DIR}/.env
+Environment=MERIDIAN_AGENT_BINARY=${INSTALL_DIR}/${AGENT_BIN_NAME}
 ExecStart=${INSTALL_DIR}/${BIN_NAME}
 WorkingDirectory=${DATA_DIR}
 Restart=on-failure
@@ -857,7 +875,7 @@ SVCEOF
 }
 
 migrate_update_systemd_service() {
-    local tmp_dir="$1" service_copy service_new legacy_line current_line configured_line
+    local tmp_dir="$1" service_copy service_new legacy_line current_line configured_line agent_line
     is_systemd || return 0
     service_copy="${tmp_dir}/meridian.service.current"
     service_new="${tmp_dir}/meridian.service.new"
@@ -865,16 +883,24 @@ migrate_update_systemd_service() {
     as_root cp -p -- "$SERVICE_FILE" "$UPDATE_SERVICE_SNAPSHOT"
     as_root cp -p -- "$SERVICE_FILE" "$service_copy"
     configured_line=$(grep '^RestrictAddressFamilies=' "$service_copy" || true)
+    agent_line=$(grep '^Environment=MERIDIAN_AGENT_BINARY=' "$service_copy" || true)
     legacy_line='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'
     current_line="RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}"
-    if [ "$configured_line" = "$current_line" ]; then
-        return 0
-    fi
-    if [ "$configured_line" != "$legacy_line" ]; then
+    if [ "$configured_line" != "$current_line" ] && [ "$configured_line" != "$legacy_line" ]; then
         warn "现有 systemd 网络族配置不是安装器管理的旧格式；拒绝自动覆盖: $SERVICE_FILE"
         return 1
     fi
+    if [ -n "$agent_line" ] && [ "$agent_line" != "Environment=MERIDIAN_AGENT_BINARY=${INSTALL_DIR}/${AGENT_BIN_NAME}" ]; then
+        warn "现有 systemd Agent 路径不是安装器管理的格式；拒绝自动覆盖: $SERVICE_FILE"
+        return 1
+    fi
+    if [ "$configured_line" = "$current_line" ] && [ -n "$agent_line" ]; then
+        return 0
+    fi
     sed "s/^RestrictAddressFamilies=.*/${current_line}/" "$service_copy" > "$service_new"
+    if [ -z "$agent_line" ]; then
+        sed -i "/^EnvironmentFile=/a Environment=MERIDIAN_AGENT_BINARY=${INSTALL_DIR}\/${AGENT_BIN_NAME}" "$service_new"
+    fi
     UPDATE_SERVICE_CHANGED=1
     as_root install -o root -g root -m 0644 "$service_new" "$SERVICE_FILE"
     as_root systemctl daemon-reload
@@ -927,12 +953,25 @@ restore_previous_binary() {
     as_root mv -f "${INSTALL_DIR}/${BIN_NAME}.rollback" "${INSTALL_DIR}/${BIN_NAME}"
 }
 
+restore_previous_agent_binary() {
+    if [ "$UPDATE_AGENT_WAS_PRESENT" = "1" ]; then
+        [ -f "$PREVIOUS_AGENT_BIN" ] || return 1
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$PREVIOUS_AGENT_BIN" "${INSTALL_DIR}/${AGENT_BIN_NAME}.rollback"
+        as_root mv -f "${INSTALL_DIR}/${AGENT_BIN_NAME}.rollback" "${INSTALL_DIR}/${AGENT_BIN_NAME}"
+    else
+        as_root rm -f -- "${INSTALL_DIR}/${AGENT_BIN_NAME}"
+    fi
+}
+
 cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
         warn "更新中断，正在恢复更新前的二进制和数据状态..."
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
+        fi
+        if [ "$UPDATE_AGENT_CHANGED" = "1" ]; then
+            restore_previous_agent_binary || true
         fi
         if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
             && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
@@ -952,6 +991,7 @@ cleanup_update_transaction() {
         fi
         UPDATE_TRANSACTION=0
         UPDATE_BINARY_CHANGED=0
+        UPDATE_AGENT_CHANGED=0
     fi
     UPDATE_SERVICE_CHANGED=0
     UPDATE_SERVICE_SNAPSHOT=""
@@ -1664,7 +1704,7 @@ apply_domain_choice() {
 }
 
 do_install() {
-    local current_binary="${INSTALL_DIR}/${BIN_NAME}" tmp_dir version
+    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_agent="${INSTALL_DIR}/${AGENT_BIN_NAME}" tmp_dir version
     INITIAL_SETUP_TOKEN=""
     need_cmd curl
     need_cmd awk
@@ -1705,10 +1745,13 @@ do_install() {
     as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$INSTALL_DIR"
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
     as_root mv -f "${current_binary}.new" "$current_binary"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY" "${current_agent}.new"
+    as_root mv -f "${current_agent}.new" "$current_agent"
 
     if is_systemd; then
         if ! as_root systemctl restart "$SERVICE_NAME" || ! wait_for_health 20; then
             as_root rm -f -- "$current_binary"
+            as_root rm -f -- "$current_agent"
             as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
             rm -rf -- "$tmp_dir"
             fail "首次启动未通过健康检查；二进制已移除，数据与配置已保留"
@@ -1733,7 +1776,7 @@ do_install() {
 }
 
 do_update() {
-    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
+    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_agent="${INSTALL_DIR}/${AGENT_BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
     INITIAL_SETUP_TOKEN=""
     UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_SERVICE_CHANGED=0
@@ -1801,16 +1844,29 @@ do_update() {
 
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new"
     as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"
+    if as_root test -f "$current_agent"; then
+        UPDATE_AGENT_WAS_PRESENT=1
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent" "${PREVIOUS_AGENT_BIN}.new"
+        as_root mv -f "${PREVIOUS_AGENT_BIN}.new" "$PREVIOUS_AGENT_BIN"
+    else
+        UPDATE_AGENT_WAS_PRESENT=0
+        as_root rm -f -- "$PREVIOUS_AGENT_BIN"
+    fi
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
     as_root mv -f "${current_binary}.new" "$current_binary"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY" "${current_agent}.new"
+    as_root mv -f "${current_agent}.new" "$current_agent"
     UPDATE_BINARY_CHANGED=1
+    UPDATE_AGENT_CHANGED=1
 
     if is_systemd; then
         as_root systemctl restart "$SERVICE_NAME"
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
             restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
+            restore_previous_agent_binary || fail "回滚失败：缺少上一版本 Agent，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             UPDATE_BINARY_CHANGED=0
+            UPDATE_AGENT_CHANGED=0
             if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
@@ -1826,7 +1882,9 @@ do_update() {
         if ! "$current_binary" --version >/dev/null 2>&1; then
             warn "新版本二进制无法执行，正在自动回滚..."
             restore_previous_binary || true
+            restore_previous_agent_binary || true
             UPDATE_BINARY_CHANGED=0
+            UPDATE_AGENT_CHANGED=0
             if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
@@ -2058,7 +2116,9 @@ do_uninstall() {
         as_root systemctl daemon-reload
     fi
     as_root rm -f -- "${INSTALL_DIR}/${BIN_NAME}" "$PREVIOUS_BIN" \
-        "${INSTALL_DIR}/${BIN_NAME}.new" "${INSTALL_DIR}/${BIN_NAME}.rollback"
+        "${INSTALL_DIR}/${BIN_NAME}.new" "${INSTALL_DIR}/${BIN_NAME}.rollback" \
+        "${INSTALL_DIR}/${AGENT_BIN_NAME}" "$PREVIOUS_AGENT_BIN" \
+        "${INSTALL_DIR}/${AGENT_BIN_NAME}.new" "${INSTALL_DIR}/${AGENT_BIN_NAME}.rollback"
 
     if [ "$remove_data" = "1" ]; then
         as_root rm -rf -- "$DATA_DIR"

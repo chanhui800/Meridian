@@ -26,6 +26,11 @@ var agentBinaryIdentityCache struct {
 func configuredAgentBinaryPath() string {
 	executable := strings.TrimSpace(os.Getenv("MERIDIAN_AGENT_BINARY"))
 	if executable == "" {
+		// Docker sets MERIDIAN_AGENT_BINARY explicitly. For standalone installs,
+		// prefer the installer path and retain the historical image fallback.
+		if _, err := os.Stat("/usr/local/bin/meridian-agent"); err == nil {
+			return "/usr/local/bin/meridian-agent"
+		}
 		executable = "/app/meridian-agent"
 	}
 	return executable
@@ -180,8 +185,8 @@ printf '%%s\n' 'Meridian Agent installed and running.'
 }
 
 func buildNodeInstallCommand(controllerURL, enrollmentToken string) string {
-	return fmt.Sprintf("wget -qO- %s/api/agent/install.sh | sudo bash -s -- -c %s -t %s",
-		shellSingleQuote(strings.TrimRight(controllerURL, "/")), shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken))
+	return fmt.Sprintf("wget -qO- 'https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh' | sudo bash -s -- -e %s -t %s",
+		shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken))
 }
 
 func writeNodeAPIError(a *App, w http.ResponseWriter, err error) {

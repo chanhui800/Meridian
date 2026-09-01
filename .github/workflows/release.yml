@@ -106,6 +106,7 @@ jobs:
             GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -buildvcs=false \
               -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" \
               -o "meridian-${suffix}" .
+            cp "meridian-${suffix}" "meridian-agent-${suffix}"
           }
           build linux amd64 linux-amd64
           build linux arm64 linux-arm64

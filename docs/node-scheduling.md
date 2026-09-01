@@ -45,7 +45,7 @@ wget -qO- https://panel.example.com:9090/api/agent/install.sh | sudo bash -s -- 
   -t ONE_TIME_ENROLLMENT_TOKEN
 ```
 
-安装器会从同一个主控下载匹配版本的 Agent 二进制，创建并启动 `meridian-agent.service`。注册成功后，一次性令牌会从节点删除并换成长期 Agent 凭据；不要把令牌写入公开脚本或提交到 Git 仓库。
+安装器会从同一个主控下载并校验匹配版本的 Agent 二进制，创建并启动 `meridian-agent.service`。独立二进制安装的主控会将 Agent 安装到 `/usr/local/bin/meridian-agent`，升级时与主控成对更新，失败时成对回滚。注册成功后，一次性令牌会从节点删除并换成长期 Agent 凭据；不要把令牌写入公开脚本或提交到 Git 仓库。
 
 ## 验证 Agent
 
@@ -97,4 +97,3 @@ sudo ss -lntp | grep ':9090'
 ## 删除节点
 
 先在面板删除节点，主控会撤销该节点的 Agent 授权。然后在节点执行卸载步骤。删除节点不会自动删除节点上其他业务进程，也不会修改 Nginx、Caddy 或 Xray 配置。
-
