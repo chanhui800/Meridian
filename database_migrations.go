@@ -137,7 +137,8 @@ func (d *DB) migrateOnce() error {
 		bytes_in BIGINT DEFAULT 0,
 		bytes_out BIGINT DEFAULT 0,
 		requests BIGINT NOT NULL DEFAULT 0,
-		recorded_at DATETIME NOT NULL
+		recorded_at DATETIME NOT NULL,
+		recorded_at_ms INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_traffic_site_time ON traffic_logs(site_id, recorded_at);
 	CREATE TABLE IF NOT EXISTS request_logs (
@@ -159,6 +160,7 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(recorded_at_ms DESC, id DESC);
 	CREATE INDEX IF NOT EXISTS idx_request_logs_category_status ON request_logs(resource_category, status_code, recorded_at_ms DESC);
+	CREATE INDEX IF NOT EXISTS idx_request_logs_site_time ON request_logs(site_id, recorded_at_ms DESC, id DESC);
 	CREATE TABLE IF NOT EXISTS media_items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -795,6 +797,41 @@ func (d *DB) migrateOnce() error {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "DROP INDEX IF EXISTS idx_traffic_site_hour"); err != nil {
+		return err
+	}
+	var hasTrafficRecordedMS int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('traffic_logs') WHERE name='recorded_at_ms'").Scan(&hasTrafficRecordedMS); err != nil {
+		return err
+	}
+	if hasTrafficRecordedMS == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE traffic_logs ADD COLUMN recorded_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		rows, err := conn.QueryContext(ctx, "SELECT id, recorded_at FROM traffic_logs WHERE recorded_at_ms=0")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id int64
+			var recordedAt string
+			if err := rows.Scan(&id, &recordedAt); err != nil {
+				rows.Close()
+				return err
+			}
+			if recordedAtMS := trafficWallClockMillis(recordedAt); recordedAtMS > 0 {
+				if _, err := conn.ExecContext(ctx, "UPDATE traffic_logs SET recorded_at_ms=? WHERE id=?", recordedAtMS, id); err != nil {
+					rows.Close()
+					return err
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_traffic_site_time_ms ON traffic_logs(site_id, recorded_at_ms)"); err != nil {
 		return err
 	}
 

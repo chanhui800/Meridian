@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 var agentBinaryIdentityCache struct {
@@ -433,5 +435,53 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	for _, event := range report.Events {
 		accepted = append(accepted, event.EventID)
 	}
-	a.jsonOK(w, map[string]interface{}{"accepted": true, "node_id": node.ID, "next_report_seconds": 15, "accepted_event_ids": accepted})
+	configChanged := node.DesiredConfigHash != "" && node.DesiredConfigHash != report.AppliedConfigHash
+	a.jsonOK(w, map[string]interface{}{
+		"accepted": true, "node_id": node.ID, "next_report_seconds": 15,
+		"accepted_event_ids": accepted, "config_hash": node.DesiredConfigHash,
+		"config_changed": configChanged,
+	})
+}
+
+// handleAgentWebSocket is a control-plane heartbeat channel. It deliberately
+// shares RecordNodeReport with the POST fallback so sequence/event idempotency,
+// node traffic accounting, and metadata replay have one implementation.
+func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
+	if ws == nil || ws.Request() == nil {
+		return
+	}
+	token := requestBearerToken(ws.Request())
+	if _, err := a.db.nodeByAgentToken(token, time.Now()); err != nil {
+		return
+	}
+	ws.MaxPayloadBytes = maxAgentReportBodyBytes
+	defer ws.Close()
+	for {
+		if err := ws.SetReadDeadline(time.Now().Add(nodeOnlineWindow)); err != nil {
+			return
+		}
+		var report NodeReport
+		if err := websocket.JSON.Receive(ws, &report); err != nil {
+			return
+		}
+		node, err := a.db.RecordNodeReport(token, report, time.Now())
+		if err != nil {
+			return
+		}
+		accepted := make([]int64, 0, len(report.Events))
+		for _, event := range report.Events {
+			accepted = append(accepted, event.EventID)
+		}
+		ack := map[string]interface{}{
+			"accepted": true, "node_id": node.ID, "next_report_seconds": 15,
+			"accepted_event_ids": accepted, "config_hash": node.DesiredConfigHash,
+			"config_changed": node.DesiredConfigHash != "" && node.DesiredConfigHash != report.AppliedConfigHash,
+		}
+		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return
+		}
+		if err := websocket.JSON.Send(ws, ack); err != nil {
+			return
+		}
+	}
 }

@@ -109,13 +109,13 @@ func (d *DB) addTrafficWithRequestsAt(siteID, bytesIn, bytesOut, requests int64,
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(
-		`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at)
-		 VALUES (?,?,?,?,?)
+		`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at, recorded_at_ms)
+		 VALUES (?,?,?,?,?,?)
 		 ON CONFLICT(site_id, recorded_at) DO UPDATE SET
 			bytes_in = traffic_logs.bytes_in + excluded.bytes_in,
 			bytes_out = traffic_logs.bytes_out + excluded.bytes_out,
 			requests = traffic_logs.requests + excluded.requests`,
-		siteID, bytesIn, bytesOut, requests, minute,
+		siteID, bytesIn, bytesOut, requests, minute, trafficWallClockMillis(minute),
 	); err != nil {
 		return err
 	}
@@ -137,10 +137,9 @@ func (d *DB) addTrafficWithRequestsAt(siteID, bytesIn, bytesOut, requests int64,
 }
 
 func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
-	since := time.Now().Add(-time.Duration(hours) * time.Hour).Format("2006-01-02 15:04:05")
 	rows, err := d.db.Query(
-		"SELECT id, site_id, bytes_in, bytes_out, requests, recorded_at FROM traffic_logs WHERE site_id=? AND recorded_at>=? ORDER BY recorded_at",
-		siteID, since,
+		"SELECT id, site_id, bytes_in, bytes_out, requests, recorded_at, recorded_at_ms FROM traffic_logs WHERE site_id=? AND (recorded_at_ms>=? OR (recorded_at_ms=0 AND recorded_at>=?)) ORDER BY recorded_at_ms, recorded_at",
+		siteID, time.Now().Add(-time.Duration(hours)*time.Hour).UnixMilli(), time.Now().Add(-time.Duration(hours)*time.Hour).Format("2006-01-02 15:04:05"),
 	)
 	if err != nil {
 		return nil, err
@@ -149,10 +148,12 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	var logs []TrafficLog
 	for rows.Next() {
 		var l TrafficLog
-		if err := rows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAt); err != nil {
+		if err := rows.Scan(&l.ID, &l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAt, &l.RecordedAtMS); err != nil {
 			return nil, err
 		}
-		l.RecordedAtMS = trafficWallClockMillis(l.RecordedAt)
+		if l.RecordedAtMS == 0 {
+			l.RecordedAtMS = trafficWallClockMillis(l.RecordedAt)
+		}
 		logs = append(logs, l)
 	}
 	if err := rows.Err(); err != nil {
@@ -232,17 +233,40 @@ func (d *DB) SumTrafficSinceForSite(siteID int64, start time.Time, billingMode s
 	return trafficBillableBytes(billingMode, bytesIn, bytesOut), err
 }
 
-// GetTrafficTrendLogs returns minute/hour buckets in the requested wall-clock
-// window. The caller performs aggregation so that one endpoint can support all
-// dashboard ranges without adding a schema migration.
+// GetTrafficTrendLogs returns traffic rows in the requested wall-clock window.
+// Rows are bounded to the selected range and grouped into the dashboard bucket
+// by GetTrafficTrendLogsGrouped without changing the persisted schema.
 func (d *DB) GetTrafficTrendLogs(siteID *int64, start, end time.Time) ([]TrafficLog, error) {
-	query := "SELECT site_id, bytes_in, bytes_out, requests, recorded_at FROM traffic_logs WHERE recorded_at >= ? AND recorded_at < ?"
-	args := []interface{}{start.In(time.Local).Format("2006-01-02 15:04:05"), end.In(time.Local).Format("2006-01-02 15:04:05")}
+	return d.GetTrafficTrendLogsGrouped(siteID, start, end, time.Minute)
+}
+
+// GetTrafficTrendLogsGrouped aggregates both controller and node traffic at
+// the requested bucket in SQLite, keeping long dashboard ranges out of the Go
+// heap. The returned rows are already ordered and can be fed directly to the
+// dashboard bucket merger.
+func (d *DB) GetTrafficTrendLogsGrouped(siteID *int64, start, end time.Time, bucket time.Duration) ([]TrafficLog, error) {
+	bucketMS := bucket.Milliseconds()
+	if bucketMS < 1 {
+		bucketMS = time.Minute.Milliseconds()
+	}
+	startMS, endMS := start.UnixMilli(), end.UnixMilli()
+	query := `WITH source AS (
+		SELECT site_id, bytes_in, bytes_out, requests, recorded_at_ms FROM traffic_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?
+		UNION ALL
+		SELECT site_id, bytes_in, bytes_out, requests, recorded_at_ms FROM node_site_traffic_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?
+	), bucketed AS (
+		SELECT site_id, bytes_in, bytes_out, requests,
+			(? + ((recorded_at_ms - ?) / ?) * ?) AS bucket_ms
+		FROM source
+	)
+	SELECT site_id, COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0), COALESCE(SUM(requests),0), bucket_ms
+	FROM bucketed`
+	args := []any{startMS, endMS, startMS, endMS, startMS, startMS, bucketMS, bucketMS}
 	if siteID != nil {
-		query += " AND site_id = ?"
+		query += " WHERE site_id=?"
 		args = append(args, *siteID)
 	}
-	query += " ORDER BY recorded_at"
+	query += " GROUP BY site_id, bucket_ms ORDER BY bucket_ms, site_id"
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -251,38 +275,14 @@ func (d *DB) GetTrafficTrendLogs(siteID *int64, start, end time.Time) ([]Traffic
 	logs := make([]TrafficLog, 0)
 	for rows.Next() {
 		var l TrafficLog
-		if err := rows.Scan(&l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAt); err != nil {
-			return nil, err
-		}
-		l.RecordedAtMS = trafficWallClockMillis(l.RecordedAt)
-		logs = append(logs, l)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	nodeQuery := "SELECT site_id,bytes_in,bytes_out,requests,recorded_at_ms FROM node_site_traffic_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?"
-	nodeArgs := []interface{}{start.UnixMilli(), end.UnixMilli()}
-	if siteID != nil {
-		nodeQuery += " AND site_id=?"
-		nodeArgs = append(nodeArgs, *siteID)
-	}
-	nodeQuery += " ORDER BY recorded_at_ms"
-	nodeRows, err := d.db.Query(nodeQuery, nodeArgs...)
-	if err != nil {
-		return nil, err
-	}
-	defer nodeRows.Close()
-	for nodeRows.Next() {
-		var l TrafficLog
-		if err := nodeRows.Scan(&l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAtMS); err != nil {
+		if err := rows.Scan(&l.SiteID, &l.BytesIn, &l.BytesOut, &l.Requests, &l.RecordedAtMS); err != nil {
 			return nil, err
 		}
 		l.RecordedAt = time.UnixMilli(l.RecordedAtMS).In(time.Local).Format("2006-01-02 15:04:05")
 		logs = append(logs, l)
 	}
-	if err := nodeRows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.SliceStable(logs, func(i, j int) bool { return logs[i].RecordedAtMS < logs[j].RecordedAtMS })
 	return logs, nil
 }

@@ -78,6 +78,8 @@ type ProxyManager struct {
 	assetCache              *assetCache
 	siteTLSConfig           *tls.Config
 	accountRetention        *accountRetentionTracker
+	trendCacheMu            sync.Mutex
+	trendCache              map[string]dashboardTrendCacheEntry
 }
 
 // ProxyRuntimeStat is a non-persistent edge snapshot. Node scheduling quotas

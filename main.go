@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 const (
@@ -242,6 +245,17 @@ func main() {
 	mux.HandleFunc("/api/agent/enroll", app.handleAgentEnroll)
 	mux.HandleFunc("/api/agent/report", app.handleAgentReport)
 	mux.HandleFunc("/api/agent/config", app.handleAgentConfig)
+	mux.Handle("/api/agent/ws", websocket.Server{
+		Handshake: func(config *websocket.Config, request *http.Request) error {
+			if _, err := app.db.nodeByAgentToken(requestBearerToken(request), time.Now()); err != nil {
+				return errors.New("invalid agent token")
+			}
+			// Agent clients are not browsers; token authentication is the origin
+			// boundary, so do not apply the package's browser Origin check.
+			return nil
+		},
+		Handler: websocket.Handler(app.handleAgentWebSocket),
+	})
 
 	// Protected routes
 	mux.HandleFunc("/api/account", cors(app.authMiddleware(app.handleAccount)))

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -78,11 +79,16 @@ type RequestLog struct {
 	Method            string `json:"method"`
 	Path              string `json:"path"`
 	RecordedAtMS      int64  `json:"recorded_at_ms"`
+	CursorAtMS        int64  `json:"cursor_at_ms,omitempty"`
 }
 
 type RequestLogFilter struct {
 	FromMS      int64
 	ToMS        int64
+	AfterMS     int64
+	AfterID     int64
+	BeforeMS    int64
+	BeforeID    int64
 	Category    string
 	StatusGroup string
 	Query       string
@@ -92,6 +98,38 @@ type RequestLogFilter struct {
 type RequestLogsResponse struct {
 	Logs        []RequestLog `json:"logs"`
 	DroppedLogs uint64       `json:"dropped_logs"`
+	NextCursor  string       `json:"next_cursor,omitempty"`
+	HasMore     bool         `json:"has_more,omitempty"`
+}
+
+func encodeRequestLogCursor(recordedAtMS, id int64) string {
+	if recordedAtMS <= 0 || id <= 0 {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%d", recordedAtMS, id)))
+}
+
+func decodeRequestLogCursor(value string) (int64, int64, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, 0, nil
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	if err != nil || len(decoded) > 64 {
+		return 0, 0, fmt.Errorf("invalid cursor")
+	}
+	parts := strings.Split(string(decoded), ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid cursor")
+	}
+	recordedAtMS, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || recordedAtMS <= 0 {
+		return 0, 0, fmt.Errorf("invalid cursor")
+	}
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || id <= 0 {
+		return 0, 0, fmt.Errorf("invalid cursor")
+	}
+	return recordedAtMS, id, nil
 }
 
 type queuedRequestLog struct {
@@ -231,10 +269,12 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	if filter.Limit < 1 || filter.Limit > 500 {
 		return nil, fmt.Errorf("request log limit must be between 1 and 500")
 	}
-	if err := d.flushDynamicObservations(); err != nil {
+	if filter.AfterMS < 0 || filter.AfterID < 0 || filter.BeforeMS < 0 || filter.BeforeID < 0 {
+		return nil, fmt.Errorf("invalid request log cursor")
+	}
+	if err := d.flushDynamicObservationsIfSmall(); err != nil {
 		return nil, err
 	}
-
 	conditions := make([]string, 0, 6)
 	args := make([]interface{}, 0, 12)
 	if filter.FromMS > 0 {
@@ -244,6 +284,17 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	if filter.ToMS > 0 {
 		conditions = append(conditions, "recorded_at_ms<=?")
 		args = append(args, filter.ToMS)
+	}
+	if filter.AfterMS > 0 {
+		conditions = append(conditions, "(request_logs.recorded_at_ms>? OR (request_logs.recorded_at_ms=? AND request_logs.id>?))")
+		args = append(args, filter.AfterMS, filter.AfterMS, filter.AfterID)
+	} else if filter.AfterID > 0 {
+		conditions = append(conditions, "request_logs.id>?")
+		args = append(args, filter.AfterID)
+	}
+	if filter.BeforeMS > 0 {
+		conditions = append(conditions, "(request_logs.recorded_at_ms<? OR (request_logs.recorded_at_ms=? AND request_logs.id<?))")
+		args = append(args, filter.BeforeMS, filter.BeforeMS, filter.BeforeID)
 	}
 	if filter.Category != "" && filter.Category != "all" {
 		switch filter.Category {
@@ -273,7 +324,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 			args = append(args, filter.Query)
 		}
 	}
-	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.final_node, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.upstream_user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
+	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.final_node, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.upstream_user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.recorded_at_ms, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- conditions are fixed SQL fragments selected from validated filters; values remain parameters.
 	}
@@ -287,9 +338,11 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	logs := make([]RequestLog, 0)
 	for rows.Next() {
 		var entry RequestLog
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.FinalNode, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.UpstreamUserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.RecordedAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
+		var timelineAtMS int64
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.FinalNode, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.UpstreamUserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.CursorAtMS, &timelineAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
 			return nil, err
 		}
+		entry.RecordedAtMS = timelineAtMS
 		if entry.ResourceCategory == requestLogCategoryPlayback && isRequestLogPlaybackActivityPath(entry.Path) {
 			entry.ResourceCategory = requestLogCategoryPlaybackSync
 		}
@@ -684,13 +737,53 @@ func (a *App) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
 			}
 			filter.Limit = value
 		}
+		if raw := strings.TrimSpace(query.Get("after_id")); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value < 0 {
+				a.jsonErr(w, http.StatusBadRequest, "after_id must be a non-negative integer")
+				return
+			}
+			filter.AfterID = value
+		}
+		if raw := strings.TrimSpace(query.Get("after_cursor")); raw != "" {
+			valueMS, valueID, err := decodeRequestLogCursor(raw)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, "after_cursor is invalid")
+				return
+			}
+			filter.AfterMS, filter.AfterID = valueMS, valueID
+		}
+		pageLimit := filter.Limit
+		if pageLimit == 0 {
+			pageLimit = 200
+		}
+		if raw := strings.TrimSpace(query.Get("cursor")); raw != "" {
+			valueMS, valueID, err := decodeRequestLogCursor(raw)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, "cursor is invalid")
+				return
+			}
+			filter.BeforeMS, filter.BeforeID = valueMS, valueID
+			if pageLimit < 500 {
+				filter.Limit = pageLimit + 1
+			}
+		}
 		logs, err := a.db.ListRequestLogs(filter)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		hasMore := len(logs) > pageLimit
+		if hasMore {
+			logs = logs[:pageLimit]
+		}
+		nextCursor := ""
+		if hasMore && len(logs) > 0 {
+			last := logs[len(logs)-1]
+			nextCursor = encodeRequestLogCursor(last.CursorAtMS, last.ID)
+		}
 		a.clientIPRegions.enrich(logs)
-		a.jsonOK(w, RequestLogsResponse{Logs: logs, DroppedLogs: a.db.DroppedRequestLogs()})
+		a.jsonOK(w, RequestLogsResponse{Logs: logs, DroppedLogs: a.db.DroppedRequestLogs(), NextCursor: nextCursor, HasMore: hasMore})
 	case http.MethodDelete:
 		if err := a.db.ClearRequestLogs(); err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "clear request logs failed")

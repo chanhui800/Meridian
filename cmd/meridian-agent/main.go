@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -25,6 +26,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 var version = "dev"
@@ -35,6 +38,7 @@ const maxAgentEventBodyBytes = 32 << 10
 // when several metadata events are acknowledged in one heartbeat.
 const maxAgentEventResponseBodyBytes = 64 << 10
 const maxAgentEventsPerReport = 16
+const maxAgentReportResponseBodyBytes = 2 << 20
 
 type state struct {
 	NodeGUID string `json:"node_guid"`
@@ -52,6 +56,105 @@ type report struct {
 	ListenerError     string         `json:"listener_error"`
 	SiteStats         []siteStat     `json:"site_stats,omitempty"`
 	Events            []requestEvent `json:"events,omitempty"`
+}
+
+type reportAck struct {
+	AcceptedEventIDs []int64 `json:"accepted_event_ids"`
+	ConfigHash       string  `json:"config_hash"`
+	ConfigChanged    bool    `json:"config_changed"`
+}
+
+type wsReportClient struct {
+	mu         sync.Mutex
+	controller string
+	token      string
+	conn       *websocket.Conn
+	nextTry    time.Time
+}
+
+func newWSReportClient(controller, token string) *wsReportClient {
+	return &wsReportClient{controller: controller, token: token}
+}
+
+func (c *wsReportClient) closeLocked() {
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+}
+
+func (c *wsReportClient) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeLocked()
+}
+
+func (c *wsReportClient) connectLocked(ctx context.Context) error {
+	if c.conn != nil {
+		return nil
+	}
+	if !c.nextTry.IsZero() && time.Now().Before(c.nextTry) {
+		return errors.New("websocket retry backoff")
+	}
+	parsed, err := url.Parse(c.controller + "/api/agent/ws")
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme == "https" {
+		parsed.Scheme = "wss"
+	} else {
+		parsed.Scheme = "ws"
+	}
+	origin := *parsed
+	origin.Path = "/"
+	if origin.Scheme == "wss" {
+		origin.Scheme = "https"
+	} else {
+		origin.Scheme = "http"
+	}
+	config, err := websocket.NewConfig(parsed.String(), origin.String())
+	if err != nil {
+		return err
+	}
+	config.Header.Set("Authorization", "Bearer "+c.token)
+	config.TlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	conn, err := config.DialContext(ctx)
+	if err != nil {
+		c.nextTry = time.Now().Add(30 * time.Second)
+		return err
+	}
+	conn.MaxPayloadBytes = maxAgentReportResponseBodyBytes
+	c.conn = conn
+	c.nextTry = time.Time{}
+	return nil
+}
+
+func (c *wsReportClient) report(ctx context.Context, payload report) (reportAck, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.connectLocked(ctx); err != nil {
+		return reportAck{}, err
+	}
+	if err := c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		c.closeLocked()
+		return reportAck{}, err
+	}
+	if err := websocket.JSON.Send(c.conn, payload); err != nil {
+		c.closeLocked()
+		c.nextTry = time.Now().Add(30 * time.Second)
+		return reportAck{}, err
+	}
+	if err := c.conn.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+		c.closeLocked()
+		return reportAck{}, err
+	}
+	var ack reportAck
+	if err := websocket.JSON.Receive(c.conn, &ack); err != nil {
+		c.closeLocked()
+		c.nextTry = time.Now().Add(30 * time.Second)
+		return reportAck{}, err
+	}
+	return ack, nil
 }
 
 type requestEvent struct {
@@ -93,6 +196,72 @@ type requestEventStore struct {
 	mu    sync.Mutex
 	next  int64
 	items []requestEvent
+	path  string
+}
+
+func (s *requestEventStore) init(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.path = filepath.Join(dir, "events.json")
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var stored struct {
+		Next  int64          `json:"next"`
+		Items []requestEvent `json:"items"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return fmt.Errorf("load event queue: %w", err)
+	}
+	if len(stored.Items) > 128 {
+		stored.Items = stored.Items[len(stored.Items)-128:]
+	}
+	s.next, s.items = stored.Next, append([]requestEvent(nil), stored.Items...)
+	for _, item := range s.items {
+		if item.EventID > s.next {
+			s.next = item.EventID
+		}
+	}
+	return nil
+}
+
+func (s *requestEventStore) persistLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	data, err := json.Marshal(struct {
+		Next  int64          `json:"next"`
+		Items []requestEvent `json:"items"`
+	}{s.next, s.items})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".events-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	_ = tmp.Chmod(0o600)
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, s.path)
 }
 
 func (s *requestEventStore) add(event requestEvent) {
@@ -105,8 +274,9 @@ func (s *requestEventStore) add(event requestEvent) {
 	event.EventID = s.next
 	s.items = append(s.items, event)
 	if len(s.items) > 128 {
-		s.items = s.items[len(s.items)-128:]
+		s.items = append([]requestEvent(nil), s.items[len(s.items)-128:]...)
 	}
+	_ = s.persistLocked()
 }
 func (s *requestEventStore) snapshot() []requestEvent {
 	if s == nil {
@@ -126,14 +296,41 @@ func (s *requestEventStore) ack(events []requestEvent) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	max := events[len(events)-1].EventID
+	accepted := make(map[int64]struct{}, len(events))
+	for _, event := range events {
+		accepted[event.EventID] = struct{}{}
+	}
 	kept := s.items[:0]
 	for _, item := range s.items {
-		if item.EventID > max {
+		if _, ok := accepted[item.EventID]; !ok {
 			kept = append(kept, item)
 		}
 	}
 	s.items = kept
+	_ = s.persistLocked()
+}
+
+func eventsByIDs(events []requestEvent, ids []int64) []requestEvent {
+	accepted := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		accepted[id] = struct{}{}
+	}
+	result := make([]requestEvent, 0, len(ids))
+	for _, event := range events {
+		if _, ok := accepted[event.EventID]; ok {
+			result = append(result, event)
+		}
+	}
+	return result
+}
+
+func agentHTTPTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 32
+	transport.MaxIdleConnsPerHost = 8
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	return transport
 }
 
 func (s *siteStatsStore) record(host string, status int) {
@@ -269,11 +466,13 @@ func saveState(path string, value state) error {
 
 func request(ctx context.Context, client *http.Client, method, endpoint, token string, body, output any) error {
 	var reader io.Reader
+	var payload []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
+		payload = data
 		reader = bytes.NewReader(data)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
@@ -283,6 +482,21 @@ func request(ctx context.Context, client *http.Client, method, endpoint, token s
 	req.Header.Set("Authorization", "Bearer "+token)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+		if len(payload) >= 1024 {
+			var compressed bytes.Buffer
+			writer := gzip.NewWriter(&compressed)
+			if _, err := writer.Write(payload); err != nil {
+				_ = writer.Close()
+				return err
+			}
+			if err := writer.Close(); err != nil {
+				return err
+			}
+			reader = bytes.NewReader(compressed.Bytes())
+			req.Body = io.NopCloser(reader)
+			req.ContentLength = int64(compressed.Len())
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 	}
 	response, err := client.Do(req)
 	if err != nil {
@@ -827,7 +1041,7 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	client := &http.Client{Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Timeout: 12 * time.Second, Transport: agentHTTPTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	current, err := loadState(*statePath)
 	if err != nil {
 		return err
@@ -844,9 +1058,19 @@ func run() error {
 	}
 	runtime := &agentRuntime{stateDir: filepath.Dir(*statePath)}
 	runtime.stats = &siteStatsStore{events: &requestEventStore{}}
+	if err := runtime.stats.events.init(filepath.Join(runtime.stateDir, "events")); err != nil {
+		return err
+	}
 	defer runtime.stop()
 	id, sequence := runID(), int64(1)
-	applyConfig := func() {
+	const configRefreshInterval = 60 * time.Second
+	lastConfigAt := time.Time{}
+	wsReporter := newWSReportClient(controller, current.Token)
+	defer wsReporter.close()
+	applyConfig := func(force bool) {
+		if !force && !lastConfigAt.IsZero() && time.Since(lastConfigAt) < configRefreshInterval {
+			return
+		}
 		config, err := fetchConfig(ctx, client, controller, current.Token)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
@@ -858,6 +1082,7 @@ func run() error {
 			runtime.mu.Unlock()
 			fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
 		}
+		lastConfigAt = time.Now()
 	}
 	reportOnce := func() error {
 		payload, err := collect(id, sequence)
@@ -867,14 +1092,20 @@ func run() error {
 		payload.AppliedConfigHash, payload.ListenerError = runtime.status()
 		payload.SiteStats = runtime.stats.snapshot()
 		payload.Events = runtime.stats.events.snapshot()
-		if err := request(ctx, client, http.MethodPost, controller+"/api/agent/report", current.Token, payload, nil); err != nil {
-			return err
+		ack, wsErr := wsReporter.report(ctx, payload)
+		if wsErr != nil {
+			if err := request(ctx, client, http.MethodPost, controller+"/api/agent/report", current.Token, payload, &ack); err != nil {
+				return err
+			}
 		}
-		runtime.stats.events.ack(payload.Events)
+		runtime.stats.events.ack(eventsByIDs(payload.Events, ack.AcceptedEventIDs))
+		if ack.ConfigChanged {
+			applyConfig(true)
+		}
 		sequence++
 		return nil
 	}
-	applyConfig()
+	applyConfig(true)
 	if err := reportOnce(); err != nil {
 		return err
 	}
@@ -888,7 +1119,7 @@ func run() error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			applyConfig()
+			applyConfig(false)
 			if err := reportOnce(); err != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", err)
 			}

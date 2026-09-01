@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -25,6 +26,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 const (
@@ -755,11 +758,13 @@ func edgeSaveState(path string, state edgeAgentState) error {
 
 func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, token string, body, output any) error {
 	var reader io.Reader
+	var payload []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
+		payload = data
 		reader = bytes.NewReader(data)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
@@ -769,6 +774,20 @@ func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, 
 	request.Header.Set("Authorization", "Bearer "+token)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
+		if len(payload) >= 1024 {
+			var compressed bytes.Buffer
+			writer := gzip.NewWriter(&compressed)
+			if _, err := writer.Write(payload); err != nil {
+				_ = writer.Close()
+				return err
+			}
+			if err := writer.Close(); err != nil {
+				return err
+			}
+			request.Body = io.NopCloser(bytes.NewReader(compressed.Bytes()))
+			request.ContentLength = int64(compressed.Len())
+			request.Header.Set("Content-Encoding", "gzip")
+		}
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -794,6 +813,110 @@ func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, 
 
 type edgeReportAck struct {
 	AcceptedEventIDs []int64 `json:"accepted_event_ids"`
+	ConfigHash       string  `json:"config_hash"`
+	ConfigChanged    bool    `json:"config_changed"`
+}
+
+type edgeWSReportClient struct {
+	mu         sync.Mutex
+	controller string
+	token      string
+	conn       *websocket.Conn
+	nextTry    time.Time
+}
+
+func newEdgeWSReportClient(controller, token string) *edgeWSReportClient {
+	return &edgeWSReportClient{controller: controller, token: token}
+}
+
+func (c *edgeWSReportClient) closeLocked() {
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+}
+
+func (c *edgeWSReportClient) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeLocked()
+}
+
+func (c *edgeWSReportClient) connectLocked(ctx context.Context) error {
+	if c.conn != nil {
+		return nil
+	}
+	if !c.nextTry.IsZero() && time.Now().Before(c.nextTry) {
+		return errors.New("websocket retry backoff")
+	}
+	parsed, err := url.Parse(c.controller + "/api/agent/ws")
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme == "https" {
+		parsed.Scheme = "wss"
+	} else {
+		parsed.Scheme = "ws"
+	}
+	origin := *parsed
+	origin.Path = "/"
+	if origin.Scheme == "wss" {
+		origin.Scheme = "https"
+	} else {
+		origin.Scheme = "http"
+	}
+	config, err := websocket.NewConfig(parsed.String(), origin.String())
+	if err != nil {
+		return err
+	}
+	config.Header.Set("Authorization", "Bearer "+c.token)
+	config.TlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	conn, err := config.DialContext(ctx)
+	if err != nil {
+		c.nextTry = time.Now().Add(30 * time.Second)
+		return err
+	}
+	conn.MaxPayloadBytes = maxAgentReportBodyBytes
+	c.conn = conn
+	c.nextTry = time.Time{}
+	return nil
+}
+
+func (c *edgeWSReportClient) report(ctx context.Context, payload NodeReport) (edgeReportAck, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.connectLocked(ctx); err != nil {
+		return edgeReportAck{}, err
+	}
+	if err := c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		c.closeLocked()
+		return edgeReportAck{}, err
+	}
+	if err := websocket.JSON.Send(c.conn, payload); err != nil {
+		c.closeLocked()
+		c.nextTry = time.Now().Add(30 * time.Second)
+		return edgeReportAck{}, err
+	}
+	if err := c.conn.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+		c.closeLocked()
+		return edgeReportAck{}, err
+	}
+	var ack edgeReportAck
+	if err := websocket.JSON.Receive(c.conn, &ack); err != nil {
+		c.closeLocked()
+		c.nextTry = time.Now().Add(30 * time.Second)
+		return edgeReportAck{}, err
+	}
+	return ack, nil
+}
+
+func edgeHTTPTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 32
+	transport.MaxIdleConnsPerHost = 8
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	return transport
 }
 
 func edgeEnroll(ctx context.Context, client *http.Client, controller, tokenFile, statePath string) (edgeAgentState, error) {
@@ -962,7 +1085,7 @@ func runEdgeAgent() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	client := &http.Client{Timeout: 2 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Timeout: 2 * time.Minute, Transport: edgeHTTPTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	state, err := edgeLoadState(*statePath)
 	if err != nil {
 		return err
@@ -981,23 +1104,30 @@ func runEdgeAgent() error {
 		return err
 	}
 	defer runtime.close()
+	wsReporter := newEdgeWSReportClient(controller, state.Token)
+	defer wsReporter.close()
 	bootID := edgeBootID()
 	sequence := int64(0)
+	const configRefreshInterval = 60 * time.Second
+	lastConfigAt := time.Time{}
 	for {
-		var config AgentRuntimeConfig
-		if err := edgeAPIRequest(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config); err != nil {
-			fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
-		} else if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
-			if errors.Is(updateErr, errEdgeAgentUpdated) {
-				return updateErr
-			}
-			fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
-		} else {
-			applied, _ := runtime.status()
-			if config.ConfigHash != applied {
-				if err := runtime.apply(config); err != nil {
-					fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
+		if lastConfigAt.IsZero() || time.Since(lastConfigAt) >= configRefreshInterval {
+			var config AgentRuntimeConfig
+			if err := edgeAPIRequest(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config); err != nil {
+				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
+			} else if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
+				if errors.Is(updateErr, errEdgeAgentUpdated) {
+					return updateErr
 				}
+				fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
+			} else {
+				applied, _ := runtime.status()
+				if config.ConfigHash != applied {
+					if err := runtime.apply(config); err != nil {
+						fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
+					}
+				}
+				lastConfigAt = time.Now()
 			}
 		}
 		sequence++
@@ -1009,9 +1139,12 @@ func runEdgeAgent() error {
 			report.SiteStats = runtime.siteStatsSnapshot()
 			report.MediaCounts, report.Retention, report.Observations = runtime.telemetrySnapshot()
 			report.Events = runtime.events.snapshot()
-			var ack edgeReportAck
-			if err := edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/report", state.Token, report, &ack); err != nil {
-				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", err)
+			ack, wsErr := wsReporter.report(ctx, report)
+			if wsErr != nil {
+				wsErr = edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/report", state.Token, report, &ack)
+			}
+			if wsErr != nil {
+				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", wsErr)
 			} else {
 				accepted := make(map[int64]bool, len(ack.AcceptedEventIDs))
 				for _, id := range ack.AcceptedEventIDs {
@@ -1024,6 +1157,9 @@ func runEdgeAgent() error {
 					}
 				}
 				runtime.events.ack(ackEvents)
+				if ack.ConfigChanged {
+					lastConfigAt = time.Time{}
+				}
 			}
 		}
 		if *once {

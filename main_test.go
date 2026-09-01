@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"database/sql"
@@ -24,8 +25,95 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/websocket"
 	"meridian/web"
 )
+
+func TestDecodeJSONBodyAcceptsGzipReport(t *testing.T) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write([]byte(`{"boot_id":"boot","sequence":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/report", &compressed)
+	req.Header.Set("Content-Encoding", "gzip")
+	var payload struct {
+		BootID   string `json:"boot_id"`
+		Sequence int64  `json:"sequence"`
+	}
+	if err := decodeJSONBodyWithLimit(httptest.NewRecorder(), req, &payload, 1<<20); err != nil {
+		t.Fatalf("decode gzip body: %v", err)
+	}
+	if payload.BootID != "boot" || payload.Sequence != 1 {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
+func TestDecodeJSONBodyRejectsUnknownEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/report", strings.NewReader(`{"boot_id":"boot"}`))
+	req.Header.Set("Content-Encoding", "br")
+	if err := decodeJSONBodyWithLimit(httptest.NewRecorder(), req, &struct{}{}, 1<<20); err == nil {
+		t.Fatal("unknown content encoding was accepted")
+	}
+}
+
+func TestAgentWebSocketReportAcknowledgesHeartbeat(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "agent-ws.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node, enrollment, err := db.CreateControlNode(NodeCreateInput{Name: "ws-node", Address: "127.0.0.1", Port: 9090}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := db.EnrollControlNode(enrollment, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{db: db}
+	server := httptest.NewServer(websocket.Server{
+		Handshake: func(_ *websocket.Config, r *http.Request) error {
+			if _, err := db.nodeByAgentToken(requestBearerToken(r), time.Now()); err != nil {
+				return err
+			}
+			return nil
+		},
+		Handler: websocket.Handler(app.handleAgentWebSocket),
+	})
+	defer server.Close()
+	config, err := websocket.NewConfig("ws"+strings.TrimPrefix(server.URL, "http")+"/api/agent/ws", server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Header.Set("Authorization", "Bearer "+agentToken)
+	conn, err := websocket.DialConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	report := NodeReport{BootID: "ws-boot", Sequence: 1, InterfaceName: "ens5", RXBytes: 10, TXBytes: 20, AgentVersion: "test"}
+	if err := websocket.JSON.Send(conn, report); err != nil {
+		t.Fatal(err)
+	}
+	var ack struct {
+		Accepted bool  `json:"accepted"`
+		NodeID   int64 `json:"node_id"`
+	}
+	if err := websocket.JSON.Receive(conn, &ack); err != nil {
+		t.Fatal(err)
+	}
+	if !ack.Accepted || ack.NodeID != node.ID {
+		t.Fatalf("ack=%+v", ack)
+	}
+	snapshot, err := db.NodeControlSnapshot(time.Now())
+	if err != nil || len(snapshot.Nodes) != 1 || snapshot.Nodes[0].Status != "online" {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

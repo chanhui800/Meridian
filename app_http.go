@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
@@ -129,8 +130,26 @@ func decodeJSONBodyWithLimit(w http.ResponseWriter, r *http.Request, dst interfa
 	if limit <= 0 {
 		limit = maxJSONBodyBytes
 	}
+	encoding := strings.TrimSpace(r.Header.Get("Content-Encoding"))
+	compressed := strings.EqualFold(encoding, "gzip")
+	if encoding != "" && !compressed {
+		return errors.New("unsupported content encoding")
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	decoder := json.NewDecoder(r.Body)
+	var body io.Reader = r.Body
+	var gzipReader *gzip.Reader
+	var expanded *io.LimitedReader
+	if compressed {
+		var err error
+		gzipReader, err = gzip.NewReader(r.Body)
+		if err != nil {
+			return err
+		}
+		defer gzipReader.Close()
+		expanded = &io.LimitedReader{R: gzipReader, N: limit + 1}
+		body = expanded
+	}
+	decoder := json.NewDecoder(body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
 		return err
@@ -140,6 +159,9 @@ func decodeJSONBodyWithLimit(w http.ResponseWriter, r *http.Request, dst interfa
 			return errors.New("request body must contain one JSON object")
 		}
 		return err
+	}
+	if expanded != nil && expanded.N == 0 {
+		return errors.New("request body too large")
 	}
 	return nil
 }
