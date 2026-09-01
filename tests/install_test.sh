@@ -750,7 +750,7 @@ if (
 fi
 assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
 assert_eq 'v9.9.11' "$(get_current_version)" 'rollback must restore the previous binary'
-assert_eq 'v9.9.10' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'rollback must restore the previous Agent'
+assert_eq 'v9.9.11' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'rollback must restore the previous Agent'
 # The restored DATA_DIR is owned by the service user (0750, db 0600,
 # .env root:meridian 0640), so a non-root runner cannot read it directly.
 run_as_test_root cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before" \
