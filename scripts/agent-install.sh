@@ -59,10 +59,10 @@ else
   echo 'sha256sum or shasum is required.' >&2
   exit 1
 fi
-[ -n "$expected_sha" ] && [ "$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" ] || {
+if [ -z "$expected_sha" ] || [ "$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" ]; then
   echo 'Agent binary checksum mismatch.' >&2
   exit 1
-}
+fi
 rm -f "$headers_tmp"
 chmod 0755 "$binary_tmp"
 mv -f "$binary_tmp" "$install_dir/meridian-agent"
