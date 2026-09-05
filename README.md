@@ -131,7 +131,7 @@ sudo systemctl daemon-reload
 
 启用调度后，控制器把站点 Host 路由和边缘专用证书配置下发到 Agent，并使用节点 IP 发起带 SNI/Host 的 HTTPS 健康检查。检查成功后才创建或更新 Cloudflare 精确 A/AAAA 记录。停用或删除调度时只删除 Meridian 自己保存的 DNS 记录 ID，不触碰用户手动创建的同名记录。DNS 只影响新连接，已建立的播放连接不会迁移。
 
-Docker 主控在已配置 Cloudflare ACME 凭据后，可执行 `docker exec meridian /app/meridian admin issue-edge-certificate` 为已注册且启用的节点签发独立于面板私钥的 Edge 证书。每张证书包含路由泛域名和节点唯一 SAN，避免所有节点消耗同一 ACME 标识符集合；节点注册后会立即尝试签发，定时任务只负责续签和补偿。证书缺失时 Agent 配置会保持等待并在调度页面显示最后一次错误。
+Docker 主控在已配置 Cloudflare ACME 凭据后，可执行 `docker exec meridian /app/meridian admin issue-edge-certificate` 为已注册且启用的节点签发独立于面板私钥的 Edge 证书。每张证书包含路由泛域名和位于其外部的节点唯一 SAN（`edge-<hash>.edge.<routeDomain>`），避免所有节点消耗同一 ACME 标识符集合；节点注册后会立即尝试签发，定时任务只负责续签和补偿。证书缺失时 Agent 配置会保持等待并在调度页面显示最后一次错误。
 
 节点上报的网卡累计流量是额度统计的依据；按站点上报的收发字节和趋势只用于日志、排查和展示。流量周期可在节点编辑中选择每月重置日，已用流量也可以手动校正。
 

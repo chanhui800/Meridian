@@ -16,7 +16,10 @@ const edgeCertificateRenewalTimeout = 3 * time.Minute
 
 func edgeCertificateHost(routeDomain, nodeGUID string) string {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(nodeGUID)))
-	return "edge-" + hex.EncodeToString(digest[:6]) + "." + strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+	// Keep the per-node SAN outside the route wildcard's namespace. ACME
+	// providers reject a request that contains both *.example.com and a
+	// covered sibling such as edge-node.example.com as redundant.
+	return "edge-" + hex.EncodeToString(digest[:6]) + ".edge." + strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
 }
 
 func edgeCertificateIdentifiers(routeDomain, nodeGUID string) []string {
