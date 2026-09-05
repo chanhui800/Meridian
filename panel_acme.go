@@ -463,7 +463,7 @@ func certificateStatusForFile(certFile string, expectedWildcard string) panelCer
 }
 
 func certificateCoversHost(certFile, host string) error {
-	data, err := os.ReadFile(certFile) // #nosec G304 -- path is derived from the administrator-controlled TLS directory.
+	data, err := os.ReadFile(certFile) // #nosec G703 G304 -- path is derived from the administrator-controlled TLS directory.
 	if err != nil {
 		return fmt.Errorf("read edge TLS certificate: %w", err)
 	}
