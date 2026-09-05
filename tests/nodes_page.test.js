@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'web/static/index.html'), 'utf8');
 const api = fs.readFileSync(path.join(root, 'web/static/js/api.js'), 'utf8');
 const page = fs.readFileSync(path.join(root, 'web/static/js/pages/nodes.js'), 'utf8');
+const style = fs.readFileSync(path.join(root, 'web/static/css/style.css'), 'utf8');
 const router = fs.readFileSync(path.join(root, 'web/static/js/router.js'), 'utf8');
 
 test('node scheduling is a first-level page with refresh cleanup', () => {
@@ -57,6 +58,7 @@ test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {
   assert.match(page, /enabled && mode === 'fixed'/);
   assert.match(page, /node-site-card/);
   assert.match(page, /保存站点设置/);
+  assert.match(style, /\.node-site-card\s*\{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\)/);
 });
 
 test('node schedule refresh preserves unsaved checkbox and selector edits', () => {

@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -196,6 +197,9 @@ func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
 	}
 	if first[1] == second[1] || first[1] == first[0] || second[1] == second[0] {
 		t.Fatalf("edge identifiers are not node-unique: %#v %#v", first, second)
+	}
+	if !strings.HasSuffix(first[1], ".edge.example.com") || !strings.HasSuffix(second[1], ".edge.example.com") {
+		t.Fatalf("edge identifiers must live outside the route wildcard: %#v %#v", first, second)
 	}
 }
 
