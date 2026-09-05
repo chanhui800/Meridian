@@ -5,11 +5,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -162,5 +165,25 @@ func TestLoadOrCreateACMEAccountKeyStaysWithinAccountDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(directory), "escape.pem")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("escape path was created: %v", err)
+	}
+}
+
+func TestInstallCertificatePairAtomicKeepsMatchingCurrentPair(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer tlsServer.Close()
+	certificate := tlsServer.TLS.Certificates[0]
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "edge-nodes", "node", "current")
+	certFile, keyFile := filepath.Join(root, "fullchain.pem"), filepath.Join(root, "privkey.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := installCertificatePairAtomic(certFile, keyFile, certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		t.Fatalf("current pair is not loadable: %v", err)
 	}
 }

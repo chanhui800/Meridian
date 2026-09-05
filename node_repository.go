@@ -179,7 +179,13 @@ type NodeRequestEvent struct {
 	InboundColo             string `json:"inbound_colo,omitempty"`
 	OutboundColo            string `json:"outbound_colo,omitempty"`
 	SkipRequestLog          bool   `json:"skip_request_log,omitempty"`
+	Priority                string `json:"priority,omitempty"`
 }
+
+const (
+	nodeEventPriorityCritical   = "critical"
+	nodeEventPriorityBestEffort = "best_effort"
+)
 
 // Metadata responses from Emby-compatible backends can include provider and
 // image fields large enough to exceed the old 8 KiB event cap. Keep the event
@@ -692,7 +698,7 @@ func validateNodeReport(report NodeReport) error {
 }
 
 func validateNodeRequestEvent(event NodeRequestEvent) error {
-	if event.EventID <= 0 || (event.EventUID != "" && (len(event.EventUID) != 32 || !isHexString(event.EventUID))) || event.SiteID <= 0 || len(event.Host) > 255 || len(event.Method) > 16 || len(event.Path) > 2048 || len(event.Query) > 4096 || event.StatusCode < 0 || event.StatusCode > 999 || len(event.ClientIP) > 64 || len(event.UserAgent) > 512 || len(event.Authorization) > 8192 || len(event.Body) > maxNodeRequestEventBodyBytes || len(event.ContentType) > 128 || len(event.ContentEncoding) > 64 || len(event.ResponseBody) > maxNodeRequestEventResponseBodyBytes || len(event.ResponseContentType) > 128 || len(event.ResponseContentEncoding) > 64 || len(event.ResourceCategory) > 32 || len(event.UpstreamUserAgent) > 512 || len(event.BackendAddress) > 2048 || len(event.InboundColo) > 64 || len(event.OutboundColo) > 64 || event.RecordedAtMS <= 0 {
+	if event.EventID <= 0 || (event.EventUID != "" && (len(event.EventUID) != 32 || !isHexString(event.EventUID))) || event.SiteID <= 0 || len(event.Host) > 255 || len(event.Method) > 16 || len(event.Path) > 2048 || len(event.Query) > 4096 || event.StatusCode < 0 || event.StatusCode > 999 || len(event.ClientIP) > 64 || len(event.UserAgent) > 512 || len(event.Authorization) > 8192 || len(event.Body) > maxNodeRequestEventBodyBytes || len(event.ContentType) > 128 || len(event.ContentEncoding) > 64 || len(event.ResponseBody) > maxNodeRequestEventResponseBodyBytes || len(event.ResponseContentType) > 128 || len(event.ResponseContentEncoding) > 64 || len(event.ResourceCategory) > 32 || len(event.UpstreamUserAgent) > 512 || len(event.BackendAddress) > 2048 || len(event.InboundColo) > 64 || len(event.OutboundColo) > 64 || event.RecordedAtMS <= 0 || (event.Priority != "" && event.Priority != nodeEventPriorityCritical && event.Priority != nodeEventPriorityBestEffort) {
 		return errors.New("invalid request event")
 	}
 	return nil

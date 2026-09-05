@@ -26,6 +26,88 @@ func testEdgeRuntimeKey(t *testing.T) string {
 	return base64.RawURLEncoding.EncodeToString(value)
 }
 
+func TestEdgeEventSpoolUsesIndependentKeyAcrossReenrollment(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	var first edgeEventStore
+	if err := first.initWithRawKey(dir, key, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.add(NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: "GET", Path: "/Sessions/Playing", StatusCode: 200, RecordedAtMS: time.Now().UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	var restored edgeEventStore
+	if err := restored.initWithRawKey(dir, key, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.snapshot()) != 1 {
+		t.Fatal("event spool did not survive an agent token change")
+	}
+}
+
+func TestEdgeEventQueueRetainsCriticalEventsWhenFull(t *testing.T) {
+	var store edgeEventStore
+	for i := 0; i < edgeEventQueueLimit; i++ {
+		if err := store.add(NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: "GET", Path: "/api/Items", ResourceCategory: requestLogCategoryAPI, StatusCode: 200, RecordedAtMS: int64(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.add(NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: "POST", Path: "/Sessions/Playing/Progress", ResourceCategory: requestLogCategoryPlaybackSync, StatusCode: 204, RecordedAtMS: edgeEventQueueLimit + 1}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	foundCritical := false
+	for _, event := range store.items {
+		if event.ResourceCategory == requestLogCategoryPlaybackSync {
+			foundCritical = true
+			break
+		}
+	}
+	if !foundCritical {
+		t.Fatal("critical playback event was dropped when queue was full")
+	}
+}
+
+func TestEdgeEventSpoolCorruptionCanBeQuarantined(t *testing.T) {
+	dir := t.TempDir()
+	spoolDir := filepath.Join(dir, "events")
+	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(spoolDir, "events.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"nonce":"bad","ciphertext":"bad"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	var store edgeEventStore
+	if err := store.initWithRawKey(spoolDir, key, nil); err == nil {
+		t.Fatal("corrupt spool unexpectedly loaded")
+	}
+	if err := quarantineEventSpool(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.initWithRawKey(spoolDir, key, nil); err != nil {
+		t.Fatalf("reinitialize after quarantine: %v", err)
+	}
+}
+
+func TestBuildNodeInstallCommandUsesControllerInstaller(t *testing.T) {
+	command := buildNodeInstallCommand("https://panel.example.test:9090", "token")
+	if strings.Contains(command, "raw.githubusercontent.com") || strings.Contains(command, "/main/") {
+		t.Fatalf("installer command still uses mutable GitHub main: %s", command)
+	}
+	if !strings.Contains(command, "https://panel.example.test:9090/api/agent/install.sh") {
+		t.Fatalf("installer command does not use controller endpoint: %s", command)
+	}
+}
+
 func TestEdgeProxyRewritesAndServesDynamicPlaybackBackend(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/Items/1/PlaybackInfo" {
@@ -183,6 +265,13 @@ func TestBuildAgentConfigCarriesCompleteDynamicSiteWithoutNestedQueryDeadlock(t 
 	now := time.Now()
 	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "edge", Address: "203.0.113.10", Port: 9090}, now)
 	if err != nil {
+		t.Fatal(err)
+	}
+	edgeCertFile, edgeKeyFile, err := app.panelCertificates.nodeEdgeTLSPaths(node.GUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installCertificatePairAtomic(edgeCertFile, edgeKeyFile, certPEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})); err != nil {
 		t.Fatal(err)
 	}
 	_, token, err := app.db.EnrollControlNode(enrollment, now)

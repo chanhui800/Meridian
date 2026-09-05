@@ -173,24 +173,32 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 	if manager == nil || strings.TrimSpace(manager.edgeCertFile) == "" || strings.TrimSpace(manager.edgeKeyFile) == "" {
 		return errors.New("edge TLS certificate paths are unavailable")
 	}
+	nodes, err := db.listControlNodes(time.Now())
+	if err != nil {
+		return fmt.Errorf("list control nodes: %w", err)
+	}
+	if len(nodes) == 0 {
+		return errors.New("no control nodes are enrolled")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
-	if err != nil {
-		return fmt.Errorf("issue edge wildcard certificate: %w", err)
+	for _, node := range nodes {
+		if strings.TrimSpace(node.GUID) == "" {
+			continue
+		}
+		edgeCertFile, edgeKeyFile, pathErr := manager.nodeEdgeTLSPaths(node.GUID)
+		if pathErr != nil {
+			return pathErr
+		}
+		issued, issueErr := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
+		if issueErr != nil {
+			return fmt.Errorf("issue edge certificate for node %s: %w", node.Name, issueErr)
+		}
+		if installErr := installCertificatePairAtomic(edgeCertFile, edgeKeyFile, issued.certPEM, issued.keyPEM); installErr != nil {
+			return fmt.Errorf("install edge certificate for node %s: %w", node.Name, installErr)
+		}
 	}
-	// #nosec G703 -- the manager path is derived from administrator-controlled
-	// DB_PATH/EDGE_TLS_CERT_FILE and is never supplied by an HTTP request.
-	if err := os.MkdirAll(filepath.Dir(manager.edgeCertFile), 0o700); err != nil {
-		return fmt.Errorf("create edge TLS directory: %w", err)
-	}
-	if err := writePrivateFileAtomic(manager.edgeKeyFile, issued.keyPEM); err != nil {
-		return fmt.Errorf("write edge TLS private key: %w", err)
-	}
-	if err := writePrivateFileAtomic(manager.edgeCertFile, issued.certPEM); err != nil {
-		return fmt.Errorf("write edge TLS certificate: %w", err)
-	}
-	_, err = fmt.Fprintf(output, "edge wildcard certificate installed for *.%s\n", settings.RouteDomain)
+	_, err = fmt.Fprintf(output, "edge certificates installed for %d node(s) for *.%s\n", len(nodes), settings.RouteDomain)
 	return err
 }
 

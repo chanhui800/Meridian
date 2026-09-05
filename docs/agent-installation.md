@@ -2,20 +2,20 @@
 
 ## 安装脚本从哪里获取
 
-Agent 安装器保存在 Meridian GitHub 仓库的 `scripts/agent-install.sh`，面板生成的命令会从该公开脚本地址获取：
+Agent 安装器随 Meridian 版本发布在 `scripts/agent-install.sh`，面板生成的命令从当前主控的固定入口获取：
 
 ```text
-https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh
+https://<你的主控域名>/api/agent/install.sh
 ```
 
-运行中的主控提供实际的 `/api/agent/binary` 下载和注册接口。这样用户部署自己的 Meridian 后，只使用公开安装脚本，不需要访问项目作者的面板，也不会把节点注册到其他人的主控。
+运行中的主控提供版本一致的安装脚本、`/api/agent/binary` 下载和注册接口。这样用户部署自己的 Meridian 后，不会把节点注册到其他人的主控。
 
 ## 一键安装
 
 在自己的主控面板中创建节点，复制面板生成的完整命令，在目标 Linux amd64 或 arm64 VPS 以 root 执行：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh | sudo bash -s -- \
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://<你的主控域名>/api/agent/install.sh | sudo bash -s -- \
   -e https://panel.example.com:9090 \
   -t ONE_TIME_ENROLLMENT_TOKEN
 ```

@@ -237,6 +237,52 @@ func TestSiteNodeSchedulingIsOptInAndCanFollowGlobalNode(t *testing.T) {
 	}
 }
 
+func TestSiteNodeAutoSchedulingFallsBackAfterProbeCooldown(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 15, 0, 0, 0, time.UTC)
+	site, err := app.db.CreateSiteRecord(Site{Name: "fallback", ListenPort: 18092, PublicHost: "fallback.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "passthrough"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, tokenA, err := app.db.CreateControlNode(NodeCreateInput{Name: "first", Address: "203.0.113.20", Port: 9090, Priority: 200}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, tokenB, err := app.db.CreateControlNode(NodeCreateInput{Name: "second", Address: "203.0.113.21", Port: 9090, Priority: 100}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{tokenA, tokenB} {
+		_, agentToken, enrollErr := app.db.EnrollControlNode(token, now)
+		if enrollErr != nil {
+			t.Fatal(enrollErr)
+		}
+		if _, reportErr := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "boot-" + token[:4], Sequence: 1, InterfaceName: "eth0"}, now); reportErr != nil {
+			t.Fatal(reportErr)
+		}
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.refreshSiteAssignments(now); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil || schedule.DesiredNodeID != first.ID {
+		t.Fatalf("initial desired node = %#v, %v", schedule, err)
+	}
+	if err := app.db.recordSiteNodeProbeFailure(site.ID, first.ID, errors.New("probe failed"), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.refreshSiteAssignments(now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err = app.db.siteNodeSchedule(site.ID)
+	if err != nil || schedule.DesiredNodeID != second.ID {
+		t.Fatalf("fallback desired node = %#v, %v", schedule, err)
+	}
+}
+
 func TestSiteNodeSchedulingCanBeDisabledWithoutFixedNode(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 8, 30, 14, 0, 0, 0, time.UTC)

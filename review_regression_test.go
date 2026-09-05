@@ -39,6 +39,25 @@ func installReviewCertificate(t *testing.T, app *App) {
 	app.panelCertificates = &panelCertificateManager{certFile: certFile, keyFile: keyFile, edgeCertFile: certFile, edgeKeyFile: keyFile, accountDir: dir}
 }
 
+func installReviewCertificateForNode(t *testing.T, app *App, guid string) {
+	t.Helper()
+	certPEM, err := readBoundedPrivateFile(app.panelCertificates.certFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := readBoundedPrivateFile(app.panelCertificates.keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certFile, keyFile, err := app.panelCertificates.nodeEdgeTLSPaths(guid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installCertificatePairAtomic(certFile, keyFile, []byte(certPEM), []byte(keyPEM)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func reviewCertificatePEM(t *testing.T) (string, string) {
 	t.Helper()
 	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
@@ -155,6 +174,7 @@ func TestReviewOldNodeRetainsRouteUntilDNSCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	installReviewCertificateForNode(t, app, old.GUID)
 	_, oldToken, err := app.db.EnrollControlNode(enrollment, now)
 	if err != nil {
 		t.Fatal(err)

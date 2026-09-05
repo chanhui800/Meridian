@@ -394,6 +394,15 @@ func (d *DB) migrateOnce() error {
 		updated_at_ms INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_schedules_desired ON site_node_schedules(desired_node_id,enabled);
+	CREATE TABLE IF NOT EXISTS site_node_probe_failures (
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		failed_until_ms INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(site_id,node_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_site_node_probe_failures_until ON site_node_probe_failures(site_id,failed_until_ms);
 	`); err != nil {
 		return err
 	}

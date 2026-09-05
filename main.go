@@ -139,6 +139,9 @@ func main() {
 	panelHost := panelSettings.PanelDomain
 	routeDomain := panelSettings.RouteDomain
 	panelCertificates := newPanelCertificateManager(dbPath, nil)
+	if err := panelCertificates.validatePanelEdgeKeySeparation(); err != nil {
+		log.Fatalf("invalid panel/edge TLS key separation: %v", err)
+	}
 	if disabled, err := disableExpiredPanelTLSIfNeeded(db, panelCertificates); err != nil {
 		log.Fatalf("check panel TLS certificate: %v", err)
 	} else if disabled {
@@ -292,6 +295,7 @@ func main() {
 	mux.HandleFunc("/api/events", cors(app.authMiddleware(app.handleSSE)))
 	mux.HandleFunc("/api/nodes", cors(app.authMiddleware(app.handleNodes)))
 	mux.HandleFunc("/api/nodes/", cors(app.authMiddleware(app.handleNodeByID)))
+	mux.HandleFunc("/api/agent/install.sh", app.handleAgentInstaller)
 	mux.HandleFunc("/api/node-scheduler", cors(app.authMiddleware(app.handleNodeScheduler)))
 	mux.HandleFunc("/api/node-scheduler/sites", cors(app.authMiddleware(app.handleSiteNodeSchedules)))
 	mux.HandleFunc("/api/node-scheduler/sites/", cors(app.authMiddleware(app.handleSiteNodeScheduleByID)))

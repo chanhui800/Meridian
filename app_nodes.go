@@ -120,8 +120,21 @@ func buildNodeInstallScript(controllerURL, enrollmentToken string) string {
 }
 
 func buildNodeInstallCommand(controllerURL, enrollmentToken string) string {
-	return fmt.Sprintf("wget -qO- 'https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh' | sudo bash -s -- -e %s -t %s",
+	endpoint := strings.TrimRight(controllerURL, "/") + "/api/agent/install.sh"
+	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL %s | sudo bash -s -- -e %s -t %s",
+		shellSingleQuote(endpoint),
 		shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken))
+}
+
+func (a *App) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.WriteString(w, agentInstallerScript)
 }
 
 func writeNodeAPIError(a *App, w http.ResponseWriter, err error) {
