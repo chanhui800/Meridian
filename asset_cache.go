@@ -125,6 +125,27 @@ func assetCacheIdentity(r *http.Request) string {
 	return fmt.Sprintf("%x", digest[:])
 }
 
+// Agent runtimes rebuild their in-memory SQLite database, so the local row ID
+// is not a durable identity across configuration refreshes. Keep the stable
+// controller-provided namespace path-safe and human-readable for diagnostics.
+func assetCacheNamespace(site Site) string {
+	namespace := strings.TrimSpace(site.AssetCacheNamespace)
+	if namespace == "" {
+		return fmt.Sprintf("site-%d", site.ID)
+	}
+	return namespace
+}
+
+func assetCacheSitePrefix(site Site) string {
+	namespace := assetCacheNamespace(site)
+	if strings.HasPrefix(namespace, "site-") {
+		if index := strings.Index(namespace, "-config-"); index > 0 {
+			return namespace[:index]
+		}
+	}
+	return namespace
+}
+
 func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *assetCacheRequest {
 	if c == nil || !assetCacheRequestEligible(site, r, target) {
 		return nil
@@ -138,7 +159,7 @@ func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *asset
 	}, "\n")
 	digest := sha256.Sum256([]byte(raw))
 	key := fmt.Sprintf("%x", digest[:])
-	relDir := filepath.Join(strconv.FormatInt(site.ID, 10), key[:2])
+	relDir := filepath.Join(assetCacheNamespace(site), key[:2])
 	metaName := filepath.Join(relDir, key+".json")
 	bodyName := filepath.Join(relDir, key+".body")
 	return &assetCacheRequest{
@@ -206,7 +227,14 @@ func (c *assetCache) sizeBySite() (map[int64]int64, int64, error) {
 		if len(parts) != 2 {
 			return nil
 		}
-		siteID, err := strconv.ParseInt(parts[0], 10, 64)
+		directory := parts[0]
+		if strings.HasPrefix(directory, "site-") {
+			directory = strings.TrimPrefix(directory, "site-")
+			if dash := strings.IndexByte(directory, '-'); dash >= 0 {
+				directory = directory[:dash]
+			}
+		}
+		siteID, err := strconv.ParseInt(directory, 10, 64)
 		if err != nil || siteID <= 0 {
 			return nil
 		}
@@ -302,14 +330,17 @@ func assetCacheResponseEligible(resp *http.Response, body []byte) bool {
 	if resp == nil || resp.StatusCode != http.StatusOK || len(body) == 0 || int64(len(body)) > maxAssetCacheObject || len(resp.Header.Values("Set-Cookie")) > 0 {
 		return false
 	}
-	cacheControl := strings.ToLower(resp.Header.Get("Cache-Control"))
-	if strings.Contains(cacheControl, "no-store") || strings.Contains(cacheControl, "no-cache") || strings.Contains(cacheControl, "private") {
-		return false
+	cacheControl := strings.ToLower(strings.Join(resp.Header.Values("Cache-Control"), ","))
+	for _, directive := range strings.Split(cacheControl, ",") {
+		name := strings.TrimSpace(strings.SplitN(directive, "=", 2)[0])
+		if name == "no-store" || name == "no-cache" || name == "private" {
+			return false
+		}
 	}
-	vary := strings.ToLower(resp.Header.Get("Vary"))
+	vary := strings.ToLower(strings.Join(resp.Header.Values("Vary"), ","))
 	for _, name := range strings.Split(vary, ",") {
 		name = strings.TrimSpace(name)
-		if name != "" && name != "accept" && name != "accept-encoding" {
+		if name == "*" || name != "" && name != "accept" && name != "accept-encoding" {
 			return false
 		}
 	}
@@ -386,11 +417,15 @@ type assetCacheFile struct {
 }
 
 func (c *assetCache) enforceBudgetLocked(root *os.Root, site Site) error {
-	siteDir := strconv.FormatInt(site.ID, 10)
+	siteDir := assetCacheSitePrefix(site)
 	files := make([]assetCacheFile, 0)
 	var total int64
-	err := fs.WalkDir(root.FS(), siteDir, func(path string, entry fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return nil
+		}
+		parts := strings.SplitN(filepath.ToSlash(path), "/", 2)
+		if len(parts) != 2 || parts[0] != siteDir && !strings.HasPrefix(parts[0], siteDir+"-") {
 			return nil
 		}
 		data, err := root.ReadFile(path)

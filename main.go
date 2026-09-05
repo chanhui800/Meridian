@@ -38,7 +38,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.9.0"
+var appVersion = "dev"
 
 func main() {
 	if strings.EqualFold(filepath.Base(os.Args[0]), "meridian-agent") {

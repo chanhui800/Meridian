@@ -70,10 +70,12 @@ type panelCertificateStatus struct {
 }
 
 type panelCertificateManager struct {
-	certFile   string
-	keyFile    string
-	accountDir string
-	httpClient *http.Client
+	certFile     string
+	keyFile      string
+	edgeCertFile string
+	edgeKeyFile  string
+	accountDir   string
+	httpClient   *http.Client
 
 	mu                 sync.Mutex
 	issuing            bool
@@ -123,8 +125,25 @@ func panelTLSPaths(dbPath string) (certFile, keyFile string) {
 	return filepath.Join(base, "fullchain.pem"), filepath.Join(base, "privkey.pem")
 }
 
+// edgeTLSPaths deliberately has its own certificate and key.  Edge nodes are
+// untrusted execution environments relative to the panel; the panel key must
+// never be included in an Agent runtime configuration.
+func edgeTLSPaths(dbPath string) (certFile, keyFile string) {
+	certFile = strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
+	keyFile = strings.TrimSpace(os.Getenv("EDGE_TLS_KEY_FILE"))
+	if certFile != "" || keyFile != "" {
+		return certFile, keyFile
+	}
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return "", ""
+	}
+	base := filepath.Join(filepath.Dir(dbPath), "tls")
+	return filepath.Join(base, "edge-fullchain.pem"), filepath.Join(base, "edge-privkey.pem")
+}
+
 func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCertificateManager {
 	certFile, keyFile := panelTLSPaths(dbPath)
+	edgeCertFile, edgeKeyFile := edgeTLSPaths(dbPath)
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -133,10 +152,12 @@ func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCe
 		accountDir = filepath.Dir(certFile)
 	}
 	return &panelCertificateManager{
-		certFile:   certFile,
-		keyFile:    keyFile,
-		accountDir: accountDir,
-		httpClient: httpClient,
+		certFile:     certFile,
+		keyFile:      keyFile,
+		edgeCertFile: edgeCertFile,
+		edgeKeyFile:  edgeKeyFile,
+		accountDir:   accountDir,
+		httpClient:   httpClient,
 	}
 }
 

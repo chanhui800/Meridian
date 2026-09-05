@@ -1,0 +1,205 @@
+package main
+
+import (
+	"crypto/x509"
+	"encoding/pem"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestReviewOversizeChunkedBodyPreserved(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	payload := strings.Repeat("x", edgeEventBodyLimit+20)
+	request := httptest.NewRequest("POST", "https://media.example.test/Sessions/Playing/Progress", strings.NewReader(payload))
+	request.ContentLength = -1
+	request.TransferEncoding = []string{"chunked"}
+	var received []byte
+	handler := runtime.observe(map[string]int64{"media.example.test": 101}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		received, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(204)
+	}))
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	if string(received) != payload {
+		t.Fatalf("upstream received %d bytes, original body was %d bytes", len(received), len(payload))
+	}
+}
+
+func reviewRoute(id int64, host, target string) AgentSiteRoute {
+	return AgentSiteRoute{SiteID: id, Host: host, TargetURL: target, PlaybackMode: "direct",
+		Site:            Site{Name: host, PublicHost: host, IngressMode: ingressModeHost, TargetURL: target, PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth, DynamicProfile: dynamicProfileSafe},
+		FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: `["redirect","playback_info"]`, DynamicRules: "[]"}
+}
+
+func TestReviewCacheMultiValueHeaders(t *testing.T) {
+	for name, values := range map[string][]string{"Cache-Control": {"public", "no-store"}, "Vary": {"Accept-Encoding", "X-User-ID"}} {
+		t.Run(name, func(t *testing.T) {
+			h := http.Header{"Content-Type": {"image/jpeg"}}
+			h[name] = values
+			if assetCacheResponseEligible(&http.Response{StatusCode: 200, Header: h}, []byte("private image")) {
+				t.Fatal("response with restrictive second header line was accepted for caching")
+			}
+		})
+	}
+}
+
+func TestReviewCacheSiteIdentityAcrossRebuild(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "image/jpeg")
+		io.WriteString(w, r.Header.Get("X-Origin-Secret"))
+	}))
+	defer upstream.Close()
+	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+	config := AgentRuntimeConfig{SchemaVersion: 1, NodeGUID: "review-node", HTTPSPort: 9090, DynamicKey: testEdgeRuntimeKey(t)}
+	for i, name := range []string{"a.example.test", "b.example.test"} {
+		route := reviewRoute(int64(100+i), name, upstream.URL)
+		route.Headers = map[string][]string{"X-Origin-Secret": {name}}
+		route.Site.AssetCacheEnabled = true
+		route.Site.AssetCacheTTLSec = 3600
+		route.Site.AssetCacheMaxBytes = 16 << 20
+		route.Site.AssetCacheRules = "*/web/*"
+		config.Routes = []AgentSiteRoute{route}
+		bundle, err := buildEdgeProxy(config, runtime)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		bundle.handler.ServeHTTP(response, httptest.NewRequest("GET", "https://"+name+"/web/private.jpg", nil))
+		bundle.close()
+		if response.Code != 200 {
+			t.Fatalf("unexpected status %d: %s", response.Code, response.Body.String())
+		}
+		if response.Body.String() != name {
+			t.Fatalf("site %s received %q from previous site; upstream calls=%d", name, response.Body.String(), calls)
+		}
+	}
+}
+
+func TestReviewSchedulerSkipsListenerFailure(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	var healthyID int64
+	for i, name := range []string{"broken", "healthy"} {
+		node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: name, Priority: 200 - i*100, Address: "203.0.113.10", Port: 9090}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, token, err := app.db.EnrollControlNode(enrollment, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report := NodeReport{BootID: name, Sequence: 1, InterfaceName: "eth0"}
+		if i == 0 {
+			report.ListenerError = "bind: address already in use"
+		} else {
+			healthyID = node.ID
+		}
+		if _, err := app.db.RecordNodeReport(token, report, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := app.db.NodeControlSnapshot(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Scheduler.ActiveNodeID != healthyID {
+		t.Fatalf("selected node %d with listener failure, healthy node is %d", snapshot.Scheduler.ActiveNodeID, healthyID)
+	}
+}
+
+func TestReviewOldNodeRetainsRouteUntilDNSCommit(t *testing.T) {
+	app := newTestApp(t)
+	app.dynamicRouteKey = make([]byte, 32)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "old", Address: "203.0.113.10", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "old", Sequence: 1, InterfaceName: "eth0"}, now); err != nil {
+		t.Fatal(err)
+	}
+	next, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "new", Address: "203.0.113.11", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, nextToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(nextToken, NodeReport{BootID: "new", Sequence: 1, InterfaceName: "eth0"}, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(reviewRoute(0, "media.example.test", "https://origin.example.test").Site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", next.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET applied_node_id=?,cf_record_id='still-points-to-old',dns_status='active' WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	config, err := app.buildAgentConfig(token, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Routes) == 0 {
+		t.Fatal("old node loses all routes while applied DNS still points to it and new node has not applied configuration")
+	}
+}
+
+func TestReviewConfigRefreshPreservesActiveRequest(t *testing.T) {
+	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+	defer runtime.close()
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer tlsServer.Close()
+	cert := tlsServer.TLS.Certificates[0]
+	der, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := reviewRoute(101, "media.example.test", "http://127.0.0.1:8096")
+	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigHash: "old", NodeGUID: "review", HTTPSPort: 9090, DynamicKey: testEdgeRuntimeKey(t), Routes: []AgentSiteRoute{route}, CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})), PrivateKeyPEM: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))}
+	old, err := buildEdgeProxy(config, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reuse a listener placeholder so this test never binds a public port.
+	runtime.bundle = old
+	runtime.handler = old.handler
+	runtime.port = 9090
+	runtime.server = &http.Server{}
+	runtime.nodeGUID = "review"
+	var inst *ProxyInstance
+	for _, p := range old.manager.proxies {
+		inst = p
+	}
+	if !inst.beginRequest() {
+		t.Fatal("request gate closed")
+	}
+	defer inst.endRequest()
+	config.ConfigHash = "new"
+	config.Routes[0].Site.Name = "renamed only"
+	if err := runtime.apply(config); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inst.ctx.Done():
+		t.Fatal("configuration refresh cancelled an active request on an unchanged route")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+}

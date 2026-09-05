@@ -31,6 +31,7 @@ state_dir=/var/lib/meridian-agent
 token_dir=/etc/meridian-agent
 token_file="$token_dir/enrollment-token"
 binary_tmp="$install_dir/meridian-agent.tmp"
+headers_tmp="$install_dir/meridian-agent.headers.tmp"
 
 [ "$(id -u)" -eq 0 ] || { echo 'Please run this script as root.' >&2; exit 1; }
 case "$(uname -s):$(uname -m)" in
@@ -43,12 +44,26 @@ command -v systemctl >/dev/null 2>&1 || { echo 'systemd is required.' >&2; exit 
 install -d -m 0755 "$install_dir"
 install -d -m 0700 "$state_dir" "$token_dir"
 systemctl stop meridian-agent.service 2>/dev/null || true
-rm -f "$state_dir/state.json" "$binary_tmp"
+rm -f "$state_dir/state.json" "$binary_tmp" "$headers_tmp"
 umask 077
 printf '%s' "$enrollment_token" > "$token_file"
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$headers_tmp" \
   -H "Authorization: Bearer $enrollment_token" \
   "$controller_url/api/agent/binary" -o "$binary_tmp"
+expected_sha=$(awk 'BEGIN{IGNORECASE=1} /^X-Meridian-Agent-SHA256:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$headers_tmp" | tr -d '\r')
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_sha=$(sha256sum "$binary_tmp" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual_sha=$(shasum -a 256 "$binary_tmp" | awk '{print $1}')
+else
+  echo 'sha256sum or shasum is required.' >&2
+  exit 1
+fi
+[ -n "$expected_sha" ] && [ "$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" ] || {
+  echo 'Agent binary checksum mismatch.' >&2
+  exit 1
+}
+rm -f "$headers_tmp"
 chmod 0755 "$binary_tmp"
 mv -f "$binary_tmp" "$install_dir/meridian-agent"
 

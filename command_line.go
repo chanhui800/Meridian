@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -89,8 +90,17 @@ func runHealthcheckCommand() error {
 }
 
 func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
-	if len(args) == 0 || args[0] != "reset-password" {
-		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin")
+	if len(args) == 0 {
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-edge-certificate")
+	}
+	if args[0] == "issue-edge-certificate" {
+		if len(args) != 1 {
+			return errors.New("issue-edge-certificate does not accept arguments")
+		}
+		return runIssueEdgeCertificateCommand(output)
+	}
+	if args[0] != "reset-password" {
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-edge-certificate")
 	}
 	var dbPath string
 	passwordStdin := false
@@ -128,6 +138,59 @@ func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 		return fmt.Errorf("reset administrator password: %w", err)
 	}
 	_, err = fmt.Fprintln(output, "administrator password updated")
+	return err
+}
+
+// runIssueEdgeCertificateCommand provisions a second wildcard certificate for
+// Agent listeners without touching the panel certificate/key pair. It reads
+// the already encrypted Cloudflare credential from the local database and
+// only prints non-sensitive status to the caller.
+func runIssueEdgeCertificateCommand(output io.Writer) error {
+	if jwtSecretEphemeral {
+		return errors.New("JWT_SECRET is ephemeral; configure a persistent secret before issuing an edge certificate")
+	}
+	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
+	if dbPath == "" {
+		dbPath = "/app/data/meridian.db"
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	settings, err := db.PanelSettings()
+	if err != nil {
+		return fmt.Errorf("read panel settings: %w", err)
+	}
+	if !settings.Configured || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
+		return errors.New("Cloudflare ACME credentials and panel settings are not configured")
+	}
+	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
+	if err != nil {
+		return fmt.Errorf("decrypt Cloudflare DNS token: %w", err)
+	}
+	manager := newPanelCertificateManager(dbPath, nil)
+	if manager == nil || strings.TrimSpace(manager.edgeCertFile) == "" || strings.TrimSpace(manager.edgeKeyFile) == "" {
+		return errors.New("edge TLS certificate paths are unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
+	if err != nil {
+		return fmt.Errorf("issue edge wildcard certificate: %w", err)
+	}
+	// #nosec G703 -- the manager path is derived from administrator-controlled
+	// DB_PATH/EDGE_TLS_CERT_FILE and is never supplied by an HTTP request.
+	if err := os.MkdirAll(filepath.Dir(manager.edgeCertFile), 0o700); err != nil {
+		return fmt.Errorf("create edge TLS directory: %w", err)
+	}
+	if err := writePrivateFileAtomic(manager.edgeKeyFile, issued.keyPEM); err != nil {
+		return fmt.Errorf("write edge TLS private key: %w", err)
+	}
+	if err := writePrivateFileAtomic(manager.edgeCertFile, issued.certPEM); err != nil {
+		return fmt.Errorf("write edge TLS certificate: %w", err)
+	}
+	_, err = fmt.Fprintf(output, "edge wildcard certificate installed for *.%s\n", settings.RouteDomain)
 	return err
 }
 

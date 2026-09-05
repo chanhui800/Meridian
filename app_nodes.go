@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,6 +18,13 @@ import (
 
 	"golang.org/x/net/websocket"
 )
+
+// agentInstallerScript is the single canonical installer served by the panel
+// and published under scripts/. Keep the generated response and install
+// command on the same implementation.
+//
+//go:embed scripts/agent-install.sh
+var agentInstallerScript string
 
 var agentBinaryIdentityCache struct {
 	sync.Once
@@ -108,82 +116,7 @@ func shellSingleQuote(value string) string {
 func buildNodeInstallScript(controllerURL, enrollmentToken string) string {
 	controller := shellSingleQuote(controllerURL)
 	token := shellSingleQuote(enrollmentToken)
-	return fmt.Sprintf(`#!/bin/sh
-set -eu
-controller_url=%s
-enrollment_token=%s
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -c|--controller) [ "$#" -ge 2 ] || { echo 'missing controller URL' >&2; exit 2; }; controller_url="$2"; shift 2 ;;
-    -t|--token) [ "$#" -ge 2 ] || { echo 'missing enrollment token' >&2; exit 2; }; enrollment_token="$2"; shift 2 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
-  esac
-done
-if [ -z "$controller_url" ] || [ -z "$enrollment_token" ]; then
-  echo 'usage: install.sh -c https://panel.example.com -t ENROLLMENT_TOKEN' >&2
-  exit 2
-fi
-install_dir=/opt/meridian-agent
-state_dir=/var/lib/meridian-agent
-token_dir=/etc/meridian-agent
-token_file="$token_dir/enrollment-token"
-binary_tmp="$install_dir/meridian-agent.tmp"
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Please run this script as root." >&2
-  exit 1
-fi
-
-case "$(uname -m)" in
-  x86_64|amd64) ;;
-  *) echo "This test Agent currently supports Linux x86_64 only." >&2; exit 1 ;;
-esac
-
-install -d -m 0755 "$install_dir"
-install -d -m 0700 "$state_dir"
-install -d -m 0700 "$token_dir"
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop meridian-agent.service 2>/dev/null || true
-fi
-rm -f "$state_dir/state.json"
-umask 077
-printf '%%s' "$enrollment_token" > "$token_file"
-curl -fsSL -H "Authorization: Bearer $enrollment_token" \
-  "$controller_url/api/agent/binary" -o "$binary_tmp"
-chmod 0755 "$binary_tmp"
-mv -f "$binary_tmp" "$install_dir/meridian-agent"
-
-cat > /etc/systemd/system/meridian-agent.service <<EOF
-[Unit]
-Description=Meridian node agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$install_dir/meridian-agent --controller $controller_url --state $state_dir/state.json --enroll-token-file $token_file
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=$state_dir $install_dir $token_dir
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now meridian-agent.service
-# Keep the generated installer non-interactive: status may invoke a pager on
-# distributions that ignore --no-pager in non-login shells.
-if ! systemctl is-active --quiet meridian-agent.service; then
-  systemctl --no-pager --full --lines=20 status meridian-agent.service >&2 || true
-  exit 1
-fi
-printf '%%s\n' 'Meridian Agent installed and running.'
-`, controller, token)
+	return fmt.Sprintf("#!/bin/sh\nset -eu\nexec /bin/sh -s -- -e %s -t %s <<'MERIDIAN_CANONICAL_INSTALLER'\n%sMERIDIAN_CANONICAL_INSTALLER\n", controller, token, agentInstallerScript)
 }
 
 func buildNodeInstallCommand(controllerURL, enrollmentToken string) string {
@@ -379,10 +312,20 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
 		return
 	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
+		return
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="meridian-agent"`)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.Header().Set("X-Meridian-Agent-SHA256", hex.EncodeToString(digest.Sum(nil)))
 	_, _ = io.Copy(w, file)
 }
 
@@ -396,7 +339,7 @@ func (a *App) handleAgentInstallScript(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = io.WriteString(w, buildNodeInstallScript("", ""))
+	_, _ = io.WriteString(w, agentInstallerScript)
 }
 
 func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
@@ -432,13 +375,17 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accepted := make([]int64, 0, len(report.Events))
+	acceptedUIDs := make([]string, 0, len(report.Events))
 	for _, event := range report.Events {
 		accepted = append(accepted, event.EventID)
+		if event.EventUID != "" {
+			acceptedUIDs = append(acceptedUIDs, event.EventUID)
+		}
 	}
 	configChanged := node.DesiredConfigHash != "" && node.DesiredConfigHash != report.AppliedConfigHash
 	a.jsonOK(w, map[string]interface{}{
 		"accepted": true, "node_id": node.ID, "next_report_seconds": 15,
-		"accepted_event_ids": accepted, "config_hash": node.DesiredConfigHash,
+		"accepted_event_ids": accepted, "accepted_event_uids": acceptedUIDs, "config_hash": node.DesiredConfigHash,
 		"config_changed": configChanged,
 	})
 }
@@ -469,12 +416,16 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 			return
 		}
 		accepted := make([]int64, 0, len(report.Events))
+		acceptedUIDs := make([]string, 0, len(report.Events))
 		for _, event := range report.Events {
 			accepted = append(accepted, event.EventID)
+			if event.EventUID != "" {
+				acceptedUIDs = append(acceptedUIDs, event.EventUID)
+			}
 		}
 		ack := map[string]interface{}{
 			"accepted": true, "node_id": node.ID, "next_report_seconds": 15,
-			"accepted_event_ids": accepted, "config_hash": node.DesiredConfigHash,
+			"accepted_event_ids": accepted, "accepted_event_uids": acceptedUIDs, "config_hash": node.DesiredConfigHash,
 			"config_changed": node.DesiredConfigHash != "" && node.DesiredConfigHash != report.AppliedConfigHash,
 		}
 		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {

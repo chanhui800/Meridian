@@ -1,6 +1,10 @@
 let nodesRefreshTimer = null;
 let nodesSnapshot = { nodes: [], scheduler: { mode: 'auto', manual_node_id: 0, active_node_id: 0 } };
 let siteSchedulesSnapshot = { sites: [] };
+// Keep edits in the current page alive while the five-second status refresh
+// replaces the server snapshot. Drafts are cleared after a successful save or
+// when the page is recreated.
+let siteScheduleDrafts = new Map();
 
 function stopNodesRefresh() {
   if (nodesRefreshTimer) clearInterval(nodesRefreshTimer);
@@ -55,6 +59,7 @@ function renderScheduler() {
 }
 
 async function loadNodes() {
+  captureSiteScheduleDrafts();
   try {
     const [snapshot, siteSchedules] = await Promise.all([API.getNodes(), API.getSiteNodeSchedules()]);
     if (!snapshot || !siteSchedules || Router.current !== 'nodes') return;
@@ -132,20 +137,39 @@ function nodeName(id) {
   return node ? node.name : '—';
 }
 
+function captureSiteScheduleDrafts() {
+  const rows = document.querySelectorAll('#node-site-list .node-site-row');
+  rows.forEach(row => {
+    const siteID = Number(row.dataset.siteId);
+    if (!Number.isFinite(siteID) || siteID <= 0) return;
+    const enabled = row.querySelector('[data-field="enabled"]')?.checked === true;
+    const mode = row.querySelector('[data-field="mode"]')?.value || 'global';
+    const fixedNodeID = Number(row.querySelector('[data-field="fixed-node"]')?.value || 0);
+    const server = (siteSchedulesSnapshot.sites || []).find(site => Number(site.site_id) === siteID);
+    if (!server || (enabled === (server.enabled === true) && mode === (server.mode || 'global') && fixedNodeID === Number(server.fixed_node_id || 0))) {
+      siteScheduleDrafts.delete(siteID);
+      return;
+    }
+    siteScheduleDrafts.set(siteID, { enabled, mode, fixed_node_id: fixedNodeID });
+  });
+}
+
 function renderSiteSchedules() {
   const container = document.getElementById('node-site-list');
   if (!container) return;
   const sites = siteSchedulesSnapshot.sites || [];
   if (!sites.length) { container.innerHTML = '<div class="node-empty">还没有可调度的站点。</div>'; return; }
   container.innerHTML = sites.map(site => {
-    const scheduleEnabled = site.enabled === true;
-    const nodeOptions = nodesSnapshot.nodes.map(node => `<option value="${node.id}" ${Number(site.fixed_node_id) === Number(node.id) ? 'selected' : ''}>${esc(node.name)}</option>`).join('');
+    const draft = siteScheduleDrafts.get(Number(site.site_id));
+    const view = draft ? { ...site, ...draft } : site;
+    const scheduleEnabled = view.enabled === true;
+    const nodeOptions = nodesSnapshot.nodes.map(node => `<option value="${node.id}" ${Number(view.fixed_node_id) === Number(node.id) ? 'selected' : ''}>${esc(node.name)}</option>`).join('');
     const error = site.last_error ? `<small class="is-error">${esc(site.last_error)}</small>` : `<small>${scheduleEnabled ? 'DNS 只会在 Agent 配置与入口健康检查通过后生效' : '未启用节点调度，继续使用原面板入口'}</small>`;
     return `<div class="node-site-row" data-site-id="${site.site_id}">
       <div class="node-site-identity"><strong>${esc(site.site_name)}</strong><span>${esc(site.public_host || '未配置站点域名')}</span></div>
       <label class="node-check"><input type="checkbox" data-field="enabled" ${scheduleEnabled ? 'checked' : ''}> 启用节点调度</label>
-      <select class="form-input" data-field="mode" ${scheduleEnabled ? '' : 'disabled'}><option value="global" ${site.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${site.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select>
-      <select class="form-input" data-field="fixed-node" ${scheduleEnabled && site.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select>
+      <select class="form-input" data-field="mode" ${scheduleEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select>
+      <select class="form-input" data-field="fixed-node" ${scheduleEnabled && view.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select>
       <div class="node-site-status"><span>${scheduleEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}` : '原面板模式 · 节点调度未启用'}</span>${scheduleEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}</div>
       <button type="button" class="node-button is-primary" data-action="save-site">保存</button>
     </div>`;
@@ -165,10 +189,16 @@ async function handleSiteScheduleAction(event) {
   if (!row) return;
   if (event.target.matches('[data-field="enabled"]')) {
     syncSiteScheduleRow(row);
+    captureSiteScheduleDrafts();
     return;
   }
   if (event.target.matches('[data-field="mode"]')) {
     syncSiteScheduleRow(row);
+    captureSiteScheduleDrafts();
+    return;
+  }
+  if (event.target.matches('[data-field="fixed-node"]')) {
+    captureSiteScheduleDrafts();
     return;
   }
   const button = event.target.closest('[data-action="save-site"]');
@@ -181,6 +211,7 @@ async function handleSiteScheduleAction(event) {
   button.disabled = true;
   try {
     await API.saveSiteNodeSchedule(Number(row.dataset.siteId), { enabled, mode, fixed_node_id: fixedNodeID });
+    siteScheduleDrafts.delete(Number(row.dataset.siteId));
     Toast.success('站点调度已保存');
     await loadNodes();
   } catch (error) { Toast.error(error.message || '站点调度保存失败'); }
@@ -189,6 +220,7 @@ async function handleSiteScheduleAction(event) {
 
 function renderNodes() {
   stopNodesRefresh();
+  siteScheduleDrafts = new Map();
   const page = document.getElementById('page-nodes');
   page.innerHTML = `<div class="nodes-page fade-up">
     <div class="node-test-banner"><strong>切换保护</strong><span>现有站点默认不参与调度。DNS 仅在 Agent 应用配置并通过域名证书与入口健康检查后切换；已有连接不会被强制迁移。</span></div>

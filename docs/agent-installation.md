@@ -12,7 +12,7 @@ https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install
 
 ## 一键安装
 
-在自己的主控面板中创建节点，复制面板生成的完整命令，在目标 Linux x86_64 VPS 以 root 执行：
+在自己的主控面板中创建节点，复制面板生成的完整命令，在目标 Linux amd64 或 arm64 VPS 以 root 执行：
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/agent-install.sh | sudo bash -s -- \
@@ -25,7 +25,7 @@ wget -qO- https://raw.githubusercontent.com/chanhui800/Meridian/main/scripts/age
 - `-c` / `--controller`：自己的主控 HTTPS 地址，必须带正确端口。
 - `-t` / `--token`：面板为该节点生成的一次性注册令牌，默认 24 小时有效。
 
-安装器只支持 Linux x86_64，并要求节点可以通过 HTTPS 访问主控。脚本会自动识别默认路由网卡，不需要手动填写 `eth0`、`ens3` 等网卡名。
+安装器支持 Linux amd64 和 arm64，并要求节点可以通过 HTTPS 访问主控。脚本会校验下载二进制的 SHA-256，并自动识别默认路由网卡，不需要手动填写 `eth0`、`ens3` 等网卡名。
 
 ## 安装后检查
 

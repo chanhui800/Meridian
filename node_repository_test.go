@@ -298,8 +298,8 @@ func TestBuildNodeInstallScriptDoesNotPersistTokenInService(t *testing.T) {
 	if strings.Contains(service, "enrollment-secret") {
 		t.Fatal("systemd service contains the one-time enrollment token")
 	}
-	if !strings.Contains(script, "Linux x86_64 only") {
-		t.Fatal("install script does not declare architecture limit")
+	if !strings.Contains(script, "Linux amd64 and arm64 only") {
+		t.Fatal("install script does not declare the supported architectures")
 	}
 }
 

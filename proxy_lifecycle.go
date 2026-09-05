@@ -489,3 +489,26 @@ func (pm *ProxyManager) GracefulShutdown(ctx context.Context) {
 		pm.mu.Unlock()
 	}
 }
+
+// DrainShutdown is the hot-reload variant of GracefulShutdown. It closes the
+// ingress gate but lets already admitted requests retain their instance context
+// until the caller's grace period expires.
+func (pm *ProxyManager) DrainShutdown(ctx context.Context) {
+	pm.lifecycleMu.Lock()
+	pm.shutdownStarted.Store(true)
+	pm.mu.RLock()
+	instances := make([]*ProxyInstance, 0, len(pm.proxies))
+	for _, inst := range pm.proxies {
+		instances = append(instances, inst)
+	}
+	pm.mu.RUnlock()
+	pm.lifecycleMu.Unlock()
+
+	results := make(chan error, len(instances))
+	for _, inst := range instances {
+		go func(value *ProxyInstance) { results <- value.drain(ctx) }(inst)
+	}
+	for range instances {
+		<-results
+	}
+}
