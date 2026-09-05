@@ -205,6 +205,39 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 
 const siteNodeProbeCooldown = 2 * time.Minute
 
+const (
+	readinessCertificate = "certificate"
+	readinessConfig      = "config"
+	readinessListener    = "listener"
+	readinessProbe       = "probe"
+)
+
+type nodeReadinessError struct {
+	Kind string
+	Err  error
+}
+
+func (e *nodeReadinessError) Error() string {
+	if e == nil || e.Err == nil {
+		return "node is not ready"
+	}
+	return e.Err.Error()
+}
+
+func (e *nodeReadinessError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func readinessError(kind string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &nodeReadinessError{Kind: kind, Err: err}
+}
+
 func (d *DB) siteNodeProbeCooldowns(siteID int64, now time.Time) (map[int64]bool, error) {
 	rows, err := d.db.Query("SELECT node_id FROM site_node_probe_failures WHERE site_id=? AND failed_until_ms>?", siteID, now.UnixMilli())
 	if err != nil {
@@ -298,9 +331,11 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		if status == "" || status == "disabled" {
 			status = "pending"
 		}
-		if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
-			nullableNodeID(desired), status, lastError, now.UnixMilli(), value.SiteID); err != nil {
-			return err
+		if desired != value.DesiredNodeID || status != value.DNSStatus || lastError != value.LastError {
+			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
+				nullableNodeID(desired), status, lastError, now.UnixMilli(), value.SiteID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -711,26 +746,26 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	}
 	node, err := a.db.controlNodeByID(schedule.DesiredNodeID, now)
 	if err != nil {
-		return err
+		return readinessError(readinessListener, err)
 	}
 	if a.panelCertificates == nil {
-		return errors.New("edge TLS certificate is unavailable")
+		return readinessError(readinessCertificate, errors.New("edge TLS certificate is unavailable"))
 	}
 	edgeCertFile, _, pathErr := a.panelCertificates.nodeEdgeTLSPaths(node.GUID)
 	if pathErr != nil {
-		return pathErr
+		return readinessError(readinessCertificate, pathErr)
 	}
 	if err := certificateCoversHost(edgeCertFile, schedule.PublicHost); err != nil {
-		return err
+		return readinessError(readinessCertificate, err)
 	}
 	if node.DesiredConfigHash == "" || node.AppliedConfigHash != node.DesiredConfigHash {
-		return errors.New("Agent has not applied the desired configuration")
+		return readinessError(readinessConfig, errors.New("Agent has not applied the desired configuration"))
 	}
 	if node.AgentListenerError != "" {
-		return errors.New(node.AgentListenerError)
+		return readinessError(readinessListener, errors.New(node.AgentListenerError))
 	}
 	if err := probeScheduledNode(ctx, node, schedule.PublicHost); err != nil {
-		return fmt.Errorf("entry health check: %w", err)
+		return readinessError(readinessProbe, fmt.Errorf("entry health check: %w", err))
 	}
 	if err := a.db.clearSiteNodeProbeFailure(schedule.SiteID, node.ID); err != nil {
 		return fmt.Errorf("clear entry health cooldown: %w", err)
@@ -797,15 +832,24 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 		cancel()
 		if err != nil {
 			log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
-			if value.Mode == "global" && value.DesiredNodeID > 0 && strings.Contains(err.Error(), "entry health check") {
+			var readiness *nodeReadinessError
+			if value.Mode == "global" && value.DesiredNodeID > 0 && errors.As(err, &readiness) {
 				var schedulerMode string
 				if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
-					if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
-						log.Printf("[node-scheduler] record site %d probe cooldown failed: %v", value.SiteID, cooldownErr)
+					shouldCooldown := readiness.Kind == readinessCertificate || readiness.Kind == readinessListener || readiness.Kind == readinessProbe
+					if readiness.Kind == readinessConfig && value.UpdatedAtMS > 0 {
+						shouldCooldown = now.Sub(time.UnixMilli(value.UpdatedAtMS)) >= 90*time.Second
+					}
+					if shouldCooldown {
+						if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
+							log.Printf("[node-scheduler] record site %d node %d cooldown failed: %v", value.SiteID, value.DesiredNodeID, cooldownErr)
+						}
 					}
 				}
 			}
-			_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
+			if value.DNSStatus != "waiting" || value.LastError != err.Error() {
+				_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
+			}
 		}
 	}
 }

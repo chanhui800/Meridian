@@ -119,6 +119,17 @@ type NodeReport struct {
 	Events            []NodeRequestEvent       `json:"events,omitempty"`
 }
 
+// NodeReportResult keeps the protocol acknowledgement tied to the exact
+// validation/commit decision made by the controller. Handlers must not infer
+// ACKs from their original request slice after invalid events are filtered.
+type NodeReportResult struct {
+	Node               ControlNode
+	AcceptedEventIDs   []int64
+	AcceptedEventUIDs  []string
+	DiscardedEventIDs  []int64
+	DiscardedEventUIDs []string
+}
+
 type NodeSiteStat struct {
 	Host               string `json:"host"`
 	RequestCount       int64  `json:"request_count"`
@@ -791,7 +802,7 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 	// A malformed/stale event must not make the whole heartbeat unprocessable.
 	// Keep the node online and drop only the offending event; core counters and
 	// valid events remain durable.
-	validEvents := report.Events[:0]
+	validEvents := make([]NodeRequestEvent, 0, len(report.Events))
 	for _, event := range report.Events {
 		if validateNodeRequestEvent(event) == nil {
 			validEvents = append(validEvents, event)
@@ -937,6 +948,41 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 	}
 	_, _ = d.NodeControlSnapshot(now)
 	return node, nil
+}
+
+// RecordNodeReportResult is the acknowledgement-safe variant used by HTTP
+// and WebSocket handlers. Invalid event payloads are explicitly retired so a
+// poison event cannot remain in an Agent spool forever.
+func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now time.Time) (NodeReportResult, error) {
+	result := NodeReportResult{}
+	validEvents := make([]NodeRequestEvent, 0, len(report.Events))
+	for _, event := range report.Events {
+		if validateNodeRequestEvent(event) == nil {
+			validEvents = append(validEvents, event)
+			continue
+		}
+		if event.EventID > 0 {
+			result.DiscardedEventIDs = append(result.DiscardedEventIDs, event.EventID)
+		}
+		if len(event.EventUID) == 32 && isHexString(event.EventUID) {
+			result.DiscardedEventUIDs = append(result.DiscardedEventUIDs, event.EventUID)
+		}
+	}
+	report.Events = validEvents
+	node, err := d.RecordNodeReport(agentToken, report, now)
+	if err != nil {
+		return NodeReportResult{}, err
+	}
+	result.Node = node
+	for _, event := range validEvents {
+		if event.EventID > 0 {
+			result.AcceptedEventIDs = append(result.AcceptedEventIDs, event.EventID)
+		}
+		if len(event.EventUID) == 32 && isHexString(event.EventUID) {
+			result.AcceptedEventUIDs = append(result.AcceptedEventUIDs, event.EventUID)
+		}
+	}
+	return result, nil
 }
 
 func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) {

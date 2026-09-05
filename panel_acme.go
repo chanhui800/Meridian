@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -139,14 +140,32 @@ func installCertificatePairAtomic(certFile, keyFile string, certPEM, keyPEM []by
 	}
 	// Linux production uses an atomic symlink replacement. Windows test/dev
 	// environments may not permit symlinks, so retain a safe pair-wise fallback.
-	tmpLink := currentDir + ".next"
+	tmpLink := fmt.Sprintf("%s.next.%d.%d", currentDir, os.Getpid(), time.Now().UnixNano())
 	_ = os.Remove(tmpLink)                                                                               // #nosec G703 -- tmpLink is derived from the validated current directory.
 	if err := os.Symlink(filepath.Join("generations", filepath.Base(generation)), tmpLink); err == nil { // #nosec G703 -- link target is generated beneath the private TLS directory.
 		if err := os.Rename(tmpLink, currentDir); err != nil { // #nosec G703 -- both paths are generated within the private TLS directory.
+			// Backups from v1.9.13 may have restored current as a real
+			// directory. Move it aside, switch the pointer, then remove the
+			// legacy directory; readers never observe a partial new pair.
+			legacyDir := fmt.Sprintf("%s.legacy.%d", currentDir, time.Now().UnixNano())
+			if info, statErr := os.Stat(currentDir); statErr == nil && info.IsDir() && os.Rename(currentDir, legacyDir) == nil {
+				if switchErr := os.Rename(tmpLink, currentDir); switchErr == nil {
+					_ = os.RemoveAll(legacyDir) // #nosec G703 -- legacyDir is a private, uniquely named sibling of currentDir.
+					keep = true
+					if cleanupErr := cleanupOldCertificateGenerations(generations, currentDir, 2); cleanupErr != nil {
+						return fmt.Errorf("cleanup old certificate generations: %w", cleanupErr)
+					}
+					return nil
+				}
+				_ = os.Rename(legacyDir, currentDir)
+			}
 			_ = os.Remove(tmpLink) // #nosec G703 -- tmpLink is generated within the private TLS directory.
 			return err
 		}
 		keep = true
+		if err := cleanupOldCertificateGenerations(generations, currentDir, 2); err != nil {
+			return fmt.Errorf("cleanup old certificate generations: %w", err)
+		}
 		return nil
 	}
 	if err := os.MkdirAll(currentDir, 0o700); err != nil { // #nosec G703 -- currentDir is derived from validated TLS paths.
@@ -159,6 +178,61 @@ func installCertificatePairAtomic(certFile, keyFile string, certPEM, keyPEM []by
 		return err
 	}
 	keep = true
+	if err := cleanupOldCertificateGenerations(generations, currentDir, 2); err != nil {
+		return fmt.Errorf("cleanup old certificate generations: %w", err)
+	}
+	return nil
+}
+
+// cleanupOldCertificateGenerations bounds long-running renewal storage while
+// retaining the active generation and one rollback candidate.  It never
+// follows or removes the current pointer itself.
+func cleanupOldCertificateGenerations(generationsDir, currentDir string, keep int) error {
+	if keep < 1 {
+		keep = 1
+	}
+	entries, err := os.ReadDir(generationsDir)
+	if err != nil {
+		return err
+	}
+	currentName := ""
+	if target, readErr := os.Readlink(currentDir); readErr == nil {
+		currentName = filepath.Base(filepath.Clean(target))
+	}
+	type generationEntry struct {
+		name string
+		info os.FileInfo
+	}
+	values := make([]generationEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "generation-") {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		values = append(values, generationEntry{name: entry.Name(), info: info})
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].info.ModTime().After(values[j].info.ModTime()) })
+	retained := make(map[string]bool, keep)
+	if currentName != "" {
+		retained[currentName] = true
+	}
+	for _, entry := range values {
+		if len(retained) >= keep {
+			break
+		}
+		retained[entry.name] = true
+	}
+	for _, entry := range values {
+		if retained[entry.name] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(generationsDir, entry.name)); err != nil { // #nosec G703 -- entry names are returned by ReadDir from the private generations directory.
+			return err
+		}
+	}
 	return nil
 }
 
@@ -170,18 +244,13 @@ func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
 		return nil
 	}
 	panelPair, panelErr := tls.LoadX509KeyPair(m.certFile, m.keyFile)
-	edgePair, edgeErr := tls.LoadX509KeyPair(m.edgeCertFile, m.edgeKeyFile)
-	if errors.Is(panelErr, os.ErrNotExist) || errors.Is(edgeErr, os.ErrNotExist) {
+	if errors.Is(panelErr, os.ErrNotExist) {
 		return nil
 	}
-	if panelErr != nil || edgeErr != nil {
+	if panelErr != nil || len(panelPair.Certificate) == 0 {
 		return nil
 	}
 	panelCert, err := x509.ParseCertificate(panelPair.Certificate[0])
-	if err != nil {
-		return nil
-	}
-	edgeCert, err := x509.ParseCertificate(edgePair.Certificate[0])
 	if err != nil {
 		return nil
 	}
@@ -189,12 +258,38 @@ func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
 	if err != nil {
 		return nil
 	}
-	edgeSPKI, err := x509.MarshalPKIXPublicKey(edgeCert.PublicKey)
-	if err != nil {
+	comparePair := func(certFile, keyFile string) error {
+		edgePair, edgeErr := tls.LoadX509KeyPair(certFile, keyFile)
+		if errors.Is(edgeErr, os.ErrNotExist) || edgeErr != nil || len(edgePair.Certificate) == 0 {
+			return nil
+		}
+		edgeCert, parseErr := x509.ParseCertificate(edgePair.Certificate[0])
+		if parseErr != nil {
+			return nil
+		}
+		edgeSPKI, marshalErr := x509.MarshalPKIXPublicKey(edgeCert.PublicKey)
+		if marshalErr == nil && bytes.Equal(panelSPKI, edgeSPKI) {
+			return errors.New("panel TLS and edge TLS use the same private key; configure a dedicated edge certificate")
+		}
 		return nil
 	}
-	if bytes.Equal(panelSPKI, edgeSPKI) {
-		return errors.New("panel TLS and edge TLS use the same private key; configure a dedicated edge certificate")
+	if err := comparePair(m.edgeCertFile, m.edgeKeyFile); err != nil {
+		return err
+	}
+	edgeRoot := filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes")
+	entries, readErr := os.ReadDir(edgeRoot)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		certFile := filepath.Join(edgeRoot, entry.Name(), "current", "fullchain.pem")
+		keyFile := filepath.Join(edgeRoot, entry.Name(), "current", "privkey.pem")
+		if err := comparePair(certFile, keyFile); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -507,6 +602,39 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	if err != nil {
 		return nil, err
 	}
+	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.RouteDomain, []string{wildcardDomainForSettings(settings)}, staging)
+}
+
+// issueCloudflareForIdentifiers issues one certificate for an explicit SAN
+// set. Edge certificates include a node-unique SAN alongside the shared
+// wildcard, so each node uses a distinct ACME identifier set and does not
+// consume the exact-set rate limit shared by every other node.
+func (m *panelCertificateManager) issueCloudflareForIdentifiers(ctx context.Context, email, token, routeDomain string, identifiers []string, staging bool) (*issuedPanelCertificate, error) {
+	normalizedRoute, err := normalizeRouteDomain(routeDomain)
+	if err != nil {
+		return nil, fmt.Errorf("invalid route domain: %w", err)
+	}
+	cleanIdentifiers := make([]string, 0, len(identifiers))
+	seen := make(map[string]bool, len(identifiers))
+	for _, identifier := range identifiers {
+		value := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(identifier), "."))
+		if value == "" || strings.ContainsAny(value, "\r\n") || len(value) > 253 {
+			return nil, errors.New("invalid ACME certificate identifier")
+		}
+		if _, err := normalizePublicHost(strings.TrimPrefix(value, "*.")); err != nil {
+			return nil, fmt.Errorf("invalid ACME certificate identifier %q: %w", value, err)
+		}
+		if strings.HasPrefix(value, "*.") && strings.Count(value, "*") != 1 {
+			return nil, errors.New("invalid wildcard certificate identifier")
+		}
+		if !seen[value] {
+			seen[value] = true
+			cleanIdentifiers = append(cleanIdentifiers, value)
+		}
+	}
+	if len(cleanIdentifiers) == 0 {
+		return nil, errors.New("at least one ACME certificate identifier is required")
+	}
 	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
 		return nil, errors.New("可写的 TLS 数据目录不可用")
 	}
@@ -545,14 +673,13 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 		return nil, fmt.Errorf("register ACME account: %w", err)
 	}
 
-	wildcard := "*." + settings.RouteDomain
-	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(wildcard))
+	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(cleanIdentifiers...))
 	if err != nil {
 		return nil, fmt.Errorf("create ACME order: %w", err)
 	}
 	cf := &cloudflareClient{token: strings.TrimSpace(token), httpClient: m.httpClient, apiBase: "https://api.cloudflare.com/client/v4"}
 	for _, authorizationURL := range order.AuthzURLs {
-		if err := fulfillCloudflareDNSAuthorization(ctx, client, cf, authorizationURL, settings.RouteDomain); err != nil {
+		if err := fulfillCloudflareDNSAuthorization(ctx, client, cf, authorizationURL, normalizedRoute); err != nil {
 			return nil, err
 		}
 	}
@@ -564,7 +691,7 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	if err != nil {
 		return nil, fmt.Errorf("generate certificate key: %w", err)
 	}
-	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{wildcard}}, certificateKey)
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: cleanIdentifiers}, certificateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create certificate request: %w", err)
 	}

@@ -2,13 +2,31 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 )
+
+const edgeCertificateRenewalTimeout = 3 * time.Minute
+
+func edgeCertificateHost(routeDomain, nodeGUID string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(nodeGUID)))
+	return "edge-" + hex.EncodeToString(digest[:6]) + "." + strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+}
+
+func edgeCertificateIdentifiers(routeDomain, nodeGUID string) []string {
+	wildcard := "*." + strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+	return []string{wildcard, edgeCertificateHost(routeDomain, nodeGUID)}
+}
+
+func edgeCertificateRequired(node ControlNode) bool {
+	return node.EnrolledAtMS > 0 && node.Enabled
+}
 
 func runPanelCertificateRenewalScheduler(ctx context.Context, db *DB, manager *panelCertificateManager, restart ...func()) {
 	if db == nil || manager == nil {
@@ -76,30 +94,69 @@ func renewEdgeCertificatesIfDue(ctx context.Context, db *DB, manager *panelCerti
 	if err != nil {
 		return err
 	}
-	wildcard := wildcardDomainForSettings(settings)
+	var failures []error
 	for _, node := range nodes {
-		if strings.TrimSpace(node.GUID) == "" {
+		if !edgeCertificateRequired(node) || strings.TrimSpace(node.GUID) == "" {
 			continue
 		}
-		certFile, keyFile, pathErr := manager.nodeEdgeTLSPaths(node.GUID)
-		if pathErr != nil {
-			return pathErr
+		nodeCtx, cancel := context.WithTimeout(ctx, edgeCertificateRenewalTimeout)
+		_, ensureErr := ensureEdgeCertificateForNode(nodeCtx, settings, token, manager, node)
+		cancel()
+		if ensureErr != nil {
+			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, ensureErr))
+			log.Printf("[edge-certificate] node %s renewal failed: %v", node.Name, ensureErr)
 		}
-		status := certificateStatusForFile(certFile, wildcard)
-		_, pairErr := tls.LoadX509KeyPair(certFile, keyFile)
-		if status.Configured && pairErr == nil && status.CertificateValid && status.CertificateCurrent && status.DaysRemaining > int(panelCertificateRenewalWindow.Hours()/24) {
-			continue
-		}
-		issued, issueErr := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
-		if issueErr != nil {
-			return fmt.Errorf("issue edge certificate for node %s: %w", node.Name, issueErr)
-		}
-		if installErr := installCertificatePairAtomic(certFile, keyFile, issued.certPEM, issued.keyPEM); installErr != nil {
-			return fmt.Errorf("install edge certificate for node %s: %w", node.Name, installErr)
-		}
-		log.Printf("[edge-certificate] certificate renewed for node %s (*.%s)", node.Name, settings.RouteDomain)
 	}
-	return nil
+	return errors.Join(failures...)
+}
+
+// ensureEdgeCertificateForNode provisions or renews exactly one enrolled
+// node's certificate. A valid pair is reused, preventing an administrator
+// retry or a scheduler tick from needlessly consuming ACME issuance quota.
+func ensureEdgeCertificateForNode(ctx context.Context, settings PanelSettings, token string, manager *panelCertificateManager, node ControlNode) (bool, error) {
+	if manager == nil || !edgeCertificateRequired(node) || strings.TrimSpace(node.GUID) == "" {
+		return false, nil
+	}
+	certFile, keyFile, err := manager.nodeEdgeTLSPaths(node.GUID)
+	if err != nil {
+		return false, err
+	}
+	wildcard := wildcardDomainForSettings(settings)
+	uniqueHost := edgeCertificateHost(settings.RouteDomain, node.GUID)
+	status := certificateStatusForFile(certFile, wildcard)
+	_, pairErr := tls.LoadX509KeyPair(certFile, keyFile)
+	hostErr := certificateCoversHost(certFile, uniqueHost)
+	if status.Configured && pairErr == nil && status.CertificateValid && status.CertificateCurrent && hostErr == nil && status.DaysRemaining > int(panelCertificateRenewalWindow.Hours()/24) {
+		return false, nil
+	}
+	issued, issueErr := manager.issueCloudflareForIdentifiers(ctx, settings.ACMEEmail, token, settings.RouteDomain, edgeCertificateIdentifiers(settings.RouteDomain, node.GUID), settings.ACMEStaging)
+	if issueErr != nil {
+		return false, issueErr
+	}
+	if installErr := installCertificatePairAtomic(certFile, keyFile, issued.certPEM, issued.keyPEM); installErr != nil {
+		return false, installErr
+	}
+	log.Printf("[edge-certificate] certificate provisioned for node %s (%s + %s)", node.Name, wildcard, uniqueHost)
+	return true, nil
+}
+
+func provisionEdgeCertificateForNode(ctx context.Context, db *DB, manager *panelCertificateManager, node ControlNode) error {
+	if db == nil || manager == nil || !edgeCertificateRequired(node) {
+		return nil
+	}
+	settings, err := db.PanelSettings()
+	if err != nil {
+		return err
+	}
+	if !settings.Configured || strings.TrimSpace(settings.RouteDomain) == "" || jwtSecretEphemeral || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
+		return nil
+	}
+	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
+	if err != nil {
+		return errors.New("无法解密已保存的 DNS API Token")
+	}
+	_, err = ensureEdgeCertificateForNode(ctx, settings, token, manager, node)
+	return err
 }
 
 // disableExpiredPanelTLSIfNeeded makes an expired certificate a recoverable

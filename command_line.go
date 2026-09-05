@@ -180,25 +180,29 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 	if len(nodes) == 0 {
 		return errors.New("no control nodes are enrolled")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	required := 0
 	for _, node := range nodes {
-		if strings.TrimSpace(node.GUID) == "" {
-			continue
-		}
-		edgeCertFile, edgeKeyFile, pathErr := manager.nodeEdgeTLSPaths(node.GUID)
-		if pathErr != nil {
-			return pathErr
-		}
-		issued, issueErr := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
-		if issueErr != nil {
-			return fmt.Errorf("issue edge certificate for node %s: %w", node.Name, issueErr)
-		}
-		if installErr := installCertificatePairAtomic(edgeCertFile, edgeKeyFile, issued.certPEM, issued.keyPEM); installErr != nil {
-			return fmt.Errorf("install edge certificate for node %s: %w", node.Name, installErr)
+		if edgeCertificateRequired(node) && strings.TrimSpace(node.GUID) != "" {
+			required++
 		}
 	}
-	_, err = fmt.Fprintf(output, "edge certificates installed for %d node(s) for *.%s\n", len(nodes), settings.RouteDomain)
+	if required == 0 {
+		return errors.New("no enabled enrolled control nodes require an edge certificate")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	installed := 0
+	for _, node := range nodes {
+		if !edgeCertificateRequired(node) || strings.TrimSpace(node.GUID) == "" {
+			continue
+		}
+		if changed, ensureErr := ensureEdgeCertificateForNode(ctx, settings, token, manager, node); ensureErr != nil {
+			return fmt.Errorf("issue edge certificate for node %s: %w", node.Name, ensureErr)
+		} else if changed {
+			installed++
+		}
+	}
+	_, err = fmt.Fprintf(output, "edge certificates installed or renewed for %d node(s) for *.%s\n", installed, settings.RouteDomain)
 	return err
 }
 

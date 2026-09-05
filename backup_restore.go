@@ -29,7 +29,7 @@ const (
 	backupSaltBytes          = 16
 	backupMaxUploadBytes     = 256 << 20
 	backupMaxExpandedBytes   = 512 << 20
-	backupMaxFiles           = 8
+	backupMaxFiles           = 512
 	backupMinPasswordBytes   = 12
 	backupMaxPasswordBytes   = 128
 	backupPendingSuffix      = ".restore-pending"
@@ -42,6 +42,7 @@ const (
 	backupTLSEnabled         = "tls/enabled"
 	backupACMEAccount        = "tls/acme-account.pem"
 	backupACMEAccountStaging = "tls/acme-account-staging.pem"
+	backupTLSEdgeNodesPrefix = "tls/edge-nodes/"
 )
 
 var backupAllowedEntries = map[string]int64{
@@ -52,6 +53,37 @@ var backupAllowedEntries = map[string]int64{
 	backupTLSEnabled:         64,
 	backupACMEAccount:        1 << 20,
 	backupACMEAccountStaging: 1 << 20,
+}
+
+func backupEntryLimit(name string) (int64, bool) {
+	if limit, ok := backupAllowedEntries[name]; ok {
+		return limit, true
+	}
+	if !strings.HasPrefix(name, backupTLSEdgeNodesPrefix) {
+		return 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(name, backupTLSEdgeNodesPrefix), "/")
+	if len(parts) != 2 || parts[0] == "" || (parts[1] != "fullchain.pem" && parts[1] != "privkey.pem") {
+		return 0, false
+	}
+	for _, r := range parts[0] {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return 0, false
+		}
+	}
+	return 4 << 20, true
+}
+
+func backupTLSEntries(manifestFiles []string) []string {
+	values := make([]string, 0, len(manifestFiles))
+	for _, name := range manifestFiles {
+		if strings.HasPrefix(name, "tls/") {
+			if _, ok := backupEntryLimit(name); ok {
+				values = append(values, name)
+			}
+		}
+	}
+	return values
 }
 
 type backupManifest struct {
@@ -109,6 +141,24 @@ func restoreDirectoryIncludesTLS(dir string) bool {
 		return true
 	}
 	return markerIncludesTLS(marker)
+}
+
+func restoreDirectoryTLSEntries(dir string) []string {
+	data, err := os.ReadFile(filepath.Join(dir, "restore.json")) // #nosec G304 G703 -- dir is an internal rollback directory created by Meridian.
+	if err != nil {
+		values := make([]string, 0, len(backupAllowedEntries))
+		for name := range backupAllowedEntries {
+			if strings.HasPrefix(name, "tls/") {
+				values = append(values, name)
+			}
+		}
+		return values
+	}
+	var marker restoreMarker
+	if json.Unmarshal(data, &marker) != nil {
+		return nil
+	}
+	return backupTLSEntries(marker.Files)
 }
 
 func validateBackupPassword(password string) error {
@@ -285,6 +335,49 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 				files = append(files, candidate.name)
 			}
 		}
+		// Per-node Edge certificates live behind an atomic current pointer.
+		// Back up the resolved pair under stable archive names; restore rebuilds
+		// each node's current directory from these files.
+		if certFile != "" {
+			edgeRoot := filepath.Join(filepath.Dir(certFile), "edge-nodes")
+			entries, readErr := os.ReadDir(edgeRoot)
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("读取 Edge 节点证书目录: %w", readErr)
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				guid := entry.Name()
+				for _, filename := range []string{"fullchain.pem", "privkey.pem"} {
+					name := backupTLSEdgeNodesPrefix + guid + "/" + filename
+					path := filepath.Join(edgeRoot, guid, "current", filename)
+					if filename == "fullchain.pem" {
+						keyPath := filepath.Join(edgeRoot, guid, "current", "privkey.pem")
+						_, certErr := os.Stat(path)
+						_, keyErr := os.Stat(keyPath)
+						certExists := certErr == nil
+						keyExists := keyErr == nil
+						if certExists != keyExists {
+							return nil, fmt.Errorf("Edge 节点 %s 的证书和私钥不成对", guid)
+						}
+						if !certExists {
+							if certErr != nil && !errors.Is(certErr, os.ErrNotExist) || keyErr != nil && !errors.Is(keyErr, os.ErrNotExist) {
+								return nil, fmt.Errorf("检查 Edge 节点 %s 证书: %v / %v", guid, certErr, keyErr)
+							}
+							break
+						}
+					}
+					added, addErr := addZipFile(zipWriter, name, path)
+					if addErr != nil {
+						return nil, fmt.Errorf("读取 %s: %w", name, addErr)
+					}
+					if added {
+						files = append(files, name)
+					}
+				}
+			}
+		}
 	}
 	manifest := backupManifest{
 		Format:            "meridian-backup",
@@ -347,7 +440,7 @@ func parseBackupArchive(plain []byte) (backupManifest, map[string][]byte, error)
 	entries := make(map[string][]byte, len(reader.File))
 	var expanded int64
 	for _, file := range reader.File {
-		limit, allowed := backupAllowedEntries[file.Name]
+		limit, allowed := backupEntryLimit(file.Name)
 		if !allowed || filepath.ToSlash(filepath.Clean(file.Name)) != file.Name || strings.HasPrefix(file.Name, "/") {
 			return manifest, nil, fmt.Errorf("备份包含不允许的文件: %s", file.Name)
 		}
@@ -389,7 +482,7 @@ func parseBackupArchive(plain []byte) (backupManifest, map[string][]byte, error)
 	declared := make(map[string]bool, len(manifest.Files)+1)
 	declared[backupManifestEntry] = true
 	for _, name := range manifest.Files {
-		if _, ok := backupAllowedEntries[name]; !ok || name == backupManifestEntry || declared[name] {
+		if _, ok := backupEntryLimit(name); !ok || name == backupManifestEntry || declared[name] {
 			return manifest, nil, errors.New("备份清单文件列表无效")
 		}
 		declared[name] = true
@@ -829,7 +922,17 @@ func targetTLSPath(dbPath, entry string) string {
 	case backupACMEAccountStaging:
 		return filepath.Join(filepath.Dir(certFile), "acme-account-staging.pem")
 	default:
-		return ""
+		if !strings.HasPrefix(entry, backupTLSEdgeNodesPrefix) {
+			return ""
+		}
+		parts := strings.Split(strings.TrimPrefix(entry, backupTLSEdgeNodesPrefix), "/")
+		if len(parts) != 2 || (parts[1] != "fullchain.pem" && parts[1] != "privkey.pem") {
+			return ""
+		}
+		if _, ok := backupEntryLimit(entry); !ok {
+			return ""
+		}
+		return filepath.Join(filepath.Dir(certFile), "edge-nodes", parts[0], "current", parts[1])
 	}
 }
 
@@ -900,10 +1003,7 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	}
 	rollbackReady = true
 	if markerIncludesTLS(marker) {
-		for entry := range backupAllowedEntries {
-			if !strings.HasPrefix(entry, "tls/") {
-				continue
-			}
+		for _, entry := range backupTLSEntries(marker.Files) {
 			target := targetTLSPath(dbPath, entry)
 			if target == "" {
 				continue
@@ -924,10 +1024,7 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		return nil, err
 	}
 	if markerIncludesTLS(marker) {
-		for entry := range backupAllowedEntries {
-			if !strings.HasPrefix(entry, "tls/") {
-				continue
-			}
+		for _, entry := range backupTLSEntries(marker.Files) {
 			target := targetTLSPath(dbPath, entry)
 			if target != "" {
 				if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
@@ -981,10 +1078,7 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		}
 	}
 	if restoreDirectoryIncludesTLS(rollback) {
-		for entry := range backupAllowedEntries {
-			if !strings.HasPrefix(entry, "tls/") {
-				continue
-			}
+		for _, entry := range restoreDirectoryTLSEntries(rollback) {
 			target := targetTLSPath(dbPath, entry)
 			if target == "" {
 				continue

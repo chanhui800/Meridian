@@ -165,14 +165,16 @@ function renderSiteSchedules() {
     const scheduleEnabled = view.enabled === true;
     const nodeOptions = nodesSnapshot.nodes.map(node => `<option value="${node.id}" ${Number(view.fixed_node_id) === Number(node.id) ? 'selected' : ''}>${esc(node.name)}</option>`).join('');
     const error = site.last_error ? `<small class="is-error">${esc(site.last_error)}</small>` : `<small>${scheduleEnabled ? 'DNS 只会在 Agent 配置与入口健康检查通过后生效' : '未启用节点调度，继续使用原面板入口'}</small>`;
-    return `<div class="node-site-row" data-site-id="${site.site_id}">
-      <div class="node-site-identity"><strong>${esc(site.site_name)}</strong><span>${esc(site.public_host || '未配置站点域名')}</span></div>
-      <label class="node-check"><input type="checkbox" data-field="enabled" ${scheduleEnabled ? 'checked' : ''}> 启用节点调度</label>
-      <select class="form-input" data-field="mode" ${scheduleEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select>
-      <select class="form-input" data-field="fixed-node" ${scheduleEnabled && view.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select>
+    return `<article class="node-site-row node-site-card" data-site-id="${site.site_id}">
+      <header class="node-site-card-head"><div class="node-site-identity"><strong>${esc(site.site_name)}</strong><span>${esc(site.public_host || '未配置站点域名')}</span></div><span class="node-site-state ${scheduleEnabled ? 'is-enabled' : ''}">${scheduleEnabled ? '调度已启用' : '使用面板入口'}</span></header>
+      <div class="node-site-card-controls">
+        <label class="node-check"><input type="checkbox" data-field="enabled" ${scheduleEnabled ? 'checked' : ''}> 启用节点调度</label>
+        <label class="node-site-field">调度方式<select class="form-input" data-field="mode" ${scheduleEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select></label>
+        <label class="node-site-field">固定节点<select class="form-input" data-field="fixed-node" ${scheduleEnabled && view.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select></label>
+      </div>
       <div class="node-site-status"><span>${scheduleEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}` : '原面板模式 · 节点调度未启用'}</span>${scheduleEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}</div>
-      <button type="button" class="node-button is-primary" data-action="save-site">保存</button>
-    </div>`;
+      <footer class="node-site-card-actions"><button type="button" class="node-button is-primary" data-action="save-site">保存站点设置</button></footer>
+    </article>`;
   }).join('');
 }
 
