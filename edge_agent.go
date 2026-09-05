@@ -53,12 +53,13 @@ type edgeSiteIdentity struct {
 }
 
 type edgeEventStore struct {
-	mu      sync.Mutex
-	next    int64
-	items   []NodeRequestEvent
-	path    string
-	key     []byte
-	dropped int64
+	mu        sync.Mutex
+	next      int64
+	items     []NodeRequestEvent
+	path      string
+	key       []byte
+	legacyKey []byte
+	dropped   int64
 }
 
 func (s *edgeEventStore) init(dir string) error {
@@ -66,16 +67,23 @@ func (s *edgeEventStore) init(dir string) error {
 }
 
 func (s *edgeEventStore) initWithKey(dir string, secret []byte) error {
+	var key []byte
+	if len(secret) > 0 {
+		digest := sha256.Sum256(secret)
+		key = append([]byte(nil), digest[:]...)
+	}
+	return s.initWithRawKey(dir, key, nil)
+}
+
+func (s *edgeEventStore) initWithRawKey(dir string, key, legacyKey []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.path = filepath.Join(dir, "events.json")
-	if len(secret) > 0 {
-		digest := sha256.Sum256(secret)
-		s.key = append([]byte(nil), digest[:]...)
-	}
+	s.key = append([]byte(nil), key...)
+	s.legacyKey = append([]byte(nil), legacyKey...)
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -104,25 +112,15 @@ func (s *edgeEventStore) initWithKey(dir string, secret []byte) error {
 		if envelope.Version != 1 {
 			return fmt.Errorf("load event queue: invalid encrypted spool")
 		}
-		block, err := aes.NewCipher(s.key)
-		if err != nil {
-			return err
+		opened, decryptErr := decryptEventSpoolEnvelope(envelope.Version, envelope.Nonce, envelope.Ciphertext, s.key)
+		if decryptErr != nil && len(s.legacyKey) > 0 {
+			opened, decryptErr = decryptEventSpoolEnvelope(envelope.Version, envelope.Nonce, envelope.Ciphertext, s.legacyKey)
+			if decryptErr == nil {
+				plaintext = true // migration below rewrites using the independent key.
+			}
 		}
-		gcm, err := cipher.NewGCM(block)
-		if err != nil {
-			return err
-		}
-		nonce, err := base64.RawStdEncoding.DecodeString(envelope.Nonce)
-		if err != nil || len(nonce) != gcm.NonceSize() {
-			return errors.New("load event queue: invalid nonce")
-		}
-		ciphertext, err := base64.RawStdEncoding.DecodeString(envelope.Ciphertext)
-		if err != nil {
-			return errors.New("load event queue: invalid ciphertext")
-		}
-		opened, err := gcm.Open(nil, nonce, ciphertext, nil)
-		if err != nil {
-			return fmt.Errorf("load event queue: decrypt: %w", err)
+		if decryptErr != nil {
+			return fmt.Errorf("load event queue: decrypt: %w", decryptErr)
 		}
 		if err := json.Unmarshal(opened, &stored); err != nil {
 			return fmt.Errorf("load event queue: decrypt: %w", err)
@@ -157,6 +155,29 @@ func (s *edgeEventStore) initWithKey(dir string, secret []byte) error {
 		}
 	}
 	return nil
+}
+
+func decryptEventSpoolEnvelope(version int, nonceText, ciphertextText string, key []byte) ([]byte, error) {
+	if version != 1 || len(key) == 0 {
+		return nil, errors.New("invalid encrypted spool")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := base64.RawStdEncoding.DecodeString(nonceText)
+	if err != nil || len(nonce) != gcm.NonceSize() {
+		return nil, errors.New("invalid nonce")
+	}
+	ciphertext, err := base64.RawStdEncoding.DecodeString(ciphertextText)
+	if err != nil {
+		return nil, errors.New("invalid ciphertext")
+	}
+	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
 func (s *edgeEventStore) persistLocked() error {
@@ -223,6 +244,52 @@ func newEdgeEventUID() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
+func loadOrCreateSpoolKey(path string) ([]byte, error) {
+	data, err := os.ReadFile(path) // #nosec G304 -- path is the administrator-selected local Agent state directory.
+	if err == nil {
+		if len(data) != 32 {
+			return nil, errors.New("event spool key has an invalid size")
+		}
+		return append([]byte(nil), data...), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	if err := writePrivateFileAtomic(path, key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func quarantineEventSpool(path string) error {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	quarantine := fmt.Sprintf("%s.corrupt.%d", path, time.Now().UnixNano())
+	if err := os.Rename(path, quarantine); err != nil {
+		return err
+	}
+	return nil
+}
+
+func nodeEventPriority(event NodeRequestEvent) string {
+	if event.Priority == nodeEventPriorityCritical || event.Priority == nodeEventPriorityBestEffort {
+		return event.Priority
+	}
+	switch event.ResourceCategory {
+	case requestLogCategoryPlayback, requestLogCategoryPlaybackSync, requestLogCategoryMetadata:
+		return nodeEventPriorityCritical
+	default:
+		return nodeEventPriorityBestEffort
+	}
+}
+
 func (s *edgeEventStore) add(event NodeRequestEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,9 +302,32 @@ func (s *edgeEventStore) add(event NodeRequestEvent) error {
 		}
 		event.EventUID = uid
 	}
+	event.Priority = nodeEventPriority(event)
+	if len(s.items) >= edgeEventQueueLimit {
+		if event.Priority == nodeEventPriorityCritical {
+			removed := -1
+			for i, existing := range s.items {
+				if nodeEventPriority(existing) == nodeEventPriorityBestEffort {
+					removed = i
+					break
+				}
+			}
+			if removed >= 0 {
+				s.items = append(s.items[:removed], s.items[removed+1:]...)
+				s.dropped++
+			} else {
+				// If the queue is entirely critical, keep the newest critical
+				// event and discard the oldest one.
+				s.items = append([]NodeRequestEvent(nil), s.items[1:]...)
+				s.dropped++
+			}
+		} else {
+			s.dropped++
+			return s.persistLocked()
+		}
+	}
 	s.items = append(s.items, event)
 	if len(s.items) > edgeEventQueueLimit {
-		s.dropped += int64(len(s.items) - edgeEventQueueLimit)
 		s.items = append([]NodeRequestEvent(nil), s.items[len(s.items)-edgeEventQueueLimit:]...)
 	}
 	return s.persistLocked()
@@ -489,49 +579,107 @@ func (runtime *edgeAgentRuntime) recordTelemetry(event edgeTelemetryEvent) {
 	}
 }
 
-func (runtime *edgeAgentRuntime) telemetrySnapshot() (media []NodeMediaCount, retention []NodeRetentionStatus, observations []NodeDynamicObservation) {
-	runtime.telemetryMu.Lock()
-	defer runtime.telemetryMu.Unlock()
-	for _, value := range runtime.mediaCounts {
-		media = append(media, value)
-	}
-	for _, value := range runtime.retention {
-		retention = append(retention, value)
-	}
-	if len(runtime.observations) > maxNodeTelemetryItemsPerReport {
-		runtime.observations = runtime.observations[len(runtime.observations)-maxNodeTelemetryItemsPerReport:]
-	}
-	observations = append([]NodeDynamicObservation(nil), runtime.observations...)
-	runtime.observations = runtime.observations[:0]
-	return
+type edgeTelemetryPending struct {
+	media        []NodeMediaCount
+	retention    []NodeRetentionStatus
+	observations []NodeDynamicObservation
 }
 
-func (runtime *edgeAgentRuntime) siteStatsSnapshot() []NodeSiteStat {
+func (runtime *edgeAgentRuntime) prepareTelemetry() edgeTelemetryPending {
+	if runtime == nil {
+		return edgeTelemetryPending{}
+	}
+	runtime.telemetryMu.Lock()
+	defer runtime.telemetryMu.Unlock()
+	pending := edgeTelemetryPending{}
+	for _, value := range runtime.mediaCounts {
+		pending.media = append(pending.media, value)
+	}
+	for _, value := range runtime.retention {
+		pending.retention = append(pending.retention, value)
+	}
+	end := len(runtime.observations)
+	if end > maxNodeTelemetryItemsPerReport {
+		end = maxNodeTelemetryItemsPerReport
+	}
+	pending.observations = append([]NodeDynamicObservation(nil), runtime.observations[:end]...)
+	return pending
+}
+
+func (runtime *edgeAgentRuntime) commitTelemetry(pending edgeTelemetryPending) {
+	if runtime == nil {
+		return
+	}
+	runtime.telemetryMu.Lock()
+	defer runtime.telemetryMu.Unlock()
+	for _, sent := range pending.media {
+		if current, ok := runtime.mediaCounts[sent.SiteID]; ok && current == sent {
+			delete(runtime.mediaCounts, sent.SiteID)
+		}
+	}
+	for _, sent := range pending.retention {
+		if current, ok := runtime.retention[sent.SiteID]; ok && current == sent {
+			delete(runtime.retention, sent.SiteID)
+		}
+	}
+	if len(pending.observations) > 0 && len(runtime.observations) >= len(pending.observations) {
+		matches := true
+		for i := range pending.observations {
+			if runtime.observations[i] != pending.observations[i] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			runtime.observations = append([]NodeDynamicObservation(nil), runtime.observations[len(pending.observations):]...)
+		}
+	}
+}
+
+func (runtime *edgeAgentRuntime) telemetrySnapshot() (media []NodeMediaCount, retention []NodeRetentionStatus, observations []NodeDynamicObservation) {
+	pending := runtime.prepareTelemetry()
+	runtime.commitTelemetry(pending)
+	return pending.media, pending.retention, pending.observations
+}
+
+type edgeSiteStatsPending struct {
+	stats   []NodeSiteStat
+	current map[int64]ProxyRuntimeStat
+}
+
+func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
+	pending := edgeSiteStatsPending{}
+	if runtime == nil {
+		return pending
+	}
 	runtime.mu.RLock()
 	bundle := runtime.bundle
 	runtime.mu.RUnlock()
 	if bundle == nil || bundle.manager == nil {
-		return nil
+		return pending
 	}
 	current := bundle.manager.ProxyRuntimeStats()
+	pending.current = make(map[int64]ProxyRuntimeStat, len(current))
 	requestStats := runtime.stats.snapshot()
 	byHost := make(map[string]NodeSiteStat, len(requestStats))
 	for _, value := range requestStats {
 		byHost[value.Host] = value
 	}
-	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
-	if runtime.siteReported == nil {
-		runtime.siteReported = make(map[int64]ProxyRuntimeStat)
+	runtime.mu.RLock()
+	previous := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
+	for siteID, value := range runtime.siteReported {
+		previous[siteID] = value
 	}
-	stats := make([]NodeSiteStat, 0, len(current))
+	runtime.mu.RUnlock()
+	pending.stats = make([]NodeSiteStat, 0, len(current))
 	for _, value := range current {
+		pending.current[value.SiteID] = value
 		identity, ok := bundle.localSites[value.SiteID]
 		if !ok {
 			continue
 		}
-		previous := runtime.siteReported[value.SiteID]
-		inDelta, outDelta := value.CumulativeBytesIn-previous.CumulativeBytesIn, value.CumulativeBytesOut-previous.CumulativeBytesOut
+		prior := previous[value.SiteID]
+		inDelta, outDelta := value.CumulativeBytesIn-prior.CumulativeBytesIn, value.CumulativeBytesOut-prior.CumulativeBytesOut
 		if inDelta < 0 {
 			inDelta = value.CumulativeBytesIn
 		}
@@ -543,10 +691,31 @@ func (runtime *edgeAgentRuntime) siteStatsSnapshot() []NodeSiteStat {
 		observed.RequestCount = value.Requests
 		observed.BytesIn, observed.BytesOut = inDelta, outDelta
 		observed.CumulativeBytesIn, observed.CumulativeBytesOut = value.CumulativeBytesIn, value.CumulativeBytesOut
-		stats = append(stats, observed)
-		runtime.siteReported[value.SiteID] = value
+		pending.stats = append(pending.stats, observed)
 	}
-	return stats
+	return pending
+}
+
+func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
+	if runtime == nil || len(pending.current) == 0 {
+		return
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.siteReported == nil {
+		runtime.siteReported = make(map[int64]ProxyRuntimeStat)
+	}
+	for siteID, sent := range pending.current {
+		if current := runtime.siteReported[siteID]; current == sent || current.CumulativeBytesIn <= sent.CumulativeBytesIn && current.CumulativeBytesOut <= sent.CumulativeBytesOut {
+			runtime.siteReported[siteID] = sent
+		}
+	}
+}
+
+func (runtime *edgeAgentRuntime) siteStatsSnapshot() []NodeSiteStat {
+	pending := runtime.prepareSiteStats()
+	runtime.commitSiteStats(pending)
+	return pending.stats
 }
 
 func edgeDecodeKey(value string) ([]byte, error) {
@@ -800,13 +969,10 @@ func (runtime *edgeAgentRuntime) startServer(port int) error {
 }
 
 func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
-	if config.SchemaVersion != agentConfigSchemaVersion || config.ConfigHash == "" || config.NodeGUID == "" {
-		return errors.New("Agent configuration is invalid")
+	if err := validateAgentConfigEnvelope(config); err != nil {
+		return err
 	}
-	expectedHash, err := agentConfigHash(config)
-	if err != nil || !hmac.Equal([]byte(expectedHash), []byte(config.ConfigHash)) {
-		return errors.New("Agent configuration checksum mismatch")
-	}
+	var err error
 	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
 		return errors.New("Agent port is invalid")
 	}
@@ -864,6 +1030,20 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 		// previous bundle. Stop accepting new requests on it, let active streams
 		// drain, and only force-close them after the bounded grace period.
 		go oldBundle.drain(15 * time.Second)
+	}
+	return nil
+}
+
+func validateAgentConfigEnvelope(config AgentRuntimeConfig) error {
+	if config.SchemaVersion != agentConfigSchemaVersion || config.ConfigHash == "" || config.NodeGUID == "" {
+		return errors.New("Agent configuration is invalid")
+	}
+	expectedHash, err := agentConfigHash(config)
+	if err != nil || !hmac.Equal([]byte(expectedHash), []byte(config.ConfigHash)) {
+		return errors.New("Agent configuration checksum mismatch")
+	}
+	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
+		return errors.New("Agent port is invalid")
 	}
 	return nil
 }
@@ -1291,8 +1471,28 @@ func runEdgeAgent() error {
 		}
 	}
 	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID}
-	if err := runtime.events.initWithKey(filepath.Join(runtime.stateDir, "events"), []byte(state.Token)); err != nil {
-		return err
+	spoolDir := filepath.Join(runtime.stateDir, "events")
+	spoolKey, spoolKeyErr := loadOrCreateSpoolKey(filepath.Join(runtime.stateDir, "spool.key"))
+	if spoolKeyErr != nil {
+		_ = quarantineEventSpool(filepath.Join(runtime.stateDir, "spool.key"))
+		spoolKey, spoolKeyErr = loadOrCreateSpoolKey(filepath.Join(runtime.stateDir, "spool.key"))
+	}
+	if spoolKeyErr != nil {
+		return fmt.Errorf("initialize event spool key: %w", spoolKeyErr)
+	}
+	legacyDigest := sha256.Sum256([]byte(state.Token))
+	if err := runtime.events.initWithRawKey(spoolDir, spoolKey, legacyDigest[:]); err != nil {
+		// Re-enrollment, interrupted upgrades, or manual edits must never trap
+		// systemd in a restart loop. Preserve the corrupt spool for inspection
+		// and continue with an empty queue encrypted by the independent key.
+		if quarantineErr := quarantineEventSpool(filepath.Join(spoolDir, "events.json")); quarantineErr == nil {
+			runtime.eventSpoolError = "event spool quarantined after load failure: " + err.Error()
+			if resetErr := runtime.events.initWithRawKey(spoolDir, spoolKey, nil); resetErr != nil {
+				return fmt.Errorf("reset event spool: %w", resetErr)
+			}
+		} else {
+			return fmt.Errorf("load event spool: %w (quarantine failed: %v)", err, quarantineErr)
+		}
 	}
 	defer runtime.close()
 	wsReporter := newEdgeWSReportClient(controller, state.Token)
@@ -1306,6 +1506,8 @@ func runEdgeAgent() error {
 			var config AgentRuntimeConfig
 			if err := edgeAPIRequest(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config); err != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
+			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
+				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
 				if errors.Is(updateErr, errEdgeAgentUpdated) {
 					return updateErr
@@ -1329,8 +1531,10 @@ func runEdgeAgent() error {
 			report.AppliedConfigHash, report.ListenerError = runtime.status()
 			report.EventSpoolError, report.EventQueueDepth = runtime.eventSpoolStatus()
 			report.EventDropped = runtime.events.droppedCount()
-			report.SiteStats = runtime.siteStatsSnapshot()
-			report.MediaCounts, report.Retention, report.Observations = runtime.telemetrySnapshot()
+			pendingStats := runtime.prepareSiteStats()
+			pendingTelemetry := runtime.prepareTelemetry()
+			report.SiteStats = pendingStats.stats
+			report.MediaCounts, report.Retention, report.Observations = pendingTelemetry.media, pendingTelemetry.retention, pendingTelemetry.observations
 			report.Events = runtime.events.snapshot()
 			ack, wsErr := wsReporter.report(ctx, report)
 			if wsErr != nil {
@@ -1339,6 +1543,8 @@ func runEdgeAgent() error {
 			if wsErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", wsErr)
 			} else {
+				runtime.commitSiteStats(pendingStats)
+				runtime.commitTelemetry(pendingTelemetry)
 				accepted := make(map[int64]bool, len(ack.AcceptedEventIDs))
 				for _, id := range ack.AcceptedEventIDs {
 					accepted[id] = true

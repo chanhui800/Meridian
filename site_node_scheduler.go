@@ -203,6 +203,43 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 	return d.siteNodeSchedule(siteID)
 }
 
+const siteNodeProbeCooldown = 2 * time.Minute
+
+func (d *DB) siteNodeProbeCooldowns(siteID int64, now time.Time) (map[int64]bool, error) {
+	rows, err := d.db.Query("SELECT node_id FROM site_node_probe_failures WHERE site_id=? AND failed_until_ms>?", siteID, now.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make(map[int64]bool)
+	for rows.Next() {
+		var nodeID int64
+		if err := rows.Scan(&nodeID); err != nil {
+			return nil, err
+		}
+		values[nodeID] = true
+	}
+	return values, rows.Err()
+}
+
+func (d *DB) recordSiteNodeProbeFailure(siteID, nodeID int64, probeErr error, now time.Time) error {
+	if siteID <= 0 || nodeID <= 0 || probeErr == nil {
+		return nil
+	}
+	_, err := d.db.Exec(`INSERT INTO site_node_probe_failures(site_id,node_id,failed_until_ms,last_error,updated_at_ms)
+		VALUES(?,?,?,?,?) ON CONFLICT(site_id,node_id) DO UPDATE SET failed_until_ms=excluded.failed_until_ms,last_error=excluded.last_error,updated_at_ms=excluded.updated_at_ms`,
+		siteID, nodeID, now.Add(siteNodeProbeCooldown).UnixMilli(), probeErr.Error(), now.UnixMilli())
+	return err
+}
+
+func (d *DB) clearSiteNodeProbeFailure(siteID, nodeID int64) error {
+	if siteID <= 0 || nodeID <= 0 {
+		return nil
+	}
+	_, err := d.db.Exec("DELETE FROM site_node_probe_failures WHERE site_id=? AND node_id=?", siteID, nodeID)
+	return err
+}
+
 func (d *DB) nodeByAgentToken(token string, now time.Time) (ControlNode, error) {
 	if strings.TrimSpace(token) == "" {
 		return ControlNode{}, errInvalidAgentToken
@@ -238,6 +275,18 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		lastError := strings.TrimSpace(value.LastError)
 		if value.Mode == "fixed" {
 			desired = value.FixedNodeID
+		} else if snapshot.Scheduler.Mode == "auto" {
+			cooldowns, cooldownErr := a.db.siteNodeProbeCooldowns(value.SiteID, now)
+			if cooldownErr != nil {
+				return cooldownErr
+			}
+			desired = 0
+			for _, candidate := range snapshot.Nodes {
+				if nodeEligible(candidate) && !cooldowns[candidate.ID] {
+					desired = candidate.ID
+					break
+				}
+			}
 		}
 		if desired <= 0 || !eligible[desired] {
 			desired = 0
@@ -380,16 +429,20 @@ func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig,
 		if a.panelCertificates == nil {
 			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")
 		}
-		if strings.TrimSpace(a.panelCertificates.edgeCertFile) == "" || strings.TrimSpace(a.panelCertificates.edgeKeyFile) == "" {
-			return AgentRuntimeConfig{}, errors.New("edge TLS certificate and key must be configured separately from the panel certificate")
+		edgeCertFile, edgeKeyFile, pathErr := a.panelCertificates.nodeEdgeTLSPaths(node.GUID)
+		if pathErr != nil {
+			return AgentRuntimeConfig{}, pathErr
 		}
-		config.CertificatePEM, err = readBoundedPrivateFile(a.panelCertificates.edgeCertFile)
+		config.CertificatePEM, err = readBoundedPrivateFile(edgeCertFile)
 		if err != nil {
 			return AgentRuntimeConfig{}, fmt.Errorf("read edge TLS certificate: %w", err)
 		}
-		config.PrivateKeyPEM, err = readBoundedPrivateFile(a.panelCertificates.edgeKeyFile)
+		config.PrivateKeyPEM, err = readBoundedPrivateFile(edgeKeyFile)
 		if err != nil {
 			return AgentRuntimeConfig{}, fmt.Errorf("read edge TLS private key: %w", err)
+		}
+		if _, err := tls.X509KeyPair([]byte(config.CertificatePEM), []byte(config.PrivateKeyPEM)); err != nil {
+			return AgentRuntimeConfig{}, fmt.Errorf("edge TLS certificate/key pair is invalid: %w", err)
 		}
 	}
 	config.ConfigHash, err = agentConfigHash(config)
@@ -478,6 +531,26 @@ func (a *App) handleSiteNodeScheduleByID(w http.ResponseWriter, r *http.Request)
 	if err := decodeJSONBody(w, r, &input); err != nil {
 		a.jsonErr(w, http.StatusBadRequest, "invalid request")
 		return
+	}
+	if input.Enabled {
+		if site, siteErr := a.db.GetSite(id); siteErr == nil {
+			if settings, settingsErr := a.db.PanelSettings(); settingsErr == nil && strings.TrimSpace(settings.RouteDomain) != "" && !wildcardDomainCoversHost(settings.RouteDomain, site.PublicHost) {
+				a.jsonErr(w, http.StatusBadRequest, fmt.Sprintf("edge wildcard certificate does not cover host %q", site.PublicHost))
+				return
+			}
+			if input.Mode == "fixed" && input.FixedNodeID > 0 && a.panelCertificates != nil {
+				if node, nodeErr := a.db.controlNodeByID(input.FixedNodeID, time.Now()); nodeErr == nil {
+					if certFile, _, pathErr := a.panelCertificates.nodeEdgeTLSPaths(node.GUID); pathErr == nil {
+						if _, statErr := os.Stat(certFile); statErr == nil {
+							if certErr := certificateCoversHost(certFile, site.PublicHost); certErr != nil {
+								a.jsonErr(w, http.StatusBadRequest, certErr.Error())
+								return
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	previous, _ := a.db.siteNodeSchedule(id)
 	value, err := a.db.SaveSiteNodeSchedule(id, input.Enabled, input.Mode, input.FixedNodeID, time.Now())
@@ -640,6 +713,16 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if err != nil {
 		return err
 	}
+	if a.panelCertificates == nil {
+		return errors.New("edge TLS certificate is unavailable")
+	}
+	edgeCertFile, _, pathErr := a.panelCertificates.nodeEdgeTLSPaths(node.GUID)
+	if pathErr != nil {
+		return pathErr
+	}
+	if err := certificateCoversHost(edgeCertFile, schedule.PublicHost); err != nil {
+		return err
+	}
 	if node.DesiredConfigHash == "" || node.AppliedConfigHash != node.DesiredConfigHash {
 		return errors.New("Agent has not applied the desired configuration")
 	}
@@ -648,6 +731,9 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	}
 	if err := probeScheduledNode(ctx, node, schedule.PublicHost); err != nil {
 		return fmt.Errorf("entry health check: %w", err)
+	}
+	if err := a.db.clearSiteNodeProbeFailure(schedule.SiteID, node.ID); err != nil {
+		return fmt.Errorf("clear entry health cooldown: %w", err)
 	}
 	ip := net.ParseIP(strings.TrimSpace(node.Address))
 	if ip == nil {
@@ -711,6 +797,14 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 		cancel()
 		if err != nil {
 			log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
+			if value.Mode == "global" && value.DesiredNodeID > 0 && strings.Contains(err.Error(), "entry health check") {
+				var schedulerMode string
+				if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
+					if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
+						log.Printf("[node-scheduler] record site %d probe cooldown failed: %v", value.SiteID, cooldownErr)
+					}
+				}
+			}
 			_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
 		}
 	}

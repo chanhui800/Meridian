@@ -75,7 +75,7 @@ async function loadNodes() {
 
 function showNodeScript(script, command) {
   document.getElementById('modal-title').textContent = 'Agent 一键安装脚本';
-  document.getElementById('modal-body').innerHTML = `${command ? '<p class="node-script-note">推荐直接执行以下命令（不会进入分页器）：</p><textarea class="node-script" id="node-install-command" readonly></textarea>' : ''}<p class="node-script-note">脚本含一次性令牌，24 小时内有效。仅在目标 Linux x86_64 VPS 上以 root 执行。</p><textarea class="node-script" id="node-install-script" readonly></textarea>`;
+  document.getElementById('modal-body').innerHTML = `${command ? '<p class="node-script-note">推荐直接执行以下命令（不会进入分页器）：</p><textarea class="node-script" id="node-install-command" readonly></textarea>' : ''}<p class="node-script-note">脚本含一次性令牌，24 小时内有效。请在目标 Linux amd64 或 arm64 VPS 上以 root 执行。</p><textarea class="node-script" id="node-install-script" readonly></textarea>`;
   document.getElementById('node-install-script').value = script;
   if (command) document.getElementById('node-install-command').value = command;
   document.getElementById('modal-footer').innerHTML = `${command ? '<button type="button" class="node-button" id="node-copy-command">复制一键命令</button>' : ''}<button type="button" class="node-button" id="node-copy-script">复制脚本</button><button type="button" class="node-button is-primary" id="node-close-script">完成</button>`;

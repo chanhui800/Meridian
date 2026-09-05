@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/aes"
@@ -80,6 +81,122 @@ type panelCertificateManager struct {
 	mu                 sync.Mutex
 	issuing            bool
 	currentCertificate *tls.Certificate
+}
+
+// nodeEdgeTLSPaths returns an isolated certificate pair for one Agent.  The
+// legacy edgeCertFile/edgeKeyFile pair is retained for migration and CLI
+// compatibility, but runtime Agent configurations must use this per-node
+// directory so compromising one node cannot expose another node's key.
+func (m *panelCertificateManager) nodeEdgeTLSPaths(nodeGUID string) (string, string, error) {
+	if m == nil || strings.TrimSpace(m.edgeCertFile) == "" || strings.TrimSpace(m.edgeKeyFile) == "" {
+		return "", "", errors.New("edge TLS certificate paths are unavailable")
+	}
+	guid := strings.TrimSpace(nodeGUID)
+	if guid == "" || strings.ContainsAny(guid, `/\\`) || guid == "." || guid == ".." {
+		return "", "", errors.New("node GUID is invalid")
+	}
+	for _, r := range guid {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return "", "", errors.New("node GUID is invalid")
+		}
+	}
+	root := filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes", guid)
+	current := filepath.Join(root, "current")
+	return filepath.Join(current, "fullchain.pem"), filepath.Join(current, "privkey.pem"), nil
+}
+
+// installCertificatePairAtomic writes both TLS files into an immutable
+// generation and atomically switches one current-directory pointer.  Readers
+// therefore observe a matching certificate/key pair even during renewal.
+func installCertificatePairAtomic(certFile, keyFile string, certPEM, keyPEM []byte) error {
+	if strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" || filepath.Dir(certFile) != filepath.Dir(keyFile) {
+		return errors.New("certificate and key paths must share a directory")
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return fmt.Errorf("certificate/key pair is invalid: %w", err)
+	}
+	currentDir := filepath.Dir(certFile)
+	root := filepath.Dir(currentDir)
+	generations := filepath.Join(root, "generations")
+	if err := os.MkdirAll(generations, 0o700); err != nil { // #nosec G703 -- paths are derived from validated administrator-controlled TLS locations.
+		return err
+	}
+	generation, err := os.MkdirTemp(generations, "generation-")
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.RemoveAll(generation) // #nosec G703 -- generation is created by MkdirTemp beneath the private TLS directory.
+		}
+	}()
+	if err := writePrivateFileAtomic(filepath.Join(generation, "fullchain.pem"), certPEM); err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(filepath.Join(generation, "privkey.pem"), keyPEM); err != nil {
+		return err
+	}
+	// Linux production uses an atomic symlink replacement. Windows test/dev
+	// environments may not permit symlinks, so retain a safe pair-wise fallback.
+	tmpLink := currentDir + ".next"
+	_ = os.Remove(tmpLink)                                                                                     // #nosec G703 -- tmpLink is derived from the validated current directory.
+	if err := os.Symlink(filepath.Join("..", "generations", filepath.Base(generation)), tmpLink); err == nil { // #nosec G703 -- link target is generated beneath the private TLS directory.
+		if err := os.Rename(tmpLink, currentDir); err != nil { // #nosec G703 -- both paths are generated within the private TLS directory.
+			_ = os.Remove(tmpLink) // #nosec G703 -- tmpLink is generated within the private TLS directory.
+			return err
+		}
+		keep = true
+		return nil
+	}
+	if err := os.MkdirAll(currentDir, 0o700); err != nil { // #nosec G703 -- currentDir is derived from validated TLS paths.
+		return err
+	}
+	if err := writePrivateFileAtomic(certFile, certPEM); err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(keyFile, keyPEM); err != nil {
+		return err
+	}
+	keep = true
+	return nil
+}
+
+// validatePanelEdgeKeySeparation prevents an accidentally reused private key
+// from being accepted at startup. Missing edge files are allowed so automatic
+// provisioning can create the first per-node pair.
+func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.edgeCertFile == "" || m.edgeKeyFile == "" {
+		return nil
+	}
+	panelPair, panelErr := tls.LoadX509KeyPair(m.certFile, m.keyFile)
+	edgePair, edgeErr := tls.LoadX509KeyPair(m.edgeCertFile, m.edgeKeyFile)
+	if errors.Is(panelErr, os.ErrNotExist) || errors.Is(edgeErr, os.ErrNotExist) {
+		return nil
+	}
+	if panelErr != nil || edgeErr != nil {
+		return nil
+	}
+	panelCert, err := x509.ParseCertificate(panelPair.Certificate[0])
+	if err != nil {
+		return nil
+	}
+	edgeCert, err := x509.ParseCertificate(edgePair.Certificate[0])
+	if err != nil {
+		return nil
+	}
+	panelSPKI, err := x509.MarshalPKIXPublicKey(panelCert.PublicKey)
+	if err != nil {
+		return nil
+	}
+	edgeSPKI, err := x509.MarshalPKIXPublicKey(edgeCert.PublicKey)
+	if err != nil {
+		return nil
+	}
+	if bytes.Equal(panelSPKI, edgeSPKI) {
+		return errors.New("panel TLS and edge TLS use the same private key; configure a dedicated edge certificate")
+	}
+	return nil
 }
 
 type issuedPanelCertificate struct {
@@ -217,6 +334,70 @@ func certificateNeedsRenewal(status panelCertificateStatus) bool {
 
 func certificateCanBeReused(status panelCertificateStatus) bool {
 	return status.CertificateCurrent && status.CertificateValid && !certificateNeedsRenewal(status)
+}
+
+func certificateStatusForFile(certFile string, expectedWildcard string) panelCertificateStatus {
+	status := panelCertificateStatus{WildcardDomain: expectedWildcard}
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- path is derived from the administrator-controlled TLS directory.
+	if err != nil {
+		return status
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return status
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return status
+	}
+	status.Configured = true
+	status.CertificateValid = time.Now().Before(certificate.NotAfter)
+	for _, name := range certificate.DNSNames {
+		if strings.HasPrefix(name, "*.") {
+			status.CertificateWildcardDomain = strings.ToLower(name)
+			break
+		}
+	}
+	status.CertificateCurrent = expectedWildcard == "" || strings.EqualFold(status.CertificateWildcardDomain, expectedWildcard)
+	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
+	status.DaysRemaining = int(time.Until(certificate.NotAfter).Hours() / 24)
+	if status.DaysRemaining < 0 {
+		status.DaysRemaining = 0
+	}
+	return status
+}
+
+func certificateCoversHost(certFile, host string) error {
+	data, err := os.ReadFile(certFile) // #nosec G304 -- path is derived from the administrator-controlled TLS directory.
+	if err != nil {
+		return fmt.Errorf("read edge TLS certificate: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return errors.New("edge TLS certificate is invalid")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse edge TLS certificate: %w", err)
+	}
+	if err := certificate.VerifyHostname(strings.TrimSpace(host)); err != nil {
+		return fmt.Errorf("edge TLS certificate does not cover host %q", host)
+	}
+	return nil
+}
+
+func wildcardDomainCoversHost(routeDomain, host string) bool {
+	route := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+	value := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if route == "" || value == "" {
+		return true
+	}
+	suffix := "." + route
+	if !strings.HasSuffix(value, suffix) {
+		return false
+	}
+	label := strings.TrimSuffix(value, suffix)
+	return label != "" && !strings.Contains(label, ".")
 }
 
 func panelACMETokenKeyForSecret(secret []byte) []byte {

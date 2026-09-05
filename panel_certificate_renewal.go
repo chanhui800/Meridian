@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -25,10 +26,12 @@ func runPanelCertificateRenewalScheduler(ctx context.Context, db *DB, manager *p
 			if len(restart) > 0 && restart[0] != nil {
 				restart[0]()
 			}
-			return
 		}
 		if err := renewPanelCertificateIfDue(checkCtx, db, manager); err != nil && !errors.Is(err, errCertificateIssuanceBusy) && !errors.Is(err, context.Canceled) {
 			log.Printf("[panel-certificate] automatic renewal failed: %v", err)
+		}
+		if err := renewEdgeCertificatesIfDue(checkCtx, db, manager); err != nil && !errors.Is(err, errCertificateIssuanceBusy) && !errors.Is(err, context.Canceled) {
+			log.Printf("[edge-certificate] automatic renewal failed: %v", err)
 		}
 	}
 	go check()
@@ -42,6 +45,61 @@ func runPanelCertificateRenewalScheduler(ctx context.Context, db *DB, manager *p
 			return
 		}
 	}
+}
+
+// renewEdgeCertificatesIfDue provisions an independent certificate/key pair
+// for every enrolled node. A missing, expiring, invalid, or hostname-mismatched
+// pair is replaced in its own generation directory without touching panel TLS.
+func renewEdgeCertificatesIfDue(ctx context.Context, db *DB, manager *panelCertificateManager) error {
+	if db == nil || manager == nil {
+		return nil
+	}
+	settings, err := db.PanelSettings()
+	if err != nil {
+		return err
+	}
+	if !settings.Configured || strings.TrimSpace(settings.RouteDomain) == "" || jwtSecretEphemeral || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(settings.ACMEDNSProvider))
+	if provider == "" {
+		provider = "cloudflare"
+	}
+	if provider != "cloudflare" {
+		return errors.New("automatic edge renewal supports Cloudflare DNS only")
+	}
+	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
+	if err != nil {
+		return errors.New("无法解密已保存的 DNS API Token")
+	}
+	nodes, err := db.listControlNodes(time.Now())
+	if err != nil {
+		return err
+	}
+	wildcard := wildcardDomainForSettings(settings)
+	for _, node := range nodes {
+		if strings.TrimSpace(node.GUID) == "" {
+			continue
+		}
+		certFile, keyFile, pathErr := manager.nodeEdgeTLSPaths(node.GUID)
+		if pathErr != nil {
+			return pathErr
+		}
+		status := certificateStatusForFile(certFile, wildcard)
+		_, pairErr := tls.LoadX509KeyPair(certFile, keyFile)
+		if status.Configured && pairErr == nil && status.CertificateValid && status.CertificateCurrent && status.DaysRemaining > int(panelCertificateRenewalWindow.Hours()/24) {
+			continue
+		}
+		issued, issueErr := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
+		if issueErr != nil {
+			return fmt.Errorf("issue edge certificate for node %s: %w", node.Name, issueErr)
+		}
+		if installErr := installCertificatePairAtomic(certFile, keyFile, issued.certPEM, issued.keyPEM); installErr != nil {
+			return fmt.Errorf("install edge certificate for node %s: %w", node.Name, installErr)
+		}
+		log.Printf("[edge-certificate] certificate renewed for node %s (*.%s)", node.Name, settings.RouteDomain)
+	}
+	return nil
 }
 
 // disableExpiredPanelTLSIfNeeded makes an expired certificate a recoverable
