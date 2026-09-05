@@ -331,6 +331,9 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		if status == "" || status == "disabled" {
 			status = "pending"
 		}
+		if desired != value.DesiredNodeID {
+			status = "pending"
+		}
 		if desired != value.DesiredNodeID || status != value.DNSStatus || lastError != value.LastError {
 			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
 				nullableNodeID(desired), status, lastError, now.UnixMilli(), value.SiteID); err != nil {

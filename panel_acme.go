@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,7 +82,64 @@ type panelCertificateManager struct {
 
 	mu                 sync.Mutex
 	issuing            bool
+	issueGate          chan struct{}
 	currentCertificate *tls.Certificate
+}
+
+// panelPairPaths returns the currently active panel certificate pair.  The
+// legacy fullchain.pem/privkey.pem files remain readable for upgrades, while
+// renewals switch a sibling pointer atomically so cert and key always match.
+func (m *panelCertificateManager) panelPairPaths() (string, string) {
+	if m == nil || strings.TrimSpace(m.certFile) == "" || strings.TrimSpace(m.keyFile) == "" {
+		return "", ""
+	}
+	currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
+		return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+	}
+	return m.certFile, m.keyFile
+}
+
+func (m *panelCertificateManager) panelAtomicPairPaths() (string, string) {
+	if m == nil || strings.TrimSpace(m.certFile) == "" {
+		return "", ""
+	}
+	currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+	return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+}
+
+func (m *panelCertificateManager) acquireIssue(ctx context.Context) error {
+	if m == nil {
+		return errors.New("certificate manager is unavailable")
+	}
+	m.mu.Lock()
+	if m.issueGate == nil {
+		m.issueGate = make(chan struct{}, 1)
+	}
+	gate := m.issueGate
+	m.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		m.mu.Lock()
+		m.issuing = true
+		m.mu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *panelCertificateManager) releaseIssue() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	gate := m.issueGate
+	m.issuing = false
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 }
 
 // nodeEdgeTLSPaths returns an isolated certificate pair for one Agent.  The
@@ -243,7 +301,8 @@ func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
 	if m == nil || m.certFile == "" || m.keyFile == "" || m.edgeCertFile == "" || m.edgeKeyFile == "" {
 		return nil
 	}
-	panelPair, panelErr := tls.LoadX509KeyPair(m.certFile, m.keyFile)
+	panelCertFile, panelKeyFile := m.panelPairPaths()
+	panelPair, panelErr := tls.LoadX509KeyPair(panelCertFile, panelKeyFile)
 	if errors.Is(panelErr, os.ErrNotExist) {
 		return nil
 	}
@@ -337,6 +396,26 @@ func panelTLSPaths(dbPath string) (certFile, keyFile string) {
 	return filepath.Join(base, "fullchain.pem"), filepath.Join(base, "privkey.pem")
 }
 
+func panelTLSBackupPaths(dbPath string) (certFile, keyFile string) {
+	certFile, keyFile = panelTLSPaths(dbPath)
+	if certFile == "" {
+		return certFile, keyFile
+	}
+	currentDir := filepath.Join(filepath.Dir(certFile), ".panel-current")
+	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
+		return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+	}
+	return certFile, keyFile
+}
+
+func edgeNodeTLSRoot(dbPath string) string {
+	certFile, _ := edgeTLSPaths(dbPath)
+	if strings.TrimSpace(certFile) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(certFile), "edge-nodes")
+}
+
 // edgeTLSPaths deliberately has its own certificate and key.  Edge nodes are
 // untrusted execution environments relative to the panel; the panel key must
 // never be included in an Agent runtime configuration.
@@ -370,6 +449,7 @@ func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCe
 		edgeKeyFile:  edgeKeyFile,
 		accountDir:   accountDir,
 		httpClient:   httpClient,
+		issueGate:    make(chan struct{}, 1),
 	}
 }
 
@@ -392,7 +472,8 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	status.Issuing = m.issuing
-	data, err := os.ReadFile(m.certFile) // #nosec G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
+	certFile, _ := m.panelPairPaths()
+	data, err := os.ReadFile(certFile) // #nosec G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
 	if err != nil {
 		return status
 	}
@@ -412,7 +493,8 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 		}
 	}
 	status.CertificateCurrent = status.CertificateWildcardDomain != "" && status.CertificateWildcardDomain == status.WildcardDomain
-	status.CertificateValid = time.Now().Before(certificate.NotAfter)
+	now := time.Now()
+	status.CertificateValid = !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
 	status.Subject = certificate.Subject.CommonName
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
 	days := int(time.Until(certificate.NotAfter).Hours() / 24)
@@ -446,7 +528,8 @@ func certificateStatusForFile(certFile string, expectedWildcard string) panelCer
 		return status
 	}
 	status.Configured = true
-	status.CertificateValid = time.Now().Before(certificate.NotAfter)
+	now := time.Now()
+	status.CertificateValid = !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
 	for _, name := range certificate.DNSNames {
 		if strings.HasPrefix(name, "*.") {
 			status.CertificateWildcardDomain = strings.ToLower(name)
@@ -477,6 +560,48 @@ func certificateCoversHost(certFile, host string) error {
 	}
 	if err := certificate.VerifyHostname(strings.TrimSpace(host)); err != nil {
 		return fmt.Errorf("edge TLS certificate does not cover host %q", host)
+	}
+	return nil
+}
+
+// verifyCertificateChainForHost validates the complete PEM chain against the
+// host's system trust store.  Hostname-only checks are insufficient for edge
+// reuse because a self-signed or not-yet-valid certificate can still contain
+// the expected SAN.
+func verifyCertificateChainForHost(certFile, host string) error {
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- path is derived from administrator-controlled TLS configuration.
+	if err != nil {
+		return fmt.Errorf("read edge TLS certificate: %w", err)
+	}
+	var chain []*x509.Certificate
+	for rest := data; len(rest) > 0; {
+		block, remaining := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = remaining
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			return fmt.Errorf("parse edge TLS certificate: %w", parseErr)
+		}
+		chain = append(chain, cert)
+	}
+	if len(chain) == 0 {
+		return errors.New("edge TLS certificate chain is empty")
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		return errors.New("system trust store is unavailable")
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range chain[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := chain[0].Verify(x509.VerifyOptions{DNSName: strings.TrimSpace(host), CurrentTime: time.Now(), Roots: roots, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		return fmt.Errorf("edge TLS certificate chain is not trusted: %w", err)
 	}
 	return nil
 }
@@ -561,7 +686,8 @@ func (m *panelCertificateManager) tlsConfig(enabled bool) (*tls.Config, bool, er
 	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
 		return nil, false, errors.New("panel TLS certificate storage is unavailable")
 	}
-	certificate, err := tls.LoadX509KeyPair(m.certFile, m.keyFile)
+	certFile, keyFile := m.panelPairPaths()
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, false, fmt.Errorf("load panel TLS certificate: %w", err)
 	}
@@ -641,18 +767,10 @@ func (m *panelCertificateManager) issueCloudflareForIdentifiers(ctx context.Cont
 	if err := validatePanelCertificateRequest(email, token); err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	if m.issuing {
-		m.mu.Unlock()
-		return nil, errCertificateIssuanceBusy
+	if err := m.acquireIssue(ctx); err != nil {
+		return nil, err
 	}
-	m.issuing = true
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		m.issuing = false
-		m.mu.Unlock()
-	}()
+	defer m.releaseIssue()
 
 	if err := os.MkdirAll(m.accountDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create TLS directory: %w", err)
@@ -721,11 +839,12 @@ func (m *panelCertificateManager) install(issued *issuedPanelCertificate, activa
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := writePrivateFileAtomic(m.keyFile, issued.keyPEM); err != nil {
-		return fmt.Errorf("write certificate key: %w", err)
+	certFile, keyFile := m.panelAtomicPairPaths()
+	if certFile == "" || keyFile == "" {
+		return errors.New("panel TLS certificate storage is unavailable")
 	}
-	if err := writePrivateFileAtomic(m.certFile, issued.certPEM); err != nil {
-		return fmt.Errorf("write certificate chain: %w", err)
+	if err := installCertificatePairAtomic(certFile, keyFile, issued.certPEM, issued.keyPEM); err != nil {
+		return fmt.Errorf("install certificate pair: %w", err)
 	}
 	if err := writePrivateFileAtomic(filepath.Join(m.accountDir, "enabled"), []byte("enabled\n")); err != nil {
 		return fmt.Errorf("write panel TLS enabled marker: %w", err)
@@ -804,10 +923,11 @@ func (m *panelCertificateManager) backupInstalledFiles() (installedPanelCertific
 	defer m.mu.Unlock()
 	var backup installedPanelCertificateBackup
 	var err error
-	if backup.certPEM, backup.certExists, err = readOptionalFile(m.certFile); err != nil {
+	certFile, keyFile := m.panelPairPaths()
+	if backup.certPEM, backup.certExists, err = readOptionalFile(certFile); err != nil {
 		return installedPanelCertificateBackup{}, fmt.Errorf("back up certificate chain: %w", err)
 	}
-	if backup.keyPEM, backup.keyExists, err = readOptionalFile(m.keyFile); err != nil {
+	if backup.keyPEM, backup.keyExists, err = readOptionalFile(keyFile); err != nil {
 		return installedPanelCertificateBackup{}, fmt.Errorf("back up certificate key: %w", err)
 	}
 	markerFile := filepath.Join(m.accountDir, "enabled")
@@ -834,15 +954,32 @@ func (m *panelCertificateManager) restoreInstalledFiles(backup installedPanelCer
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := restoreOptionalFile(m.keyFile, backup.keyPEM, backup.keyExists); err != nil {
-		return fmt.Errorf("restore certificate key: %w", err)
-	}
-	if err := restoreOptionalFile(m.certFile, backup.certPEM, backup.certExists); err != nil {
-		return fmt.Errorf("restore certificate chain: %w", err)
+	certFile, keyFile := m.panelPairPaths()
+	if backup.certExists && backup.keyExists {
+		atomicCert, atomicKey := m.panelAtomicPairPaths()
+		if err := installCertificatePairAtomic(atomicCert, atomicKey, backup.certPEM, backup.keyPEM); err != nil {
+			return fmt.Errorf("restore certificate pair: %w", err)
+		}
+	} else {
+		// No previous pair means this was the first installation. Remove the
+		// newly-created atomic pointer before restoring the legacy paths.
+		currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+		if err := os.Remove(currentDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if removeAllErr := os.RemoveAll(currentDir); removeAllErr != nil {
+				return fmt.Errorf("remove new certificate pointer: %w", err)
+			}
+		}
+		if err := restoreOptionalFile(keyFile, backup.keyPEM, backup.keyExists); err != nil {
+			return fmt.Errorf("restore certificate key: %w", err)
+		}
+		if err := restoreOptionalFile(certFile, backup.certPEM, backup.certExists); err != nil {
+			return fmt.Errorf("restore certificate chain: %w", err)
+		}
 	}
 	if err := restoreOptionalFile(filepath.Join(m.accountDir, "enabled"), backup.marker, backup.markerExists); err != nil {
 		return fmt.Errorf("restore TLS marker: %w", err)
 	}
+	m.currentCertificate = nil
 	return nil
 }
 
@@ -991,17 +1128,56 @@ func fulfillCloudflareDNSAuthorization(ctx context.Context, acmeClient *acme.Cli
 	return nil
 }
 
+func dnsPropagationResolvers() []*net.Resolver {
+	servers := strings.Split(strings.TrimSpace(os.Getenv("DNS_PROPAGATION_RESOLVERS")), ",")
+	if len(servers) == 1 && strings.TrimSpace(servers[0]) == "" {
+		servers = []string{"1.1.1.1", "8.8.8.8"}
+	}
+	resolvers := make([]*net.Resolver, 0, len(servers)+1)
+	for _, server := range servers {
+		server = strings.TrimSpace(server)
+		if net.ParseIP(server) == nil {
+			continue
+		}
+		resolverIP := server
+		resolvers = append(resolvers, &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "udp", net.JoinHostPort(resolverIP, "53"))
+		}})
+	}
+	// Keep the host resolver as a final fallback for split-horizon DNS and
+	// environments that intentionally block public recursive resolvers.
+	resolvers = append(resolvers, net.DefaultResolver)
+	return resolvers
+}
+
+func dnsPropagationTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("DNS_PROPAGATION_TIMEOUT"))
+	if value == "" {
+		return 2 * time.Minute
+	}
+	if duration, err := time.ParseDuration(value); err == nil && duration >= 10*time.Second && duration <= 15*time.Minute {
+		return duration
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 10 && seconds <= 900 {
+		return time.Duration(seconds) * time.Second
+	}
+	return 2 * time.Minute
+}
+
 func waitForTXTRecord(ctx context.Context, name, value string) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	timeout := time.NewTimer(2 * time.Minute)
+	timeout := time.NewTimer(dnsPropagationTimeout())
 	defer timeout.Stop()
+	resolvers := dnsPropagationResolvers()
 	for {
-		records, err := net.DefaultResolver.LookupTXT(ctx, name)
-		if err == nil {
-			for _, record := range records {
-				if record == value {
-					return nil
+		for _, resolver := range resolvers {
+			records, err := resolver.LookupTXT(ctx, name)
+			if err == nil {
+				for _, record := range records {
+					if record == value {
+						return nil
+					}
 				}
 			}
 		}
@@ -1009,7 +1185,7 @@ func waitForTXTRecord(ctx context.Context, name, value string) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timeout.C:
-			return fmt.Errorf("DNS-01 record %s did not propagate within two minutes", name)
+			return fmt.Errorf("DNS-01 record %s did not propagate within %s", name, dnsPropagationTimeout())
 		case <-ticker.C:
 		}
 	}

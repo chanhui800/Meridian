@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const edgeCertificateRenewalTimeout = 3 * time.Minute
+const (
+	edgeCertificateRenewalTimeout = 3 * time.Minute
+	edgeCertificateBatchTimeout   = 30 * time.Minute
+)
 
 func edgeCertificateHost(routeDomain, nodeGUID string) string {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(nodeGUID)))
@@ -36,23 +39,28 @@ func runPanelCertificateRenewalScheduler(ctx context.Context, db *DB, manager *p
 		return
 	}
 	check := func() {
-		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-		defer cancel()
-		disabled, err := disableExpiredPanelTLSIfNeeded(db, manager)
-		if err != nil {
-			log.Printf("[panel-certificate] automatic HTTPS fallback failed: %v", err)
-			return
+		panelCtx, panelCancel := context.WithTimeout(ctx, 5*time.Minute)
+		recovered, renewErr := renewPanelCertificateIfDue(panelCtx, db, manager)
+		panelCancel()
+		if renewErr != nil && !errors.Is(renewErr, errCertificateIssuanceBusy) && !errors.Is(renewErr, context.Canceled) {
+			log.Printf("[panel-certificate] automatic renewal failed: %v", renewErr)
 		}
-		if disabled {
-			if len(restart) > 0 && restart[0] != nil {
+		if recovered && len(restart) > 0 && restart[0] != nil {
+			restart[0]()
+		}
+		if !recovered {
+			disabled, fallbackErr := disableExpiredPanelTLSIfNeeded(db, manager)
+			if fallbackErr != nil {
+				log.Printf("[panel-certificate] automatic HTTPS fallback failed: %v", fallbackErr)
+			} else if disabled && len(restart) > 0 && restart[0] != nil {
 				restart[0]()
 			}
 		}
-		if err := renewPanelCertificateIfDue(checkCtx, db, manager); err != nil && !errors.Is(err, errCertificateIssuanceBusy) && !errors.Is(err, context.Canceled) {
-			log.Printf("[panel-certificate] automatic renewal failed: %v", err)
-		}
-		if err := renewEdgeCertificatesIfDue(checkCtx, db, manager); err != nil && !errors.Is(err, errCertificateIssuanceBusy) && !errors.Is(err, context.Canceled) {
-			log.Printf("[edge-certificate] automatic renewal failed: %v", err)
+		edgeCtx, edgeCancel := context.WithTimeout(ctx, edgeCertificateBatchTimeout)
+		edgeErr := renewEdgeCertificatesIfDue(edgeCtx, db, manager)
+		edgeCancel()
+		if edgeErr != nil && !errors.Is(edgeErr, errCertificateIssuanceBusy) && !errors.Is(edgeErr, context.Canceled) {
+			log.Printf("[edge-certificate] automatic renewal failed: %v", edgeErr)
 		}
 	}
 	go check()
@@ -129,7 +137,8 @@ func ensureEdgeCertificateForNode(ctx context.Context, settings PanelSettings, t
 	status := certificateStatusForFile(certFile, wildcard)
 	_, pairErr := tls.LoadX509KeyPair(certFile, keyFile)
 	hostErr := certificateCoversHost(certFile, uniqueHost)
-	if status.Configured && pairErr == nil && status.CertificateValid && status.CertificateCurrent && hostErr == nil && status.DaysRemaining > int(panelCertificateRenewalWindow.Hours()/24) {
+	chainErr := verifyCertificateChainForHost(certFile, uniqueHost)
+	if status.Configured && pairErr == nil && status.CertificateValid && status.CertificateCurrent && hostErr == nil && chainErr == nil && status.DaysRemaining > int(panelCertificateRenewalWindow.Hours()/24) {
 		return false, nil
 	}
 	issued, issueErr := manager.issueCloudflareForIdentifiers(ctx, settings.ACMEEmail, token, settings.RouteDomain, edgeCertificateIdentifiers(settings.RouteDomain, node.GUID), settings.ACMEStaging)
@@ -173,14 +182,17 @@ func disableExpiredPanelTLSIfNeeded(db *DB, manager *panelCertificateManager) (b
 	if err != nil {
 		return false, err
 	}
-	if !settings.TLSEnabled || !settings.Configured || settings.PanelDomain == "" || settings.RouteDomain == "" {
+	if !settings.Configured || settings.PanelDomain == "" || settings.RouteDomain == "" {
+		return false, nil
+	}
+	if !settings.TLSEnabled {
 		return false, nil
 	}
 	status := manager.status(settings, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, settings.TLSEnabled)
 	if status.Issuing || !status.Configured || status.CertificateValid {
 		return false, nil
 	}
-	if err := db.SetPanelTLSEnabled(false); err != nil {
+	if err := db.setPanelTLSExpiredFallback(); err != nil {
 		return false, fmt.Errorf("disable expired panel TLS in settings: %w", err)
 	}
 	if err := manager.disable(); err != nil {
@@ -190,44 +202,54 @@ func disableExpiredPanelTLSIfNeeded(db *DB, manager *panelCertificateManager) (b
 	return true, nil
 }
 
-func renewPanelCertificateIfDue(ctx context.Context, db *DB, manager *panelCertificateManager) error {
+func renewPanelCertificateIfDue(ctx context.Context, db *DB, manager *panelCertificateManager) (bool, error) {
 	settings, err := db.PanelSettings()
 	if err != nil {
-		return err
+		return false, err
 	}
-	if !settings.TLSEnabled || !settings.Configured || settings.PanelDomain == "" || settings.RouteDomain == "" {
-		return nil
+	if !settings.Configured || settings.PanelDomain == "" || settings.RouteDomain == "" {
+		return false, nil
+	}
+	if !settings.TLSEnabled && settings.TLSDisabledReason != panelTLSDisabledReasonExpiredFallback {
+		return false, nil
 	}
 	if jwtSecretEphemeral || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
-		return nil
+		return false, nil
 	}
 	status := manager.status(settings, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, settings.TLSEnabled)
 	if !certificateNeedsRenewal(status) {
-		return nil
+		return false, nil
 	}
 	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
 	if err != nil {
-		return errors.New("无法解密已保存的 DNS API Token")
+		return false, errors.New("无法解密已保存的 DNS API Token")
 	}
 	provider := strings.ToLower(strings.TrimSpace(settings.ACMEDNSProvider))
 	if provider == "" {
 		provider = "cloudflare"
 	}
 	if provider != "cloudflare" {
-		return errors.New("自动续签暂仅支持 Cloudflare DNS")
+		return false, errors.New("自动续签暂仅支持 Cloudflare DNS")
 	}
 	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
 	if err != nil {
-		return err
+		return false, err
 	}
 	backup, err := manager.backupInstalledFiles()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := manager.install(issued, true); err != nil {
 		_ = manager.restoreInstalledFiles(backup)
-		return err
+		return false, err
+	}
+	recovered := !settings.TLSEnabled && settings.TLSDisabledReason == panelTLSDisabledReasonExpiredFallback
+	if recovered {
+		if err := db.SetPanelTLSEnabled(true); err != nil {
+			_ = manager.restoreInstalledFiles(backup)
+			return false, fmt.Errorf("re-enable panel TLS after renewal: %w", err)
+		}
 	}
 	log.Printf("[panel-certificate] wildcard certificate renewed for *.%s", settings.RouteDomain)
-	return nil
+	return recovered, nil
 }

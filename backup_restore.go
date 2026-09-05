@@ -310,13 +310,14 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 		return nil, err
 	}
 	if includeTLS {
-		certFile, keyFile := panelTLSPaths(a.dbPath)
+		certFile, keyFile := panelTLSBackupPaths(a.dbPath)
+		panelCertFile, _ := panelTLSPaths(a.dbPath)
 		tlsCandidates := []struct{ name, path string }{
 			{backupTLSCertificate, certFile},
 			{backupTLSPrivateKey, keyFile},
 		}
-		if certFile != "" {
-			tlsDir := filepath.Dir(certFile)
+		if panelCertFile != "" {
+			tlsDir := filepath.Dir(panelCertFile)
 			tlsCandidates = append(tlsCandidates,
 				struct{ name, path string }{backupTLSEnabled, filepath.Join(tlsDir, "enabled")},
 				struct{ name, path string }{backupACMEAccount, filepath.Join(tlsDir, "acme-account.pem")},
@@ -338,8 +339,7 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 		// Per-node Edge certificates live behind an atomic current pointer.
 		// Back up the resolved pair under stable archive names; restore rebuilds
 		// each node's current directory from these files.
-		if certFile != "" {
-			edgeRoot := filepath.Join(filepath.Dir(certFile), "edge-nodes")
+		if edgeRoot := edgeNodeTLSRoot(a.dbPath); edgeRoot != "" {
 			entries, readErr := os.ReadDir(edgeRoot)
 			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 				return nil, fmt.Errorf("读取 Edge 节点证书目录: %w", readErr)
@@ -905,8 +905,35 @@ func copyPrivateFile(source, target string) error {
 	return writePrivateFileAtomic(target, data)
 }
 
+func isPanelCertificatePairEntry(entry string) bool {
+	return entry == backupTLSCertificate || entry == backupTLSPrivateKey
+}
+
+func restorePanelCertificatePair(dbPath, sourceDir string) (bool, error) {
+	certSource := filepath.Join(sourceDir, filepath.FromSlash(backupTLSCertificate))
+	keySource := filepath.Join(sourceDir, filepath.FromSlash(backupTLSPrivateKey))
+	certPEM, certErr := os.ReadFile(certSource) // #nosec G304 -- source is an allowlisted restore directory and fixed TLS entry.
+	keyPEM, keyErr := os.ReadFile(keySource)    // #nosec G304 -- source is an allowlisted restore directory and fixed TLS entry.
+	if errors.Is(certErr, os.ErrNotExist) || errors.Is(keyErr, os.ErrNotExist) {
+		return false, nil
+	}
+	if certErr != nil {
+		return false, certErr
+	}
+	if keyErr != nil {
+		return false, keyErr
+	}
+	manager := newPanelCertificateManager(dbPath, nil)
+	certTarget, keyTarget := manager.panelAtomicPairPaths()
+	if certTarget == "" || keyTarget == "" {
+		return false, errors.New("panel TLS certificate storage is unavailable")
+	}
+	return true, installCertificatePairAtomic(certTarget, keyTarget, certPEM, keyPEM)
+}
+
 func targetTLSPath(dbPath, entry string) string {
-	certFile, keyFile := panelTLSPaths(dbPath)
+	certFile, keyFile := panelTLSBackupPaths(dbPath)
+	panelCertFile, _ := panelTLSPaths(dbPath)
 	if certFile == "" {
 		return ""
 	}
@@ -916,11 +943,11 @@ func targetTLSPath(dbPath, entry string) string {
 	case backupTLSPrivateKey:
 		return keyFile
 	case backupTLSEnabled:
-		return filepath.Join(filepath.Dir(certFile), "enabled")
+		return filepath.Join(filepath.Dir(panelCertFile), "enabled")
 	case backupACMEAccount:
-		return filepath.Join(filepath.Dir(certFile), "acme-account.pem")
+		return filepath.Join(filepath.Dir(panelCertFile), "acme-account.pem")
 	case backupACMEAccountStaging:
-		return filepath.Join(filepath.Dir(certFile), "acme-account-staging.pem")
+		return filepath.Join(filepath.Dir(panelCertFile), "acme-account-staging.pem")
 	default:
 		if !strings.HasPrefix(entry, backupTLSEdgeNodesPrefix) {
 			return ""
@@ -932,7 +959,11 @@ func targetTLSPath(dbPath, entry string) string {
 		if _, ok := backupEntryLimit(entry); !ok {
 			return ""
 		}
-		return filepath.Join(filepath.Dir(certFile), "edge-nodes", parts[0], "current", parts[1])
+		root := edgeNodeTLSRoot(dbPath)
+		if root == "" {
+			return ""
+		}
+		return filepath.Join(root, parts[0], "current", parts[1])
 	}
 }
 
@@ -1002,8 +1033,12 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		return nil, err
 	}
 	rollbackReady = true
+	panelPairRestored := false
 	if markerIncludesTLS(marker) {
 		for _, entry := range backupTLSEntries(marker.Files) {
+			if isPanelCertificatePairEntry(entry) && panelPairRestored {
+				continue
+			}
 			target := targetTLSPath(dbPath, entry)
 			if target == "" {
 				continue
@@ -1042,8 +1077,16 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		return nil, err
 	}
 	if markerIncludesTLS(marker) {
+		var pairErr error
+		panelPairRestored, pairErr = restorePanelCertificatePair(dbPath, pending)
+		if pairErr != nil {
+			return nil, pairErr
+		}
 		for _, entry := range marker.Files {
 			if !strings.HasPrefix(entry, "tls/") {
+				continue
+			}
+			if isPanelCertificatePairEntry(entry) && panelPairRestored {
 				continue
 			}
 			target := targetTLSPath(dbPath, entry)
@@ -1078,7 +1121,14 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		}
 	}
 	if restoreDirectoryIncludesTLS(rollback) {
+		panelPairRestored, pairErr := restorePanelCertificatePair(dbPath, rollback)
+		if pairErr != nil {
+			return pairErr
+		}
 		for _, entry := range restoreDirectoryTLSEntries(rollback) {
+			if isPanelCertificatePairEntry(entry) && panelPairRestored {
+				continue
+			}
 			target := targetTLSPath(dbPath, entry)
 			if target == "" {
 				continue
