@@ -1228,7 +1228,7 @@ function renderPanelCertificateStatus(status) {
 	}
 	return `
 	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
-	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${status.certificate_current ? 'good' : 'warn'}">${status.certificate_current ? '泛域名一致' : '需要申请或更新'}</span></div>
+	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${status.certificate_current ? 'good' : 'warn'}">${status.certificate_current ? '面板域名一致' : '需要申请或更新'}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
 	  <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${status.certificate_valid ? 'good' : 'warn'}">${status.certificate_valid ? '有效' : '已过期或不可用'}</span></div>
 	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token'}</span></div>
@@ -1244,9 +1244,7 @@ function panelHTTPSPreview(panelDomain) {
 }
 
 function panelDomainFromForm() {
-	const prefix = document.getElementById('m-panel-prefix').value.trim().replace(/^\*\./, '');
-	const wildcard = document.getElementById('m-wildcard-domain').value.trim().replace(/^\*\./, '');
-	return prefix && wildcard ? `${prefix}.${wildcard}` : '';
+	return document.getElementById('m-panel-domain').value.trim().replace(/^\*\./, '');
 }
 
 async function waitForPanelRestart(redirectURL) {
@@ -1275,9 +1273,9 @@ async function showPanelCertificateModal() {
 	document.getElementById('modal-body').innerHTML = `
 	  <div id="m-panel-certificate-status">${renderPanelCertificateStatus(status)}</div>
 	  <div class="form-group" style="margin-top:18px">
-	    <label>面板访问域名前缀</label>
-	    <input type="text" class="form-input" id="m-panel-prefix" maxlength="63" value="${esc(status.panel_prefix || '')}" placeholder="panel" autocomplete="off" autocapitalize="none" spellcheck="false">
-	    <div class="form-help">只需填写前缀，例如 <code>panel</code>，不要填写完整域名。</div>
+	    <label>面板访问域名</label>
+	    <input type="text" class="form-input" id="m-panel-domain" maxlength="255" value="${esc(status.panel_domain || '')}" placeholder="panel.example.com" autocomplete="off" autocapitalize="none" spellcheck="false">
+	    <div class="form-help">填写面板完整域名；面板与节点泛域名必须属于同一注册域但不能相同。</div>
 	  </div>
 	  <div class="form-group">
 	    <label>节点泛域名</label>
@@ -1323,7 +1321,7 @@ async function showPanelCertificateModal() {
 		const port = Number(document.getElementById('m-panel-listen-port').value) || 9090;
 		document.getElementById('m-panel-address-preview').textContent = domain ? `https://${domain}${port === 443 ? '' : `:${port}`}` : '—';
 	};
-	document.getElementById('m-panel-prefix').addEventListener('input', refreshPreview);
+	document.getElementById('m-panel-domain').addEventListener('input', refreshPreview);
 	document.getElementById('m-wildcard-domain').addEventListener('input', refreshPreview);
 	document.getElementById('m-panel-listen-port').addEventListener('input', refreshPreview);
 	document.getElementById('m-cert-cancel').onclick = closeModal;
@@ -1343,22 +1341,22 @@ async function showPanelCertificateModal() {
 		}
 	};
 	const settingsPayload = () => ({
-		panel_prefix: document.getElementById('m-panel-prefix').value.trim(),
+		panel_domain: document.getElementById('m-panel-domain').value.trim(),
 		wildcard_domain: document.getElementById('m-wildcard-domain').value.trim(),
 		listen_port: Number(document.getElementById('m-panel-listen-port').value),
 	});
 	document.getElementById('m-cert-save').onclick = async () => {
 		const button = document.getElementById('m-cert-save');
 		const payload = settingsPayload();
-		if (!payload.panel_prefix || !payload.wildcard_domain || !Number.isInteger(payload.listen_port) || payload.listen_port < 1 || payload.listen_port > 65535) {
-			Toast.error('请填写面板前缀、泛域名和有效监听端口');
+		if (!payload.panel_domain || !payload.wildcard_domain || !Number.isInteger(payload.listen_port) || payload.listen_port < 1 || payload.listen_port > 65535) {
+			Toast.error('请填写面板域名、节点泛域名和有效监听端口');
 			return;
 		}
 		button.disabled = true;
 		button.textContent = '保存中…';
 		try {
 			await API.savePanelSettings(payload);
-			Toast.success('面板设置已保存；证书不会因修改前缀而重新申请');
+			Toast.success('面板设置已保存；面板证书仅覆盖面板域名');
 			closeModal();
 			await showPanelCertificateModal();
 		} catch (error) {
@@ -1373,7 +1371,7 @@ async function showPanelCertificateModal() {
 		const settingsPayloadValue = settingsPayload();
 		const savedWildcard = String(status.wildcard_domain || '').toLowerCase().replace(/^\*\./, '');
 		const formWildcard = settingsPayloadValue.wildcard_domain.toLowerCase().replace(/^\*\./, '');
-		if (settingsPayloadValue.panel_prefix !== status.panel_prefix || formWildcard !== savedWildcard || settingsPayloadValue.listen_port !== Number(status.listen_port)) {
+		if (settingsPayloadValue.panel_domain.toLowerCase().replace(/\.$/, '') !== String(status.panel_domain || '').toLowerCase().replace(/\.$/, '') || formWildcard !== savedWildcard || settingsPayloadValue.listen_port !== Number(status.listen_port)) {
 			Toast.error('请先点击“保存设置”，再申请证书');
 			return;
 		}
@@ -1391,7 +1389,7 @@ async function showPanelCertificateModal() {
 		button.textContent = '申请中…';
 		try {
 			const updated = await API.requestPanelCertificate(payload);
-			Toast.success(updated.certificate_reused ? '泛域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+			Toast.success(updated.certificate_reused ? '面板域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
 			closeModal();
 			await showPanelCertificateModal();
 		} catch (error) {

@@ -328,9 +328,9 @@ async function renderTLSSettings() {
           <header><span>TLS</span><h2>TLS 设置</h2><b>${status.configured ? '已配置' : '未配置'}</b></header>
           <div class="global-settings-status" id="p-panel-certificate-status">${renderPanelCertificateStatus(status)}</div>
           <div class="form-group" style="margin-top:18px">
-            <label>面板访问域名前缀</label>
-            <input type="text" class="form-input" id="p-panel-prefix" maxlength="63" value="${esc(status.panel_prefix || '')}" placeholder="panel" autocomplete="off" autocapitalize="none" spellcheck="false">
-            <div class="form-help">只需填写前缀，例如 <code>panel</code>，不必填写完整域名。</div>
+            <label>面板访问域名</label>
+            <input type="text" class="form-input" id="p-panel-domain" maxlength="255" value="${esc(status.panel_domain || '')}" placeholder="panel.example.com" autocomplete="off" autocapitalize="none" spellcheck="false">
+            <div class="form-help">填写面板完整域名。面板域名与节点泛域名可以是同一注册域下的不同子域名。</div>
           </div>
           <div class="form-group">
             <label>节点泛域名</label>
@@ -348,7 +348,7 @@ async function renderTLSSettings() {
           </div>
         </section>
         <section class="settings-panel fade-up">
-          <header><span>ACME</span><h2>申请泛域名证书</h2><b>Cloudflare DNS</b></header>
+          <header><span>ACME</span><h2>申请面板证书</h2><b>Cloudflare DNS</b></header>
           <div class="form-group"><label>ACME 邮箱</label><input type="email" class="form-input" id="p-acme-email" autocomplete="email" maxlength="254" value="${esc(status.acme_email || '')}" placeholder="admin@example.com"><div class="form-help">邮箱会直接显示在面板中，用于 ACME 账户与证书续签通知。</div></div>
           <div class="form-group"><label>DNS 服务商</label><select class="form-select" id="p-acme-provider"><option value="cloudflare">Cloudflare DNS</option></select></div>
           <div class="form-group"><label>DNS API Token</label><input type="text" class="form-input mono" id="p-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token"><div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div></div>
@@ -364,13 +364,11 @@ async function renderTLSSettings() {
     bindGlobalSettingsNav(page);
     const get = id => document.getElementById(`p-${id}`);
     const refreshPreview = () => {
-      const prefix = get('panel-prefix').value.trim().replace(/^\*\./, '');
-      const wildcard = get('wildcard-domain').value.trim().replace(/^\*\./, '');
-      const domain = prefix && wildcard ? `${prefix}.${wildcard}` : '';
+      const domain = get('panel-domain').value.trim().replace(/^\*\./, '');
       const port = Number(get('panel-listen-port').value) || 9090;
       get('panel-address-preview').textContent = domain ? `https://${domain}${port === 443 ? '' : `:${port}`}` : '—';
     };
-    ['panel-prefix', 'wildcard-domain', 'panel-listen-port'].forEach(id => get(id).addEventListener('input', refreshPreview));
+    ['panel-domain', 'wildcard-domain', 'panel-listen-port'].forEach(id => get(id).addEventListener('input', refreshPreview));
     const restartButton = get('cert-restart');
     if (restartButton) restartButton.onclick = async () => {
       if (!window.confirm('重启会短暂中断面板和所有站点连接，确定现在重启吗？')) return;
@@ -387,22 +385,22 @@ async function renderTLSSettings() {
       }
     };
     const settingsPayload = () => ({
-      panel_prefix: get('panel-prefix').value.trim(),
+      panel_domain: get('panel-domain').value.trim(),
       wildcard_domain: get('wildcard-domain').value.trim(),
       listen_port: Number(get('panel-listen-port').value),
     });
     get('cert-save').onclick = async () => {
       const button = get('cert-save');
       const payload = settingsPayload();
-      if (!payload.panel_prefix || !payload.wildcard_domain || !Number.isInteger(payload.listen_port) || payload.listen_port < 1 || payload.listen_port > 65535) {
-        Toast.error('请填写面板前缀、泛域名和有效监听端口');
+      if (!payload.panel_domain || !payload.wildcard_domain || !Number.isInteger(payload.listen_port) || payload.listen_port < 1 || payload.listen_port > 65535) {
+        Toast.error('请填写面板域名、节点泛域名和有效监听端口');
         return;
       }
       button.disabled = true;
       button.textContent = '保存中…';
       try {
         await API.savePanelSettings(payload);
-        Toast.success('面板设置已保存；证书不会因修改前缀而重新申请');
+        Toast.success('面板设置已保存；面板证书仅覆盖面板域名');
         await renderTLSSettings();
       } catch (error) {
         button.disabled = false;
@@ -416,7 +414,7 @@ async function renderTLSSettings() {
       const settingsPayloadValue = settingsPayload();
       const savedWildcard = String(status.wildcard_domain || '').toLowerCase().replace(/^\*\./, '');
       const formWildcard = settingsPayloadValue.wildcard_domain.toLowerCase().replace(/^\*\./, '');
-      if (settingsPayloadValue.panel_prefix !== status.panel_prefix || formWildcard !== savedWildcard || settingsPayloadValue.listen_port !== Number(status.listen_port)) {
+      if (settingsPayloadValue.panel_domain.toLowerCase().replace(/\.$/, '') !== String(status.panel_domain || '').toLowerCase().replace(/\.$/, '') || formWildcard !== savedWildcard || settingsPayloadValue.listen_port !== Number(status.listen_port)) {
         Toast.error('请先点击“保存设置”，再申请证书');
         return;
       }
@@ -434,7 +432,7 @@ async function renderTLSSettings() {
       button.textContent = '申请中…';
       try {
         const updated = await API.requestPanelCertificate(payload);
-        Toast.success(updated.certificate_reused ? '泛域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+        Toast.success(updated.certificate_reused ? '面板域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
         await renderTLSSettings();
       } catch (error) {
         button.disabled = false;

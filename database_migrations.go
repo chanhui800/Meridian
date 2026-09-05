@@ -290,6 +290,12 @@ func (d *DB) migrateOnce() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO panel_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS acme_issue_lock (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		owner TEXT NOT NULL DEFAULT '',
+		expires_at_ms INTEGER NOT NULL DEFAULT 0
+	);
+	INSERT OR IGNORE INTO acme_issue_lock (id) VALUES (1);
 	CREATE TABLE IF NOT EXISTS telegram_report_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		enabled INTEGER NOT NULL DEFAULT 0,

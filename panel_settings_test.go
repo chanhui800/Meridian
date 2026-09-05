@@ -13,14 +13,39 @@ func TestNormalizeManagedPanelSettings(t *testing.T) {
 	if settings.PanelDomain != "panel.example.com" || settings.RouteDomain != "example.com" || !settings.TLSEnabled {
 		t.Fatalf("unexpected settings: %+v", settings)
 	}
+	decoupled, err := normalizeManagedPanelSettings("panel.86518000.xyz", "edge.86518000.xyz")
+	if err != nil || decoupled.PanelDomain != "panel.86518000.xyz" || decoupled.RouteDomain != "edge.86518000.xyz" {
+		t.Fatalf("decoupled domains rejected: %+v err=%v", decoupled, err)
+	}
 	for _, tc := range [][2]string{
 		{"example.com", "example.com"},
-		{"a.b.example.com", "example.com"},
+		{"panel.example.net", "example.com"},
 		{"panel.example.com", ""},
 	} {
 		if _, err := normalizeManagedPanelSettings(tc[0], tc[1]); err == nil {
 			t.Fatalf("normalizeManagedPanelSettings(%q, %q) unexpectedly succeeded", tc[0], tc[1])
 		}
+	}
+}
+
+func TestSaveManagedPanelSettingsRejectsRouteChangeWithManagedDNS(t *testing.T) {
+	db, err := openDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.BootstrapPanelSettings("panel.old.example.com", "old.example.com", false, 9090); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO sites (name, listen_port, public_host, target_url) VALUES (?, ?, ?, ?); INSERT INTO site_node_schedules (site_id, enabled, cf_record_id) VALUES (last_insert_rowid(), 1, 'record-1')`, "one", 19001, "one.old.example.com", "http://127.0.0.1:8096"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.SaveManagedPanelSettings("panel.new.example.com", "new.example.com", 9090, false); err == nil {
+		t.Fatal("route-domain change with a managed DNS record was accepted")
+	}
+	settings, err := db.PanelSettings()
+	if err != nil || settings.RouteDomain != "old.example.com" {
+		t.Fatalf("route domain changed after rejection: %+v err=%v", settings, err)
 	}
 }
 

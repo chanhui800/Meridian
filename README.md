@@ -92,7 +92,7 @@ sudo journalctl -u meridian -f
 
 一个站点可配置一条主线路和最多七条备用线路。请求无法连接主线路时按顺序尝试备用线路，主线路恢复后新请求自动切回。普通 API、HLS/DASH、字幕、图片和 WebSocket 默认反代；主视频流选择“直连”时，仅在上游返回合法公网 30x 后交给客户端连接 CDN。
 
-域名前缀入口需要在“全局设置 → TLS 设置”配置面板域名、泛域名和 Cloudflare DNS API Token。证书由 ACME 申请和续签，Token 加密保存在数据库中。
+域名入口需要在“全局设置 → TLS 设置”分别配置面板完整域名（例如 `panel.86518000.xyz`）和节点泛域名（例如 `*.edge.86518000.xyz`），再填写 Cloudflare DNS API Token。两者必须属于同一注册域但不能相同；面板证书只签面板域名，节点证书由各节点独立签发。证书由 ACME 申请和续签，Token 加密保存在数据库中。
 
 DNS-01 传播检查默认同时查询公共递归 DNS 与系统 resolver；可用 `DNS_PROPAGATION_RESOLVERS`（逗号分隔的 IPv4/IPv6 地址）和 `DNS_PROPAGATION_TIMEOUT`（如 `120s`）调整。Agent 发布包仅提供 Linux amd64/arm64；Windows/macOS 构建产物仅是主控程序，因为节点流量采集依赖 Linux 网卡计数器。
 
