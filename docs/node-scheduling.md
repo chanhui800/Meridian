@@ -24,10 +24,10 @@
 ## 前置条件
 
 1. 主控必须通过有效的 HTTPS 证书访问，不能使用自签名证书。
-2. 节点需要 Linux x86_64、root 权限和可访问主控的出站 HTTPS。
+2. 节点需要 Linux amd64 或 arm64、root 权限和可访问主控的出站 HTTPS。
 3. 节点的 `端口` 必须没有被 Xray、Nginx、Caddy 或其他服务占用。443 被占用时，可以使用 9090、9443 等端口。
 4. 站点域名需要由 DNS 服务商解析到节点地址。使用自动 DNS 时，在主控 TLS 设置中配置 Cloudflare DNS API Token。
-5. 分配给节点的站点必须使用主控可以提供的 TLS 证书，通常是面板域名和泛域名证书。
+5. 节点必须配置独立于面板证书的边缘证书和私钥。通过 `EDGE_TLS_CERT_FILE`、`EDGE_TLS_KEY_FILE` 指定；不能复用 `PANEL_TLS_CERT_FILE`、`PANEL_TLS_KEY_FILE`。证书 SAN 需要覆盖分配给节点的站点域名。Docker 主控可在已配置 Cloudflare ACME 凭据后执行 `docker exec meridian /app/meridian admin issue-edge-certificate` 自动签发隔离的 wildcard 证书。
 
 ## 创建并安装节点
 

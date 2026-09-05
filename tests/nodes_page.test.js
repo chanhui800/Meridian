@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'web/static/index.html'), 'utf8');
@@ -54,4 +55,47 @@ test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {
   assert.match(page, /原面板模式 · 节点调度未启用/);
   assert.match(page, /syncSiteScheduleRow/);
   assert.match(page, /enabled && mode === 'fixed'/);
+});
+
+test('node schedule refresh preserves unsaved checkbox and selector edits', () => {
+  const fields = {
+    '[data-field="enabled"]': { checked: false },
+    '[data-field="mode"]': { value: 'global' },
+    '[data-field="fixed-node"]': { value: '' },
+  };
+  const row = {
+    dataset: { siteId: '1' },
+    querySelector(selector) { return fields[selector] || null; },
+  };
+  const container = { innerHTML: '' };
+  const sandbox = {
+    console,
+    Map,
+    Number,
+    String,
+    Math,
+    document: {
+      getElementById(id) { return id === 'node-site-list' ? container : null; },
+      querySelectorAll(selector) { return selector === '#node-site-list .node-site-row' ? [row] : []; },
+    },
+    esc(value) { return String(value); },
+    meridianFormatDateTime(value) { return String(value); },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  vm.runInContext(`siteSchedulesSnapshot = { sites: [{ site_id: 1, site_name: 'site', public_host: 'site.example', enabled: true, mode: 'global', fixed_node_id: 0, desired_node_id: 42, desired_node_name: 'node', applied_node_id: 42, applied_node_name: 'node', applied_node_port: 9090, dns_status: 'active', last_error: '' }] }; nodesSnapshot = { nodes: [{ id: 42, name: 'node' }] };`, sandbox);
+
+  sandbox.captureSiteScheduleDrafts();
+  sandbox.renderSiteSchedules();
+  assert.doesNotMatch(container.innerHTML, /data-field="enabled" checked/);
+  assert.match(container.innerHTML, /原面板模式 · 节点调度未启用/);
+
+  fields['[data-field="enabled"]'].checked = true;
+  fields['[data-field="mode"]'].value = 'fixed';
+  fields['[data-field="fixed-node"]'].value = '42';
+  sandbox.captureSiteScheduleDrafts();
+  sandbox.renderSiteSchedules();
+  assert.match(container.innerHTML, /data-field="enabled" checked/);
+  assert.match(container.innerHTML, /<option value="fixed" selected>固定节点<\/option>/);
+  assert.match(container.innerHTML, /value="42" selected/);
 });

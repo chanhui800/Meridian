@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -33,8 +36,8 @@ import (
 const (
 	edgeEventBodyLimit     = 8 << 10
 	edgeEventResponseLimit = maxNodeRequestEventResponseBodyBytes
-	edgeReportEventLimit   = 32
-	edgeEventQueueLimit    = 1024
+	edgeReportEventLimit   = maxNodeRequestEventsPerReport
+	edgeEventQueueLimit    = 8192
 )
 
 var errEdgeAgentUpdated = errors.New("Agent binary updated; restarting")
@@ -50,19 +53,29 @@ type edgeSiteIdentity struct {
 }
 
 type edgeEventStore struct {
-	mu    sync.Mutex
-	next  int64
-	items []NodeRequestEvent
-	path  string
+	mu      sync.Mutex
+	next    int64
+	items   []NodeRequestEvent
+	path    string
+	key     []byte
+	dropped int64
 }
 
 func (s *edgeEventStore) init(dir string) error {
+	return s.initWithKey(dir, nil)
+}
+
+func (s *edgeEventStore) initWithKey(dir string, secret []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.path = filepath.Join(dir, "events.json")
+	if len(secret) > 0 {
+		digest := sha256.Sum256(secret)
+		s.key = append([]byte(nil), digest[:]...)
+	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -71,19 +84,76 @@ func (s *edgeEventStore) init(dir string) error {
 		return err
 	}
 	var stored struct {
-		Next  int64              `json:"next"`
-		Items []NodeRequestEvent `json:"items"`
+		Next    int64              `json:"next"`
+		Items   []NodeRequestEvent `json:"items"`
+		Dropped int64              `json:"dropped"`
 	}
-	if err := json.Unmarshal(data, &stored); err != nil {
-		return fmt.Errorf("load event queue: %w", err)
+	plaintext := true
+	plainErr := json.Unmarshal(data, &stored)
+	var envelope struct {
+		Version    int    `json:"version"`
+		Nonce      string `json:"nonce"`
+		Ciphertext string `json:"ciphertext"`
+	}
+	_ = json.Unmarshal(data, &envelope)
+	if plainErr != nil || (envelope.Version == 1 && envelope.Ciphertext != "") {
+		plaintext = false
+		if len(s.key) == 0 {
+			return fmt.Errorf("load event queue: %w", plainErr)
+		}
+		if envelope.Version != 1 {
+			return fmt.Errorf("load event queue: invalid encrypted spool")
+		}
+		block, err := aes.NewCipher(s.key)
+		if err != nil {
+			return err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		nonce, err := base64.RawStdEncoding.DecodeString(envelope.Nonce)
+		if err != nil || len(nonce) != gcm.NonceSize() {
+			return errors.New("load event queue: invalid nonce")
+		}
+		ciphertext, err := base64.RawStdEncoding.DecodeString(envelope.Ciphertext)
+		if err != nil {
+			return errors.New("load event queue: invalid ciphertext")
+		}
+		opened, err := gcm.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			return fmt.Errorf("load event queue: decrypt: %w", err)
+		}
+		if err := json.Unmarshal(opened, &stored); err != nil {
+			return fmt.Errorf("load event queue: decrypt: %w", err)
+		}
 	}
 	if len(stored.Items) > edgeEventQueueLimit {
+		stored.Dropped += int64(len(stored.Items) - edgeEventQueueLimit)
 		stored.Items = stored.Items[len(stored.Items)-edgeEventQueueLimit:]
 	}
-	s.next, s.items = stored.Next, append([]NodeRequestEvent(nil), stored.Items...)
+	s.next, s.items, s.dropped = stored.Next, append([]NodeRequestEvent(nil), stored.Items...), stored.Dropped
+	changed := false
 	for _, item := range s.items {
 		if item.EventID > s.next {
 			s.next = item.EventID
+		}
+		if item.EventUID == "" {
+			changed = true
+		}
+	}
+	if changed || (len(s.key) > 0 && plaintext) {
+		for i := range s.items {
+			if s.items[i].EventUID == "" {
+				uid, err := newEdgeEventUID()
+				if err != nil {
+					return err
+				}
+				s.items[i].EventUID = uid
+			}
+		}
+		if err := s.persistLocked(); err != nil {
+			return fmt.Errorf("migrate event queue identities: %w", err)
 		}
 	}
 	return nil
@@ -94,11 +164,35 @@ func (s *edgeEventStore) persistLocked() error {
 		return nil
 	}
 	data, err := json.Marshal(struct {
-		Next  int64              `json:"next"`
-		Items []NodeRequestEvent `json:"items"`
-	}{s.next, s.items})
+		Next    int64              `json:"next"`
+		Items   []NodeRequestEvent `json:"items"`
+		Dropped int64              `json:"dropped"`
+	}{s.next, s.items, s.dropped})
 	if err != nil {
 		return err
+	}
+	if len(s.key) > 0 {
+		block, err := aes.NewCipher(s.key)
+		if err != nil {
+			return err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := rand.Read(nonce); err != nil {
+			return err
+		}
+		sealed := gcm.Seal(nil, nonce, data, nil)
+		data, err = json.Marshal(struct {
+			Version    int    `json:"version"`
+			Nonce      string `json:"nonce"`
+			Ciphertext string `json:"ciphertext"`
+		}{1, base64.RawStdEncoding.EncodeToString(nonce), base64.RawStdEncoding.EncodeToString(sealed)})
+		if err != nil {
+			return err
+		}
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".events-*")
 	if err != nil {
@@ -121,16 +215,32 @@ func (s *edgeEventStore) persistLocked() error {
 	return os.Rename(tmpName, s.path)
 }
 
-func (s *edgeEventStore) add(event NodeRequestEvent) {
+func newEdgeEventUID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func (s *edgeEventStore) add(event NodeRequestEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.next++
 	event.EventID = s.next
+	if event.EventUID == "" {
+		uid, err := newEdgeEventUID()
+		if err != nil {
+			return err
+		}
+		event.EventUID = uid
+	}
 	s.items = append(s.items, event)
 	if len(s.items) > edgeEventQueueLimit {
+		s.dropped += int64(len(s.items) - edgeEventQueueLimit)
 		s.items = append([]NodeRequestEvent(nil), s.items[len(s.items)-edgeEventQueueLimit:]...)
 	}
-	_ = s.persistLocked()
+	return s.persistLocked()
 }
 
 func (s *edgeEventStore) snapshot() []NodeRequestEvent {
@@ -143,9 +253,21 @@ func (s *edgeEventStore) snapshot() []NodeRequestEvent {
 	return append([]NodeRequestEvent(nil), s.items[:end]...)
 }
 
-func (s *edgeEventStore) ack(events []NodeRequestEvent) {
+func (s *edgeEventStore) depth() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.items)
+}
+
+func (s *edgeEventStore) droppedCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dropped
+}
+
+func (s *edgeEventStore) ack(events []NodeRequestEvent) error {
 	if len(events) == 0 {
-		return
+		return nil
 	}
 	accepted := make(map[int64]struct{}, len(events))
 	for _, event := range events {
@@ -160,7 +282,7 @@ func (s *edgeEventStore) ack(events []NodeRequestEvent) {
 		}
 	}
 	s.items = kept
-	_ = s.persistLocked()
+	return s.persistLocked()
 }
 
 type edgeSiteStats struct {
@@ -269,26 +391,63 @@ func (b *edgeProxyBundle) close() {
 	}
 }
 
+func (b *edgeProxyBundle) drain(grace time.Duration) {
+	if b == nil {
+		return
+	}
+	if b.manager != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), grace)
+		b.manager.DrainShutdown(ctx)
+		cancel()
+	}
+	if b.database != nil {
+		b.database.Close()
+	}
+}
+
 type edgeAgentRuntime struct {
-	mu            sync.RWMutex
-	stateDir      string
-	nodeGUID      string
-	port          int
-	handler       http.Handler
-	certificate   *tls.Certificate
-	server        *http.Server
-	bundle        *edgeProxyBundle
-	appliedHash   string
-	listenerError string
-	events        edgeEventStore
-	stats         edgeSiteStats
-	telemetryMu   sync.Mutex
-	mediaCounts   map[int64]NodeMediaCount
-	retention     map[int64]NodeRetentionStatus
-	observations  []NodeDynamicObservation
-	siteReported  map[int64]ProxyRuntimeStat
-	resolver      dynamicIPResolver
-	transport     dynamicTransportFactory
+	mu              sync.RWMutex
+	stateDir        string
+	nodeGUID        string
+	port            int
+	handler         http.Handler
+	certificate     *tls.Certificate
+	server          *http.Server
+	bundle          *edgeProxyBundle
+	appliedHash     string
+	listenerError   string
+	eventSpoolError string
+	events          edgeEventStore
+	stats           edgeSiteStats
+	telemetryMu     sync.Mutex
+	mediaCounts     map[int64]NodeMediaCount
+	retention       map[int64]NodeRetentionStatus
+	observations    []NodeDynamicObservation
+	siteReported    map[int64]ProxyRuntimeStat
+	resolver        dynamicIPResolver
+	transport       dynamicTransportFactory
+}
+
+func (runtime *edgeAgentRuntime) queueEvent(event NodeRequestEvent) {
+	if runtime == nil {
+		return
+	}
+	if err := runtime.events.add(event); err != nil {
+		runtime.mu.Lock()
+		runtime.eventSpoolError = err.Error()
+		runtime.mu.Unlock()
+	} else {
+		runtime.mu.Lock()
+		runtime.eventSpoolError = ""
+		runtime.mu.Unlock()
+	}
+}
+
+func (runtime *edgeAgentRuntime) eventSpoolStatus() (string, int) {
+	runtime.mu.RLock()
+	errText := runtime.eventSpoolError
+	runtime.mu.RUnlock()
+	return errText, runtime.events.depth()
 }
 
 type edgeTelemetryEvent struct {
@@ -437,10 +596,15 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 		}
 		var requestBody string
 		if edgePlaybackSyncPath(r.URL.Path) && r.Body != nil && (r.ContentLength < 0 || r.ContentLength <= edgeEventBodyLimit) {
-			body, err := io.ReadAll(io.LimitReader(r.Body, edgeEventBodyLimit+1))
+			originalBody := r.Body
+			body, err := io.ReadAll(io.LimitReader(originalBody, edgeEventBodyLimit+1))
+			// Sampling must never consume bytes that the upstream proxy needs. If
+			// the body is too large (or a read fails), put the sampled prefix and
+			// unread remainder back before the handler. Oversized bodies simply
+			// skip telemetry.
+			r.Body = &edgeReplayBody{Reader: io.MultiReader(bytes.NewReader(body), originalBody), Closer: originalBody}
 			if err == nil && len(body) <= edgeEventBodyLimit {
 				requestBody = string(body)
-				r.Body = io.NopCloser(bytes.NewReader(body))
 			}
 		}
 		next.ServeHTTP(writer, r)
@@ -460,7 +624,7 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 		if requestBody == "" && responseBody == "" {
 			return
 		}
-		runtime.events.add(NodeRequestEvent{
+		runtime.queueEvent(NodeRequestEvent{
 			SiteID: siteID, Host: host, Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery,
 			StatusCode: status, ClientIP: edgeClientIP(r.RemoteAddr), UserAgent: r.UserAgent(),
 			Authorization: authorization, Body: requestBody, ContentType: r.Header.Get("Content-Type"),
@@ -469,6 +633,11 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 			RecordedAtMS: time.Now().UnixMilli(), SkipRequestLog: true,
 		})
 	})
+}
+
+type edgeReplayBody struct {
+	io.Reader
+	io.Closer
 }
 
 func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edgeProxyBundle, error) {
@@ -493,6 +662,9 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
+		if route.SiteID > 0 {
+			site.AssetCacheNamespace = fmt.Sprintf("site-%d-config-%s", route.SiteID, config.ConfigHash)
+		}
 		site.PublicHost = strings.ToLower(strings.TrimSpace(route.Host))
 		site.IngressMode = ingressModeHost
 		site.PathPrefix = ""
@@ -516,6 +688,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		if _, updateErr := database.db.Exec("UPDATE sites SET enabled=1 WHERE id=?", created.ID); updateErr != nil {
 			return fail(updateErr)
 		}
+		created.AssetCacheNamespace = site.AssetCacheNamespace
 		siteIDs[site.PublicHost] = route.SiteID
 		localSites[created.ID] = edgeSiteIdentity{centralID: route.SiteID, host: site.PublicHost}
 		bundle.localSites[created.ID] = localSites[created.ID]
@@ -526,7 +699,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		if !ok {
 			return
 		}
-		runtime.events.add(NodeRequestEvent{
+		runtime.queueEvent(NodeRequestEvent{
 			SiteID: identity.centralID, Host: identity.host, Method: event.Method, Path: event.Path,
 			StatusCode: event.StatusCode, ClientIP: event.ClientIP, UserAgent: event.UserAgent,
 			RecordedAtMS: time.Now().UnixMilli(), ResourceCategory: event.ResourceCategory,
@@ -630,6 +803,10 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	if config.SchemaVersion != agentConfigSchemaVersion || config.ConfigHash == "" || config.NodeGUID == "" {
 		return errors.New("Agent configuration is invalid")
 	}
+	expectedHash, err := agentConfigHash(config)
+	if err != nil || !hmac.Equal([]byte(expectedHash), []byte(config.ConfigHash)) {
+		return errors.New("Agent configuration checksum mismatch")
+	}
 	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
 		return errors.New("Agent port is invalid")
 	}
@@ -683,7 +860,10 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
 	if oldBundle != nil {
-		go oldBundle.close()
+		// A config refresh must not cancel requests that were admitted by the
+		// previous bundle. Stop accepting new requests on it, let active streams
+		// drain, and only force-close them after the bounded grace period.
+		go oldBundle.drain(15 * time.Second)
 	}
 	return nil
 }
@@ -812,9 +992,10 @@ func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, 
 }
 
 type edgeReportAck struct {
-	AcceptedEventIDs []int64 `json:"accepted_event_ids"`
-	ConfigHash       string  `json:"config_hash"`
-	ConfigChanged    bool    `json:"config_changed"`
+	AcceptedEventIDs  []int64  `json:"accepted_event_ids"`
+	AcceptedEventUIDs []string `json:"accepted_event_uids"`
+	ConfigHash        string   `json:"config_hash"`
+	ConfigChanged     bool     `json:"config_changed"`
 }
 
 type edgeWSReportClient struct {
@@ -885,7 +1066,9 @@ func (c *edgeWSReportClient) connectLocked(ctx context.Context) error {
 func (c *edgeWSReportClient) report(ctx context.Context, payload NodeReport) (edgeReportAck, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.connectLocked(ctx); err != nil {
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := c.connectLocked(dialCtx); err != nil {
 		return edgeReportAck{}, err
 	}
 	if err := c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
@@ -985,7 +1168,15 @@ func edgeBootID() string {
 	return prefix + hex.EncodeToString(random)
 }
 
-func edgeCollect(bootID string, sequence int64) (NodeReport, error) {
+func edgeCounterEpoch(interfaceName string) string {
+	kernelBootID := "unknown"
+	if data, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+		kernelBootID = strings.TrimSpace(string(data))
+	}
+	return kernelBootID + ":" + interfaceName
+}
+
+func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	interfaceName := edgeDefaultInterface()
 	if interfaceName == "" {
 		return NodeReport{}, errors.New("no active network interface")
@@ -998,7 +1189,7 @@ func edgeCollect(bootID string, sequence int64) (NodeReport, error) {
 	if err != nil {
 		return NodeReport{}, err
 	}
-	return NodeReport{BootID: bootID, Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
+	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
 }
 
 func edgeExecutableDigest() (string, string, error) {
@@ -1100,7 +1291,7 @@ func runEdgeAgent() error {
 		}
 	}
 	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID}
-	if err := runtime.events.init(filepath.Join(runtime.stateDir, "events")); err != nil {
+	if err := runtime.events.initWithKey(filepath.Join(runtime.stateDir, "events"), []byte(state.Token)); err != nil {
 		return err
 	}
 	defer runtime.close()
@@ -1136,6 +1327,8 @@ func runEdgeAgent() error {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
 			report.AppliedConfigHash, report.ListenerError = runtime.status()
+			report.EventSpoolError, report.EventQueueDepth = runtime.eventSpoolStatus()
+			report.EventDropped = runtime.events.droppedCount()
 			report.SiteStats = runtime.siteStatsSnapshot()
 			report.MediaCounts, report.Retention, report.Observations = runtime.telemetrySnapshot()
 			report.Events = runtime.events.snapshot()
@@ -1150,13 +1343,25 @@ func runEdgeAgent() error {
 				for _, id := range ack.AcceptedEventIDs {
 					accepted[id] = true
 				}
+				acceptedUIDs := make(map[string]bool, len(ack.AcceptedEventUIDs))
+				for _, uid := range ack.AcceptedEventUIDs {
+					acceptedUIDs[uid] = true
+				}
 				ackEvents := make([]NodeRequestEvent, 0, len(report.Events))
 				for _, event := range report.Events {
-					if accepted[event.EventID] {
+					if accepted[event.EventID] || (event.EventUID != "" && acceptedUIDs[event.EventUID]) {
 						ackEvents = append(ackEvents, event)
 					}
 				}
-				runtime.events.ack(ackEvents)
+				if err := runtime.events.ack(ackEvents); err != nil {
+					runtime.mu.Lock()
+					runtime.eventSpoolError = err.Error()
+					runtime.mu.Unlock()
+				} else if len(ackEvents) > 0 {
+					runtime.mu.Lock()
+					runtime.eventSpoolError = ""
+					runtime.mu.Unlock()
+				}
 				if ack.ConfigChanged {
 					lastConfigAt = time.Time{}
 				}
@@ -1168,7 +1373,12 @@ func runEdgeAgent() error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(15 * time.Second):
+		case <-time.After(func() time.Duration {
+			if runtime.events.depth() > 0 {
+				return time.Second
+			}
+			return 15 * time.Second
+		}()):
 		}
 	}
 }

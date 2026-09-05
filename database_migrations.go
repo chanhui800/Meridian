@@ -347,12 +347,16 @@ func (d *DB) migrateOnce() error {
 		last_raw_rx_bytes BIGINT NOT NULL DEFAULT 0,
 		last_raw_tx_bytes BIGINT NOT NULL DEFAULT 0,
 		last_boot_id TEXT NOT NULL DEFAULT '',
+		last_report_session_id TEXT NOT NULL DEFAULT '',
 		last_sequence BIGINT NOT NULL DEFAULT 0,
 		interface_name TEXT NOT NULL DEFAULT '',
 		agent_version TEXT NOT NULL DEFAULT '',
 		desired_config_hash TEXT NOT NULL DEFAULT '',
 		applied_config_hash TEXT NOT NULL DEFAULT '',
 		agent_listener_error TEXT NOT NULL DEFAULT '',
+		event_spool_error TEXT NOT NULL DEFAULT '',
+		event_queue_depth INTEGER NOT NULL DEFAULT 0,
+		event_dropped BIGINT NOT NULL DEFAULT 0,
 		enrollment_token_hash TEXT NOT NULL DEFAULT '',
 		enrollment_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 		agent_token_hash TEXT NOT NULL DEFAULT '',
@@ -642,6 +646,10 @@ func (d *DB) migrateOnce() error {
 	}
 	for _, migration := range []struct{ table, column, sql string }{
 		{"control_nodes", "traffic_manual_offset_bytes", "ALTER TABLE control_nodes ADD COLUMN traffic_manual_offset_bytes BIGINT NOT NULL DEFAULT 0"},
+		{"control_nodes", "last_report_session_id", "ALTER TABLE control_nodes ADD COLUMN last_report_session_id TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "event_spool_error", "ALTER TABLE control_nodes ADD COLUMN event_spool_error TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "event_queue_depth", "ALTER TABLE control_nodes ADD COLUMN event_queue_depth INTEGER NOT NULL DEFAULT 0"},
+		{"control_nodes", "event_dropped", "ALTER TABLE control_nodes ADD COLUMN event_dropped BIGINT NOT NULL DEFAULT 0"},
 		{"site_node_schedules", "agent_boot_id", "ALTER TABLE site_node_schedules ADD COLUMN agent_boot_id TEXT NOT NULL DEFAULT ''"},
 		{"site_node_schedules", "agent_request_count", "ALTER TABLE site_node_schedules ADD COLUMN agent_request_count BIGINT NOT NULL DEFAULT 0"},
 		{"site_node_schedules", "agent_last_request_at_ms", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_request_at_ms INTEGER NOT NULL DEFAULT 0"},
@@ -661,9 +669,23 @@ func (d *DB) migrateOnce() error {
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
 		agent_boot_id TEXT NOT NULL,
 		event_id BIGINT NOT NULL,
+		event_uid TEXT NOT NULL DEFAULT '',
 		received_at_ms INTEGER NOT NULL,
 		PRIMARY KEY(node_id, agent_boot_id, event_id)
 	) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS idx_node_request_events_received ON node_request_events(received_at_ms);`); err != nil {
+		return err
+	}
+	var eventUIDColumnCount int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_request_events') WHERE name=?", "event_uid").Scan(&eventUIDColumnCount); err != nil {
+		return err
+	} else if eventUIDColumnCount == 0 {
+		// The table may have been created by an older release. Add the stable
+		// event identity before creating the partial unique index.
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE node_request_events ADD COLUMN event_uid TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_node_request_events_uid ON node_request_events(node_id,event_uid) WHERE event_uid <> ''"); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_site_counters (

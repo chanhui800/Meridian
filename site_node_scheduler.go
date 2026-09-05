@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -231,13 +232,18 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 			continue
 		}
 		desired := snapshot.Scheduler.ActiveNodeID
-		lastError := ""
+		// Keep the last reconciliation error visible between UI refreshes. The
+		// health/DNS pass clears it only after a successful commit; otherwise a
+		// GET /api/node-scheduler/sites must not hide the reason for waiting.
+		lastError := strings.TrimSpace(value.LastError)
 		if value.Mode == "fixed" {
 			desired = value.FixedNodeID
 		}
 		if desired <= 0 || !eligible[desired] {
 			desired = 0
 			lastError = "no eligible node is available"
+		} else if desired != value.DesiredNodeID {
+			lastError = ""
 		}
 		status := value.DNSStatus
 		if status == "" || status == "disabled" {
@@ -285,7 +291,7 @@ func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig,
 	}
 	rows, err := a.db.db.Query(`SELECT s.id,s.public_host,s.target_url,s.playback_target_url,s.playback_mode,s.stream_hosts,s.upstream_headers
 		FROM site_node_schedules n JOIN sites s ON s.id=n.site_id
-		WHERE n.enabled=1 AND n.desired_node_id=? AND s.enabled=1 ORDER BY s.id`, node.ID)
+		WHERE n.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND s.enabled=1 ORDER BY s.id`, node.ID, node.ID)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
@@ -372,15 +378,18 @@ func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig,
 	config.AgentVersion, config.AgentSHA256, _ = agentBinaryIdentity()
 	if len(routes) > 0 {
 		if a.panelCertificates == nil {
-			return AgentRuntimeConfig{}, errors.New("panel TLS certificate is unavailable")
+			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")
 		}
-		config.CertificatePEM, err = readBoundedPrivateFile(a.panelCertificates.certFile)
-		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("read TLS certificate: %w", err)
+		if strings.TrimSpace(a.panelCertificates.edgeCertFile) == "" || strings.TrimSpace(a.panelCertificates.edgeKeyFile) == "" {
+			return AgentRuntimeConfig{}, errors.New("edge TLS certificate and key must be configured separately from the panel certificate")
 		}
-		config.PrivateKeyPEM, err = readBoundedPrivateFile(a.panelCertificates.keyFile)
+		config.CertificatePEM, err = readBoundedPrivateFile(a.panelCertificates.edgeCertFile)
 		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("read TLS private key: %w", err)
+			return AgentRuntimeConfig{}, fmt.Errorf("read edge TLS certificate: %w", err)
+		}
+		config.PrivateKeyPEM, err = readBoundedPrivateFile(a.panelCertificates.edgeKeyFile)
+		if err != nil {
+			return AgentRuntimeConfig{}, fmt.Errorf("read edge TLS private key: %w", err)
 		}
 	}
 	config.ConfigHash, err = agentConfigHash(config)
@@ -685,10 +694,12 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	now := time.Now()
 	if err := a.refreshSiteAssignments(now); err != nil {
+		log.Printf("[node-scheduler] refresh assignments failed: %v", err)
 		return
 	}
 	values, err := a.db.ListSiteNodeSchedules()
 	if err != nil {
+		log.Printf("[node-scheduler] list site schedules failed: %v", err)
 		return
 	}
 	for _, value := range values {
@@ -699,6 +710,7 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 		err := a.reconcileOneSiteSchedule(probeCtx, value, now)
 		cancel()
 		if err != nil {
+			log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
 			_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
 		}
 	}

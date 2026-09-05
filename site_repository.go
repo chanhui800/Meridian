@@ -66,6 +66,10 @@ type Site struct {
 	CreatedAt                     string               `json:"created_at"`
 	UpdatedAt                     string               `json:"updated_at"`
 	RuntimeUpstreamHeaders        map[string][]string  `json:"-"`
+	// AssetCacheNamespace is runtime-only. Agent runtimes recreate their local
+	// SQLite rows whenever a configuration is applied, so cache identity must
+	// come from the controller rather than the local row ID.
+	AssetCacheNamespace string `json:"-"`
 }
 
 func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade, assetCacheEnabled, watchHistoryEnabled int) error {

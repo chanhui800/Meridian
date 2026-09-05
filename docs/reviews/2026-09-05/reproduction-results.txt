@@ -1,0 +1,35 @@
+=== RUN   TestReviewOversizeChunkedBodyPreserved
+    review_regression_test.go:31: upstream received 19 bytes, original body was 8212 bytes
+--- FAIL: TestReviewOversizeChunkedBodyPreserved (0.00s)
+=== RUN   TestReviewCacheMultiValueHeaders
+=== RUN   TestReviewCacheMultiValueHeaders/Cache-Control
+    review_regression_test.go:47: response with restrictive second header line was accepted for caching
+=== RUN   TestReviewCacheMultiValueHeaders/Vary
+    review_regression_test.go:47: response with restrictive second header line was accepted for caching
+--- FAIL: TestReviewCacheMultiValueHeaders (0.00s)
+    --- FAIL: TestReviewCacheMultiValueHeaders/Cache-Control (0.00s)
+    --- FAIL: TestReviewCacheMultiValueHeaders/Vary (0.00s)
+=== RUN   TestReviewCacheSiteIdentityAcrossRebuild
+2026/09/05 18:49:59 [a.example.test] shared-host proxy a.example.test -> http://127.0.0.1:59806 (UA: passthrough)
+2026/09/05 18:50:00 [a.example.test] shutting down...
+2026/09/05 18:50:00 [b.example.test] shared-host proxy b.example.test -> http://127.0.0.1:59806 (UA: passthrough)
+2026/09/05 18:50:00 [b.example.test] shutting down...
+    review_regression_test.go:82: site b.example.test received "a.example.test" from previous site; upstream calls=1
+--- FAIL: TestReviewCacheSiteIdentityAcrossRebuild (0.70s)
+=== RUN   TestReviewSchedulerSkipsListenerFailure
+2026/09/05 18:50:00 This platform does not enforce POSIX file modes, so C:\Users\Holei\AppData\Local\Temp\TestReviewSchedulerSkipsListenerFailure2386182393\001\test.db keeps whatever permissions it inherits from its directory. That file holds the administrator password hash and every configured upstream URL: restrict the directory yourself and do not leave it somewhere other local users can read.
+    review_regression_test.go:115: selected node 1 with listener failure, healthy node is 2
+--- FAIL: TestReviewSchedulerSkipsListenerFailure (0.34s)
+=== RUN   TestReviewOldNodeRetainsRouteUntilDNSCommit
+    review_regression_test.go:160: old node loses all routes while applied DNS still points to it and new node has not applied configuration
+--- FAIL: TestReviewOldNodeRetainsRouteUntilDNSCommit (0.36s)
+=== RUN   TestReviewConfigRefreshPreservesActiveRequest
+2026/09/05 18:50:01 [media.example.test] shared-host proxy media.example.test -> http://127.0.0.1:8096 (UA: passthrough)
+2026/09/05 18:50:01 [renamed only] shared-host proxy media.example.test -> http://127.0.0.1:8096 (UA: passthrough)
+2026/09/05 18:50:01 [media.example.test] shutting down...
+    review_regression_test.go:201: configuration refresh cancelled an active request on an unchanged route
+2026/09/05 18:50:01 [renamed only] shutting down...
+--- FAIL: TestReviewConfigRefreshPreservesActiveRequest (0.65s)
+FAIL
+FAIL	meridian	3.030s
+FAIL

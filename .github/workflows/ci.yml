@@ -56,12 +56,13 @@ jobs:
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
           node --test tests/*.test.js
           bash -n install.sh
+          bash -n scripts/agent-install.sh
           bash -n docker-entrypoint.sh
           bash -n tests/install_test.sh
           bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh
           bash -n tests/dynamic_route_key_test.sh
-          shellcheck install.sh docker-entrypoint.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
+          shellcheck install.sh scripts/agent-install.sh docker-entrypoint.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh

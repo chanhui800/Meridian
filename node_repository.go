@@ -51,6 +51,9 @@ type ControlNode struct {
 	DesiredConfigHash   string `json:"desired_config_hash"`
 	AppliedConfigHash   string `json:"applied_config_hash"`
 	AgentListenerError  string `json:"agent_listener_error"`
+	EventSpoolError     string `json:"event_spool_error"`
+	EventQueueDepth     int    `json:"event_queue_depth"`
+	EventDropped        int64  `json:"event_dropped"`
 	EnrolledAtMS        int64  `json:"enrolled_at_ms"`
 	LastSeenAtMS        int64  `json:"last_seen_at_ms"`
 	CreatedAtMS         int64  `json:"created_at_ms"`
@@ -64,7 +67,8 @@ type ControlNode struct {
 
 	lastRawRXBytes      int64
 	lastRawTXBytes      int64
-	lastBootID          string
+	lastBootID          string // counter epoch (kernel boot + interface)
+	lastReportSessionID string
 	lastSequence        int64
 	enrollmentTokenHash string
 	agentTokenHash      string
@@ -96,6 +100,8 @@ type NodeCreateInput struct {
 
 type NodeReport struct {
 	BootID            string                   `json:"boot_id"`
+	ReportSessionID   string                   `json:"report_session_id,omitempty"`
+	CounterEpoch      string                   `json:"counter_epoch,omitempty"`
 	Sequence          int64                    `json:"sequence"`
 	InterfaceName     string                   `json:"interface_name"`
 	RXBytes           int64                    `json:"rx_bytes"`
@@ -103,6 +109,9 @@ type NodeReport struct {
 	AgentVersion      string                   `json:"agent_version"`
 	AppliedConfigHash string                   `json:"applied_config_hash"`
 	ListenerError     string                   `json:"listener_error"`
+	EventSpoolError   string                   `json:"event_spool_error,omitempty"`
+	EventQueueDepth   int                      `json:"event_queue_depth,omitempty"`
+	EventDropped      int64                    `json:"event_dropped,omitempty"`
 	SiteStats         []NodeSiteStat           `json:"site_stats,omitempty"`
 	MediaCounts       []NodeMediaCount         `json:"media_counts,omitempty"`
 	Retention         []NodeRetentionStatus    `json:"retention,omitempty"`
@@ -146,6 +155,7 @@ type NodeDynamicObservation struct {
 }
 
 type NodeRequestEvent struct {
+	EventUID                string `json:"event_uid,omitempty"`
 	EventID                 int64  `json:"event_id"`
 	SiteID                  int64  `json:"site_id"`
 	Host                    string `json:"host"`
@@ -177,7 +187,7 @@ type NodeRequestEvent struct {
 const maxNodeRequestEventBodyBytes = 8 << 10
 const maxNodeRequestEventResponseBodyBytes = 64 << 10
 const maxAgentReportBodyBytes = 2 << 20
-const maxNodeRequestEventsPerReport = 32
+const maxNodeRequestEventsPerReport = 128
 const maxNodeTelemetryItemsPerReport = 128
 
 func newNodeToken() (string, error) {
@@ -332,7 +342,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
-	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_listener_error,
+	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	enrollment_token_hash,enrollment_expires_at_ms,agent_token_hash,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
 
@@ -341,8 +351,8 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var enabled int
 	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
-		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID,
-		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentListenerError, &node.enrollmentTokenHash, &node.enrollmentExpiresMS,
+		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
+		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS,
 		&node.agentTokenHash, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
 	if err != nil {
 		return ControlNode{}, err
@@ -413,7 +423,7 @@ func (d *DB) listControlNodes(now time.Time) ([]ControlNode, error) {
 }
 
 func nodeEligible(node ControlNode) bool {
-	return node.Enabled && node.Status == "online" && !node.Depleted
+	return node.Enabled && node.Status == "online" && !node.Depleted && strings.TrimSpace(node.AgentListenerError) == ""
 }
 
 func (d *DB) NodeControlSnapshot(now time.Time) (NodeControlSnapshot, error) {
@@ -540,7 +550,7 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 		return ControlNode{}, "", err
 	}
 	result, err := d.db.Exec(`UPDATE control_nodes SET enrollment_token_hash=?,enrollment_expires_at_ms=?,
-		agent_token_hash='',enrolled_at_ms=0,last_seen_at_ms=0,last_boot_id='',last_sequence=0,
+		agent_token_hash='',enrolled_at_ms=0,last_seen_at_ms=0,last_boot_id='',last_report_session_id='',last_sequence=0,
 		last_raw_rx_bytes=0,last_raw_tx_bytes=0,updated_at_ms=? WHERE id=?`, hashNodeToken(token),
 		now.Add(nodeEnrollmentLifetime).UnixMilli(), now.UnixMilli(), id)
 	if err != nil {
@@ -632,14 +642,16 @@ func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string
 
 func validateNodeReport(report NodeReport) error {
 	report.BootID = strings.TrimSpace(report.BootID)
+	report.ReportSessionID = strings.TrimSpace(report.ReportSessionID)
+	report.CounterEpoch = strings.TrimSpace(report.CounterEpoch)
 	report.InterfaceName = strings.TrimSpace(report.InterfaceName)
-	if report.BootID == "" || len(report.BootID) > 128 {
+	if report.BootID == "" || len(report.BootID) > 128 || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 {
 		return errors.New("invalid boot_id")
 	}
 	if report.Sequence <= 0 || report.RXBytes < 0 || report.TXBytes < 0 {
 		return errors.New("invalid traffic counters")
 	}
-	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ListenerError) > 1024 {
+	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ListenerError) > 1024 || len(report.EventSpoolError) > 1024 || report.EventQueueDepth < 0 || report.EventQueueDepth > edgeEventQueueLimit || report.EventDropped < 0 {
 		return errors.New("invalid agent metadata")
 	}
 	if len(report.SiteStats) > 512 {
@@ -680,10 +692,18 @@ func validateNodeReport(report NodeReport) error {
 }
 
 func validateNodeRequestEvent(event NodeRequestEvent) error {
-	if event.EventID <= 0 || event.SiteID <= 0 || len(event.Host) > 255 || len(event.Method) > 16 || len(event.Path) > 2048 || len(event.Query) > 4096 || event.StatusCode < 0 || event.StatusCode > 999 || len(event.ClientIP) > 64 || len(event.UserAgent) > 512 || len(event.Authorization) > 8192 || len(event.Body) > maxNodeRequestEventBodyBytes || len(event.ContentType) > 128 || len(event.ContentEncoding) > 64 || len(event.ResponseBody) > maxNodeRequestEventResponseBodyBytes || len(event.ResponseContentType) > 128 || len(event.ResponseContentEncoding) > 64 || len(event.ResourceCategory) > 32 || len(event.UpstreamUserAgent) > 512 || len(event.BackendAddress) > 2048 || len(event.InboundColo) > 64 || len(event.OutboundColo) > 64 || event.RecordedAtMS <= 0 {
+	if event.EventID <= 0 || (event.EventUID != "" && (len(event.EventUID) != 32 || !isHexString(event.EventUID))) || event.SiteID <= 0 || len(event.Host) > 255 || len(event.Method) > 16 || len(event.Path) > 2048 || len(event.Query) > 4096 || event.StatusCode < 0 || event.StatusCode > 999 || len(event.ClientIP) > 64 || len(event.UserAgent) > 512 || len(event.Authorization) > 8192 || len(event.Body) > maxNodeRequestEventBodyBytes || len(event.ContentType) > 128 || len(event.ContentEncoding) > 64 || len(event.ResponseBody) > maxNodeRequestEventResponseBodyBytes || len(event.ResponseContentType) > 128 || len(event.ResponseContentEncoding) > 64 || len(event.ResourceCategory) > 32 || len(event.UpstreamUserAgent) > 512 || len(event.BackendAddress) > 2048 || len(event.InboundColo) > 64 || len(event.OutboundColo) > 64 || event.RecordedAtMS <= 0 {
 		return errors.New("invalid request event")
 	}
 	return nil
+}
+
+func isHexString(value string) bool {
+	if value == "" {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeRequestEvent) error {
@@ -785,29 +805,38 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 	defer tx.Rollback()
 	acceptedEvents := make([]NodeRequestEvent, 0, len(report.Events))
 	var id, lastSequence, lastRX, lastTX int64
-	var lastBootID string
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID)
+	var lastBootID, lastSessionID string
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errInvalidAgentToken
 	}
 	if err != nil {
 		return ControlNode{}, err
 	}
+	legacyBootID := strings.TrimSpace(report.BootID)
+	sessionID := strings.TrimSpace(report.ReportSessionID)
+	if sessionID == "" {
+		sessionID = legacyBootID
+	}
+	counterEpoch := strings.TrimSpace(report.CounterEpoch)
+	if counterEpoch == "" {
+		counterEpoch = legacyBootID
+	}
 	deltaRX, deltaTX := int64(0), int64(0)
-	if report.BootID == lastBootID && report.Sequence > lastSequence && report.RXBytes >= lastRX && report.TXBytes >= lastTX {
+	if counterEpoch == lastBootID && report.RXBytes >= lastRX && report.TXBytes >= lastTX && (sessionID != lastSessionID || report.Sequence > lastSequence) {
 		deltaRX = report.RXBytes - lastRX
 		deltaTX = report.TXBytes - lastTX
 	}
-	if report.BootID == lastBootID && report.Sequence <= lastSequence {
+	if sessionID == lastSessionID && report.Sequence <= lastSequence {
 		deltaRX, deltaTX = 0, 0
 		report.RXBytes, report.TXBytes, report.Sequence = lastRX, lastTX, lastSequence
 	}
 	_, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 		lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-		last_boot_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_listener_error=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
-		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, report.BootID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), now.UnixMilli(), now.UnixMilli(), id)
+		last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, now.UnixMilli(), now.UnixMilli(), id)
 	if err != nil {
 		return ControlNode{}, err
 	}
@@ -827,18 +856,18 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 			return ControlNode{}, err
 		}
 		count := stat.RequestCount
-		if previousBoot != report.BootID || count < previousCount {
+		if previousBoot != sessionID || count < previousCount {
 			previousCount = 0
 		}
 		if count < previousCount {
 			count = previousCount
 		}
 		_, err = tx.Exec(`UPDATE site_node_schedules SET agent_boot_id=?,agent_request_count=?,agent_last_request_at_ms=?,agent_last_status=?,updated_at_ms=? WHERE site_id=?`,
-			report.BootID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID)
+			sessionID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID)
 		if err != nil {
 			return ControlNode{}, err
 		}
-		if err := recordNodeSiteTrafficTx(tx, id, report.BootID, stat, now.UnixMilli()); err != nil {
+		if err := recordNodeSiteTrafficTx(tx, id, sessionID, stat, now.UnixMilli()); err != nil {
 			return ControlNode{}, err
 		}
 	}
@@ -861,7 +890,7 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 		}
 	}
 	for _, event := range report.Events {
-		result, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,received_at_ms) VALUES(?,?,?,?)`, id, report.BootID, event.EventID, now.UnixMilli())
+		result, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,event_uid,received_at_ms) VALUES(?,?,?,?,?)`, id, sessionID, event.EventID, event.EventUID, now.UnixMilli())
 		if err != nil {
 			return ControlNode{}, err
 		}
@@ -870,6 +899,10 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 			return ControlNode{}, err
 		}
 		if rows == 0 {
+			// The event was already durably accepted (for example, the previous
+			// ACK was lost). Acknowledge it again so the Agent can retire its
+			// durable spool entry without replaying the side effect.
+			acceptedEvents = append(acceptedEvents, event)
 			continue
 		}
 		if !event.SkipRequestLog {

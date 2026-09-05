@@ -252,6 +252,65 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 	}
 }
 
+// drain stops new requests while preserving the instance context for requests
+// already in flight. Agent hot reloads use this path; shutdown remains the
+// immediate cancellation path for explicit service stops.
+func (inst *ProxyInstance) drain(ctx context.Context) error {
+	inst.lifecycleMu.Lock()
+	inst.closing = true
+	connections := make([]net.Conn, 0, len(inst.hijackedConns))
+	for conn := range inst.hijackedConns {
+		connections = append(connections, conn)
+	}
+	inst.lifecycleMu.Unlock()
+
+	if inst.listener != nil {
+		_ = inst.listener.Close()
+	}
+	if inst.server != nil {
+		_ = inst.server.Close()
+	}
+	if inst.transport != nil {
+		inst.transport.CloseIdleConnections()
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		inst.activeRequests.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		if inst.dynamicState != nil {
+			inst.dynamicState.close()
+		}
+		return nil
+	case <-ctx.Done():
+		// Force cancellation only after the grace period expires.
+		inst.lifecycleMu.Lock()
+		if inst.cancel != nil {
+			inst.cancel()
+		}
+		now := time.Now()
+		for controller := range inst.activeHTTP {
+			_ = controller.SetReadDeadline(now)
+			_ = controller.SetWriteDeadline(now)
+		}
+		inst.lifecycleMu.Unlock()
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		// No new request can be added after closing is set. Wait for handlers to
+		// observe the cancellation before the hot-reload caller closes the old
+		// bundle's database.
+		inst.activeRequests.Wait()
+		if inst.dynamicState != nil {
+			inst.dynamicState.close()
+		}
+		return ctx.Err()
+	}
+}
+
 func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 	pm := &ProxyManager{
 		proxies:         make(map[int64]*ProxyInstance),
