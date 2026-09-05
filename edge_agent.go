@@ -659,6 +659,9 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		return pending
 	}
 	current := bundle.manager.ProxyRuntimeStats()
+	// Baselines are keyed by the Controller's stable SiteID. The in-memory
+	// Edge database is rebuilt whenever configuration changes, so its local
+	// auto-increment IDs must never be used as long-lived identities.
 	pending.current = make(map[int64]ProxyRuntimeStat, len(current))
 	requestStats := runtime.stats.snapshot()
 	byHost := make(map[string]NodeSiteStat, len(requestStats))
@@ -673,12 +676,13 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 	runtime.mu.RUnlock()
 	pending.stats = make([]NodeSiteStat, 0, len(current))
 	for _, value := range current {
-		pending.current[value.SiteID] = value
 		identity, ok := bundle.localSites[value.SiteID]
 		if !ok {
 			continue
 		}
-		prior := previous[value.SiteID]
+		centralID := identity.centralID
+		pending.current[centralID] = value
+		prior := previous[centralID]
 		inDelta, outDelta := value.CumulativeBytesIn-prior.CumulativeBytesIn, value.CumulativeBytesOut-prior.CumulativeBytesOut
 		if inDelta < 0 {
 			inDelta = value.CumulativeBytesIn

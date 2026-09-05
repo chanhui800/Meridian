@@ -94,6 +94,8 @@ sudo journalctl -u meridian -f
 
 域名前缀入口需要在“全局设置 → TLS 设置”配置面板域名、泛域名和 Cloudflare DNS API Token。证书由 ACME 申请和续签，Token 加密保存在数据库中。
 
+DNS-01 传播检查默认同时查询公共递归 DNS 与系统 resolver；可用 `DNS_PROPAGATION_RESOLVERS`（逗号分隔的 IPv4/IPv6 地址）和 `DNS_PROPAGATION_TIMEOUT`（如 `120s`）调整。Agent 发布包仅提供 Linux amd64/arm64；Windows/macOS 构建产物仅是主控程序，因为节点流量采集依赖 Linux 网卡计数器。
+
 ## 节点调度
 
 节点调度是可选模块。主控保存节点、站点分配、优先级、流量周期和 DNS 状态；每台 VPS 只运行一个 `meridian-agent`，不需要安装完整面板。详细步骤见：[节点调度](docs/node-scheduling.md) 和 [Agent 安装与卸载](docs/agent-installation.md)。

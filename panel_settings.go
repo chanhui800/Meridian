@@ -18,7 +18,13 @@ type PanelSettings struct {
 	ACMEDNSProvider     string `json:"-"`
 	ACMETokenCiphertext string `json:"-"`
 	ACMEStaging         bool   `json:"-"`
+	TLSDisabledReason   string `json:"-"`
 }
+
+const (
+	panelTLSDisabledReasonManual          = "manual"
+	panelTLSDisabledReasonExpiredFallback = "expired_fallback"
+)
 
 // normalizeWildcardDomain accepts the UI form (*.example.com) and stores the
 // DNS suffix without the wildcard marker so routing code can continue to build
@@ -63,7 +69,7 @@ func scanPanelSettings(scanner interface{ Scan(...any) error }) (PanelSettings, 
 	var tlsEnabled, configured, acmeStaging int
 	err := scanner.Scan(
 		&settings.PanelDomain, &settings.RouteDomain, &settings.ListenPort, &tlsEnabled, &configured,
-		&settings.ACMEEmail, &settings.ACMEDNSProvider, &settings.ACMETokenCiphertext, &acmeStaging,
+		&settings.ACMEEmail, &settings.ACMEDNSProvider, &settings.ACMETokenCiphertext, &acmeStaging, &settings.TLSDisabledReason,
 	)
 	settings.TLSEnabled = tlsEnabled != 0
 	settings.Configured = configured != 0
@@ -77,7 +83,7 @@ func (d *DB) PanelSettings() (PanelSettings, error) {
 	}
 	return scanPanelSettings(d.db.QueryRow(`
 		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured,
-			acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging
+			acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging, tls_disabled_reason
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 }
 
@@ -210,7 +216,7 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPor
 
 	current, err := scanPanelSettings(tx.QueryRow(`
 		SELECT panel_domain, route_domain, listen_port, tls_enabled, configured,
-			acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging
+			acme_email, acme_dns_provider, acme_token_ciphertext, acme_staging, tls_disabled_reason
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 	if err != nil {
 		return PanelSettings{}, 0, err
@@ -268,10 +274,14 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPor
 			return PanelSettings{}, 0, err
 		}
 	}
+	reason := ""
+	if !candidate.TLSEnabled {
+		reason = panelTLSDisabledReasonManual
+	}
 	if _, err := tx.Exec(`
 		UPDATE panel_settings
-		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, configured=1, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, candidate.PanelDomain, candidate.RouteDomain, candidate.ListenPort, sqliteBool(candidate.TLSEnabled), panelSettingsRowID); err != nil {
+		SET panel_domain=?, route_domain=?, listen_port=?, tls_enabled=?, tls_disabled_reason=?, configured=1, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, candidate.PanelDomain, candidate.RouteDomain, candidate.ListenPort, sqliteBool(candidate.TLSEnabled), reason, panelSettingsRowID); err != nil {
 		return PanelSettings{}, 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -301,9 +311,21 @@ func (d *DB) SetPanelTLSEnabled(enabled bool) error {
 	if d == nil || d.db == nil {
 		return errors.New("panel settings database is unavailable")
 	}
+	reason := ""
+	if !enabled {
+		reason = panelTLSDisabledReasonManual
+	}
 	_, err := d.db.Exec(`
 		UPDATE panel_settings
-		SET tls_enabled=?, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, sqliteBool(enabled), panelSettingsRowID)
+		SET tls_enabled=?, tls_disabled_reason=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, sqliteBool(enabled), reason, panelSettingsRowID)
+	return err
+}
+
+func (d *DB) setPanelTLSExpiredFallback() error {
+	if d == nil || d.db == nil {
+		return errors.New("panel settings database is unavailable")
+	}
+	_, err := d.db.Exec(`UPDATE panel_settings SET tls_enabled=0, tls_disabled_reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, panelTLSDisabledReasonExpiredFallback, panelSettingsRowID)
 	return err
 }

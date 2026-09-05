@@ -34,8 +34,8 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # Release publishes windows and darwin binaries, but every job here runs on
-      # ubuntu, so the !unix build was never even type-checked.
+      # Controller binaries are cross-compiled for Windows and macOS. Agents
+      # remain Linux-only because traffic counters use Linux sysfs.
       - name: Vet non-unix build targets
         run: |
           GOOS=windows GOARCH=amd64 go vet ./...

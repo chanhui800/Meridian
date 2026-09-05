@@ -189,6 +189,65 @@ func TestInstallCertificatePairAtomicKeepsMatchingCurrentPair(t *testing.T) {
 	}
 }
 
+func TestPanelCertificateManagerInstallUsesAtomicPair(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer tlsServer.Close()
+	certificate := tlsServer.TLS.Certificates[0]
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	issuedPair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manager := &panelCertificateManager{certFile: filepath.Join(root, "fullchain.pem"), keyFile: filepath.Join(root, "privkey.pem"), accountDir: root}
+	if err := manager.install(&issuedPanelCertificate{certPEM: certPEM, keyPEM: keyPEM, certificate: issuedPair}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, enabled, err := manager.tlsConfig(true); err != nil || !enabled {
+		t.Fatalf("installed panel pair could not be activated: enabled=%v err=%v", enabled, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".panel-current")); err != nil {
+		t.Fatalf("atomic panel pointer missing: %v", err)
+	}
+}
+
+func TestPanelTLSDisabledReasonDistinguishesManualAndFallback(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "meridian.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.BootstrapPanelSettings("panel.example.com", "example.com", true, 9090); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPanelTLSEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := db.PanelSettings()
+	if err != nil || settings.TLSDisabledReason != panelTLSDisabledReasonManual {
+		t.Fatalf("manual TLS disable reason=%q err=%v", settings.TLSDisabledReason, err)
+	}
+	if err := db.setPanelTLSExpiredFallback(); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = db.PanelSettings()
+	if err != nil || settings.TLSDisabledReason != panelTLSDisabledReasonExpiredFallback {
+		t.Fatalf("fallback TLS disable reason=%q err=%v", settings.TLSDisabledReason, err)
+	}
+	if err := db.SetPanelTLSEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = db.PanelSettings()
+	if err != nil || settings.TLSDisabledReason != "" || !settings.TLSEnabled {
+		t.Fatalf("TLS re-enable did not clear reason: %+v err=%v", settings, err)
+	}
+}
+
 func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
 	first := edgeCertificateIdentifiers("example.com", "node-a")
 	second := edgeCertificateIdentifiers("example.com", "node-b")

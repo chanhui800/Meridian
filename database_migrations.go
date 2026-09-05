@@ -880,6 +880,7 @@ func ensurePanelSettingsListenPortSchema(ctx context.Context, conn *sql.Conn) er
 		{"acme_dns_provider", "ALTER TABLE panel_settings ADD COLUMN acme_dns_provider TEXT NOT NULL DEFAULT 'cloudflare'"},
 		{"acme_token_ciphertext", "ALTER TABLE panel_settings ADD COLUMN acme_token_ciphertext TEXT NOT NULL DEFAULT ''"},
 		{"acme_staging", "ALTER TABLE panel_settings ADD COLUMN acme_staging INTEGER NOT NULL DEFAULT 0"},
+		{"tls_disabled_reason", "ALTER TABLE panel_settings ADD COLUMN tls_disabled_reason TEXT NOT NULL DEFAULT ''"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('panel_settings') WHERE name=?", migration.column).Scan(&found); err != nil {
