@@ -83,6 +83,33 @@ func TestControlNodeEnrollmentTrafficAndDelete(t *testing.T) {
 	}
 }
 
+func TestRecordNodeReportResultRetiresInvalidEvents(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "ack", Address: "203.0.113.50"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validUID := strings.Repeat("a", 32)
+	result, err := app.db.RecordNodeReportResult(token, NodeReport{
+		BootID: "session", ReportSessionID: "session", CounterEpoch: "epoch", Sequence: 1,
+		InterfaceName: "eth0", Events: []NodeRequestEvent{
+			{EventID: 1, EventUID: validUID, SiteID: 1, Host: "x.example", Method: "GET", Path: "/", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+			{EventID: 2, EventUID: strings.Repeat("b", 32), SiteID: 1, Host: "x.example", Method: "GET", Path: strings.Repeat("x", 2049), StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+		},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Node.ID != node.ID || len(result.AcceptedEventUIDs) != 1 || len(result.DiscardedEventIDs) != 1 || len(result.DiscardedEventUIDs) != 1 {
+		t.Fatalf("unexpected report result: %#v", result)
+	}
+}
+
 func TestControlNodePortValidation(t *testing.T) {
 	custom, err := normalizeNodeInput(NodeCreateInput{Name: "custom", Port: 9090})
 	if err != nil || custom.Port != 9090 {

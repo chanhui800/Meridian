@@ -7132,3 +7132,49 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
 
   .node-actions .is-danger { grid-column: 1 / -1; }
 }
+
+/* Each site keeps its own scheduling card so independent edits and status
+   remain visually grouped while sharing the node page's existing surface. */
+.node-site-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 14px;
+  margin-top: 16px;
+  border-top: 0;
+}
+.node-site-card {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 12%, transparent);
+}
+.node-site-card-head,
+.node-site-card-actions { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.node-site-card-head { padding-bottom: 14px; border-bottom: 1px solid var(--glass-border); }
+.node-site-card .node-site-identity { gap: 6px; }
+.node-site-card .node-site-identity strong { font-size: 16px; color: var(--white-87); }
+.node-site-card .node-site-identity span { color: var(--white-60); font-size: 13px; overflow-wrap: anywhere; }
+.node-site-state { flex: 0 0 auto; padding: 5px 9px; border-radius: 999px; background: var(--surface); color: var(--white-60); font-size: 12px; }
+.node-site-state.is-enabled { color: var(--green); background: color-mix(in srgb, var(--green) 13%, var(--surface)); }
+.node-site-card-controls { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: end; }
+.node-site-card-controls .node-check { min-height: 40px; }
+.node-site-field { display: grid; gap: 7px; color: var(--white-60); font-size: 12px; }
+.node-site-card .node-site-status { min-height: 58px; padding: 11px 12px; border: 1px solid var(--glass-border); border-radius: 9px; background: var(--surface); }
+.node-site-card-actions { justify-content: flex-end; }
+@media (max-width: 900px) { .node-site-card-controls { grid-template-columns: 1fr 1fr; }.node-site-card-controls .node-check { grid-column: 1 / -1; } }
+@media (max-width: 680px) {
+  .node-site-list { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .node-site-row { grid-template-columns: minmax(0, 1fr); }
+  .node-site-row .form-input { width: 100%; max-width: 100%; }
+  .node-site-row > .node-button { width: 100%; min-height: 44px; }
+  .node-site-card { padding: 14px; gap: 14px; }
+  .node-site-card-head { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .node-site-state { justify-self: start; }
+  .node-site-card-controls { grid-template-columns: 1fr; }
+  .node-site-card-controls .node-check { grid-column: auto; min-height: 44px; }
+  .node-site-card-actions .node-button { width: 100%; min-height: 44px; }
+}

@@ -135,6 +135,15 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	edgeDir := filepath.Join(tlsDir, "edge-nodes", "node-a", "current")
+	if err := os.MkdirAll(edgeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{"fullchain.pem": "edge certificate", "privkey.pem": "edge private key"} {
+		if err := os.WriteFile(filepath.Join(edgeDir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	app := &App{db: db, dbPath: dbPath, pm: NewProxyManager(db, bytes.Repeat([]byte("h"), 32))}
 	const password = "correct horse battery staple"
 
@@ -177,6 +186,25 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 	for _, name := range []string{backupTLSCertificate, backupTLSPrivateKey, backupTLSEnabled, backupACMEAccount} {
 		if _, ok := entries[name]; !ok {
 			t.Fatalf("selected TLS backup is missing %s", name)
+		}
+	}
+	for _, name := range []string{backupTLSEdgeNodesPrefix + "node-a/fullchain.pem", backupTLSEdgeNodesPrefix + "node-a/privkey.pem"} {
+		if _, ok := entries[name]; !ok {
+			t.Fatalf("selected TLS backup is missing %s", name)
+		}
+	}
+}
+
+func TestBackupEntryLimitAllowsOnlySafeEdgeNodePairs(t *testing.T) {
+	if limit, ok := backupEntryLimit(backupTLSEdgeNodesPrefix + "node-a/fullchain.pem"); !ok || limit <= 0 {
+		t.Fatal("valid edge node certificate entry was rejected")
+	}
+	for _, name := range []string{
+		backupTLSEdgeNodesPrefix + "../fullchain.pem",
+		backupTLSEdgeNodesPrefix + "node-a/other.pem",
+	} {
+		if _, ok := backupEntryLimit(name); ok {
+			t.Fatalf("unsafe edge backup entry accepted: %s", name)
 		}
 	}
 }

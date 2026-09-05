@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -365,6 +367,18 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid enrollment token")
 		return
 	}
+	// Provision this node immediately instead of waiting for the 12-hour
+	// renewal scheduler. The operation is bounded and asynchronous so enroll
+	// remains responsive; the normal scheduler retries any transient failure.
+	if a.panelCertificates != nil {
+		go func(enrolled ControlNode) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if err := provisionEdgeCertificateForNode(ctx, a.db, a.panelCertificates, enrolled); err != nil {
+				log.Printf("[edge-certificate] initial provision failed for node %s: %v", enrolled.Name, err)
+			}
+		}(node)
+	}
 	a.jsonOK(w, map[string]interface{}{"node_guid": node.GUID, "agent_token": agentToken, "report_interval_seconds": 15})
 }
 
@@ -378,7 +392,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	node, err := a.db.RecordNodeReport(requestBearerToken(r), report, time.Now())
+	result, err := a.db.RecordNodeReportResult(requestBearerToken(r), report, time.Now())
 	if errors.Is(err, errInvalidAgentToken) {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return
@@ -387,18 +401,12 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	accepted := make([]int64, 0, len(report.Events))
-	acceptedUIDs := make([]string, 0, len(report.Events))
-	for _, event := range report.Events {
-		accepted = append(accepted, event.EventID)
-		if event.EventUID != "" {
-			acceptedUIDs = append(acceptedUIDs, event.EventUID)
-		}
-	}
-	configChanged := node.DesiredConfigHash != "" && node.DesiredConfigHash != report.AppliedConfigHash
+	configChanged := result.Node.DesiredConfigHash != "" && result.Node.DesiredConfigHash != report.AppliedConfigHash
 	a.jsonOK(w, map[string]interface{}{
-		"accepted": true, "node_id": node.ID, "next_report_seconds": 15,
-		"accepted_event_ids": accepted, "accepted_event_uids": acceptedUIDs, "config_hash": node.DesiredConfigHash,
+		"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
+		"accepted_event_ids": result.AcceptedEventIDs, "accepted_event_uids": result.AcceptedEventUIDs,
+		"discarded_event_ids": result.DiscardedEventIDs, "discarded_event_uids": result.DiscardedEventUIDs,
+		"config_hash":    result.Node.DesiredConfigHash,
 		"config_changed": configChanged,
 	})
 }
@@ -424,22 +432,16 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		if err := websocket.JSON.Receive(ws, &report); err != nil {
 			return
 		}
-		node, err := a.db.RecordNodeReport(token, report, time.Now())
+		result, err := a.db.RecordNodeReportResult(token, report, time.Now())
 		if err != nil {
 			return
 		}
-		accepted := make([]int64, 0, len(report.Events))
-		acceptedUIDs := make([]string, 0, len(report.Events))
-		for _, event := range report.Events {
-			accepted = append(accepted, event.EventID)
-			if event.EventUID != "" {
-				acceptedUIDs = append(acceptedUIDs, event.EventUID)
-			}
-		}
 		ack := map[string]interface{}{
-			"accepted": true, "node_id": node.ID, "next_report_seconds": 15,
-			"accepted_event_ids": accepted, "accepted_event_uids": acceptedUIDs, "config_hash": node.DesiredConfigHash,
-			"config_changed": node.DesiredConfigHash != "" && node.DesiredConfigHash != report.AppliedConfigHash,
+			"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
+			"accepted_event_ids": result.AcceptedEventIDs, "accepted_event_uids": result.AcceptedEventUIDs,
+			"discarded_event_ids": result.DiscardedEventIDs, "discarded_event_uids": result.DiscardedEventUIDs,
+			"config_hash":    result.Node.DesiredConfigHash,
+			"config_changed": result.Node.DesiredConfigHash != "" && result.Node.DesiredConfigHash != report.AppliedConfigHash,
 		}
 		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 			return

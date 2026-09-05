@@ -799,7 +799,7 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 			Authorization: authorization, Body: requestBody, ContentType: r.Header.Get("Content-Type"),
 			ContentEncoding: r.Header.Get("Content-Encoding"), ResponseBody: responseBody,
 			ResponseContentType: w.Header().Get("Content-Type"), ResponseContentEncoding: w.Header().Get("Content-Encoding"),
-			RecordedAtMS: time.Now().UnixMilli(), SkipRequestLog: true,
+			RecordedAtMS: time.Now().UnixMilli(), Priority: nodeEventPriorityCritical, SkipRequestLog: true,
 		})
 	})
 }
@@ -1172,10 +1172,12 @@ func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, 
 }
 
 type edgeReportAck struct {
-	AcceptedEventIDs  []int64  `json:"accepted_event_ids"`
-	AcceptedEventUIDs []string `json:"accepted_event_uids"`
-	ConfigHash        string   `json:"config_hash"`
-	ConfigChanged     bool     `json:"config_changed"`
+	AcceptedEventIDs   []int64  `json:"accepted_event_ids"`
+	AcceptedEventUIDs  []string `json:"accepted_event_uids"`
+	DiscardedEventIDs  []int64  `json:"discarded_event_ids"`
+	DiscardedEventUIDs []string `json:"discarded_event_uids"`
+	ConfigHash         string   `json:"config_hash"`
+	ConfigChanged      bool     `json:"config_changed"`
 }
 
 type edgeWSReportClient struct {
@@ -1553,9 +1555,17 @@ func runEdgeAgent() error {
 				for _, uid := range ack.AcceptedEventUIDs {
 					acceptedUIDs[uid] = true
 				}
+				discarded := make(map[int64]bool, len(ack.DiscardedEventIDs))
+				for _, id := range ack.DiscardedEventIDs {
+					discarded[id] = true
+				}
+				discardedUIDs := make(map[string]bool, len(ack.DiscardedEventUIDs))
+				for _, uid := range ack.DiscardedEventUIDs {
+					discardedUIDs[uid] = true
+				}
 				ackEvents := make([]NodeRequestEvent, 0, len(report.Events))
 				for _, event := range report.Events {
-					if accepted[event.EventID] || (event.EventUID != "" && acceptedUIDs[event.EventUID]) {
+					if accepted[event.EventID] || discarded[event.EventID] || (event.EventUID != "" && (acceptedUIDs[event.EventUID] || discardedUIDs[event.EventUID])) {
 						ackEvents = append(ackEvents, event)
 					}
 				}

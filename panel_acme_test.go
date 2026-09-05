@@ -187,3 +187,41 @@ func TestInstallCertificatePairAtomicKeepsMatchingCurrentPair(t *testing.T) {
 		t.Fatalf("current pair is not loadable: %v", err)
 	}
 }
+
+func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
+	first := edgeCertificateIdentifiers("example.com", "node-a")
+	second := edgeCertificateIdentifiers("example.com", "node-b")
+	if len(first) != 2 || len(second) != 2 || first[0] != "*.example.com" || second[0] != "*.example.com" {
+		t.Fatalf("unexpected edge identifiers: %#v %#v", first, second)
+	}
+	if first[1] == second[1] || first[1] == first[0] || second[1] == second[0] {
+		t.Fatalf("edge identifiers are not node-unique: %#v %#v", first, second)
+	}
+}
+
+func TestCertificateGenerationCleanupKeepsCurrentAndPrevious(t *testing.T) {
+	root := t.TempDir()
+	generations := filepath.Join(root, "generations")
+	current := filepath.Join(root, "current")
+	if err := os.MkdirAll(generations, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"generation-old", "generation-previous", "generation-current"} {
+		if err := os.Mkdir(filepath.Join(generations, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join("generations", "generation-current"), current); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+	if err := cleanupOldCertificateGenerations(generations, current, 2); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(generations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("generation count = %d, want 2", len(entries))
+	}
+}

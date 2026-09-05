@@ -72,6 +72,30 @@ func TestEdgeEventQueueRetainsCriticalEventsWhenFull(t *testing.T) {
 	}
 }
 
+func TestEdgeObserverMarksReplayEventsCritical(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &edgeAgentRuntime{}
+	if err := runtime.events.initWithRawKey(dir, key, nil); err != nil {
+		t.Fatal(err)
+	}
+	handler := runtime.observe(map[string]int64{"media.example.test": 7}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "https://media.example.test/Sessions/Playing", strings.NewReader(`{"ItemId":"1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	events := runtime.events.snapshot()
+	if len(events) != 1 || events[0].Priority != nodeEventPriorityCritical {
+		t.Fatalf("observer event priority = %#v, want critical", events)
+	}
+}
+
 func TestEdgeEventSpoolCorruptionCanBeQuarantined(t *testing.T) {
 	dir := t.TempDir()
 	spoolDir := filepath.Join(dir, "events")
