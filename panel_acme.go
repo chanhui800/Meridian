@@ -140,8 +140,8 @@ func installCertificatePairAtomic(certFile, keyFile string, certPEM, keyPEM []by
 	// Linux production uses an atomic symlink replacement. Windows test/dev
 	// environments may not permit symlinks, so retain a safe pair-wise fallback.
 	tmpLink := currentDir + ".next"
-	_ = os.Remove(tmpLink)                                                                                     // #nosec G703 -- tmpLink is derived from the validated current directory.
-	if err := os.Symlink(filepath.Join("..", "generations", filepath.Base(generation)), tmpLink); err == nil { // #nosec G703 -- link target is generated beneath the private TLS directory.
+	_ = os.Remove(tmpLink)                                                                               // #nosec G703 -- tmpLink is derived from the validated current directory.
+	if err := os.Symlink(filepath.Join("generations", filepath.Base(generation)), tmpLink); err == nil { // #nosec G703 -- link target is generated beneath the private TLS directory.
 		if err := os.Rename(tmpLink, currentDir); err != nil { // #nosec G703 -- both paths are generated within the private TLS directory.
 			_ = os.Remove(tmpLink) // #nosec G703 -- tmpLink is generated within the private TLS directory.
 			return err
