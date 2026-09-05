@@ -14,7 +14,6 @@ import (
 
 const (
 	edgeCertificateRenewalTimeout = 3 * time.Minute
-	edgeCertificateBatchTimeout   = 30 * time.Minute
 )
 
 func edgeCertificateHost(routeDomain, nodeGUID string) string {
@@ -56,9 +55,10 @@ func runPanelCertificateRenewalScheduler(ctx context.Context, db *DB, manager *p
 				restart[0]()
 			}
 		}
-		edgeCtx, edgeCancel := context.WithTimeout(ctx, edgeCertificateBatchTimeout)
-		edgeErr := renewEdgeCertificatesIfDue(edgeCtx, db, manager)
-		edgeCancel()
+		// Each node receives its own three-minute context inside
+		// renewEdgeCertificatesIfDue. Do not impose a short batch deadline that
+		// would cancel later nodes merely because an earlier node was slow.
+		edgeErr := renewEdgeCertificatesIfDue(ctx, db, manager)
 		if edgeErr != nil && !errors.Is(edgeErr, errCertificateIssuanceBusy) && !errors.Is(edgeErr, context.Canceled) {
 			log.Printf("[edge-certificate] automatic renewal failed: %v", edgeErr)
 		}
