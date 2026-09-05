@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -259,6 +260,36 @@ func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
 	}
 	if !strings.HasSuffix(first[1], ".edge.example.com") || !strings.HasSuffix(second[1], ".edge.example.com") {
 		t.Fatalf("edge identifiers must live outside the route wildcard: %#v %#v", first, second)
+	}
+}
+
+func TestCloudflareFindZoneUsesLongestMatch(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query().Get("name"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("name") == "edge.example.com" {
+			_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"edge-zone"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result":[]}`))
+	}))
+	defer server.Close()
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	zone, err := client.findZone(context.Background(), "1111.edge.example.com")
+	if err != nil || zone != "edge-zone" {
+		t.Fatalf("zone=%q err=%v", zone, err)
+	}
+	if len(queries) != 2 || queries[0] != "1111.edge.example.com" || queries[1] != "edge.example.com" {
+		t.Fatalf("zone query order=%v", queries)
+	}
+}
+
+func TestDNSPropagationResolversIncludeUDPAndTCP(t *testing.T) {
+	t.Setenv("DNS_PROPAGATION_RESOLVERS", "1.1.1.1")
+	resolvers := dnsPropagationResolvers()
+	if len(resolvers) != 3 {
+		t.Fatalf("resolver count=%d, want UDP/TCP/system", len(resolvers))
 	}
 }
 

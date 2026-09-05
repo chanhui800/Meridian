@@ -21,8 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/net/publicsuffix"
 )
 
 const agentConfigSchemaVersion = 1
@@ -781,17 +779,13 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if ip.To4() == nil {
 		recordType = "AAAA"
 	}
-	zoneName, err := publicsuffix.EffectiveTLDPlusOne(schedule.PublicHost)
-	if err != nil {
-		return err
-	}
 	cf, err := a.cloudflareForScheduling()
 	if err != nil {
 		return err
 	}
 	zoneID := schedule.cfZoneID
 	if zoneID == "" {
-		zoneID, err = cf.findZone(ctx, zoneName)
+		zoneID, err = cf.findZone(ctx, schedule.PublicHost)
 		if err != nil {
 			return err
 		}

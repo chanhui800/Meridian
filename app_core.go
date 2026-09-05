@@ -26,6 +26,7 @@ type App struct {
 	routeDomain       string
 	panelTLSEnabled   bool
 	panelCertificates *panelCertificateManager
+	certificateWorker *certificateWorker
 	panelBindLoopback bool
 	panelListenPort   int
 	dynamicRouteKey   []byte

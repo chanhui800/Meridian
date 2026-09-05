@@ -367,10 +367,11 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid enrollment token")
 		return
 	}
-	// Provision this node immediately instead of waiting for the 12-hour
-	// renewal scheduler. The operation is bounded and asynchronous so enroll
-	// remains responsive; the normal scheduler retries any transient failure.
-	if a.panelCertificates != nil {
+	// Queue provisioning so enrollment returns immediately and each job gets
+	// its own ACME timeout/retry budget instead of waiting behind another node.
+	if a.certificateWorker != nil {
+		a.certificateWorker.enqueue(node.ID)
+	} else if a.panelCertificates != nil {
 		go func(enrolled ControlNode) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()

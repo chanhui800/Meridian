@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 const panelSettingsRowID = 1
@@ -112,16 +114,19 @@ func normalizeManagedPanelSettings(panelDomain, routeDomain string) (PanelSettin
 	if settings.PanelDomain == "" || settings.RouteDomain == "" {
 		return PanelSettings{}, errors.New("面板访问域名和节点基础域名不能为空")
 	}
-	suffix := "." + settings.RouteDomain
-	if !strings.HasSuffix(settings.PanelDomain, suffix) {
-		return PanelSettings{}, errors.New("面板访问域名必须属于节点基础域名")
+	if strings.EqualFold(settings.PanelDomain, settings.RouteDomain) {
+		return PanelSettings{}, errors.New("面板访问域名和节点基础域名必须不同")
 	}
-	label := strings.TrimSuffix(settings.PanelDomain, suffix)
-	if label == "" || strings.Contains(label, ".") {
-		return PanelSettings{}, errors.New("面板访问域名必须是节点基础域名下的一层子域名")
+	panelRoot, err := publicsuffix.EffectiveTLDPlusOne(settings.PanelDomain)
+	if err != nil {
+		return PanelSettings{}, fmt.Errorf("面板访问域名注册域无效: %w", err)
 	}
-	if _, err := normalizeRoutePrefix(label); err != nil {
-		return PanelSettings{}, fmt.Errorf("面板访问域名前缀无效: %w", err)
+	routeRoot, err := publicsuffix.EffectiveTLDPlusOne(settings.RouteDomain)
+	if err != nil {
+		return PanelSettings{}, fmt.Errorf("节点基础域名注册域无效: %w", err)
+	}
+	if !strings.EqualFold(panelRoot, routeRoot) {
+		return PanelSettings{}, errors.New("面板访问域名和节点基础域名必须属于同一注册域")
 	}
 	settings.Configured = true
 	settings.TLSEnabled = true
@@ -155,6 +160,13 @@ func (d *DB) BootstrapPanelSettings(panelDomain, routeDomain string, tlsEnabled 
 	candidate, err := normalizeStoredPanelSettings(panelDomain, routeDomain, tlsEnabled)
 	if err != nil {
 		return PanelSettings{}, err
+	}
+	if candidate.Configured {
+		candidate, err = normalizeManagedPanelSettings(panelDomain, routeDomain)
+		if err != nil {
+			return PanelSettings{}, err
+		}
+		candidate.TLSEnabled = tlsEnabled
 	}
 	candidate.ListenPort = listenPort
 	if !candidate.Configured {
@@ -220,6 +232,15 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPor
 		FROM panel_settings WHERE id=?`, panelSettingsRowID))
 	if err != nil {
 		return PanelSettings{}, 0, err
+	}
+	if current.RouteDomain != "" && current.RouteDomain != candidate.RouteDomain {
+		var managedRecords int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM site_node_schedules WHERE TRIM(cf_record_id) <> ''`).Scan(&managedRecords); err != nil {
+			return PanelSettings{}, 0, err
+		}
+		if managedRecords > 0 {
+			return PanelSettings{}, 0, errors.New("请先停用节点 DNS 调度并清理已托管 DNS 记录，再修改节点基础域名")
+		}
 	}
 	rows, err := tx.Query("SELECT id, public_host FROM sites WHERE public_host <> '' ORDER BY id")
 	if err != nil {

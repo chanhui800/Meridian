@@ -170,6 +170,7 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 		return fmt.Errorf("decrypt Cloudflare DNS token: %w", err)
 	}
 	manager := newPanelCertificateManager(dbPath, nil)
+	manager.attachDB(db)
 	if manager == nil || strings.TrimSpace(manager.edgeCertFile) == "" || strings.TrimSpace(manager.edgeKeyFile) == "" {
 		return errors.New("edge TLS certificate paths are unavailable")
 	}
@@ -189,18 +190,24 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 	if required == 0 {
 		return errors.New("no enabled enrolled control nodes require an edge certificate")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
 	installed := 0
+	var failures []error
 	for _, node := range nodes {
 		if !edgeCertificateRequired(node) || strings.TrimSpace(node.GUID) == "" {
 			continue
 		}
-		if changed, ensureErr := ensureEdgeCertificateForNode(ctx, settings, token, manager, node); ensureErr != nil {
-			return fmt.Errorf("issue edge certificate for node %s: %w", node.Name, ensureErr)
+		nodeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		changed, ensureErr := ensureEdgeCertificateForNode(nodeCtx, settings, token, manager, node)
+		cancel()
+		if ensureErr != nil {
+			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, ensureErr))
+			continue
 		} else if changed {
 			installed++
 		}
+	}
+	if err := errors.Join(failures...); err != nil {
+		return fmt.Errorf("one or more edge certificate jobs failed: %w", err)
 	}
 	_, err = fmt.Fprintf(output, "edge certificates installed or renewed for %d node(s) for *.%s\n", installed, settings.RouteDomain)
 	return err

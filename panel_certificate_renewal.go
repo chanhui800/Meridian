@@ -198,7 +198,7 @@ func disableExpiredPanelTLSIfNeeded(db *DB, manager *panelCertificateManager) (b
 	if err := manager.disable(); err != nil {
 		return false, fmt.Errorf("disable expired panel TLS marker: %w", err)
 	}
-	log.Printf("[panel-certificate] certificate for *.%s expired; HTTPS disabled and HTTP fallback requested", settings.RouteDomain)
+	log.Printf("[panel-certificate] certificate for %s expired; HTTPS disabled and HTTP fallback requested", settings.PanelDomain)
 	return true, nil
 }
 
@@ -250,6 +250,6 @@ func renewPanelCertificateIfDue(ctx context.Context, db *DB, manager *panelCerti
 			return false, fmt.Errorf("re-enable panel TLS after renewal: %w", err)
 		}
 	}
-	log.Printf("[panel-certificate] wildcard certificate renewed for *.%s", settings.RouteDomain)
+	log.Printf("[panel-certificate] panel certificate renewed for %s", settings.PanelDomain)
 	return recovered, nil
 }

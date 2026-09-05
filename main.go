@@ -40,8 +40,13 @@ var startTime = time.Now()
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
 var appVersion = "dev"
 
+// buildMode is injected by release and container builds.  Keeping the mode in
+// the binary metadata means an Agent remains an Agent even when an operator
+// renames the executable or invokes it through a symlink.
+var buildMode = "controller"
+
 func main() {
-	if strings.EqualFold(filepath.Base(os.Args[0]), "meridian-agent") {
+	if strings.EqualFold(strings.TrimSpace(buildMode), "agent") {
 		if err := runEdgeAgent(); err != nil {
 			fmt.Fprintf(os.Stderr, "meridian-agent: %v\n", err)
 			os.Exit(1)
@@ -139,6 +144,7 @@ func main() {
 	panelHost := panelSettings.PanelDomain
 	routeDomain := panelSettings.RouteDomain
 	panelCertificates := newPanelCertificateManager(dbPath, nil)
+	panelCertificates.attachDB(db)
 	if err := panelCertificates.validatePanelEdgeKeySeparation(); err != nil {
 		log.Fatalf("invalid panel/edge TLS key separation: %v", err)
 	}
@@ -233,6 +239,8 @@ func main() {
 		restartCh:         make(chan struct{}),
 		tmdb:              tmdb,
 	}
+	app.certificateWorker = newCertificateWorker(ctx, db, panelCertificates)
+	defer app.certificateWorker.close()
 	go runPanelCertificateRenewalScheduler(ctx, db, panelCertificates, app.requestRestart)
 	go runSiteNodeScheduler(ctx, app)
 

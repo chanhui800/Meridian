@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/mail"
@@ -32,7 +33,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/acme"
-	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -79,6 +79,7 @@ type panelCertificateManager struct {
 	edgeKeyFile  string
 	accountDir   string
 	httpClient   *http.Client
+	db           *DB
 
 	mu                 sync.Mutex
 	issuing            bool
@@ -453,6 +454,15 @@ func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCe
 	}
 }
 
+func (m *panelCertificateManager) attachDB(db *DB) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.db = db
+	m.mu.Unlock()
+}
+
 func (m *panelCertificateManager) status(settings PanelSettings, activePanelDomain, activeRouteDomain string, activeListenPort int, tlsEnabled bool) panelCertificateStatus {
 	status := panelCertificateStatus{
 		Available:          m != nil && m.certFile != "" && m.keyFile != "",
@@ -492,9 +502,11 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 			break
 		}
 	}
-	status.CertificateCurrent = status.CertificateWildcardDomain != "" && status.CertificateWildcardDomain == status.WildcardDomain
+	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(strings.TrimSpace(activePanelDomain)) == nil
 	now := time.Now()
-	status.CertificateValid = !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
+	timeValid := !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
+	chainValid := strings.TrimSpace(activePanelDomain) != "" && verifyCertificateChainForHost(certFile, activePanelDomain) == nil
+	status.CertificateValid = timeValid && chainValid
 	status.Subject = certificate.Subject.CommonName
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
 	days := int(time.Until(certificate.NotAfter).Hours() / 24)
@@ -728,7 +740,9 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	if err != nil {
 		return nil, err
 	}
-	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.RouteDomain, []string{wildcardDomainForSettings(settings)}, staging)
+	// Panel certificates are intentionally scoped to the panel hostname. Edge
+	// listeners obtain their own per-node certificate through the renewal path.
+	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.PanelDomain, []string{settings.PanelDomain}, staging)
 }
 
 // issueCloudflareForIdentifiers issues one certificate for an explicit SAN
@@ -771,6 +785,23 @@ func (m *panelCertificateManager) issueCloudflareForIdentifiers(ctx context.Cont
 		return nil, err
 	}
 	defer m.releaseIssue()
+	m.mu.Lock()
+	lockDB := m.db
+	m.mu.Unlock()
+	lockOwner := ""
+	if lockDB != nil {
+		lockOwner = newACMELockOwner()
+		if err := lockDB.acquireACMELock(ctx, lockOwner, acmeIssueLeaseTTL); err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err := lockDB.releaseACMELock(lockOwner); err != nil {
+				// Issuance has completed; surface the release failure in logs while
+				// leaving the lease to expire safely if the database is unavailable.
+				log.Printf("[acme] release shared issuance lock failed: %v", err)
+			}
+		}()
+	}
 
 	if err := os.MkdirAll(m.accountDir, 0o700); err != nil { // #nosec G703 -- accountDir is captured from administrator-configured TLS paths.
 		return nil, fmt.Errorf("create TLS directory: %w", err)
@@ -1098,11 +1129,11 @@ func fulfillCloudflareDNSAuthorization(ctx context.Context, acmeClient *acme.Cli
 	if err != nil {
 		return fmt.Errorf("prepare DNS-01 challenge: %w", err)
 	}
-	zoneName, err := publicsuffix.EffectiveTLDPlusOne(routeDomain)
-	if err != nil {
+	zoneLookupName := strings.TrimPrefix(authorization.Identifier.Value, "*.")
+	if _, err := normalizePublicHost(zoneLookupName); err != nil {
 		return fmt.Errorf("resolve DNS zone: %w", err)
 	}
-	zoneID, err := cf.findZone(ctx, zoneName)
+	zoneID, err := cf.findZone(ctx, zoneLookupName)
 	if err != nil {
 		return err
 	}
@@ -1133,16 +1164,19 @@ func dnsPropagationResolvers() []*net.Resolver {
 	if len(servers) == 1 && strings.TrimSpace(servers[0]) == "" {
 		servers = []string{"1.1.1.1", "8.8.8.8"}
 	}
-	resolvers := make([]*net.Resolver, 0, len(servers)+1)
+	resolvers := make([]*net.Resolver, 0, len(servers)*2+1)
 	for _, server := range servers {
 		server = strings.TrimSpace(server)
 		if net.ParseIP(server) == nil {
 			continue
 		}
-		resolverIP := server
-		resolvers = append(resolvers, &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "udp", net.JoinHostPort(resolverIP, "53"))
-		}})
+		for _, network := range []string{"udp", "tcp"} {
+			resolverIP := server
+			resolverNetwork := network
+			resolvers = append(resolvers, &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, resolverNetwork, net.JoinHostPort(resolverIP, "53"))
+			}})
+		}
 	}
 	// Keep the host resolver as a final fallback for split-horizon DNS and
 	// environments that intentionally block public recursive resolvers.
@@ -1222,17 +1256,34 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 }
 
 func (c *cloudflareClient) findZone(ctx context.Context, zoneName string) (string, error) {
-	result, err := c.request(ctx, http.MethodGet, "/zones?name="+url.QueryEscape(zoneName)+"&status=active&per_page=1", nil)
-	if err != nil {
-		return "", err
+	value := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zoneName)), ".")
+	if value == "" {
+		return "", errors.New("cloudflare DNS zone name is empty")
 	}
-	var zones []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(result, &zones); err != nil || len(zones) == 0 || zones[0].ID == "" {
+	labels := strings.Split(value, ".")
+	if len(labels) < 2 {
 		return "", fmt.Errorf("cloudflare DNS zone %s was not found", zoneName)
 	}
-	return zones[0].ID, nil
+	// Query the most specific candidate first. This supports installations
+	// where edge.example.com is delegated as its own Cloudflare zone while
+	// still falling back to the registrable parent example.com.
+	for start := 0; start <= len(labels)-2; start++ {
+		candidate := strings.Join(labels[start:], ".")
+		result, err := c.request(ctx, http.MethodGet, "/zones?name="+url.QueryEscape(candidate)+"&status=active&per_page=1", nil)
+		if err != nil {
+			return "", err
+		}
+		var zones []struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(result, &zones); err != nil {
+			return "", errors.New("cloudflare DNS returned an invalid zone response")
+		}
+		if len(zones) > 0 && zones[0].ID != "" {
+			return zones[0].ID, nil
+		}
+	}
+	return "", fmt.Errorf("cloudflare DNS zone %s was not found", zoneName)
 }
 
 func (c *cloudflareClient) createTXTRecord(ctx context.Context, zoneID, name, value string) (string, error) {
