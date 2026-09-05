@@ -912,8 +912,8 @@ func isPanelCertificatePairEntry(entry string) bool {
 func restorePanelCertificatePair(dbPath, sourceDir string) (bool, error) {
 	certSource := filepath.Join(sourceDir, filepath.FromSlash(backupTLSCertificate))
 	keySource := filepath.Join(sourceDir, filepath.FromSlash(backupTLSPrivateKey))
-	certPEM, certErr := os.ReadFile(certSource) // #nosec G304 -- source is an allowlisted restore directory and fixed TLS entry.
-	keyPEM, keyErr := os.ReadFile(keySource)    // #nosec G304 -- source is an allowlisted restore directory and fixed TLS entry.
+	certPEM, certErr := os.ReadFile(certSource) // #nosec G304 G703 -- source is an allowlisted restore directory and fixed TLS entry.
+	keyPEM, keyErr := os.ReadFile(keySource)    // #nosec G304 G703 -- source is an allowlisted restore directory and fixed TLS entry.
 	if errors.Is(certErr, os.ErrNotExist) || errors.Is(keyErr, os.ErrNotExist) {
 		return false, nil
 	}

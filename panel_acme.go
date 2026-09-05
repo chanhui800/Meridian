@@ -94,7 +94,7 @@ func (m *panelCertificateManager) panelPairPaths() (string, string) {
 		return "", ""
 	}
 	currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
-	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
+	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil { // #nosec G703 -- currentDir is derived from the administrator-configured TLS path.
 		return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
 	}
 	return m.certFile, m.keyFile
@@ -473,7 +473,7 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	defer m.mu.Unlock()
 	status.Issuing = m.issuing
 	certFile, _ := m.panelPairPaths()
-	data, err := os.ReadFile(certFile) // #nosec G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
 	if err != nil {
 		return status
 	}
@@ -772,7 +772,7 @@ func (m *panelCertificateManager) issueCloudflareForIdentifiers(ctx context.Cont
 	}
 	defer m.releaseIssue()
 
-	if err := os.MkdirAll(m.accountDir, 0o700); err != nil {
+	if err := os.MkdirAll(m.accountDir, 0o700); err != nil { // #nosec G703 -- accountDir is captured from administrator-configured TLS paths.
 		return nil, fmt.Errorf("create TLS directory: %w", err)
 	}
 	directoryURL := letsEncryptProductionDirectory
@@ -964,8 +964,8 @@ func (m *panelCertificateManager) restoreInstalledFiles(backup installedPanelCer
 		// No previous pair means this was the first installation. Remove the
 		// newly-created atomic pointer before restoring the legacy paths.
 		currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
-		if err := os.Remove(currentDir); err != nil && !errors.Is(err, os.ErrNotExist) {
-			if removeAllErr := os.RemoveAll(currentDir); removeAllErr != nil {
+		if err := os.Remove(currentDir); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 -- currentDir is derived from the manager's validated TLS path.
+			if removeAllErr := os.RemoveAll(currentDir); removeAllErr != nil { // #nosec G703 -- currentDir is derived from the manager's validated TLS path.
 				return fmt.Errorf("remove new certificate pointer: %w", err)
 			}
 		}
