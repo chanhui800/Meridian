@@ -502,7 +502,7 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 			break
 		}
 	}
-	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(strings.TrimSpace(activePanelDomain)) == nil
+	status.CertificateCurrent = status.CertificateWildcardDomain != "" && strings.EqualFold(status.CertificateWildcardDomain, status.WildcardDomain)
 	now := time.Now()
 	timeValid := !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
 	chainValid := strings.TrimSpace(activePanelDomain) != "" && verifyCertificateChainForHost(certFile, activePanelDomain) == nil
@@ -740,9 +740,7 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	if err != nil {
 		return nil, err
 	}
-	// Panel certificates are intentionally scoped to the panel hostname. Edge
-	// listeners obtain their own per-node certificate through the renewal path.
-	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.PanelDomain, []string{settings.PanelDomain}, staging)
+	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.RouteDomain, []string{wildcardDomainForSettings(settings)}, staging)
 }
 
 // issueCloudflareForIdentifiers issues one certificate for an explicit SAN
