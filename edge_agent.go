@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1121,6 +1122,10 @@ func edgeSaveState(path string, state edgeAgentState) error {
 }
 
 func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, token string, body, output any) error {
+	return edgeAPIRequestWithHeaders(ctx, client, method, endpoint, token, body, output, nil)
+}
+
+func edgeAPIRequestWithHeaders(ctx context.Context, client *http.Client, method, endpoint, token string, body, output any, headers http.Header) error {
 	var reader io.Reader
 	var payload []byte
 	if body != nil {
@@ -1136,6 +1141,11 @@ func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, 
 		return err
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
+	for key, values := range headers {
+		for _, value := range values {
+			request.Header.Add(key, value)
+		}
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 		if len(payload) >= 1024 {
@@ -1297,7 +1307,9 @@ func edgeEnroll(ctx context.Context, client *http.Client, controller, tokenFile,
 		NodeGUID string `json:"node_guid"`
 		Token    string `json:"agent_token"`
 	}
-	if err := edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/enroll", strings.TrimSpace(string(data)), nil, &response); err != nil {
+	if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodPost, controller+"/api/agent/enroll", strings.TrimSpace(string(data)), nil, &response, http.Header{
+		agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
+	}); err != nil {
 		return edgeAgentState{}, err
 	}
 	state := edgeAgentState{NodeGUID: response.NodeGUID, Token: response.Token}
@@ -1410,6 +1422,7 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 		return err
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set(agentPlatformHeader, goruntime.GOOS+"/"+goruntime.GOARCH)
 	response, err := client.Do(request)
 	if err != nil {
 		return err
@@ -1510,7 +1523,9 @@ func runEdgeAgent() error {
 	for {
 		if lastConfigAt.IsZero() || time.Since(lastConfigAt) >= configRefreshInterval {
 			var config AgentRuntimeConfig
-			if err := edgeAPIRequest(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config); err != nil {
+			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, http.Header{
+				agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)

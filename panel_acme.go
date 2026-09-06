@@ -56,6 +56,7 @@ type panelCertificateStatus struct {
 	PanelCoveredByEdgeWildcard         bool   `json:"panel_covered_by_edge_wildcard"`
 	CertificateCurrent                 bool   `json:"certificate_current"`
 	CertificateMatchesConfiguredDomain bool   `json:"certificate_matches_configured_domain"`
+	CertificateMatchesRouteWildcard    bool   `json:"certificate_matches_route_wildcard"`
 	CertificateValid                   bool   `json:"certificate_valid"`
 	CertificateReused                  bool   `json:"certificate_reused,omitempty"`
 	ListenPort                         int    `json:"listen_port"`
@@ -509,9 +510,13 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	activePanelDomain = strings.TrimSpace(activePanelDomain)
 	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(activePanelDomain) == nil
 	status.CertificateMatchesConfiguredDomain = configuredPanelDomain != "" && certificate.VerifyHostname(configuredPanelDomain) == nil
+	routeProbeHost := routeWildcardProbeHost(settings.RouteDomain)
+	status.CertificateMatchesRouteWildcard = routeProbeHost != "" && certificate.VerifyHostname(routeProbeHost) == nil
 	now := time.Now()
 	timeValid := !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
-	chainValid := configuredPanelDomain != "" && verifyCertificateChainForHost(certFile, configuredPanelDomain) == nil
+	chainValid := configuredPanelDomain != "" && status.CertificateMatchesRouteWildcard &&
+		verifyCertificateChainForHost(certFile, configuredPanelDomain) == nil &&
+		verifyCertificateChainForHost(certFile, routeProbeHost) == nil
 	status.CertificateValid = timeValid && chainValid
 	status.Subject = certificate.Subject.CommonName
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
@@ -524,11 +529,11 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 }
 
 func certificateNeedsRenewal(status panelCertificateStatus) bool {
-	return !status.Configured || !status.CertificateMatchesConfiguredDomain || !status.CertificateValid || status.DaysRemaining <= int(panelCertificateRenewalWindow.Hours()/24)
+	return !status.Configured || !status.CertificateMatchesConfiguredDomain || !status.CertificateMatchesRouteWildcard || !status.CertificateValid || status.DaysRemaining <= int(panelCertificateRenewalWindow.Hours()/24)
 }
 
 func certificateCanBeReused(status panelCertificateStatus) bool {
-	return status.CertificateMatchesConfiguredDomain && status.CertificateValid && !certificateNeedsRenewal(status)
+	return status.CertificateMatchesConfiguredDomain && status.CertificateMatchesRouteWildcard && status.CertificateValid && !certificateNeedsRenewal(status)
 }
 
 func certificateStatusForFile(certFile string, expectedWildcard string) panelCertificateStatus {
@@ -636,6 +641,14 @@ func wildcardDomainCoversHost(routeDomain, host string) bool {
 	}
 	label := strings.TrimSuffix(value, suffix)
 	return label != "" && !strings.Contains(label, ".")
+}
+
+func routeWildcardProbeHost(routeDomain string) string {
+	route := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+	if route == "" {
+		return ""
+	}
+	return "meridian-edge-check." + route
 }
 
 func panelACMETokenKeyForSecret(secret []byte) []byte {
@@ -746,9 +759,24 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	if err != nil {
 		return nil, err
 	}
-	// Panel certificates are intentionally scoped to the panel hostname. Edge
-	// listeners obtain their own per-node certificate through the renewal path.
-	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.PanelDomain, []string{settings.PanelDomain}, staging)
+	// The controller listener also terminates TLS for host-mode sites. Keep the
+	// route wildcard on the controller certificate for those sites, and add a
+	// separate exact SAN only when the configured Panel hostname is nested and
+	// therefore outside the wildcard's coverage. Edge nodes obtain their own
+	// per-node certificate through the renewal path and never receive this key.
+	identifiers := panelCertificateIdentifiers(settings)
+	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.RouteDomain, identifiers, staging)
+}
+
+func panelCertificateIdentifiers(settings PanelSettings) []string {
+	wildcard := wildcardDomainForSettings(settings)
+	if wildcard == "" {
+		return nil
+	}
+	if wildcardDomainCoversHost(settings.RouteDomain, settings.PanelDomain) {
+		return []string{wildcard}
+	}
+	return []string{settings.PanelDomain, wildcard}
 }
 
 // issueCloudflareForIdentifiers issues one certificate for an explicit SAN

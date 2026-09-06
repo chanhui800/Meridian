@@ -367,6 +367,10 @@ func readBoundedPrivateFile(path string) (string, error) {
 }
 
 func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig, error) {
+	return a.buildAgentConfigForPlatform(token, now, "")
+}
+
+func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform string) (AgentRuntimeConfig, error) {
 	node, err := a.db.nodeByAgentToken(token, now)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
@@ -460,7 +464,7 @@ func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig,
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, EntryMode: "direct",
 		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), Routes: routes}
-	config.AgentVersion, config.AgentSHA256, _ = agentBinaryIdentity()
+	config.AgentVersion, config.AgentSHA256, _ = agentBinaryIdentityForPlatform(platform)
 	if len(routes) > 0 {
 		if a.panelCertificates == nil {
 			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")
@@ -498,7 +502,12 @@ func (a *App) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	config, err := a.buildAgentConfig(requestBearerToken(r), time.Now())
+	platform, platformErr := requestedAgentPlatform(r)
+	if platformErr != nil {
+		a.jsonErr(w, http.StatusBadRequest, platformErr.Error())
+		return
+	}
+	config, err := a.buildAgentConfigForPlatform(requestBearerToken(r), time.Now(), platform)
 	if errors.Is(err, errInvalidAgentToken) {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return

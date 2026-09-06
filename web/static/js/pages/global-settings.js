@@ -335,7 +335,7 @@ async function renderTLSSettings() {
           <div class="form-group">
             <label>节点泛域名</label>
             <input type="text" class="form-input" id="p-wildcard-domain" maxlength="255" value="${esc(status.wildcard_domain || (status.route_domain ? `*.${status.route_domain}` : ''))}" placeholder="*.example.com" autocomplete="off" autocapitalize="none" spellcheck="false">
-            <div class="form-help">仅使用泛域名申请证书，例如 <code>*.example.com</code>；请提前将泛域名解析到本机。</div>
+            <div class="form-help">Controller 证书会覆盖节点泛域名；多级面板域名会额外加入精确 SAN。请提前将泛域名解析到本机。</div>
           </div>
           <div class="form-group">
             <label>启用后的面板地址</label>
@@ -354,7 +354,7 @@ async function renderTLSSettings() {
           <div class="form-group"><label>DNS API Token</label><input type="text" class="form-input mono" id="p-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token"><div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div></div>
           <label class="settings-check"><input type="checkbox" id="p-acme-staging" ${status.acme_staging ? 'checked' : ''}><span>ACME 测试环境</span></label>
           <div class="settings-save-bar tls-settings-actions">
-            ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current)) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="telegram-btn primary" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
+            ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current) && status.certificate_valid) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="telegram-btn primary" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
             <button class="telegram-btn" type="button" id="p-cert-save">保存设置</button>
             <button class="telegram-btn primary" type="button" id="p-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
           </div>
@@ -400,7 +400,7 @@ async function renderTLSSettings() {
       button.textContent = '保存中…';
       try {
         await API.savePanelSettings(payload);
-        Toast.success('面板设置已保存；面板证书仅覆盖面板域名');
+        Toast.success('面板设置已保存；证书会覆盖面板域名和节点站点泛域名');
         await renderTLSSettings();
       } catch (error) {
         button.disabled = false;

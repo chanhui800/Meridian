@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,11 @@ import (
 var agentInstallerScript string
 
 var agentBinaryIdentityCache struct {
+	mu      sync.Mutex
+	entries map[string]*agentBinaryIdentityEntry
+}
+
+type agentBinaryIdentityEntry struct {
 	sync.Once
 	version string
 	digest  string
@@ -48,23 +54,100 @@ func configuredAgentBinaryPath() string {
 	return executable
 }
 
+const agentPlatformHeader = "X-Meridian-Agent-Platform"
+
+func normalizeAgentPlatform(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "linux/amd64", "linux-amd64", "amd64", "x86_64":
+		return "linux/amd64"
+	case "linux/arm64", "linux-arm64", "arm64", "aarch64":
+		return "linux/arm64"
+	default:
+		return ""
+	}
+}
+
+func requestedAgentPlatform(r *http.Request) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+	raw := strings.TrimSpace(r.Header.Get(agentPlatformHeader))
+	if raw == "" {
+		return "", nil
+	}
+	platform := normalizeAgentPlatform(raw)
+	if platform == "" {
+		return "", errors.New("unsupported agent platform")
+	}
+	return platform, nil
+}
+
+func configuredAgentBinaryPathForPlatform(platform string) (string, error) {
+	platform = normalizeAgentPlatform(platform)
+	if platform == "" {
+		return configuredAgentBinaryPath(), nil
+	}
+	var envName string
+	var candidates []string
+	switch platform {
+	case "linux/amd64":
+		envName = "MERIDIAN_AGENT_BINARY_LINUX_AMD64"
+		candidates = []string{"/app/meridian-agent-linux-amd64", "/usr/local/bin/meridian-agent-linux-amd64"}
+	case "linux/arm64":
+		envName = "MERIDIAN_AGENT_BINARY_LINUX_ARM64"
+		candidates = []string{"/app/meridian-agent-linux-arm64", "/usr/local/bin/meridian-agent-linux-arm64"}
+	}
+	if configured := strings.TrimSpace(os.Getenv(envName)); configured != "" {
+		return configured, nil
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if platform == runtime.GOOS+"/"+runtime.GOARCH {
+		return configuredAgentBinaryPath(), nil
+	}
+	return "", fmt.Errorf("agent binary for %s is unavailable", platform)
+}
+
 func agentBinaryIdentity() (string, string, error) {
-	agentBinaryIdentityCache.Do(func() {
-		file, err := os.Open(configuredAgentBinaryPath()) // #nosec G304 -- fixed image path or administrator-controlled environment value.
+	return agentBinaryIdentityForPlatform("")
+}
+
+func agentBinaryIdentityForPlatform(platform string) (string, string, error) {
+	platform = normalizeAgentPlatform(platform)
+	agentBinaryIdentityCache.mu.Lock()
+	if agentBinaryIdentityCache.entries == nil {
+		agentBinaryIdentityCache.entries = make(map[string]*agentBinaryIdentityEntry)
+	}
+	entry, ok := agentBinaryIdentityCache.entries[platform]
+	if !ok {
+		entry = &agentBinaryIdentityEntry{}
+		agentBinaryIdentityCache.entries[platform] = entry
+	}
+	agentBinaryIdentityCache.mu.Unlock()
+	entry.Do(func() {
+		executable, pathErr := configuredAgentBinaryPathForPlatform(platform)
+		if pathErr != nil {
+			entry.err = pathErr
+			return
+		}
+		file, err := os.Open(executable) // #nosec G304 -- fixed image path or administrator-controlled environment value.
 		if err != nil {
-			agentBinaryIdentityCache.err = err
+			entry.err = err
 			return
 		}
 		defer file.Close()
 		digest := sha256.New()
 		if _, err := io.Copy(digest, file); err != nil {
-			agentBinaryIdentityCache.err = err
+			entry.err = err
 			return
 		}
-		agentBinaryIdentityCache.version = appVersion
-		agentBinaryIdentityCache.digest = hex.EncodeToString(digest.Sum(nil))
+		entry.version = appVersion
+		entry.digest = hex.EncodeToString(digest.Sum(nil))
 	})
-	return agentBinaryIdentityCache.version, agentBinaryIdentityCache.digest, agentBinaryIdentityCache.err
+	return entry.version, entry.digest, entry.err
 }
 
 type nodeAPIInput struct {
@@ -315,7 +398,16 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	executable := configuredAgentBinaryPath()
+	platform, err := requestedAgentPlatform(r)
+	if err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	executable, err := configuredAgentBinaryPathForPlatform(platform)
+	if err != nil {
+		a.jsonErr(w, http.StatusConflict, err.Error())
+		return
+	}
 	file, err := os.Open(executable) // #nosec G304 -- the path is fixed by the image or an administrator-controlled environment variable.
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
@@ -341,6 +433,9 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.Header().Set("X-Meridian-Agent-SHA256", hex.EncodeToString(digest.Sum(nil)))
+	if platform != "" {
+		w.Header().Set(agentPlatformHeader, platform)
+	}
 	_, _ = io.Copy(w, file)
 }
 

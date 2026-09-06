@@ -35,7 +35,8 @@ headers_tmp="$install_dir/meridian-agent.headers.tmp"
 
 [ "$(id -u)" -eq 0 ] || { echo 'Please run this script as root.' >&2; exit 1; }
 case "$(uname -s):$(uname -m)" in
-  Linux:x86_64|Linux:amd64|Linux:aarch64|Linux:arm64) ;;
+  Linux:x86_64|Linux:amd64) agent_platform='linux/amd64' ;;
+  Linux:aarch64|Linux:arm64) agent_platform='linux/arm64' ;;
   *) echo 'This Agent installer supports Linux amd64 and arm64 only.' >&2; exit 1 ;;
 esac
 
@@ -49,8 +50,14 @@ umask 077
 printf '%s' "$enrollment_token" > "$token_file"
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$headers_tmp" \
   -H "Authorization: Bearer $enrollment_token" \
+  -H "X-Meridian-Agent-Platform: $agent_platform" \
   "$controller_url/api/agent/binary" -o "$binary_tmp"
-expected_sha=$(awk 'BEGIN{IGNORECASE=1} /^X-Meridian-Agent-SHA256:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$headers_tmp" | tr -d '\r')
+served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
+if [ "$served_platform" != "$agent_platform" ]; then
+  echo "Agent binary platform mismatch (requested $agent_platform, received ${served_platform:-unknown})." >&2
+  exit 1
+fi
+expected_sha=$(awk 'tolower($1) == "x-meridian-agent-sha256:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
 if command -v sha256sum >/dev/null 2>&1; then
   actual_sha=$(sha256sum "$binary_tmp" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
@@ -59,8 +66,15 @@ else
   echo 'sha256sum or shasum is required.' >&2
   exit 1
 fi
-if [ -z "$expected_sha" ] || [ "$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" ]; then
+actual_sha=$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')
+if [ -z "$expected_sha" ]; then
+  echo 'Agent download response is missing X-Meridian-Agent-SHA256.' >&2
+  exit 1
+fi
+if [ "$expected_sha" != "$actual_sha" ]; then
   echo 'Agent binary checksum mismatch.' >&2
+  echo "expected: $expected_sha" >&2
+  echo "actual:   $actual_sha" >&2
   exit 1
 fi
 rm -f "$headers_tmp"

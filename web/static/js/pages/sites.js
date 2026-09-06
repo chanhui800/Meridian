@@ -1231,6 +1231,7 @@ function renderPanelCertificateStatus(status) {
 	  ${status.panel_covered_by_edge_wildcard ? '<div class="form-help" style="color:var(--orange);margin-bottom:10px">⚠ 面板域名位于节点泛域名覆盖范围内；建议改为多级域名，例如 <code>panel.admin.example.com</code>，以隔离面板与节点证书。</div>' : ''}
 	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
 	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${certificateMatchesConfiguredDomain ? 'good' : 'warn'}">${certificateMatchesConfiguredDomain ? '面板域名一致' : '需要申请或更新'}</span></div>
+	  <div class="diag-row"><span class="diag-key">站点泛域名</span><span class="diag-val ${status.certificate_matches_route_wildcard ? 'good' : 'warn'}">${status.certificate_matches_route_wildcard ? '已覆盖' : '需要更新'}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
 	  <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${status.certificate_valid ? 'good' : 'warn'}">${status.certificate_valid ? '有效' : '已过期或不可用'}</span></div>
 	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token'}</span></div>
@@ -1282,7 +1283,7 @@ async function showPanelCertificateModal() {
 	  <div class="form-group">
 	    <label>节点泛域名</label>
 	    <input type="text" class="form-input" id="m-wildcard-domain" maxlength="255" value="${esc(status.wildcard_domain || (status.route_domain ? `*.${status.route_domain}` : ''))}" placeholder="*.example.com" autocomplete="off" autocapitalize="none" spellcheck="false">
-	    <div class="form-help">仅使用泛域名申请证书，例如 <code>*.example.com</code>；请提前将泛域名解析到本机。</div>
+	    <div class="form-help">Controller 证书会覆盖节点泛域名；多级面板域名会额外加入精确 SAN。请提前将泛域名解析到本机。</div>
 	  </div>
 	  <div class="form-group">
 	    <label>启用后的面板地址</label>
@@ -1314,7 +1315,7 @@ async function showPanelCertificateModal() {
 	`;
 	document.getElementById('modal-footer').innerHTML = `
 	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
-	  ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current)) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="btn-modal primary" id="m-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
+	  ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current) && status.certificate_valid) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="btn-modal primary" id="m-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
 	  <button class="btn-modal" id="m-cert-save">保存设置</button>
 	  <button class="btn-modal primary" id="m-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
 	`;
@@ -1358,7 +1359,7 @@ async function showPanelCertificateModal() {
 		button.textContent = '保存中…';
 		try {
 			await API.savePanelSettings(payload);
-			Toast.success('面板设置已保存；面板证书仅覆盖面板域名');
+			Toast.success('面板设置已保存；证书会覆盖面板域名和节点站点泛域名');
 			closeModal();
 			await showPanelCertificateModal();
 		} catch (error) {

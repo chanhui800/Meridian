@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -373,6 +375,35 @@ func TestBuildNodeInstallScriptDoesNotPersistTokenInService(t *testing.T) {
 	}
 	if !strings.Contains(script, "Linux amd64 and arm64 only") {
 		t.Fatal("install script does not declare the supported architectures")
+	}
+	if strings.Contains(script, "IGNORECASE") || !strings.Contains(script, "tolower($1)") {
+		t.Fatal("install script must parse response headers with portable case folding")
+	}
+}
+
+func TestAgentPlatformHeaderNormalization(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "linux/amd64", want: "linux/amd64"},
+		{input: "Linux-amd64", want: "linux/amd64"},
+		{input: "x86_64", want: "linux/amd64"},
+		{input: "linux/arm64", want: "linux/arm64"},
+		{input: "aarch64", want: "linux/arm64"},
+	} {
+		if got := normalizeAgentPlatform(test.input); got != test.want {
+			t.Fatalf("normalizeAgentPlatform(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+	if got := normalizeAgentPlatform("windows/amd64"); got != "" {
+		t.Fatalf("unsupported platform normalized to %q", got)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/agent/binary", nil)
+	request.Header.Set(agentPlatformHeader, "ARM64")
+	platform, err := requestedAgentPlatform(request)
+	if err != nil || platform != "linux/arm64" {
+		t.Fatalf("requested platform = %q, err=%v", platform, err)
 	}
 }
 

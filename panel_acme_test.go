@@ -48,7 +48,7 @@ func TestPanelACMETokenEncryptionRoundTripAndIsolation(t *testing.T) {
 }
 
 func TestCertificateRenewalWindow(t *testing.T) {
-	base := panelCertificateStatus{Configured: true, CertificateCurrent: false, CertificateMatchesConfiguredDomain: true, CertificateValid: true}
+	base := panelCertificateStatus{Configured: true, CertificateCurrent: false, CertificateMatchesConfiguredDomain: true, CertificateMatchesRouteWildcard: true, CertificateValid: true}
 	base.DaysRemaining = 31
 	if certificateNeedsRenewal(base) || !certificateCanBeReused(base) {
 		t.Fatal("certificate with 31 days remaining should be reused")
@@ -67,6 +67,11 @@ func TestCertificateRenewalWindow(t *testing.T) {
 	base.DaysRemaining = 90
 	if certificateCanBeReused(base) || !certificateNeedsRenewal(base) {
 		t.Fatal("certificate for a different configured domain must not be reused")
+	}
+	base.CertificateMatchesConfiguredDomain = true
+	base.CertificateMatchesRouteWildcard = false
+	if certificateCanBeReused(base) || !certificateNeedsRenewal(base) {
+		t.Fatal("certificate without route wildcard coverage must not be reused")
 	}
 }
 
@@ -131,6 +136,9 @@ func TestPanelCertificateStatusSeparatesActiveAndConfiguredDomains(t *testing.T)
 	}
 	if status.CertificateMatchesConfiguredDomain {
 		t.Fatal("edge wildcard must not match the nested configured panel host")
+	}
+	if !status.CertificateMatchesRouteWildcard {
+		t.Fatal("edge wildcard should match the route probe host")
 	}
 	if status.CertificateValid {
 		t.Fatal("self-signed certificate must not be considered trusted")
@@ -333,6 +341,23 @@ func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
 	}
 	if !strings.HasSuffix(first[1], ".edge.example.com") || !strings.HasSuffix(second[1], ".edge.example.com") {
 		t.Fatalf("edge identifiers must live outside the route wildcard: %#v %#v", first, second)
+	}
+}
+
+func TestPanelCertificateIdentifiersKeepHostModeSitesCovered(t *testing.T) {
+	legacy := panelCertificateIdentifiers(PanelSettings{
+		PanelDomain: "panel.example.test",
+		RouteDomain: "example.test",
+	})
+	if len(legacy) != 1 || legacy[0] != "*.example.test" {
+		t.Fatalf("legacy panel identifiers = %#v", legacy)
+	}
+	nested := panelCertificateIdentifiers(PanelSettings{
+		PanelDomain: "panel.admin.example.test",
+		RouteDomain: "example.test",
+	})
+	if len(nested) != 2 || nested[0] != "panel.admin.example.test" || nested[1] != "*.example.test" {
+		t.Fatalf("nested panel identifiers = %#v", nested)
 	}
 }
 
