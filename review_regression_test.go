@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -252,7 +254,7 @@ func TestReviewConfigRefreshPreservesActiveRequest(t *testing.T) {
 func TestReviewEventUIDDeduplicatesAcrossAgentRestart(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now()
-	_, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "event-dedupe", Address: "203.0.113.20", Port: 9090}, now)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "event-dedupe", Address: "203.0.113.20", Port: 9090}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +262,17 @@ func TestReviewEventUIDDeduplicatesAcrossAgentRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	event := NodeRequestEvent{EventUID: strings.Repeat("a", 32), EventID: 1, SiteID: 1, Host: "media.example.test", Method: http.MethodPost, Path: "/Sessions/Playing/Progress", StatusCode: 204, RecordedAtMS: now.UnixMilli(), SkipRequestLog: true}
+	site, err := app.db.CreateSiteRecord(Site{Name: "event-site", PublicHost: "media.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	event := NodeRequestEvent{EventUID: strings.Repeat("a", 32), EventID: 1, SiteID: site.ID, Host: "media.example.test", Method: http.MethodPost, Path: "/Sessions/Playing/Progress", StatusCode: 204, RecordedAtMS: now.UnixMilli(), SkipRequestLog: true}
 	first := NodeReport{BootID: "session-a", ReportSessionID: "session-a", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0", Events: []NodeRequestEvent{event}}
 	second := first
 	second.BootID = "session-b"
@@ -312,6 +324,200 @@ func TestReviewTrafficCounterContinuesAcrossAgentRestart(t *testing.T) {
 	}
 	if got.PeriodRXBytes != 500 || got.PeriodTXBytes != 600 {
 		t.Fatalf("counter delta after Agent restart = rx %d tx %d, want 500/600", got.PeriodRXBytes, got.PeriodTXBytes)
+	}
+}
+
+func TestReviewSiteTrafficCounterContinuesAcrossAgentRestart(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "site-counter-continuity", Address: "203.0.113.22", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "site-counter", PublicHost: "site-counter.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	base := NodeSiteStat{Host: site.PublicHost, RequestCount: 10, LastRequestAtMS: now.UnixMilli(), LastStatus: 200, CumulativeBytesIn: 1000, CumulativeBytesOut: 2000}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "session-a", ReportSessionID: "session-a", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{base}}, now); err != nil {
+		t.Fatal(err)
+	}
+	second := base
+	second.RequestCount = 14
+	second.CumulativeBytesIn = 1500
+	second.CumulativeBytesOut = 2600
+	second.LastRequestAtMS = now.Add(time.Second).UnixMilli()
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "session-b", ReportSessionID: "session-b", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{second}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var gotIn, gotOut, gotRequests int64
+	if err := app.db.db.QueryRow("SELECT COALESCE(SUM(bytes_in),0),COALESCE(SUM(bytes_out),0),COALESCE(SUM(requests),0) FROM node_site_traffic_logs WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&gotIn, &gotOut, &gotRequests); err != nil {
+		t.Fatal(err)
+	}
+	if gotIn != 500 || gotOut != 600 || gotRequests != 4 {
+		t.Fatalf("site traffic delta after Agent restart = in %d out %d requests %d, want 500/600/4", gotIn, gotOut, gotRequests)
+	}
+}
+
+func TestReviewAgentReportCannotModifyUnauthorizedSite(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	nodeA, enrollA, err := app.db.CreateControlNode(NodeCreateInput{Name: "auth-a", Address: "203.0.113.30", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeB, enrollB, err := app.db.CreateControlNode(NodeCreateInput{Name: "auth-b", Address: "203.0.113.31", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tokenA, err := app.db.EnrollControlNode(enrollA, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollB, now); err != nil {
+		t.Fatal(err)
+	}
+	siteA, err := app.db.CreateSiteRecord(Site{Name: "auth-site-a", ListenPort: 18080, PublicHost: "auth-a.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	siteB, err := app.db.CreateSiteRecord(Site{Name: "auth-site-b", ListenPort: 18081, PublicHost: "auth-b.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18081"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, site := range []*Site{siteA, siteB} {
+		if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", nodeA.ID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", nodeA.ID, siteA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=? WHERE site_id=?", nodeB.ID, nodeB.ID, siteB.ID); err != nil {
+		t.Fatal(err)
+	}
+	validUID := strings.Repeat("a", 32)
+	unauthorizedUID := strings.Repeat("b", 32)
+	result, err := app.db.RecordNodeReportResult(tokenA, NodeReport{
+		BootID: "auth-session", ReportSessionID: "auth-session", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0",
+		MediaCounts:  []NodeMediaCount{{SiteID: siteB.ID, MovieCount: 99, SeriesCount: 88, EpisodeCount: 77, ObservedAtMS: now.UnixMilli()}},
+		Observations: []NodeDynamicObservation{{SiteID: siteB.ID, CanonicalAuthority: "https://auth-b.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, ObservedAtMS: now.UnixMilli()}},
+		Events: []NodeRequestEvent{
+			{EventID: 10, EventUID: validUID, SiteID: siteA.ID, Host: siteA.PublicHost, Method: http.MethodGet, Path: "/ok", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+			{EventID: 11, EventUID: unauthorizedUID, SiteID: siteB.ID, Host: siteB.PublicHost, Method: http.MethodGet, Path: "/secret", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+		},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.AcceptedEventIDs) != 1 || result.AcceptedEventIDs[0] != 10 || len(result.DiscardedEventIDs) != 1 || result.DiscardedEventIDs[0] != 11 {
+		t.Fatalf("unexpected event acknowledgement: %#v", result)
+	}
+	if len(result.DiscardedEventUIDs) != 1 || result.DiscardedEventUIDs[0] != unauthorizedUID {
+		t.Fatalf("unauthorized event UID was not discarded: %#v", result)
+	}
+	var movieCount int
+	if err := app.db.db.QueryRow("SELECT media_movie_count FROM sites WHERE id=?", siteB.ID).Scan(&movieCount); err != nil {
+		t.Fatal(err)
+	}
+	if movieCount != -1 {
+		t.Fatalf("unauthorized media count modified Site B: %d", movieCount)
+	}
+	var observations, logs int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM dynamic_observations WHERE site_id=?", siteB.ID).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM request_logs WHERE site_id=?", siteB.ID).Scan(&logs); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 0 || logs != 0 {
+		t.Fatalf("unauthorized report produced Site B side effects: observations=%d logs=%d", observations, logs)
+	}
+	// The same site ID with another site's Host is also unauthorized.
+	result, err = app.db.RecordNodeReportResult(tokenA, NodeReport{
+		BootID: "auth-session", ReportSessionID: "auth-session", CounterEpoch: "kernel:eth0", Sequence: 2, InterfaceName: "eth0",
+		Events: []NodeRequestEvent{{EventID: 12, EventUID: strings.Repeat("c", 32), SiteID: siteA.ID, Host: siteB.PublicHost, Method: http.MethodGet, Path: "/spoof", StatusCode: 200, RecordedAtMS: now.UnixMilli()}},
+	}, now.Add(time.Second))
+	if err != nil || len(result.DiscardedEventIDs) != 1 || result.DiscardedEventIDs[0] != 12 {
+		t.Fatalf("mismatched Site/Host event was accepted: result=%#v err=%v", result, err)
+	}
+}
+
+func TestReviewLegacyEdgeTLSMigratesOnlyKnownNodesIntoStateDir(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	legacyRoot := filepath.Join(dir, "external", "edge-nodes")
+	stateDir := filepath.Join(dir, "owned-tls")
+	t.Setenv("EDGE_TLS_CERT_FILE", filepath.Join(dir, "external", "edge.pem"))
+	t.Setenv("EDGE_TLS_KEY_FILE", filepath.Join(dir, "external", "edge.key"))
+	t.Setenv("TLS_STATE_DIR", stateDir)
+	if err := os.MkdirAll(filepath.Dir(os.Getenv("EDGE_TLS_CERT_FILE")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	known, _, err := db.CreateControlNode(NodeCreateInput{Name: "known-edge", Address: "203.0.113.40", Port: 9090}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "sentinel.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := reviewCertificatePEM(t)
+	legacyCurrent := filepath.Join(legacyRoot, known.GUID, "current")
+	if err := os.MkdirAll(legacyCurrent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyCurrent, "fullchain.pem"), []byte(certPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyCurrent, "privkey.pem"), []byte(keyPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unknownCurrent := filepath.Join(legacyRoot, "unknown-node", "current")
+	if err := os.MkdirAll(unknownCurrent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unknownCurrent, "fullchain.pem"), []byte("unknown"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateLegacyEdgeTLSState(db, dbPath); err != nil {
+		t.Fatal(err)
+	}
+	manager := newPanelCertificateManager(dbPath, nil)
+	certPath, keyPath, err := manager.nodeEdgeTLSPaths(known.GUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		t.Fatalf("migrated certificate pair is invalid: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "edge-nodes", "unknown-node")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unknown legacy node was migrated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyRoot, "sentinel.txt")); err != nil {
+		t.Fatalf("legacy sentinel was changed or removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyCurrent, "fullchain.pem")); err != nil {
+		t.Fatalf("legacy known certificate was removed: %v", err)
 	}
 }
 

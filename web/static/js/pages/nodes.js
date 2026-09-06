@@ -172,7 +172,7 @@ function renderSiteSchedules() {
     const error = site.last_error ? `<small class="is-error">${esc(site.last_error)}</small>` : `<small>${savedEnabled ? 'DNS 只会在 Agent 配置与入口健康检查通过后生效' : '未启用节点调度，继续使用原面板入口'}</small>`;
     const dirtyNote = dirty ? '<small class="node-site-dirty">当前修改尚未保存，保存后才会生效</small>' : '';
     return `<article class="node-site-row node-site-card" data-site-id="${site.site_id}">
-      <header class="node-site-card-head"><div class="node-site-identity"><strong>${esc(site.site_name)}</strong><span>${esc(site.public_host || '未配置站点域名')}</span></div><span class="node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}">${stateLabel}</span></header>
+      <header class="node-site-card-head"><div class="node-site-identity"><strong>${esc(site.site_name)}</strong><span>${esc(site.public_host || '未配置站点域名')}</span></div><span class="node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}" data-role="site-state" aria-live="polite">${stateLabel}</span></header>
       <div class="node-site-card-controls">
         <label class="node-check"><input type="checkbox" data-field="enabled" ${formEnabled ? 'checked' : ''}> 启用节点调度</label>
         <label class="node-site-field">调度方式<select class="form-input" data-field="mode" ${formEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select></label>
@@ -184,12 +184,39 @@ function renderSiteSchedules() {
   }).join('');
 }
 
+function refreshSiteScheduleRowState(row) {
+  const siteID = Number(row?.dataset?.siteId);
+  if (!Number.isFinite(siteID) || siteID <= 0) return;
+  const server = (siteSchedulesSnapshot.sites || []).find(site => Number(site.site_id) === siteID);
+  if (!server) return;
+  const draft = siteScheduleDrafts.get(siteID);
+  const savedEnabled = server.enabled === true;
+  const dirty = !!draft;
+  const state = row.querySelector('[data-role="site-state"]');
+  if (state) {
+    state.className = `node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}`;
+    state.textContent = dirty
+      ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
+      : (savedEnabled ? '调度已启用' : '使用面板入口');
+  }
+  const status = row.querySelector('.node-site-status');
+  if (!status) return;
+  const dirtyNote = status.querySelector('.node-site-dirty');
+  if (dirty && !dirtyNote) {
+    status.insertAdjacentHTML('beforeend', '<small class="node-site-dirty">当前修改尚未保存，保存后才会生效</small>');
+  } else if (!dirty && dirtyNote) {
+    dirtyNote.remove();
+  }
+}
+
 function syncSiteScheduleRow(row) {
   const enabled = row.querySelector('[data-field="enabled"]')?.checked === true;
   const mode = row.querySelector('[data-field="mode"]');
   const fixedNode = row.querySelector('[data-field="fixed-node"]');
   if (mode) mode.disabled = !enabled;
   if (fixedNode) fixedNode.disabled = !enabled || mode?.value !== 'fixed';
+  captureSiteScheduleDrafts();
+  refreshSiteScheduleRowState(row);
 }
 
 async function handleSiteScheduleAction(event) {
@@ -197,16 +224,15 @@ async function handleSiteScheduleAction(event) {
   if (!row) return;
   if (event.target.matches('[data-field="enabled"]')) {
     syncSiteScheduleRow(row);
-    captureSiteScheduleDrafts();
     return;
   }
   if (event.target.matches('[data-field="mode"]')) {
     syncSiteScheduleRow(row);
-    captureSiteScheduleDrafts();
     return;
   }
   if (event.target.matches('[data-field="fixed-node"]')) {
     captureSiteScheduleDrafts();
+    refreshSiteScheduleRowState(row);
     return;
   }
   const button = event.target.closest('[data-action="save-site"]');
@@ -241,6 +267,7 @@ function renderNodes() {
   document.getElementById('node-list').onclick = handleNodeAction;
   document.getElementById('node-site-list').onclick = handleSiteScheduleAction;
   document.getElementById('node-site-list').onchange = handleSiteScheduleAction;
+  document.getElementById('node-site-list').oninput = handleSiteScheduleAction;
   document.querySelectorAll('input[name="node-mode"]').forEach(input => input.onchange = () => {
     const manual = document.getElementById('node-mode-manual').checked;
     const choices = document.getElementById('node-manual-choices');

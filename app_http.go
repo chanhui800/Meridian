@@ -168,6 +168,14 @@ func decodeJSONBodyWithLimit(w http.ResponseWriter, r *http.Request, dst interfa
 }
 
 func originMatchesRequestHost(origin string, r *http.Request) bool {
+	return originMatchesRequestHostWithProxies(origin, r, nil)
+}
+
+// corsOriginMatchesRequestHost keeps CORS preflight/read compatibility for a
+// trusted reverse proxy that terminates TLS before forwarding to the panel.
+// State-changing requests still pass through requestHasSameOriginWithProxies,
+// which performs the strict scheme/host/port check.
+func corsOriginMatchesRequestHost(origin string, r *http.Request) bool {
 	parsed, err := url.Parse(origin)
 	if err != nil || parsed.User != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return false
@@ -178,19 +186,52 @@ func originMatchesRequestHost(origin string, r *http.Request) bool {
 	return strings.EqualFold(parsed.Host, r.Host)
 }
 
+func originMatchesRequestHostWithProxies(origin string, r *http.Request, trustedProxies []*net.IPNet) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	if !strings.EqualFold(parsed.Host, r.Host) {
+		return false
+	}
+	expectedScheme := "http"
+	if requestIsHTTPS(r, trustedProxies) {
+		expectedScheme = "https"
+	}
+	return strings.EqualFold(parsed.Scheme, expectedScheme)
+}
+
 func refererMatchesRequestHost(referer string, r *http.Request) bool {
+	return refererMatchesRequestHostWithProxies(referer, r, nil)
+}
+
+func refererMatchesRequestHostWithProxies(referer string, r *http.Request, trustedProxies []*net.IPNet) bool {
 	parsed, err := url.Parse(referer)
 	if err != nil || parsed.User != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return false
 	}
-	return strings.EqualFold(parsed.Host, r.Host)
+	if !strings.EqualFold(parsed.Host, r.Host) {
+		return false
+	}
+	expectedScheme := "http"
+	if requestIsHTTPS(r, trustedProxies) {
+		expectedScheme = "https"
+	}
+	return strings.EqualFold(parsed.Scheme, expectedScheme)
 }
 
 func requestHasSameOrigin(r *http.Request) bool {
+	return requestHasSameOriginWithProxies(r, nil)
+}
+
+func requestHasSameOriginWithProxies(r *http.Request, trustedProxies []*net.IPNet) bool {
 	if origin := r.Header.Get("Origin"); origin != "" {
-		return originMatchesRequestHost(origin, r)
+		return originMatchesRequestHostWithProxies(origin, r, trustedProxies)
 	}
-	return refererMatchesRequestHost(r.Referer(), r)
+	return refererMatchesRequestHostWithProxies(r.Referer(), r, trustedProxies)
 }
 
 func stateChangingMethod(method string) bool {
@@ -206,7 +247,7 @@ func cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if !originMatchesRequestHost(origin, r) {
+			if !corsOriginMatchesRequestHost(origin, r) {
 				http.Error(w, "cross-origin request denied", http.StatusForbidden)
 				return
 			}
@@ -366,7 +407,7 @@ func (a *App) authenticatedSessionIdentity(r *http.Request) (int64, string, erro
 
 func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if stateChangingMethod(r.Method) && !requestHasSameOrigin(r) {
+		if stateChangingMethod(r.Method) && !requestHasSameOriginWithProxies(r, a.trustedProxies) {
 			a.jsonErr(w, http.StatusForbidden, "same-origin request required")
 			return
 		}
@@ -380,7 +421,7 @@ func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
 			return
 		}
-		if stateChangingMethod(r.Method) && !requestHasSameOrigin(r) {
+		if stateChangingMethod(r.Method) && !requestHasSameOriginWithProxies(r, a.trustedProxies) {
 			a.jsonErr(w, http.StatusForbidden, "same-origin request required")
 			return
 		}

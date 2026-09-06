@@ -67,6 +67,44 @@ func startSecurityHostSite(t *testing.T, targetURL, playbackTargetURL, playbackM
 	return handler
 }
 
+func TestSameOriginRequiresSchemeHostAndPort(t *testing.T) {
+	trustedProxy := &net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(32, 32)}
+	cases := []struct {
+		name   string
+		url    string
+		origin string
+		remote string
+		proxy  string
+		want   bool
+	}{
+		{name: "https same host", url: "https://panel.example.test/api", origin: "https://panel.example.test", remote: "198.51.100.10:1234", want: true},
+		{name: "https wrong scheme", url: "https://panel.example.test/api", origin: "http://panel.example.test", remote: "198.51.100.10:1234", want: false},
+		{name: "http same host", url: "http://panel.example.test/api", origin: "http://panel.example.test", remote: "198.51.100.10:1234", want: true},
+		{name: "http wrong scheme", url: "http://panel.example.test/api", origin: "https://panel.example.test", remote: "198.51.100.10:1234", want: false},
+		{name: "https explicit port", url: "https://panel.example.test:8443/api", origin: "https://panel.example.test:8443", remote: "198.51.100.10:1234", want: true},
+		{name: "https missing port", url: "https://panel.example.test:8443/api", origin: "https://panel.example.test", remote: "198.51.100.10:1234", want: false},
+		{name: "trusted proxy https", url: "http://panel.example.test/api", origin: "https://panel.example.test", remote: "127.0.0.1:1234", proxy: "https", want: true},
+		{name: "untrusted forwarded proto", url: "http://panel.example.test/api", origin: "https://panel.example.test", remote: "198.51.100.10:1234", proxy: "https", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.url, nil)
+			req.RemoteAddr = tc.remote
+			req.Header.Set("Origin", tc.origin)
+			if tc.proxy != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.proxy)
+			}
+			proxies := []*net.IPNet(nil)
+			if strings.HasPrefix(tc.name, "trusted") {
+				proxies = []*net.IPNet{trustedProxy}
+			}
+			if got := requestHasSameOriginWithProxies(req, proxies); got != tc.want {
+				t.Fatalf("same-origin=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSecurityRegressionVendorForwardingHeadersAreStrippedFromHTTPAndWebSocket(t *testing.T) {
 	vendorHeaders := []string{
 		"CF-Connecting-IP",

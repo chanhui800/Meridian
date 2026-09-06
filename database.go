@@ -26,6 +26,9 @@ type DB struct {
 	droppedDynamicObservations  atomic.Uint64
 	droppedRequestLogs          atomic.Uint64
 	droppedWatchHistory         atomic.Uint64
+	agentSecurityRejected       atomic.Uint64
+	agentSecurityMu             sync.Mutex
+	agentSecurityLastLog        map[string]time.Time
 	systemSettings              atomic.Pointer[SystemSettings]
 	watchHistoryMetadataMu      sync.Mutex
 	watchHistoryMetadata        map[watchHistoryMetadataKey]watchHistoryMetadataEntry
@@ -38,7 +41,7 @@ func openDB(path string) (*DB, error) {
 		return nil, err
 	}
 	sqlDB.SetMaxOpenConns(1)
-	d := &DB{db: sqlDB}
+	d := &DB{db: sqlDB, agentSecurityLastLog: make(map[string]time.Time)}
 	if err := d.migrate(); err != nil {
 		sqlDB.Close()
 		return nil, err

@@ -11,29 +11,31 @@ import (
 )
 
 type App struct {
-	db                *DB
-	dbPath            string
-	pm                *ProxyManager
-	backupMu          sync.Mutex
-	siteLifecycleMu   sync.Mutex
-	setupTokenMu      sync.Mutex
-	setupToken        string
-	loginLimiter      *loginRateLimiter
-	loginLimiterOnce  sync.Once
-	trustedProxies    []*net.IPNet
-	clientIPRegions   *clientIPRegionResolver
-	panelHost         string
-	routeDomain       string
-	panelTLSEnabled   bool
-	panelCertificates *panelCertificateManager
-	certificateWorker *certificateWorker
-	panelBindLoopback bool
-	panelListenPort   int
-	dynamicRouteKey   []byte
-	restartCh         chan struct{}
-	restartOnce       sync.Once
-	tmdb              *tmdbService
-	tmdbOnce          sync.Once
+	db                 *DB
+	dbPath             string
+	pm                 *ProxyManager
+	backupMu           sync.Mutex
+	siteLifecycleMu    sync.Mutex
+	setupTokenMu       sync.Mutex
+	setupToken         string
+	loginLimiter       *loginRateLimiter
+	loginLimiterOnce   sync.Once
+	trustedProxies     []*net.IPNet
+	clientIPRegions    *clientIPRegionResolver
+	panelHost          string
+	routeDomain        string
+	panelTLSEnabled    bool
+	panelCertificates  *panelCertificateManager
+	certificateWorker  *certificateWorker
+	panelBindLoopback  bool
+	panelListenPort    int
+	dynamicRouteKey    []byte
+	restartCh          chan struct{}
+	restartOnce        sync.Once
+	tmdb               *tmdbService
+	tmdbOnce           sync.Once
+	agentReportMu      sync.Mutex
+	agentReportLimiter *nodeReportAdmission
 }
 
 func (a *App) tmdbService() *tmdbService {

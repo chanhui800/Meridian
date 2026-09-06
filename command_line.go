@@ -167,6 +167,9 @@ func runIssuePanelCertificateCommand(output io.Writer) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer db.Close()
+	if err := migrateLegacyEdgeTLSState(db, dbPath); err != nil {
+		return fmt.Errorf("migrate legacy Edge TLS state: %w", err)
+	}
 	settings, err := db.PanelSettings()
 	if err != nil {
 		return fmt.Errorf("read panel settings: %w", err)
@@ -236,6 +239,9 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer db.Close()
+	if err := migrateLegacyEdgeTLSState(db, dbPath); err != nil {
+		return fmt.Errorf("migrate legacy Edge TLS state: %w", err)
+	}
 	settings, err := db.PanelSettings()
 	if err != nil {
 		return fmt.Errorf("read panel settings: %w", err)

@@ -427,6 +427,22 @@ func TestCloudflareFindZoneUsesLongestMatch(t *testing.T) {
 	}
 }
 
+func TestCloudflareDeleteRecordIsIdempotentWhenRecordIsMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %s, want DELETE", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":81044,"message":"Record does not exist"}]}`))
+	}))
+	defer server.Close()
+
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	if err := client.deleteRecord(context.Background(), "zone", "record"); err != nil {
+		t.Fatalf("missing record should be treated as an idempotent delete: %v", err)
+	}
+}
+
 func TestDNSPropagationResolversIncludeUDPAndTCP(t *testing.T) {
 	t.Setenv("DNS_PROPAGATION_RESOLVERS", "1.1.1.1")
 	resolvers := dnsPropagationResolvers()

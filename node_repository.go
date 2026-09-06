@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -713,6 +714,84 @@ func validateNodeRequestEvent(event NodeRequestEvent) error {
 	return nil
 }
 
+type authorizedNodeSite struct {
+	ID         int64
+	PublicHost string
+}
+
+// authorizedNodeSitesTx is the single source of truth for report-side site
+// authorization. A site remains authorized during a scheduler transition
+// while either desired_node_id or applied_node_id points at the reporting node.
+func authorizedNodeSitesTx(tx *sql.Tx, nodeID int64) (map[int64]authorizedNodeSite, error) {
+	rows, err := tx.Query(`
+		SELECT s.id, LOWER(TRIM(s.public_host))
+		FROM site_node_schedules n
+		JOIN sites s ON s.id=n.site_id
+		WHERE n.enabled=1
+		  AND s.enabled=1
+		  AND (n.desired_node_id=? OR n.applied_node_id=?)
+	`, nodeID, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int64]authorizedNodeSite)
+	for rows.Next() {
+		var site authorizedNodeSite
+		if err := rows.Scan(&site.ID, &site.PublicHost); err != nil {
+			return nil, err
+		}
+		result[site.ID] = site
+	}
+	return result, rows.Err()
+}
+
+func authorizedNodeSiteHost(sites map[int64]authorizedNodeSite, siteID int64, host string) bool {
+	site, ok := sites[siteID]
+	if !ok {
+		return false
+	}
+	normalized := requestPublicHost(strings.TrimSpace(host))
+	return normalized != "" && strings.EqualFold(normalized, site.PublicHost)
+}
+
+func (d *DB) authorizedNodeSitesForAgentToken(token string) (int64, map[int64]authorizedNodeSite, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	var nodeID int64
+	if err := tx.QueryRow("SELECT id FROM control_nodes WHERE agent_token_hash=?", hashNodeToken(token)).Scan(&nodeID); errors.Is(err, sql.ErrNoRows) {
+		return 0, nil, errInvalidAgentToken
+	} else if err != nil {
+		return 0, nil, err
+	}
+	sites, err := authorizedNodeSitesTx(tx, nodeID)
+	if err != nil {
+		return 0, nil, err
+	}
+	return nodeID, sites, nil
+}
+
+func (d *DB) recordAgentSecurityRejection(nodeID, siteID int64, category string) {
+	if d == nil {
+		return
+	}
+	d.agentSecurityRejected.Add(1)
+	key := fmt.Sprintf("%d:%d:%s", nodeID, siteID, category)
+	now := time.Now()
+	d.agentSecurityMu.Lock()
+	last := d.agentSecurityLastLog[key]
+	if last.IsZero() || now.Sub(last) >= time.Minute {
+		d.agentSecurityLastLog[key] = now
+		d.agentSecurityMu.Unlock()
+		log.Printf("[agent-security] rejected unauthorized site report node_id=%d site_id=%d category=%s", nodeID, siteID, category)
+		return
+	}
+	d.agentSecurityMu.Unlock()
+}
+
 func isHexString(value string) bool {
 	if value == "" {
 		return false
@@ -758,10 +837,16 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 	return err
 }
 
-func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeSiteStat, nowMS int64) error {
+func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite) error {
 	var siteID int64
-	host := strings.ToLower(strings.TrimSpace(stat.Host))
-	if err := tx.QueryRow(`SELECT s.id FROM site_node_schedules n JOIN sites s ON s.id=n.site_id WHERE n.enabled=1 AND n.desired_node_id=? AND lower(s.public_host)=?`, nodeID, host).Scan(&siteID); err != nil {
+	host := requestPublicHost(strings.TrimSpace(stat.Host))
+	for id, site := range allowedSites {
+		if strings.EqualFold(site.PublicHost, host) {
+			siteID = id
+			break
+		}
+	}
+	if siteID <= 0 {
 		return nil
 	}
 	currentIn, currentOut := stat.CumulativeBytesIn, stat.CumulativeBytesOut
@@ -829,6 +914,10 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 	if err != nil {
 		return ControlNode{}, err
 	}
+	allowedSites, err := authorizedNodeSitesTx(tx, id)
+	if err != nil {
+		return ControlNode{}, err
+	}
 	legacyBootID := strings.TrimSpace(report.BootID)
 	sessionID := strings.TrimSpace(report.ReportSessionID)
 	if sessionID == "" {
@@ -863,12 +952,16 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 		var scheduleID int64
 		var previousBoot string
 		var previousCount int64
-		err := tx.QueryRow(`SELECT n.site_id,n.agent_boot_id,n.agent_request_count FROM site_node_schedules n JOIN sites s ON s.id=n.site_id WHERE n.enabled=1 AND n.desired_node_id=? AND lower(s.public_host)=?`, id, host).Scan(&scheduleID, &previousBoot, &previousCount)
+		err := tx.QueryRow(`SELECT n.site_id,n.agent_boot_id,n.agent_request_count FROM site_node_schedules n JOIN sites s ON s.id=n.site_id WHERE n.enabled=1 AND s.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND lower(s.public_host)=?`, id, id, host).Scan(&scheduleID, &previousBoot, &previousCount)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return ControlNode{}, err
+		}
+		if !authorizedNodeSiteHost(allowedSites, scheduleID, host) {
+			d.recordAgentSecurityRejection(id, scheduleID, "site-stats")
+			continue
 		}
 		count := stat.RequestCount
 		if previousBoot != sessionID || count < previousCount {
@@ -882,29 +975,48 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 		if err != nil {
 			return ControlNode{}, err
 		}
-		if err := recordNodeSiteTrafficTx(tx, id, sessionID, stat, now.UnixMilli()); err != nil {
+		// Site traffic counters are cumulative NIC counters.  Keep their epoch
+		// independent from the process/report session so an Agent restart does
+		// not discard the bytes accumulated since the previous report.
+		if err := recordNodeSiteTrafficTx(tx, id, counterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
 			return ControlNode{}, err
 		}
 	}
 	for _, count := range report.MediaCounts {
+		if _, allowed := allowedSites[count.SiteID]; !allowed {
+			d.recordAgentSecurityRejection(id, count.SiteID, "media-counts")
+			continue
+		}
 		_, err := tx.Exec(`UPDATE sites SET media_movie_count=?,media_series_count=?,media_episode_count=?,media_count_updated_at_ms=? WHERE id=? AND media_count_updated_at_ms<?`, count.MovieCount, count.SeriesCount, count.EpisodeCount, count.ObservedAtMS, count.SiteID, count.ObservedAtMS)
 		if err != nil {
 			return ControlNode{}, err
 		}
 	}
 	for _, status := range report.Retention {
+		if _, allowed := allowedSites[status.SiteID]; !allowed {
+			d.recordAgentSecurityRejection(id, status.SiteID, "retention")
+			continue
+		}
 		_, err := tx.Exec(`UPDATE sites SET account_retention_started_at_ms=?,account_retention_last_completed_at_ms=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND account_retention_days>0 AND account_retention_started_at_ms=?`, status.CompletedAtMS, status.CompletedAtMS, status.SiteID, status.ExpectedStartedAtMS)
 		if err != nil {
 			return ControlNode{}, err
 		}
 	}
 	for _, observation := range report.Observations {
+		if _, allowed := allowedSites[observation.SiteID]; !allowed {
+			d.recordAgentSecurityRejection(id, observation.SiteID, "observation")
+			continue
+		}
 		_, err := tx.Exec(`INSERT INTO dynamic_observations(site_id,canonical_authority,source,decision,reason_code,first_seen_ms,last_seen_ms,count) VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(site_id,canonical_authority,source,decision,reason_code) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,count=count+1`, observation.SiteID, observation.CanonicalAuthority, observation.Source, observation.Decision, observation.ReasonCode, observation.ObservedAtMS, observation.ObservedAtMS)
 		if err != nil {
 			return ControlNode{}, err
 		}
 	}
 	for _, event := range report.Events {
+		if !authorizedNodeSiteHost(allowedSites, event.SiteID, event.Host) {
+			d.recordAgentSecurityRejection(id, event.SiteID, "request-event")
+			continue
+		}
 		result, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,event_uid,received_at_ms) VALUES(?,?,?,?,?)`, id, sessionID, event.EventID, event.EventUID, now.UnixMilli())
 		if err != nil {
 			return ControlNode{}, err
@@ -966,13 +1078,31 @@ func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now ti
 			result.DiscardedEventUIDs = append(result.DiscardedEventUIDs, event.EventUID)
 		}
 	}
-	report.Events = validEvents
+	nodeID, allowedSites, authErr := d.authorizedNodeSitesForAgentToken(agentToken)
+	if authErr != nil {
+		return NodeReportResult{}, authErr
+	}
+	authorizedEvents := make([]NodeRequestEvent, 0, len(validEvents))
+	for _, event := range validEvents {
+		if !authorizedNodeSiteHost(allowedSites, event.SiteID, event.Host) {
+			d.recordAgentSecurityRejection(nodeID, event.SiteID, "request-event")
+			if event.EventID > 0 {
+				result.DiscardedEventIDs = append(result.DiscardedEventIDs, event.EventID)
+			}
+			if len(event.EventUID) == 32 && isHexString(event.EventUID) {
+				result.DiscardedEventUIDs = append(result.DiscardedEventUIDs, event.EventUID)
+			}
+			continue
+		}
+		authorizedEvents = append(authorizedEvents, event)
+	}
+	report.Events = authorizedEvents
 	node, err := d.RecordNodeReport(agentToken, report, now)
 	if err != nil {
 		return NodeReportResult{}, err
 	}
 	result.Node = node
-	for _, event := range validEvents {
+	for _, event := range authorizedEvents {
 		if event.EventID > 0 {
 			result.AcceptedEventIDs = append(result.AcceptedEventIDs, event.EventID)
 		}

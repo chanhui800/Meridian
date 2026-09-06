@@ -560,7 +560,15 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			// Telegram credentials are embedded in the request URL. Never follow
+			// a redirect to another authority (or even replay them to a changed
+			// Telegram endpoint); treat every 3xx as an explicit failure.
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("telegram request failed: %w", err)

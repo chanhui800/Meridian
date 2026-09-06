@@ -57,6 +57,8 @@ test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {
   assert.match(page, /未启用节点调度，继续使用原面板入口/);
   assert.match(page, /原面板模式 · 节点调度未启用/);
   assert.match(page, /syncSiteScheduleRow/);
+  assert.match(page, /refreshSiteScheduleRowState/);
+  assert.match(page, /getElementById\('node-site-list'\)\.oninput = handleSiteScheduleAction/);
   assert.match(page, /enabled && mode === 'fixed'/);
   assert.match(page, /node-site-card/);
   assert.match(page, /保存站点设置/);

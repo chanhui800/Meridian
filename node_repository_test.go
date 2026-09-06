@@ -190,12 +190,22 @@ func TestRecordNodeReportResultRetiresInvalidEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "ack-site", PublicHost: "x.example", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
 	validUID := strings.Repeat("a", 32)
 	result, err := app.db.RecordNodeReportResult(token, NodeReport{
 		BootID: "session", ReportSessionID: "session", CounterEpoch: "epoch", Sequence: 1,
 		InterfaceName: "eth0", Events: []NodeRequestEvent{
-			{EventID: 1, EventUID: validUID, SiteID: 1, Host: "x.example", Method: "GET", Path: "/", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
-			{EventID: 2, EventUID: strings.Repeat("b", 32), SiteID: 1, Host: "x.example", Method: "GET", Path: strings.Repeat("x", 2049), StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+			{EventID: 1, EventUID: validUID, SiteID: site.ID, Host: "x.example", Method: "GET", Path: "/", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+			{EventID: 2, EventUID: strings.Repeat("b", 32), SiteID: site.ID, Host: "x.example", Method: "GET", Path: strings.Repeat("x", 2049), StatusCode: 200, RecordedAtMS: now.UnixMilli()},
 		},
 	}, now)
 	if err != nil {

@@ -94,7 +94,7 @@ sudo journalctl -u meridian -f
 
 域名入口需要在“全局设置 → TLS 设置”分别配置面板完整域名（例如 `panel.admin.example.com`）和节点泛域名（例如 `*.example.com`），再填写 Cloudflare DNS API Token。两者必须属于同一注册域但不能相同。Controller 证书会按配置包含面板域名，并在需要承载 Host 入口时包含节点泛域名；现有站点域名无需迁移。每台 Edge Node 使用独立证书和独立私钥，绝不共享 Controller 私钥。证书由 ACME 申请和续签，Token 加密保存在数据库中。
 
-DNS-01 传播检查默认同时查询公共递归 DNS 与系统 resolver；可用 `DNS_PROPAGATION_RESOLVERS`（逗号分隔的 IPv4/IPv6 地址）和 `DNS_PROPAGATION_TIMEOUT`（如 `120s`）调整。Agent 发布包仅提供 Linux amd64/arm64；Windows/macOS 构建产物仅是主控程序，因为节点流量采集依赖 Linux 网卡计数器。
+DNS-01 传播检查默认同时查询公共递归 DNS 与系统 resolver；可用 `DNS_PROPAGATION_RESOLVERS`（逗号分隔的 IPv4/IPv6 地址）和 `DNS_PROPAGATION_TIMEOUT`（如 `120s`）调整。Agent 发布包仅提供 Linux amd64/arm64；Windows/macOS 构建产物仅是主控程序，因为节点流量采集依赖 Linux 网卡计数器。Windows/macOS 主控用于开发和测试，生产部署支持 Linux。
 
 ## 节点调度
 

@@ -41,6 +41,31 @@ func TestBackupEncryptionRejectsWrongPasswordAndTampering(t *testing.T) {
 	}
 }
 
+func TestBackupV2RoundTripStreamsAndRejectsTampering(t *testing.T) {
+	plain := bytes.Repeat([]byte("v2 backup data "), 400000)
+	password := "correct horse battery staple"
+	sealed, err := sealBackupV2(plain, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(sealed, []byte(backupMagicV2)) {
+		t.Fatalf("backup magic = %q, want %s", sealed[:len(backupMagicV2)], backupMagicV2)
+	}
+	opened, err := openBackup(sealed, password)
+	if err != nil || !bytes.Equal(opened, plain) {
+		t.Fatalf("v2 round trip length=%d err=%v", len(opened), err)
+	}
+	var streamed bytes.Buffer
+	if size, err := openBackupV2Reader(bytes.NewReader(sealed), password, &streamed); err != nil || size != int64(len(plain)) || !bytes.Equal(streamed.Bytes(), plain) {
+		t.Fatalf("v2 streaming round trip size=%d err=%v", size, err)
+	}
+	tampered := append([]byte(nil), sealed...)
+	tampered[len(tampered)/2] ^= 1
+	if _, err := openBackup(tampered, password); err == nil {
+		t.Fatal("tampered v2 backup was accepted")
+	}
+}
+
 func TestDatabaseSchemaVersionIsPersisted(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "schema.db"))
 	if err != nil {

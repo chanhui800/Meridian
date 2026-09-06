@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -9,6 +10,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,11 +27,14 @@ import (
 )
 
 const (
-	backupMagic            = "MRDBKP01"
-	backupFormatVersion    = 1
-	backupSaltBytes        = 16
-	backupMaxUploadBytes   = 256 << 20
-	backupMaxExpandedBytes = 512 << 20
+	backupMagic               = "MRDBKP01" // v1 reader compatibility
+	backupMagicV2             = "MRDBKP02"
+	backupFormatVersion       = 2
+	backupLegacyFormatVersion = 1
+	backupSaltBytes           = 16
+	backupV2ChunkBytes        = 4 << 20
+	backupMaxUploadBytes      = 256 << 20
+	backupMaxExpandedBytes    = 512 << 20
 	// Keep the entry-count ceiling comfortably above the current per-node TLS
 	// layout (two files per node) while retaining the independent expanded-size
 	// and per-entry limits below.
@@ -211,9 +216,128 @@ func sealBackup(plain []byte, password string) ([]byte, error) {
 	return append(header, sealed...), nil
 }
 
+// sealBackupV2 encrypts independent, ordered chunks. Each record carries its
+// index and plaintext length in authenticated data, so reordering, omission,
+// duplication, truncation, and length forgery all fail closed in openBackup.
+func sealBackupV2(plain []byte, password string) ([]byte, error) {
+	var out bytes.Buffer
+	if _, err := sealBackupV2Reader(bytes.NewReader(plain), password, &out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// sealBackupV2Reader is the streaming v2 writer.  The compatibility wrapper
+// above remains useful for small unit fixtures, while production backup
+// creation feeds the ZIP from a private temporary file so the complete ZIP
+// and encrypted payload are never resident in memory at the same time.
+func sealBackupV2Reader(reader io.Reader, password string, writer io.Writer) (int64, error) {
+	if err := validateBackupPassword(password); err != nil {
+		return 0, err
+	}
+	salt := make([]byte, backupSaltBytes)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return 0, fmt.Errorf("生成备份盐值: %w", err)
+	}
+	key, err := backupKey(password, salt)
+	if err != nil {
+		return 0, fmt.Errorf("派生备份密钥: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return 0, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return 0, err
+	}
+	written := int64(0)
+	write := func(data []byte) error {
+		n, err := writer.Write(data)
+		written += int64(n)
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
+	if err := write([]byte(backupMagicV2)); err != nil {
+		return written, err
+	}
+	if err := write(salt); err != nil {
+		return written, err
+	}
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], backupV2ChunkBytes)
+	if err := write(size[:]); err != nil {
+		return written, err
+	}
+	writeRecord := func(index uint32, part []byte) error {
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+			return fmt.Errorf("生成备份随机数: %w", err)
+		}
+		sealed := gcm.Seal(nil, nonce, part, backupV2AAD(index, uint32(len(part)))) // #nosec G115 -- part is bounded by backupV2ChunkBytes.
+		var record [12]byte
+		binary.BigEndian.PutUint32(record[0:4], index)
+		binary.BigEndian.PutUint32(record[4:8], uint32(len(part)))    // #nosec G115 -- part is bounded by backupV2ChunkBytes.
+		binary.BigEndian.PutUint32(record[8:12], uint32(len(sealed))) // #nosec G115 -- sealed is a bounded chunk plus the GCM tag.
+		if err := write(record[:]); err != nil {
+			return err
+		}
+		if err := write(nonce); err != nil {
+			return err
+		}
+		return write(sealed)
+	}
+	buffer := make([]byte, backupV2ChunkBytes)
+	var index uint32
+	for {
+		n, readErr := io.ReadFull(reader, buffer)
+		if n > 0 {
+			if err := writeRecord(index, buffer[:n]); err != nil {
+				return written, err
+			}
+			index++
+		}
+		if readErr == nil {
+			continue
+		}
+		if readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			return written, readErr
+		}
+		break
+	}
+	// A zero-length authenticated record is an explicit end-of-plaintext
+	// marker. It also makes truncation at an exact chunk boundary detectable.
+	if err := writeRecord(index, nil); err != nil {
+		return written, err
+	}
+	// An explicit authenticated stream terminator lets the reader distinguish a
+	// complete exact-size stream from a truncated final chunk.
+	if err := write([]byte("END!")); err != nil {
+		return written, err
+	}
+	return written, nil
+}
+
+func backupV2AAD(index, plainLen uint32) []byte {
+	var aad [8 + 4 + 4 + 4]byte
+	copy(aad[:], backupMagicV2)
+	binary.BigEndian.PutUint32(aad[8:12], backupFormatVersion)
+	binary.BigEndian.PutUint32(aad[12:16], index)
+	binary.BigEndian.PutUint32(aad[16:20], plainLen)
+	return aad[:]
+}
+
 func openBackup(payload []byte, password string) ([]byte, error) {
 	if err := validateBackupPassword(password); err != nil {
 		return nil, err
+	}
+	if len(payload) >= len(backupMagicV2) && string(payload[:len(backupMagicV2)]) == backupMagicV2 {
+		return openBackupV2(payload, password)
 	}
 	minimum := len(backupMagic) + backupSaltBytes + 1
 	if len(payload) < minimum || string(payload[:len(backupMagic)]) != backupMagic {
@@ -246,6 +370,105 @@ func openBackup(payload []byte, password string) ([]byte, error) {
 		return nil, errors.New("备份密码错误或文件已被篡改")
 	}
 	return plain, nil
+}
+
+func openBackupV2(payload []byte, password string) ([]byte, error) {
+	var plain bytes.Buffer
+	if _, err := openBackupV2Reader(bytes.NewReader(payload), password, &plain); err != nil {
+		return nil, err
+	}
+	return plain.Bytes(), nil
+}
+
+// openBackupV2Reader authenticates and decrypts one chunk at a time.  The
+// writer is deliberately supplied by the caller so restore handlers can keep
+// the plaintext ZIP on disk instead of retaining the encrypted upload and the
+// decrypted archive simultaneously.
+func openBackupV2Reader(reader io.Reader, password string, writer io.Writer) (int64, error) {
+	if err := validateBackupPassword(password); err != nil {
+		return 0, err
+	}
+	minimum := len(backupMagicV2) + backupSaltBytes + 4
+	header := make([]byte, minimum)
+	if _, err := io.ReadFull(reader, header); err != nil || string(header[:len(backupMagicV2)]) != backupMagicV2 {
+		return 0, errors.New("不是有效的 Meridian v2 备份文件")
+	}
+	saltStart := len(backupMagicV2)
+	salt := header[saltStart : saltStart+backupSaltBytes]
+	chunkSize := binary.BigEndian.Uint32(header[saltStart+backupSaltBytes : minimum])
+	if chunkSize == 0 || chunkSize > backupV2ChunkBytes {
+		return 0, errors.New("备份分块大小无效")
+	}
+	key, err := backupKey(password, salt)
+	if err != nil {
+		return 0, fmt.Errorf("派生备份密钥: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return 0, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return 0, err
+	}
+	buffer := bufio.NewReaderSize(reader, 64<<10)
+	var expected uint32
+	shortChunkSeen := false
+	endChunkSeen := false
+	var expanded int64
+	for {
+		marker := make([]byte, 4)
+		if _, err := io.ReadFull(buffer, marker); err != nil {
+			return 0, errors.New("备份分块缺失")
+		}
+		if string(marker) == "END!" {
+			var trailing [1]byte
+			if n, err := buffer.Read(trailing[:]); n != 0 || err != io.EOF {
+				return 0, errors.New("备份包含尾随数据")
+			}
+			if !endChunkSeen {
+				return 0, errors.New("备份分块结束标记缺失")
+			}
+			return expanded, nil
+		}
+		meta := make([]byte, 8)
+		if _, err := io.ReadFull(buffer, meta); err != nil {
+			return 0, errors.New("备份分块缺失")
+		}
+		index := binary.BigEndian.Uint32(marker)
+		plainLen := binary.BigEndian.Uint32(meta[:4])
+		cipherLen := binary.BigEndian.Uint32(meta[4:])
+		if index != expected || endChunkSeen || (shortChunkSeen && plainLen != 0) || plainLen > chunkSize || cipherLen != plainLen+uint32(gcm.Overhead()) || cipherLen > backupMaxExpandedBytes || int64(plainLen)+expanded > backupMaxExpandedBytes { // #nosec G115 -- GCM overhead is a fixed small constant.
+			return 0, errors.New("备份分块顺序或长度无效")
+		}
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := io.ReadFull(buffer, nonce); err != nil {
+			return 0, errors.New("备份分块缺失")
+		}
+		sealed := make([]byte, cipherLen)
+		if _, err := io.ReadFull(buffer, sealed); err != nil {
+			return 0, errors.New("备份分块缺失")
+		}
+		part, err := gcm.Open(nil, nonce, sealed, backupV2AAD(index, plainLen))
+		if err != nil {
+			return 0, errors.New("备份密码错误或文件已被篡改")
+		}
+		if uint32(len(part)) != plainLen { // #nosec G115 -- decrypted part is bounded by the authenticated chunk length.
+			return 0, errors.New("备份分块长度无效")
+		}
+		if plainLen == 0 {
+			endChunkSeen = true
+		} else if plainLen < chunkSize {
+			shortChunkSeen = true
+		}
+		if n, err := writer.Write(part); err != nil {
+			return expanded, err
+		} else if n != len(part) {
+			return expanded, io.ErrShortWrite
+		}
+		expanded += int64(len(part))
+		expected++
+	}
 }
 
 func quoteSQLiteString(value string) string {
@@ -376,8 +599,13 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	}
 	defer cleanup()
 
-	var archive bytes.Buffer
-	zipWriter := zip.NewWriter(&archive)
+	archivePath := filepath.Join(filepath.Dir(snapshot), "archive.zip")
+	archiveFile, err := os.OpenFile(archivePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- archivePath is inside the private snapshot directory.
+	if err != nil {
+		return nil, err
+	}
+	defer archiveFile.Close()
+	zipWriter := zip.NewWriter(archiveFile)
 	files := make([]string, 0, 8)
 	expandedSize := int64(0)
 	if err := addBackupEntry(zipWriter, &files, &expandedSize, backupDatabaseEntry, snapshot); err != nil {
@@ -493,7 +721,32 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	if err := zipWriter.Close(); err != nil {
 		return nil, err
 	}
-	payload, err := sealBackup(archive.Bytes(), password)
+	if err := archiveFile.Sync(); err != nil {
+		return nil, err
+	}
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	payloadPath := filepath.Join(filepath.Dir(snapshot), "backup.mrbak")
+	payloadFile, err := os.OpenFile(payloadPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- payloadPath is inside the private snapshot directory.
+	if err != nil {
+		return nil, err
+	}
+	defer payloadFile.Close()
+	payloadSize, err := sealBackupV2Reader(archiveFile, password, payloadFile)
+	if err != nil {
+		return nil, err
+	}
+	if payloadSize > backupMaxUploadBytes {
+		return nil, fmt.Errorf("生成的备份为 %d MiB，超过当前恢复接口支持的 %d MiB", payloadSize>>20, backupMaxUploadBytes>>20)
+	}
+	if err := payloadFile.Sync(); err != nil {
+		return nil, err
+	}
+	if _, err := payloadFile.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	payload, err := io.ReadAll(io.LimitReader(payloadFile, backupMaxUploadBytes+1))
 	if err != nil {
 		return nil, err
 	}
@@ -523,11 +776,32 @@ func readZipEntry(file *zip.File, maxBytes int64) ([]byte, error) {
 }
 
 func parseBackupArchive(plain []byte) (backupManifest, map[string][]byte, error) {
-	var manifest backupManifest
 	reader, err := zip.NewReader(bytes.NewReader(plain), int64(len(plain)))
 	if err != nil {
-		return manifest, nil, errors.New("备份压缩包损坏")
+		return backupManifest{}, nil, errors.New("备份压缩包损坏")
 	}
+	return parseBackupZipReader(reader)
+}
+
+func parseBackupArchiveFile(path string) (backupManifest, map[string][]byte, error) {
+	file, err := os.Open(path) // #nosec G304 -- path is an internal restore staging file.
+	if err != nil {
+		return backupManifest{}, nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return backupManifest{}, nil, err
+	}
+	reader, err := zip.NewReader(file, info.Size())
+	if err != nil {
+		return backupManifest{}, nil, errors.New("备份压缩包损坏")
+	}
+	return parseBackupZipReader(reader)
+}
+
+func parseBackupZipReader(reader *zip.Reader) (backupManifest, map[string][]byte, error) {
+	var manifest backupManifest
 	if len(reader.File) < 2 || len(reader.File) > backupMaxFiles {
 		return manifest, nil, errors.New("备份文件数量无效")
 	}
@@ -560,7 +834,7 @@ func parseBackupArchive(plain []byte) (backupManifest, map[string][]byte, error)
 	if err := decoder.Decode(&manifest); err != nil {
 		return manifest, nil, errors.New("备份清单无效")
 	}
-	if manifest.Format != "meridian-backup" || manifest.FormatVersion != backupFormatVersion {
+	if manifest.Format != "meridian-backup" || (manifest.FormatVersion != backupFormatVersion && manifest.FormatVersion != backupLegacyFormatVersion) {
 		return manifest, nil, errors.New("不支持的备份格式版本")
 	}
 	if manifest.DatabaseSchemaVersion > databaseSchemaVersion {
@@ -1806,19 +2080,74 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	payload, err := io.ReadAll(io.LimitReader(file, backupMaxUploadBytes+1))
-	if err != nil || len(payload) > backupMaxUploadBytes {
+	restoreTemp, err := os.MkdirTemp(filepath.Dir(a.dbPath), ".meridian-restore-upload-*")
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "恢复暂存目录创建失败")
+		return
+	}
+	defer os.RemoveAll(restoreTemp)
+	encryptedPath := filepath.Join(restoreTemp, "backup.mrbak")
+	encrypted, err := os.OpenFile(encryptedPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- encryptedPath is inside a private restore directory.
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "恢复暂存文件创建失败")
+		return
+	}
+	readBytes, copyErr := io.Copy(encrypted, io.LimitReader(file, backupMaxUploadBytes+1))
+	closeErr := encrypted.Close()
+	if copyErr != nil || closeErr != nil || readBytes > backupMaxUploadBytes {
 		a.jsonErr(w, http.StatusBadRequest, "备份文件读取失败或超过 256 MiB")
+		return
+	}
+	plainPath := filepath.Join(restoreTemp, "archive.zip")
+	plainFile, err := os.OpenFile(plainPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- plainPath is inside a private restore directory.
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "恢复解密文件创建失败")
+		return
+	}
+	encrypted, err = os.Open(encryptedPath) // #nosec G304 -- encryptedPath is inside a private restore directory.
+	if err != nil {
+		_ = plainFile.Close()
+		a.jsonErr(w, http.StatusInternalServerError, "恢复暂存文件读取失败")
+		return
+	}
+	prefix := make([]byte, len(backupMagicV2))
+	_, prefixErr := io.ReadFull(encrypted, prefix)
+	if _, err := encrypted.Seek(0, io.SeekStart); err != nil {
+		_ = encrypted.Close()
+		_ = plainFile.Close()
+		a.jsonErr(w, http.StatusInternalServerError, "恢复暂存文件定位失败")
+		return
+	}
+	var decryptErr error
+	if prefixErr == nil && string(prefix) == backupMagicV2 {
+		_, decryptErr = openBackupV2Reader(encrypted, password, plainFile)
+	} else {
+		legacyPayload, readErr := io.ReadAll(io.LimitReader(encrypted, backupMaxUploadBytes+1))
+		if readErr != nil || int64(len(legacyPayload)) > backupMaxUploadBytes {
+			decryptErr = errors.New("备份文件读取失败或超过 256 MiB")
+		} else {
+			var plain []byte
+			plain, decryptErr = openBackup(legacyPayload, password)
+			if decryptErr == nil {
+				var written int
+				written, decryptErr = plainFile.Write(plain)
+				if decryptErr == nil && written != len(plain) {
+					decryptErr = io.ErrShortWrite
+				}
+			}
+		}
+	}
+	_ = encrypted.Close()
+	if closeErr := plainFile.Close(); decryptErr == nil && closeErr != nil {
+		decryptErr = closeErr
+	}
+	if decryptErr != nil {
+		a.jsonErr(w, http.StatusBadRequest, decryptErr.Error())
 		return
 	}
 	a.backupMu.Lock()
 	defer a.backupMu.Unlock()
-	plain, err := openBackup(payload, password)
-	if err != nil {
-		a.jsonErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	manifest, entries, err := parseBackupArchive(plain)
+	manifest, entries, err := parseBackupArchiveFile(plainPath)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return

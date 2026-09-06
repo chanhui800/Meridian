@@ -34,7 +34,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if ! bash scripts/release-policy.sh is-valid "$RELEASE_TAG"; then
             echo "Release tags must use exactly vMAJOR.MINOR.PATCH without a suffix." >&2
             exit 1
           fi
@@ -72,10 +72,13 @@ jobs:
           bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh
           bash -n tests/dynamic_route_key_test.sh
-          shellcheck install.sh scripts/agent-install.sh docker-entrypoint.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh
+          bash -n scripts/release-policy.sh
+          bash -n tests/release_policy_test.sh
+          shellcheck install.sh scripts/agent-install.sh docker-entrypoint.sh scripts/release-policy.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh tests/release_policy_test.sh
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
+          bash tests/release_policy_test.sh
 
       - name: Test Docker entrypoint
         run: bash tests/docker_entrypoint_test.sh
@@ -264,7 +267,7 @@ jobs:
             echo "Could not determine the newest successful GitHub release." >&2
             exit 1
           fi
-          if [ "$RELEASE_TAG" = "$latest_tag" ]; then
+          if bash scripts/release-policy.sh should-promote "$RELEASE_TAG" "$latest_tag"; then
             echo 'promote=true' >> "$GITHUB_OUTPUT"
           else
             echo "Skipping :latest promotion for $RELEASE_TAG; newest successful release is $latest_tag"

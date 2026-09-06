@@ -647,12 +647,32 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	token := requestBearerToken(r)
+	node, authErr := a.db.nodeByAgentToken(token, time.Now())
+	if authErr != nil {
+		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		return
+	}
+	release, retryAfter, admitted := a.agentReports().admit(node.ID, time.Now())
+	if !admitted {
+		seconds := int(retryAfter.Seconds())
+		if retryAfter-time.Duration(seconds)*time.Second > 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		a.jsonErr(w, http.StatusTooManyRequests, "agent report rate or concurrency limit exceeded")
+		return
+	}
+	defer release()
 	var report NodeReport
 	if err := decodeJSONBodyWithLimit(w, r, &report, maxAgentReportBodyBytes); err != nil {
 		a.jsonErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	result, err := a.db.RecordNodeReportResult(requestBearerToken(r), report, time.Now())
+	result, err := a.db.RecordNodeReportResult(token, report, time.Now())
 	if errors.Is(err, errInvalidAgentToken) {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return
@@ -679,7 +699,8 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		return
 	}
 	token := requestBearerToken(ws.Request())
-	if _, err := a.db.nodeByAgentToken(token, time.Now()); err != nil {
+	node, err := a.db.nodeByAgentToken(token, time.Now())
+	if err != nil {
 		return
 	}
 	ws.MaxPayloadBytes = maxAgentReportBodyBytes
@@ -692,7 +713,18 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		if err := websocket.JSON.Receive(ws, &report); err != nil {
 			return
 		}
+		release, retryAfter, admitted := a.agentReports().admit(node.ID, time.Now())
+		if !admitted {
+			_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_ = websocket.JSON.Send(ws, map[string]interface{}{
+				"accepted":            false,
+				"error":               "agent report rate or concurrency limit exceeded",
+				"retry_after_seconds": max(1, int(retryAfter.Seconds()+0.5)),
+			})
+			continue
+		}
 		result, err := a.db.RecordNodeReportResult(token, report, time.Now())
+		release()
 		if err != nil {
 			return
 		}

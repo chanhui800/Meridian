@@ -122,6 +122,9 @@ func main() {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer db.Close()
+	if err := migrateLegacyEdgeTLSState(db, dbPath); err != nil {
+		log.Fatalf("migrate legacy Edge TLS state: %v", err)
+	}
 	panelSettings, err := db.BootstrapPanelSettings(os.Getenv("PANEL_DOMAIN"), os.Getenv("PANEL_ROUTE_DOMAIN"), envBool("PANEL_TLS_ENABLED"), port)
 	if err != nil {
 		log.Fatalf("invalid panel settings: %v", err)

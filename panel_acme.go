@@ -598,20 +598,100 @@ func edgeNodeTLSRoot(dbPath string) string {
 	if stateDir == "" {
 		return ""
 	}
-	stateRoot := filepath.Join(stateDir, "edge-nodes")
-	certFile, _ := edgeTLSPaths(dbPath)
-	legacyRoot := ""
-	if strings.TrimSpace(certFile) != "" {
-		legacyRoot = filepath.Join(filepath.Dir(certFile), "edge-nodes")
+	// Meridian-owned Edge state always lives below TLS_STATE_DIR. Legacy
+	// external directories are read only by migrateLegacyEdgeTLSState during
+	// startup and are never selected by the runtime.
+	return filepath.Join(stateDir, "edge-nodes")
+}
+
+func legacyEdgeNodeTLSRoot(dbPath string) string {
+	configured := strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
+	if configured == "" {
+		return ""
 	}
-	if legacyRoot != "" && filepath.Clean(legacyRoot) != filepath.Clean(stateRoot) {
-		if _, err := os.Stat(stateRoot); errors.Is(err, os.ErrNotExist) {
-			if _, legacyErr := os.Stat(legacyRoot); legacyErr == nil {
-				return legacyRoot
-			}
+	certFile := cleanConfiguredTLSPath(configured)
+	if certFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(certFile), "edge-nodes")
+}
+
+func validTLSNodeGUID(guid string) bool {
+	guid = strings.TrimSpace(guid)
+	if guid == "" || guid == "." || guid == ".." || strings.ContainsAny(guid, `/\\`) {
+		return false
+	}
+	for _, r := range guid {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return false
 		}
 	}
-	return stateRoot
+	return true
+}
+
+// migrateLegacyEdgeTLSState performs a one-time, allowlisted copy from the
+// pre-TLS_STATE_DIR external edge-nodes directory. It only considers GUIDs
+// present in control_nodes, validates regular files and the key pair, and
+// leaves the legacy directory untouched for operator rollback.
+func migrateLegacyEdgeTLSState(db *DB, dbPath string) error {
+	if db == nil || strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return fmt.Errorf("invalid TLS path configuration: %w", err)
+	}
+	legacyRoot := legacyEdgeNodeTLSRoot(dbPath)
+	stateRoot := edgeNodeTLSRoot(dbPath)
+	if legacyRoot == "" || filepath.Clean(legacyRoot) == filepath.Clean(stateRoot) {
+		return nil
+	}
+	if _, err := os.Stat(legacyRoot); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	rows, err := db.db.Query("SELECT guid FROM control_nodes WHERE TRIM(guid) <> ''")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var guid string
+		if err := rows.Scan(&guid); err != nil {
+			return err
+		}
+		if !validTLSNodeGUID(guid) {
+			continue
+		}
+		sourceDir := filepath.Join(legacyRoot, guid, "current")
+		certSource := filepath.Join(sourceDir, "fullchain.pem")
+		keySource := filepath.Join(sourceDir, "privkey.pem")
+		certPEM, certErr := os.ReadFile(certSource) // #nosec G304 -- GUID is selected from the database and validated above.
+		keyPEM, keyErr := os.ReadFile(keySource)    // #nosec G304 -- GUID is selected from the database and validated above.
+		if errors.Is(certErr, os.ErrNotExist) || errors.Is(keyErr, os.ErrNotExist) {
+			continue
+		}
+		if certErr != nil {
+			return certErr
+		}
+		if keyErr != nil {
+			return keyErr
+		}
+		if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+			continue
+		}
+		targetCert := filepath.Join(stateRoot, guid, "current", "fullchain.pem")
+		targetKey := filepath.Join(stateRoot, guid, "current", "privkey.pem")
+		if _, certErr := os.Stat(targetCert); certErr == nil {
+			if _, keyErr := os.Stat(targetKey); keyErr == nil {
+				continue
+			}
+		}
+		if err := installCertificatePairAtomic(targetCert, targetKey, certPEM, keyPEM); err != nil {
+			return fmt.Errorf("migrate edge TLS for node %s: %w", guid, err)
+		}
+	}
+	return rows.Err()
 }
 
 // edgeTLSPaths deliberately has its own certificate and key.  Edge nodes are
@@ -1555,5 +1635,22 @@ func (c *cloudflareClient) createTXTRecord(ctx context.Context, zoneID, name, va
 
 func (c *cloudflareClient) deleteRecord(ctx context.Context, zoneID, recordID string) error {
 	_, err := c.request(ctx, http.MethodDelete, "/zones/"+url.PathEscape(zoneID)+"/dns_records/"+url.PathEscape(recordID), nil)
+	// Deletion is intentionally idempotent.  A record may already have been
+	// removed manually, by a previous retry, or by Cloudflare's reconciliation
+	// of the zone.  In that case there is no remote state left to clean up and
+	// the local schedule can safely be marked disabled.
+	if isCloudflareRecordNotFoundError(err) {
+		return nil
+	}
 	return err
+}
+
+func isCloudflareRecordNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "record does not exist") ||
+		strings.Contains(message, "record not found") ||
+		strings.Contains(message, "81044")
 }
