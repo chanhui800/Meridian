@@ -130,6 +130,55 @@ func TestRefreshNodeEnrollmentKeepsOldAgentUntilReplacement(t *testing.T) {
 	}
 }
 
+func TestRefreshNodeEnrollmentPreservesRuntimeStateAndTrafficBaseline(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "preserve-runtime", Address: "203.0.113.61"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := NodeReport{
+		BootID: "legacy-boot", ReportSessionID: "session-a", CounterEpoch: "kernel-boot:eth0", Sequence: 7,
+		InterfaceName: "eth0", RXBytes: 10_000, TXBytes: 20_000, AgentVersion: "test",
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, first, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := app.db.controlNodeByID(node.ID, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.LastSeenAtMS == 0 || before.lastBootID == "" || before.lastReportSessionID == "" || before.lastSequence != first.Sequence || before.lastRawRXBytes != first.RXBytes || before.lastRawTXBytes != first.TXBytes {
+		t.Fatalf("initial runtime state was not recorded: %#v", before)
+	}
+	if _, _, err := app.db.RefreshNodeEnrollment(node.ID, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LastSeenAtMS != before.LastSeenAtMS || after.lastBootID != before.lastBootID || after.lastReportSessionID != before.lastReportSessionID || after.lastSequence != before.lastSequence || after.lastRawRXBytes != before.lastRawRXBytes || after.lastRawTXBytes != before.lastRawTXBytes {
+		t.Fatalf("refresh reset runtime state: before=%#v after=%#v", before, after)
+	}
+	second := first
+	second.ReportSessionID = "session-b"
+	second.Sequence = 1
+	second.RXBytes = 10_500
+	second.TXBytes = 20_750
+	reported, err := app.db.RecordNodeReport(agentToken, second, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported.PeriodRXBytes != 500 || reported.PeriodTXBytes != 750 {
+		t.Fatalf("traffic baseline was lost across enrollment refresh: %#v", reported)
+	}
+}
+
 func TestRecordNodeReportResultRetiresInvalidEvents(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()

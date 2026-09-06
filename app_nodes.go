@@ -432,18 +432,50 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusConflict, "legacy Agent must send X-Meridian-Agent-Platform; reinstall it to enable updates")
 		return
 	}
+	// Resolve the immutable Release checksum before considering any local
+	// legacy bundle. Standalone v1.9.29 Controllers may still have stale
+	// platform binaries on disk; serving one would make an old Agent download
+	// the same version it already runs and fail its checksum verification.
+	manifest, manifestErr := agentReleaseManifestForPlatform(r.Context(), platform)
+	if manifestErr != nil {
+		log.Printf("Agent release manifest unavailable for %s: %v", platform, manifestErr)
+		a.jsonErr(w, http.StatusServiceUnavailable, "agent binary unavailable")
+		return
+	}
 	if executable, pathErr := configuredAgentBinaryPathForPlatform(platform); pathErr == nil {
-		if serveAgentBinaryFile(w, executable, platform) {
+		if localAgentBinaryMatchesManifest(executable, manifest) && serveAgentBinaryFile(w, executable, platform) {
 			return
 		}
 	}
-	started, err := proxyAgentReleaseBinary(w, r, platform)
+	started, err := proxyAgentReleaseBinaryWithManifest(w, r, manifest)
 	if err != nil {
 		log.Printf("legacy Agent binary proxy failed for %s: %v", platform, err)
 		if !started {
 			a.jsonErr(w, http.StatusServiceUnavailable, "agent binary unavailable")
 		}
 	}
+}
+
+func agentBinarySHA256(executable string) (string, error) {
+	file, err := os.Open(executable) // #nosec G304 -- the path is fixed by the image or an administrator-controlled environment variable.
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	written, err := io.Copy(digest, io.LimitReader(file, 128<<20+1))
+	if err != nil || written <= 0 || written > 128<<20 {
+		if err != nil {
+			return "", err
+		}
+		return "", errors.New("Agent binary is too large")
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func localAgentBinaryMatchesManifest(executable string, manifest AgentBinaryManifest) bool {
+	localSHA, err := agentBinarySHA256(executable)
+	return err == nil && strings.EqualFold(localSHA, manifest.SHA256)
 }
 
 func serveAgentBinaryFile(w http.ResponseWriter, executable, platform string) bool {
@@ -480,6 +512,10 @@ func proxyAgentReleaseBinary(w http.ResponseWriter, r *http.Request, platform st
 	if err != nil {
 		return false, err
 	}
+	return proxyAgentReleaseBinaryWithManifest(w, r, manifest)
+}
+
+func proxyAgentReleaseBinaryWithManifest(w http.ResponseWriter, r *http.Request, manifest AgentBinaryManifest) (bool, error) {
 	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, manifest.DownloadURL, nil)
 	if err != nil {
 		return false, err

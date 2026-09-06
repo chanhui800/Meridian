@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
 )
@@ -32,5 +35,22 @@ func TestValidateAgentReleaseDownloadURL(t *testing.T) {
 		if err := validateAgentReleaseDownloadURL(invalid, "v1.9.30", "meridian-agent-linux-arm64"); err == nil {
 			t.Fatalf("invalid Agent release URL accepted: %s", invalid)
 		}
+	}
+}
+
+func TestLocalAgentBinaryMustMatchReleaseManifest(t *testing.T) {
+	path := t.TempDir() + string(os.PathSeparator) + "meridian-agent"
+	contents := []byte("stale Agent binary")
+	if err := os.WriteFile(path, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	manifest := AgentBinaryManifest{Version: "v1.9.32", Platform: "linux/amd64", SHA256: hex.EncodeToString(digest[:])}
+	if !localAgentBinaryMatchesManifest(path, manifest) {
+		t.Fatal("matching local Agent binary was rejected")
+	}
+	manifest.SHA256 = strings.Repeat("0", 64)
+	if localAgentBinaryMatchesManifest(path, manifest) {
+		t.Fatal("stale local Agent binary was accepted for a different release")
 	}
 }
