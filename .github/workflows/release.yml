@@ -188,7 +188,12 @@ jobs:
             echo "Could not find draft release for ${RELEASE_TAG}." >&2
             exit 1
           fi
-          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -f draft=false >/dev/null
+          latest_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))) | .tag_name' | sort -V | tail -n1)"
+          if [ -z "$latest_tag" ] || [ "$(printf '%s\n' "$latest_tag" "$RELEASE_TAG" | sort -V | tail -n1)" = "$RELEASE_TAG" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -F draft=false -F make_latest=true >/dev/null
+          else
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -F draft=false >/dev/null
+          fi
 
   docker:
     needs: [verify, build]
