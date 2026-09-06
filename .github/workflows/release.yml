@@ -236,7 +236,7 @@ jobs:
         id: newest
         run: |
           set -euo pipefail
-          latest_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\.[0-9]+\.[0-9]+$"))) | .tag_name' | sort -V | tail -n1)"
+          latest_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))) | .tag_name' | sort -V | tail -n1)"
           if [ -z "$latest_tag" ]; then
             echo "Could not determine the newest successful GitHub release." >&2
             exit 1
