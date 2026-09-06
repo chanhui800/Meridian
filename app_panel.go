@@ -102,7 +102,7 @@ func (a *App) handlePanelSettings(w http.ResponseWriter, r *http.Request) {
 	var managed PanelSettings
 	var err error
 	if strings.TrimSpace(req.PanelDomain) != "" {
-		managed, err = normalizeManagedPanelSettings(req.PanelDomain, req.WildcardDomain)
+		managed, err = normalizeManagedPanelDomain(req.PanelDomain, req.WildcardDomain)
 	} else {
 		managed, err = normalizeManagedPanelPrefix(req.PanelPrefix, req.WildcardDomain)
 	}

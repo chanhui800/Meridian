@@ -52,6 +52,21 @@ func normalizeManagedPanelPrefix(panelPrefix, wildcardDomain string) (PanelSetti
 	return normalizeManagedPanelSettings(prefix+"."+routeDomain, routeDomain)
 }
 
+// normalizeManagedPanelDomain accepts the complete Panel hostname together
+// with the UI's wildcard form and stores only the route suffix. Keeping this
+// conversion at the boundary prevents "*.example.com" from reaching the
+// public-host validator, which intentionally rejects wildcard values.
+func normalizeManagedPanelDomain(panelDomain, wildcardDomain string) (PanelSettings, error) {
+	if !strings.HasPrefix(strings.TrimSpace(wildcardDomain), "*.") {
+		return PanelSettings{}, errors.New("节点泛域名必须以 *. 开头，例如 *.example.com")
+	}
+	routeDomain, err := normalizeWildcardDomain(wildcardDomain)
+	if err != nil {
+		return PanelSettings{}, fmt.Errorf("节点泛域名无效: %w", err)
+	}
+	return normalizeManagedPanelSettings(panelDomain, routeDomain)
+}
+
 func panelPrefixForSettings(settings PanelSettings) string {
 	if prefix, ok := routePrefixFromConfiguredHost(settings.PanelDomain, settings.RouteDomain); ok {
 		return prefix

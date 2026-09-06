@@ -92,7 +92,8 @@ test('node schedule refresh preserves unsaved checkbox and selector edits', () =
   sandbox.captureSiteScheduleDrafts();
   sandbox.renderSiteSchedules();
   assert.doesNotMatch(container.innerHTML, /data-field="enabled" checked/);
-  assert.match(container.innerHTML, /原面板模式 · 节点调度未启用/);
+  assert.match(container.innerHTML, /调度已启用 · 待保存/);
+  assert.match(container.innerHTML, /期望 node · 生效 node :9090 · DNS active/);
 
   fields['[data-field="enabled"]'].checked = true;
   fields['[data-field="mode"]'].value = 'fixed';
@@ -102,4 +103,41 @@ test('node schedule refresh preserves unsaved checkbox and selector edits', () =
   assert.match(container.innerHTML, /data-field="enabled" checked/);
   assert.match(container.innerHTML, /<option value="fixed" selected>固定节点<\/option>/);
   assert.match(container.innerHTML, /value="42" selected/);
+  assert.match(container.innerHTML, /调度已启用 · 待保存/);
+  assert.match(container.innerHTML, /期望 node · 生效 node :9090 · DNS active/);
+  assert.match(container.innerHTML, /当前修改尚未保存，保存后才会生效/);
+
+  // A saved enabled state remains authoritative while an unsaved disable is
+  // being edited: only the form controls reflect the draft.
+  siteSchedulesSnapshot = { sites: [{ site_id: 1, site_name: 'site', public_host: 'site.example', enabled: true, mode: 'global', fixed_node_id: 0, desired_node_id: 42, desired_node_name: 'node', applied_node_id: 42, applied_node_name: 'node', applied_node_port: 9090, dns_status: 'active', last_error: '' }] };
+  vm.runInContext('siteScheduleDrafts.clear(); siteScheduleDrafts.set(1, { enabled: false, mode: "global", fixed_node_id: 0 });', sandbox);
+  sandbox.renderSiteSchedules();
+  assert.doesNotMatch(container.innerHTML, /data-field="enabled" checked/);
+  assert.match(container.innerHTML, /调度已启用 · 待保存/);
+  assert.match(container.innerHTML, /期望 node · 生效 node :9090 · DNS active/);
+  assert.match(container.innerHTML, /当前修改尚未保存，保存后才会生效/);
+});
+
+test('unsaved schedule draft does not change persisted status label', () => {
+  const container = { innerHTML: '' };
+  const sandbox = {
+    console,
+    Map,
+    Number,
+    String,
+    Math,
+    document: {
+      getElementById(id) { return id === 'node-site-list' ? container : null; },
+      querySelectorAll() { return []; },
+    },
+    esc(value) { return String(value); },
+    meridianFormatDateTime(value) { return String(value); },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  vm.runInContext(`nodesSnapshot = { nodes: [] }; siteSchedulesSnapshot = { sites: [{ site_id: 7, site_name: 'site', public_host: 'site.example', enabled: false, mode: 'global', fixed_node_id: 0, desired_node_id: 0, applied_node_id: 0, dns_status: 'disabled', last_error: '' }] }; siteScheduleDrafts = new Map([[7, { enabled: true, mode: 'global', fixed_node_id: 0 }]]);`, sandbox);
+  sandbox.renderSiteSchedules();
+  assert.match(container.innerHTML, /使用面板入口 · 待保存/);
+  assert.doesNotMatch(container.innerHTML, /调度已启用 · 待保存/);
+  assert.match(container.innerHTML, /原面板模式 · 节点调度未启用/);
 });

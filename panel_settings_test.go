@@ -28,6 +28,22 @@ func TestNormalizeManagedPanelSettings(t *testing.T) {
 	}
 }
 
+func TestNormalizeManagedPanelDomainAcceptsWildcardForm(t *testing.T) {
+	settings, err := normalizeManagedPanelDomain("panel.admin.example.test", "*.example.test")
+	if err != nil {
+		t.Fatalf("normalize managed panel domain: %v", err)
+	}
+	if settings.PanelDomain != "panel.admin.example.test" || settings.RouteDomain != "example.test" || !settings.TLSEnabled {
+		t.Fatalf("unexpected settings: %+v", settings)
+	}
+}
+
+func TestNormalizeManagedPanelDomainRejectsPlainRouteDomain(t *testing.T) {
+	if _, err := normalizeManagedPanelDomain("panel.admin.example.test", "example.test"); err == nil {
+		t.Fatal("expected wildcard marker validation error")
+	}
+}
+
 func TestSaveManagedPanelSettingsRejectsRouteChangeWithManagedDNS(t *testing.T) {
 	db, err := openDB(":memory:")
 	if err != nil {
