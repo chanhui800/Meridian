@@ -11,7 +11,7 @@ ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=controller" -o meridian .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-amd64 .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-arm64 .
-RUN cp "/app/meridian-agent-${TARGETARCH}" /app/meridian-agent
+RUN cp "/app/meridian-agent-linux-${TARGETARCH}" /app/meridian-agent
 
 # Runtime stage
 FROM alpine:3.24
