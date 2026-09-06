@@ -1047,7 +1047,7 @@ func managedTLSRoots(dbPath string) []string {
 }
 
 func copyTLSNamespaceTree(source, target string) error {
-	info, err := os.Lstat(source)
+	info, err := os.Lstat(source) // #nosec G703 -- source is an internally derived Meridian TLS namespace root.
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -1057,10 +1057,10 @@ func copyTLSNamespaceTree(source, target string) error {
 	if !info.IsDir() {
 		return errors.New("TLS namespace root is not a directory")
 	}
-	if err := os.MkdirAll(target, 0o700); err != nil {
+	if err := os.MkdirAll(target, 0o700); err != nil { // #nosec G703 -- target is an internally generated rollback namespace path.
 		return err
 	}
-	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error { // #nosec G703 G122 -- source and target are private Meridian TLS roots; symlinks are copied without following them.
 		if walkErr != nil {
 			return walkErr
 		}
@@ -1077,14 +1077,14 @@ func copyTLSNamespaceTree(source, target string) error {
 			if err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil { // #nosec G703 -- destination is beneath the generated rollback root.
 				return err
 			}
-			_ = os.Remove(destination)
-			return os.Symlink(link, destination)
+			_ = os.Remove(destination)           // #nosec G703 -- destination is beneath the generated rollback root.
+			return os.Symlink(link, destination) // #nosec G703 G122 -- destination is beneath the generated rollback root and link text is copied verbatim.
 		}
 		if entry.IsDir() {
-			return os.MkdirAll(destination, 0o700)
+			return os.MkdirAll(destination, 0o700) // #nosec G703 -- destination is beneath the generated rollback root.
 		}
 		return copyPrivateFile(path, destination)
 	})
@@ -1096,10 +1096,10 @@ func snapshotTLSNamespace(dbPath, rollback string) error {
 		return nil
 	}
 	base := filepath.Join(rollback, "tls-tree")
-	if err := os.RemoveAll(base); err != nil {
+	if err := os.RemoveAll(base); err != nil { // #nosec G703 -- base is beneath the private rollback directory created by Meridian.
 		return err
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
+	if err := os.MkdirAll(base, 0o700); err != nil { // #nosec G703 -- base is beneath the private rollback directory created by Meridian.
 		return err
 	}
 	for index, root := range roots {
@@ -1124,7 +1124,7 @@ func removeManagedTLSNamespace(dbPath string) error {
 }
 
 func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
-	data, err := os.ReadFile(filepath.Join(rollback, "tls-namespace.json"))
+	data, err := os.ReadFile(filepath.Join(rollback, "tls-namespace.json")) // #nosec G304 G703 -- rollback is a private directory created by Meridian.
 	if err != nil {
 		return err
 	}
@@ -1293,7 +1293,7 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		}
 	}
 	if restoreDirectoryIncludesTLS(rollback) {
-		if _, err := os.Stat(filepath.Join(rollback, "tls-namespace.json")); err == nil {
+		if _, err := os.Stat(filepath.Join(rollback, "tls-namespace.json")); err == nil { // #nosec G703 -- rollback is the private fixed restore directory.
 			return restoreTLSNamespaceSnapshot(dbPath, rollback)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err

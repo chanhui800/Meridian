@@ -1496,7 +1496,7 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 }
 
 func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+	directory, err := os.Open(path) // #nosec G304 -- path is the parent directory of the Agent executable selected by Meridian.
 	if err != nil {
 		return err
 	}
