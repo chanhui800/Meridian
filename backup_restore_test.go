@@ -637,6 +637,96 @@ func TestApplyPendingRestoreAndRollback(t *testing.T) {
 	}
 }
 
+func TestBackupExporterRejectsUnsafeEntriesAndFileCountOverflow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "entry")
+	if err := os.WriteFile(path, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	files := make([]string, backupMaxFiles-1)
+	expanded := int64(0)
+	if err := addBackupEntry(writer, &files, &expanded, backupTLSEdgeNodesPrefix+"node!/fullchain.pem", path); err == nil {
+		t.Fatal("unsafe edge node entry was accepted")
+	}
+	files = make([]string, backupMaxFiles-1)
+	if err := addBackupEntry(writer, &files, &expanded, backupTLSEdgeNodesPrefix+"node-a/fullchain.pem", path); err == nil {
+		t.Fatal("backup file count overflow was accepted")
+	}
+	_ = writer.Close()
+}
+
+func TestTLSRestoreScopeProtectsCustomParents(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	panelDir := filepath.Join(dir, "shared-panel")
+	edgeDir := filepath.Join(dir, "shared-edge")
+	if err := os.MkdirAll(panelDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(edgeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(panelDir, "sentinel.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(edgeDir, "sentinel.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PANEL_TLS_CERT_FILE", filepath.Join(panelDir, "panel.pem"))
+	t.Setenv("PANEL_TLS_KEY_FILE", filepath.Join(panelDir, "panel.key"))
+	t.Setenv("EDGE_TLS_CERT_FILE", filepath.Join(edgeDir, "edge.pem"))
+	t.Setenv("EDGE_TLS_KEY_FILE", filepath.Join(edgeDir, "edge.key"))
+	scope := managedTLSRestoreScope(dbPath)
+	if len(scope.OwnedRoots) != 1 || filepath.Clean(scope.OwnedRoots[0]) != filepath.Clean(filepath.Join(edgeDir, "edge-nodes")) {
+		t.Fatalf("owned TLS roots = %#v", scope.OwnedRoots)
+	}
+	for _, parent := range []string{panelDir, edgeDir} {
+		for _, root := range scope.OwnedRoots {
+			if filepath.Clean(root) == filepath.Clean(parent) {
+				t.Fatalf("custom parent was treated as owned root: %s", parent)
+			}
+		}
+	}
+	rollback := filepath.Join(dir, "rollback")
+	if err := snapshotTLSNamespace(dbPath, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManagedTLSNamespace(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, parent := range []string{panelDir, edgeDir} {
+		if _, err := os.Stat(filepath.Join(parent, "sentinel.txt")); err != nil {
+			t.Fatalf("custom parent sentinel removed: %s: %v", parent, err)
+		}
+	}
+	if err := restoreTLSNamespaceSnapshot(dbPath, rollback); err != nil {
+		t.Fatal(err)
+	}
+	for _, parent := range []string{panelDir, edgeDir} {
+		if _, err := os.Stat(filepath.Join(parent, "sentinel.txt")); err != nil {
+			t.Fatalf("custom parent sentinel missing after rollback: %s: %v", parent, err)
+		}
+	}
+}
+
+func TestCopyTLSNamespaceTreeRejectsOverlappingPaths(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "tls")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "cert.pem"), []byte("cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyTLSNamespaceTree(source, filepath.Join(source, "rollback")); err == nil {
+		t.Fatal("snapshot destination inside source was accepted")
+	}
+	if err := copyTLSNamespaceTree(filepath.Join(source, "nested"), source); err == nil {
+		t.Fatal("snapshot source inside destination was accepted")
+	}
+}
+
 func TestTLSRestoreReplacesManagedNamespaceAndRollbackRestoresIt(t *testing.T) {
 	t.Setenv("PANEL_TLS_CERT_FILE", "")
 	t.Setenv("PANEL_TLS_KEY_FILE", "")

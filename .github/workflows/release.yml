@@ -26,7 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.release_tag || github.ref }}
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          fetch-depth: 0
 
       - name: Validate release tag
         id: release_tag
@@ -35,6 +36,14 @@ jobs:
         run: |
           if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Release tags must use exactly vMAJOR.MINOR.PATCH without a suffix." >&2
+            exit 1
+          fi
+          git fetch --tags --force origin
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [ "$tag_commit" != "$head_commit" ]; then
+            echo "Checked out commit does not match release tag ${RELEASE_TAG}." >&2
+            echo "tag=${tag_commit} head=${head_commit}" >&2
             exit 1
           fi
           printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -216,22 +225,26 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/meridian
       RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.release_tag }}
           fetch-depth: 0
 
-      - name: Check whether this is the newest release tag
+      - name: Check whether this is the newest successful release
         id: newest
         run: |
           set -euo pipefail
-          git fetch --tags --force origin
-          latest_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)"
+          latest_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\.[0-9]+\.[0-9]+$"))) | .tag_name' | sort -V | tail -n1)"
+          if [ -z "$latest_tag" ]; then
+            echo "Could not determine the newest successful GitHub release." >&2
+            exit 1
+          fi
           if [ "$RELEASE_TAG" = "$latest_tag" ]; then
             echo 'promote=true' >> "$GITHUB_OUTPUT"
           else
-            echo "Skipping :latest promotion for $RELEASE_TAG; newest tag is $latest_tag"
+            echo "Skipping :latest promotion for $RELEASE_TAG; newest successful release is $latest_tag"
             echo 'promote=false' >> "$GITHUB_OUTPUT"
           fi
 

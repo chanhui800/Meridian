@@ -286,12 +286,27 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 }
 
 func addZipFile(writer *zip.Writer, name, path string) (bool, int64, error) {
-	data, err := os.ReadFile(path) // #nosec G304 -- path is selected from internal database/TLS files before entering the archive.
+	limit, ok := backupEntryLimit(name)
+	if !ok || name == backupManifestEntry {
+		return false, 0, fmt.Errorf("不允许的备份条目: %s", name)
+	}
+	file, err := os.Open(path) // #nosec G304 -- path is selected from internal database/TLS files before entering the archive.
 	if errors.Is(err, os.ErrNotExist) {
 		return false, 0, nil
 	}
 	if err != nil {
 		return false, 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, 0, errors.New("备份条目必须是普通文件")
+	}
+	if info.Size() > limit {
+		return false, 0, fmt.Errorf("备份条目 %s 超过大小限制", name)
 	}
 	header := &zip.FileHeader{Name: name, Method: zip.Deflate}
 	header.SetMode(0o600)
@@ -300,8 +315,47 @@ func addZipFile(writer *zip.Writer, name, path string) (bool, int64, error) {
 	if err != nil {
 		return false, 0, err
 	}
-	_, err = entry.Write(data)
-	return true, int64(len(data)), err
+	written, err := io.Copy(entry, io.LimitReader(file, limit+1))
+	if err != nil {
+		return false, written, err
+	}
+	if written > limit {
+		return false, written, fmt.Errorf("备份条目 %s 超过大小限制", name)
+	}
+	return true, written, nil
+}
+
+func addBackupEntry(writer *zip.Writer, files *[]string, expandedSize *int64, name, path string) error {
+	if files == nil || expandedSize == nil {
+		return errors.New("备份条目状态为空")
+	}
+	if _, ok := backupEntryLimit(name); !ok || name == backupManifestEntry {
+		return fmt.Errorf("不允许的备份条目: %s", name)
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) { // #nosec G304 -- path is selected from internal database/TLS files before entering the archive.
+		return nil
+	} else if err != nil {
+		return err
+	}
+	// The manifest is added after all data entries. Reserve one slot for it
+	// while admitting the candidate entry so exported backups are always
+	// accepted by parseBackupArchive.
+	if len(*files)+2 > backupMaxFiles {
+		return errors.New("备份文件数量超过可恢复上限")
+	}
+	added, size, err := addZipFile(writer, name, path)
+	if err != nil {
+		return err
+	}
+	if !added {
+		return nil
+	}
+	if *expandedSize > backupMaxExpandedBytes-size {
+		return errors.New("备份解压后总大小超出限制")
+	}
+	*expandedSize += size
+	*files = append(*files, name)
+	return nil
 }
 
 func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
@@ -316,12 +370,11 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 
 	var archive bytes.Buffer
 	zipWriter := zip.NewWriter(&archive)
-	files := []string{backupDatabaseEntry}
-	_, databaseSize, err := addZipFile(zipWriter, backupDatabaseEntry, snapshot)
-	if err != nil {
+	files := make([]string, 0, 8)
+	expandedSize := int64(0)
+	if err := addBackupEntry(zipWriter, &files, &expandedSize, backupDatabaseEntry, snapshot); err != nil {
 		return nil, err
 	}
-	expandedSize := databaseSize
 	if includeTLS {
 		certFile, keyFile := panelTLSBackupPaths(a.dbPath)
 		panelCertFile, _ := panelTLSPaths(a.dbPath)
@@ -341,16 +394,8 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 			if candidate.path == "" {
 				continue
 			}
-			added, size, err := addZipFile(zipWriter, candidate.name, candidate.path)
-			if err != nil {
+			if err := addBackupEntry(zipWriter, &files, &expandedSize, candidate.name, candidate.path); err != nil {
 				return nil, fmt.Errorf("读取 %s: %w", candidate.name, err)
-			}
-			if added {
-				expandedSize += size
-				if expandedSize > backupMaxExpandedBytes {
-					return nil, errors.New("备份解压后总大小超出限制")
-				}
-				files = append(files, candidate.name)
 			}
 		}
 		// Per-node Edge certificates live behind an atomic current pointer.
@@ -385,20 +430,15 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 							break
 						}
 					}
-					added, size, addErr := addZipFile(zipWriter, name, path)
-					if addErr != nil {
+					if addErr := addBackupEntry(zipWriter, &files, &expandedSize, name, path); addErr != nil {
 						return nil, fmt.Errorf("读取 %s: %w", name, addErr)
-					}
-					if added {
-						expandedSize += size
-						if expandedSize > backupMaxExpandedBytes {
-							return nil, errors.New("备份解压后总大小超出限制")
-						}
-						files = append(files, name)
 					}
 				}
 			}
 		}
+	}
+	if len(files)+1 > backupMaxFiles {
+		return nil, errors.New("备份文件数量超过可恢复上限")
 	}
 	manifest := backupManifest{
 		Format:                "meridian-backup",
@@ -1022,31 +1062,150 @@ func targetTLSPath(dbPath, entry string) string {
 	}
 }
 
-type tlsNamespaceSnapshot struct {
-	Roots []string `json:"roots"`
+type tlsRestoreScope struct {
+	OwnedRoots      []string `json:"owned_roots,omitempty"`
+	ExactPaths      []string `json:"exact_paths,omitempty"`
+	GenerationRoots []string `json:"generation_roots,omitempty"`
 }
 
-func managedTLSRoots(dbPath string) []string {
-	roots := make([]string, 0, 2)
-	seen := make(map[string]struct{}, 2)
-	panelCert, _ := panelTLSPaths(dbPath)
-	edgeCert, _ := edgeTLSPaths(dbPath)
-	for _, path := range []string{panelCert, edgeCert} {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		root := filepath.Clean(filepath.Dir(path))
-		if _, ok := seen[root]; ok {
-			continue
-		}
-		seen[root] = struct{}{}
-		roots = append(roots, root)
+type tlsSnapshotPath struct {
+	Path    string `json:"path"`
+	Present bool   `json:"present"`
+}
+
+type tlsNamespaceSnapshot struct {
+	// Roots is retained for rollback compatibility with v1.9.34 snapshots.
+	Roots []string          `json:"roots,omitempty"`
+	Scope tlsRestoreScope   `json:"scope,omitempty"`
+	Exact []tlsSnapshotPath `json:"exact,omitempty"`
+}
+
+func appendUniqueTLSPath(values []string, seen map[string]struct{}, value string) []string {
+	value = filepath.Clean(strings.TrimSpace(value))
+	if value == "." || value == "" {
+		return values
 	}
-	return roots
+	if _, ok := seen[value]; ok {
+		return values
+	}
+	seen[value] = struct{}{}
+	return append(values, value)
+}
+
+// pathWithin reports lexical containment without following symlinks. It is
+// used before copying/removing managed directories so a rollback destination
+// can never be created inside the source namespace (or vice versa).
+func pathWithin(parent, child string) bool {
+	parent = filepath.Clean(parent)
+	child = filepath.Clean(child)
+	relative, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)))
+}
+
+func managedTLSRestoreScope(dbPath string) tlsRestoreScope {
+	scope := tlsRestoreScope{}
+	ownedSeen := make(map[string]struct{}, 2)
+	exactSeen := make(map[string]struct{}, 12)
+	generationSeen := make(map[string]struct{}, 2)
+	addDefaultRoot := func() {
+		if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+			return
+		}
+		scope.OwnedRoots = appendUniqueTLSPath(scope.OwnedRoots, ownedSeen, filepath.Join(filepath.Dir(dbPath), "tls"))
+	}
+	addPanelCustomPaths := func(certFile, keyFile string) {
+		for _, path := range []string{certFile, keyFile} {
+			if strings.TrimSpace(path) != "" {
+				scope.ExactPaths = appendUniqueTLSPath(scope.ExactPaths, exactSeen, path)
+			}
+		}
+		if strings.TrimSpace(certFile) == "" {
+			return
+		}
+		parent := filepath.Dir(certFile)
+		for _, name := range []string{".panel-current", "enabled", "acme-account.pem", "acme-account-staging.pem"} {
+			scope.ExactPaths = appendUniqueTLSPath(scope.ExactPaths, exactSeen, filepath.Join(parent, name))
+		}
+		scope.GenerationRoots = appendUniqueTLSPath(scope.GenerationRoots, generationSeen, filepath.Join(parent, "generations"))
+	}
+	addEdgeCustomPaths := func(certFile, keyFile string) {
+		for _, path := range []string{certFile, keyFile} {
+			if strings.TrimSpace(path) != "" {
+				scope.ExactPaths = appendUniqueTLSPath(scope.ExactPaths, exactSeen, path)
+			}
+		}
+		if strings.TrimSpace(certFile) != "" {
+			// The edge-nodes tree is a Meridian-owned namespace below the
+			// user-selected certificate directory; the parent is not owned.
+			scope.OwnedRoots = appendUniqueTLSPath(scope.OwnedRoots, ownedSeen, filepath.Join(filepath.Dir(certFile), "edge-nodes"))
+		}
+	}
+
+	panelCertEnv := strings.TrimSpace(os.Getenv("PANEL_TLS_CERT_FILE"))
+	panelKeyEnv := strings.TrimSpace(os.Getenv("PANEL_TLS_KEY_FILE"))
+	if panelCertEnv == "" && panelKeyEnv == "" {
+		addDefaultRoot()
+	} else {
+		addPanelCustomPaths(panelCertEnv, panelKeyEnv)
+	}
+	edgeCertEnv := strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
+	edgeKeyEnv := strings.TrimSpace(os.Getenv("EDGE_TLS_KEY_FILE"))
+	if edgeCertEnv == "" && edgeKeyEnv == "" {
+		// The default panel root already owns the complete default TLS tree.
+		addDefaultRoot()
+	} else {
+		addEdgeCustomPaths(edgeCertEnv, edgeKeyEnv)
+	}
+
+	// Exact paths below an owned root are already covered by the tree copy and
+	// must not be removed separately.
+	filtered := scope.ExactPaths[:0]
+	for _, path := range scope.ExactPaths {
+		covered := false
+		for _, root := range scope.OwnedRoots {
+			if pathWithin(root, path) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			filtered = append(filtered, path)
+		}
+	}
+	scope.ExactPaths = filtered
+	filteredGenerations := scope.GenerationRoots[:0]
+	for _, root := range scope.GenerationRoots {
+		covered := false
+		for _, owned := range scope.OwnedRoots {
+			if pathWithin(owned, root) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			filteredGenerations = append(filteredGenerations, root)
+		}
+	}
+	scope.GenerationRoots = filteredGenerations
+	return scope
+}
+
+// managedTLSRoots remains as a compatibility helper for older tests/callers,
+// but only returns explicitly owned Meridian roots. Custom certificate parent
+// directories are deliberately excluded.
+func managedTLSRoots(dbPath string) []string {
+	return managedTLSRestoreScope(dbPath).OwnedRoots
 }
 
 func copyTLSNamespaceTree(source, target string) error {
+	source = filepath.Clean(source)
+	target = filepath.Clean(target)
+	if pathWithin(source, target) || pathWithin(target, source) {
+		return errors.New("TLS snapshot source and target must not overlap")
+	}
 	info, err := os.Lstat(source) // #nosec G703 -- source is an internally derived Meridian TLS namespace root.
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1090,9 +1249,136 @@ func copyTLSNamespaceTree(source, target string) error {
 	})
 }
 
+func copyManagedTLSPath(source, target string) (bool, error) {
+	source = filepath.Clean(source)
+	target = filepath.Clean(target)
+	info, err := os.Lstat(source) // #nosec G703 -- source is an internally derived TLS path from the configured scope.
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.IsDir() {
+		if err := copyTLSNamespaceTree(source, target); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		link, err := os.Readlink(source)
+		if err != nil {
+			return false, err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil { // #nosec G703 -- target is beneath the private rollback namespace.
+			return false, err
+		}
+		_ = os.Remove(target)                            // #nosec G703 -- target is an internally generated rollback path.
+		if err := os.Symlink(link, target); err != nil { // #nosec G703 G122 -- link text is copied verbatim without following the link.
+			return false, err
+		}
+		return true, nil
+	}
+	if !info.Mode().IsRegular() {
+		return false, errors.New("TLS snapshot path must be a regular file, directory, or symlink")
+	}
+	if err := copyPrivateFile(source, target); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func copyTLSGenerationEntries(source, target string) error {
+	entries, err := os.ReadDir(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "generation-") {
+			continue
+		}
+		if err := os.MkdirAll(target, 0o700); err != nil { // #nosec G703 -- target is beneath the private rollback namespace.
+			return err
+		}
+		if _, err := copyManagedTLSPath(filepath.Join(source, entry.Name()), filepath.Join(target, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeTLSGenerationEntries(root string) error {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "generation-") {
+			if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil { // #nosec G703 -- entry names are constrained by the generation prefix and root is configured TLS state.
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func removeTLSRestoreScope(scope tlsRestoreScope) error {
+	for _, root := range scope.OwnedRoots {
+		if err := os.RemoveAll(root); err != nil { // #nosec G703 -- root is an explicitly owned Meridian TLS namespace.
+			return err
+		}
+	}
+	for _, path := range scope.ExactPaths {
+		info, err := os.Lstat(path) // #nosec G703 -- path is an explicitly tracked certificate/account file or pointer.
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && filepath.Base(path) != ".panel-current" {
+			return fmt.Errorf("TLS exact path unexpectedly points to a directory: %s", path)
+		}
+		if err := os.RemoveAll(path); err != nil { // #nosec G703 -- path is an explicitly tracked certificate/account file or pointer.
+			return err
+		}
+	}
+	for _, root := range scope.GenerationRoots {
+		if err := removeTLSGenerationEntries(root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTLSRestoreScope(dbPath string, scope tlsRestoreScope) error {
+	if strings.TrimSpace(dbPath) == "" {
+		return nil
+	}
+	protected := map[string]struct{}{}
+	for _, path := range []string{dbPath, dbPath + backupPendingSuffix, dbPath + backupAppliedSuffix, dbPath + backupRollbackSuffix} {
+		protected[filepath.Clean(path)] = struct{}{}
+	}
+	for _, path := range append(append([]string{}, scope.ExactPaths...), scope.GenerationRoots...) {
+		if _, blocked := protected[filepath.Clean(path)]; blocked {
+			return fmt.Errorf("TLS 恢复路径不能覆盖数据库或恢复工作目录: %s", path)
+		}
+	}
+	return nil
+}
+
 func snapshotTLSNamespace(dbPath, rollback string) error {
-	roots := managedTLSRoots(dbPath)
-	if len(roots) == 0 {
+	scope := managedTLSRestoreScope(dbPath)
+	if err := validateTLSRestoreScope(dbPath, scope); err != nil {
+		return err
+	}
+	if len(scope.OwnedRoots) == 0 && len(scope.ExactPaths) == 0 && len(scope.GenerationRoots) == 0 {
 		return nil
 	}
 	base := filepath.Join(rollback, "tls-tree")
@@ -1102,12 +1388,33 @@ func snapshotTLSNamespace(dbPath, rollback string) error {
 	if err := os.MkdirAll(base, 0o700); err != nil { // #nosec G703 -- base is beneath the private rollback directory created by Meridian.
 		return err
 	}
-	for index, root := range roots {
-		if err := copyTLSNamespaceTree(root, filepath.Join(base, fmt.Sprintf("%d", index))); err != nil {
+	for index, root := range scope.OwnedRoots {
+		if err := copyTLSNamespaceTree(root, filepath.Join(base, "owned", fmt.Sprintf("%d", index))); err != nil {
 			return fmt.Errorf("备份 TLS 目录 %s: %w", root, err)
 		}
 	}
-	data, err := json.Marshal(tlsNamespaceSnapshot{Roots: roots})
+	for index, path := range scope.ExactPaths {
+		present, err := copyManagedTLSPath(path, filepath.Join(base, "exact", fmt.Sprintf("%d", index)))
+		if err != nil {
+			return fmt.Errorf("备份 TLS 路径 %s: %w", path, err)
+		}
+		if !present {
+			// Keep the destination namespace deterministic even for absent files.
+			_ = os.RemoveAll(filepath.Join(base, "exact", fmt.Sprintf("%d", index))) // #nosec G703 -- generated rollback path.
+		}
+	}
+	for index, root := range scope.GenerationRoots {
+		if err := copyTLSGenerationEntries(root, filepath.Join(base, "generations", fmt.Sprintf("%d", index))); err != nil {
+			return fmt.Errorf("备份 TLS generation 目录 %s: %w", root, err)
+		}
+	}
+	exact := make([]tlsSnapshotPath, len(scope.ExactPaths))
+	for index, path := range scope.ExactPaths {
+		_, statErr := os.Lstat(path) // #nosec G703 -- path is an explicitly tracked TLS path.
+		exact[index] = tlsSnapshotPath{Path: path, Present: statErr == nil}
+	}
+	snapshot := tlsNamespaceSnapshot{Scope: scope, Exact: exact}
+	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
 	}
@@ -1115,12 +1422,11 @@ func snapshotTLSNamespace(dbPath, rollback string) error {
 }
 
 func removeManagedTLSNamespace(dbPath string) error {
-	for _, root := range managedTLSRoots(dbPath) {
-		if err := os.RemoveAll(root); err != nil {
-			return err
-		}
+	scope := managedTLSRestoreScope(dbPath)
+	if err := validateTLSRestoreScope(dbPath, scope); err != nil {
+		return err
 	}
-	return nil
+	return removeTLSRestoreScope(scope)
 }
 
 func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
@@ -1132,22 +1438,84 @@ func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return err
 	}
-	currentRoots := managedTLSRoots(dbPath)
-	if len(snapshot.Roots) != len(currentRoots) {
+	currentScope := managedTLSRestoreScope(dbPath)
+	scope := snapshot.Scope
+	if len(scope.OwnedRoots) == 0 && len(scope.ExactPaths) == 0 && len(scope.GenerationRoots) == 0 && len(snapshot.Roots) > 0 {
+		// v1.9.34 snapshots may only be safely replayed when their roots are
+		// the default DB-local TLS namespace. Never trust a legacy custom
+		// parent directory as an owned root.
+		defaultRoot := filepath.Join(filepath.Dir(dbPath), "tls")
+		for _, root := range snapshot.Roots {
+			if filepath.Clean(root) != filepath.Clean(defaultRoot) {
+				return errors.New("旧版 TLS 回滚清单包含不安全的自定义目录")
+			}
+		}
+		scope = tlsRestoreScope{OwnedRoots: append([]string(nil), snapshot.Roots...)}
+	}
+	if !sameTLSRestoreScope(scope, currentScope) {
 		return errors.New("TLS 回滚清单与当前配置不一致")
 	}
-	if err := removeManagedTLSNamespace(dbPath); err != nil {
+	if err := validateTLSRestoreScope(dbPath, currentScope); err != nil {
 		return err
 	}
-	for index, root := range snapshot.Roots {
-		if filepath.Clean(root) != currentRoots[index] {
-			return errors.New("TLS 回滚清单路径与当前配置不一致")
-		}
-		if err := copyTLSNamespaceTree(filepath.Join(rollback, "tls-tree", fmt.Sprintf("%d", index)), root); err != nil {
+	if err := removeTLSRestoreScope(currentScope); err != nil {
+		return err
+	}
+	base := filepath.Join(rollback, "tls-tree")
+	for index, root := range scope.OwnedRoots {
+		if err := copyTLSNamespaceTree(filepath.Join(base, "owned", fmt.Sprintf("%d", index)), root); err != nil {
 			return err
 		}
 	}
+	for index, path := range scope.ExactPaths {
+		if index >= len(snapshot.Exact) || !snapshot.Exact[index].Present {
+			continue
+		}
+		if _, err := copyManagedTLSPath(filepath.Join(base, "exact", fmt.Sprintf("%d", index)), path); err != nil {
+			return err
+		}
+	}
+	for index, root := range scope.GenerationRoots {
+		entries, err := os.ReadDir(filepath.Join(base, "generations", fmt.Sprintf("%d", index)))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "generation-") {
+				continue
+			}
+			if _, err := copyManagedTLSPath(filepath.Join(base, "generations", fmt.Sprintf("%d", index), entry.Name()), filepath.Join(root, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func sameTLSRestoreScope(a, b tlsRestoreScope) bool {
+	clean := func(values []string) []string {
+		result := make([]string, len(values))
+		for index, value := range values {
+			result[index] = filepath.Clean(value)
+		}
+		return result
+	}
+	return slicesEqual(clean(a.OwnedRoots), clean(b.OwnedRoots)) && slicesEqual(clean(a.ExactPaths), clean(b.ExactPaths)) && slicesEqual(clean(a.GenerationRoots), clean(b.GenerationRoots))
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index] != b[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func replaceTLSNamespaceWithPending(dbPath string) error {
