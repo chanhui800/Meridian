@@ -64,6 +64,26 @@ func TestCertificateRenewalWindow(t *testing.T) {
 	}
 }
 
+func TestPanelCertificateStatusWarnsWhenPanelIsCoveredByEdgeWildcard(t *testing.T) {
+	var manager *panelCertificateManager
+	legacy := manager.status(PanelSettings{
+		PanelDomain: "panel.example.com",
+		RouteDomain: "example.com",
+		Configured:  true,
+	}, "panel.example.com", "example.com", 9090, true)
+	if !legacy.PanelCoveredByEdgeWildcard {
+		t.Fatal("legacy one-label panel domain should be flagged as covered by the edge wildcard")
+	}
+	nested := manager.status(PanelSettings{
+		PanelDomain: "panel.admin.example.com",
+		RouteDomain: "example.com",
+		Configured:  true,
+	}, "panel.admin.example.com", "example.com", 9090, true)
+	if nested.PanelCoveredByEdgeWildcard {
+		t.Fatal("nested panel domain should not be covered by the edge wildcard")
+	}
+}
+
 func TestDisableExpiredPanelTLSIfNeeded(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "meridian.db"))
 	if err != nil {

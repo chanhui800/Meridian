@@ -168,7 +168,7 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !settings.Configured || settings.PanelDomain == "" || settings.RouteDomain == "" || settings.ListenPort == 0 {
-		a.jsonErr(w, http.StatusConflict, "请先保存面板前缀、泛域名和监听端口")
+		a.jsonErr(w, http.StatusConflict, "请先保存面板域名、节点泛域名和监听端口")
 		return
 	}
 	provider := strings.ToLower(strings.TrimSpace(req.Provider))
@@ -241,7 +241,7 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 		} else if validateErr := validatePanelCertificateRequest(email, token); validateErr != nil {
 			status = http.StatusBadRequest
 		}
-		log.Printf("panel certificate request failed for %s: %v", settings.RouteDomain, err)
+		log.Printf("panel certificate request failed for %s: %v", settings.PanelDomain, err)
 		a.jsonErr(w, status, err.Error())
 		return
 	}
@@ -265,7 +265,7 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 	if !status.RestartRequired {
 		a.panelCertificates.activate(issued)
 	}
-	log.Printf("panel wildcard certificate installed for *.%s (migrated sites: %d, restart required: %t)", settings.RouteDomain, migrated, status.RestartRequired)
+	log.Printf("panel certificate installed for %s (migrated sites: %d, restart required: %t)", settings.PanelDomain, migrated, status.RestartRequired)
 	a.jsonOK(w, status)
 }
 

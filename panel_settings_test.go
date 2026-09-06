@@ -13,9 +13,12 @@ func TestNormalizeManagedPanelSettings(t *testing.T) {
 	if settings.PanelDomain != "panel.example.com" || settings.RouteDomain != "example.com" || !settings.TLSEnabled {
 		t.Fatalf("unexpected settings: %+v", settings)
 	}
+	decoupled, err := normalizeManagedPanelSettings("panel.admin.example.com", "example.com")
+	if err != nil || decoupled.PanelDomain != "panel.admin.example.com" || decoupled.RouteDomain != "example.com" {
+		t.Fatalf("nested panel domain rejected: %+v err=%v", decoupled, err)
+	}
 	for _, tc := range [][2]string{
 		{"example.com", "example.com"},
-		{"a.b.example.com", "example.com"},
 		{"panel.example.net", "example.com"},
 		{"panel.example.com", ""},
 	} {
