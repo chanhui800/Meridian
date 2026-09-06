@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 28
+	databaseSchemaVersion = 29
 )
 
 func (d *DB) migrate() error {
@@ -369,6 +369,7 @@ func (d *DB) migrateOnce() error {
 		event_dropped BIGINT NOT NULL DEFAULT 0,
 		enrollment_token_hash TEXT NOT NULL DEFAULT '',
 		enrollment_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		probe_secret_ciphertext TEXT NOT NULL DEFAULT '',
 		agent_token_hash TEXT NOT NULL DEFAULT '',
 		enrolled_at_ms INTEGER NOT NULL DEFAULT 0,
 		last_seen_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -511,6 +512,17 @@ func (d *DB) migrateOnce() error {
 					return err
 				}
 			}
+		}
+	}
+	// Probe secrets were introduced after the original control node table. Keep
+	// existing databases upgradeable without exposing the plaintext secret.
+	var probeSecretColumnCount int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('control_nodes') WHERE name=?", "probe_secret_ciphertext").Scan(&probeSecretColumnCount); err != nil {
+		return err
+	}
+	if probeSecretColumnCount == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE control_nodes ADD COLUMN probe_secret_ciphertext TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
 		}
 	}
 	for _, migration := range []struct {

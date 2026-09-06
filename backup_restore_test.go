@@ -238,6 +238,55 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 	}
 }
 
+func TestBuildBackupToFileRoundTripsThroughStreamingParser(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.db.Exec(`INSERT INTO users (username, password_hash) VALUES ('backup-test', 'hash')`); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{db: db, dbPath: dbPath, pm: NewProxyManager(db, bytes.Repeat([]byte("h"), 32))}
+	artifact, err := app.buildBackupToFile("correct horse battery staple", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer artifact.Cleanup()
+	if artifact.Size <= int64(len(backupMagicV2)) {
+		t.Fatalf("backup artifact is unexpectedly small: %d", artifact.Size)
+	}
+	encrypted, err := os.Open(artifact.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer encrypted.Close()
+	plainPath := filepath.Join(dir, "archive.zip")
+	plain, err := os.OpenFile(plainPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openBackupV2Reader(encrypted, "correct horse battery staple", plain); err != nil {
+		_ = plain.Close()
+		t.Fatal(err)
+	}
+	if err := plain.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest, entries, err := parseBackupArchiveFileToPaths(plainPath, filepath.Join(dir, "entries"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.FormatVersion != backupFormatVersion || len(entries) < 2 {
+		t.Fatalf("streaming backup parse manifest=%#v entries=%d", manifest, len(entries))
+	}
+	if _, ok := entries[backupDatabaseEntry]; !ok {
+		t.Fatal("streaming backup parse omitted database entry")
+	}
+}
+
 func TestParseBackupArchiveRejectsNewerDatabaseSchema(t *testing.T) {
 	includeTLS := false
 	manifest := backupManifest{

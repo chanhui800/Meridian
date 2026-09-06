@@ -46,16 +46,16 @@ var appVersion = "dev"
 var buildMode = "controller"
 
 func main() {
-	if strings.EqualFold(strings.TrimSpace(buildMode), "agent") {
-		if err := runEdgeAgent(); err != nil {
-			fmt.Fprintf(os.Stderr, "meridian-agent: %v\n", err)
+	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "meridian: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
-	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "meridian: %v\n", err)
+	if strings.EqualFold(strings.TrimSpace(buildMode), "agent") {
+		if err := runEdgeAgent(); err != nil {
+			fmt.Fprintf(os.Stderr, "meridian-agent: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -265,9 +265,19 @@ func main() {
 	mux.HandleFunc("/api/agent/config", app.handleAgentConfig)
 	mux.Handle("/api/agent/ws", websocket.Server{
 		Handshake: func(config *websocket.Config, request *http.Request) error {
-			if _, err := app.db.nodeByAgentToken(requestBearerToken(request), time.Now()); err != nil {
+			preRelease, retryAfter, admitted := app.agentPreAuthAdmission().admit(requestClientKey(request, app.trustedProxies), time.Now())
+			if !admitted {
+				return fmt.Errorf("agent authentication rate limit exceeded; retry after %s", retryAfter.Round(time.Millisecond))
+			}
+			node, err := app.db.nodeByAgentToken(requestBearerToken(request), time.Now())
+			preRelease()
+			if err != nil {
 				return errors.New("invalid agent token")
 			}
+			// x/net/websocket passes the same request pointer to the handler. Carry
+			// the authenticated node through its context so the handler never
+			// performs a second SQLite token lookup for this connection.
+			*request = *withAgentWebSocketNode(request, node)
 			// Agent clients are not browsers; token authentication is the origin
 			// boundary, so do not apply the package's browser Origin check.
 			return nil

@@ -27,6 +27,12 @@ type DB struct {
 	droppedRequestLogs          atomic.Uint64
 	droppedWatchHistory         atomic.Uint64
 	agentSecurityRejected       atomic.Uint64
+	agentSecurityRequestEvent   atomic.Uint64
+	agentSecuritySiteStat       atomic.Uint64
+	agentSecurityMediaCount     atomic.Uint64
+	agentSecurityRetention      atomic.Uint64
+	agentSecurityObservation    atomic.Uint64
+	agentSecurityLastRejectedMS atomic.Int64
 	agentSecurityMu             sync.Mutex
 	agentSecurityLastLog        map[string]time.Time
 	systemSettings              atomic.Pointer[SystemSettings]

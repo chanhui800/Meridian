@@ -36,6 +36,8 @@ type App struct {
 	tmdbOnce           sync.Once
 	agentReportMu      sync.Mutex
 	agentReportLimiter *nodeReportAdmission
+	agentPreAuthMu     sync.Mutex
+	agentPreAuth       *agentPreAuthAdmission
 }
 
 func (a *App) tmdbService() *tmdbService {

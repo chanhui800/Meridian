@@ -78,6 +78,7 @@ type AgentRuntimeConfig struct {
 	CertificatePEM   string           `json:"certificate_pem,omitempty"`
 	PrivateKeyPEM    string           `json:"private_key_pem,omitempty"`
 	DynamicKey       string           `json:"dynamic_key,omitempty"`
+	ProbeSecret      string           `json:"probe_secret,omitempty"`
 	AgentVersion     string           `json:"agent_version,omitempty"`
 	AgentSHA256      string           `json:"agent_sha256,omitempty"`
 	AgentDownloadURL string           `json:"agent_download_url,omitempty"`
@@ -369,6 +370,10 @@ func agentConfigHash(config AgentRuntimeConfig) (string, error) {
 func agentConfigLegacyHash(config AgentRuntimeConfig) (string, error) {
 	config.ConfigHash = ""
 	config.AgentDownloadURL = ""
+	// ProbeSecret was added after the legacy Agent contract. Older Agents ignore
+	// the field, so omit it from the compatibility hash while current Agents
+	// use the runtime hash above and authenticate their health probes with it.
+	config.ProbeSecret = ""
 	data, err := json.Marshal(config)
 	if err != nil {
 		return "", err
@@ -440,6 +445,10 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	pending := make([]pendingRoute, 0)
 	dynamicKey := deriveNodeRuntimeKey(a.dynamicRouteKey, node.GUID, "dynamic-routes")
+	probeSecret, probeErr := dNodeProbeSecret(a.db, node)
+	if probeErr != nil {
+		return AgentRuntimeConfig{}, probeErr
+	}
 	for rows.Next() {
 		var value pendingRoute
 		if err := rows.Scan(&value.route.SiteID, &value.route.Host, &value.route.TargetURL, &value.route.PlaybackTargetURL, &value.route.PlaybackMode, &value.streamHosts, &value.storedHeaders); err != nil {
@@ -513,7 +522,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	// Keep the legacy field names in the Agent wire contract during rolling
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, EntryMode: "direct",
-		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), Routes: routes}
+		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: encodeRuntimeKey([]byte(probeSecret)), Routes: routes}
 	// Legacy Agents do not send a platform header. Do not advertise the
 	// controller's local binary to those clients: on a cross-architecture
 	// rollout that checksum would make an old arm64 Agent download an amd64
@@ -769,7 +778,10 @@ func nodeHTTPSProbePort(node ControlNode) int {
 	return node.Port
 }
 
-func probeScheduledNode(ctx context.Context, node ControlNode, host string) error {
+func probeScheduledNode(ctx context.Context, node ControlNode, host string, probeSecret []byte) error {
+	if len(probeSecret) == 0 {
+		return errors.New("node health probe secret is unavailable")
+	}
 	address, err := nodeDialAddress(node.Address, nodeHTTPSProbePort(node))
 	if err != nil {
 		return err
@@ -789,6 +801,7 @@ func probeScheduledNode(ctx context.Context, node ControlNode, host string) erro
 	if err != nil {
 		return err
 	}
+	req.Header.Set("X-Meridian-Probe", encodeRuntimeKey(probeSecret))
 	response, err := client.Do(req)
 	if err != nil {
 		return err
@@ -839,7 +852,15 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if node.AgentListenerError != "" {
 		return readinessError(readinessListener, errors.New(node.AgentListenerError))
 	}
-	if err := probeScheduledNode(ctx, node, schedule.PublicHost); err != nil {
+	probeSecretText, err := dNodeProbeSecret(a.db, node)
+	if err != nil {
+		return readinessError(readinessProbe, err)
+	}
+	probeSecret, err := base64.RawURLEncoding.DecodeString(probeSecretText)
+	if err != nil {
+		return readinessError(readinessProbe, errors.New("node health probe secret is invalid"))
+	}
+	if err := probeScheduledNode(ctx, node, schedule.PublicHost, probeSecret); err != nil {
 		return readinessError(readinessProbe, fmt.Errorf("entry health check: %w", err))
 	}
 	if err := a.db.clearSiteNodeProbeFailure(schedule.SiteID, node.ID); err != nil {

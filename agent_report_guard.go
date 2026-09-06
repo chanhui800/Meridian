@@ -26,6 +26,88 @@ type nodeReportAdmission struct {
 	entries map[int64]*nodeReportAdmissionEntry
 }
 
+const (
+	agentPreAuthRatePerSecond = 10.0
+	agentPreAuthBurst         = 20.0
+	agentPreAuthEntryTTL      = 15 * time.Minute
+	agentPreAuthConcurrency   = 32
+)
+
+type agentPreAuthEntry struct {
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
+}
+
+// agentPreAuthAdmission is deliberately keyed by the trusted-proxy-aware
+// client identity rather than an Agent token. It runs before the SQLite token
+// lookup so a stream of invalid credentials cannot monopolize the sole DB
+// connection.
+type agentPreAuthAdmission struct {
+	mu      sync.Mutex
+	entries map[string]*agentPreAuthEntry
+	active  int
+}
+
+func newAgentPreAuthAdmission() *agentPreAuthAdmission {
+	return &agentPreAuthAdmission{entries: make(map[string]*agentPreAuthEntry)}
+}
+
+func (a *agentPreAuthAdmission) prune(now time.Time) {
+	for key, entry := range a.entries {
+		if now.Sub(entry.lastSeen) > agentPreAuthEntryTTL {
+			delete(a.entries, key)
+		}
+	}
+}
+
+func (a *agentPreAuthAdmission) admit(key string, now time.Time) (func(), time.Duration, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if key == "" {
+		key = "unknown"
+	}
+	a.prune(now)
+	if a.active >= agentPreAuthConcurrency {
+		return func() {}, time.Second, false
+	}
+	entry := a.entries[key]
+	if entry == nil {
+		entry = &agentPreAuthEntry{tokens: agentPreAuthBurst, last: now, lastSeen: now}
+		a.entries[key] = entry
+	}
+	if entry.last.IsZero() {
+		entry.last = now
+	}
+	if elapsed := now.Sub(entry.last).Seconds(); elapsed > 0 {
+		entry.tokens += elapsed * agentPreAuthRatePerSecond
+		if entry.tokens > agentPreAuthBurst {
+			entry.tokens = agentPreAuthBurst
+		}
+		entry.last = now
+	}
+	entry.lastSeen = now
+	if entry.tokens < 1 {
+		wait := time.Duration((1 - entry.tokens) / agentPreAuthRatePerSecond * float64(time.Second))
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		return func() {}, wait, false
+	}
+	entry.tokens--
+	a.active++
+	return func() {
+		a.mu.Lock()
+		if a.active > 0 {
+			a.active--
+		}
+		if current := a.entries[key]; current != nil {
+			current.lastSeen = time.Now()
+		}
+		a.mu.Unlock()
+	}, 0, true
+}
+
 func newNodeReportAdmission() *nodeReportAdmission {
 	return &nodeReportAdmission{entries: make(map[int64]*nodeReportAdmissionEntry)}
 }
@@ -98,4 +180,16 @@ func (a *App) agentReports() *nodeReportAdmission {
 		a.agentReportLimiter = newNodeReportAdmission()
 	}
 	return a.agentReportLimiter
+}
+
+func (a *App) agentPreAuthAdmission() *agentPreAuthAdmission {
+	if a == nil {
+		return newAgentPreAuthAdmission()
+	}
+	a.agentPreAuthMu.Lock()
+	defer a.agentPreAuthMu.Unlock()
+	if a.agentPreAuth == nil {
+		a.agentPreAuth = newAgentPreAuthAdmission()
+	}
+	return a.agentPreAuth
 }

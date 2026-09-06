@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,8 +21,14 @@ func FuzzNormalizeDynamicURL(f *testing.F) {
 	} {
 		f.Add(seed)
 	}
-	f.Fuzz(func(_ *testing.T, value string) {
-		_, _ = normalizeDynamicURL(value)
+	f.Fuzz(func(t *testing.T, value string) {
+		parsed, err := normalizeDynamicURL(value)
+		if err != nil {
+			return
+		}
+		if parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.ContainsAny(parsed.Host, "\\\r\n\t") || filepath.Clean(parsed.Path) != parsed.Path {
+			t.Fatalf("unsafe dynamic URL accepted: %q", parsed.String())
+		}
 	})
 }
 
@@ -70,8 +79,40 @@ func FuzzBackupArchiveParser(f *testing.F) {
 	} {
 		f.Add(seed)
 	}
-	f.Fuzz(func(_ *testing.T, value []byte) {
-		_, _, _ = parseBackupArchive(value)
+	f.Fuzz(func(t *testing.T, value []byte) {
+		_, entries, err := parseBackupArchive(value)
+		if err != nil {
+			return
+		}
+		if len(entries) > backupMaxFiles {
+			t.Fatalf("backup parser accepted too many entries: %d", len(entries))
+		}
+		for name := range entries {
+			if _, ok := backupEntryLimit(name); !ok || filepath.ToSlash(filepath.Clean(name)) != name || strings.HasPrefix(name, "/") {
+				t.Fatalf("backup parser accepted unsafe entry %q", name)
+			}
+		}
+	})
+}
+
+func FuzzCrossAuthorityHeaders(f *testing.F) {
+	for _, seed := range []string{"secret", "", "MediaBrowser Client=\"test\", Token=\"secret\""} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, value string) {
+		header := make(http.Header)
+		header.Set("Authorization", value)
+		header.Set("Proxy-Authorization", value)
+		header.Set("Cookie", value)
+		header.Set("X-Emby-Token", value)
+		header.Set("X-MediaBrowser-Token", value)
+		header.Set("X-Emby-Authorization", value)
+		stripSensitiveRedirectHeaders(header)
+		for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Emby-Token", "X-MediaBrowser-Token"} {
+			if header.Get(name) != "" {
+				t.Fatalf("sensitive header survived cross-authority stripping: %s", name)
+			}
+		}
 	})
 }
 

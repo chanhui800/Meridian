@@ -27,6 +27,12 @@ func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, err
 		}
 		_, err := fmt.Fprintln(output, appVersion)
 		return true, err
+	case "--build-mode":
+		if len(args) != 1 {
+			return true, errors.New("build-mode command does not accept arguments")
+		}
+		_, err := fmt.Fprintln(output, buildMode)
+		return true, err
 	case "--healthcheck":
 		if len(args) != 1 {
 			return true, errors.New("healthcheck command does not accept arguments")

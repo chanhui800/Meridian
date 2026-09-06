@@ -106,11 +106,15 @@ func (m *panelCertificateManager) panelPairPaths() (string, string) {
 			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
 		}
 	}
-	// Read the pre-TLS_STATE_DIR pointer during migration, but never create or
-	// remove anything in the operator-owned certificate directory.
-	legacyDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
-	if _, err := os.Stat(filepath.Join(legacyDir, "fullchain.pem")); err == nil { // #nosec G703 -- legacy path is read-only migration compatibility.
-		return filepath.Join(legacyDir, "fullchain.pem"), filepath.Join(legacyDir, "privkey.pem")
+	// Managers created before TLS_STATE_DIR existed may still read the legacy
+	// pointer as a compatibility measure. New managers must never inspect a
+	// sibling of an operator-owned certificate path: that directory is outside
+	// Meridian's namespace and may belong to another service.
+	if m.stateDir == "" {
+		legacyDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+		if _, err := os.Stat(filepath.Join(legacyDir, "fullchain.pem")); err == nil { // #nosec G703 -- legacy path is read-only compatibility for legacy callers.
+			return filepath.Join(legacyDir, "fullchain.pem"), filepath.Join(legacyDir, "privkey.pem")
+		}
 	}
 	return m.certFile, m.keyFile
 }
@@ -184,8 +188,18 @@ func (m *panelCertificateManager) nodeEdgeTLSPaths(nodeGUID string) (string, str
 		}
 	}
 	rootBase := m.edgeStateRoot
+	// Older in-process callers and tests may construct a manager directly
+	// without filling edgeStateRoot.  Derive the private state namespace only
+	// from the manager's own state/account directory; never fall back to the
+	// operator-provided EDGE_TLS_CERT_FILE parent.
+	if rootBase == "" && strings.TrimSpace(m.stateDir) != "" {
+		rootBase = filepath.Join(m.stateDir, "edge-nodes")
+	}
+	if rootBase == "" && strings.TrimSpace(m.accountDir) != "" {
+		rootBase = filepath.Join(m.accountDir, "edge-nodes")
+	}
 	if rootBase == "" {
-		rootBase = filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes")
+		return "", "", errors.New("edge TLS state directory is unavailable")
 	}
 	root := filepath.Join(rootBase, guid)
 	current := filepath.Join(root, "current")
@@ -365,7 +379,7 @@ func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
 	}
 	edgeRoot := m.edgeStateRoot
 	if edgeRoot == "" {
-		edgeRoot = filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes")
+		return errors.New("edge TLS state directory is unavailable")
 	}
 	entries, readErr := os.ReadDir(edgeRoot)
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
@@ -586,9 +600,11 @@ func panelTLSBackupPaths(dbPath string) (certFile, keyFile string) {
 			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
 		}
 	}
-	currentDir = filepath.Join(filepath.Dir(certFile), ".panel-current")
-	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
-		return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+	if stateDir == "" {
+		currentDir = filepath.Join(filepath.Dir(certFile), ".panel-current")
+		if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
+			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+		}
 	}
 	return certFile, keyFile
 }
@@ -629,6 +645,34 @@ func validTLSNodeGUID(guid string) bool {
 	return true
 }
 
+const (
+	legacyEdgeCertificateMaxBytes = 4 << 20
+	legacyEdgePrivateKeyMaxBytes  = 1 << 20
+)
+
+func readLegacyTLSFile(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > maxBytes {
+		return nil, errors.New("legacy TLS file is not a bounded regular file")
+	}
+	file, err := os.Open(path) // #nosec G304 -- path is constructed from an administrator-owned legacy root and validated node GUID.
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || int64(len(data)) > maxBytes {
+		return nil, errors.New("legacy TLS file exceeds size limit")
+	}
+	return data, nil
+}
+
 // migrateLegacyEdgeTLSState performs a one-time, allowlisted copy from the
 // pre-TLS_STATE_DIR external edge-nodes directory. It only considers GUIDs
 // present in control_nodes, validates regular files and the key pair, and
@@ -666,16 +710,16 @@ func migrateLegacyEdgeTLSState(db *DB, dbPath string) error {
 		sourceDir := filepath.Join(legacyRoot, guid, "current")
 		certSource := filepath.Join(sourceDir, "fullchain.pem")
 		keySource := filepath.Join(sourceDir, "privkey.pem")
-		certPEM, certErr := os.ReadFile(certSource) // #nosec G304 -- GUID is selected from the database and validated above.
-		keyPEM, keyErr := os.ReadFile(keySource)    // #nosec G304 -- GUID is selected from the database and validated above.
+		certPEM, certErr := readLegacyTLSFile(certSource, legacyEdgeCertificateMaxBytes)
+		keyPEM, keyErr := readLegacyTLSFile(keySource, legacyEdgePrivateKeyMaxBytes)
 		if errors.Is(certErr, os.ErrNotExist) || errors.Is(keyErr, os.ErrNotExist) {
 			continue
 		}
-		if certErr != nil {
-			return certErr
-		}
-		if keyErr != nil {
-			return keyErr
+		if certErr != nil || keyErr != nil {
+			// Legacy state is an operator-owned, low-trust input. Ignore
+			// symlinks, special files, oversized material, and unreadable entries;
+			// never activate a partially validated pair.
+			continue
 		}
 		if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 			continue

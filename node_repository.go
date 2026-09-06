@@ -66,14 +66,15 @@ type ControlNode struct {
 	Depleted            bool   `json:"depleted"`
 	Active              bool   `json:"active"`
 
-	lastRawRXBytes      int64
-	lastRawTXBytes      int64
-	lastBootID          string // counter epoch (kernel boot + interface)
-	lastReportSessionID string
-	lastSequence        int64
-	enrollmentTokenHash string
-	agentTokenHash      string
-	enrollmentExpiresMS int64
+	lastRawRXBytes        int64
+	lastRawTXBytes        int64
+	lastBootID            string // counter epoch (kernel boot + interface)
+	lastReportSessionID   string
+	lastSequence          int64
+	enrollmentTokenHash   string
+	agentTokenHash        string
+	enrollmentExpiresMS   int64
+	probeSecretCiphertext string
 }
 
 type NodeSchedulerSettings struct {
@@ -84,8 +85,22 @@ type NodeSchedulerSettings struct {
 }
 
 type NodeControlSnapshot struct {
-	Nodes     []ControlNode         `json:"nodes"`
-	Scheduler NodeSchedulerSettings `json:"scheduler"`
+	Nodes         []ControlNode            `json:"nodes"`
+	Scheduler     NodeSchedulerSettings    `json:"scheduler"`
+	AgentSecurity AgentSecurityDiagnostics `json:"agent_security"`
+}
+
+// AgentSecurityDiagnostics contains bounded, aggregate counters for report
+// authorization failures. It intentionally excludes tokens, headers and site
+// payloads so the diagnostics response is safe for administrators to inspect.
+type AgentSecurityDiagnostics struct {
+	RejectedTotal  uint64 `json:"rejected_total"`
+	RequestEvent   uint64 `json:"request_event"`
+	SiteStat       uint64 `json:"site_stat"`
+	MediaCount     uint64 `json:"media_count"`
+	Retention      uint64 `json:"retention"`
+	Observation    uint64 `json:"observation"`
+	LastRejectedAt string `json:"last_rejected_at,omitempty"`
 }
 
 type NodeCreateInput struct {
@@ -335,13 +350,21 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	if err != nil {
 		return ControlNode{}, "", err
 	}
+	probeSecret, err := newNodeProbeSecret()
+	if err != nil {
+		return ControlNode{}, "", err
+	}
+	probeSecretCiphertext, err := encryptNodeProbeSecretWithSecret(probeSecret, jwtSecret)
+	if err != nil {
+		return ControlNode{}, "", err
+	}
 	nowMS := now.UnixMilli()
 	cycleStart := nodeCycleStart(now, input.ResetDay, d.currentSystemSettings().ScheduleTimezone)
 	result, err := d.db.Exec(`INSERT INTO control_nodes
 		(guid,name,address,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
-		 enrollment_token_hash,enrollment_expires_at_ms,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.Port, input.Priority, input.TrafficQuota,
-		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), nowMS, nowMS)
+		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
+		VALUES(?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.Port, input.Priority, input.TrafficQuota,
+		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), probeSecretCiphertext, nowMS, nowMS)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
 			return ControlNode{}, "", errNodeNameConflict
@@ -361,7 +384,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
-	enrollment_token_hash,enrollment_expires_at_ms,agent_token_hash,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
+	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
 
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
@@ -370,7 +393,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
-		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS,
+		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
 		&node.agentTokenHash, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
 	if err != nil {
 		return ControlNode{}, err
@@ -496,7 +519,7 @@ func (d *DB) NodeControlSnapshot(now time.Time) (NodeControlSnapshot, error) {
 	for i := range nodes {
 		nodes[i].Active = nodes[i].ID == scheduler.ActiveNodeID
 	}
-	return NodeControlSnapshot{Nodes: nodes, Scheduler: scheduler}, nil
+	return NodeControlSnapshot{Nodes: nodes, Scheduler: scheduler, AgentSecurity: d.agentSecuritySnapshot()}, nil
 }
 
 func nullableNodeID(id int64) interface{} {
@@ -627,6 +650,14 @@ func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string
 	if err != nil {
 		return ControlNode{}, "", err
 	}
+	probeSecret, err := newNodeProbeSecret()
+	if err != nil {
+		return ControlNode{}, "", err
+	}
+	probeSecretCiphertext, err := encryptNodeProbeSecretWithSecret(probeSecret, jwtSecret)
+	if err != nil {
+		return ControlNode{}, "", err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return ControlNode{}, "", err
@@ -641,7 +672,7 @@ func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string
 		return ControlNode{}, "", err
 	}
 	result, err := tx.Exec(`UPDATE control_nodes SET enrollment_token_hash='',enrollment_expires_at_ms=0,
-		agent_token_hash=?,enrolled_at_ms=?,updated_at_ms=? WHERE id=? AND enrollment_token_hash<>''`, hashNodeToken(agentToken), now.UnixMilli(), now.UnixMilli(), id)
+		agent_token_hash=?,probe_secret_ciphertext=?,enrolled_at_ms=?,updated_at_ms=? WHERE id=? AND enrollment_token_hash<>''`, hashNodeToken(agentToken), probeSecretCiphertext, now.UnixMilli(), now.UnixMilli(), id)
 	if err != nil {
 		return ControlNode{}, "", err
 	}
@@ -779,9 +810,45 @@ func (d *DB) recordAgentSecurityRejection(nodeID, siteID int64, category string)
 		return
 	}
 	d.agentSecurityRejected.Add(1)
-	key := fmt.Sprintf("%d:%d:%s", nodeID, siteID, category)
+	switch category {
+	case "request-event":
+		d.agentSecurityRequestEvent.Add(1)
+	case "site-stats":
+		d.agentSecuritySiteStat.Add(1)
+	case "media-counts":
+		d.agentSecurityMediaCount.Add(1)
+	case "retention":
+		d.agentSecurityRetention.Add(1)
+	case "observation":
+		d.agentSecurityObservation.Add(1)
+	}
+	d.agentSecurityLastRejectedMS.Store(time.Now().UnixMilli())
+	// SiteID is deliberately excluded from the log key. It is attacker
+	// controlled input and must not create an unbounded map entry per spoofed
+	// site. One bounded key per node/category is sufficient for rate limiting.
+	key := fmt.Sprintf("%d:%s", nodeID, category)
 	now := time.Now()
 	d.agentSecurityMu.Lock()
+	if d.agentSecurityLastLog == nil {
+		d.agentSecurityLastLog = make(map[string]time.Time)
+	}
+	for existingKey, timestamp := range d.agentSecurityLastLog {
+		if now.Sub(timestamp) >= 10*time.Minute {
+			delete(d.agentSecurityLastLog, existingKey)
+		}
+	}
+	if len(d.agentSecurityLastLog) >= 4096 {
+		var oldestKey string
+		var oldest time.Time
+		for existingKey, timestamp := range d.agentSecurityLastLog {
+			if oldestKey == "" || timestamp.Before(oldest) {
+				oldestKey, oldest = existingKey, timestamp
+			}
+		}
+		if oldestKey != "" {
+			delete(d.agentSecurityLastLog, oldestKey)
+		}
+	}
 	last := d.agentSecurityLastLog[key]
 	if last.IsZero() || now.Sub(last) >= time.Minute {
 		d.agentSecurityLastLog[key] = now
@@ -790,6 +857,24 @@ func (d *DB) recordAgentSecurityRejection(nodeID, siteID int64, category string)
 		return
 	}
 	d.agentSecurityMu.Unlock()
+}
+
+func (d *DB) agentSecuritySnapshot() AgentSecurityDiagnostics {
+	if d == nil {
+		return AgentSecurityDiagnostics{}
+	}
+	result := AgentSecurityDiagnostics{
+		RejectedTotal: d.agentSecurityRejected.Load(),
+		RequestEvent:  d.agentSecurityRequestEvent.Load(),
+		SiteStat:      d.agentSecuritySiteStat.Load(),
+		MediaCount:    d.agentSecurityMediaCount.Load(),
+		Retention:     d.agentSecurityRetention.Load(),
+		Observation:   d.agentSecurityObservation.Load(),
+	}
+	if timestamp := d.agentSecurityLastRejectedMS.Load(); timestamp > 0 {
+		result.LastRejectedAt = time.UnixMilli(timestamp).UTC().Format(time.RFC3339)
+	}
+	return result
 }
 
 func isHexString(value string) bool {
@@ -881,43 +966,65 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeS
 	return err
 }
 
-func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Time) (ControlNode, error) {
-	// A malformed/stale event must not make the whole heartbeat unprocessable.
-	// Keep the node online and drop only the offending event; core counters and
-	// valid events remain durable.
+type nodeReportCommitResult struct {
+	node              ControlNode
+	acceptedNew       []NodeRequestEvent
+	acceptedDuplicate []NodeRequestEvent
+	discardedIDs      []int64
+	discardedUIDs     []string
+}
+
+func appendNodeEventIdentity(ids *[]int64, uids *[]string, event NodeRequestEvent) {
+	if event.EventID > 0 {
+		*ids = append(*ids, event.EventID)
+	}
+	if len(event.EventUID) == 32 && isHexString(event.EventUID) {
+		*uids = append(*uids, event.EventUID)
+	}
+}
+
+func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now time.Time) (nodeReportCommitResult, error) {
+	result := nodeReportCommitResult{}
 	validEvents := make([]NodeRequestEvent, 0, len(report.Events))
 	for _, event := range report.Events {
 		if validateNodeRequestEvent(event) == nil {
 			validEvents = append(validEvents, event)
+			continue
 		}
+		appendNodeEventIdentity(&result.discardedIDs, &result.discardedUIDs, event)
 	}
 	report.Events = validEvents
 	if err := validateNodeReport(report); err != nil {
-		return ControlNode{}, err
+		return nodeReportCommitResult{}, err
 	}
 	if err := d.resetDueNodeCycles(now); err != nil {
-		return ControlNode{}, err
+		return nodeReportCommitResult{}, err
 	}
 	tx, err := d.db.Begin()
 	if err != nil {
-		return ControlNode{}, err
+		return nodeReportCommitResult{}, err
 	}
 	defer tx.Rollback()
-	acceptedEvents := make([]NodeRequestEvent, 0, len(report.Events))
+
 	var id, lastSequence, lastRX, lastTX int64
 	var lastBootID, lastSessionID string
 	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
 		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ControlNode{}, errInvalidAgentToken
+		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
 	if err != nil {
-		return ControlNode{}, err
+		return nodeReportCommitResult{}, err
 	}
+
+	// Authorization and every report mutation use one transaction. A scheduler
+	// transition therefore resolves as either authorized-and-committed or
+	// unauthorized-and-discarded; ACKs are never inferred from a preflight.
 	allowedSites, err := authorizedNodeSitesTx(tx, id)
 	if err != nil {
-		return ControlNode{}, err
+		return nodeReportCommitResult{}, err
 	}
+
 	legacyBootID := strings.TrimSpace(report.BootID)
 	sessionID := strings.TrimSpace(report.ReportSessionID)
 	if sessionID == "" {
@@ -936,14 +1043,14 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 		deltaRX, deltaTX = 0, 0
 		report.RXBytes, report.TXBytes, report.Sequence = lastRX, lastTX, lastSequence
 	}
-	_, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
+	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 		lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
 		last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, now.UnixMilli(), now.UnixMilli(), id)
-	if err != nil {
-		return ControlNode{}, err
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+		return nodeReportCommitResult{}, err
 	}
+
 	for _, stat := range report.SiteStats {
 		host := strings.ToLower(strings.TrimSpace(stat.Host))
 		if host == "" || len(host) > 255 || stat.RequestCount < 0 || stat.LastRequestAtMS < 0 || stat.LastStatus < 0 || stat.LastStatus > 999 {
@@ -954,10 +1061,11 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 		var previousCount int64
 		err := tx.QueryRow(`SELECT n.site_id,n.agent_boot_id,n.agent_request_count FROM site_node_schedules n JOIN sites s ON s.id=n.site_id WHERE n.enabled=1 AND s.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND lower(s.public_host)=?`, id, id, host).Scan(&scheduleID, &previousBoot, &previousCount)
 		if errors.Is(err, sql.ErrNoRows) {
+			d.recordAgentSecurityRejection(id, 0, "site-stats")
 			continue
 		}
 		if err != nil {
-			return ControlNode{}, err
+			return nodeReportCommitResult{}, err
 		}
 		if !authorizedNodeSiteHost(allowedSites, scheduleID, host) {
 			d.recordAgentSecurityRejection(id, scheduleID, "site-stats")
@@ -970,26 +1078,22 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 		if count < previousCount {
 			count = previousCount
 		}
-		_, err = tx.Exec(`UPDATE site_node_schedules SET agent_boot_id=?,agent_request_count=?,agent_last_request_at_ms=?,agent_last_status=?,updated_at_ms=? WHERE site_id=?`,
-			sessionID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID)
-		if err != nil {
-			return ControlNode{}, err
+		if _, err = tx.Exec(`UPDATE site_node_schedules SET agent_boot_id=?,agent_request_count=?,agent_last_request_at_ms=?,agent_last_status=?,updated_at_ms=? WHERE site_id=?`,
+			sessionID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID); err != nil {
+			return nodeReportCommitResult{}, err
 		}
-		// Site traffic counters are cumulative NIC counters.  Keep their epoch
-		// independent from the process/report session so an Agent restart does
-		// not discard the bytes accumulated since the previous report.
 		if err := recordNodeSiteTrafficTx(tx, id, counterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
-			return ControlNode{}, err
+			return nodeReportCommitResult{}, err
 		}
 	}
+
 	for _, count := range report.MediaCounts {
 		if _, allowed := allowedSites[count.SiteID]; !allowed {
 			d.recordAgentSecurityRejection(id, count.SiteID, "media-counts")
 			continue
 		}
-		_, err := tx.Exec(`UPDATE sites SET media_movie_count=?,media_series_count=?,media_episode_count=?,media_count_updated_at_ms=? WHERE id=? AND media_count_updated_at_ms<?`, count.MovieCount, count.SeriesCount, count.EpisodeCount, count.ObservedAtMS, count.SiteID, count.ObservedAtMS)
-		if err != nil {
-			return ControlNode{}, err
+		if _, err := tx.Exec(`UPDATE sites SET media_movie_count=?,media_series_count=?,media_episode_count=?,media_count_updated_at_ms=? WHERE id=? AND media_count_updated_at_ms<?`, count.MovieCount, count.SeriesCount, count.EpisodeCount, count.ObservedAtMS, count.SiteID, count.ObservedAtMS); err != nil {
+			return nodeReportCommitResult{}, err
 		}
 	}
 	for _, status := range report.Retention {
@@ -997,9 +1101,8 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 			d.recordAgentSecurityRejection(id, status.SiteID, "retention")
 			continue
 		}
-		_, err := tx.Exec(`UPDATE sites SET account_retention_started_at_ms=?,account_retention_last_completed_at_ms=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND account_retention_days>0 AND account_retention_started_at_ms=?`, status.CompletedAtMS, status.CompletedAtMS, status.SiteID, status.ExpectedStartedAtMS)
-		if err != nil {
-			return ControlNode{}, err
+		if _, err := tx.Exec(`UPDATE sites SET account_retention_started_at_ms=?,account_retention_last_completed_at_ms=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND account_retention_days>0 AND account_retention_started_at_ms=?`, status.CompletedAtMS, status.CompletedAtMS, status.SiteID, status.ExpectedStartedAtMS); err != nil {
+			return nodeReportCommitResult{}, err
 		}
 	}
 	for _, observation := range report.Observations {
@@ -1007,109 +1110,96 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 			d.recordAgentSecurityRejection(id, observation.SiteID, "observation")
 			continue
 		}
-		_, err := tx.Exec(`INSERT INTO dynamic_observations(site_id,canonical_authority,source,decision,reason_code,first_seen_ms,last_seen_ms,count) VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(site_id,canonical_authority,source,decision,reason_code) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,count=count+1`, observation.SiteID, observation.CanonicalAuthority, observation.Source, observation.Decision, observation.ReasonCode, observation.ObservedAtMS, observation.ObservedAtMS)
-		if err != nil {
-			return ControlNode{}, err
+		if _, err := tx.Exec(`INSERT INTO dynamic_observations(site_id,canonical_authority,source,decision,reason_code,first_seen_ms,last_seen_ms,count) VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(site_id,canonical_authority,source,decision,reason_code) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,count=count+1`, observation.SiteID, observation.CanonicalAuthority, observation.Source, observation.Decision, observation.ReasonCode, observation.ObservedAtMS, observation.ObservedAtMS); err != nil {
+			return nodeReportCommitResult{}, err
 		}
 	}
+
 	for _, event := range report.Events {
 		if !authorizedNodeSiteHost(allowedSites, event.SiteID, event.Host) {
 			d.recordAgentSecurityRejection(id, event.SiteID, "request-event")
+			appendNodeEventIdentity(&result.discardedIDs, &result.discardedUIDs, event)
 			continue
 		}
-		result, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,event_uid,received_at_ms) VALUES(?,?,?,?,?)`, id, sessionID, event.EventID, event.EventUID, now.UnixMilli())
+		inserted, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,event_uid,received_at_ms) VALUES(?,?,?,?,?)`, id, sessionID, event.EventID, event.EventUID, now.UnixMilli())
 		if err != nil {
-			return ControlNode{}, err
+			return nodeReportCommitResult{}, err
 		}
-		rows, err := result.RowsAffected()
+		rows, err := inserted.RowsAffected()
 		if err != nil {
-			return ControlNode{}, err
+			return nodeReportCommitResult{}, err
 		}
 		if rows == 0 {
-			// The event was already durably accepted (for example, the previous
-			// ACK was lost). Acknowledge it again so the Agent can retire its
-			// durable spool entry without replaying the side effect.
-			acceptedEvents = append(acceptedEvents, event)
+			var existingBoot, existingUID string
+			var existingID int64
+			lookupErr := tx.QueryRow(`SELECT agent_boot_id,event_id,event_uid FROM node_request_events WHERE node_id=? AND ((agent_boot_id=? AND event_id=?) OR (event_uid<>'' AND event_uid=?)) LIMIT 1`, id, sessionID, event.EventID, event.EventUID).Scan(&existingBoot, &existingID, &existingUID)
+			if errors.Is(lookupErr, sql.ErrNoRows) {
+				return nodeReportCommitResult{}, errors.New(`event insert was ignored without an existing identity`)
+			}
+			if lookupErr != nil {
+				return nodeReportCommitResult{}, lookupErr
+			}
+			if (event.EventUID != "" && existingUID != "" && !strings.EqualFold(event.EventUID, existingUID)) ||
+				(existingBoot != sessionID && existingUID == "") ||
+				(existingBoot == sessionID && existingID != event.EventID) {
+				appendNodeEventIdentity(&result.discardedIDs, &result.discardedUIDs, event)
+				continue
+			}
+			result.acceptedDuplicate = append(result.acceptedDuplicate, event)
 			continue
 		}
 		if !event.SkipRequestLog {
 			if err := d.recordNodeRequestEventTx(tx, id, event); err != nil {
-				return ControlNode{}, err
+				return nodeReportCommitResult{}, err
 			}
 		}
-		acceptedEvents = append(acceptedEvents, event)
+		result.acceptedNew = append(result.acceptedNew, event)
 	}
+
 	if err := tx.Commit(); err != nil {
-		return ControlNode{}, err
+		return nodeReportCommitResult{}, err
 	}
-	// Metadata responses must be replayed first. A playback sync event often
-	// arrives in the same heartbeat and relies on this cache for its title.
-	for _, event := range acceptedEvents {
+	result.node, err = d.controlNodeByID(id, now)
+	if err != nil {
+		return nodeReportCommitResult{}, err
+	}
+	// Derived in-process effects run only for newly committed events. Duplicate
+	// deliveries are acknowledged without replaying request/watch/metadata work.
+	for _, event := range result.acceptedNew {
 		if event.ResponseBody != "" {
 			d.recordNodeMetadataEvent(event)
 		}
-	}
-	for _, event := range acceptedEvents {
 		d.recordNodeWatchHistoryEvent(event)
 	}
-	node, err := d.controlNodeByID(id, now)
+	_, _ = d.NodeControlSnapshot(now)
+	return result, nil
+}
+
+func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Time) (ControlNode, error) {
+	result, err := d.recordNodeReportCommit(agentToken, report, now)
 	if err != nil {
 		return ControlNode{}, err
 	}
-	_, _ = d.NodeControlSnapshot(now)
-	return node, nil
+	return result.node, nil
 }
 
 // RecordNodeReportResult is the acknowledgement-safe variant used by HTTP
-// and WebSocket handlers. Invalid event payloads are explicitly retired so a
-// poison event cannot remain in an Agent spool forever.
+// and WebSocket handlers. It authenticates, snapshots authorization, commits
+// mutations, and derives ACK/discarded lists from that same transaction.
 func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now time.Time) (NodeReportResult, error) {
-	result := NodeReportResult{}
-	validEvents := make([]NodeRequestEvent, 0, len(report.Events))
-	for _, event := range report.Events {
-		if validateNodeRequestEvent(event) == nil {
-			validEvents = append(validEvents, event)
-			continue
-		}
-		if event.EventID > 0 {
-			result.DiscardedEventIDs = append(result.DiscardedEventIDs, event.EventID)
-		}
-		if len(event.EventUID) == 32 && isHexString(event.EventUID) {
-			result.DiscardedEventUIDs = append(result.DiscardedEventUIDs, event.EventUID)
-		}
-	}
-	nodeID, allowedSites, authErr := d.authorizedNodeSitesForAgentToken(agentToken)
-	if authErr != nil {
-		return NodeReportResult{}, authErr
-	}
-	authorizedEvents := make([]NodeRequestEvent, 0, len(validEvents))
-	for _, event := range validEvents {
-		if !authorizedNodeSiteHost(allowedSites, event.SiteID, event.Host) {
-			d.recordAgentSecurityRejection(nodeID, event.SiteID, "request-event")
-			if event.EventID > 0 {
-				result.DiscardedEventIDs = append(result.DiscardedEventIDs, event.EventID)
-			}
-			if len(event.EventUID) == 32 && isHexString(event.EventUID) {
-				result.DiscardedEventUIDs = append(result.DiscardedEventUIDs, event.EventUID)
-			}
-			continue
-		}
-		authorizedEvents = append(authorizedEvents, event)
-	}
-	report.Events = authorizedEvents
-	node, err := d.RecordNodeReport(agentToken, report, now)
+	committed, err := d.recordNodeReportCommit(agentToken, report, now)
 	if err != nil {
 		return NodeReportResult{}, err
 	}
-	result.Node = node
-	for _, event := range authorizedEvents {
-		if event.EventID > 0 {
-			result.AcceptedEventIDs = append(result.AcceptedEventIDs, event.EventID)
-		}
-		if len(event.EventUID) == 32 && isHexString(event.EventUID) {
-			result.AcceptedEventUIDs = append(result.AcceptedEventUIDs, event.EventUID)
-		}
+	result := NodeReportResult{Node: committed.node}
+	for _, event := range committed.acceptedNew {
+		appendNodeEventIdentity(&result.AcceptedEventIDs, &result.AcceptedEventUIDs, event)
 	}
+	for _, event := range committed.acceptedDuplicate {
+		appendNodeEventIdentity(&result.AcceptedEventIDs, &result.AcceptedEventUIDs, event)
+	}
+	result.DiscardedEventIDs = committed.discardedIDs
+	result.DiscardedEventUIDs = committed.discardedUIDs
 	return result, nil
 }
 

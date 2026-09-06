@@ -3,10 +3,46 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 )
+
+type telegramRedirectTransport struct {
+	first  int
+	second int
+}
+
+func (t *telegramRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == "api.telegram.org" {
+		t.first++
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"https://redirect.example.test/sendMessage"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":false,"description":"redirect"}`)),
+			Request:    req,
+		}, nil
+	}
+	t.second++
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Request: req}, nil
+}
+
+func TestTelegramReportRejectsRedirectWithoutFollowing(t *testing.T) {
+	transport := &telegramRedirectTransport{}
+	previous := telegramReportHTTPClient
+	telegramReportHTTPClient = func() *http.Client {
+		return &http.Client{Timeout: 15 * time.Second, Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	}
+	t.Cleanup(func() { telegramReportHTTPClient = previous })
+	if err := sendTelegramReport(context.Background(), "bot-token", "123", "hello"); err == nil {
+		t.Fatal("Telegram redirect was accepted")
+	}
+	if transport.first != 1 || transport.second != 0 {
+		t.Fatalf("redirect transport calls = first %d second %d, want 1/0", transport.first, transport.second)
+	}
+}
 
 func TestTelegramReportTokenRoundTrip(t *testing.T) {
 	ciphertext, err := encryptTelegramBotToken("123456:example-token")
