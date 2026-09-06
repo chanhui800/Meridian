@@ -199,16 +199,32 @@ func shellSingleQuote(value string) string {
 }
 
 func buildNodeInstallScript(controllerURL, enrollmentToken string) string {
+	return buildNodeInstallScriptWithOptions(controllerURL, enrollmentToken, false)
+}
+
+func buildNodeInstallScriptWithOptions(controllerURL, enrollmentToken string, reenroll bool) string {
 	controller := shellSingleQuote(controllerURL)
 	token := shellSingleQuote(enrollmentToken)
-	return fmt.Sprintf("#!/bin/sh\nset -eu\nexec /bin/sh -s -- -e %s -t %s <<'MERIDIAN_CANONICAL_INSTALLER'\n%sMERIDIAN_CANONICAL_INSTALLER\n", controller, token, agentInstallerScript)
+	reenrollArg := ""
+	if reenroll {
+		reenrollArg = " --reenroll"
+	}
+	return fmt.Sprintf("#!/bin/sh\nset -eu\nexec /bin/sh -s -- -e %s -t %s%s <<'MERIDIAN_CANONICAL_INSTALLER'\n%sMERIDIAN_CANONICAL_INSTALLER\n", controller, token, reenrollArg, agentInstallerScript)
 }
 
 func buildNodeInstallCommand(controllerURL, enrollmentToken string) string {
+	return buildNodeInstallCommandWithOptions(controllerURL, enrollmentToken, false)
+}
+
+func buildNodeInstallCommandWithOptions(controllerURL, enrollmentToken string, reenroll bool) string {
 	endpoint := strings.TrimRight(controllerURL, "/") + "/api/agent/install.sh"
-	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL %s | sudo bash -s -- -e %s -t %s",
+	reenrollArg := ""
+	if reenroll {
+		reenrollArg = " --reenroll"
+	}
+	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL %s | sudo bash -s -- -e %s -t %s%s",
 		shellSingleQuote(endpoint),
-		shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken))
+		shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken), reenrollArg)
 }
 
 func (a *App) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
@@ -318,7 +334,7 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			writeNodeAPIError(a, w, err)
 			return
 		}
-		a.jsonOK(w, map[string]interface{}{"node": node, "install_script": buildNodeInstallScript(controllerURL, token), "install_command": buildNodeInstallCommand(controllerURL, token)})
+		a.jsonOK(w, map[string]interface{}{"node": node, "install_script": buildNodeInstallScriptWithOptions(controllerURL, token, true), "install_command": buildNodeInstallCommandWithOptions(controllerURL, token, true)})
 		return
 	}
 	if action != "" {
@@ -437,6 +453,46 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(agentPlatformHeader, platform)
 	}
 	_, _ = io.Copy(w, file)
+}
+
+// handleAgentManifest authenticates the node exactly like the legacy binary
+// endpoint, but returns a release-pinned GitHub asset so Controllers do not
+// need to carry every Agent architecture in their image or installation.
+func (a *App) handleAgentManifest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token := requestBearerToken(r)
+	if err := a.db.AuthorizeEnrollmentToken(token, time.Now()); err != nil {
+		if _, agentErr := a.db.nodeByAgentToken(token, time.Now()); agentErr != nil {
+			a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+			return
+		}
+	}
+	platform, err := requestedAgentPlatform(r)
+	if err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if platform == "" {
+		a.jsonErr(w, http.StatusBadRequest, "agent platform is required")
+		return
+	}
+	manifest, err := agentReleaseManifestForPlatform(r.Context(), platform)
+	if err != nil {
+		log.Printf("agent release manifest unavailable for %s: %v", platform, err)
+		a.jsonErr(w, http.StatusServiceUnavailable, "agent release manifest unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Meridian-Agent-Platform", manifest.Platform)
+	w.Header().Set("X-Meridian-Agent-Version", manifest.Version)
+	w.Header().Set("X-Meridian-Agent-SHA256", manifest.SHA256)
+	w.Header().Set("X-Meridian-Agent-Download-URL", manifest.DownloadURL)
+	a.jsonOK(w, manifest)
 }
 
 // handleAgentInstallScript is intentionally public: it contains no node

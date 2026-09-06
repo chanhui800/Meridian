@@ -252,6 +252,7 @@ func main() {
 	mux.HandleFunc("/api/auth/logout", cors(app.csrfMiddleware(app.handleLogout)))
 	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
 	mux.HandleFunc("/api/agent/binary", app.handleAgentBinary)
+	mux.HandleFunc("/api/agent/manifest", app.handleAgentManifest)
 	mux.HandleFunc("/api/agent/install.sh", app.handleAgentInstallScript)
 	mux.HandleFunc("/api/agent/enroll", app.handleAgentEnroll)
 	mux.HandleFunc("/api/agent/report", app.handleAgentReport)

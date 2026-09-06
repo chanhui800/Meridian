@@ -8,7 +8,7 @@ Agent 安装器随 Meridian 版本发布在 `scripts/agent-install.sh`，面板�
 https://<你的主控域名>/api/agent/install.sh
 ```
 
-运行中的主控提供版本一致的安装脚本、`/api/agent/binary` 下载和注册接口。这样用户部署自己的 Meridian 后，不会把节点注册到其他人的主控。
+运行中的主控提供版本一致的安装脚本、带平台和 SHA-256 校验的 Release Manifest，以及注册接口。Agent 二进制从当前版本固定的 GitHub Release 地址直接下载；节点不会注册到其他人的主控。
 
 ## 一键安装
 
@@ -24,8 +24,9 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://<你的主�
 
 - `-c` / `--controller`：自己的主控 HTTPS 地址，必须带正确端口。
 - `-t` / `--token`：面板为该节点生成的一次性注册令牌，默认 24 小时有效。
+- `--reenroll`：重新生成脚本后使用；清理旧的本地注册状态并等待新的注册状态写入。
 
-安装器支持 Linux amd64 和 arm64，并要求节点可以通过 HTTPS 访问主控。脚本会校验下载二进制的 SHA-256，并自动识别默认路由网卡，不需要手动填写 `eth0`、`ens3` 等网卡名。
+安装器支持 Linux amd64 和 arm64，并要求节点可以通过 HTTPS 访问主控。脚本会先校验主控返回的版本、平台和 SHA-256，再停止现有服务；首次安装和重新注册还会等待 Agent 实际完成注册，不会仅凭 systemd 的 active 状态报告成功。
 
 ## 安装后检查
 
@@ -62,4 +63,4 @@ sudo ss -lntp | grep ':9090' || true
 - 不要把完整安装命令、一次性令牌或 Agent 长期令牌提交到 GitHub。
 - 不要让不可信用户获得主控管理员账号，否则对方可以创建、删除或刷新节点。
 - `/api/agent/install.sh` 不包含节点凭据；真正的二进制下载、注册、配置和上报接口都需要 Bearer 令牌。
-- 需要重新绑定主控时，应先删除旧节点，再从新主控生成新的安装命令。
+- 需要重新绑定主控时，应先删除旧节点，再从新主控生成新的安装命令。面板的“重新生成脚本”已经包含 `--reenroll`，会触发新的注册流程。

@@ -567,7 +567,7 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 		return ControlNode{}, "", err
 	}
 	result, err := d.db.Exec(`UPDATE control_nodes SET enrollment_token_hash=?,enrollment_expires_at_ms=?,
-		agent_token_hash='',enrolled_at_ms=0,last_seen_at_ms=0,last_boot_id='',last_report_session_id='',last_sequence=0,
+		last_seen_at_ms=0,last_boot_id='',last_report_session_id='',last_sequence=0,
 		last_raw_rx_bytes=0,last_raw_tx_bytes=0,updated_at_ms=? WHERE id=?`, hashNodeToken(token),
 		now.Add(nodeEnrollmentLifetime).UnixMilli(), now.UnixMilli(), id)
 	if err != nil {

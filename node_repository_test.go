@@ -85,6 +85,45 @@ func TestControlNodeEnrollmentTrafficAndDelete(t *testing.T) {
 	}
 }
 
+func TestRefreshNodeEnrollmentKeepsOldAgentUntilReplacement(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "reenroll", Address: "203.0.113.60"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	_, oldToken, err := app.db.EnrollControlNode(enrollment, now.Add(time.Second))
+	if !errors.Is(err, errInvalidNodeToken) || oldToken != "" {
+		t.Fatalf("reused initial enrollment token: token=%q err=%v", oldToken, err)
+	}
+	// Enroll once through a fresh node so we have a valid long-lived token.
+	_, enrollment, err = app.db.RefreshNodeEnrollment(node.ID, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, oldToken, err = app.db.EnrollControlNode(enrollment, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pending, err := app.db.RefreshNodeEnrollment(node.ID, now.Add(4*time.Second))
+	if err != nil || pending == "" {
+		t.Fatalf("refresh enrollment: token=%q err=%v", pending, err)
+	}
+	if _, err := app.db.RecordNodeReport(oldToken, NodeReport{BootID: "old", Sequence: 1, InterfaceName: "eth0", AgentVersion: "test"}, now.Add(5*time.Second)); err != nil {
+		t.Fatalf("old Agent was revoked before replacement: %v", err)
+	}
+	_, newToken, err := app.db.EnrollControlNode(pending, now.Add(6*time.Second))
+	if err != nil || newToken == "" {
+		t.Fatalf("replacement enrollment: token=%q err=%v", newToken, err)
+	}
+	if _, err := app.db.RecordNodeReport(oldToken, NodeReport{BootID: "old-2", Sequence: 2, InterfaceName: "eth0", AgentVersion: "test"}, now.Add(7*time.Second)); !errors.Is(err, errInvalidAgentToken) {
+		t.Fatalf("old Agent token remained valid after replacement: %v", err)
+	}
+}
+
 func TestRecordNodeReportResultRetiresInvalidEvents(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()
@@ -388,11 +427,22 @@ func TestAgentInstallScriptIsTransactional(t *testing.T) {
 	if downloadIndex < 0 || stopIndex < 0 || stopIndex < downloadIndex {
 		t.Fatalf("Agent installer stops the service before downloading and validating: download=%d stop=%d", downloadIndex, stopIndex)
 	}
-	if strings.Contains(script, `rm -f "$state_dir/state.json"`) {
-		t.Fatal("Agent installer deletes durable state during reinstall")
+	if !strings.Contains(script, "--reenroll") || !strings.Contains(script, "wait_for_registration") {
+		t.Fatal("Agent installer does not expose explicit re-enrollment and registration verification")
 	}
 	if !strings.Contains(script, "previous Agent, state, token, and service were restored") {
 		t.Fatal("Agent installer does not expose rollback behavior")
+	}
+}
+
+func TestBuildNodeEnrollmentScriptForcesReenrollment(t *testing.T) {
+	script := buildNodeInstallScriptWithOptions("https://panel.example.com", "enrollment-secret", true)
+	if !strings.Contains(script, "-t 'enrollment-secret' --reenroll") {
+		t.Fatalf("enrollment script does not request re-enrollment: %s", script)
+	}
+	command := buildNodeInstallCommandWithOptions("https://panel.example.com", "enrollment-secret", true)
+	if !strings.HasSuffix(command, "--reenroll") {
+		t.Fatalf("enrollment command does not request re-enrollment: %s", command)
 	}
 }
 

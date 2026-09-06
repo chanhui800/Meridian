@@ -30,6 +30,7 @@ PREVIOUS_BIN="${INSTALL_DIR}/${BIN_NAME}.previous"
 PREVIOUS_AGENT_BIN="${INSTALL_DIR}/${AGENT_BIN_NAME}.previous"
 AGENT_BIN_AMD64_NAME="${AGENT_BIN_NAME}-linux-amd64"
 AGENT_BIN_ARM64_NAME="${AGENT_BIN_NAME}-linux-arm64"
+BUNDLE_AGENT_BINARIES="${MERIDIAN_BUNDLE_AGENT_BINARIES:-0}"
 PREVIOUS_AGENT_BIN_AMD64="${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.previous"
 PREVIOUS_AGENT_BIN_ARM64="${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.previous"
 ASSUME_YES="${MERIDIAN_ASSUME_YES:-0}"
@@ -471,19 +472,25 @@ download_release_binary() {
         chmod 0755 "$verify_file"
     }
     verify_download "$asset" "$binary_file"
-    for agent_asset in "$AGENT_BIN_AMD64_NAME" "$AGENT_BIN_ARM64_NAME"; do
-        agent_file="${tmp_dir}/${agent_asset}"
-        download "https://github.com/${REPO}/releases/download/${version}/${agent_asset}" "$agent_file" \
-            || fail "${agent_asset} 下载失败；当前 Release 必须同时提供 Linux amd64/arm64 Agent"
-        verify_download "$agent_asset" "$agent_file"
-        if [ "$agent_asset" = "$AGENT_BIN_AMD64_NAME" ]; then
-            DOWNLOADED_AGENT_BINARY_AMD64="$agent_file"
-        else
-            DOWNLOADED_AGENT_BINARY_ARM64="$agent_file"
-        fi
-    done
+    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+        for agent_asset in "$AGENT_BIN_AMD64_NAME" "$AGENT_BIN_ARM64_NAME"; do
+            agent_file="${tmp_dir}/${agent_asset}"
+            download "https://github.com/${REPO}/releases/download/${version}/${agent_asset}" "$agent_file" \
+                || fail "${agent_asset} 下载失败；当前 Release 必须同时提供 Linux amd64/arm64 Agent"
+            verify_download "$agent_asset" "$agent_file"
+            if [ "$agent_asset" = "$AGENT_BIN_AMD64_NAME" ]; then
+                DOWNLOADED_AGENT_BINARY_AMD64="$agent_file"
+            else
+                DOWNLOADED_AGENT_BINARY_ARM64="$agent_file"
+            fi
+        done
+    fi
     DOWNLOADED_BINARY="$binary_file"
-    ok "主控与 Agent SHA-256 校验通过"
+    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+        ok "主控与 Agent SHA-256 校验通过"
+    else
+        ok "主控 SHA-256 校验通过；Agent 将从版本固定的 Release 直接下载"
+    fi
 }
 
 env_file_path() {
@@ -1773,21 +1780,24 @@ do_install() {
     as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$INSTALL_DIR"
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
     as_root mv -f "${current_binary}.new" "$current_binary"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
-    as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
-    as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
-    # Keep the historical single-name path for Linux systemd installs and
-    # older administrators' tooling. The controller itself always selects the
-    # platform-specific files above when a new Agent supplies its platform.
-    case "$DOWNLOADED_CONTROLLER_SUFFIX" in
-        linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
-        linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
-    esac
+    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
+        as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
+        as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
+        # Keep the historical single-name path for explicit legacy bundling.
+        case "$DOWNLOADED_CONTROLLER_SUFFIX" in
+            linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+            linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+        esac
+    fi
 
     if is_systemd; then
         if ! as_root systemctl restart "$SERVICE_NAME" || ! wait_for_health 20; then
-            as_root rm -f -- "$current_binary" "$current_agent" "$current_agent_amd64" "$current_agent_arm64"
+            as_root rm -f -- "$current_binary"
+            if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+                as_root rm -f -- "$current_agent" "$current_agent_amd64" "$current_agent_arm64"
+            fi
             as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
             rm -rf -- "$tmp_dir"
             fail "首次启动未通过健康检查；二进制已移除，数据与配置已保留"
@@ -1880,42 +1890,46 @@ do_update() {
 
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new"
     as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"
-    if as_root test -f "$current_agent"; then
-        UPDATE_AGENT_WAS_PRESENT=1
-        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent" "${PREVIOUS_AGENT_BIN}.new"
-        as_root mv -f "${PREVIOUS_AGENT_BIN}.new" "$PREVIOUS_AGENT_BIN"
-    else
-        UPDATE_AGENT_WAS_PRESENT=0
-        as_root rm -f -- "$PREVIOUS_AGENT_BIN"
-    fi
-    if as_root test -f "$current_agent_amd64"; then
-        UPDATE_AGENT_AMD64_WAS_PRESENT=1
-        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent_amd64" "${PREVIOUS_AGENT_BIN_AMD64}.new"
-        as_root mv -f "${PREVIOUS_AGENT_BIN_AMD64}.new" "$PREVIOUS_AGENT_BIN_AMD64"
-    else
-        UPDATE_AGENT_AMD64_WAS_PRESENT=0
-        as_root rm -f -- "$PREVIOUS_AGENT_BIN_AMD64"
-    fi
-    if as_root test -f "$current_agent_arm64"; then
-        UPDATE_AGENT_ARM64_WAS_PRESENT=1
-        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent_arm64" "${PREVIOUS_AGENT_BIN_ARM64}.new"
-        as_root mv -f "${PREVIOUS_AGENT_BIN_ARM64}.new" "$PREVIOUS_AGENT_BIN_ARM64"
-    else
-        UPDATE_AGENT_ARM64_WAS_PRESENT=0
-        as_root rm -f -- "$PREVIOUS_AGENT_BIN_ARM64"
+    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+        if as_root test -f "$current_agent"; then
+            UPDATE_AGENT_WAS_PRESENT=1
+            as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent" "${PREVIOUS_AGENT_BIN}.new"
+            as_root mv -f "${PREVIOUS_AGENT_BIN}.new" "$PREVIOUS_AGENT_BIN"
+        else
+            UPDATE_AGENT_WAS_PRESENT=0
+            as_root rm -f -- "$PREVIOUS_AGENT_BIN"
+        fi
+        if as_root test -f "$current_agent_amd64"; then
+            UPDATE_AGENT_AMD64_WAS_PRESENT=1
+            as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent_amd64" "${PREVIOUS_AGENT_BIN_AMD64}.new"
+            as_root mv -f "${PREVIOUS_AGENT_BIN_AMD64}.new" "$PREVIOUS_AGENT_BIN_AMD64"
+        else
+            UPDATE_AGENT_AMD64_WAS_PRESENT=0
+            as_root rm -f -- "$PREVIOUS_AGENT_BIN_AMD64"
+        fi
+        if as_root test -f "$current_agent_arm64"; then
+            UPDATE_AGENT_ARM64_WAS_PRESENT=1
+            as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent_arm64" "${PREVIOUS_AGENT_BIN_ARM64}.new"
+            as_root mv -f "${PREVIOUS_AGENT_BIN_ARM64}.new" "$PREVIOUS_AGENT_BIN_ARM64"
+        else
+            UPDATE_AGENT_ARM64_WAS_PRESENT=0
+            as_root rm -f -- "$PREVIOUS_AGENT_BIN_ARM64"
+        fi
     fi
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
     as_root mv -f "${current_binary}.new" "$current_binary"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
-    as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
-    as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
-    case "$DOWNLOADED_CONTROLLER_SUFFIX" in
-        linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
-        linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
-    esac
+    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
+        as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
+        as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
+        case "$DOWNLOADED_CONTROLLER_SUFFIX" in
+            linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+            linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+        esac
+        UPDATE_AGENT_CHANGED=1
+    fi
     UPDATE_BINARY_CHANGED=1
-    UPDATE_AGENT_CHANGED=1
 
     if is_systemd; then
         as_root systemctl restart "$SERVICE_NAME"

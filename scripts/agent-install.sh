@@ -5,6 +5,7 @@ set -eu
 # supplied by the operator and is never stored in this repository.
 controller_url=""
 enrollment_token=""
+reenroll=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -c|-e|--controller|--endpoint)
@@ -17,12 +18,16 @@ while [ "$#" -gt 0 ]; do
       enrollment_token="$2"
       shift 2
       ;;
+    --reenroll)
+      reenroll=1
+      shift
+      ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
 if [ -z "$controller_url" ] || [ -z "$enrollment_token" ]; then
-  echo 'usage: agent-install.sh -e https://panel.example.com:9090 -t ENROLLMENT_TOKEN' >&2
+  echo 'usage: agent-install.sh -e https://panel.example.com:9090 -t ENROLLMENT_TOKEN [--reenroll]' >&2
   exit 2
 fi
 controller_url=${controller_url%/}
@@ -30,6 +35,7 @@ install_dir=/opt/meridian-agent
 state_dir=/var/lib/meridian-agent
 token_dir=/etc/meridian-agent
 token_file="$token_dir/enrollment-token"
+state_file="$state_dir/state.json"
 service_file=/etc/systemd/system/meridian-agent.service
 umask 077
 rollback_active=0
@@ -58,22 +64,39 @@ cleanup() {
 trap cleanup EXIT
 binary_tmp="$work_dir/meridian-agent"
 headers_tmp="$work_dir/meridian-agent.headers"
+manifest_headers_tmp="$work_dir/meridian-agent.manifest.headers"
 token_tmp="$work_dir/enrollment-token"
 service_tmp="$work_dir/meridian-agent.service"
 
-# Download and validate everything before touching the running service, state,
-# token, or systemd unit. A failed download therefore leaves an existing Agent
-# completely untouched.
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$headers_tmp" \
+# Download the release manifest from the controller, then fetch the immutable
+# GitHub asset directly. This keeps the Controller image free of per-platform
+# Agent binaries while retaining a controller-authenticated enrollment step.
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$manifest_headers_tmp" \
   -H "Authorization: Bearer $enrollment_token" \
   -H "X-Meridian-Agent-Platform: $agent_platform" \
-  "$controller_url/api/agent/binary" -o "$binary_tmp"
-served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
+  "$controller_url/api/agent/manifest" -o "$work_dir/agent-manifest.json"
+served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$manifest_headers_tmp")
 if [ "$served_platform" != "$agent_platform" ]; then
   echo "Agent binary platform mismatch (requested $agent_platform, received ${served_platform:-unknown})." >&2
   exit 1
 fi
-expected_sha=$(awk 'tolower($1) == "x-meridian-agent-sha256:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
+download_url=$(awk 'tolower($1) == "x-meridian-agent-download-url:" {sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); print; exit}' "$manifest_headers_tmp")
+case "$download_url" in
+  https://github.com/chanhui800/Meridian/releases/download/*/meridian-agent-linux-amd64|https://github.com/chanhui800/Meridian/releases/download/*/meridian-agent-linux-arm64) ;;
+  *) echo 'Agent release manifest returned an invalid download URL.' >&2; exit 1 ;;
+esac
+expected_sha=$(awk 'tolower($1) == "x-meridian-agent-sha256:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$manifest_headers_tmp")
+if ! printf '%s' "$expected_sha" | grep -Eq '^[[:xdigit:]]{64}$'; then
+  echo 'Agent release manifest returned an invalid SHA-256.' >&2
+  exit 1
+fi
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$headers_tmp" \
+  "$download_url" -o "$binary_tmp"
+served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
+if [ -n "$served_platform" ] && [ "$served_platform" != "$agent_platform" ]; then
+  echo "Agent binary platform mismatch (requested $agent_platform, received $served_platform)." >&2
+  exit 1
+fi
 if command -v sha256sum >/dev/null 2>&1; then
   actual_sha=$(sha256sum "$binary_tmp" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
@@ -117,12 +140,13 @@ ReadWritePaths=$state_dir $install_dir $token_dir
 WantedBy=multi-user.target
 EOF
 
-# Snapshot the small set of files that will be replaced. state.json is
-# deliberately never removed: reinstalling the binary must not force a new
-# enrollment or destroy the node's durable state.
-had_binary=0; had_token=0; had_service=0; was_active=0; was_enabled=0
+# Snapshot the small set of files that will be replaced. A normal reinstall
+# keeps state.json; an explicit re-enrollment snapshots it so rollback can
+# restore the local files if the new enrollment fails.
+had_binary=0; had_token=0; had_state=0; had_service=0; was_active=0; was_enabled=0
 binary_backup="$work_dir/meridian-agent.previous"
 token_backup="$work_dir/enrollment-token.previous"
+state_backup="$work_dir/state.json.previous"
 service_backup="$work_dir/meridian-agent.service.previous"
 if [ -f "$install_dir/meridian-agent" ]; then
   had_binary=1
@@ -131,6 +155,10 @@ fi
 if [ -f "$token_file" ]; then
   had_token=1
   cp -p "$token_file" "$token_backup"
+fi
+if [ -f "$state_file" ]; then
+  had_state=1
+  cp -p "$state_file" "$state_backup"
 fi
 if [ -f "$service_file" ]; then
   had_service=1
@@ -153,6 +181,12 @@ rollback() {
   else
     rm -f "$token_file"
   fi
+  if [ "$had_state" -eq 1 ]; then
+    install -m 0600 "$state_backup" "$state_file.rollback"
+    mv -f "$state_file.rollback" "$state_file"
+  else
+    rm -f "$state_file"
+  fi
   if [ "$had_service" -eq 1 ]; then
     install -m 0644 "$service_backup" "$service_file.rollback"
     mv -f "$service_file.rollback" "$service_file"
@@ -163,22 +197,45 @@ rollback() {
   if [ "$was_enabled" -eq 1 ]; then systemctl enable meridian-agent.service >/dev/null 2>&1 || true; else systemctl disable meridian-agent.service >/dev/null 2>&1 || true; fi
   if [ "$was_active" -eq 1 ]; then systemctl start meridian-agent.service >/dev/null 2>&1 || true; fi
 }
-trap 'if [ "$rollback_active" -eq 1 ]; then rollback; fi; exit 130' HUP INT TERM
+trap 'if [ "$rollback_active" -eq 1 ]; then rollback; rollback_active=0; fi; exit 130' HUP INT TERM
 
 systemctl stop meridian-agent.service >/dev/null 2>&1 || true
 rollback_active=1
 install -m 0755 "$binary_tmp" "$install_dir/meridian-agent.new"
 mv -f "$install_dir/meridian-agent.new" "$install_dir/meridian-agent"
-# Preserve a valid existing enrollment token and state. A new token is only
-# written for a first install or when the state file is absent (explicit
-# re-enrollment can remove state.json before running this script).
-if [ ! -f "$state_dir/state.json" ] || [ ! -f "$token_file" ]; then
+# A normal reinstall keeps durable enrollment state. The explicit re-enroll
+# path is used by the panel's "regenerate script" action and forces the Agent
+# to exchange the fresh one-time enrollment token.
+if [ "$reenroll" -eq 1 ]; then
+  rm -f "$state_file"
+  install -m 0600 "$token_tmp" "$token_file.new"
+  mv -f "$token_file.new" "$token_file"
+elif [ ! -f "$state_file" ]; then
   install -m 0600 "$token_tmp" "$token_file.new"
   mv -f "$token_file.new" "$token_file"
 fi
 install -m 0644 "$service_tmp" "$service_file.new"
 mv -f "$service_file.new" "$service_file"
-if ! systemctl daemon-reload || ! systemctl enable --now meridian-agent.service || ! systemctl is-active --quiet meridian-agent.service; then
+wait_for_registration() {
+  # systemd may report active while the Agent is retrying an invalid token.
+  # Enrollment writes a new state file and removes the one-time token; wait
+  # for both signals before reporting success for a first install/re-enroll.
+  [ "$reenroll" -eq 1 ] || [ "$had_state" -eq 0 ] || return 0
+  attempt=0
+  while [ "$attempt" -lt 30 ]; do
+    if systemctl is-active --quiet meridian-agent.service 2>/dev/null \
+      && [ -s "$state_file" ] \
+      && grep -Eq '"node_guid"[[:space:]]*:[[:space:]]*"[^"]+"' "$state_file" \
+      && grep -Eq '"agent_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$state_file" \
+      && [ ! -e "$token_file" ]; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  return 1
+}
+if ! systemctl daemon-reload || ! systemctl enable --now meridian-agent.service || ! systemctl is-active --quiet meridian-agent.service || ! wait_for_registration; then
   rollback
   rollback_active=0
   echo 'Agent installation failed; the previous Agent, state, token, and service were restored.' >&2

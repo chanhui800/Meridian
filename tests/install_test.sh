@@ -25,6 +25,9 @@ export MERIDIAN_SERVICE_FILE="${TEST_ROOT}/meridian.service"
 export MERIDIAN_NGINX_CONFIG="${TEST_ROOT}/nginx/conf.d/meridian-panel.conf"
 export MERIDIAN_NGINX_ROOT="${TEST_ROOT}/nginx"
 export MERIDIAN_ASSUME_YES=1
+# Exercise the legacy optional bundle path as well; production installers no
+# longer store Agent binaries locally because Agents pull pinned Release assets.
+export MERIDIAN_BUNDLE_AGENT_BINARIES=1
 
 # The path is computed so this test works from an arbitrary checkout.
 # shellcheck disable=SC1091

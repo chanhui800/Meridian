@@ -7,11 +7,7 @@ RUN go mod download
 
 COPY . .
 ARG VERSION=dev
-ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=controller" -o meridian .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-amd64 .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-arm64 .
-RUN cp "/app/meridian-agent-linux-${TARGETARCH}" /app/meridian-agent
 
 # Runtime stage
 FROM alpine:3.24
@@ -25,9 +21,6 @@ RUN addgroup -S meridian && \
     chown meridian:meridian /app/data && \
     chmod 0700 /app/data
 COPY --from=builder --chown=root:root --chmod=0555 /app/meridian /app/meridian
-COPY --from=builder --chown=root:root --chmod=0555 /app/meridian-agent /app/meridian-agent
-COPY --from=builder --chown=root:root --chmod=0555 /app/meridian-agent-linux-amd64 /app/meridian-agent-linux-amd64
-COPY --from=builder --chown=root:root --chmod=0555 /app/meridian-agent-linux-arm64 /app/meridian-agent-linux-arm64
 COPY --chown=root:root --chmod=0555 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN setcap cap_net_bind_service=+ep /app/meridian && \
     getcap /app/meridian | grep -Fq 'cap_net_bind_service=ep'
@@ -36,7 +29,6 @@ EXPOSE 9090
 
 ENV PORT=9090
 ENV DB_PATH=/app/data/meridian.db
-ENV MERIDIAN_AGENT_BINARY=/app/meridian-agent
 
 VOLUME ["/app/data"]
 

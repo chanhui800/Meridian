@@ -228,6 +228,12 @@ func renewPanelCertificateIfDue(ctx context.Context, db *DB, manager *panelCerti
 	if jwtSecretEphemeral || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
 		return false, nil
 	}
+	if settings.ACMEStaging {
+		// Staging is an explicit verification mode.  The renewal scheduler must
+		// never replace the active production certificate with a certificate
+		// signed by the untrusted Let's Encrypt staging CA.
+		return false, nil
+	}
 	status := manager.status(settings, settings.PanelDomain, settings.RouteDomain, settings.ListenPort, settings.TLSEnabled)
 	if !certificateNeedsRenewal(status) {
 		return false, nil
@@ -243,7 +249,7 @@ func renewPanelCertificateIfDue(ctx context.Context, db *DB, manager *panelCerti
 	if provider != "cloudflare" {
 		return false, errors.New("自动续签暂仅支持 Cloudflare DNS")
 	}
-	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
+	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, false)
 	if err != nil {
 		return false, err
 	}

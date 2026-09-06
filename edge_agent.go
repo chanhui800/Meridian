@@ -1417,13 +1417,37 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 	if err != nil || strings.EqualFold(current, config.AgentSHA256) {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, controller+"/api/agent/binary", nil)
+	downloadURL := strings.TrimSpace(config.AgentDownloadURL)
+	if downloadURL == "" {
+		manifest, manifestErr := edgeFetchAgentManifest(ctx, client, controller, token)
+		if manifestErr != nil {
+			return manifestErr
+		}
+		downloadURL = manifest.DownloadURL
+		if !strings.EqualFold(manifest.SHA256, config.AgentSHA256) {
+			return errors.New("Agent release checksum differs from controller configuration")
+		}
+	}
+	platform := goruntime.GOOS + "/" + goruntime.GOARCH
+	asset, assetErr := agentReleaseAssetName(platform)
+	if assetErr != nil {
+		return assetErr
+	}
+	if err := validateAgentReleaseDownloadURL(downloadURL, strings.TrimSpace(config.AgentVersion), asset); err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set(agentPlatformHeader, goruntime.GOOS+"/"+goruntime.GOARCH)
-	response, err := client.Do(request)
+	releaseClient := *client
+	releaseClient.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		if req.URL.Scheme != "https" {
+			return errors.New("refusing non-HTTPS Agent release redirect")
+		}
+		return nil
+	}
+	response, err := releaseClient.Do(request)
 	if err != nil {
 		return err
 	}
@@ -1458,6 +1482,26 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 		return err
 	}
 	return errEdgeAgentUpdated
+}
+
+func edgeFetchAgentManifest(ctx context.Context, client *http.Client, controller, token string) (AgentBinaryManifest, error) {
+	var manifest AgentBinaryManifest
+	if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/manifest", token, nil, &manifest, http.Header{
+		agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
+	}); err != nil {
+		return AgentBinaryManifest{}, err
+	}
+	asset, err := agentReleaseAssetName(manifest.Platform)
+	if err != nil {
+		return AgentBinaryManifest{}, err
+	}
+	if !strings.EqualFold(manifest.Platform, goruntime.GOOS+"/"+goruntime.GOARCH) || !validAgentReleaseVersion(manifest.Version) || len(manifest.SHA256) != sha256.Size*2 {
+		return AgentBinaryManifest{}, errors.New("controller returned an invalid Agent release manifest")
+	}
+	if err := validateAgentReleaseDownloadURL(manifest.DownloadURL, manifest.Version, asset); err != nil {
+		return AgentBinaryManifest{}, err
+	}
+	return manifest, nil
 }
 
 func runEdgeAgent() error {

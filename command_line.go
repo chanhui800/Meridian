@@ -237,6 +237,9 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 	if !settings.Configured || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
 		return errors.New("Cloudflare ACME credentials and panel settings are not configured")
 	}
+	if settings.ACMEStaging {
+		return errors.New("edge certificate issuance is disabled while ACME staging mode is enabled; disable staging mode first")
+	}
 	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
 	if err != nil {
 		return fmt.Errorf("decrypt Cloudflare DNS token: %w", err)

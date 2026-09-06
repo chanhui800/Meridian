@@ -330,6 +330,27 @@ func TestPanelTLSDisabledReasonDistinguishesManualAndFallback(t *testing.T) {
 	}
 }
 
+func TestPanelRenewalSkipsACMEStaging(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "meridian.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.BootstrapPanelSettings("panel.example.com", "example.com", true, 9090); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SavePanelACMECredentials("admin@example.com", "cloudflare", "ciphertext", true); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := renewPanelCertificateIfDue(context.Background(), db, nil)
+	if err != nil {
+		t.Fatalf("staging renewal returned an error: %v", err)
+	}
+	if changed {
+		t.Fatal("staging renewal unexpectedly changed the active certificate")
+	}
+}
+
 func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
 	first := edgeCertificateIdentifiers("example.com", "node-a")
 	second := edgeCertificateIdentifiers("example.com", "node-b")

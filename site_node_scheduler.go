@@ -69,18 +69,19 @@ type AgentSiteRoute struct {
 }
 
 type AgentRuntimeConfig struct {
-	SchemaVersion  int              `json:"schema_version"`
-	ConfigHash     string           `json:"config_hash"`
-	NodeGUID       string           `json:"node_guid"`
-	EntryMode      string           `json:"entry_mode"`
-	HTTPPort       int              `json:"http_port"`
-	HTTPSPort      int              `json:"https_port"`
-	CertificatePEM string           `json:"certificate_pem,omitempty"`
-	PrivateKeyPEM  string           `json:"private_key_pem,omitempty"`
-	DynamicKey     string           `json:"dynamic_key,omitempty"`
-	AgentVersion   string           `json:"agent_version,omitempty"`
-	AgentSHA256    string           `json:"agent_sha256,omitempty"`
-	Routes         []AgentSiteRoute `json:"routes"`
+	SchemaVersion    int              `json:"schema_version"`
+	ConfigHash       string           `json:"config_hash"`
+	NodeGUID         string           `json:"node_guid"`
+	EntryMode        string           `json:"entry_mode"`
+	HTTPPort         int              `json:"http_port"`
+	HTTPSPort        int              `json:"https_port"`
+	CertificatePEM   string           `json:"certificate_pem,omitempty"`
+	PrivateKeyPEM    string           `json:"private_key_pem,omitempty"`
+	DynamicKey       string           `json:"dynamic_key,omitempty"`
+	AgentVersion     string           `json:"agent_version,omitempty"`
+	AgentSHA256      string           `json:"agent_sha256,omitempty"`
+	AgentDownloadURL string           `json:"agent_download_url,omitempty"`
+	Routes           []AgentSiteRoute `json:"routes"`
 }
 
 func deriveNodeRuntimeKey(master []byte, nodeGUID, purpose string) []byte {
@@ -275,7 +276,11 @@ func (d *DB) nodeByAgentToken(token string, now time.Time) (ControlNode, error) 
 	if strings.TrimSpace(token) == "" {
 		return ControlNode{}, errInvalidAgentToken
 	}
-	node, err := scanControlNode(d.db.QueryRow(controlNodeSelect+" WHERE agent_token_hash=?", hashNodeToken(token)), now)
+	// During the bounded re-enrollment window keep the currently running Agent
+	// authorized so a failed installer can recover. Once the one-time token
+	// expires, the old long-lived token is automatically revoked; a successful
+	// enrollment clears the window and replaces it atomically.
+	node, err := scanControlNode(d.db.QueryRow(controlNodeSelect+" WHERE agent_token_hash=? AND (enrollment_token_hash='' OR enrollment_expires_at_ms>?)", hashNodeToken(token), now.UnixMilli()), now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errInvalidAgentToken
 	}
@@ -470,7 +475,12 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 	// executable and fail with ENOEXEC. New Agents identify their platform and
 	// receive the matching version/digest below.
 	if platform != "" {
-		config.AgentVersion, config.AgentSHA256, _ = agentBinaryIdentityForPlatform(platform)
+		manifest, manifestErr := agentReleaseManifestForPlatform(context.Background(), platform)
+		if manifestErr == nil {
+			config.AgentVersion = manifest.Version
+			config.AgentSHA256 = manifest.SHA256
+			config.AgentDownloadURL = manifest.DownloadURL
+		}
 	}
 	if len(routes) > 0 {
 		if a.panelCertificates == nil {
