@@ -182,7 +182,10 @@ func runIssuePanelCertificateCommand(output io.Writer) error {
 	manager.attachDB(db)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
+	// Recovery must always restore a publicly trusted production certificate.
+	// The staging checkbox is an API test mode and must never be able to put a
+	// staging chain into the active listener during recovery.
+	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, false)
 	if err != nil {
 		return fmt.Errorf("issue panel certificate: %w", err)
 	}
@@ -194,11 +197,19 @@ func runIssuePanelCertificateCommand(output io.Writer) error {
 		_ = manager.restoreInstalledFiles(backup)
 		return fmt.Errorf("install panel certificate: %w", err)
 	}
+	if settings.ACMEStaging {
+		// A successful recovery is production issuance; clear the persisted test
+		// flag so future renewal checks are not disabled indefinitely.
+		if err := db.SavePanelACMECredentials(settings.ACMEEmail, settings.ACMEDNSProvider, settings.ACMETokenCiphertext, false); err != nil {
+			_ = manager.restoreInstalledFiles(backup)
+			return fmt.Errorf("clear ACME staging mode after recovery: %w", err)
+		}
+	}
 	if _, _, err := db.SaveManagedPanelSettings(settings.PanelDomain, settings.RouteDomain, settings.ListenPort, true); err != nil {
 		_ = manager.restoreInstalledFiles(backup)
 		return fmt.Errorf("enable panel TLS after certificate issuance: %w", err)
 	}
-	_, err = fmt.Fprintf(output, "panel certificate installed for configured host\n")
+	_, err = fmt.Fprintf(output, "panel certificate installed successfully; restart the Meridian controller to apply it\n")
 	return err
 }
 

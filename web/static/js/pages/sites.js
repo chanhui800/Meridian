@@ -1234,7 +1234,7 @@ function renderPanelCertificateStatus(status) {
 	  <div class="diag-row"><span class="diag-key">站点泛域名</span><span class="diag-val ${status.certificate_matches_route_wildcard ? 'good' : 'warn'}">${status.certificate_matches_route_wildcard ? '已覆盖' : '需要更新'}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
 	  <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${status.certificate_valid ? 'good' : 'warn'}">${status.certificate_valid ? '有效' : '已过期或不可用'}</span></div>
-	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token'}</span></div>
+	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.acme_staging ? '测试环境不会自动续签' : (status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token')}</span></div>
 	  <div class="diag-row"><span class="diag-key">当前监听端口</span><span class="diag-val">${esc(String(status.active_listen_port || '—'))}</span></div>
 	  <div class="diag-row"><span class="diag-key">设置监听端口</span><span class="diag-val ${status.listen_port !== status.active_listen_port ? 'warn' : ''}">${esc(String(status.listen_port || '—'))}</span></div>
 	  <div class="diag-row"><span class="diag-key">面板 HTTPS</span><span class="diag-val ${status.restart_required ? 'warn' : 'good'}">${status.restart_required ? '等待重启应用' : '已启用'}</span></div>
@@ -1312,6 +1312,7 @@ async function showPanelCertificateModal() {
 	    <input type="checkbox" id="m-acme-staging" ${status.acme_staging ? 'checked' : ''}>
 	    <span>ACME 测试环境</span>
 	  </label>
+	  <div class="form-help">测试环境只验证 ACME 和 DNS-01，不会替换当前正式证书，也不会启用自动续签。</div>
 	`;
 	document.getElementById('modal-footer').innerHTML = `
 	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
@@ -1392,7 +1393,7 @@ async function showPanelCertificateModal() {
 		button.textContent = '申请中…';
 		try {
 			const updated = await API.requestPanelCertificate(payload);
-		Toast.success(updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+		Toast.success(updated.staging_tested ? 'ACME 测试成功；正式证书未替换' : (updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载')));
 			closeModal();
 			await showPanelCertificateModal();
 		} catch (error) {

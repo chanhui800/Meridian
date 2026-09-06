@@ -499,7 +499,8 @@ download() {
     local url="$1" output="$2" version
     version=$(printf '%s' "$url" | awk -F/ '{print $(NF-1)}')
     if [[ "$url" == */SHA256SUMS ]]; then
-        printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n' \
+        printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n%s  meridian-agent-linux-arm64\n' \
+            "$(sha256_file "${TEST_ROOT}/release-binary")" \
             "$(sha256_file "${TEST_ROOT}/release-binary")" \
             "$(sha256_file "${TEST_ROOT}/release-binary")" > "$output"
         return
@@ -563,6 +564,8 @@ if ! (do_install) >"${TEST_ROOT}/install-first.log" 2>&1; then
 fi
 assert_eq 'v9.9.9' "$(get_current_version)" 'first installed version'
 assert_file "${INSTALL_DIR}/${AGENT_BIN_NAME}"
+assert_file "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}"
+assert_file "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}"
 assert_eq 'v9.9.9' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'first installed Agent version'
 assert_file "${DATA_DIR}/.env"
 assert_eq '0.0.0.0' "$(read_env_value PANEL_BIND_ADDR)" 'fresh IP bind'
@@ -661,6 +664,8 @@ assert_eq 'v9.9.10' "$(get_current_version)" 'updated latest version'
 assert_eq 'v9.9.9' "$($PREVIOUS_BIN --version)" 'retained previous version'
 assert_eq 'v9.9.10' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'updated Agent version'
 assert_eq 'v9.9.9' "$($PREVIOUS_AGENT_BIN --version)" 'retained previous Agent version'
+assert_eq 'v9.9.10' "$("${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}" --version)" 'updated amd64 Agent version'
+assert_eq 'v9.9.10' "$("${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}" --version)" 'updated arm64 Agent version'
 assert_eq "$domain_env_before" "$(sha256_file "${DATA_DIR}/.env")" 'update preserves .env'
 assert_dir "$BACKUP_DIR"
 assert_contains "$NGINX_CONFIG" "$NGINX_REDACTION_MARKER"
@@ -738,8 +743,8 @@ if (
     download() {
         local url="$1" output="$2"
         if [[ "$url" == */SHA256SUMS ]]; then
-            printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n' \
-                "$(sha256_file "$failing_binary")" "$(sha256_file "$failing_binary")" > "$output"
+            printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n%s  meridian-agent-linux-arm64\n' \
+                "$(sha256_file "$failing_binary")" "$(sha256_file "$failing_binary")" "$(sha256_file "$failing_binary")" > "$output"
             return
         fi
         cp "$failing_binary" "$output"
@@ -751,6 +756,8 @@ fi
 assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
 assert_eq 'v9.9.11' "$(get_current_version)" 'rollback must restore the previous binary'
 assert_eq 'v9.9.11' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'rollback must restore the previous Agent'
+assert_eq 'v9.9.11' "$("${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}" --version)" 'rollback must restore the previous amd64 Agent'
+assert_eq 'v9.9.11' "$("${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}" --version)" 'rollback must restore the previous arm64 Agent'
 # The restored DATA_DIR is owned by the service user (0750, db 0600,
 # .env root:meridian 0640), so a non-root runner cannot read it directly.
 run_as_test_root cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before" \
@@ -1069,8 +1076,8 @@ if (
     download() {
         local url="$1" output="$2"
         if [[ "$url" == */SHA256SUMS ]]; then
-            printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n' \
-                "$(sha256_file "$retry_failing_binary")" "$(sha256_file "$retry_failing_binary")" > "$output"
+            printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n%s  meridian-agent-linux-arm64\n' \
+                "$(sha256_file "$retry_failing_binary")" "$(sha256_file "$retry_failing_binary")" "$(sha256_file "$retry_failing_binary")" > "$output"
             return
         fi
         cp "$retry_failing_binary" "$output"

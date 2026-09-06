@@ -90,6 +90,12 @@ func renewEdgeCertificatesIfDue(ctx context.Context, db *DB, manager *panelCerti
 	if !settings.Configured || strings.TrimSpace(settings.RouteDomain) == "" || jwtSecretEphemeral || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
 		return nil
 	}
+	if settings.ACMEStaging {
+		// Staging issuance is an explicit test action. Never let the renewal
+		// scheduler replace production panel or edge certificates with a chain
+		// that normal clients do not trust.
+		return nil
+	}
 	provider := strings.ToLower(strings.TrimSpace(settings.ACMEDNSProvider))
 	if provider == "" {
 		provider = "cloudflare"
@@ -128,6 +134,9 @@ func ensureEdgeCertificateForNode(ctx context.Context, settings PanelSettings, t
 	if manager == nil || !edgeCertificateRequired(node) || strings.TrimSpace(node.GUID) == "" {
 		return false, nil
 	}
+	if settings.ACMEStaging {
+		return false, nil
+	}
 	certFile, keyFile, err := manager.nodeEdgeTLSPaths(node.GUID)
 	if err != nil {
 		return false, err
@@ -161,6 +170,9 @@ func provisionEdgeCertificateForNode(ctx context.Context, db *DB, manager *panel
 		return err
 	}
 	if !settings.Configured || strings.TrimSpace(settings.RouteDomain) == "" || jwtSecretEphemeral || strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
+		return nil
+	}
+	if settings.ACMEStaging {
 		return nil
 	}
 	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)

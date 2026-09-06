@@ -134,7 +134,7 @@ func (a *App) panelCertificateStatus(settings PanelSettings) panelCertificateSta
 	status.ACMEEmail = settings.ACMEEmail
 	status.ACMEDNSProvider = settings.ACMEDNSProvider
 	status.ACMEStaging = settings.ACMEStaging
-	status.AutoRenewEnabled = !jwtSecretEphemeral && settings.ACMEEmail != "" && settings.ACMETokenCiphertext != ""
+	status.AutoRenewEnabled = !jwtSecretEphemeral && !settings.ACMEStaging && settings.ACMEEmail != "" && settings.ACMETokenCiphertext != ""
 	if settings.ACMETokenCiphertext == "" {
 		return status
 	}
@@ -215,6 +215,28 @@ func (a *App) handlePanelCertificateIssue(w http.ResponseWriter, r *http.Request
 	settings, err = a.db.PanelSettings()
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "failed to read panel settings")
+		return
+	}
+	if req.UseStaging {
+		// Let operators validate the ACME account and DNS-01 challenge without
+		// ever replacing the live certificate or changing the TLS enablement.
+		// Staging CAs are intentionally not trusted by normal clients, so the
+		// resulting certificate must remain out of the active certificate pair.
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+		if _, issueErr := a.panelCertificates.issueCloudflare(ctx, email, token, settings.PanelDomain, settings.RouteDomain, true); issueErr != nil {
+			status := http.StatusBadGateway
+			if errors.Is(issueErr, errCertificateIssuanceBusy) {
+				status = http.StatusConflict
+			}
+			log.Printf("panel ACME staging request failed for %s: %v", settings.PanelDomain, issueErr)
+			a.jsonErr(w, status, issueErr.Error())
+			return
+		}
+		currentStatus := a.panelCertificateStatus(settings)
+		currentStatus.StagingTested = true
+		log.Printf("panel ACME staging certificate issued for %s; active TLS certificate was left unchanged", settings.PanelDomain)
+		a.jsonOK(w, currentStatus)
 		return
 	}
 	currentStatus := a.panelCertificateStatus(settings)

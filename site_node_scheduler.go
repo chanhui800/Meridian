@@ -464,7 +464,14 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, EntryMode: "direct",
 		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), Routes: routes}
-	config.AgentVersion, config.AgentSHA256, _ = agentBinaryIdentityForPlatform(platform)
+	// Legacy Agents do not send a platform header. Do not advertise the
+	// controller's local binary to those clients: on a cross-architecture
+	// rollout that checksum would make an old arm64 Agent download an amd64
+	// executable and fail with ENOEXEC. New Agents identify their platform and
+	// receive the matching version/digest below.
+	if platform != "" {
+		config.AgentVersion, config.AgentSHA256, _ = agentBinaryIdentityForPlatform(platform)
+	}
 	if len(routes) > 0 {
 		if a.panelCertificates == nil {
 			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")

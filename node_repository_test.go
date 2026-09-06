@@ -381,6 +381,21 @@ func TestBuildNodeInstallScriptDoesNotPersistTokenInService(t *testing.T) {
 	}
 }
 
+func TestAgentInstallScriptIsTransactional(t *testing.T) {
+	script := buildNodeInstallScript("https://panel.example.com", "enrollment-secret")
+	downloadIndex := strings.Index(script, "curl --proto")
+	stopIndex := strings.Index(script, "systemctl stop meridian-agent.service")
+	if downloadIndex < 0 || stopIndex < 0 || stopIndex < downloadIndex {
+		t.Fatalf("Agent installer stops the service before downloading and validating: download=%d stop=%d", downloadIndex, stopIndex)
+	}
+	if strings.Contains(script, `rm -f "$state_dir/state.json"`) {
+		t.Fatal("Agent installer deletes durable state during reinstall")
+	}
+	if !strings.Contains(script, "previous Agent, state, token, and service were restored") {
+		t.Fatal("Agent installer does not expose rollback behavior")
+	}
+}
+
 func TestAgentPlatformHeaderNormalization(t *testing.T) {
 	for _, test := range []struct {
 		input string
@@ -404,6 +419,26 @@ func TestAgentPlatformHeaderNormalization(t *testing.T) {
 	platform, err := requestedAgentPlatform(request)
 	if err != nil || platform != "linux/arm64" {
 		t.Fatalf("requested platform = %q, err=%v", platform, err)
+	}
+}
+
+func TestLegacyAgentConfigDoesNotAdvertiseControllerBinary(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	_, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "legacy-agent", Address: "203.0.113.40", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := app.buildAgentConfigForPlatform(token, now, "")
+	if err != nil {
+		t.Fatalf("build legacy Agent config: %v", err)
+	}
+	if config.AgentVersion != "" || config.AgentSHA256 != "" {
+		t.Fatalf("legacy Agent config advertised a local binary: version=%q sha=%q", config.AgentVersion, config.AgentSHA256)
 	}
 }
 

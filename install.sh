@@ -28,6 +28,10 @@ while [ "$BACKUP_DIR" != "/" ] && [[ "$BACKUP_DIR" == */ ]]; do BACKUP_DIR="${BA
 
 PREVIOUS_BIN="${INSTALL_DIR}/${BIN_NAME}.previous"
 PREVIOUS_AGENT_BIN="${INSTALL_DIR}/${AGENT_BIN_NAME}.previous"
+AGENT_BIN_AMD64_NAME="${AGENT_BIN_NAME}-linux-amd64"
+AGENT_BIN_ARM64_NAME="${AGENT_BIN_NAME}-linux-arm64"
+PREVIOUS_AGENT_BIN_AMD64="${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.previous"
+PREVIOUS_AGENT_BIN_ARM64="${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.previous"
 ASSUME_YES="${MERIDIAN_ASSUME_YES:-0}"
 PURGE_DATA=0
 DOMAIN_MODE="ask"
@@ -41,6 +45,8 @@ UPDATE_WAS_ACTIVE=0
 UPDATE_BINARY_CHANGED=0
 UPDATE_AGENT_CHANGED=0
 UPDATE_AGENT_WAS_PRESENT=0
+UPDATE_AGENT_AMD64_WAS_PRESENT=0
+UPDATE_AGENT_ARM64_WAS_PRESENT=0
 UPDATE_TRANSACTION=0
 UPDATE_SNAPSHOT_DIR=""
 UPDATE_SNAPSHOT_RESTORED=0
@@ -52,6 +58,9 @@ PASSWORD_DB_PATH=""
 PASSWORD_TRANSACTION=0
 PANEL_WORK_DIR=""
 PANEL_TRANSACTION=0
+DOWNLOADED_AGENT_BINARY_AMD64=""
+DOWNLOADED_AGENT_BINARY_ARM64=""
+DOWNLOADED_CONTROLLER_SUFFIX=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -439,38 +448,41 @@ get_current_version() {
 }
 
 download_release_binary() {
-    local version="$1" tmp_dir="$2" suffix asset agent_asset binary_file agent_file checksum_file expected actual
+    local version="$1" tmp_dir="$2" suffix asset binary_file checksum_file agent_asset agent_file
     suffix=$(detect_platform)
+    DOWNLOADED_CONTROLLER_SUFFIX="$suffix"
     asset="${BIN_NAME}-${suffix}"
-    agent_asset="${AGENT_BIN_NAME}-${suffix}"
     binary_file="${tmp_dir}/${asset}"
-    agent_file="${tmp_dir}/${agent_asset}"
     checksum_file="${tmp_dir}/SHA256SUMS"
     info "下载 Meridian ${version} (${suffix})..."
     download "https://github.com/${REPO}/releases/download/${version}/${asset}" "$binary_file" \
         || fail "二进制下载失败，请检查网络和 Release"
-    download "https://github.com/${REPO}/releases/download/${version}/${agent_asset}" "$agent_file" \
-        || fail "Agent 二进制下载失败，请检查网络和 Release"
     download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS" "$checksum_file" \
         || fail "SHA256SUMS 下载失败；已停止安装"
-    expected=$(awk -v file="$asset" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
-    printf '%s' "$expected" | grep -Eq '^[[:xdigit:]]{64}$' \
-        || fail "SHA256SUMS 中缺少 ${asset} 的有效校验值"
-    actual=$(sha256_file "$binary_file")
-    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
-    actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
-    [ "$expected" = "$actual" ] || fail "下载文件 SHA-256 校验失败"
-    chmod 0755 "$binary_file"
-    expected=$(awk -v file="$agent_asset" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
-    printf '%s' "$expected" | grep -Eq '^[[:xdigit:]]{64}$' \
-        || fail "SHA256SUMS 中缺少 ${agent_asset} 的有效校验值"
-    actual=$(sha256_file "$agent_file")
-    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
-    actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
-    [ "$expected" = "$actual" ] || fail "Agent 下载文件 SHA-256 校验失败"
-    chmod 0755 "$agent_file"
+    verify_download() {
+        local verify_asset="$1" verify_file="$2" verify_expected verify_actual
+        verify_expected=$(awk -v file="$verify_asset" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
+        printf '%s' "$verify_expected" | grep -Eq '^[[:xdigit:]]{64}$' \
+            || fail "SHA256SUMS 中缺少 ${verify_asset} 的有效校验值"
+        verify_actual=$(sha256_file "$verify_file")
+        verify_expected=$(printf '%s' "$verify_expected" | tr '[:upper:]' '[:lower:]')
+        verify_actual=$(printf '%s' "$verify_actual" | tr '[:upper:]' '[:lower:]')
+        [ "$verify_expected" = "$verify_actual" ] || fail "${verify_asset} 下载文件 SHA-256 校验失败"
+        chmod 0755 "$verify_file"
+    }
+    verify_download "$asset" "$binary_file"
+    for agent_asset in "$AGENT_BIN_AMD64_NAME" "$AGENT_BIN_ARM64_NAME"; do
+        agent_file="${tmp_dir}/${agent_asset}"
+        download "https://github.com/${REPO}/releases/download/${version}/${agent_asset}" "$agent_file" \
+            || fail "${agent_asset} 下载失败；当前 Release 必须同时提供 Linux amd64/arm64 Agent"
+        verify_download "$agent_asset" "$agent_file"
+        if [ "$agent_asset" = "$AGENT_BIN_AMD64_NAME" ]; then
+            DOWNLOADED_AGENT_BINARY_AMD64="$agent_file"
+        else
+            DOWNLOADED_AGENT_BINARY_ARM64="$agent_file"
+        fi
+    done
     DOWNLOADED_BINARY="$binary_file"
-    DOWNLOADED_AGENT_BINARY="$agent_file"
     ok "主控与 Agent SHA-256 校验通过"
 }
 
@@ -961,6 +973,20 @@ restore_previous_agent_binary() {
     else
         as_root rm -f -- "${INSTALL_DIR}/${AGENT_BIN_NAME}"
     fi
+    if [ "$UPDATE_AGENT_AMD64_WAS_PRESENT" = "1" ]; then
+        [ -f "$PREVIOUS_AGENT_BIN_AMD64" ] || return 1
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$PREVIOUS_AGENT_BIN_AMD64" "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.rollback"
+        as_root mv -f "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.rollback" "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}"
+    else
+        as_root rm -f -- "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}"
+    fi
+    if [ "$UPDATE_AGENT_ARM64_WAS_PRESENT" = "1" ]; then
+        [ -f "$PREVIOUS_AGENT_BIN_ARM64" ] || return 1
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$PREVIOUS_AGENT_BIN_ARM64" "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.rollback"
+        as_root mv -f "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.rollback" "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}"
+    else
+        as_root rm -f -- "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}"
+    fi
 }
 
 cleanup_update_transaction() {
@@ -992,6 +1018,8 @@ cleanup_update_transaction() {
         UPDATE_TRANSACTION=0
         UPDATE_BINARY_CHANGED=0
         UPDATE_AGENT_CHANGED=0
+        UPDATE_AGENT_AMD64_WAS_PRESENT=0
+        UPDATE_AGENT_ARM64_WAS_PRESENT=0
     fi
     UPDATE_SERVICE_CHANGED=0
     UPDATE_SERVICE_SNAPSHOT=""
@@ -1704,7 +1732,7 @@ apply_domain_choice() {
 }
 
 do_install() {
-    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_agent="${INSTALL_DIR}/${AGENT_BIN_NAME}" tmp_dir version
+    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_agent="${INSTALL_DIR}/${AGENT_BIN_NAME}" current_agent_amd64="${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}" current_agent_arm64="${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}" tmp_dir version
     INITIAL_SETUP_TOKEN=""
     need_cmd curl
     need_cmd awk
@@ -1745,13 +1773,21 @@ do_install() {
     as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$INSTALL_DIR"
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
     as_root mv -f "${current_binary}.new" "$current_binary"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY" "${current_agent}.new"
-    as_root mv -f "${current_agent}.new" "$current_agent"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
+    as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
+    as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
+    # Keep the historical single-name path for Linux systemd installs and
+    # older administrators' tooling. The controller itself always selects the
+    # platform-specific files above when a new Agent supplies its platform.
+    case "$DOWNLOADED_CONTROLLER_SUFFIX" in
+        linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+        linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+    esac
 
     if is_systemd; then
         if ! as_root systemctl restart "$SERVICE_NAME" || ! wait_for_health 20; then
-            as_root rm -f -- "$current_binary"
-            as_root rm -f -- "$current_agent"
+            as_root rm -f -- "$current_binary" "$current_agent" "$current_agent_amd64" "$current_agent_arm64"
             as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
             rm -rf -- "$tmp_dir"
             fail "首次启动未通过健康检查；二进制已移除，数据与配置已保留"
@@ -1776,7 +1812,7 @@ do_install() {
 }
 
 do_update() {
-    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_agent="${INSTALL_DIR}/${AGENT_BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
+    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_agent="${INSTALL_DIR}/${AGENT_BIN_NAME}" current_agent_amd64="${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}" current_agent_arm64="${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}" current_version latest_version should_stop_after=0 tmp_dir
     INITIAL_SETUP_TOKEN=""
     UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_SERVICE_CHANGED=0
@@ -1852,10 +1888,32 @@ do_update() {
         UPDATE_AGENT_WAS_PRESENT=0
         as_root rm -f -- "$PREVIOUS_AGENT_BIN"
     fi
+    if as_root test -f "$current_agent_amd64"; then
+        UPDATE_AGENT_AMD64_WAS_PRESENT=1
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent_amd64" "${PREVIOUS_AGENT_BIN_AMD64}.new"
+        as_root mv -f "${PREVIOUS_AGENT_BIN_AMD64}.new" "$PREVIOUS_AGENT_BIN_AMD64"
+    else
+        UPDATE_AGENT_AMD64_WAS_PRESENT=0
+        as_root rm -f -- "$PREVIOUS_AGENT_BIN_AMD64"
+    fi
+    if as_root test -f "$current_agent_arm64"; then
+        UPDATE_AGENT_ARM64_WAS_PRESENT=1
+        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_agent_arm64" "${PREVIOUS_AGENT_BIN_ARM64}.new"
+        as_root mv -f "${PREVIOUS_AGENT_BIN_ARM64}.new" "$PREVIOUS_AGENT_BIN_ARM64"
+    else
+        UPDATE_AGENT_ARM64_WAS_PRESENT=0
+        as_root rm -f -- "$PREVIOUS_AGENT_BIN_ARM64"
+    fi
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
     as_root mv -f "${current_binary}.new" "$current_binary"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY" "${current_agent}.new"
-    as_root mv -f "${current_agent}.new" "$current_agent"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
+    as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
+    as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
+    case "$DOWNLOADED_CONTROLLER_SUFFIX" in
+        linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+        linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
+    esac
     UPDATE_BINARY_CHANGED=1
     UPDATE_AGENT_CHANGED=1
 
@@ -2118,7 +2176,11 @@ do_uninstall() {
     as_root rm -f -- "${INSTALL_DIR}/${BIN_NAME}" "$PREVIOUS_BIN" \
         "${INSTALL_DIR}/${BIN_NAME}.new" "${INSTALL_DIR}/${BIN_NAME}.rollback" \
         "${INSTALL_DIR}/${AGENT_BIN_NAME}" "$PREVIOUS_AGENT_BIN" \
-        "${INSTALL_DIR}/${AGENT_BIN_NAME}.new" "${INSTALL_DIR}/${AGENT_BIN_NAME}.rollback"
+        "${INSTALL_DIR}/${AGENT_BIN_NAME}.new" "${INSTALL_DIR}/${AGENT_BIN_NAME}.rollback" \
+        "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}" "$PREVIOUS_AGENT_BIN_AMD64" \
+        "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.new" "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.rollback" \
+        "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}" "$PREVIOUS_AGENT_BIN_ARM64" \
+        "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.new" "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.rollback"
 
     if [ "$remove_data" = "1" ]; then
         as_root rm -rf -- "$DATA_DIR"

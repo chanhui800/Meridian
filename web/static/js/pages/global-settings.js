@@ -353,6 +353,7 @@ async function renderTLSSettings() {
           <div class="form-group"><label>DNS 服务商</label><select class="form-select" id="p-acme-provider"><option value="cloudflare">Cloudflare DNS</option></select></div>
           <div class="form-group"><label>DNS API Token</label><input type="text" class="form-input mono" id="p-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token"><div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div></div>
           <label class="settings-check"><input type="checkbox" id="p-acme-staging" ${status.acme_staging ? 'checked' : ''}><span>ACME 测试环境</span></label>
+          <div class="form-help">测试环境只验证 ACME 和 DNS-01，不会替换当前正式证书，也不会启用自动续签。</div>
           <div class="settings-save-bar tls-settings-actions">
             ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current) && status.certificate_valid) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="telegram-btn primary" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
             <button class="telegram-btn" type="button" id="p-cert-save">保存设置</button>
@@ -432,7 +433,7 @@ async function renderTLSSettings() {
       button.textContent = '申请中…';
       try {
         const updated = await API.requestPanelCertificate(payload);
-        Toast.success(updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+        Toast.success(updated.staging_tested ? 'ACME 测试成功；正式证书未替换' : (updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载')));
         await renderTLSSettings();
       } catch (error) {
         button.disabled = false;

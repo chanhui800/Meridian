@@ -361,6 +361,29 @@ func TestPanelCertificateIdentifiersKeepHostModeSitesCovered(t *testing.T) {
 	}
 }
 
+func TestCertificateWildcardCoverageRequiresExactWildcardSAN(t *testing.T) {
+	probeOnly := &x509.Certificate{DNSNames: []string{"meridian-edge-check.example.test"}}
+	if certificateHasExactDNSName(probeOnly, "*.example.test") {
+		t.Fatal("an exact probe SAN must not be treated as wildcard coverage")
+	}
+	wildcard := &x509.Certificate{DNSNames: []string{"*.example.test"}}
+	if !certificateHasExactDNSName(wildcard, "*.example.test") {
+		t.Fatal("the expected wildcard SAN was not detected")
+	}
+}
+
+func TestStagingEdgeProvisioningIsNeverInstalled(t *testing.T) {
+	changed, err := ensureEdgeCertificateForNode(context.Background(), PanelSettings{ACMEStaging: true, RouteDomain: "example.test"}, "token", &panelCertificateManager{}, ControlNode{
+		GUID: "node", Enabled: true, EnrolledAtMS: 1,
+	})
+	if err != nil {
+		t.Fatalf("staging edge provisioning returned an error: %v", err)
+	}
+	if changed {
+		t.Fatal("staging edge provisioning installed a certificate")
+	}
+}
+
 func TestCloudflareFindZoneUsesLongestMatch(t *testing.T) {
 	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

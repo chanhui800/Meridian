@@ -30,8 +30,9 @@ install_dir=/opt/meridian-agent
 state_dir=/var/lib/meridian-agent
 token_dir=/etc/meridian-agent
 token_file="$token_dir/enrollment-token"
-binary_tmp="$install_dir/meridian-agent.tmp"
-headers_tmp="$install_dir/meridian-agent.headers.tmp"
+service_file=/etc/systemd/system/meridian-agent.service
+umask 077
+rollback_active=0
 
 [ "$(id -u)" -eq 0 ] || { echo 'Please run this script as root.' >&2; exit 1; }
 case "$(uname -s):$(uname -m)" in
@@ -42,12 +43,27 @@ esac
 
 command -v curl >/dev/null 2>&1 || { echo 'curl is required.' >&2; exit 1; }
 command -v systemctl >/dev/null 2>&1 || { echo 'systemd is required.' >&2; exit 1; }
+command -v mktemp >/dev/null 2>&1 || { echo 'mktemp is required.' >&2; exit 1; }
 install -d -m 0755 "$install_dir"
 install -d -m 0700 "$state_dir" "$token_dir"
-systemctl stop meridian-agent.service 2>/dev/null || true
-rm -f "$state_dir/state.json" "$binary_tmp" "$headers_tmp"
-umask 077
-printf '%s' "$enrollment_token" > "$token_file"
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/meridian-agent-install.XXXXXXXX")
+cleanup() {
+  exit_code=$?
+  if [ "$exit_code" -ne 0 ] && [ "$rollback_active" -eq 1 ] && command -v rollback >/dev/null 2>&1; then
+    rollback || true
+  fi
+  rm -rf "$work_dir"
+  exit "$exit_code"
+}
+trap cleanup EXIT
+binary_tmp="$work_dir/meridian-agent"
+headers_tmp="$work_dir/meridian-agent.headers"
+token_tmp="$work_dir/enrollment-token"
+service_tmp="$work_dir/meridian-agent.service"
+
+# Download and validate everything before touching the running service, state,
+# token, or systemd unit. A failed download therefore leaves an existing Agent
+# completely untouched.
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$headers_tmp" \
   -H "Authorization: Bearer $enrollment_token" \
   -H "X-Meridian-Agent-Platform: $agent_platform" \
@@ -77,11 +93,10 @@ if [ "$expected_sha" != "$actual_sha" ]; then
   echo "actual:   $actual_sha" >&2
   exit 1
 fi
-rm -f "$headers_tmp"
 chmod 0755 "$binary_tmp"
-mv -f "$binary_tmp" "$install_dir/meridian-agent"
-
-cat > /etc/systemd/system/meridian-agent.service <<EOF
+printf '%s' "$enrollment_token" > "$token_tmp"
+chmod 0600 "$token_tmp"
+cat > "$service_tmp" <<EOF
 [Unit]
 Description=Meridian node agent
 After=network-online.target
@@ -102,10 +117,72 @@ ReadWritePaths=$state_dir $install_dir $token_dir
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now meridian-agent.service
-if ! systemctl is-active --quiet meridian-agent.service; then
-  systemctl --no-pager --full --lines=20 status meridian-agent.service >&2 || true
+# Snapshot the small set of files that will be replaced. state.json is
+# deliberately never removed: reinstalling the binary must not force a new
+# enrollment or destroy the node's durable state.
+had_binary=0; had_token=0; had_service=0; was_active=0; was_enabled=0
+binary_backup="$work_dir/meridian-agent.previous"
+token_backup="$work_dir/enrollment-token.previous"
+service_backup="$work_dir/meridian-agent.service.previous"
+if [ -f "$install_dir/meridian-agent" ]; then
+  had_binary=1
+  cp -p "$install_dir/meridian-agent" "$binary_backup"
+fi
+if [ -f "$token_file" ]; then
+  had_token=1
+  cp -p "$token_file" "$token_backup"
+fi
+if [ -f "$service_file" ]; then
+  had_service=1
+  cp -p "$service_file" "$service_backup"
+fi
+if systemctl is-active --quiet meridian-agent.service 2>/dev/null; then was_active=1; fi
+if systemctl is-enabled --quiet meridian-agent.service 2>/dev/null; then was_enabled=1; fi
+
+rollback() {
+  systemctl stop meridian-agent.service >/dev/null 2>&1 || true
+  if [ "$had_binary" -eq 1 ]; then
+    install -m 0755 "$binary_backup" "$install_dir/meridian-agent.rollback"
+    mv -f "$install_dir/meridian-agent.rollback" "$install_dir/meridian-agent"
+  else
+    rm -f "$install_dir/meridian-agent"
+  fi
+  if [ "$had_token" -eq 1 ]; then
+    install -m 0600 "$token_backup" "$token_file.rollback"
+    mv -f "$token_file.rollback" "$token_file"
+  else
+    rm -f "$token_file"
+  fi
+  if [ "$had_service" -eq 1 ]; then
+    install -m 0644 "$service_backup" "$service_file.rollback"
+    mv -f "$service_file.rollback" "$service_file"
+  else
+    rm -f "$service_file"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ "$was_enabled" -eq 1 ]; then systemctl enable meridian-agent.service >/dev/null 2>&1 || true; else systemctl disable meridian-agent.service >/dev/null 2>&1 || true; fi
+  if [ "$was_active" -eq 1 ]; then systemctl start meridian-agent.service >/dev/null 2>&1 || true; fi
+}
+trap 'if [ "$rollback_active" -eq 1 ]; then rollback; fi; exit 130' HUP INT TERM
+
+systemctl stop meridian-agent.service >/dev/null 2>&1 || true
+rollback_active=1
+install -m 0755 "$binary_tmp" "$install_dir/meridian-agent.new"
+mv -f "$install_dir/meridian-agent.new" "$install_dir/meridian-agent"
+# Preserve a valid existing enrollment token and state. A new token is only
+# written for a first install or when the state file is absent (explicit
+# re-enrollment can remove state.json before running this script).
+if [ ! -f "$state_dir/state.json" ] || [ ! -f "$token_file" ]; then
+  install -m 0600 "$token_tmp" "$token_file.new"
+  mv -f "$token_file.new" "$token_file"
+fi
+install -m 0644 "$service_tmp" "$service_file.new"
+mv -f "$service_file.new" "$service_file"
+if ! systemctl daemon-reload || ! systemctl enable --now meridian-agent.service || ! systemctl is-active --quiet meridian-agent.service; then
+  rollback
+  rollback_active=0
+  echo 'Agent installation failed; the previous Agent, state, token, and service were restored.' >&2
   exit 1
 fi
+rollback_active=0
 printf '%s\n' 'Meridian Agent installed and running.'

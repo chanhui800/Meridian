@@ -58,6 +58,7 @@ type panelCertificateStatus struct {
 	CertificateMatchesConfiguredDomain bool   `json:"certificate_matches_configured_domain"`
 	CertificateMatchesRouteWildcard    bool   `json:"certificate_matches_route_wildcard"`
 	CertificateValid                   bool   `json:"certificate_valid"`
+	StagingTested                      bool   `json:"staging_tested,omitempty"`
 	CertificateReused                  bool   `json:"certificate_reused,omitempty"`
 	ListenPort                         int    `json:"listen_port"`
 	ActiveListenPort                   int    `json:"active_listen_port"`
@@ -510,8 +511,9 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	activePanelDomain = strings.TrimSpace(activePanelDomain)
 	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(activePanelDomain) == nil
 	status.CertificateMatchesConfiguredDomain = configuredPanelDomain != "" && certificate.VerifyHostname(configuredPanelDomain) == nil
+	wildcardDomain := wildcardDomainForSettings(settings)
 	routeProbeHost := routeWildcardProbeHost(settings.RouteDomain)
-	status.CertificateMatchesRouteWildcard = routeProbeHost != "" && certificate.VerifyHostname(routeProbeHost) == nil
+	status.CertificateMatchesRouteWildcard = certificateHasExactDNSName(certificate, wildcardDomain)
 	now := time.Now()
 	timeValid := !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
 	chainValid := configuredPanelDomain != "" && status.CertificateMatchesRouteWildcard &&
@@ -559,13 +561,27 @@ func certificateStatusForFile(certFile string, expectedWildcard string) panelCer
 			break
 		}
 	}
-	status.CertificateCurrent = expectedWildcard == "" || strings.EqualFold(status.CertificateWildcardDomain, expectedWildcard)
+	status.CertificateMatchesRouteWildcard = certificateHasExactDNSName(certificate, expectedWildcard)
+	status.CertificateCurrent = expectedWildcard == "" || status.CertificateMatchesRouteWildcard
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
 	status.DaysRemaining = int(time.Until(certificate.NotAfter).Hours() / 24)
 	if status.DaysRemaining < 0 {
 		status.DaysRemaining = 0
 	}
 	return status
+}
+
+func certificateHasExactDNSName(certificate *x509.Certificate, expected string) bool {
+	expected = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(expected)), ".")
+	if certificate == nil || expected == "" {
+		return false
+	}
+	for _, name := range certificate.DNSNames {
+		if strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".") == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func certificateCoversHost(certFile, host string) error {
