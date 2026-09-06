@@ -91,7 +91,7 @@ func runHealthcheckCommand() error {
 
 func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-edge-certificate")
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-panel-certificate | issue-edge-certificate")
 	}
 	if args[0] == "issue-edge-certificate" {
 		if len(args) != 1 {
@@ -99,8 +99,14 @@ func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 		}
 		return runIssueEdgeCertificateCommand(output)
 	}
+	if args[0] == "issue-panel-certificate" {
+		if len(args) != 1 {
+			return errors.New("issue-panel-certificate does not accept arguments")
+		}
+		return runIssuePanelCertificateCommand(output)
+	}
 	if args[0] != "reset-password" {
-		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-edge-certificate")
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-panel-certificate | issue-edge-certificate")
 	}
 	var dbPath string
 	passwordStdin := false
@@ -138,6 +144,61 @@ func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 		return fmt.Errorf("reset administrator password: %w", err)
 	}
 	_, err = fmt.Fprintln(output, "administrator password updated")
+	return err
+}
+
+// runIssuePanelCertificateCommand provisions the configured controller
+// certificate from the encrypted Cloudflare credential in the local database.
+// It is intended for recovery when an expired panel certificate prevents the
+// HTTP API from starting; no credential material is printed.
+func runIssuePanelCertificateCommand(output io.Writer) error {
+	if jwtSecretEphemeral {
+		return errors.New("JWT_SECRET is ephemeral; configure a persistent secret before issuing a panel certificate")
+	}
+	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
+	if dbPath == "" {
+		dbPath = "/app/data/meridian.db"
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	settings, err := db.PanelSettings()
+	if err != nil {
+		return fmt.Errorf("read panel settings: %w", err)
+	}
+	if !settings.Configured || strings.TrimSpace(settings.PanelDomain) == "" || strings.TrimSpace(settings.RouteDomain) == "" || settings.ListenPort == 0 {
+		return errors.New("panel settings are not configured")
+	}
+	if strings.TrimSpace(settings.ACMEEmail) == "" || strings.TrimSpace(settings.ACMETokenCiphertext) == "" {
+		return errors.New("Cloudflare ACME credentials and panel settings are not configured")
+	}
+	token, err := decryptPanelACMEToken(settings.ACMETokenCiphertext)
+	if err != nil {
+		return fmt.Errorf("decrypt Cloudflare DNS token: %w", err)
+	}
+	manager := newPanelCertificateManager(dbPath, nil)
+	manager.attachDB(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	issued, err := manager.issueCloudflare(ctx, settings.ACMEEmail, token, settings.PanelDomain, settings.RouteDomain, settings.ACMEStaging)
+	if err != nil {
+		return fmt.Errorf("issue panel certificate: %w", err)
+	}
+	backup, err := manager.backupInstalledFiles()
+	if err != nil {
+		return fmt.Errorf("backup existing panel certificate: %w", err)
+	}
+	if err := manager.install(issued, true); err != nil {
+		_ = manager.restoreInstalledFiles(backup)
+		return fmt.Errorf("install panel certificate: %w", err)
+	}
+	if _, _, err := db.SaveManagedPanelSettings(settings.PanelDomain, settings.RouteDomain, settings.ListenPort, true); err != nil {
+		_ = manager.restoreInstalledFiles(backup)
+		return fmt.Errorf("enable panel TLS after certificate issuance: %w", err)
+	}
+	_, err = fmt.Fprintf(output, "panel certificate installed for configured host\n")
 	return err
 }
 
