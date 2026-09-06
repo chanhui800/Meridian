@@ -96,6 +96,25 @@ func TestEdgeObserverMarksReplayEventsCritical(t *testing.T) {
 	}
 }
 
+func TestEdgeAgentHealthProbeBypassesRouteAssignment(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	handler := runtime.observe(map[string]int64{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Meridian-Node", "edge-node")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "https://unassigned.example.test/.well-known/meridian-agent-health", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("health probe status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got := response.Header().Get("X-Meridian-Node"); got != "edge-node" {
+		t.Fatalf("health probe node header = %q, want edge-node", got)
+	}
+}
+
 func TestEdgeEventSpoolCorruptionCanBeQuarantined(t *testing.T) {
 	dir := t.TempDir()
 	spoolDir := filepath.Join(dir, "events")

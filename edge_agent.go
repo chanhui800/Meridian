@@ -755,6 +755,12 @@ func edgeClientIP(remote string) string {
 
 func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The scheduler probes this endpoint before a site has been assigned to
+		// the node. Let it reach the router without requiring a route mapping.
+		if r.Method == http.MethodGet && r.URL.Path == "/.well-known/meridian-agent-health" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		host := requestPublicHost(r.Host)
 		siteID := siteIDs[host]
 		if siteID == 0 {
