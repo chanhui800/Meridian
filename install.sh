@@ -1936,7 +1936,9 @@ do_update() {
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
             restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
-            restore_previous_agent_binary || fail "回滚失败：缺少上一版本 Agent，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
+            if [ "$UPDATE_AGENT_CHANGED" = "1" ]; then
+                restore_previous_agent_binary || fail "回滚失败：缺少上一版本 Agent，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
+            fi
             UPDATE_BINARY_CHANGED=0
             UPDATE_AGENT_CHANGED=0
             if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
@@ -1954,7 +1956,9 @@ do_update() {
         if ! "$current_binary" --version >/dev/null 2>&1; then
             warn "新版本二进制无法执行，正在自动回滚..."
             restore_previous_binary || true
-            restore_previous_agent_binary || true
+            if [ "$UPDATE_AGENT_CHANGED" = "1" ]; then
+                restore_previous_agent_binary || true
+            fi
             UPDATE_BINARY_CHANGED=0
             UPDATE_AGENT_CHANGED=0
             if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then

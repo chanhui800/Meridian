@@ -276,11 +276,11 @@ func (d *DB) nodeByAgentToken(token string, now time.Time) (ControlNode, error) 
 	if strings.TrimSpace(token) == "" {
 		return ControlNode{}, errInvalidAgentToken
 	}
-	// During the bounded re-enrollment window keep the currently running Agent
-	// authorized so a failed installer can recover. Once the one-time token
-	// expires, the old long-lived token is automatically revoked; a successful
-	// enrollment clears the window and replaces it atomically.
-	node, err := scanControlNode(d.db.QueryRow(controlNodeSelect+" WHERE agent_token_hash=? AND (enrollment_token_hash='' OR enrollment_expires_at_ms>?)", hashNodeToken(token), now.UnixMilli()), now)
+	// Keep the currently running Agent authorized until a replacement enrollment
+	// commits. A pending one-time enrollment token is allowed to expire without
+	// revoking the old long-lived token; this makes regenerating a script safe
+	// even when the operator does not run it immediately.
+	node, err := scanControlNode(d.db.QueryRow(controlNodeSelect+" WHERE agent_token_hash=?", hashNodeToken(token)), now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errInvalidAgentToken
 	}
@@ -347,14 +347,55 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	return nil
 }
 
+// agentConfigHash covers only the runtime behavior applied by the Agent.
+// Release metadata is intentionally excluded so a GitHub outage or a new
+// checksum cannot cause a route/config restart by itself.
 func agentConfigHash(config AgentRuntimeConfig) (string, error) {
 	config.ConfigHash = ""
+	config.AgentVersion = ""
+	config.AgentSHA256 = ""
+	config.AgentDownloadURL = ""
 	data, err := json.Marshal(config)
 	if err != nil {
 		return "", err
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+// agentConfigLegacyHash preserves the v1.9.29 wire/hash contract for Agents
+// that have not started sending their version header yet. v1.9.29 knew about
+// AgentVersion and AgentSHA256, but not AgentDownloadURL.
+func agentConfigLegacyHash(config AgentRuntimeConfig) (string, error) {
+	config.ConfigHash = ""
+	config.AgentDownloadURL = ""
+	data, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func agentUsesRuntimeConfigHash(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 9 {
+		return minor > 9
+	}
+	return patch >= 30
 }
 
 func readBoundedPrivateFile(path string) (string, error) {
@@ -376,6 +417,10 @@ func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig,
 }
 
 func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform string) (AgentRuntimeConfig, error) {
+	return a.buildAgentConfigForRequest(context.Background(), token, now, platform, "")
+}
+
+func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now time.Time, platform, clientVersion string) (AgentRuntimeConfig, error) {
 	node, err := a.db.nodeByAgentToken(token, now)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
@@ -475,11 +520,10 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 	// executable and fail with ENOEXEC. New Agents identify their platform and
 	// receive the matching version/digest below.
 	if platform != "" {
-		manifest, manifestErr := agentReleaseManifestForPlatform(context.Background(), platform)
+		manifest, manifestErr := agentReleaseManifestForPlatform(ctx, platform)
 		if manifestErr == nil {
 			config.AgentVersion = manifest.Version
 			config.AgentSHA256 = manifest.SHA256
-			config.AgentDownloadURL = manifest.DownloadURL
 		}
 	}
 	if len(routes) > 0 {
@@ -502,7 +546,11 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 			return AgentRuntimeConfig{}, fmt.Errorf("edge TLS certificate/key pair is invalid: %w", err)
 		}
 	}
-	config.ConfigHash, err = agentConfigHash(config)
+	if agentUsesRuntimeConfigHash(clientVersion) {
+		config.ConfigHash, err = agentConfigHash(config)
+	} else {
+		config.ConfigHash, err = agentConfigLegacyHash(config)
+	}
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
@@ -524,7 +572,7 @@ func (a *App) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, platformErr.Error())
 		return
 	}
-	config, err := a.buildAgentConfigForPlatform(requestBearerToken(r), time.Now(), platform)
+	config, err := a.buildAgentConfigForRequest(r.Context(), requestBearerToken(r), time.Now(), platform, r.Header.Get(agentVersionHeader))
 	if errors.Is(err, errInvalidAgentToken) {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return

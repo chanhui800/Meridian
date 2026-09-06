@@ -33,6 +33,8 @@ test('node page wires selectable manual mode, deletion, and DNS safety', () => {
   assert.match(page, /API\.deleteNode/);
   assert.match(page, /DNS 仅在 Agent 应用配置并通过域名证书与入口健康检查后切换/);
   assert.match(page, /已有连接不会被强制迁移/);
+  assert.match(page, /当前 Agent 会继续运行，直到新 Agent 注册成功/);
+  assert.doesNotMatch(page, /立即撤销该节点现有 Agent 令牌/);
 });
 
 test('node form exposes one HTTPS port without entry or gateway modes', () => {

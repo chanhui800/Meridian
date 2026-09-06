@@ -115,6 +115,12 @@ func TestRefreshNodeEnrollmentKeepsOldAgentUntilReplacement(t *testing.T) {
 	if _, err := app.db.RecordNodeReport(oldToken, NodeReport{BootID: "old", Sequence: 1, InterfaceName: "eth0", AgentVersion: "test"}, now.Add(5*time.Second)); err != nil {
 		t.Fatalf("old Agent was revoked before replacement: %v", err)
 	}
+	if _, err := app.db.RecordNodeReport(oldToken, NodeReport{BootID: "old-24h", Sequence: 2, InterfaceName: "eth0", AgentVersion: "test"}, now.Add(25*time.Hour)); err != nil {
+		t.Fatalf("old Agent was revoked after pending enrollment expiry: %v", err)
+	}
+	if _, _, err := app.db.EnrollControlNode(pending, now.Add(25*time.Hour+time.Second)); !errors.Is(err, errInvalidNodeToken) {
+		t.Fatalf("expired pending enrollment token remained valid: %v", err)
+	}
 	_, newToken, err := app.db.EnrollControlNode(pending, now.Add(6*time.Second))
 	if err != nil || newToken == "" {
 		t.Fatalf("replacement enrollment: token=%q err=%v", newToken, err)
@@ -489,6 +495,43 @@ func TestLegacyAgentConfigDoesNotAdvertiseControllerBinary(t *testing.T) {
 	}
 	if config.AgentVersion != "" || config.AgentSHA256 != "" {
 		t.Fatalf("legacy Agent config advertised a local binary: version=%q sha=%q", config.AgentVersion, config.AgentSHA256)
+	}
+}
+
+func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
+	config := AgentRuntimeConfig{
+		SchemaVersion:    agentConfigSchemaVersion,
+		NodeGUID:         "hash-node",
+		HTTPSPort:        9090,
+		DynamicKey:       testEdgeRuntimeKey(t),
+		AgentVersion:     "v1.9.30",
+		AgentSHA256:      strings.Repeat("a", 64),
+		AgentDownloadURL: "https://github.com/chanhui800/Meridian/releases/download/v1.9.30/meridian-agent-linux-amd64",
+		Routes:           []AgentSiteRoute{},
+	}
+	runtimeHash, err := agentConfigHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.AgentVersion = "v1.9.31"
+	config.AgentSHA256 = strings.Repeat("b", 64)
+	config.AgentDownloadURL = "https://github.com/chanhui800/Meridian/releases/download/v1.9.31/meridian-agent-linux-amd64"
+	changedHash, err := agentConfigHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeHash != changedHash {
+		t.Fatalf("release metadata changed runtime config hash: %s != %s", runtimeHash, changedHash)
+	}
+	legacyHash, err := agentConfigLegacyHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeHash == legacyHash {
+		t.Fatal("legacy metadata-inclusive hash unexpectedly matched runtime hash")
+	}
+	if !agentUsesRuntimeConfigHash("v1.9.30") || agentUsesRuntimeConfigHash("v1.9.29") {
+		t.Fatal("runtime config hash compatibility gate is incorrect")
 	}
 }
 

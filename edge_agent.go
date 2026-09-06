@@ -1044,8 +1044,16 @@ func validateAgentConfigEnvelope(config AgentRuntimeConfig) error {
 		return errors.New("Agent configuration is invalid")
 	}
 	expectedHash, err := agentConfigHash(config)
-	if err != nil || !hmac.Equal([]byte(expectedHash), []byte(config.ConfigHash)) {
-		return errors.New("Agent configuration checksum mismatch")
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal([]byte(expectedHash), []byte(config.ConfigHash)) {
+		// During rolling upgrades a controller may deliberately use the
+		// v1.9.29 hash for an Agent that has not advertised its version yet.
+		legacyHash, legacyErr := agentConfigLegacyHash(config)
+		if legacyErr != nil || !hmac.Equal([]byte(legacyHash), []byte(config.ConfigHash)) {
+			return errors.New("Agent configuration checksum mismatch")
+		}
 	}
 	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
 		return errors.New("Agent port is invalid")
@@ -1569,6 +1577,7 @@ func runEdgeAgent() error {
 			var config AgentRuntimeConfig
 			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, http.Header{
 				agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
+				agentVersionHeader:  []string{appVersion},
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {

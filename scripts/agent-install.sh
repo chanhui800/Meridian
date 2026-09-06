@@ -39,6 +39,7 @@ state_file="$state_dir/state.json"
 service_file=/etc/systemd/system/meridian-agent.service
 umask 077
 rollback_active=0
+enrollment_committed=0
 
 [ "$(id -u)" -eq 0 ] || { echo 'Please run this script as root.' >&2; exit 1; }
 case "$(uname -s):$(uname -m)" in
@@ -160,6 +161,10 @@ if [ -f "$state_file" ]; then
   had_state=1
   cp -p "$state_file" "$state_backup"
 fi
+previous_state_token=""
+if [ "$had_state" -eq 1 ]; then
+  previous_state_token=$(sed -n 's/.*"agent_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)
+fi
 if [ -f "$service_file" ]; then
   had_service=1
   cp -p "$service_file" "$service_backup"
@@ -181,7 +186,12 @@ rollback() {
   else
     rm -f "$token_file"
   fi
-  if [ "$had_state" -eq 1 ]; then
+  if [ "$enrollment_committed" -eq 1 ]; then
+    # The Controller has already atomically replaced the old Agent token.
+    # Keep the newly enrolled state so rollback never restores credentials
+    # that the server has deliberately invalidated.
+    rm -f "$token_file"
+  elif [ "$had_state" -eq 1 ]; then
     install -m 0600 "$state_backup" "$state_file.rollback"
     mv -f "$state_file.rollback" "$state_file"
   else
@@ -220,15 +230,22 @@ wait_for_registration() {
   # systemd may report active while the Agent is retrying an invalid token.
   # Enrollment writes a new state file and removes the one-time token; wait
   # for both signals before reporting success for a first install/re-enroll.
-  [ "$reenroll" -eq 1 ] || [ "$had_state" -eq 0 ] || return 0
+  if [ "$reenroll" -ne 1 ] && [ "$had_state" -ne 0 ]; then
+    return 0
+  fi
   attempt=0
   while [ "$attempt" -lt 30 ]; do
-    if systemctl is-active --quiet meridian-agent.service 2>/dev/null \
-      && [ -s "$state_file" ] \
+    if [ -s "$state_file" ] \
       && grep -Eq '"node_guid"[[:space:]]*:[[:space:]]*"[^"]+"' "$state_file" \
-      && grep -Eq '"agent_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$state_file" \
-      && [ ! -e "$token_file" ]; then
-      return 0
+      && grep -Eq '"agent_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$state_file"; then
+      current_state_token=$(sed -n 's/.*"agent_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)
+      if [ "$had_state" -eq 0 ] || [ "$current_state_token" != "$previous_state_token" ]; then
+        enrollment_committed=1
+      fi
+      if systemctl is-active --quiet meridian-agent.service 2>/dev/null \
+        && [ ! -e "$token_file" ]; then
+        return 0
+      fi
     fi
     attempt=$((attempt + 1))
     sleep 2
@@ -238,7 +255,11 @@ wait_for_registration() {
 if ! systemctl daemon-reload || ! systemctl enable --now meridian-agent.service || ! systemctl is-active --quiet meridian-agent.service || ! wait_for_registration; then
   rollback
   rollback_active=0
-  echo 'Agent installation failed; the previous Agent, state, token, and service were restored.' >&2
+  if [ "$enrollment_committed" -eq 1 ]; then
+    echo 'Agent installation did not finish, but the new Controller enrollment was committed; the new state was kept for recovery.' >&2
+  else
+    echo 'Agent installation failed; the previous Agent, state, token, and service were restored.' >&2
+  fi
   exit 1
 fi
 rollback_active=0

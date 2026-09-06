@@ -102,7 +102,7 @@ DNS-01 传播检查默认同时查询公共递归 DNS 与系统 resolver；可�
 
 ### 添加 Agent
 
-在“节点调度”中创建节点，复制页面一次性显示的安装命令，在目标 VPS 执行。命令从当前主控的 `/api/agent/install.sh` 获取与该版本绑定的通用安装器，安装器再从同一主控下载并校验 Agent；注册成功后将短期注册令牌替换为长期凭据，并创建 `meridian-agent.service`。独立二进制安装的主控也会同时安装 `/usr/local/bin/meridian-agent`，因此 `/api/agent/binary` 不依赖 Docker 专用路径；升级主控时 Agent 会一并更新，失败会成对回滚。Agent 会自动选择默认路由网卡，每 15 秒上报心跳、累计收发字节、配置版本和监听错误。
+在“节点调度”中创建节点，复制页面一次性显示的安装命令，在目标 VPS 执行。命令从当前主控的 `/api/agent/install.sh` 获取与该版本绑定的通用安装器，安装器从固定版本的 GitHub Release 获取并校验对应架构的 Agent；注册成功后将短期注册令牌替换为长期凭据，并创建 `meridian-agent.service`。主控不需要在 Docker 镜像中携带 Agent 二进制；旧版 Agent 仍可通过兼容接口完成升级。Agent 会自动选择默认路由网卡，每 15 秒上报心跳、累计收发字节、配置版本和监听错误。
 
 Agent 安装脚本只应从你自己的主控地址获取，例如：
 

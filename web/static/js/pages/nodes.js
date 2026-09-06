@@ -127,7 +127,7 @@ async function handleNodeAction(event) {
     return;
   }
   if (button.dataset.action === 'enroll') {
-    if (!confirm('这会立即撤销该节点现有 Agent 令牌，确认继续？')) return;
+    if (!confirm('这会生成新的注册脚本；当前 Agent 会继续运行，直到新 Agent 注册成功。确认继续？')) return;
     try { const result = await API.refreshNodeEnrollment(node.id, location.origin); showNodeScript(result.install_script, result.install_command); await loadNodes(); } catch (error) { Toast.error(error.message); }
   }
 }

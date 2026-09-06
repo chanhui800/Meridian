@@ -54,7 +54,10 @@ func configuredAgentBinaryPath() string {
 	return executable
 }
 
-const agentPlatformHeader = "X-Meridian-Agent-Platform"
+const (
+	agentPlatformHeader = "X-Meridian-Agent-Platform"
+	agentVersionHeader  = "X-Meridian-Agent-Version"
+)
 
 func normalizeAgentPlatform(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -419,30 +422,46 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	executable, err := configuredAgentBinaryPathForPlatform(platform)
-	if err != nil {
-		a.jsonErr(w, http.StatusConflict, err.Error())
+	// A platform-aware legacy Agent can still use this endpoint. Prefer a
+	// locally installed binary for old standalone Controllers, then proxy the
+	// pinned Release asset when the Controller image no longer carries one.
+	if platform == "" {
+		if serveAgentBinaryFile(w, configuredAgentBinaryPath(), "") {
+			return
+		}
+		a.jsonErr(w, http.StatusConflict, "legacy Agent must send X-Meridian-Agent-Platform; reinstall it to enable updates")
 		return
 	}
+	if executable, pathErr := configuredAgentBinaryPathForPlatform(platform); pathErr == nil {
+		if serveAgentBinaryFile(w, executable, platform) {
+			return
+		}
+	}
+	started, err := proxyAgentReleaseBinary(w, r, platform)
+	if err != nil {
+		log.Printf("legacy Agent binary proxy failed for %s: %v", platform, err)
+		if !started {
+			a.jsonErr(w, http.StatusServiceUnavailable, "agent binary unavailable")
+		}
+	}
+}
+
+func serveAgentBinaryFile(w http.ResponseWriter, executable, platform string) bool {
 	file, err := os.Open(executable) // #nosec G304 -- the path is fixed by the image or an administrator-controlled environment variable.
 	if err != nil {
-		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
-		return
+		return false
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil {
-		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
-		return
+	if err != nil || info.Size() <= 0 || info.Size() > 128<<20 {
+		return false
 	}
 	digest := sha256.New()
 	if _, err := io.Copy(digest, file); err != nil {
-		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
-		return
+		return false
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		a.jsonErr(w, http.StatusInternalServerError, "agent binary unavailable")
-		return
+		return false
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="meridian-agent"`)
@@ -453,6 +472,53 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(agentPlatformHeader, platform)
 	}
 	_, _ = io.Copy(w, file)
+	return true
+}
+
+func proxyAgentReleaseBinary(w http.ResponseWriter, r *http.Request, platform string) (bool, error) {
+	manifest, err := agentReleaseManifestForPlatform(r.Context(), platform)
+	if err != nil {
+		return false, err
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, manifest.DownloadURL, nil)
+	if err != nil {
+		return false, err
+	}
+	client := &http.Client{Timeout: 2 * time.Minute, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		if req.URL.Scheme != "https" {
+			return errors.New("refusing non-HTTPS GitHub redirect")
+		}
+		return nil
+	}}
+	response, err := client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("GitHub Agent release returned %s", response.Status)
+	}
+	if response.ContentLength > 128<<20 {
+		return false, errors.New("Agent release binary is too large")
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="meridian-agent"`)
+	w.Header().Set("Cache-Control", "no-store")
+	if response.ContentLength >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(response.ContentLength, 10))
+	}
+	w.Header().Set("X-Meridian-Agent-SHA256", manifest.SHA256)
+	w.Header().Set("X-Meridian-Agent-Version", manifest.Version)
+	w.Header().Set(agentPlatformHeader, manifest.Platform)
+	digest := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(w, digest), io.LimitReader(response.Body, 128<<20+1))
+	if copyErr != nil {
+		return true, copyErr
+	}
+	if written <= 0 || written > 128<<20 || !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), manifest.SHA256) {
+		return true, errors.New("GitHub Agent release checksum mismatch")
+	}
+	return true, nil
 }
 
 // handleAgentManifest authenticates the node exactly like the legacy binary

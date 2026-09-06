@@ -40,7 +40,7 @@ sudo journalctl -u meridian-agent -n 100 --no-pager
 
 ## 卸载 Agent
 
-先在主控删除节点或刷新节点注册令牌，使旧 Agent 失去授权。然后在目标节点执行：
+先在主控删除节点，或等待重新生成脚本后的新 Agent 注册成功并完成令牌替换。然后在目标节点执行：
 
 ```bash
 sudo systemctl disable --now meridian-agent.service

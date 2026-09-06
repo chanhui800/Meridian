@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const agentReleaseRepository = "chanhui800/Meridian"
@@ -28,11 +30,11 @@ type AgentBinaryManifest struct {
 
 var agentReleaseChecksums = struct {
 	sync.Mutex
-	version   string
-	values    map[string]string
-	fetchedAt time.Time
-	err       error
+	version string
+	values  map[string]string
 }{values: make(map[string]string)}
+
+var agentReleaseChecksumFlight singleflight.Group
 
 func agentReleaseAssetName(platform string) (string, error) {
 	switch normalizeAgentPlatform(platform) {
@@ -114,9 +116,8 @@ func fetchAgentReleaseChecksums(ctx context.Context, version string) (map[string
 	if !validAgentReleaseVersion(version) {
 		return nil, errors.New("agent release manifest is unavailable for a development build")
 	}
-	now := time.Now()
 	agentReleaseChecksums.Lock()
-	if agentReleaseChecksums.version == version && now.Sub(agentReleaseChecksums.fetchedAt) < 10*time.Minute && agentReleaseChecksums.err == nil {
+	if agentReleaseChecksums.version == version && len(agentReleaseChecksums.values) > 0 {
 		values := make(map[string]string, len(agentReleaseChecksums.values))
 		for key, value := range agentReleaseChecksums.values {
 			values[key] = value
@@ -126,43 +127,76 @@ func fetchAgentReleaseChecksums(ctx context.Context, version string) (map[string
 	}
 	agentReleaseChecksums.Unlock()
 
-	requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	endpoint := agentReleaseDownloadURL(version, "SHA256SUMS")
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-		if req.URL.Scheme != "https" {
-			return errors.New("refusing non-HTTPS GitHub redirect")
+	result, err, _ := agentReleaseChecksumFlight.Do(version, func() (any, error) {
+		// Re-check after joining the singleflight group; another caller may
+		// have completed the immutable release lookup while we were waiting.
+		agentReleaseChecksums.Lock()
+		if agentReleaseChecksums.version == version && len(agentReleaseChecksums.values) > 0 {
+			values := make(map[string]string, len(agentReleaseChecksums.values))
+			for key, value := range agentReleaseChecksums.values {
+				values[key] = value
+			}
+			agentReleaseChecksums.Unlock()
+			return values, nil
 		}
-		return nil
-	}}
-	response, err := client.Do(request)
+		agentReleaseChecksums.Unlock()
+
+		requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		endpoint := agentReleaseDownloadURL(version, "SHA256SUMS")
+		request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			if req.URL.Scheme != "https" {
+				return errors.New("refusing non-HTTPS GitHub redirect")
+			}
+			return nil
+		}}
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("GitHub checksum manifest returned %s", response.Status)
+		}
+		values, err := parseAgentReleaseChecksums(response.Body)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := values["meridian-agent-linux-amd64"]; !ok {
+			return nil, errors.New("GitHub checksum manifest has no amd64 Agent")
+		}
+		if _, ok := values["meridian-agent-linux-arm64"]; !ok {
+			return nil, errors.New("GitHub checksum manifest has no arm64 Agent")
+		}
+		agentReleaseChecksums.Lock()
+		agentReleaseChecksums.version = version
+		agentReleaseChecksums.values = values
+		agentReleaseChecksums.Unlock()
+		return values, nil
+	})
 	if err != nil {
+		// A successful lookup is immutable for this Controller release. Keep
+		// serving it if a later caller somehow observes a transient fetch error.
+		agentReleaseChecksums.Lock()
+		if agentReleaseChecksums.version == version && len(agentReleaseChecksums.values) > 0 {
+			values := make(map[string]string, len(agentReleaseChecksums.values))
+			for key, value := range agentReleaseChecksums.values {
+				values[key] = value
+			}
+			agentReleaseChecksums.Unlock()
+			return values, nil
+		}
+		agentReleaseChecksums.Unlock()
 		return nil, err
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub checksum manifest returned %s", response.Status)
+	values, ok := result.(map[string]string)
+	if !ok {
+		return nil, errors.New("invalid cached Agent release manifest")
 	}
-	values, err := parseAgentReleaseChecksums(response.Body)
-	if err != nil {
-		return nil, err
-	}
-	if _, ok := values["meridian-agent-linux-amd64"]; !ok {
-		return nil, errors.New("GitHub checksum manifest has no amd64 Agent")
-	}
-	if _, ok := values["meridian-agent-linux-arm64"]; !ok {
-		return nil, errors.New("GitHub checksum manifest has no arm64 Agent")
-	}
-	agentReleaseChecksums.Lock()
-	agentReleaseChecksums.version = version
-	agentReleaseChecksums.values = values
-	agentReleaseChecksums.fetchedAt = time.Now()
-	agentReleaseChecksums.err = nil
-	agentReleaseChecksums.Unlock()
 	return values, nil
 }
 
