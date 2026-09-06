@@ -753,11 +753,18 @@ func edgeClientIP(remote string) string {
 	return remote
 }
 
-func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Handler) http.Handler {
+func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Handler, probeSecret ...[]byte) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The scheduler probes this endpoint before a site has been assigned to
-		// the node. Let it reach the router without requiring a route mapping.
+		// the node. It still requires the per-node runtime key so the endpoint
+		// cannot be used as an unauthenticated public liveness oracle.
 		if r.Method == http.MethodGet && r.URL.Path == "/.well-known/meridian-agent-health" {
+			if len(probeSecret) == 0 || !hmac.Equal([]byte(strings.TrimSpace(r.Header.Get("X-Meridian-Probe"))), []byte(encodeRuntimeKey(probeSecret[0]))) {
+				// Return not-found for unauthenticated probes so the endpoint does
+				// not disclose that an Agent is present or reveal its identity.
+				http.NotFound(w, r)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -822,6 +829,10 @@ type edgeReplayBody struct {
 
 func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edgeProxyBundle, error) {
 	dynamicKey, err := edgeDecodeKey(config.DynamicKey)
+	if err != nil {
+		return nil, err
+	}
+	probeSecret, err := edgeDecodeKey(config.ProbeSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -922,7 +933,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		ctx := context.WithValue(r.Context(), publicHostIngressContextKey{}, true)
 		handler.ServeHTTP(w, r.WithContext(ctx))
 	})
-	bundle.handler = runtime.observe(siteIDs, router)
+	bundle.handler = runtime.observe(siteIDs, router, probeSecret)
 	return bundle, nil
 }
 

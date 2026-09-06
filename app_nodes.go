@@ -648,8 +648,19 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	preRelease, retryAfter, preAdmitted := a.agentPreAuthAdmission().admit(requestClientKey(r, a.trustedProxies), time.Now())
+	if !preAdmitted {
+		seconds := int(retryAfter.Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		a.jsonErr(w, http.StatusTooManyRequests, "agent authentication rate limit exceeded")
+		return
+	}
 	token := requestBearerToken(r)
 	node, authErr := a.db.nodeByAgentToken(token, time.Now())
+	preRelease()
 	if authErr != nil {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return
@@ -692,6 +703,15 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type agentWebSocketNodeContextKey struct{}
+
+func withAgentWebSocketNode(r *http.Request, node ControlNode) *http.Request {
+	if r == nil {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), agentWebSocketNodeContextKey{}, node))
+}
+
 // handleAgentWebSocket is a control-plane heartbeat channel. It deliberately
 // shares RecordNodeReport with the POST fallback so sequence/event idempotency,
 // node traffic accounting, and metadata replay have one implementation.
@@ -700,9 +720,17 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		return
 	}
 	token := requestBearerToken(ws.Request())
-	node, err := a.db.nodeByAgentToken(token, time.Now())
-	if err != nil {
-		return
+	node, ok := ws.Request().Context().Value(agentWebSocketNodeContextKey{}).(ControlNode)
+	if !ok || node.ID <= 0 {
+		// Keep direct handler tests and embedders functional when they do not
+		// install the main router's handshake context. The production router
+		// always supplies the authenticated node and therefore performs no
+		// second lookup for a connection.
+		var authErr error
+		node, authErr = a.db.nodeByAgentToken(token, time.Now())
+		if authErr != nil {
+			return
+		}
 	}
 	ws.MaxPayloadBytes = maxAgentReportBodyBytes
 	defer ws.Close()
@@ -710,23 +738,25 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		if err := ws.SetReadDeadline(time.Now().Add(nodeOnlineWindow)); err != nil {
 			return
 		}
-		// Read only the bounded WebSocket frame before decoding it. The
-		// connection was authenticated above; admission is shared with the
-		// HTTP endpoint so a node cannot bypass its report budget by switching
-		// transports. MaxPayloadBytes bounds the frame allocation.
-		var payload []byte
-		if err := websocket.Message.Receive(ws, &payload); err != nil {
-			return
-		}
 		release, retryAfter, admitted := a.agentReports().admit(node.ID, time.Now())
 		if !admitted {
-			_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			// Do not receive or decode another frame after admission is denied.
+			// Closing prevents an over-limit peer from keeping the connection in
+			// a tight error loop while it continues sending large frames.
+			_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_ = websocket.JSON.Send(ws, map[string]interface{}{
 				"accepted":            false,
 				"error":               "agent report rate or concurrency limit exceeded",
 				"retry_after_seconds": max(1, int(retryAfter.Seconds()+0.5)),
 			})
-			continue
+			return
+		}
+		// Read only the bounded WebSocket frame after admission. MaxPayloadBytes
+		// bounds the frame allocation before JSON decoding.
+		var payload []byte
+		if err := websocket.Message.Receive(ws, &payload); err != nil {
+			release()
+			return
 		}
 		var report NodeReport
 		if err := json.Unmarshal(payload, &report); err != nil {

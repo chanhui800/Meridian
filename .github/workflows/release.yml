@@ -136,6 +136,16 @@ jobs:
           build darwin amd64 darwin-amd64
           build darwin arm64 darwin-arm64
 
+      - name: Verify release binary metadata
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          test "$(./meridian-linux-amd64 --version)" = "$RELEASE_TAG"
+          test "$(./meridian-linux-amd64 --build-mode)" = "controller"
+          test "$(./meridian-agent-linux-amd64 --version)" = "$RELEASE_TAG"
+          test "$(./meridian-agent-linux-amd64 --build-mode)" = "agent"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meridian-release-binaries
@@ -167,6 +177,21 @@ jobs:
           subject-path: |
             meridian-*
             SHA256SUMS
+
+      - name: Refuse to mutate a published release
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # A published release is immutable from Meridian's workflow. This
+          # also protects manual reruns of an older tag from replacing assets
+          # that agents may already trust.
+          existing_draft="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.RELEASE_TAG) | select(.draft == false) | .id' | head -n1)"
+          if [ -n "$existing_draft" ]; then
+            echo "Release ${RELEASE_TAG} is already published and cannot be mutated." >&2
+            exit 1
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

@@ -479,6 +479,32 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 	if a == nil || a.db == nil || a.dbPath == "" || a.dbPath == ":memory:" || strings.HasPrefix(a.dbPath, "file:") {
 		return "", func() {}, errors.New("当前数据库模式不支持备份")
 	}
+	// VACUUM INTO must not be the first operation that discovers a nearly full
+	// filesystem. Account for the live database and SQLite sidecars before any
+	// snapshot directory is created. The later check covers the actual snapshot
+	// size, which may be larger after vacuuming.
+	var databaseBytes int64
+	for _, candidate := range []string{a.dbPath, a.dbPath + "-wal", a.dbPath + "-shm"} {
+		info, statErr := os.Stat(candidate)
+		if statErr == nil {
+			if !info.Mode().IsRegular() {
+				return "", func() {}, errors.New("数据库文件必须是普通文件")
+			}
+			databaseBytes += info.Size()
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", func() {}, fmt.Errorf("检查数据库空间: %w", statErr)
+		}
+	}
+	if databaseBytes <= 0 {
+		databaseBytes = 1 << 20
+	}
+	archiveEstimate := databaseBytes
+	if archiveEstimate > backupMaxUploadBytes {
+		archiveEstimate = backupMaxUploadBytes
+	}
+	if err := ensureDiskSpace(filepath.Dir(a.dbPath), databaseBytes*2+archiveEstimate+(64<<20)); err != nil {
+		return "", func() {}, err
+	}
 	if a.pm != nil {
 		a.pm.FlushTraffic()
 	}
@@ -584,32 +610,53 @@ func addBackupEntry(writer *zip.Writer, files *[]string, expandedSize *int64, na
 	return nil
 }
 
-func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
+type builtBackupFile struct {
+	Path    string
+	Size    int64
+	Cleanup func()
+}
+
+func (a *App) buildBackupToFile(password string, includeTLS bool) (builtBackupFile, error) {
 	if err := validateBackupPassword(password); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if includeTLS && a != nil {
 		if err := validateTLSPathConfiguration(a.dbPath); err != nil {
-			return nil, fmt.Errorf("invalid TLS path configuration: %w", err)
+			return builtBackupFile{}, fmt.Errorf("invalid TLS path configuration: %w", err)
 		}
 	}
 	snapshot, cleanup, err := a.databaseSnapshot()
 	if err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
-	defer cleanup()
-
+	retainSnapshot := false
+	defer func() {
+		if !retainSnapshot {
+			cleanup()
+		}
+	}()
+	if info, statErr := os.Stat(snapshot); statErr == nil {
+		// Snapshot, ZIP, encrypted payload, and a small rollback margin coexist
+		// for the duration of export. Refuse early when the filesystem cannot hold
+		// those bounded temporary copies.
+		required := info.Size()*3 + 64<<20
+		if err := ensureDiskSpace(filepath.Dir(snapshot), required); err != nil {
+			return builtBackupFile{}, err
+		}
+	} else {
+		return builtBackupFile{}, statErr
+	}
 	archivePath := filepath.Join(filepath.Dir(snapshot), "archive.zip")
 	archiveFile, err := os.OpenFile(archivePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- archivePath is inside the private snapshot directory.
 	if err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	defer archiveFile.Close()
 	zipWriter := zip.NewWriter(archiveFile)
 	files := make([]string, 0, 8)
 	expandedSize := int64(0)
 	if err := addBackupEntry(zipWriter, &files, &expandedSize, backupDatabaseEntry, snapshot); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if includeTLS {
 		certFile, keyFile := panelTLSBackupPaths(a.dbPath)
@@ -620,13 +667,13 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 			certExists := certErr == nil
 			keyExists := keyErr == nil
 			if certExists != keyExists {
-				return nil, errors.New("面板 TLS 证书和私钥不成对，无法创建包含 TLS 的备份")
+				return builtBackupFile{}, errors.New("面板 TLS 证书和私钥不成对，无法创建包含 TLS 的备份")
 			}
 			if certErr != nil && !errors.Is(certErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("检查面板 TLS 证书: %w", certErr)
+				return builtBackupFile{}, fmt.Errorf("检查面板 TLS 证书: %w", certErr)
 			}
 			if keyErr != nil && !errors.Is(keyErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("检查面板 TLS 私钥: %w", keyErr)
+				return builtBackupFile{}, fmt.Errorf("检查面板 TLS 私钥: %w", keyErr)
 			}
 		}
 		tlsCandidates := []struct{ name, path string }{
@@ -645,7 +692,7 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 				continue
 			}
 			if err := addBackupEntry(zipWriter, &files, &expandedSize, candidate.name, candidate.path); err != nil {
-				return nil, fmt.Errorf("读取 %s: %w", candidate.name, err)
+				return builtBackupFile{}, fmt.Errorf("读取 %s: %w", candidate.name, err)
 			}
 		}
 		// Per-node Edge certificates live behind an atomic current pointer.
@@ -654,7 +701,7 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 		if edgeRoot := edgeNodeTLSRoot(a.dbPath); edgeRoot != "" {
 			entries, readErr := os.ReadDir(edgeRoot)
 			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("读取 Edge 节点证书目录: %w", readErr)
+				return builtBackupFile{}, fmt.Errorf("读取 Edge 节点证书目录: %w", readErr)
 			}
 			for _, entry := range entries {
 				if !entry.IsDir() {
@@ -671,24 +718,24 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 						certExists := certErr == nil
 						keyExists := keyErr == nil
 						if certExists != keyExists {
-							return nil, fmt.Errorf("Edge 节点 %s 的证书和私钥不成对", guid)
+							return builtBackupFile{}, fmt.Errorf("Edge 节点 %s 的证书和私钥不成对", guid)
 						}
 						if !certExists {
 							if certErr != nil && !errors.Is(certErr, os.ErrNotExist) || keyErr != nil && !errors.Is(keyErr, os.ErrNotExist) {
-								return nil, fmt.Errorf("检查 Edge 节点 %s 证书: %v / %v", guid, certErr, keyErr)
+								return builtBackupFile{}, fmt.Errorf("检查 Edge 节点 %s 证书: %v / %v", guid, certErr, keyErr)
 							}
 							break
 						}
 					}
 					if addErr := addBackupEntry(zipWriter, &files, &expandedSize, name, path); addErr != nil {
-						return nil, fmt.Errorf("读取 %s: %w", name, addErr)
+						return builtBackupFile{}, fmt.Errorf("读取 %s: %w", name, addErr)
 					}
 				}
 			}
 		}
 	}
 	if len(files)+1 > backupMaxFiles {
-		return nil, errors.New("备份文件数量超过可恢复上限")
+		return builtBackupFile{}, errors.New("备份文件数量超过可恢复上限")
 	}
 	manifest := backupManifest{
 		Format:                "meridian-backup",
@@ -703,57 +750,63 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	}
 	manifestData, err := json.Marshal(manifest) // #nosec G117 -- the manifest is immediately encrypted before it leaves the process.
 	if err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	header := &zip.FileHeader{Name: backupManifestEntry, Method: zip.Deflate}
 	header.SetMode(0o600)
 	header.Modified = time.Unix(0, 0).UTC()
 	entry, err := zipWriter.CreateHeader(header)
 	if err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if _, err := entry.Write(manifestData); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if expandedSize+int64(len(manifestData)) > backupMaxExpandedBytes {
-		return nil, errors.New("备份解压后总大小超出限制")
+		return builtBackupFile{}, errors.New("备份解压后总大小超出限制")
 	}
 	if err := zipWriter.Close(); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if err := archiveFile.Sync(); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	payloadPath := filepath.Join(filepath.Dir(snapshot), "backup.mrbak")
 	payloadFile, err := os.OpenFile(payloadPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- payloadPath is inside the private snapshot directory.
 	if err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	defer payloadFile.Close()
 	payloadSize, err := sealBackupV2Reader(archiveFile, password, payloadFile)
 	if err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
 	if payloadSize > backupMaxUploadBytes {
-		return nil, fmt.Errorf("生成的备份为 %d MiB，超过当前恢复接口支持的 %d MiB", payloadSize>>20, backupMaxUploadBytes>>20)
+		return builtBackupFile{}, fmt.Errorf("生成的备份为 %d MiB，超过当前恢复接口支持的 %d MiB", payloadSize>>20, backupMaxUploadBytes>>20)
 	}
 	if err := payloadFile.Sync(); err != nil {
-		return nil, err
+		return builtBackupFile{}, err
 	}
-	if _, err := payloadFile.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+	if err := syncDirectory(filepath.Dir(payloadPath)); err != nil {
+		return builtBackupFile{}, err
 	}
-	payload, err := io.ReadAll(io.LimitReader(payloadFile, backupMaxUploadBytes+1))
+	retainSnapshot = true
+	return builtBackupFile{Path: payloadPath, Size: payloadSize, Cleanup: cleanup}, nil
+}
+
+// buildBackup keeps the byte-slice API for unit tests and legacy callers. The
+// production HTTP path uses buildBackupToFile so it never materializes the
+// final encrypted backup in memory.
+func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
+	artifact, err := a.buildBackupToFile(password, includeTLS)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(payload)) > backupMaxUploadBytes {
-		return nil, fmt.Errorf("生成的备份为 %d MiB，超过当前恢复接口支持的 %d MiB", len(payload)>>20, backupMaxUploadBytes>>20)
-	}
-	return payload, nil
+	defer artifact.Cleanup()
+	return os.ReadFile(artifact.Path) // #nosec G304 -- path is a private temporary backup artifact.
 }
 
 func readZipEntry(file *zip.File, maxBytes int64) ([]byte, error) {
@@ -798,6 +851,173 @@ func parseBackupArchiveFile(path string) (backupManifest, map[string][]byte, err
 		return backupManifest{}, nil, errors.New("备份压缩包损坏")
 	}
 	return parseBackupZipReader(reader)
+}
+
+// parseBackupArchiveFileToPaths validates a decrypted archive while keeping
+// each entry on disk. The restore path uses this variant so a legal large
+// backup never becomes an in-memory map[string][]byte.
+func parseBackupArchiveFileToPaths(path, entriesDir string) (backupManifest, map[string]string, error) {
+	var manifest backupManifest
+	file, err := os.Open(path) // #nosec G304 -- path is an internal restore staging file.
+	if err != nil {
+		return manifest, nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return manifest, nil, err
+	}
+	reader, err := zip.NewReader(file, info.Size())
+	if err != nil {
+		return manifest, nil, errors.New("备份压缩包损坏")
+	}
+	if len(reader.File) < 2 || len(reader.File) > backupMaxFiles {
+		return manifest, nil, errors.New("备份文件数量无效")
+	}
+	if err := os.MkdirAll(entriesDir, 0o700); err != nil {
+		return manifest, nil, err
+	}
+	entries := make(map[string]string, len(reader.File))
+	var expanded int64
+	for index, archiveEntry := range reader.File {
+		limit, allowed := backupEntryLimit(archiveEntry.Name)
+		if !allowed || filepath.ToSlash(filepath.Clean(archiveEntry.Name)) != archiveEntry.Name || strings.HasPrefix(archiveEntry.Name, "/") {
+			return manifest, nil, fmt.Errorf("备份包含不允许的文件: %s", archiveEntry.Name)
+		}
+		if _, duplicate := entries[archiveEntry.Name]; duplicate {
+			return manifest, nil, fmt.Errorf("备份包含重复文件: %s", archiveEntry.Name)
+		}
+		if archiveEntry.UncompressedSize64 > uint64(limit) || archiveEntry.UncompressedSize64 > uint64(backupMaxExpandedBytes) { // #nosec G115 -- limits are fixed positive constants returned by backupEntryLimit.
+			return manifest, nil, fmt.Errorf("%s 解压后过大", archiveEntry.Name)
+		}
+		if archiveEntry.UncompressedSize64 > uint64(backupMaxExpandedBytes)-uint64(expanded) {
+			return manifest, nil, errors.New("备份解压后总大小超出限制")
+		}
+		expanded += int64(archiveEntry.UncompressedSize64)
+		entryPath := filepath.Join(entriesDir, fmt.Sprintf("%08d.entry", index))
+		if err := copyZipEntryToFile(archiveEntry, limit, entryPath); err != nil {
+			return manifest, nil, err
+		}
+		entries[archiveEntry.Name] = entryPath
+	}
+	manifestPath, ok := entries[backupManifestEntry]
+	if !ok {
+		return manifest, nil, errors.New("备份缺少清单")
+	}
+	manifestData, err := os.ReadFile(manifestPath) // #nosec G304 -- path is a private parser staging entry.
+	if err != nil {
+		return manifest, nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(manifestData))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return manifest, nil, errors.New("备份清单无效")
+	}
+	if manifest.Format != "meridian-backup" || (manifest.FormatVersion != backupFormatVersion && manifest.FormatVersion != backupLegacyFormatVersion) {
+		return manifest, nil, errors.New("不支持的备份格式版本")
+	}
+	if manifest.DatabaseSchemaVersion > databaseSchemaVersion {
+		return manifest, nil, errors.New("该备份由更高数据库版本的 Meridian 创建，请先升级 Meridian 后再恢复")
+	}
+	if !manifestIncludesTLS(manifest) {
+		for name := range entries {
+			if strings.HasPrefix(name, "tls/") {
+				return manifest, nil, errors.New("备份清单声明不包含 TLS，但压缩包中存在 TLS 文件")
+			}
+		}
+	}
+	if _, ok := entries[backupDatabaseEntry]; !ok {
+		return manifest, nil, errors.New("备份缺少数据库")
+	}
+	declared := make(map[string]bool, len(manifest.Files)+1)
+	declared[backupManifestEntry] = true
+	for _, name := range manifest.Files {
+		if _, ok := backupEntryLimit(name); !ok || name == backupManifestEntry || declared[name] {
+			return manifest, nil, errors.New("备份清单文件列表无效")
+		}
+		declared[name] = true
+	}
+	if len(declared) != len(entries) {
+		return manifest, nil, errors.New("备份清单与文件内容不一致")
+	}
+	for name := range entries {
+		if !declared[name] {
+			return manifest, nil, errors.New("备份清单与文件内容不一致")
+		}
+	}
+	return manifest, entries, nil
+}
+
+func copyZipEntryToFile(file *zip.File, maxBytes int64, target string) error {
+	reader, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- target is an internal parser staging path.
+	if err != nil {
+		return err
+	}
+	remove := true
+	defer func() {
+		_ = out.Close()
+		if remove {
+			_ = os.Remove(target)
+		}
+	}()
+	written, copyErr := io.Copy(out, io.LimitReader(reader, maxBytes+1))
+	if copyErr != nil {
+		return copyErr
+	}
+	if written > maxBytes {
+		return fmt.Errorf("%s 解压后过大", file.Name)
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	remove = false
+	return nil
+}
+
+func ensureRestoreDiskSpace(dbPath string, entries map[string]string) error {
+	if strings.TrimSpace(dbPath) == "" || len(entries) == 0 {
+		return nil
+	}
+	var incomingDB, incomingTLS, currentDB int64
+	if path := entries[backupDatabaseEntry]; path != "" {
+		if info, err := os.Stat(path); err == nil {
+			incomingDB = info.Size()
+		} else {
+			return err
+		}
+	}
+	if info, err := os.Stat(dbPath); err == nil {
+		currentDB = info.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for name, path := range entries {
+		if !strings.HasPrefix(name, "tls/") {
+			continue
+		}
+		if info, err := os.Stat(path); err == nil {
+			incomingTLS += info.Size()
+		} else {
+			return err
+		}
+	}
+	if incomingDB <= 0 {
+		return errors.New("备份缺少数据库")
+	}
+	// The restore transaction keeps the uploaded/decrypted artifacts, a staged
+	// database, and a rollback copy of the current database alive at once. TLS
+	// state is similarly copied into pending and rollback namespaces. Keep a
+	// generous fixed margin for SQLite journals and directory metadata.
+	required := incomingDB*2 + currentDB + incomingTLS*2 + (64 << 20)
+	return ensureDiskSpace(filepath.Dir(dbPath), required)
 }
 
 func parseBackupZipReader(reader *zip.Reader) (backupManifest, map[string][]byte, error) {
@@ -1045,6 +1265,48 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 			}
 		}
 	}
+	if hasProbeSecret, err := backupSQLiteColumnExists(tx, "control_nodes", "probe_secret_ciphertext"); err != nil {
+		return err
+	} else if hasProbeSecret {
+		rows, err := tx.Query("SELECT id,probe_secret_ciphertext FROM control_nodes WHERE probe_secret_ciphertext <> ''")
+		if err != nil {
+			return err
+		}
+		type probeUpdate struct {
+			id         int64
+			ciphertext string
+		}
+		updates := make([]probeUpdate, 0)
+		for rows.Next() {
+			var item probeUpdate
+			if err := rows.Scan(&item.id, &item.ciphertext); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			secret, err := decryptNodeProbeSecretWithSecret(item.ciphertext, oldJWT)
+			if err != nil {
+				if _, currentErr := decryptNodeProbeSecretWithSecret(item.ciphertext, newJWT); currentErr != nil {
+					_ = rows.Close()
+					return fmt.Errorf("无法解密节点健康探针密钥: %w", err)
+				}
+				continue
+			}
+			migrated, err := encryptNodeProbeSecretWithSecret(secret, newJWT)
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("无法迁移节点健康探针密钥: %w", err)
+			}
+			updates = append(updates, probeUpdate{id: item.id, ciphertext: migrated})
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, item := range updates {
+			if _, err := tx.Exec("UPDATE control_nodes SET probe_secret_ciphertext=? WHERE id=?", item.ciphertext, item.id); err != nil {
+				return err
+			}
+		}
+	}
 	return tx.Commit()
 }
 
@@ -1080,6 +1342,10 @@ func backupHasJWTProtectedToken(database []byte) (bool, error) {
 	if err := writePrivateFileAtomic(path, database); err != nil {
 		return false, err
 	}
+	return backupHasJWTProtectedTokenFile(path)
+}
+
+func backupHasJWTProtectedTokenFile(path string) (bool, error) {
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=query_only(1)")
 	if err != nil {
 		return false, err
@@ -1195,7 +1461,7 @@ func reconcileRestoredSiteIngress(path string, hostIngressAvailable bool) (int64
 	return result.RowsAffected()
 }
 
-func writeRestorePending(dbPath string, manifest backupManifest, entries map[string][]byte, targetJWT, targetHeaderKey []byte, preservedPanelSettings *backupPanelSettings, targetHostIngressWithoutTLS bool) (int64, error) {
+func writeRestorePendingFromPaths(dbPath string, manifest backupManifest, entries map[string]string, targetJWT, targetHeaderKey []byte, preservedPanelSettings *backupPanelSettings, targetHostIngressWithoutTLS bool) (int64, error) {
 	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
 		return 0, errors.New("当前数据库模式不支持恢复")
 	}
@@ -1214,7 +1480,7 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 	}
 	defer os.RemoveAll(tmp)
 	databasePath := filepath.Join(tmp, backupDatabaseEntry)
-	if err := writePrivateFileAtomic(databasePath, entries[backupDatabaseEntry]); err != nil {
+	if err := copyPrivateFile(entries[backupDatabaseEntry], databasePath); err != nil {
 		return 0, err
 	}
 	if err := validateSQLiteBackup(databasePath); err != nil {
@@ -1264,11 +1530,11 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 	if err := validateSQLiteBackup(databasePath); err != nil {
 		return 0, err
 	}
-	for name, data := range entries {
+	for name, source := range entries {
 		if !strings.HasPrefix(name, "tls/") {
 			continue
 		}
-		if err := writePrivateFileAtomic(filepath.Join(tmp, filepath.FromSlash(name)), data); err != nil {
+		if err := copyPrivateFile(source, filepath.Join(tmp, filepath.FromSlash(name))); err != nil {
 			return 0, err
 		}
 	}
@@ -1286,6 +1552,29 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 		return 0, err
 	}
 	return resetIngressCount, nil
+}
+
+// writeRestorePending keeps the byte-slice API for existing callers and unit
+// tests. HTTP restore uses writeRestorePendingFromPaths to avoid retaining the
+// whole decrypted archive in memory.
+func writeRestorePending(dbPath string, manifest backupManifest, entries map[string][]byte, targetJWT, targetHeaderKey []byte, preservedPanelSettings *backupPanelSettings, targetHostIngressWithoutTLS bool) (int64, error) {
+	stage, err := os.MkdirTemp("", ".meridian-restore-entries-*")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(stage)
+	paths := make(map[string]string, len(entries))
+	for name, data := range entries {
+		if _, allowed := backupEntryLimit(name); !allowed {
+			return 0, fmt.Errorf("备份包含不允许的文件: %s", name)
+		}
+		path := filepath.Join(stage, fmt.Sprintf("%08d.entry", len(paths)))
+		if err := writePrivateFileAtomic(path, data); err != nil {
+			return 0, err
+		}
+		paths[name] = path
+	}
+	return writeRestorePendingFromPaths(dbPath, manifest, paths, targetJWT, targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
 }
 
 func copyPrivateFile(source, target string) error {
@@ -2039,17 +2328,24 @@ func (a *App) handleBackupExport(w http.ResponseWriter, r *http.Request) {
 	if request.IncludeTLS != nil {
 		includeTLS = *request.IncludeTLS
 	}
-	payload, err := a.buildBackup(request.Password, includeTLS)
+	artifact, err := a.buildBackupToFile(request.Password, includeTLS)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	defer artifact.Cleanup()
+	file, err := os.Open(artifact.Path) // #nosec G304 -- artifact is a private temporary backup file created above.
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "备份文件读取失败")
+		return
+	}
+	defer file.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="meridian-backup-%s.mrbak"`, time.Now().Format("20060102-150405")))
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", artifact.Size))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(payload)
+	_, _ = io.Copy(w, file)
 }
 
 func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
@@ -2096,6 +2392,10 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	closeErr := encrypted.Close()
 	if copyErr != nil || closeErr != nil || readBytes > backupMaxUploadBytes {
 		a.jsonErr(w, http.StatusBadRequest, "备份文件读取失败或超过 256 MiB")
+		return
+	}
+	if err := ensureDiskSpace(restoreTemp, readBytes*3+64<<20); err != nil {
+		a.jsonErr(w, http.StatusInsufficientStorage, err.Error())
 		return
 	}
 	plainPath := filepath.Join(restoreTemp, "archive.zip")
@@ -2147,13 +2447,18 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	a.backupMu.Lock()
 	defer a.backupMu.Unlock()
-	manifest, entries, err := parseBackupArchiveFile(plainPath)
+	entriesDir := filepath.Join(restoreTemp, "entries")
+	manifest, entries, err := parseBackupArchiveFileToPaths(plainPath, entriesDir)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := ensureRestoreDiskSpace(a.dbPath, entries); err != nil {
+		a.jsonErr(w, http.StatusInsufficientStorage, err.Error())
+		return
+	}
 	if jwtSecretEphemeral {
-		hasToken, tokenErr := backupHasJWTProtectedToken(entries[backupDatabaseEntry])
+		hasToken, tokenErr := backupHasJWTProtectedTokenFile(entries[backupDatabaseEntry])
 		if tokenErr != nil {
 			a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查加密 Token 配置")
 			return
@@ -2180,7 +2485,7 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			tempDB := filepath.Join(tempDir, backupDatabaseEntry)
-			writeErr := writePrivateFileAtomic(tempDB, entries[backupDatabaseEntry])
+			writeErr := copyPrivateFile(entries[backupDatabaseEntry], tempDB)
 			hasHeaders := false
 			if writeErr == nil {
 				checkDB, openErr := sql.Open("sqlite", "file:"+filepath.ToSlash(tempDB)+"?mode=ro&_pragma=query_only(1)")
@@ -2213,7 +2518,7 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	targetHostIngressWithoutTLS := a.panelBindLoopback || len(a.trustedProxies) > 0
-	resetIngressCount, err := writeRestorePending(a.dbPath, manifest, entries, jwtSecret, targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
+	resetIngressCount, err := writeRestorePendingFromPaths(a.dbPath, manifest, entries, jwtSecret, targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, "恢复校验失败："+err.Error())
 		return

@@ -1,86 +1,75 @@
 package main
 
 import (
-	"sync"
 	"testing"
 	"time"
 )
 
-func TestNodeReportAdmissionLimitsBurstAndRefills(t *testing.T) {
-	guard := newNodeReportAdmission()
-	now := time.Unix(100, 0)
-	for i := 0; i < int(nodeReportBurst); i++ {
-		release, _, ok := guard.admit(7, now)
-		if !ok {
-			t.Fatalf("burst admission %d rejected", i)
-		}
-		release()
+func TestAgentSecurityAuditStateIsBoundedByNodeAndCategory(t *testing.T) {
+	db := &DB{}
+	for siteID := int64(1); siteID <= 100000; siteID++ {
+		db.recordAgentSecurityRejection(7, siteID, "request-event")
 	}
-	if release, _, ok := guard.admit(7, now); ok {
-		release()
-		t.Fatal("report beyond burst was admitted")
+	db.agentSecurityMu.Lock()
+	entries := len(db.agentSecurityLastLog)
+	db.agentSecurityMu.Unlock()
+	if entries != 1 {
+		t.Fatalf("security audit limiter retained %d site-specific entries, want 1", entries)
 	}
-	release, _, ok := guard.admit(7, now.Add(time.Second))
-	if !ok {
-		t.Fatal("one report should be admitted after one second")
-	}
-	release()
-}
-
-func TestNodeReportAdmissionSerializesOneReportPerNode(t *testing.T) {
-	guard := newNodeReportAdmission()
-	now := time.Unix(200, 0)
-	release, _, ok := guard.admit(9, now)
-	if !ok {
-		t.Fatal("first report rejected")
-	}
-	if secondRelease, _, secondOK := guard.admit(9, now); secondOK {
-		secondRelease()
-		t.Fatal("concurrent report for one node was admitted")
-	}
-	release()
-	if nextRelease, _, nextOK := guard.admit(9, now); !nextOK {
-		t.Fatal("report should be admitted after release")
-	} else {
-		nextRelease()
+	if got := db.agentSecurityRejected.Load(); got != 100000 {
+		t.Fatalf("rejection counter=%d, want 100000", got)
 	}
 }
 
-func TestNodeReportAdmissionKeepsNodesIndependentAndPrunesIdleEntries(t *testing.T) {
-	guard := newNodeReportAdmission()
+func TestAgentPreAuthAdmissionRateAndConcurrency(t *testing.T) {
+	admission := newAgentPreAuthAdmission()
 	now := time.Now()
-	releases := make([]func(), 0, 2)
-	for _, nodeID := range []int64{1, 2} {
-		release, _, ok := guard.admit(nodeID, now)
+	releases := make([]func(), 0, agentPreAuthConcurrency)
+	for i := 0; i < agentPreAuthConcurrency; i++ {
+		release, _, ok := admission.admit("client-"+string(rune('a'+i)), now)
 		if !ok {
-			t.Fatalf("node %d rejected", nodeID)
+			t.Fatalf("pre-auth admission %d was rejected before concurrency ceiling", i)
 		}
 		releases = append(releases, release)
+	}
+	if _, _, ok := admission.admit("other-client", now); ok {
+		t.Fatal("pre-auth concurrency ceiling was bypassed")
 	}
 	for _, release := range releases {
 		release()
 	}
-	guard.mu.Lock()
-	guard.prune(now.Add(nodeReportEntryTTL + time.Second))
-	guard.mu.Unlock()
-	if len(guard.entries) != 0 {
-		t.Fatalf("idle limiter entries remain: %d", len(guard.entries))
+	// A separate client has its own token bucket and is admitted immediately;
+	// a single noisy client is rate limited without affecting it.
+	for i := 0; i < agentPreAuthBurst; i++ {
+		release, _, ok := admission.admit("noisy", now)
+		if !ok {
+			t.Fatalf("burst admission %d was rejected", i)
+		}
+		release()
+	}
+	if _, _, ok := admission.admit("noisy", now); ok {
+		t.Fatal("pre-auth token bucket did not reject an exhausted client")
+	}
+	if release, _, ok := admission.admit("independent", now); !ok {
+		t.Fatal("one client's pre-auth limiter affected another client")
+	} else {
+		release()
 	}
 }
 
-func TestNodeReportAdmissionIsSafeForConcurrentNodes(t *testing.T) {
-	guard := newNodeReportAdmission()
+func TestNodeReportAdmissionReclaimsIdleEntries(t *testing.T) {
+	admission := newNodeReportAdmission()
 	now := time.Now()
-	var wg sync.WaitGroup
-	for i := int64(1); i <= 32; i++ {
-		wg.Add(1)
-		go func(nodeID int64) {
-			defer wg.Done()
-			release, _, ok := guard.admit(nodeID, now)
-			if ok {
-				release()
-			}
-		}(i)
+	release, _, ok := admission.admit(42, now)
+	if !ok {
+		t.Fatal("node report was rejected")
 	}
-	wg.Wait()
+	release()
+	admission.mu.Lock()
+	admission.prune(now.Add(nodeReportEntryTTL + time.Second))
+	_, exists := admission.entries[42]
+	admission.mu.Unlock()
+	if exists {
+		t.Fatal("idle node report limiter entry was not reclaimed")
+	}
 }

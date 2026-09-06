@@ -283,6 +283,18 @@ type telegramReportSettingsView struct {
 	Timezone     int
 }
 
+// telegramReportHTTPClient is a narrow injection point for redirect and
+// timeout regression tests. Production callers receive a fresh client with
+// redirects disabled because the bot token is embedded in the request URL.
+var telegramReportHTTPClient = func() *http.Client {
+	return &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
 func (d *DB) telegramReportSettingsView() (telegramReportSettingsView, telegramReportStoredSettings, error) {
 	stored, err := d.telegramReportSettings()
 	if err != nil {
@@ -560,14 +572,9 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			// Telegram credentials are embedded in the request URL. Never follow
-			// a redirect to another authority (or even replay them to a changed
-			// Telegram endpoint); treat every 3xx as an explicit failure.
-			return http.ErrUseLastResponse
-		},
+	client := telegramReportHTTPClient()
+	if client == nil {
+		return errors.New("telegram HTTP client is unavailable")
 	}
 	resp, err := client.Do(req)
 	if err != nil {

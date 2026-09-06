@@ -98,12 +98,14 @@ func TestEdgeObserverMarksReplayEventsCritical(t *testing.T) {
 
 func TestEdgeAgentHealthProbeBypassesRouteAssignment(t *testing.T) {
 	runtime := &edgeAgentRuntime{}
+	probeSecret := []byte("probe-secret")
 	handler := runtime.observe(map[string]int64{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Meridian-Node", "edge-node")
 		w.WriteHeader(http.StatusOK)
-	}))
+	}), probeSecret)
 
 	request := httptest.NewRequest(http.MethodGet, "https://unassigned.example.test/.well-known/meridian-agent-health", nil)
+	request.Header.Set("X-Meridian-Probe", encodeRuntimeKey(probeSecret))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
@@ -112,6 +114,18 @@ func TestEdgeAgentHealthProbeBypassesRouteAssignment(t *testing.T) {
 	}
 	if got := response.Header().Get("X-Meridian-Node"); got != "edge-node" {
 		t.Fatalf("health probe node header = %q, want edge-node", got)
+	}
+}
+
+func TestEdgeAgentHealthProbeRequiresSecret(t *testing.T) {
+	handler := (&edgeAgentRuntime{}).observe(map[string]int64{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthorized health probe reached router")
+	}), []byte("probe-secret"))
+	request := httptest.NewRequest(http.MethodGet, "https://unassigned.example.test/.well-known/meridian-agent-health", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("health probe status = %d, want %d", response.Code, http.StatusNotFound)
 	}
 }
 
