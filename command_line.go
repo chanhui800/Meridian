@@ -159,6 +159,9 @@ func runIssuePanelCertificateCommand(output io.Writer) error {
 	if dbPath == "" {
 		dbPath = "/app/data/meridian.db"
 	}
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return fmt.Errorf("invalid TLS path configuration: %w", err)
+	}
 	db, err := openDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
@@ -224,6 +227,9 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
 	if dbPath == "" {
 		dbPath = "/app/data/meridian.db"
+	}
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return fmt.Errorf("invalid TLS path configuration: %w", err)
 	}
 	db, err := openDB(dbPath)
 	if err != nil {

@@ -678,8 +678,11 @@ func TestTLSRestoreScopeProtectsCustomParents(t *testing.T) {
 	t.Setenv("EDGE_TLS_CERT_FILE", filepath.Join(edgeDir, "edge.pem"))
 	t.Setenv("EDGE_TLS_KEY_FILE", filepath.Join(edgeDir, "edge.key"))
 	scope := managedTLSRestoreScope(dbPath)
-	if len(scope.OwnedRoots) != 1 || filepath.Clean(scope.OwnedRoots[0]) != filepath.Clean(filepath.Join(edgeDir, "edge-nodes")) {
+	if len(scope.OwnedRoots) != 1 || filepath.Clean(scope.OwnedRoots[0]) != filepath.Clean(filepath.Join(dir, "tls")) {
 		t.Fatalf("owned TLS roots = %#v", scope.OwnedRoots)
+	}
+	if len(scope.ExactPaths) != 0 {
+		t.Fatalf("operator TLS files unexpectedly destructive: %#v", scope.ExactPaths)
 	}
 	for _, parent := range []string{panelDir, edgeDir} {
 		for _, root := range scope.OwnedRoots {
@@ -707,6 +710,132 @@ func TestTLSRestoreScopeProtectsCustomParents(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(parent, "sentinel.txt")); err != nil {
 			t.Fatalf("custom parent sentinel missing after rollback: %s: %v", parent, err)
 		}
+	}
+}
+
+func TestTLSRestorePreservesOperatorCertificateFiles(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	if err := os.WriteFile(dbPath, []byte("db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shared := filepath.Join(dir, "shared")
+	if err := os.MkdirAll(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"panel.pem":    "panel-cert",
+		"panel.key":    "panel-key",
+		"edge.pem":     "edge-cert",
+		"edge.key":     "edge-key",
+		"sentinel.txt": "keep",
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(shared, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	managed := filepath.Join(dir, "tls")
+	if err := os.MkdirAll(managed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managed, "enabled"), []byte("true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PANEL_TLS_CERT_FILE", filepath.Join(shared, "panel.pem"))
+	t.Setenv("PANEL_TLS_KEY_FILE", filepath.Join(shared, "panel.key"))
+	t.Setenv("EDGE_TLS_CERT_FILE", filepath.Join(shared, "edge.pem"))
+	t.Setenv("EDGE_TLS_KEY_FILE", filepath.Join(shared, "edge.key"))
+	if got, want := targetTLSPath(dbPath, backupTLSCertificate), filepath.Join(dir, "tls", ".panel-current", "fullchain.pem"); got != want {
+		t.Fatalf("panel restore target = %q, want managed state path %q", got, want)
+	}
+	scope := managedTLSRestoreScope(dbPath)
+	for _, path := range []string{filepath.Join(shared, "panel.pem"), filepath.Join(shared, "panel.key"), filepath.Join(shared, "edge.pem"), filepath.Join(shared, "edge.key")} {
+		for _, owned := range scope.OwnedRoots {
+			if tlsPathsOverlap(owned, path) {
+				t.Fatalf("operator file is inside destructive scope: %s", path)
+			}
+		}
+	}
+	rollback := filepath.Join(dir, "rollback")
+	if err := snapshotTLSNamespace(dbPath, rollback); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeManagedTLSNamespace(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreTLSNamespaceSnapshot(dbPath, rollback); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range files {
+		data, err := os.ReadFile(filepath.Join(shared, name))
+		if err != nil || string(data) != want {
+			t.Fatalf("shared TLS file %s changed after restore: %q err=%v", name, data, err)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(managed, "enabled")); err != nil || string(data) != "true\n" {
+		t.Fatalf("managed TLS state was not restored: %q err=%v", data, err)
+	}
+}
+
+func TestTLSPathConfigurationRejectsRelativeAndOverlappingPaths(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	t.Setenv("PANEL_TLS_CERT_FILE", "relative/panel.pem")
+	t.Setenv("PANEL_TLS_KEY_FILE", "relative/panel.key")
+	if err := validateTLSPathConfiguration(dbPath); err == nil {
+		t.Fatal("relative TLS paths were accepted")
+	}
+	t.Setenv("PANEL_TLS_CERT_FILE", filepath.Join(dir, "tls", "panel.pem"))
+	t.Setenv("PANEL_TLS_KEY_FILE", filepath.Join(dir, "tls", "panel.key"))
+	t.Setenv("TLS_STATE_DIR", filepath.Join(dir, "tls"))
+	if err := validateTLSPathConfiguration(dbPath); err == nil {
+		t.Fatal("TLS paths inside TLS_STATE_DIR were accepted")
+	}
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	t.Setenv("TLS_STATE_DIR", dbPath+backupPendingSuffix)
+	if err := validateTLSPathConfiguration(dbPath); err == nil {
+		t.Fatal("TLS_STATE_DIR inside restore staging was accepted")
+	}
+}
+
+func TestTLSPathConfigurationResolvesSymlinkedAncestors(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	stateDir := filepath.Join(dir, "tls")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "tls-link")
+	if err := os.Symlink(stateDir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("TLS_STATE_DIR", stateDir)
+	t.Setenv("PANEL_TLS_CERT_FILE", filepath.Join(link, "panel.pem"))
+	t.Setenv("PANEL_TLS_KEY_FILE", filepath.Join(link, "panel.key"))
+	if err := validateTLSPathConfiguration(dbPath); err == nil {
+		t.Fatal("symlinked TLS path inside TLS_STATE_DIR was accepted")
+	}
+	linkedState := filepath.Join(dir, "linked-state")
+	if err := os.Symlink(stateDir, linkedState); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("TLS_STATE_DIR", linkedState)
+	t.Setenv("PANEL_TLS_CERT_FILE", filepath.Join(dir, "panel.pem"))
+	t.Setenv("PANEL_TLS_KEY_FILE", filepath.Join(dir, "panel.key"))
+	if err := validateTLSPathConfiguration(dbPath); err == nil {
+		t.Fatal("symlinked TLS_STATE_DIR was accepted")
+	}
+	parentLink := filepath.Join(dir, "parent-link")
+	if err := os.Symlink(dir, parentLink); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("TLS_STATE_DIR", filepath.Join(parentLink, "tls-state"))
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	if err := validateTLSPathConfiguration(dbPath); err == nil {
+		t.Fatal("TLS_STATE_DIR with a symlinked ancestor was accepted")
 	}
 }
 

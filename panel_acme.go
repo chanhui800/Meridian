@@ -77,13 +77,15 @@ type panelCertificateStatus struct {
 }
 
 type panelCertificateManager struct {
-	certFile     string
-	keyFile      string
-	edgeCertFile string
-	edgeKeyFile  string
-	accountDir   string
-	httpClient   *http.Client
-	db           *DB
+	certFile      string
+	keyFile       string
+	edgeCertFile  string
+	edgeKeyFile   string
+	stateDir      string
+	edgeStateRoot string
+	accountDir    string
+	httpClient    *http.Client
+	db            *DB
 
 	mu                 sync.Mutex
 	issuing            bool
@@ -98,18 +100,35 @@ func (m *panelCertificateManager) panelPairPaths() (string, string) {
 	if m == nil || strings.TrimSpace(m.certFile) == "" || strings.TrimSpace(m.keyFile) == "" {
 		return "", ""
 	}
-	currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
-	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil { // #nosec G703 -- currentDir is derived from the administrator-configured TLS path.
-		return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+	if m.stateDir != "" {
+		currentDir := filepath.Join(m.stateDir, ".panel-current")
+		if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil { // #nosec G703 -- stateDir is a validated private Meridian directory.
+			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+		}
+	}
+	// Read the pre-TLS_STATE_DIR pointer during migration, but never create or
+	// remove anything in the operator-owned certificate directory.
+	legacyDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+	if _, err := os.Stat(filepath.Join(legacyDir, "fullchain.pem")); err == nil { // #nosec G703 -- legacy path is read-only migration compatibility.
+		return filepath.Join(legacyDir, "fullchain.pem"), filepath.Join(legacyDir, "privkey.pem")
 	}
 	return m.certFile, m.keyFile
 }
 
 func (m *panelCertificateManager) panelAtomicPairPaths() (string, string) {
-	if m == nil || strings.TrimSpace(m.certFile) == "" {
+	if m == nil {
 		return "", ""
 	}
-	currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+	stateDir := strings.TrimSpace(m.stateDir)
+	if stateDir == "" && strings.TrimSpace(m.certFile) != "" {
+		// Compatibility for tests and pre-TLS_STATE_DIR managers constructed by
+		// older callers. New managers always set stateDir explicitly.
+		stateDir = filepath.Dir(m.certFile)
+	}
+	if stateDir == "" {
+		return "", ""
+	}
+	currentDir := filepath.Join(stateDir, ".panel-current")
 	return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
 }
 
@@ -164,7 +183,11 @@ func (m *panelCertificateManager) nodeEdgeTLSPaths(nodeGUID string) (string, str
 			return "", "", errors.New("node GUID is invalid")
 		}
 	}
-	root := filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes", guid)
+	rootBase := m.edgeStateRoot
+	if rootBase == "" {
+		rootBase = filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes")
+	}
+	root := filepath.Join(rootBase, guid)
 	current := filepath.Join(root, "current")
 	return filepath.Join(current, "fullchain.pem"), filepath.Join(current, "privkey.pem"), nil
 }
@@ -340,7 +363,10 @@ func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
 	if err := comparePair(m.edgeCertFile, m.edgeKeyFile); err != nil {
 		return err
 	}
-	edgeRoot := filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes")
+	edgeRoot := m.edgeStateRoot
+	if edgeRoot == "" {
+		edgeRoot = filepath.Join(filepath.Dir(m.edgeCertFile), "edge-nodes")
+	}
 	entries, readErr := os.ReadDir(edgeRoot)
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		return readErr
@@ -388,16 +414,163 @@ type cloudflareResponse struct {
 	Result json.RawMessage `json:"result"`
 }
 
+// cleanConfiguredTLSPath normalizes valid administrator paths for consistent
+// comparisons. Validation is performed by validateTLSPathConfiguration before
+// the server starts; retaining the cleaned raw value here keeps legacy callers
+// that only need to display paths deterministic.
+func cleanConfiguredTLSPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if canonical, err := canonicalConfiguredPath(value); err == nil {
+		return canonical
+	}
+	return filepath.Clean(value)
+}
+
+func tlsStateDir(dbPath string) string {
+	configured := strings.TrimSpace(os.Getenv("TLS_STATE_DIR"))
+	if configured != "" {
+		return filepath.Clean(configured)
+	}
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return ""
+	}
+	base, err := filepath.Abs(filepath.Dir(dbPath))
+	if err != nil {
+		base = filepath.Dir(filepath.Clean(dbPath))
+	}
+	return filepath.Join(base, "tls")
+}
+
+// canonicalConfiguredPath requires an absolute path and resolves symlinked
+// ancestors even when the final file has not been created yet. This prevents
+// lexical path checks from mistaking a shared symlinked directory for a safe
+// independent TLS location.
+func canonicalConfiguredPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("path is empty")
+	}
+	if !filepath.IsAbs(value) {
+		return "", errors.New("path must be absolute")
+	}
+	clean := filepath.Clean(value)
+	probe := clean
+	parts := make([]string, 0, 4)
+	for {
+		_, err := os.Lstat(probe)
+		if err == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(probe)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			for index := len(parts) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, parts[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", errors.New("path has no existing ancestor")
+		}
+		parts = append(parts, filepath.Base(probe))
+		probe = parent
+	}
+}
+
+func tlsPathPairError(certName, keyName string) error {
+	cert := strings.TrimSpace(os.Getenv(certName))
+	key := strings.TrimSpace(os.Getenv(keyName))
+	if (cert == "") != (key == "") {
+		return fmt.Errorf("%s and %s must be configured together", certName, keyName)
+	}
+	return nil
+}
+
+func validateTLSPathConfiguration(dbPath string) error {
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	dbAbsolute, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("resolve database path: %w", err)
+	}
+	dbCanonical, err := canonicalConfiguredPath(dbAbsolute)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("resolve database path: %w", err)
+	}
+	if err != nil {
+		dbCanonical = filepath.Clean(dbAbsolute)
+	}
+	stateRaw := tlsStateDir(dbPath)
+	if stateInfo, stateErr := os.Lstat(stateRaw); stateErr == nil && stateInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("TLS_STATE_DIR must not be a symlink")
+	} else if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect TLS_STATE_DIR: %w", stateErr)
+	}
+	stateCanonical, err := canonicalConfiguredPath(stateRaw)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("invalid TLS_STATE_DIR: %w", err)
+	}
+	if err != nil {
+		stateCanonical = filepath.Clean(stateRaw)
+	}
+	if filepath.Clean(stateCanonical) != filepath.Clean(stateRaw) {
+		return errors.New("TLS_STATE_DIR must not use symlinked ancestors")
+	}
+	protected := []string{dbCanonical, dbCanonical + backupPendingSuffix, dbCanonical + backupAppliedSuffix, dbCanonical + backupRollbackSuffix}
+	if stateCanonical == "" {
+		return errors.New("TLS_STATE_DIR must be separate from the database and restore paths")
+	}
+	for _, blocked := range protected {
+		if tlsPathsOverlap(stateCanonical, blocked) {
+			return errors.New("TLS_STATE_DIR must be separate from the database and restore paths")
+		}
+	}
+	if pathWithin(stateCanonical, dbCanonical) || pathWithin(dbCanonical, stateCanonical) {
+		return errors.New("TLS_STATE_DIR must be separate from the database and restore paths")
+	}
+	for _, pair := range [][2]string{{"PANEL_TLS_CERT_FILE", "PANEL_TLS_KEY_FILE"}, {"EDGE_TLS_CERT_FILE", "EDGE_TLS_KEY_FILE"}} {
+		if err := tlsPathPairError(pair[0], pair[1]); err != nil {
+			return err
+		}
+		for _, name := range pair {
+			raw := strings.TrimSpace(os.Getenv(name))
+			if raw == "" {
+				continue
+			}
+			canonical, pathErr := canonicalConfiguredPath(raw)
+			if pathErr != nil {
+				return fmt.Errorf("invalid %s: %w", name, pathErr)
+			}
+			for _, blocked := range protected {
+				if tlsPathsOverlap(canonical, blocked) {
+					return fmt.Errorf("%s must not point to the database or restore marker", name)
+				}
+			}
+			if pathWithin(stateCanonical, canonical) || pathWithin(canonical, stateCanonical) {
+				return fmt.Errorf("%s must be outside TLS_STATE_DIR", name)
+			}
+		}
+	}
+	return nil
+}
+
 func panelTLSPaths(dbPath string) (certFile, keyFile string) {
 	certFile = strings.TrimSpace(os.Getenv("PANEL_TLS_CERT_FILE"))
 	keyFile = strings.TrimSpace(os.Getenv("PANEL_TLS_KEY_FILE"))
 	if certFile != "" || keyFile != "" {
-		return certFile, keyFile
+		return cleanConfiguredTLSPath(certFile), cleanConfiguredTLSPath(keyFile)
 	}
-	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+	base := tlsStateDir(dbPath)
+	if base == "" {
 		return "", ""
 	}
-	base := filepath.Join(filepath.Dir(dbPath), "tls")
 	return filepath.Join(base, "fullchain.pem"), filepath.Join(base, "privkey.pem")
 }
 
@@ -406,7 +579,14 @@ func panelTLSBackupPaths(dbPath string) (certFile, keyFile string) {
 	if certFile == "" {
 		return certFile, keyFile
 	}
-	currentDir := filepath.Join(filepath.Dir(certFile), ".panel-current")
+	stateDir := tlsStateDir(dbPath)
+	currentDir := filepath.Join(stateDir, ".panel-current")
+	if stateDir != "" {
+		if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil { // #nosec G703 -- stateDir is a validated private Meridian directory.
+			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+		}
+	}
+	currentDir = filepath.Join(filepath.Dir(certFile), ".panel-current")
 	if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
 		return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
 	}
@@ -414,11 +594,24 @@ func panelTLSBackupPaths(dbPath string) (certFile, keyFile string) {
 }
 
 func edgeNodeTLSRoot(dbPath string) string {
-	certFile, _ := edgeTLSPaths(dbPath)
-	if strings.TrimSpace(certFile) == "" {
+	stateDir := tlsStateDir(dbPath)
+	if stateDir == "" {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(certFile), "edge-nodes")
+	stateRoot := filepath.Join(stateDir, "edge-nodes")
+	certFile, _ := edgeTLSPaths(dbPath)
+	legacyRoot := ""
+	if strings.TrimSpace(certFile) != "" {
+		legacyRoot = filepath.Join(filepath.Dir(certFile), "edge-nodes")
+	}
+	if legacyRoot != "" && filepath.Clean(legacyRoot) != filepath.Clean(stateRoot) {
+		if _, err := os.Stat(stateRoot); errors.Is(err, os.ErrNotExist) {
+			if _, legacyErr := os.Stat(legacyRoot); legacyErr == nil {
+				return legacyRoot
+			}
+		}
+	}
+	return stateRoot
 }
 
 // edgeTLSPaths deliberately has its own certificate and key.  Edge nodes are
@@ -428,33 +621,33 @@ func edgeTLSPaths(dbPath string) (certFile, keyFile string) {
 	certFile = strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
 	keyFile = strings.TrimSpace(os.Getenv("EDGE_TLS_KEY_FILE"))
 	if certFile != "" || keyFile != "" {
-		return certFile, keyFile
+		return cleanConfiguredTLSPath(certFile), cleanConfiguredTLSPath(keyFile)
 	}
-	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+	base := tlsStateDir(dbPath)
+	if base == "" {
 		return "", ""
 	}
-	base := filepath.Join(filepath.Dir(dbPath), "tls")
 	return filepath.Join(base, "edge-fullchain.pem"), filepath.Join(base, "edge-privkey.pem")
 }
 
 func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCertificateManager {
 	certFile, keyFile := panelTLSPaths(dbPath)
 	edgeCertFile, edgeKeyFile := edgeTLSPaths(dbPath)
+	stateDir := tlsStateDir(dbPath)
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	accountDir := ""
-	if certFile != "" {
-		accountDir = filepath.Dir(certFile)
-	}
+	accountDir := stateDir
 	return &panelCertificateManager{
-		certFile:     certFile,
-		keyFile:      keyFile,
-		edgeCertFile: edgeCertFile,
-		edgeKeyFile:  edgeKeyFile,
-		accountDir:   accountDir,
-		httpClient:   httpClient,
-		issueGate:    make(chan struct{}, 1),
+		certFile:      certFile,
+		keyFile:       keyFile,
+		edgeCertFile:  edgeCertFile,
+		edgeKeyFile:   edgeKeyFile,
+		stateDir:      stateDir,
+		edgeStateRoot: edgeNodeTLSRoot(dbPath),
+		accountDir:    accountDir,
+		httpClient:    httpClient,
+		issueGate:     make(chan struct{}, 1),
 	}
 }
 
@@ -1044,17 +1237,23 @@ func (m *panelCertificateManager) restoreInstalledFiles(backup installedPanelCer
 	} else {
 		// No previous pair means this was the first installation. Remove the
 		// newly-created atomic pointer before restoring the legacy paths.
-		currentDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+		atomicCert, _ := m.panelAtomicPairPaths()
+		currentDir := filepath.Dir(atomicCert)
 		if err := os.Remove(currentDir); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 -- currentDir is derived from the manager's validated TLS path.
 			if removeAllErr := os.RemoveAll(currentDir); removeAllErr != nil { // #nosec G703 -- currentDir is derived from the manager's validated TLS path.
 				return fmt.Errorf("remove new certificate pointer: %w", err)
 			}
 		}
-		if err := restoreOptionalFile(keyFile, backup.keyPEM, backup.keyExists); err != nil {
-			return fmt.Errorf("restore certificate key: %w", err)
-		}
-		if err := restoreOptionalFile(certFile, backup.certPEM, backup.certExists); err != nil {
-			return fmt.Errorf("restore certificate chain: %w", err)
+		// New managers keep operator-provided cert/key files outside Meridian's
+		// rollback namespace. Only legacy test/compatibility managers without a
+		// state directory may restore those historical paths.
+		if m.stateDir == "" {
+			if err := restoreOptionalFile(keyFile, backup.keyPEM, backup.keyExists); err != nil {
+				return fmt.Errorf("restore certificate key: %w", err)
+			}
+			if err := restoreOptionalFile(certFile, backup.certPEM, backup.certExists); err != nil {
+				return fmt.Errorf("restore certificate chain: %w", err)
+			}
 		}
 	}
 	if err := restoreOptionalFile(filepath.Join(m.accountDir, "enabled"), backup.marker, backup.markerExists); err != nil {

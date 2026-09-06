@@ -157,6 +157,9 @@ Docker 主控在已配置 Cloudflare ACME 凭据后，可执行 `docker exec mer
 | `DYNAMIC_ROUTE_KEY` | 自动生成 | 动态路由密钥 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 可信前置代理网段 |
 | `ASSET_CACHE_DIR` | 数据库目录下 `asset-cache` | 图片缓存目录 |
+| `TLS_STATE_DIR` | 数据库目录下 `tls` | Meridian 自己管理的证书、ACME 账户和节点证书状态目录；必须使用绝对路径并与数据库分离 |
+| `PANEL_TLS_CERT_FILE` / `PANEL_TLS_KEY_FILE` | TLS 状态目录中的面板证书 | 可指定外部证书文件；这些路径由运维方拥有，备份恢复不会删除或替换它们 |
+| `EDGE_TLS_CERT_FILE` / `EDGE_TLS_KEY_FILE` | TLS 状态目录中的边缘证书 | 可指定外部证书文件；节点证书状态仍保存在 `TLS_STATE_DIR`，外部文件不会被恢复流程删除 |
 
 ## 发布和开发
 

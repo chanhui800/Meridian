@@ -1496,7 +1496,12 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 }
 
 func syncDirectory(path string) error {
-	directory, err := os.Open(path) // #nosec G304 -- path is the parent directory of the Agent executable selected by Meridian.
+	if goruntime.GOOS == "windows" {
+		// Windows does not expose a directory fsync operation. The file itself
+		// is flushed before rename; directory metadata durability is best effort.
+		return nil
+	}
+	directory, err := os.Open(path) // #nosec G304 G703 -- path is the parent directory of the Agent executable selected by Meridian.
 	if err != nil {
 		return err
 	}

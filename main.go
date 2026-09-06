@@ -91,6 +91,9 @@ func main() {
 			}
 		}
 	}
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		log.Fatalf("invalid TLS path configuration: %v", err)
+	}
 	dynamicRouteKey, err := resolveDynamicRouteKey(os.Getenv("DYNAMIC_ROUTE_KEY"))
 	if err != nil {
 		log.Fatalf("invalid dynamic route key: %v", err)

@@ -25,12 +25,15 @@ import (
 )
 
 const (
-	backupMagic              = "MRDBKP01"
-	backupFormatVersion      = 1
-	backupSaltBytes          = 16
-	backupMaxUploadBytes     = 256 << 20
-	backupMaxExpandedBytes   = 512 << 20
-	backupMaxFiles           = 512
+	backupMagic            = "MRDBKP01"
+	backupFormatVersion    = 1
+	backupSaltBytes        = 16
+	backupMaxUploadBytes   = 256 << 20
+	backupMaxExpandedBytes = 512 << 20
+	// Keep the entry-count ceiling comfortably above the current per-node TLS
+	// layout (two files per node) while retaining the independent expanded-size
+	// and per-entry limits below.
+	backupMaxFiles           = 4096
 	backupMinPasswordBytes   = 12
 	backupMaxPasswordBytes   = 128
 	backupPendingSuffix      = ".restore-pending"
@@ -362,6 +365,11 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	if err := validateBackupPassword(password); err != nil {
 		return nil, err
 	}
+	if includeTLS && a != nil {
+		if err := validateTLSPathConfiguration(a.dbPath); err != nil {
+			return nil, fmt.Errorf("invalid TLS path configuration: %w", err)
+		}
+	}
 	snapshot, cleanup, err := a.databaseSnapshot()
 	if err != nil {
 		return nil, err
@@ -377,13 +385,27 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	}
 	if includeTLS {
 		certFile, keyFile := panelTLSBackupPaths(a.dbPath)
-		panelCertFile, _ := panelTLSPaths(a.dbPath)
+		tlsDir := tlsStateDir(a.dbPath)
+		if certFile != "" && keyFile != "" {
+			_, certErr := os.Stat(certFile)
+			_, keyErr := os.Stat(keyFile)
+			certExists := certErr == nil
+			keyExists := keyErr == nil
+			if certExists != keyExists {
+				return nil, errors.New("面板 TLS 证书和私钥不成对，无法创建包含 TLS 的备份")
+			}
+			if certErr != nil && !errors.Is(certErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("检查面板 TLS 证书: %w", certErr)
+			}
+			if keyErr != nil && !errors.Is(keyErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("检查面板 TLS 私钥: %w", keyErr)
+			}
+		}
 		tlsCandidates := []struct{ name, path string }{
 			{backupTLSCertificate, certFile},
 			{backupTLSPrivateKey, keyFile},
 		}
-		if panelCertFile != "" {
-			tlsDir := filepath.Dir(panelCertFile)
+		if tlsDir != "" {
 			tlsCandidates = append(tlsCandidates,
 				struct{ name, path string }{backupTLSEnabled, filepath.Join(tlsDir, "enabled")},
 				struct{ name, path string }{backupACMEAccount, filepath.Join(tlsDir, "acme-account.pem")},
@@ -993,11 +1015,48 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 }
 
 func copyPrivateFile(source, target string) error {
-	data, err := os.ReadFile(source) // #nosec G304 G703 -- source is always a path generated from the private restore directory and an allowlisted entry.
+	if filepath.Clean(source) == filepath.Clean(target) {
+		return errors.New("source and target must differ")
+	}
+	src, err := os.Open(source) // #nosec G304 G703 -- source is always a path generated from the private restore directory and an allowlisted entry.
 	if err != nil {
 		return err
 	}
-	return writePrivateFileAtomic(target, data)
+	defer src.Close()
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil { // #nosec G703 -- target is an internally generated private path.
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".meridian-copy-*") // #nosec G703 -- directory is an internally generated private path.
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tmpName) // #nosec G703 -- temporary file was created by this function.
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, target); err != nil { // #nosec G703 -- both paths are private restore paths.
+		return err
+	}
+	removeTemp = false
+	return syncDirectory(filepath.Dir(target))
 }
 
 func isPanelCertificatePairEntry(entry string) bool {
@@ -1027,22 +1086,22 @@ func restorePanelCertificatePair(dbPath, sourceDir string) (bool, error) {
 }
 
 func targetTLSPath(dbPath, entry string) string {
-	certFile, keyFile := panelTLSBackupPaths(dbPath)
-	panelCertFile, _ := panelTLSPaths(dbPath)
-	if certFile == "" {
+	if tlsStateDir(dbPath) == "" {
 		return ""
 	}
+	tlsDir := tlsStateDir(dbPath)
+	panelCurrentDir := filepath.Join(tlsDir, ".panel-current")
 	switch entry {
 	case backupTLSCertificate:
-		return certFile
+		return filepath.Join(panelCurrentDir, "fullchain.pem")
 	case backupTLSPrivateKey:
-		return keyFile
+		return filepath.Join(panelCurrentDir, "privkey.pem")
 	case backupTLSEnabled:
-		return filepath.Join(filepath.Dir(panelCertFile), "enabled")
+		return filepath.Join(tlsDir, "enabled")
 	case backupACMEAccount:
-		return filepath.Join(filepath.Dir(panelCertFile), "acme-account.pem")
+		return filepath.Join(tlsDir, "acme-account.pem")
 	case backupACMEAccountStaging:
-		return filepath.Join(filepath.Dir(panelCertFile), "acme-account-staging.pem")
+		return filepath.Join(tlsDir, "acme-account-staging.pem")
 	default:
 		if !strings.HasPrefix(entry, backupTLSEdgeNodesPrefix) {
 			return ""
@@ -1105,91 +1164,42 @@ func pathWithin(parent, child string) bool {
 	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)))
 }
 
+func tlsPathsOverlap(first, second string) bool {
+	if pathWithin(first, second) || pathWithin(second, first) {
+		return true
+	}
+	canonicalFirst, firstErr := canonicalConfiguredPath(first)
+	canonicalSecond, secondErr := canonicalConfiguredPath(second)
+	if firstErr != nil || secondErr != nil {
+		return false
+	}
+	return pathWithin(canonicalFirst, canonicalSecond) || pathWithin(canonicalSecond, canonicalFirst)
+}
+
 func managedTLSRestoreScope(dbPath string) tlsRestoreScope {
 	scope := tlsRestoreScope{}
 	ownedSeen := make(map[string]struct{}, 2)
-	exactSeen := make(map[string]struct{}, 12)
-	generationSeen := make(map[string]struct{}, 2)
-	addDefaultRoot := func() {
-		if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
-			return
-		}
-		scope.OwnedRoots = appendUniqueTLSPath(scope.OwnedRoots, ownedSeen, filepath.Join(filepath.Dir(dbPath), "tls"))
+	stateDir := tlsStateDir(dbPath)
+	if stateDir != "" {
+		// TLS_STATE_DIR is the only directory Meridian may replace wholesale.
+		// Operator-provided cert/key files are intentionally excluded.
+		scope.OwnedRoots = appendUniqueTLSPath(scope.OwnedRoots, ownedSeen, stateDir)
 	}
-	addPanelCustomPaths := func(certFile, keyFile string) {
-		for _, path := range []string{certFile, keyFile} {
-			if strings.TrimSpace(path) != "" {
-				scope.ExactPaths = appendUniqueTLSPath(scope.ExactPaths, exactSeen, path)
-			}
-		}
-		if strings.TrimSpace(certFile) == "" {
-			return
-		}
-		parent := filepath.Dir(certFile)
-		for _, name := range []string{".panel-current", "enabled", "acme-account.pem", "acme-account-staging.pem"} {
-			scope.ExactPaths = appendUniqueTLSPath(scope.ExactPaths, exactSeen, filepath.Join(parent, name))
-		}
-		scope.GenerationRoots = appendUniqueTLSPath(scope.GenerationRoots, generationSeen, filepath.Join(parent, "generations"))
-	}
-	addEdgeCustomPaths := func(certFile, keyFile string) {
-		for _, path := range []string{certFile, keyFile} {
-			if strings.TrimSpace(path) != "" {
-				scope.ExactPaths = appendUniqueTLSPath(scope.ExactPaths, exactSeen, path)
-			}
-		}
-		if strings.TrimSpace(certFile) != "" {
-			// The edge-nodes tree is a Meridian-owned namespace below the
-			// user-selected certificate directory; the parent is not owned.
-			scope.OwnedRoots = appendUniqueTLSPath(scope.OwnedRoots, ownedSeen, filepath.Join(filepath.Dir(certFile), "edge-nodes"))
-		}
-	}
-
-	panelCertEnv := strings.TrimSpace(os.Getenv("PANEL_TLS_CERT_FILE"))
-	panelKeyEnv := strings.TrimSpace(os.Getenv("PANEL_TLS_KEY_FILE"))
-	if panelCertEnv == "" && panelKeyEnv == "" {
-		addDefaultRoot()
-	} else {
-		addPanelCustomPaths(panelCertEnv, panelKeyEnv)
-	}
-	edgeCertEnv := strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
-	edgeKeyEnv := strings.TrimSpace(os.Getenv("EDGE_TLS_KEY_FILE"))
-	if edgeCertEnv == "" && edgeKeyEnv == "" {
-		// The default panel root already owns the complete default TLS tree.
-		addDefaultRoot()
-	} else {
-		addEdgeCustomPaths(edgeCertEnv, edgeKeyEnv)
-	}
-
-	// Exact paths below an owned root are already covered by the tree copy and
-	// must not be removed separately.
-	filtered := scope.ExactPaths[:0]
-	for _, path := range scope.ExactPaths {
-		covered := false
+	// Keep the legacy per-node namespace in scope during migration, but only
+	// the explicitly named edge-nodes child is owned; the external parent and
+	// certificate/key files remain operator-owned.
+	if edgeRoot := edgeNodeTLSRoot(dbPath); edgeRoot != "" {
+		coveredByState := false
 		for _, root := range scope.OwnedRoots {
-			if pathWithin(root, path) {
-				covered = true
+			if pathWithin(root, edgeRoot) {
+				coveredByState = true
 				break
 			}
 		}
-		if !covered {
-			filtered = append(filtered, path)
+		if !coveredByState {
+			scope.OwnedRoots = appendUniqueTLSPath(scope.OwnedRoots, ownedSeen, edgeRoot)
 		}
 	}
-	scope.ExactPaths = filtered
-	filteredGenerations := scope.GenerationRoots[:0]
-	for _, root := range scope.GenerationRoots {
-		covered := false
-		for _, owned := range scope.OwnedRoots {
-			if pathWithin(owned, root) {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			filteredGenerations = append(filteredGenerations, root)
-		}
-	}
-	scope.GenerationRoots = filteredGenerations
 	return scope
 }
 
@@ -1203,7 +1213,7 @@ func managedTLSRoots(dbPath string) []string {
 func copyTLSNamespaceTree(source, target string) error {
 	source = filepath.Clean(source)
 	target = filepath.Clean(target)
-	if pathWithin(source, target) || pathWithin(target, source) {
+	if tlsPathsOverlap(source, target) {
 		return errors.New("TLS snapshot source and target must not overlap")
 	}
 	info, err := os.Lstat(source) // #nosec G703 -- source is an internally derived Meridian TLS namespace root.
@@ -1361,19 +1371,37 @@ func validateTLSRestoreScope(dbPath string, scope tlsRestoreScope) error {
 	if strings.TrimSpace(dbPath) == "" {
 		return nil
 	}
-	protected := map[string]struct{}{}
-	for _, path := range []string{dbPath, dbPath + backupPendingSuffix, dbPath + backupAppliedSuffix, dbPath + backupRollbackSuffix} {
-		protected[filepath.Clean(path)] = struct{}{}
+	protectedBase, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("解析数据库路径: %w", err)
 	}
-	for _, path := range append(append([]string{}, scope.ExactPaths...), scope.GenerationRoots...) {
-		if _, blocked := protected[filepath.Clean(path)]; blocked {
-			return fmt.Errorf("TLS 恢复路径不能覆盖数据库或恢复工作目录: %s", path)
+	protected := []string{protectedBase, protectedBase + backupPendingSuffix, protectedBase + backupAppliedSuffix, protectedBase + backupRollbackSuffix}
+	managed := append(append([]string{}, scope.OwnedRoots...), scope.ExactPaths...)
+	managed = append(managed, scope.GenerationRoots...)
+	for _, path := range managed {
+		for _, blocked := range protected {
+			if tlsPathsOverlap(path, blocked) {
+				return fmt.Errorf("TLS 恢复路径不能覆盖数据库或恢复工作目录: %s", path)
+			}
+		}
+	}
+	for index, first := range managed {
+		if strings.TrimSpace(first) == "" {
+			return errors.New("TLS 恢复路径为空")
+		}
+		for _, second := range managed[index+1:] {
+			if tlsPathsOverlap(first, second) {
+				return fmt.Errorf("TLS 恢复路径互相重叠: %s", first)
+			}
 		}
 	}
 	return nil
 }
 
 func snapshotTLSNamespace(dbPath, rollback string) error {
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return err
+	}
 	scope := managedTLSRestoreScope(dbPath)
 	if err := validateTLSRestoreScope(dbPath, scope); err != nil {
 		return err
@@ -1422,6 +1450,9 @@ func snapshotTLSNamespace(dbPath, rollback string) error {
 }
 
 func removeManagedTLSNamespace(dbPath string) error {
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return err
+	}
 	scope := managedTLSRestoreScope(dbPath)
 	if err := validateTLSRestoreScope(dbPath, scope); err != nil {
 		return err
@@ -1430,6 +1461,9 @@ func removeManagedTLSNamespace(dbPath string) error {
 }
 
 func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(filepath.Join(rollback, "tls-namespace.json")) // #nosec G304 G703 -- rollback is a private directory created by Meridian.
 	if err != nil {
 		return err
@@ -1444,9 +1478,13 @@ func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
 		// v1.9.34 snapshots may only be safely replayed when their roots are
 		// the default DB-local TLS namespace. Never trust a legacy custom
 		// parent directory as an owned root.
-		defaultRoot := filepath.Join(filepath.Dir(dbPath), "tls")
+		defaultRoot, absErr := filepath.Abs(filepath.Join(filepath.Dir(dbPath), "tls"))
+		if absErr != nil {
+			return fmt.Errorf("解析旧版 TLS 回滚目录: %w", absErr)
+		}
 		for _, root := range snapshot.Roots {
-			if filepath.Clean(root) != filepath.Clean(defaultRoot) {
+			rootAbsolute, rootErr := filepath.Abs(root)
+			if rootErr != nil || filepath.Clean(rootAbsolute) != filepath.Clean(defaultRoot) {
 				return errors.New("旧版 TLS 回滚清单包含不安全的自定义目录")
 			}
 		}
