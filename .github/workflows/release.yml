@@ -180,7 +180,14 @@ jobs:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
           set -euo pipefail
-          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id')"
+          # Draft releases are not addressable through /releases/tags until
+          # they are published. List releases instead so the draft created by
+          # the previous step can be published after all assets are uploaded.
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[] | select(.tag_name == env.RELEASE_TAG) | .id' | head -n1)"
+          if [ -z "$release_id" ]; then
+            echo "Could not find draft release for ${RELEASE_TAG}." >&2
+            exit 1
+          fi
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -f draft=false >/dev/null
 
   docker:
