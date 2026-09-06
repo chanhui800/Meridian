@@ -188,6 +188,12 @@ func normalizeControllerURL(value string) (string, error) {
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", errors.New("controller_url cannot contain credentials, query, or fragment")
 	}
+	if parsed.EscapedPath() != "" && parsed.EscapedPath() != "/" {
+		return "", errors.New("controller_url must not contain a path")
+	}
+	if parsed.RawPath != "" && parsed.RawPath != "/" {
+		return "", errors.New("controller_url must not contain a path")
+	}
 	hostIP := net.ParseIP(parsed.Hostname())
 	if parsed.Scheme != "https" && parsed.Hostname() != "localhost" && (hostIP == nil || !hostIP.IsLoopback()) {
 		return "", errors.New("public controller_url must use HTTPS")

@@ -92,7 +92,7 @@ sudo journalctl -u meridian -f
 
 一个站点可配置一条主线路和最多七条备用线路。请求无法连接主线路时按顺序尝试备用线路，主线路恢复后新请求自动切回。普通 API、HLS/DASH、字幕、图片和 WebSocket 默认反代；主视频流选择“直连”时，仅在上游返回合法公网 30x 后交给客户端连接 CDN。
 
-域名入口需要在“全局设置 → TLS 设置”分别配置面板完整域名（例如 `panel.admin.example.com`）和节点泛域名（例如 `*.example.com`），再填写 Cloudflare DNS API Token。两者必须属于同一注册域但不能相同；面板证书只签面板域名，现有站点域名无需迁移，节点继续使用自己的 Edge 泛域名证书。证书由 ACME 申请和续签，Token 加密保存在数据库中。
+域名入口需要在“全局设置 → TLS 设置”分别配置面板完整域名（例如 `panel.admin.example.com`）和节点泛域名（例如 `*.example.com`），再填写 Cloudflare DNS API Token。两者必须属于同一注册域但不能相同。Controller 证书会按配置包含面板域名，并在需要承载 Host 入口时包含节点泛域名；现有站点域名无需迁移。每台 Edge Node 使用独立证书和独立私钥，绝不共享 Controller 私钥。证书由 ACME 申请和续签，Token 加密保存在数据库中。
 
 DNS-01 传播检查默认同时查询公共递归 DNS 与系统 resolver；可用 `DNS_PROPAGATION_RESOLVERS`（逗号分隔的 IPv4/IPv6 地址）和 `DNS_PROPAGATION_TIMEOUT`（如 `120s`）调整。Agent 发布包仅提供 Linux amd64/arm64；Windows/macOS 构建产物仅是主控程序，因为节点流量采集依赖 Linux 网卡计数器。
 
@@ -160,14 +160,15 @@ Docker 主控在已配置 Cloudflare ACME 凭据后，可执行 `docker exec mer
 
 ## 发布和开发
 
-最新正式版和校验文件见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。容器镜像为 `ghcr.io/chanhui800/meridian:latest`，固定版本可使用 `ghcr.io/chanhui800/meridian:v1.9.4`。
+最新正式版和校验文件见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。容器镜像为 `ghcr.io/chanhui800/meridian:latest`，固定版本可使用 `ghcr.io/chanhui800/meridian:<版本号>`。
 
 本地检查：
 
 ```bash
 go test ./...
 go vet ./...
-npm test
+find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
+node --test tests/*.test.js
 ```
 
 项目许可证见 [LICENSE](LICENSE)。

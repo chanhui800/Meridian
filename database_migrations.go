@@ -16,6 +16,10 @@ import (
 const (
 	migrationRetryDelay    = 25 * time.Millisecond
 	migrationRetryDeadline = 5 * time.Second
+	// databaseSchemaVersion is independent from the application and backup
+	// format versions. It is persisted in SQLite so restores can reject a
+	// database whose columns/state are newer than this binary understands.
+	databaseSchemaVersion = 28
 )
 
 func (d *DB) migrate() error {
@@ -869,6 +873,9 @@ func (d *DB) migrateOnce() error {
 		rows.Close()
 	}
 	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_traffic_site_time_ms ON traffic_logs(site_id, recorded_at_ms)"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)); err != nil {
 		return err
 	}
 

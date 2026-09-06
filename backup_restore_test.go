@@ -41,6 +41,21 @@ func TestBackupEncryptionRejectsWrongPasswordAndTampering(t *testing.T) {
 	}
 }
 
+func TestDatabaseSchemaVersionIsPersisted(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != databaseSchemaVersion {
+		t.Fatalf("PRAGMA user_version=%d, want %d", version, databaseSchemaVersion)
+	}
+}
+
 func testBackupArchive(t *testing.T, manifest backupManifest, files map[string][]byte) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
@@ -183,6 +198,9 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 	if !manifestIncludesTLS(manifest) {
 		t.Fatal("selected TLS backup does not declare TLS data")
 	}
+	if manifest.DatabaseSchemaVersion != databaseSchemaVersion {
+		t.Fatalf("backup schema version=%d, want %d", manifest.DatabaseSchemaVersion, databaseSchemaVersion)
+	}
 	for _, name := range []string{backupTLSCertificate, backupTLSPrivateKey, backupTLSEnabled, backupACMEAccount} {
 		if _, ok := entries[name]; !ok {
 			t.Fatalf("selected TLS backup is missing %s", name)
@@ -192,6 +210,21 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 		if _, ok := entries[name]; !ok {
 			t.Fatalf("selected TLS backup is missing %s", name)
 		}
+	}
+}
+
+func TestParseBackupArchiveRejectsNewerDatabaseSchema(t *testing.T) {
+	includeTLS := false
+	manifest := backupManifest{
+		Format:                "meridian-backup",
+		FormatVersion:         backupFormatVersion,
+		DatabaseSchemaVersion: databaseSchemaVersion + 1,
+		Files:                 []string{backupDatabaseEntry},
+		IncludeTLS:            &includeTLS,
+	}
+	archive := testBackupArchive(t, manifest, map[string][]byte{backupDatabaseEntry: []byte("db")})
+	if _, _, err := parseBackupArchive(archive); err == nil || !strings.Contains(err.Error(), "更高数据库版本") {
+		t.Fatalf("newer schema backup was accepted: %v", err)
 	}
 }
 
@@ -601,6 +634,84 @@ func TestApplyPendingRestoreAndRollback(t *testing.T) {
 	data, _ = os.ReadFile(filepath.Join(tlsDir, "fullchain.pem"))
 	if string(data) != "old cert" {
 		t.Fatalf("rolled back cert = %q", data)
+	}
+}
+
+func TestTLSRestoreReplacesManagedNamespaceAndRollbackRestoresIt(t *testing.T) {
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	t.Setenv("EDGE_TLS_CERT_FILE", "")
+	t.Setenv("EDGE_TLS_KEY_FILE", "")
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	if err := os.WriteFile(dbPath, []byte("old database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tlsDir := filepath.Join(dir, "tls")
+	for _, guid := range []string{"node-a", "node-b", "node-c"} {
+		current := filepath.Join(tlsDir, "edge-nodes", guid, "current")
+		if err := os.MkdirAll(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(current, "fullchain.pem"), []byte("old-"+guid+"-cert"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(current, "privkey.pem"), []byte("old-"+guid+"-key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := dbPath + backupPendingSuffix
+	for _, guid := range []string{"node-a", "node-b"} {
+		current := filepath.Join(pending, "tls", "edge-nodes", guid)
+		if err := os.MkdirAll(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(current, "fullchain.pem"), []byte("new-"+guid+"-cert"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(current, "privkey.pem"), []byte("new-"+guid+"-key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(pending, backupDatabaseEntry), []byte("new database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	includeTLS := true
+	manifest := restoreMarker{Files: []string{
+		backupDatabaseEntry,
+		backupTLSEdgeNodesPrefix + "node-a/fullchain.pem",
+		backupTLSEdgeNodesPrefix + "node-a/privkey.pem",
+		backupTLSEdgeNodesPrefix + "node-b/fullchain.pem",
+		backupTLSEdgeNodesPrefix + "node-b/privkey.pem",
+	}, IncludeTLS: &includeTLS}
+	markerData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pending, "restore.json"), markerData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := applyPendingRestore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(tlsDir, "edge-nodes", "node-c")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale node-c TLS namespace remains after restore: %v", err)
+	}
+	for _, guid := range []string{"node-a", "node-b"} {
+		data, err := os.ReadFile(filepath.Join(tlsDir, "edge-nodes", guid, "current", "fullchain.pem"))
+		if err != nil || string(data) != "new-"+guid+"-cert" {
+			t.Fatalf("restored %s certificate=%q err=%v", guid, data, err)
+		}
+	}
+	if err := rollbackAppliedRestore(dbPath, state); err != nil {
+		t.Fatal(err)
+	}
+	for _, guid := range []string{"node-a", "node-b", "node-c"} {
+		data, err := os.ReadFile(filepath.Join(tlsDir, "edge-nodes", guid, "current", "fullchain.pem"))
+		if err != nil || string(data) != "old-"+guid+"-cert" {
+			t.Fatalf("rolled back %s certificate=%q err=%v", guid, data, err)
+		}
 	}
 }
 

@@ -322,7 +322,7 @@ func main() {
 	// bound by ProxyManager and are not affected by PANEL_BIND_ADDR.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeaders(mux))),
+		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeadersForProxies(mux, trustedProxies))),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Shared-host site traffic can include long-running uploads. Header and
 		// per-endpoint body limits protect the panel without imposing a 30-second

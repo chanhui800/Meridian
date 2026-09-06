@@ -1722,6 +1722,18 @@ func TestSecurityHeaders(t *testing.T) {
 	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
 		t.Fatalf("X-Frame-Options = %q, want DENY", got)
 	}
+	if got := rr.Header().Get("Strict-Transport-Security"); got != "" {
+		t.Fatalf("plain HTTP response unexpectedly set HSTS: %q", got)
+	}
+
+	secure := httptest.NewRecorder()
+	secureRequest := httptest.NewRequest(http.MethodGet, "https://panel.example.com/", nil)
+	securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(secure, secureRequest)
+	if got := secure.Header().Get("Strict-Transport-Security"); got != "max-age=31536000" {
+		t.Fatalf("HTTPS response HSTS = %q", got)
+	}
 }
 
 func TestHandleAuthCheckExposesSingleAdminModeBeforeSetup(t *testing.T) {

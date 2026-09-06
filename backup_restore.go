@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -87,14 +88,15 @@ func backupTLSEntries(manifestFiles []string) []string {
 }
 
 type backupManifest struct {
-	Format            string   `json:"format"`
-	FormatVersion     int      `json:"format_version"`
-	AppVersion        string   `json:"app_version"`
-	CreatedAt         string   `json:"created_at"`
-	Files             []string `json:"files"`
-	IncludeTLS        *bool    `json:"include_tls,omitempty"`
-	JWTSecret         string   `json:"jwt_secret"` // #nosec G117 -- encrypted backup manifest field; it is never logged or persisted outside the encrypted archive.
-	UpstreamHeaderKey string   `json:"upstream_header_key"`
+	Format                string   `json:"format"`
+	FormatVersion         int      `json:"format_version"`
+	AppVersion            string   `json:"app_version"`
+	DatabaseSchemaVersion int      `json:"database_schema_version,omitempty"`
+	CreatedAt             string   `json:"created_at"`
+	Files                 []string `json:"files"`
+	IncludeTLS            *bool    `json:"include_tls,omitempty"`
+	JWTSecret             string   `json:"jwt_secret"` // #nosec G117 -- encrypted backup manifest field; it is never logged or persisted outside the encrypted archive.
+	UpstreamHeaderKey     string   `json:"upstream_header_key"`
 }
 
 type restoreAppliedState struct {
@@ -267,6 +269,15 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 		cleanup()
 		return "", func() {}, fmt.Errorf("创建 SQLite 一致性快照: %w", err)
 	}
+	info, err := os.Stat(snapshot)
+	if err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("检查 SQLite 快照大小: %w", err)
+	}
+	if info.Size() > backupMaxExpandedBytes {
+		cleanup()
+		return "", func() {}, fmt.Errorf("数据库大小 %d MiB 超过当前备份格式可恢复上限 %d MiB", info.Size()>>20, backupMaxExpandedBytes>>20)
+	}
 	if err := hardenDatabaseFilePermissions(snapshot); err != nil {
 		cleanup()
 		return "", func() {}, err
@@ -274,23 +285,23 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 	return snapshot, cleanup, nil
 }
 
-func addZipFile(writer *zip.Writer, name, path string) (bool, error) {
+func addZipFile(writer *zip.Writer, name, path string) (bool, int64, error) {
 	data, err := os.ReadFile(path) // #nosec G304 -- path is selected from internal database/TLS files before entering the archive.
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return false, 0, nil
 	}
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	header := &zip.FileHeader{Name: name, Method: zip.Deflate}
 	header.SetMode(0o600)
 	header.Modified = time.Unix(0, 0).UTC()
 	entry, err := writer.CreateHeader(header)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	_, err = entry.Write(data)
-	return true, err
+	return true, int64(len(data)), err
 }
 
 func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
@@ -306,9 +317,11 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	var archive bytes.Buffer
 	zipWriter := zip.NewWriter(&archive)
 	files := []string{backupDatabaseEntry}
-	if _, err := addZipFile(zipWriter, backupDatabaseEntry, snapshot); err != nil {
+	_, databaseSize, err := addZipFile(zipWriter, backupDatabaseEntry, snapshot)
+	if err != nil {
 		return nil, err
 	}
+	expandedSize := databaseSize
 	if includeTLS {
 		certFile, keyFile := panelTLSBackupPaths(a.dbPath)
 		panelCertFile, _ := panelTLSPaths(a.dbPath)
@@ -328,11 +341,15 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 			if candidate.path == "" {
 				continue
 			}
-			added, err := addZipFile(zipWriter, candidate.name, candidate.path)
+			added, size, err := addZipFile(zipWriter, candidate.name, candidate.path)
 			if err != nil {
 				return nil, fmt.Errorf("读取 %s: %w", candidate.name, err)
 			}
 			if added {
+				expandedSize += size
+				if expandedSize > backupMaxExpandedBytes {
+					return nil, errors.New("备份解压后总大小超出限制")
+				}
 				files = append(files, candidate.name)
 			}
 		}
@@ -368,11 +385,15 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 							break
 						}
 					}
-					added, addErr := addZipFile(zipWriter, name, path)
+					added, size, addErr := addZipFile(zipWriter, name, path)
 					if addErr != nil {
 						return nil, fmt.Errorf("读取 %s: %w", name, addErr)
 					}
 					if added {
+						expandedSize += size
+						if expandedSize > backupMaxExpandedBytes {
+							return nil, errors.New("备份解压后总大小超出限制")
+						}
 						files = append(files, name)
 					}
 				}
@@ -380,14 +401,15 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 		}
 	}
 	manifest := backupManifest{
-		Format:            "meridian-backup",
-		FormatVersion:     backupFormatVersion,
-		AppVersion:        appVersion,
-		CreatedAt:         time.Now().UTC().Format(time.RFC3339),
-		Files:             files,
-		IncludeTLS:        boolPointer(includeTLS),
-		JWTSecret:         base64.RawStdEncoding.EncodeToString(jwtSecret),
-		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(a.pm.upstreamHeaderKey),
+		Format:                "meridian-backup",
+		FormatVersion:         backupFormatVersion,
+		AppVersion:            appVersion,
+		DatabaseSchemaVersion: databaseSchemaVersion,
+		CreatedAt:             time.Now().UTC().Format(time.RFC3339),
+		Files:                 files,
+		IncludeTLS:            boolPointer(includeTLS),
+		JWTSecret:             base64.RawStdEncoding.EncodeToString(jwtSecret),
+		UpstreamHeaderKey:     base64.RawStdEncoding.EncodeToString(a.pm.upstreamHeaderKey),
 	}
 	manifestData, err := json.Marshal(manifest) // #nosec G117 -- the manifest is immediately encrypted before it leaves the process.
 	if err != nil {
@@ -403,10 +425,20 @@ func (a *App) buildBackup(password string, includeTLS bool) ([]byte, error) {
 	if _, err := entry.Write(manifestData); err != nil {
 		return nil, err
 	}
+	if expandedSize+int64(len(manifestData)) > backupMaxExpandedBytes {
+		return nil, errors.New("备份解压后总大小超出限制")
+	}
 	if err := zipWriter.Close(); err != nil {
 		return nil, err
 	}
-	return sealBackup(archive.Bytes(), password)
+	payload, err := sealBackup(archive.Bytes(), password)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > backupMaxUploadBytes {
+		return nil, fmt.Errorf("生成的备份为 %d MiB，超过当前恢复接口支持的 %d MiB", len(payload)>>20, backupMaxUploadBytes>>20)
+	}
+	return payload, nil
 }
 
 func readZipEntry(file *zip.File, maxBytes int64) ([]byte, error) {
@@ -469,6 +501,9 @@ func parseBackupArchive(plain []byte) (backupManifest, map[string][]byte, error)
 	if manifest.Format != "meridian-backup" || manifest.FormatVersion != backupFormatVersion {
 		return manifest, nil, errors.New("不支持的备份格式版本")
 	}
+	if manifest.DatabaseSchemaVersion > databaseSchemaVersion {
+		return manifest, nil, errors.New("该备份由更高数据库版本的 Meridian 创建，请先升级 Meridian 后再恢复")
+	}
 	if !manifestIncludesTLS(manifest) {
 		for name := range entries {
 			if strings.HasPrefix(name, "tls/") {
@@ -522,6 +557,19 @@ func validateSQLiteBackup(path string) error {
 		return errors.New("备份中没有管理员账户")
 	}
 	return nil
+}
+
+func sqliteSchemaVersion(path string) (int, error) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=query_only(1)")
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHeaderKey []byte) error {
@@ -836,6 +884,13 @@ func writeRestorePending(dbPath string, manifest backupManifest, entries map[str
 	if err := validateSQLiteBackup(databasePath); err != nil {
 		return 0, err
 	}
+	schemaVersion, err := sqliteSchemaVersion(databasePath)
+	if err != nil {
+		return 0, fmt.Errorf("读取备份数据库版本: %w", err)
+	}
+	if schemaVersion > databaseSchemaVersion || manifest.DatabaseSchemaVersion > databaseSchemaVersion {
+		return 0, errors.New("该备份由更高数据库版本的 Meridian 创建，请先升级 Meridian 后再恢复")
+	}
 	if !manifestIncludesTLS(manifest) {
 		if err := preserveBackupPanelSettings(databasePath, preservedPanelSettings); err != nil {
 			return 0, fmt.Errorf("保留目标服务器 TLS 设置: %w", err)
@@ -967,6 +1022,141 @@ func targetTLSPath(dbPath, entry string) string {
 	}
 }
 
+type tlsNamespaceSnapshot struct {
+	Roots []string `json:"roots"`
+}
+
+func managedTLSRoots(dbPath string) []string {
+	roots := make([]string, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	panelCert, _ := panelTLSPaths(dbPath)
+	edgeCert, _ := edgeTLSPaths(dbPath)
+	for _, path := range []string{panelCert, edgeCert} {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		root := filepath.Clean(filepath.Dir(path))
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+func copyTLSNamespaceTree(source, target string) error {
+	info, err := os.Lstat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("TLS namespace root is not a directory")
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		destination := filepath.Join(target, relative)
+		if entry.Type()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			_ = os.Remove(destination)
+			return os.Symlink(link, destination)
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(destination, 0o700)
+		}
+		return copyPrivateFile(path, destination)
+	})
+}
+
+func snapshotTLSNamespace(dbPath, rollback string) error {
+	roots := managedTLSRoots(dbPath)
+	if len(roots) == 0 {
+		return nil
+	}
+	base := filepath.Join(rollback, "tls-tree")
+	if err := os.RemoveAll(base); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return err
+	}
+	for index, root := range roots {
+		if err := copyTLSNamespaceTree(root, filepath.Join(base, fmt.Sprintf("%d", index))); err != nil {
+			return fmt.Errorf("备份 TLS 目录 %s: %w", root, err)
+		}
+	}
+	data, err := json.Marshal(tlsNamespaceSnapshot{Roots: roots})
+	if err != nil {
+		return err
+	}
+	return writePrivateFileAtomic(filepath.Join(rollback, "tls-namespace.json"), data)
+}
+
+func removeManagedTLSNamespace(dbPath string) error {
+	for _, root := range managedTLSRoots(dbPath) {
+		if err := os.RemoveAll(root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
+	data, err := os.ReadFile(filepath.Join(rollback, "tls-namespace.json"))
+	if err != nil {
+		return err
+	}
+	var snapshot tlsNamespaceSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return err
+	}
+	currentRoots := managedTLSRoots(dbPath)
+	if len(snapshot.Roots) != len(currentRoots) {
+		return errors.New("TLS 回滚清单与当前配置不一致")
+	}
+	if err := removeManagedTLSNamespace(dbPath); err != nil {
+		return err
+	}
+	for index, root := range snapshot.Roots {
+		if filepath.Clean(root) != currentRoots[index] {
+			return errors.New("TLS 回滚清单路径与当前配置不一致")
+		}
+		if err := copyTLSNamespaceTree(filepath.Join(rollback, "tls-tree", fmt.Sprintf("%d", index)), root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func replaceTLSNamespaceWithPending(dbPath string) error {
+	if err := removeManagedTLSNamespace(dbPath); err != nil {
+		return err
+	}
+	return nil
+}
+
 func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
 		return nil, nil
@@ -1033,23 +1223,9 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		return nil, err
 	}
 	rollbackReady = true
-	panelPairRestored := false
 	if markerIncludesTLS(marker) {
-		for _, entry := range backupTLSEntries(marker.Files) {
-			if isPanelCertificatePairEntry(entry) && panelPairRestored {
-				continue
-			}
-			target := targetTLSPath(dbPath, entry)
-			if target == "" {
-				continue
-			}
-			if _, err := os.Stat(target); err == nil { // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
-				if err := copyPrivateFile(target, filepath.Join(rollback, filepath.FromSlash(entry))); err != nil {
-					return nil, err
-				}
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return nil, err
-			}
+		if err := snapshotTLSNamespace(dbPath, rollback); err != nil {
+			return nil, err
 		}
 	}
 	// From this point on every destructive change is recoverable. The marker is
@@ -1059,13 +1235,8 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		return nil, err
 	}
 	if markerIncludesTLS(marker) {
-		for _, entry := range backupTLSEntries(marker.Files) {
-			target := targetTLSPath(dbPath, entry)
-			if target != "" {
-				if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
-					return nil, err
-				}
-			}
+		if err := replaceTLSNamespaceWithPending(dbPath); err != nil {
+			return nil, err
 		}
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -1077,6 +1248,7 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		return nil, err
 	}
 	if markerIncludesTLS(marker) {
+		panelPairRestored := false
 		var pairErr error
 		panelPairRestored, pairErr = restorePanelCertificatePair(dbPath, pending)
 		if pairErr != nil {
@@ -1121,6 +1293,11 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		}
 	}
 	if restoreDirectoryIncludesTLS(rollback) {
+		if _, err := os.Stat(filepath.Join(rollback, "tls-namespace.json")); err == nil {
+			return restoreTLSNamespaceSnapshot(dbPath, rollback)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		panelPairRestored, pairErr := restorePanelCertificatePair(dbPath, rollback)
 		if pairErr != nil {
 			return pairErr

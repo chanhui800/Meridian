@@ -594,3 +594,15 @@ func TestNormalizeControllerURLRequiresHTTPSForRemoteHosts(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeControllerURLRejectsBasePaths(t *testing.T) {
+	for _, input := range []string{
+		"https://panel.example.com/meridian",
+		"https://panel.example.com/meridian/",
+		"https://panel.example.com/%2Fmeridian",
+	} {
+		if _, err := normalizeControllerURL(input); err == nil || !strings.Contains(err.Error(), "must not contain a path") {
+			t.Fatalf("normalizeControllerURL(%q) accepted path: %v", input, err)
+		}
+	}
+}

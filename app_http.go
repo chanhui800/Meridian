@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -223,6 +224,10 @@ func cors(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func securityHeaders(next http.Handler) http.Handler {
+	return securityHeadersForProxies(next, nil)
+}
+
+func securityHeadersForProxies(next http.Handler, trustedProxies []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -230,6 +235,9 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		if requestIsHTTPS(r, trustedProxies) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

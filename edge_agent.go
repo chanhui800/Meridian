@@ -1489,7 +1489,23 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 	if err := os.Rename(temporaryName, executable); err != nil {
 		return err
 	}
+	if err := syncDirectory(filepath.Dir(executable)); err != nil {
+		return err
+	}
 	return errEdgeAgentUpdated
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func edgeFetchAgentManifest(ctx context.Context, client *http.Client, controller, token string) (AgentBinaryManifest, error) {
