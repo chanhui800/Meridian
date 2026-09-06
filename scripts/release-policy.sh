@@ -55,7 +55,9 @@ case "${1:-}" in
     fi
     ;;
   should-promote)
-    [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage
+    if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+      usage
+    fi
     should_promote_latest "$2" "${3:-}"
     ;;
   *) usage ;;
