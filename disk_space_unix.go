@@ -12,10 +12,10 @@ func diskAvailableBytes(path string) (int64, error) {
 		return 0, err
 	}
 	blocks := stat.Bavail
-	blockSize := uint64(stat.Bsize)
-	if blockSize == 0 {
+	if stat.Bsize <= 0 || blocks == 0 {
 		return 0, nil
 	}
+	blockSize := uint64(stat.Bsize) // #nosec G115 -- Bsize is checked positive before conversion.
 	const maxInt64 = uint64(1<<63 - 1)
 	if blocks > maxInt64/blockSize {
 		return int64(maxInt64), nil // #nosec G115 -- maxInt64 is the largest representable result.
