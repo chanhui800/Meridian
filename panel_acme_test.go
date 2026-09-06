@@ -48,7 +48,7 @@ func TestPanelACMETokenEncryptionRoundTripAndIsolation(t *testing.T) {
 }
 
 func TestCertificateRenewalWindow(t *testing.T) {
-	base := panelCertificateStatus{Configured: true, CertificateCurrent: true, CertificateValid: true}
+	base := panelCertificateStatus{Configured: true, CertificateCurrent: false, CertificateMatchesConfiguredDomain: true, CertificateValid: true}
 	base.DaysRemaining = 31
 	if certificateNeedsRenewal(base) || !certificateCanBeReused(base) {
 		t.Fatal("certificate with 31 days remaining should be reused")
@@ -61,6 +61,12 @@ func TestCertificateRenewalWindow(t *testing.T) {
 	base.DaysRemaining = 90
 	if !certificateNeedsRenewal(base) {
 		t.Fatal("expired certificate should be renewed regardless of days remaining")
+	}
+	base.CertificateValid = true
+	base.CertificateMatchesConfiguredDomain = false
+	base.DaysRemaining = 90
+	if certificateCanBeReused(base) || !certificateNeedsRenewal(base) {
+		t.Fatal("certificate for a different configured domain must not be reused")
 	}
 }
 
@@ -81,6 +87,53 @@ func TestPanelCertificateStatusWarnsWhenPanelIsCoveredByEdgeWildcard(t *testing.
 	}, "panel.admin.example.test", "example.test", 9090, true)
 	if nested.PanelCoveredByEdgeWildcard {
 		t.Fatal("nested panel domain should not be covered by the edge wildcard")
+	}
+}
+
+func TestPanelCertificateStatusSeparatesActiveAndConfiguredDomains(t *testing.T) {
+	tlsDir := t.TempDir()
+	certFile := filepath.Join(tlsDir, "fullchain.pem")
+	keyFile := filepath.Join(tlsDir, "privkey.pem")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "*.example.test"},
+		DNSNames:     []string{"*.example.test"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "*.example.test"},
+		DNSNames:     []string{"*.example.test"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &panelCertificateManager{certFile: certFile, keyFile: keyFile}
+	status := manager.status(PanelSettings{
+		PanelDomain: "panel.admin.example.test",
+		RouteDomain: "example.test",
+		Configured:  true,
+	}, "panel.example.test", "example.test", 9090, true)
+	if !status.CertificateCurrent {
+		t.Fatal("certificate should still match the active legacy panel host")
+	}
+	if status.CertificateMatchesConfiguredDomain {
+		t.Fatal("edge wildcard must not match the nested configured panel host")
+	}
+	if status.CertificateValid {
+		t.Fatal("self-signed certificate must not be considered trusted")
 	}
 }
 

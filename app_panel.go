@@ -284,8 +284,8 @@ func (a *App) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusConflict, "请先保存面板域名和监听端口")
 		return
 	}
-	if settings.TLSEnabled && (!status.Configured || !status.CertificateCurrent || !status.CertificateValid) {
-		a.jsonErr(w, http.StatusConflict, "泛域名已改变，请先申请匹配的 TLS 证书")
+	if settings.TLSEnabled && (!status.Configured || !status.CertificateMatchesConfiguredDomain || !status.CertificateValid) {
+		a.jsonErr(w, http.StatusConflict, "面板证书与当前配置的面板域名不匹配，请先申请匹配的 TLS 证书")
 		return
 	}
 	host := settings.PanelDomain

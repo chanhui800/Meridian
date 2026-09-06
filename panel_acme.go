@@ -46,31 +46,32 @@ const (
 var errCertificateIssuanceBusy = errors.New("a certificate request is already running")
 
 type panelCertificateStatus struct {
-	Available                  bool   `json:"available"`
-	TLSEnabled                 bool   `json:"tls_enabled"`
-	PanelDomain                string `json:"panel_domain"`
-	PanelPrefix                string `json:"panel_prefix"`
-	RouteDomain                string `json:"route_domain"`
-	WildcardDomain             string `json:"wildcard_domain"`
-	CertificateWildcardDomain  string `json:"certificate_wildcard_domain,omitempty"`
-	PanelCoveredByEdgeWildcard bool   `json:"panel_covered_by_edge_wildcard"`
-	CertificateCurrent         bool   `json:"certificate_current"`
-	CertificateValid           bool   `json:"certificate_valid"`
-	CertificateReused          bool   `json:"certificate_reused,omitempty"`
-	ListenPort                 int    `json:"listen_port"`
-	ActiveListenPort           int    `json:"active_listen_port"`
-	Configured                 bool   `json:"configured"`
-	SettingsConfigured         bool   `json:"settings_configured"`
-	Subject                    string `json:"subject,omitempty"`
-	ExpiresAt                  string `json:"expires_at,omitempty"`
-	DaysRemaining              int    `json:"days_remaining,omitempty"`
-	AutoRenewEnabled           bool   `json:"auto_renew_enabled"`
-	ACMEEmail                  string `json:"acme_email,omitempty"`
-	ACMEDNSProvider            string `json:"dns_provider,omitempty"`
-	DNSAPIToken                string `json:"dns_api_token,omitempty"`
-	ACMEStaging                bool   `json:"acme_staging"`
-	RestartRequired            bool   `json:"restart_required"`
-	Issuing                    bool   `json:"issuing"`
+	Available                          bool   `json:"available"`
+	TLSEnabled                         bool   `json:"tls_enabled"`
+	PanelDomain                        string `json:"panel_domain"`
+	PanelPrefix                        string `json:"panel_prefix"`
+	RouteDomain                        string `json:"route_domain"`
+	WildcardDomain                     string `json:"wildcard_domain"`
+	CertificateWildcardDomain          string `json:"certificate_wildcard_domain,omitempty"`
+	PanelCoveredByEdgeWildcard         bool   `json:"panel_covered_by_edge_wildcard"`
+	CertificateCurrent                 bool   `json:"certificate_current"`
+	CertificateMatchesConfiguredDomain bool   `json:"certificate_matches_configured_domain"`
+	CertificateValid                   bool   `json:"certificate_valid"`
+	CertificateReused                  bool   `json:"certificate_reused,omitempty"`
+	ListenPort                         int    `json:"listen_port"`
+	ActiveListenPort                   int    `json:"active_listen_port"`
+	Configured                         bool   `json:"configured"`
+	SettingsConfigured                 bool   `json:"settings_configured"`
+	Subject                            string `json:"subject,omitempty"`
+	ExpiresAt                          string `json:"expires_at,omitempty"`
+	DaysRemaining                      int    `json:"days_remaining,omitempty"`
+	AutoRenewEnabled                   bool   `json:"auto_renew_enabled"`
+	ACMEEmail                          string `json:"acme_email,omitempty"`
+	ACMEDNSProvider                    string `json:"dns_provider,omitempty"`
+	DNSAPIToken                        string `json:"dns_api_token,omitempty"`
+	ACMEStaging                        bool   `json:"acme_staging"`
+	RestartRequired                    bool   `json:"restart_required"`
+	Issuing                            bool   `json:"issuing"`
 }
 
 type panelCertificateManager struct {
@@ -504,10 +505,13 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 			break
 		}
 	}
-	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(strings.TrimSpace(activePanelDomain)) == nil
+	configuredPanelDomain := strings.TrimSpace(settings.PanelDomain)
+	activePanelDomain = strings.TrimSpace(activePanelDomain)
+	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(activePanelDomain) == nil
+	status.CertificateMatchesConfiguredDomain = configuredPanelDomain != "" && certificate.VerifyHostname(configuredPanelDomain) == nil
 	now := time.Now()
 	timeValid := !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
-	chainValid := strings.TrimSpace(activePanelDomain) != "" && verifyCertificateChainForHost(certFile, activePanelDomain) == nil
+	chainValid := configuredPanelDomain != "" && verifyCertificateChainForHost(certFile, configuredPanelDomain) == nil
 	status.CertificateValid = timeValid && chainValid
 	status.Subject = certificate.Subject.CommonName
 	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
@@ -520,11 +524,11 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 }
 
 func certificateNeedsRenewal(status panelCertificateStatus) bool {
-	return !status.Configured || !status.CertificateCurrent || !status.CertificateValid || status.DaysRemaining <= int(panelCertificateRenewalWindow.Hours()/24)
+	return !status.Configured || !status.CertificateMatchesConfiguredDomain || !status.CertificateValid || status.DaysRemaining <= int(panelCertificateRenewalWindow.Hours()/24)
 }
 
 func certificateCanBeReused(status panelCertificateStatus) bool {
-	return status.CertificateCurrent && status.CertificateValid && !certificateNeedsRenewal(status)
+	return status.CertificateMatchesConfiguredDomain && status.CertificateValid && !certificateNeedsRenewal(status)
 }
 
 func certificateStatusForFile(certFile string, expectedWildcard string) panelCertificateStatus {

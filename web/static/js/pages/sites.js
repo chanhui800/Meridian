@@ -1226,10 +1226,11 @@ function renderPanelCertificateStatus(status) {
 	if (!status.configured) {
 		return '<div class="form-help">尚未申请证书。请先保存域名设置，再点击“申请证书”。</div>';
 	}
+	const certificateMatchesConfiguredDomain = status.certificate_matches_configured_domain ?? status.certificate_current;
 	return `
 	  ${status.panel_covered_by_edge_wildcard ? '<div class="form-help" style="color:var(--orange);margin-bottom:10px">⚠ 面板域名位于节点泛域名覆盖范围内；建议改为多级域名，例如 <code>panel.admin.example.com</code>，以隔离面板与节点证书。</div>' : ''}
 	  <div class="diag-row"><span class="diag-key">证书域名</span><span class="diag-val">${esc(status.subject || `*.${status.route_domain || ''}`)}</span></div>
-	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${status.certificate_current ? 'good' : 'warn'}">${status.certificate_current ? '面板域名一致' : '需要申请或更新'}</span></div>
+	  <div class="diag-row"><span class="diag-key">证书匹配</span><span class="diag-val ${certificateMatchesConfiguredDomain ? 'good' : 'warn'}">${certificateMatchesConfiguredDomain ? '面板域名一致' : '需要申请或更新'}</span></div>
 	  <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val">${esc(status.expires_at || '—')}</span></div>
 	  <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${status.certificate_valid ? 'good' : 'warn'}">${status.certificate_valid ? '有效' : '已过期或不可用'}</span></div>
 	  <div class="diag-row"><span class="diag-key">自动续签</span><span class="diag-val ${status.auto_renew_enabled ? 'good' : 'warn'}">${status.auto_renew_enabled ? '已启用（到期前 30 天）' : '待配置邮箱和 Token'}</span></div>
@@ -1313,7 +1314,7 @@ async function showPanelCertificateModal() {
 	`;
 	document.getElementById('modal-footer').innerHTML = `
 	  <button class="btn-modal" id="m-cert-cancel">关闭</button>
-	  ${status.restart_required && ((status.configured && status.certificate_current) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="btn-modal primary" id="m-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
+	  ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current)) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="btn-modal primary" id="m-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
 	  <button class="btn-modal" id="m-cert-save">保存设置</button>
 	  <button class="btn-modal primary" id="m-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
 	`;
@@ -1390,7 +1391,7 @@ async function showPanelCertificateModal() {
 		button.textContent = '申请中…';
 		try {
 			const updated = await API.requestPanelCertificate(payload);
-			Toast.success(updated.certificate_reused ? '面板域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+		Toast.success(updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
 			closeModal();
 			await showPanelCertificateModal();
 		} catch (error) {

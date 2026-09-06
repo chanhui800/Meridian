@@ -354,7 +354,7 @@ async function renderTLSSettings() {
           <div class="form-group"><label>DNS API Token</label><input type="text" class="form-input mono" id="p-acme-token" autocomplete="off" maxlength="512" value="${esc(status.dns_api_token || '')}" placeholder="Cloudflare DNS API Token"><div class="form-help">Token 会直接显示给已登录管理员；数据库中仍加密保存，并用于证书自动续签。</div></div>
           <label class="settings-check"><input type="checkbox" id="p-acme-staging" ${status.acme_staging ? 'checked' : ''}><span>ACME 测试环境</span></label>
           <div class="settings-save-bar tls-settings-actions">
-            ${status.restart_required && ((status.configured && status.certificate_current) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="telegram-btn primary" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
+            ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current)) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="telegram-btn primary" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
             <button class="telegram-btn" type="button" id="p-cert-save">保存设置</button>
             <button class="telegram-btn primary" type="button" id="p-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
           </div>
@@ -432,7 +432,7 @@ async function renderTLSSettings() {
       button.textContent = '申请中…';
       try {
         const updated = await API.requestPanelCertificate(payload);
-        Toast.success(updated.certificate_reused ? '面板域名未改变，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
+        Toast.success(updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载'));
         await renderTLSSettings();
       } catch (error) {
         button.disabled = false;

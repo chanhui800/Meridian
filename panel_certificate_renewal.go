@@ -250,6 +250,6 @@ func renewPanelCertificateIfDue(ctx context.Context, db *DB, manager *panelCerti
 			return false, fmt.Errorf("re-enable panel TLS after renewal: %w", err)
 		}
 	}
-	log.Printf("[panel-certificate] wildcard certificate renewed for *.%s", settings.RouteDomain)
+	log.Printf("[panel-certificate] panel certificate renewed for %s", settings.PanelDomain)
 	return recovered, nil
 }
