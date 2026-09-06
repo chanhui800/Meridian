@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -709,8 +710,12 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		if err := ws.SetReadDeadline(time.Now().Add(nodeOnlineWindow)); err != nil {
 			return
 		}
-		var report NodeReport
-		if err := websocket.JSON.Receive(ws, &report); err != nil {
+		// Read only the bounded WebSocket frame before decoding it. The
+		// connection was authenticated above; admission is shared with the
+		// HTTP endpoint so a node cannot bypass its report budget by switching
+		// transports. MaxPayloadBytes bounds the frame allocation.
+		var payload []byte
+		if err := websocket.Message.Receive(ws, &payload); err != nil {
 			return
 		}
 		release, retryAfter, admitted := a.agentReports().admit(node.ID, time.Now())
@@ -720,6 +725,16 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 				"accepted":            false,
 				"error":               "agent report rate or concurrency limit exceeded",
 				"retry_after_seconds": max(1, int(retryAfter.Seconds()+0.5)),
+			})
+			continue
+		}
+		var report NodeReport
+		if err := json.Unmarshal(payload, &report); err != nil {
+			release()
+			_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_ = websocket.JSON.Send(ws, map[string]interface{}{
+				"accepted": false,
+				"error":    "invalid request",
 			})
 			continue
 		}
