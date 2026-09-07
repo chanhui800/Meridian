@@ -642,6 +642,21 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	if !agentUsesRuntimeConfigHash("v1.9.30") || agentUsesRuntimeConfigHash("v1.9.29") {
 		t.Fatal("runtime config hash compatibility gate is incorrect")
 	}
+	if agentSupportsProbeSecret("v1.9.42") || !agentSupportsProbeSecret("v1.9.43") {
+		t.Fatal("probe secret compatibility gate is incorrect")
+	}
+	preProbeSecret := config
+	preProbeSecret.ProbeSecret = ""
+	preProbeHash, err := agentConfigHash(preProbeSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := agentConfigHashForVersion(config, "v1.9.42"); err != nil || got != preProbeHash {
+		t.Fatalf("v1.9.42 config hash did not omit probe secret: got=%q want=%q err=%v", got, preProbeHash, err)
+	}
+	if got, err := agentConfigHashForVersion(config, "v1.9.43"); err != nil || got != runtimeHash {
+		t.Fatalf("v1.9.43 config hash changed unexpectedly: got=%q want=%q err=%v", got, runtimeHash, err)
+	}
 }
 
 func TestNormalizeControllerURLRequiresHTTPSForRemoteHosts(t *testing.T) {
