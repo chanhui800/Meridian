@@ -77,6 +77,19 @@ func newNodeProbeSecret() (string, error) {
 	return newNodeToken()
 }
 
+// decodeNodeProbeSecret converts the encrypted-at-rest plaintext representation
+// (a base64url token) into the raw 32-byte secret used on the wire. Keeping this
+// conversion in one place prevents accidentally base64-encoding the textual
+// token a second time when building Agent configs or scheduler probes.
+func decodeNodeProbeSecret(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size {
+		return nil, errors.New("invalid node probe secret")
+	}
+	return decoded, nil
+}
+
 // dNodeProbeSecret returns the plaintext only at the two places that need it:
 // the Agent config response and the Controller's private readiness probe. The
 // database stores only JWT-secret-encrypted material; the in-memory ControlNode
@@ -86,7 +99,14 @@ func dNodeProbeSecret(db *DB, node ControlNode) (string, error) {
 		return "", errors.New("node probe secret is unavailable")
 	}
 	if strings.TrimSpace(node.probeSecretCiphertext) != "" {
-		return decryptNodeProbeSecretWithSecret(node.probeSecretCiphertext, jwtSecret)
+		secret, err := decryptNodeProbeSecretWithSecret(node.probeSecretCiphertext, jwtSecret)
+		if err == nil {
+			return secret, nil
+		}
+		if jwtSecretEphemeral {
+			return "", err
+		}
+		return rotateNodeProbeSecret(db, node)
 	}
 	secret, err := newNodeProbeSecret()
 	if err != nil {
@@ -110,4 +130,39 @@ func dNodeProbeSecret(db *DB, node ControlNode) (string, error) {
 		return decryptNodeProbeSecretWithSecret(existing, jwtSecret)
 	}
 	return secret, nil
+}
+
+// rotateNodeProbeSecret repairs a ciphertext written with an old signing key
+// without touching the node identity, enrollment token, or traffic counters.
+// The conditional update makes concurrent config requests converge on one
+// secret while preserving a successfully rotated value.
+func rotateNodeProbeSecret(db *DB, node ControlNode) (string, error) {
+	if db == nil || db.db == nil || node.ID <= 0 {
+		return "", errors.New("node probe secret is unavailable")
+	}
+	if jwtSecretEphemeral || len(jwtSecret) < 32 {
+		return "", errors.New("persistent JWT_SECRET is required to rotate node probe secret")
+	}
+	secret, err := newNodeProbeSecret()
+	if err != nil {
+		return "", err
+	}
+	ciphertext, err := encryptNodeProbeSecretWithSecret(secret, jwtSecret)
+	if err != nil {
+		return "", err
+	}
+	result, err := db.db.Exec("UPDATE control_nodes SET probe_secret_ciphertext=?,updated_at_ms=? WHERE id=? AND probe_secret_ciphertext=?", ciphertext, time.Now().UnixMilli(), node.ID, node.probeSecretCiphertext)
+	if err != nil {
+		return "", err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return "", rowsErr
+	} else if affected == 1 {
+		return secret, nil
+	}
+	var existing string
+	if err := db.db.QueryRow("SELECT probe_secret_ciphertext FROM control_nodes WHERE id=?", node.ID).Scan(&existing); err != nil {
+		return "", err
+	}
+	return decryptNodeProbeSecretWithSecret(existing, jwtSecret)
 }

@@ -7168,6 +7168,7 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
 .node-site-card .node-site-status { min-height: 58px; padding: 11px 12px; border: 1px solid var(--glass-border); border-radius: 9px; background: var(--surface); }
 .node-site-dirty { color: var(--orange); }
 .node-site-card-actions { justify-content: flex-end; }
+.node-site-card.is-schedule-pending { transition: opacity .18s ease; opacity: .78; }
 @media (max-width: 900px) { .node-site-card-controls { grid-template-columns: 1fr 1fr; }.node-site-card-controls .node-check { grid-column: 1 / -1; } }
 @media (max-width: 680px) {
   .node-site-list { grid-template-columns: minmax(0, 1fr); gap: 12px; }

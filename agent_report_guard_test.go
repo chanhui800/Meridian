@@ -1,9 +1,34 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
+
+func TestAgentPreAuthCannotBeBypassedByEndpointRotation(t *testing.T) {
+	app := &App{}
+	handler := app.withAgentPreAuth(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	paths := []string{"/api/agent/enroll", "/api/agent/config", "/api/agent/manifest", "/api/agent/binary", "/api/agent/report"}
+	for i := 0; i < agentPreAuthBurst; i++ {
+		req := httptest.NewRequest(http.MethodGet, paths[i%len(paths)], nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("request %d was rejected before burst exhausted: %d", i, response.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, paths[0], nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotated endpoint bypassed shared pre-auth limiter: %d", response.Code)
+	}
+}
 
 func TestAgentSecurityAuditStateIsBoundedByNodeAndCategory(t *testing.T) {
 	db := &DB{}
@@ -71,5 +96,58 @@ func TestNodeReportAdmissionReclaimsIdleEntries(t *testing.T) {
 	admission.mu.Unlock()
 	if exists {
 		t.Fatal("idle node report limiter entry was not reclaimed")
+	}
+}
+
+func TestAgentPreAuthAdmissionHasHardEntryLimit(t *testing.T) {
+	admission := newAgentPreAuthAdmission()
+	now := time.Now()
+	for i := 0; i < maxTrackedAgentPreAuthClients+100000; i++ {
+		release, _, ok := admission.admit("client-"+strconv.Itoa(i), now)
+		if ok {
+			release()
+		}
+	}
+	admission.mu.Lock()
+	entries := len(admission.entries)
+	admission.mu.Unlock()
+	if entries > maxTrackedAgentPreAuthClients {
+		t.Fatalf("pre-auth entries=%d, want <=%d", entries, maxTrackedAgentPreAuthClients)
+	}
+}
+
+func TestAgentPreAuthAdmissionDoesNotEvictActiveEntries(t *testing.T) {
+	admission := newAgentPreAuthAdmission()
+	now := time.Now()
+	release, _, ok := admission.admit("active", now)
+	if !ok {
+		t.Fatal("active client was rejected")
+	}
+	t.Cleanup(release)
+	admission.mu.Lock()
+	admission.maxEntries = 1
+	admission.mu.Unlock()
+	if _, _, ok := admission.admit("new-client", now); ok {
+		t.Fatal("new client admitted while the only tracked entry was active")
+	}
+	admission.mu.Lock()
+	_, exists := admission.entries["active"]
+	admission.mu.Unlock()
+	if !exists {
+		t.Fatal("active pre-auth entry was evicted")
+	}
+}
+
+func BenchmarkAgentPreAuthAdmissionLargeMap(b *testing.B) {
+	admission := newAgentPreAuthAdmission()
+	now := time.Now()
+	for i := 0; i < maxTrackedAgentPreAuthClients; i++ {
+		admission.entries[strconv.Itoa(i)] = &agentPreAuthEntry{tokens: agentPreAuthBurst, last: now, lastSeen: now}
+	}
+	for i := 0; i < b.N; i++ {
+		release, _, ok := admission.admit("steady-client", now.Add(time.Duration(i)*time.Millisecond))
+		if ok {
+			release()
+		}
 	}
 }

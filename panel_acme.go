@@ -625,8 +625,11 @@ func legacyEdgeNodeTLSRoot(dbPath string) string {
 	if configured == "" {
 		return ""
 	}
-	certFile := cleanConfiguredTLSPath(configured)
-	if certFile == "" {
+	// Preserve the operator's lexical path here. Migration must be able to
+	// detect and reject symlinked ancestors rather than canonicalizing them
+	// away before the safety check.
+	certFile, err := filepath.Abs(filepath.Clean(configured))
+	if err != nil || certFile == "" {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(certFile), "edge-nodes")
@@ -673,6 +676,50 @@ func readLegacyTLSFile(path string, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
+// validateLegacyTLSPathComponents rejects symlinked ancestors before a legacy
+// certificate is copied into TLS_STATE_DIR. Lexical filepath.Clean checks are
+// insufficient here because an operator-owned legacy directory may contain a
+// link that escapes the allowlisted node namespace.
+func validateLegacyTLSPathComponents(root, path string) error {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	// Inspect ancestors individually. Lstat on a nested path follows a
+	// symlinked parent, so checking only the final path is not sufficient.
+	for ancestor := path; ; ancestor = filepath.Dir(ancestor) {
+		info, statErr := os.Lstat(ancestor)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return errors.New("legacy TLS path contains a symlinked ancestor")
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			break
+		}
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return errors.New("legacy TLS path escapes its root")
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("legacy TLS path contains a symlink")
+		}
+	}
+	return nil
+}
+
 // migrateLegacyEdgeTLSState performs a one-time, allowlisted copy from the
 // pre-TLS_STATE_DIR external edge-nodes directory. It only considers GUIDs
 // present in control_nodes, validates regular files and the key pair, and
@@ -710,6 +757,14 @@ func migrateLegacyEdgeTLSState(db *DB, dbPath string) error {
 		sourceDir := filepath.Join(legacyRoot, guid, "current")
 		certSource := filepath.Join(sourceDir, "fullchain.pem")
 		keySource := filepath.Join(sourceDir, "privkey.pem")
+		// Validate every ancestor, including the GUID/current directories, so
+		// the allowlisted copy can never follow an operator-created symlink.
+		if err := validateLegacyTLSPathComponents(legacyRoot, certSource); err != nil {
+			continue
+		}
+		if err := validateLegacyTLSPathComponents(legacyRoot, keySource); err != nil {
+			continue
+		}
 		certPEM, certErr := readLegacyTLSFile(certSource, legacyEdgeCertificateMaxBytes)
 		keyPEM, keyErr := readLegacyTLSFile(keySource, legacyEdgePrivateKeyMaxBytes)
 		if errors.Is(certErr, os.ErrNotExist) || errors.Is(keyErr, os.ErrNotExist) {

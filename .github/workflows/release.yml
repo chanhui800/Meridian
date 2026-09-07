@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       release_tag: ${{ steps.release_tag.outputs.value }}
 
@@ -47,6 +49,18 @@ jobs:
             exit 1
           fi
           printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to mutate a published release
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          existing_release="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.RELEASE_TAG) | select(.draft == false) | .id' | head -n1)"
+          if [ -n "$existing_release" ]; then
+            echo "Release ${RELEASE_TAG} is already published and cannot be mutated." >&2
+            exit 1
+          fi
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -178,21 +192,6 @@ jobs:
             meridian-*
             SHA256SUMS
 
-      - name: Refuse to mutate a published release
-        env:
-          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: |
-          set -euo pipefail
-          # A published release is immutable from Meridian's workflow. This
-          # also protects manual reruns of an older tag from replacing assets
-          # that agents may already trust.
-          existing_draft="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq '.[] | select(.tag_name == env.RELEASE_TAG) | select(.draft == false) | .id' | head -n1)"
-          if [ -n "$existing_draft" ]; then
-            echo "Release ${RELEASE_TAG} is already published and cannot be mutated." >&2
-            exit 1
-          fi
-
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
@@ -251,6 +250,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an existing versioned image tag
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE_NAME:$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Container tag $IMAGE_NAME:$RELEASE_TAG already exists and is immutable." >&2
+            exit 1
+          fi
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:

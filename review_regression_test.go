@@ -521,6 +521,70 @@ func TestReviewLegacyEdgeTLSMigratesOnlyKnownNodesIntoStateDir(t *testing.T) {
 	}
 }
 
+func TestLegacyTLSMigrationRejectsIntermediateSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	t.Setenv("PANEL_TLS_CERT_FILE", "")
+	t.Setenv("PANEL_TLS_KEY_FILE", "")
+	t.Setenv("EDGE_TLS_CERT_FILE", filepath.Join(dir, "external", "edge.pem"))
+	t.Setenv("EDGE_TLS_KEY_FILE", filepath.Join(dir, "external", "edge.key"))
+	stateDir := filepath.Join(dir, "owned-tls")
+	t.Setenv("TLS_STATE_DIR", stateDir)
+	node, _, err := db.CreateControlNode(NodeCreateInput{Name: "symlink-edge", Address: "203.0.113.72"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot := filepath.Join(dir, "external", "edge-nodes")
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := reviewCertificatePEM(t)
+	outside := filepath.Join(dir, "outside", "current")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "fullchain.pem"), []byte(certPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "privkey.pem"), []byte(keyPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(outside), filepath.Join(legacyRoot, node.GUID)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := migrateLegacyEdgeTLSState(db, dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "edge-nodes", node.GUID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlinked GUID directory was migrated: %v", err)
+	}
+	// Replace the GUID link with a real directory and make only current a link.
+	if err := os.Remove(filepath.Join(legacyRoot, node.GUID)); err != nil {
+		t.Fatal(err)
+	}
+	currentLinkRoot := filepath.Join(legacyRoot, node.GUID, "current")
+	if err := os.MkdirAll(filepath.Dir(currentLinkRoot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, currentLinkRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := migrateLegacyEdgeTLSState(db, dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "edge-nodes", node.GUID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlinked current directory was migrated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "fullchain.pem")); err != nil {
+		t.Fatalf("outside TLS file was modified or removed: %v", err)
+	}
+}
+
 func TestReviewEventSpoolEncryptsAndReportsPersistenceFailure(t *testing.T) {
 	dir := t.TempDir()
 	var store edgeEventStore
