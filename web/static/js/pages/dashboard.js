@@ -293,8 +293,12 @@ function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
     if (range === 'realtime' && realtimeSeries.size && realtimeIndex >= 0) {
       const knownSites = dashboardSites.length ? dashboardSites : allSeries.map(series => ({ id: series.site_id, name: series.site_name }));
       knownSites.forEach(site => {
-        const samples = realtimeSeries.get(String(site.id));
-        const sample = samples?.[realtimeIndex] || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+        // A site may report at a different cadence from the other sites. The
+        // per-site realtime arrays therefore contain only samples emitted by
+        // that site and cannot be indexed by the aggregate point index. Use
+        // the latest sample at or before the hovered timestamp instead of
+        // turning a sparse array lookup into a misleading zero.
+        const sample = dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms) || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
         siteRows.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(site.name || `站点 ${site.id}`)}</strong><span>${dashboardTrendMetricLine(sample, metric)}</span></div>`);
       });
     } else {
@@ -311,6 +315,21 @@ function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
   if (siteRows.length) lines.push(siteRows.join(''));
   else lines.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(selectedSiteID === null ? '全部站点' : (selectedOption?.textContent?.trim() || `站点 ${selectedSiteID}`))}</strong><span>${dashboardTrendMetricLine(point, metric)}</span></div>`);
   return lines.join('');
+}
+
+function dashboardRealtimeSiteSampleAt(siteID, timestampMS) {
+  const samples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
+  if (!samples.length) return null;
+  const target = Number(timestampMS);
+  if (!Number.isFinite(target)) return samples[samples.length - 1] || null;
+  let latest = null;
+  for (const sample of samples) {
+    const sampledAt = Number(sample?.timestamp_ms);
+    if (!Number.isFinite(sampledAt)) continue;
+    if (sampledAt > target) break;
+    latest = sample;
+  }
+  return latest;
 }
 
 function dashboardRealtimeTrendPoints() {
@@ -801,6 +820,7 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
   const liveMap = new Map();
   const trendDeltas = new Map();
   const rateSamples = new Map();
+  const changedSiteTimestamps = new Map();
   const changedSiteIDs = new Set();
   let totalDeltaIn = 0;
   let totalDeltaOut = 0;
@@ -823,10 +843,12 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
     if (!previous) {
       dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
       changedSiteIDs.add(siteID);
+      changedSiteTimestamps.set(siteID, current.timestamp);
       rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
       trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
     } else if (current.timestamp > previous.timestamp) {
       changedSiteIDs.add(siteID);
+      changedSiteTimestamps.set(siteID, current.timestamp);
       const seconds = (current.timestamp - previous.timestamp) / 1000;
       const down = current.bytesOut - previous.bytesOut;
       const up = current.bytesIn - previous.bytesIn;
@@ -861,12 +883,12 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
     dashboardSpeedSamples.set(siteID, current);
   }
   const sampledAt = Number(snapshotMS || Date.now());
-  const appendRealtimeTrendSample = (key, sample) => {
+  const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
     const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));
     const bytesOut = Math.max(0, Number(sample?.bytesOut || 0));
     samples.push({
-      timestamp_ms: sampledAt,
+      timestamp_ms: Number(sampleTimestamp || sampledAt),
       download_bps: Math.max(0, Number(sample?.download_bps || 0)),
       upload_bps: Math.max(0, Number(sample?.upload_bps || 0)),
       bytes_in: bytesIn,
@@ -884,17 +906,21 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
   for (const siteID of changedSiteIDs) {
     const rate = rateSamples.get(String(siteID)) || {};
     const delta = trendDeltas.get(siteID) || {};
-    appendRealtimeTrendSample(String(siteID), { ...rate, ...delta });
+    const siteSampledAt = changedSiteTimestamps.get(siteID) || sampledAt;
     const siteSamples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
-    siteSamples.push({
-      timestamp_ms: sampledAt,
+    const siteSample = {
+      timestamp_ms: siteSampledAt,
       download_bps: Math.max(0, Number(rate.download_bps || 0)),
       upload_bps: Math.max(0, Number(rate.upload_bps || 0)),
       bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
       bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
       requests: Math.max(0, Number(delta.requests || 0)),
       traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? Math.max(0, Number(delta.bytesOut || 0)) : 2 * (Math.max(0, Number(delta.bytesIn || 0)) + Math.max(0, Number(delta.bytesOut || 0))),
-    });
+    };
+    // Keep the site series timestamp aligned with the Agent sample. The
+    // aggregate series still uses the controller snapshot timestamp.
+    appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, siteSampledAt);
+    siteSamples.push(siteSample);
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples.slice(-1800));
   }
   dashboardSites = dashboardSites.map(site => {
