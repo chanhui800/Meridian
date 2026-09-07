@@ -259,6 +259,27 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 		PersistedTraffic: trafficBillableBytes(billingMode, persistedIn, persistedOut),
 		TrafficUsed:      trafficBillableBytes(billingMode, persistedIn, persistedOut),
 	}
+	// An applied Agent is the runtime authority for the site. Keep the
+	// per-site history endpoint on the same model as dashboard/overview instead
+	// of falling back to a stale controller-local proxy instance.
+	nodeLive, err := pm.database.NodeSiteLiveTrafficSnapshot(time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if remote, ok := nodeLive[site.ID]; ok {
+		logs, err := pm.database.GetTrafficLogs(site.ID, hours)
+		if err != nil {
+			return nil, err
+		}
+		snap.Running = remote.Running
+		snap.CumulativeBytesIn = remote.CumulativeBytesIn
+		snap.CumulativeBytesOut = remote.CumulativeBytesOut
+		snap.Requests = remote.Requests
+		snap.SampledAtMS = remote.SampledAtMS
+		snap.CacheSizeBytes = remote.CacheSizeBytes
+		snap.AgentRuntime = true
+		return &TrafficHistory{Snapshot: snap, Logs: logs, BillingMode: billingMode}, nil
+	}
 
 	pm.mu.RLock()
 	inst, present := pm.proxies[site.ID]
@@ -377,6 +398,8 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 			st.CumulativeBytesOut = remote.CumulativeBytesOut
 			st.Requests = remote.Requests
 			st.SampledAtMS = remote.SampledAtMS
+			st.CacheSizeBytes = remote.CacheSizeBytes
+			st.AgentRuntime = true
 			st.BytesIn = 0
 			st.BytesOut = 0
 			st.TrafficUsed = st.PersistedTraffic

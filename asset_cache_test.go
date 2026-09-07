@@ -182,6 +182,24 @@ func TestAssetCacheSizeAccountingOverwriteAndExpiry(t *testing.T) {
 	}
 }
 
+func TestAssetCacheKeyUsesStableControllerNamespace(t *testing.T) {
+	cache := newAssetCache(t.TempDir())
+	target, _ := url.Parse("https://media.example/file/accounting.jpg")
+	request := httptest.NewRequest(http.MethodGet, "https://proxy.example/file/accounting.jpg", nil)
+	first := Site{ID: 1, AssetCacheNamespace: "site-100-config-a", AssetCacheEnabled: true, AssetCacheTTLSec: 3600, AssetCacheMaxBytes: 16 << 20, AssetCacheRules: "*/file/*"}
+	second := first
+	second.ID = 7
+	second.AssetCacheNamespace = "site-100-config-a"
+	firstRequest := cache.request(first, request, target)
+	secondRequest := cache.request(second, request, target)
+	if firstRequest == nil || secondRequest == nil {
+		t.Fatal("stable namespace requests were not cache eligible")
+	}
+	if firstRequest.key != secondRequest.key || firstRequest.bodyPath != secondRequest.bodyPath {
+		t.Fatalf("cache identity changed with local row ID: first=%+v second=%+v", firstRequest, secondRequest)
+	}
+}
+
 func TestHandleAssetCacheReportsAndClearsCache(t *testing.T) {
 	app := newTestApp(t)
 	cache := newAssetCache(t.TempDir())

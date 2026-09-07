@@ -681,6 +681,31 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	if agentSupportsProbeSecret("v1.9.42") || !agentSupportsProbeSecret("v1.9.43") {
 		t.Fatal("probe secret compatibility gate is incorrect")
 	}
+	if agentSupportsCacheClear("v1.9.49") || !agentSupportsCacheClear("v1.9.50") {
+		t.Fatal("cache clear compatibility gate is incorrect")
+	}
+	cacheGenerationConfig := config
+	cacheGenerationConfig.CacheClearGeneration = 7
+	cacheGenerationHash, err := agentConfigHash(cacheGenerationConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCacheGenerationHash, err := agentConfigHashForVersion(cacheGenerationConfig, "v1.9.49")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutCacheGeneration := cacheGenerationConfig
+	withoutCacheGeneration.CacheClearGeneration = 0
+	wantLegacyCacheGenerationHash, err := agentConfigHash(withoutCacheGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyCacheGenerationHash != wantLegacyCacheGenerationHash || cacheGenerationHash == legacyCacheGenerationHash {
+		t.Fatalf("cache clear field was not gated for v1.9.49: legacy=%q want=%q runtime=%q", legacyCacheGenerationHash, wantLegacyCacheGenerationHash, cacheGenerationHash)
+	}
+	if got, err := agentConfigHashForVersion(cacheGenerationConfig, "v1.9.50"); err != nil || got != cacheGenerationHash {
+		t.Fatalf("v1.9.50 config hash did not include cache clear generation: got=%q want=%q err=%v", got, cacheGenerationHash, err)
+	}
 	preProbeSecret := config
 	preProbeSecret.ProbeSecret = ""
 	preProbeHash, err := agentConfigHash(preProbeSecret)

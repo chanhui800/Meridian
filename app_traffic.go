@@ -87,13 +87,48 @@ func (a *App) handleAssetCache(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, "cache statistics unavailable")
 			return
 		}
-		a.jsonOK(w, map[string]interface{}{"total_bytes": total, "sites": sites})
+		nodes := make([]map[string]any, 0)
+		if controlNodes, nodeErr := a.db.listControlNodes(time.Now()); nodeErr == nil {
+			for _, node := range controlNodes {
+				state := "applied"
+				if node.CacheClearGeneration > node.CacheClearAppliedGeneration {
+					state = "pending"
+					if node.Status != "online" {
+						state = "offline"
+					}
+				}
+				nodes = append(nodes, map[string]any{
+					"node_id":            node.ID,
+					"status":             state,
+					"generation":         node.CacheClearGeneration,
+					"applied_generation": node.CacheClearAppliedGeneration,
+				})
+			}
+		}
+		a.jsonOK(w, map[string]interface{}{"total_bytes": total, "sites": sites, "nodes": nodes})
 	case http.MethodDelete:
 		if err := a.pm.ClearAssetCache(); err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "clear asset cache failed")
 			return
 		}
-		a.jsonOK(w, map[string]string{"status": "cleared"})
+		nowMS := time.Now().UnixMilli()
+		result, err := a.db.db.Exec(`UPDATE control_nodes
+			SET cache_clear_generation=cache_clear_generation+1,updated_at_ms=?
+			WHERE enabled=1 AND agent_token_hash<>''`, nowMS)
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "schedule agent cache clear failed")
+			return
+		}
+		pending, _ := result.RowsAffected()
+		status := "cleared"
+		if pending > 0 {
+			status = "pending"
+		}
+		a.jsonOK(w, map[string]any{
+			"status":        status,
+			"local_cleared": true,
+			"nodes_pending": pending,
+		})
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}

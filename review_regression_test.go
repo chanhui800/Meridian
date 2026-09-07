@@ -364,8 +364,57 @@ func TestReviewSiteTrafficCounterContinuesAcrossAgentRestart(t *testing.T) {
 	if err := app.db.db.QueryRow("SELECT COALESCE(SUM(bytes_in),0),COALESCE(SUM(bytes_out),0),COALESCE(SUM(requests),0) FROM node_site_traffic_logs WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&gotIn, &gotOut, &gotRequests); err != nil {
 		t.Fatal(err)
 	}
-	if gotIn != 500 || gotOut != 600 || gotRequests != 4 {
-		t.Fatalf("site traffic delta after Agent restart = in %d out %d requests %d, want 500/600/4", gotIn, gotOut, gotRequests)
+	if gotIn != 500 || gotOut != 600 || gotRequests != 14 {
+		t.Fatalf("site traffic after Agent restart = in %d out %d requests %d, want 500/600/14 (including first report)", gotIn, gotOut, gotRequests)
+	}
+}
+
+func TestReviewSiteTrafficCounterSeparatesRepeatedConfigEpochs(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "site-counter-epochs", Address: "203.0.113.23", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "site-counter-epochs", PublicHost: "site-counter-epochs.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18081"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	report := func(sequence int64, epoch string, in, out, requests int64, at time.Time) {
+		t.Helper()
+		_, reportErr := app.db.RecordNodeReport(token, NodeReport{
+			BootID: "same-kernel", ReportSessionID: "same-session", CounterEpoch: "kernel:eth0", SiteCounterEpoch: epoch,
+			Sequence: sequence, InterfaceName: "eth0", SiteStats: []NodeSiteStat{{
+				Host: site.PublicHost, BytesIn: in, BytesOut: out, CumulativeBytesIn: in, CumulativeBytesOut: out,
+				RequestCount: requests, LastRequestAtMS: at.UnixMilli(), LastStatus: 200,
+			}},
+		}, at)
+		if reportErr != nil {
+			t.Fatal(reportErr)
+		}
+	}
+	report(1, "1", 1000, 2000, 10, now)
+	// The runtime returns to an earlier configuration hash after a second
+	// transition. Each monotonic Agent-side epoch must still count its first
+	// post-apply sample rather than treating it as a duplicate baseline.
+	report(2, "2", 100, 200, 5, now.Add(time.Second))
+	report(3, "3", 50, 80, 3, now.Add(2*time.Second))
+	var gotIn, gotOut, gotRequests int64
+	if err := app.db.db.QueryRow("SELECT COALESCE(SUM(bytes_in),0),COALESCE(SUM(bytes_out),0),COALESCE(SUM(requests),0) FROM node_site_traffic_logs WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&gotIn, &gotOut, &gotRequests); err != nil {
+		t.Fatal(err)
+	}
+	if gotIn != 1150 || gotOut != 2280 || gotRequests != 18 {
+		t.Fatalf("repeated config epochs lost first deltas: in=%d out=%d requests=%d, want 1150/2280/18", gotIn, gotOut, gotRequests)
 	}
 }
 

@@ -38,6 +38,8 @@ type SiteTraffic struct {
 	MonthlyTraffic     int64  `json:"monthly_traffic"`
 	Requests           int64  `json:"requests"`
 	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
+	CacheSizeBytes     int64  `json:"cache_size_bytes,omitempty"`
+	AgentRuntime       bool   `json:"-"`
 }
 
 // TrafficSnapshot is the single authoritative global traffic payload shared by
@@ -68,6 +70,7 @@ type NodeSiteLiveTraffic struct {
 	CumulativeBytesOut int64
 	Requests           int64
 	SampledAtMS        int64
+	CacheSizeBytes     int64
 }
 
 // TrafficHistory is the single-site envelope returned by
@@ -293,6 +296,7 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 			COALESCE(c.last_bytes_in, 0),
 			COALESCE(c.last_bytes_out, 0),
 			COALESCE(c.last_request_count, sch.agent_request_count, 0),
+			COALESCE(c.cache_size_bytes, 0),
 			COALESCE(c.updated_at_ms, 0),
 			COALESCE(n.last_seen_at_ms, 0),
 			COALESCE(n.enabled, 0),
@@ -315,7 +319,7 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 		var nodeLastSeenMS int64
 		var nodeEnabled int
 		var listenerError, dnsStatus string
-		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus); err != nil {
+		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.CacheSizeBytes, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus); err != nil {
 			return nil, err
 		}
 		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow

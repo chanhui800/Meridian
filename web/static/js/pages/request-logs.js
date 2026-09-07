@@ -429,8 +429,12 @@ async function clearRequestLogs() {
 async function clearAssetCache() {
   if (!confirm('确认清除所有站点的图片与静态资源缓存？站点配置和请求日志不会受到影响。')) return;
   try {
-    await API.clearAssetCache();
-    Toast.success('资产缓存已清除');
+    const result = await API.clearAssetCache();
+    if (result?.status === 'pending' && Number(result.nodes_pending || 0) > 0) {
+      Toast.success(`主控缓存已清除，${result.nodes_pending} 个节点将在下次配置同步后清除`);
+    } else {
+      Toast.success('资产缓存已清除');
+    }
   } catch (error) {
     Toast.error(error.message);
   }

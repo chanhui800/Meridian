@@ -73,11 +73,12 @@ type assetCache struct {
 }
 
 type assetCacheIndexedEntry struct {
-	siteID   int64
-	metaName string
-	bodyName string
-	accessed int64
-	size     int64
+	siteID    int64
+	namespace string
+	metaName  string
+	bodyName  string
+	accessed  int64
+	size      int64
 }
 
 type assetCacheContextKey struct{}
@@ -150,8 +151,8 @@ func assetCacheNamespace(site Site) string {
 	return namespace
 }
 
-func assetCacheSitePrefix(site Site) string {
-	namespace := assetCacheNamespace(site)
+func assetCacheNamespacePrefix(namespace string) string {
+	namespace = strings.TrimSpace(namespace)
 	if strings.HasPrefix(namespace, "site-") {
 		if index := strings.Index(namespace, "-config-"); index > 0 {
 			return namespace[:index]
@@ -160,12 +161,20 @@ func assetCacheSitePrefix(site Site) string {
 	return namespace
 }
 
+func assetCacheSitePrefix(site Site) string {
+	return assetCacheNamespacePrefix(assetCacheNamespace(site))
+}
+
 func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *assetCacheRequest {
 	if c == nil || !assetCacheRequestEligible(site, r, target) {
 		return nil
 	}
 	raw := strings.Join([]string{
-		strconv.FormatInt(site.ID, 10),
+		// The cache namespace is supplied by the Controller and remains stable
+		// across the Agent's in-memory SQLite rebuilds. Do not include the local
+		// SQLite row ID in the cache key: it is ephemeral and can change when a
+		// route is added, removed, or reordered.
+		assetCacheNamespace(site),
 		target.String(),
 		r.Header.Get("Accept"),
 		r.Header.Get("Accept-Encoding"),
@@ -226,6 +235,18 @@ func assetCacheSiteIDFromPath(path string) (int64, bool) {
 	return siteID, err == nil && siteID > 0
 }
 
+// assetCacheNamespaceFromPath returns the stable central-site namespace
+// prefix (for example site-100) rather than an Agent's ephemeral SQLite row
+// ID. Generation suffixes are intentionally ignored for budget accounting so
+// old generations remain part of the same site's quota.
+func assetCacheNamespaceFromPath(path string) string {
+	parts := strings.SplitN(filepath.ToSlash(path), "/", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return assetCacheNamespacePrefix(parts[0])
+}
+
 func (c *assetCache) rebuildSizeIndexLocked() error {
 	if c == nil {
 		return nil
@@ -274,7 +295,7 @@ func (c *assetCache) rebuildSizeIndexLocked() error {
 				accessed = meta.AccessedAtMS
 			}
 		}
-		entries[path] = assetCacheIndexedEntry{siteID: siteID, metaName: metaName, bodyName: path, accessed: accessed, size: info.Size()}
+		entries[path] = assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(path), metaName: metaName, bodyName: path, accessed: accessed, size: info.Size()}
 		return nil
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -372,6 +393,43 @@ func (c *assetCache) clear() error {
 	c.totalBytes = 0
 	c.sizeLoaded = true
 	return nil
+}
+
+// gcSiteGenerations removes cache generations for one stable central site
+// after a new configuration generation has been successfully materialized.
+// It never uses the Agent's local SQLite ID and never touches another site's
+// namespace.
+func (c *assetCache) gcSiteGenerations(sitePrefix, keepNamespace string) error {
+	if c == nil || strings.TrimSpace(sitePrefix) == "" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	root, err := c.openRoot(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	prefix := strings.TrimSuffix(sitePrefix, "-") + "-"
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) || entry.Name() == keepNamespace {
+			continue
+		}
+		if err := root.RemoveAll(entry.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return c.rebuildSizeIndexLocked()
 }
 
 func (c *assetCache) addIndexedEntryLocked(entry assetCacheIndexedEntry) {
@@ -539,7 +597,7 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 		return err
 	}
 	if siteID, ok := assetCacheSiteIDFromPath(req.bodyName); ok {
-		c.addIndexedEntryLocked(assetCacheIndexedEntry{siteID: siteID, metaName: req.metaName, bodyName: req.bodyName, accessed: meta.AccessedAtMS, size: meta.Size})
+		c.addIndexedEntryLocked(assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(req.bodyName), metaName: req.metaName, bodyName: req.bodyName, accessed: meta.AccessedAtMS, size: meta.Size})
 	}
 	return c.enforceBudgetLocked(root, site)
 }
@@ -554,8 +612,9 @@ type assetCacheFile struct {
 func (c *assetCache) enforceBudgetLocked(root *os.Root, site Site) error {
 	files := make([]assetCacheFile, 0)
 	var total int64
+	targetNamespace := assetCacheNamespacePrefix(assetCacheNamespace(site))
 	for _, entry := range c.entries {
-		if entry.siteID != site.ID {
+		if entry.namespace != targetNamespace {
 			continue
 		}
 		files = append(files, assetCacheFile{metaName: entry.metaName, bodyName: entry.bodyName, accessed: entry.accessed, size: entry.size})

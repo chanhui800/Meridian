@@ -12,10 +12,13 @@ let dashboardTrendState = { siteId: 'all', range: 'realtime', customStart: '', c
 let dashboardTrendCharts = new Map();
 let dashboardTrendData = null;
 let dashboardSites = [];
+let dashboardSitesInitialized = false;
 let dashboardSpeedSamples = new Map();
 let dashboardLiveSpeeds = new Map();
 let dashboardRealtimeTrendSamples = new Map();
 let dashboardRealtimeTrendSiteSamples = new Map();
+let dashboardLatestRatesBySite = new Map();
+let dashboardBillingMode = null;
 let dashboardLastSnapshotMS = 0;
 
 function dashboardCreateAbortController() {
@@ -142,6 +145,7 @@ async function loadDashboardBootstrap() {
       const speed = dashboardLiveSpeeds.get(Number(site.id)) || current?._liveSpeed;
       return speed ? { ...site, _liveSpeed: speed } : site;
     }) : [];
+    dashboardSitesInitialized = true;
     const cacheEl = document.getElementById('s-cache');
     if (cacheEl) cacheEl.textContent = formatBytes(dashboardSites.reduce((total, site) => total + Number(site.cache_size_bytes || 0), 0));
     if (data.snapshot) updateDashboardLive(data.snapshot);
@@ -298,7 +302,15 @@ function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
         // that site and cannot be indexed by the aggregate point index. Use
         // the latest sample at or before the hovered timestamp instead of
         // turning a sparse array lookup into a misleading zero.
-        const sample = dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms) || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+        let sample;
+        if (metric === 'speed') {
+          sample = dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms) || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+        } else {
+          // Traffic and request values describe the contribution to this
+          // aggregate interval. Carrying forward the previous sparse sample
+          // would count the same bytes again when another site reports.
+          sample = point.site_contributions?.[String(site.id)] || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+        }
         siteRows.push(`<div class="dashboard-chart-tooltip-row"><strong>${esc(site.name || `站点 ${site.id}`)}</strong><span>${dashboardTrendMetricLine(sample, metric)}</span></div>`);
       });
     } else {
@@ -322,12 +334,18 @@ function dashboardRealtimeSiteSampleAt(siteID, timestampMS) {
   if (!samples.length) return null;
   const target = Number(timestampMS);
   if (!Number.isFinite(target)) return samples[samples.length - 1] || null;
+  let low = 0;
+  let high = samples.length - 1;
   let latest = null;
-  for (const sample of samples) {
-    const sampledAt = Number(sample?.timestamp_ms);
-    if (!Number.isFinite(sampledAt)) continue;
-    if (sampledAt > target) break;
-    latest = sample;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const sampledAt = Number(samples[middle]?.timestamp_ms);
+    if (!Number.isFinite(sampledAt) || sampledAt > target) {
+      high = middle - 1;
+    } else {
+      latest = samples[middle];
+      low = middle + 1;
+    }
   }
   return latest;
 }
@@ -794,6 +812,17 @@ function updateDashboardLive(stats) {
 	const generatedAt = Number(stats?.generated_at_ms || 0);
 	if (generatedAt > 0 && generatedAt < dashboardLastSnapshotMS) return;
 	if (generatedAt > 0) dashboardLastSnapshotMS = generatedAt;
+	const incomingBillingMode = String(stats?.billing_mode || '').toLowerCase();
+	if (incomingBillingMode === 'outbound' || incomingBillingMode === 'bidirectional') {
+	  if (dashboardBillingMode && dashboardBillingMode !== incomingBillingMode) {
+	    // Existing realtime traffic was calculated under the old policy. Drop
+	    // only that derived sequence; counter baselines and live rates remain
+	    // valid and will continue on the next sample.
+	    dashboardRealtimeTrendSamples = new Map();
+	    dashboardRealtimeTrendSiteSamples = new Map();
+	  }
+	  dashboardBillingMode = incomingBillingMode;
+	}
 	const panelDomainEl = document.getElementById('s-panel-domain');
 	const currentPanelURL = dashboardCurrentPanelURL(stats.panel_access_url);
 	if (panelDomainEl && currentPanelURL) panelDomainEl.textContent = currentPanelURL;
@@ -812,11 +841,12 @@ function updateDashboardLive(stats) {
 
   const requestsEl = document.getElementById('s-requests');
   if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
-  updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt);
+  updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
   updateDashboardTrendRealtime();
 }
 
-function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
+function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
+  const snapshotValue = Number(snapshotMS || 0);
   const liveMap = new Map();
   const trendDeltas = new Map();
   const rateSamples = new Map();
@@ -827,17 +857,30 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
   let totalRateIn = 0;
   let totalRateOut = 0;
   let totalDeltaRequests = 0;
+  // Runtime samples must never guess the billing policy while bootstrap and
+  // trends are still racing. Direct callers may provide an explicit legacy
+  // fallback, but the normal SSE path passes dashboardBillingMode (which can
+  // intentionally remain null until the authoritative snapshot arrives).
+  const billingMode = billingModeOverride === undefined
+    ? (dashboardBillingMode || dashboardTrendData?.billing_mode || null)
+    : billingModeOverride;
+  const billingKnown = billingMode === 'outbound' || billingMode === 'bidirectional';
+  const freshnessWindowMS = 45 * 1000;
   for (const site of (liveSites || [])) {
     const siteID = Number(site.id);
     if (!Number.isFinite(siteID)) continue;
     liveMap.set(siteID, site);
-    const sourceTimestamp = Number(site.sampled_at_ms || snapshotMS || Date.now());
+    const sourceTimestamp = Number(site.sampled_at_ms || snapshotValue || Date.now());
+    const running = site.running === undefined ? true : site.running === true;
+    const fresh = running && sourceTimestamp > 0 && (snapshotValue <= 0 || (sourceTimestamp <= snapshotValue + 5000 && snapshotValue - sourceTimestamp <= freshnessWindowMS));
     const current = {
       trafficUsed: Number(site.monthly_traffic != null ? site.monthly_traffic : (site.traffic_used || 0)),
       bytesIn: Number(site.cumulative_bytes_in != null ? site.cumulative_bytes_in : (site.bytes_in || site.bytes_in_total || 0)),
       bytesOut: Number(site.cumulative_bytes_out != null ? site.cumulative_bytes_out : (site.bytes_out || site.bytes_out_total || 0)),
       requests: Number(site.requests || 0),
       timestamp: sourceTimestamp,
+      running,
+      fresh,
     };
     const previous = dashboardSpeedSamples.get(siteID);
     if (!previous) {
@@ -846,19 +889,31 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
       changedSiteTimestamps.set(siteID, current.timestamp);
       rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
       trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
+    } else if (!fresh) {
+      // A stale/offline sample must immediately clear a previously displayed
+      // rate, even when its timestamp did not advance. Keep the current
+      // counters as the recovery baseline.
+      if (previous.running || previous.fresh || (dashboardLiveSpeeds.get(siteID)?.down || 0) !== 0 || (dashboardLiveSpeeds.get(siteID)?.up || 0) !== 0) {
+        changedSiteIDs.add(siteID);
+        changedSiteTimestamps.set(siteID, current.timestamp);
+        rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
+        trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
+      }
+      dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
     } else if (current.timestamp > previous.timestamp) {
       changedSiteIDs.add(siteID);
       changedSiteTimestamps.set(siteID, current.timestamp);
+      // After an offline interval, establish a fresh baseline rather than
+      // charging the whole outage as a single speed sample.
+      const recovering = previous.running !== true || previous.fresh !== true;
       const seconds = (current.timestamp - previous.timestamp) / 1000;
       const down = current.bytesOut - previous.bytesOut;
       const up = current.bytesIn - previous.bytesIn;
-      if (down >= 0 && up >= 0) {
+      if (!recovering && seconds > 0 && down >= 0 && up >= 0) {
         const downRate = down / seconds;
         const upRate = up / seconds;
         dashboardLiveSpeeds.set(siteID, { down: downRate, up: upRate });
         rateSamples.set(String(siteID), { download_bps: downRate, upload_bps: upRate });
-        totalRateOut += downRate;
-        totalRateIn += upRate;
         const requests = Math.max(0, current.requests - previous.requests);
         trendDeltas.set(siteID, { bytesIn: up, bytesOut: down, requests });
         totalDeltaIn += up;
@@ -872,36 +927,96 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
         trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
       }
     } else if (current.timestamp === previous.timestamp) {
-      // The Agent has not emitted a new sample. Keep the previous speed and
-      // do not append a synthetic zero point to the realtime trend.
-      continue;
+      // The Agent has not emitted a new sample. Keep its last valid rate; the
+      // aggregate speed is recomputed from all such rates below.
+      if (current.fresh && previous.fresh) {
+        const existing = dashboardLiveSpeeds.get(siteID) || { down: 0, up: 0 };
+        dashboardLiveSpeeds.set(siteID, existing);
+      }
     } else {
       // A stale sample must never move the counter baseline backwards.
       continue;
     }
     // Keep the latest sample even when a later SSE payload omits another site.
     dashboardSpeedSamples.set(siteID, current);
+    const speed = dashboardLiveSpeeds.get(siteID) || { down: 0, up: 0 };
+    dashboardLatestRatesBySite.set(siteID, { down: speed.down || 0, up: speed.up || 0, sampledAt: current.timestamp, running: current.running, fresh: current.fresh });
+  }
+  // Sum the latest valid rate for every site, not only sites that emitted in
+  // this SSE payload. Agents report asynchronously, so this is the only way
+  // the all-sites card can remain an accurate aggregate.
+  for (const [siteID, latest] of dashboardLatestRatesBySite) {
+    const current = liveMap.get(siteID);
+    if (current) {
+      const timestamp = Number(current.sampled_at_ms || snapshotValue || latest.sampledAt || 0);
+      latest.running = current.running === undefined ? latest.running : current.running === true;
+      latest.fresh = latest.running && timestamp > 0 && (snapshotValue <= 0 || (timestamp <= snapshotValue + 5000 && snapshotValue - timestamp <= freshnessWindowMS));
+      latest.sampledAt = timestamp || latest.sampledAt;
+    } else if (snapshotValue > 0 && latest.sampledAt > 0 && snapshotValue - latest.sampledAt > freshnessWindowMS) {
+      const wasActive = latest.running && latest.fresh;
+      latest.running = false;
+      latest.fresh = false;
+      // A missing site sample is also an offline signal once it ages out of
+      // the freshness window. Mark the stored counter baseline stale so a
+      // later recovery establishes a new baseline instead of charging the
+      // whole outage interval as one speed sample.
+      const baseline = dashboardSpeedSamples.get(siteID);
+      if (baseline) {
+        baseline.running = false;
+        baseline.fresh = false;
+      }
+      const existingSpeed = dashboardLiveSpeeds.get(siteID) || { down: 0, up: 0 };
+      if (wasActive || existingSpeed.down !== 0 || existingSpeed.up !== 0) {
+        dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
+        changedSiteIDs.add(siteID);
+        changedSiteTimestamps.set(siteID, latest.sampledAt);
+        rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
+        trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
+      }
+    }
+    if (latest.running && latest.fresh) {
+      totalRateOut += Math.max(0, Number(latest.down || 0));
+      totalRateIn += Math.max(0, Number(latest.up || 0));
+    }
   }
   const sampledAt = Number(snapshotMS || Date.now());
-  const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt) => {
+  const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt, contributions = null) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
     const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));
     const bytesOut = Math.max(0, Number(sample?.bytesOut || 0));
-    samples.push({
+    const point = {
       timestamp_ms: Number(sampleTimestamp || sampledAt),
       download_bps: Math.max(0, Number(sample?.download_bps || 0)),
       upload_bps: Math.max(0, Number(sample?.upload_bps || 0)),
       bytes_in: bytesIn,
       bytes_out: bytesOut,
       requests: Math.max(0, Number(sample?.requests || 0)),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut),
-    });
+    };
+    if (billingKnown) point.traffic_bytes = billingMode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut);
+    if (contributions && Object.keys(contributions).length) point.site_contributions = contributions;
+    samples.push(point);
     // Keep the active dashboard session responsive without imposing a time
     // window; the X axis adapts to however many samples are available.
-    dashboardRealtimeTrendSamples.set(key, samples.slice(-1800));
+    if (samples.length > 1800) samples.splice(0, samples.length - 1800);
+    dashboardRealtimeTrendSamples.set(key, samples);
   };
   if (changedSiteIDs.size > 0) {
-    appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests });
+    const contributions = {};
+    for (const siteID of changedSiteIDs) {
+      const delta = trendDeltas.get(siteID) || {};
+      const rate = rateSamples.get(String(siteID)) || {};
+      contributions[String(siteID)] = {
+        download_bps: Math.max(0, Number(rate.download_bps || 0)),
+        upload_bps: Math.max(0, Number(rate.upload_bps || 0)),
+        bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
+        bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
+        requests: Math.max(0, Number(delta.requests || 0)),
+      };
+      if (billingKnown) contributions[String(siteID)].traffic_bytes = billingMode === 'outbound'
+        ? contributions[String(siteID)].bytes_out
+        : 2 * (contributions[String(siteID)].bytes_in + contributions[String(siteID)].bytes_out);
+    }
+    appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests }, sampledAt, contributions);
   }
   for (const siteID of changedSiteIDs) {
     const rate = rateSamples.get(String(siteID)) || {};
@@ -915,13 +1030,14 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
       bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
       bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
       requests: Math.max(0, Number(delta.requests || 0)),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? Math.max(0, Number(delta.bytesOut || 0)) : 2 * (Math.max(0, Number(delta.bytesIn || 0)) + Math.max(0, Number(delta.bytesOut || 0))),
     };
+    if (billingKnown) siteSample.traffic_bytes = billingMode === 'outbound' ? siteSample.bytes_out : 2 * (siteSample.bytes_in + siteSample.bytes_out);
     // Keep the site series timestamp aligned with the Agent sample. The
     // aggregate series still uses the controller snapshot timestamp.
     appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, siteSampledAt);
     siteSamples.push(siteSample);
-    dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples.slice(-1800));
+    if (siteSamples.length > 1800) siteSamples.splice(0, siteSamples.length - 1800);
+    dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples);
   }
   dashboardSites = dashboardSites.map(site => {
     const siteID = Number(site.id);
@@ -969,10 +1085,13 @@ function animateValue(id, newVal) {
 function stopDashSSE() {
   dashboardSpeedSamples = new Map();
   dashboardLiveSpeeds = new Map();
+  dashboardLatestRatesBySite = new Map();
+  dashboardBillingMode = null;
   dashboardRealtimeTrendSamples = new Map();
   dashboardRealtimeTrendSiteSamples = new Map();
   dashboardLastSnapshotMS = 0;
   dashboardTrendData = null;
+  dashboardSitesInitialized = false;
   dashboardTrendCharts = new Map();
   if (dashboardTrendResizeObserver) {
     dashboardTrendResizeObserver.disconnect();
@@ -1025,7 +1144,8 @@ async function loadDashboardTable() {
 
     if (!sites || sites.length === 0) {
       dashboardSites = [];
-      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
+      dashboardSitesInitialized = true;
+      renderDashboardTableRows();
       return;
     }
 
@@ -1044,7 +1164,21 @@ async function loadDashboardTable() {
 
 function renderDashboardTableRows() {
   const tbody = document.getElementById('dash-table');
-  if (!tbody || !dashboardSites.length) return;
+  if (!tbody) return;
+  if (!dashboardSites.length) {
+    if (!dashboardSitesInitialized) return;
+    dashboardSpeedSamples.clear();
+    dashboardLiveSpeeds.clear();
+    dashboardLatestRatesBySite.clear();
+    dashboardRealtimeTrendSiteSamples.clear();
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
+    return;
+  }
+  const known = new Set(dashboardSites.map(site => Number(site.id)));
+  for (const map of [dashboardSpeedSamples, dashboardLiveSpeeds, dashboardLatestRatesBySite]) {
+    for (const siteID of map.keys()) if (!known.has(siteID)) map.delete(siteID);
+  }
+  for (const siteID of dashboardRealtimeTrendSiteSamples.keys()) if (!known.has(Number(siteID))) dashboardRealtimeTrendSiteSamples.delete(siteID);
   tbody.innerHTML = dashboardSites.map(s => `
       <tr>
         <td style="font-weight:600">${esc(s.name)}</td>
