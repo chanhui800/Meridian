@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -62,8 +64,20 @@ type assetCacheHit struct {
 }
 
 type assetCache struct {
-	dir string
-	mu  sync.Mutex
+	dir           string
+	mu            sync.Mutex
+	sizeBySiteMap map[int64]int64
+	totalBytes    int64
+	sizeLoaded    bool
+	entries       map[string]assetCacheIndexedEntry
+}
+
+type assetCacheIndexedEntry struct {
+	siteID   int64
+	metaName string
+	bodyName string
+	accessed int64
+	size     int64
 }
 
 type assetCacheContextKey struct{}
@@ -82,7 +96,7 @@ func newAssetCache(dir string) *assetCache {
 	if dir == "" {
 		return nil
 	}
-	return &assetCache{dir: dir}
+	return &assetCache{dir: dir, sizeBySiteMap: make(map[int64]int64), entries: make(map[string]assetCacheIndexedEntry)}
 }
 
 func assetCacheTargetURL(r *http.Request, upstream *url.URL) *url.URL {
@@ -196,19 +210,35 @@ func (c *assetCache) openRoot(create bool) (*os.Root, error) {
 // sizeBySite reports the bytes occupied by cached response bodies. Metadata
 // files are intentionally excluded so the panel matches the configured cache
 // budget, which is also enforced against response body sizes.
-func (c *assetCache) sizeBySite() (map[int64]int64, int64, error) {
-	sizes := make(map[int64]int64)
-	if c == nil {
-		return sizes, 0, nil
+func assetCacheSiteIDFromPath(path string) (int64, bool) {
+	parts := strings.SplitN(filepath.ToSlash(path), "/", 2)
+	if len(parts) != 2 {
+		return 0, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	directory := parts[0]
+	if strings.HasPrefix(directory, "site-") {
+		directory = strings.TrimPrefix(directory, "site-")
+		if dash := strings.Index(directory, "-"); dash >= 0 {
+			directory = directory[:dash]
+		}
+	}
+	siteID, err := strconv.ParseInt(directory, 10, 64)
+	return siteID, err == nil && siteID > 0
+}
+
+func (c *assetCache) rebuildSizeIndexLocked() error {
+	if c == nil {
+		return nil
+	}
+	sizes := make(map[int64]int64)
+	entries := make(map[string]assetCacheIndexedEntry)
 	root, err := c.openRoot(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return sizes, 0, nil
+			c.sizeBySiteMap, c.entries, c.totalBytes, c.sizeLoaded = sizes, entries, 0, true
+			return nil
 		}
-		return nil, 0, err
+		return err
 	}
 	defer root.Close()
 
@@ -223,19 +253,8 @@ func (c *assetCache) sizeBySite() (map[int64]int64, int64, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".body") {
 			return nil
 		}
-		parts := strings.SplitN(filepath.ToSlash(path), "/", 2)
-		if len(parts) != 2 {
-			return nil
-		}
-		directory := parts[0]
-		if strings.HasPrefix(directory, "site-") {
-			directory = strings.TrimPrefix(directory, "site-")
-			if dash := strings.IndexByte(directory, '-'); dash >= 0 {
-				directory = directory[:dash]
-			}
-		}
-		siteID, err := strconv.ParseInt(directory, 10, 64)
-		if err != nil || siteID <= 0 {
+		siteID, ok := assetCacheSiteIDFromPath(path)
+		if !ok {
 			return nil
 		}
 		info, err := entry.Info()
@@ -247,12 +266,77 @@ func (c *assetCache) sizeBySite() (map[int64]int64, int64, error) {
 		}
 		sizes[siteID] += info.Size()
 		total += info.Size()
+		metaName := strings.TrimSuffix(path, ".body") + ".json"
+		accessed := int64(0)
+		if data, readErr := root.ReadFile(metaName); readErr == nil {
+			var meta assetCacheMeta
+			if json.Unmarshal(data, &meta) == nil {
+				accessed = meta.AccessedAtMS
+			}
+		}
+		entries[path] = assetCacheIndexedEntry{siteID: siteID, metaName: metaName, bodyName: path, accessed: accessed, size: info.Size()}
 		return nil
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	c.sizeBySiteMap, c.entries, c.totalBytes, c.sizeLoaded = sizes, entries, total, true
+	return nil
+}
+
+func (c *assetCache) ensureSizeIndexLocked() error {
+	if c == nil || c.sizeLoaded {
+		return nil
+	}
+	return c.rebuildSizeIndexLocked()
+}
+
+func (c *assetCache) sizeBySite() (map[int64]int64, int64, error) {
+	if c == nil {
+		return map[int64]int64{}, 0, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ensureSizeIndexLocked(); err != nil {
 		return nil, 0, err
 	}
-	return sizes, total, nil
+	sizes := make(map[int64]int64, len(c.sizeBySiteMap))
+	for siteID, size := range c.sizeBySiteMap {
+		sizes[siteID] = size
+	}
+	return sizes, c.totalBytes, nil
+}
+
+func (c *assetCache) reconcileSizeIndex() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rebuildSizeIndexLocked()
+}
+
+// startReconcile keeps the in-memory accounting correct if an operator or a
+// separate process changes the cache directory behind Meridian's back. It is
+// deliberately off the dashboard request path.
+func (c *assetCache) startReconcile(ctx context.Context) {
+	if c == nil || ctx == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.reconcileSizeIndex(); err != nil {
+					log.Printf("[asset-cache] reconcile failed: %v", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // clear removes only entries beneath the configured asset-cache root. The
@@ -283,7 +367,49 @@ func (c *assetCache) clear() error {
 			return err
 		}
 	}
+	c.sizeBySiteMap = make(map[int64]int64)
+	c.entries = make(map[string]assetCacheIndexedEntry)
+	c.totalBytes = 0
+	c.sizeLoaded = true
 	return nil
+}
+
+func (c *assetCache) addIndexedEntryLocked(entry assetCacheIndexedEntry) {
+	if old, ok := c.entries[entry.bodyName]; ok {
+		c.sizeBySiteMap[old.siteID] -= old.size
+		if c.sizeBySiteMap[old.siteID] < 0 {
+			c.sizeBySiteMap[old.siteID] = 0
+		}
+		c.totalBytes -= old.size
+		if c.totalBytes < 0 {
+			c.totalBytes = 0
+		}
+	}
+	c.entries[entry.bodyName] = entry
+	c.sizeBySiteMap[entry.siteID] += entry.size
+	c.totalBytes += entry.size
+}
+
+func (c *assetCache) removeIndexedEntryLocked(bodyName string) {
+	entry, ok := c.entries[bodyName]
+	if !ok {
+		return
+	}
+	delete(c.entries, bodyName)
+	c.sizeBySiteMap[entry.siteID] -= entry.size
+	if c.sizeBySiteMap[entry.siteID] <= 0 {
+		delete(c.sizeBySiteMap, entry.siteID)
+	}
+	c.totalBytes -= entry.size
+	if c.totalBytes < 0 {
+		c.totalBytes = 0
+	}
+}
+
+func (c *assetCache) removeEntryLocked(root *os.Root, metaName, bodyName string) {
+	_ = root.Remove(metaName)
+	_ = root.Remove(bodyName)
+	c.removeIndexedEntryLocked(bodyName)
 }
 
 func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit, error) {
@@ -292,6 +418,9 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := c.ensureSizeIndexLocked(); err != nil {
+		return nil, err
+	}
 	root, err := c.openRoot(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -309,14 +438,12 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 	}
 	var meta assetCacheMeta
 	if json.Unmarshal(metaBytes, &meta) != nil || meta.ExpiresAtMS <= now.UnixMilli() || meta.Size < 0 || meta.Size > maxAssetCacheObject {
-		_ = root.Remove(req.metaName)
-		_ = root.Remove(req.bodyName)
+		c.removeEntryLocked(root, req.metaName, req.bodyName)
 		return nil, nil
 	}
 	body, err := root.ReadFile(req.bodyName)
 	if err != nil || int64(len(body)) != meta.Size {
-		_ = root.Remove(req.metaName)
-		_ = root.Remove(req.bodyName)
+		c.removeEntryLocked(root, req.metaName, req.bodyName)
 		return nil, nil
 	}
 	meta.AccessedAtMS = now.UnixMilli()
@@ -380,6 +507,9 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := c.ensureSizeIndexLocked(); err != nil {
+		return err
+	}
 	root, err := c.openRoot(true)
 	if err != nil {
 		return err
@@ -403,8 +533,13 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 		return err
 	}
 	if err := root.Rename(metaTmp, req.metaName); err != nil {
+		_ = root.Remove(req.bodyName)
 		_ = root.Remove(metaTmp)
+		c.removeIndexedEntryLocked(req.bodyName)
 		return err
+	}
+	if siteID, ok := assetCacheSiteIDFromPath(req.bodyName); ok {
+		c.addIndexedEntryLocked(assetCacheIndexedEntry{siteID: siteID, metaName: req.metaName, bodyName: req.bodyName, accessed: meta.AccessedAtMS, size: meta.Size})
 	}
 	return c.enforceBudgetLocked(root, site)
 }
@@ -417,40 +552,21 @@ type assetCacheFile struct {
 }
 
 func (c *assetCache) enforceBudgetLocked(root *os.Root, site Site) error {
-	siteDir := assetCacheSitePrefix(site)
 	files := make([]assetCacheFile, 0)
 	var total int64
-	err := fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			return nil
+	for _, entry := range c.entries {
+		if entry.siteID != site.ID {
+			continue
 		}
-		parts := strings.SplitN(filepath.ToSlash(path), "/", 2)
-		if len(parts) != 2 || parts[0] != siteDir && !strings.HasPrefix(parts[0], siteDir+"-") {
-			return nil
-		}
-		data, err := root.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		var meta assetCacheMeta
-		if json.Unmarshal(data, &meta) != nil {
-			return nil
-		}
-		bodyName := strings.TrimSuffix(path, ".json") + ".body"
-		files = append(files, assetCacheFile{metaName: path, bodyName: bodyName, accessed: meta.AccessedAtMS, size: meta.Size})
-		total += meta.Size
-		return nil
-	})
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		files = append(files, assetCacheFile{metaName: entry.metaName, bodyName: entry.bodyName, accessed: entry.accessed, size: entry.size})
+		total += entry.size
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].accessed < files[j].accessed })
 	for _, file := range files {
 		if total <= site.AssetCacheMaxBytes {
 			break
 		}
-		_ = root.Remove(file.metaName)
-		_ = root.Remove(file.bodyName)
+		c.removeEntryLocked(root, file.metaName, file.bodyName)
 		total -= file.size
 	}
 	return nil

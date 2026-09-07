@@ -349,35 +349,25 @@ func (pm *ProxyManager) LiveSiteTraffic(sites []Site) map[int64]SiteTraffic {
 	return live
 }
 
-// TrafficSnapshot builds the authoritative global traffic payload: every DB
-// site, overlaid with live per-instance state for running sites. Dashboard,
-// traffic overview and SSE events all render this single payload.
-func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
-	sites, err := pm.database.ListSites()
-	if err != nil {
-		return nil, err
-	}
-	settings := pm.database.currentSystemSettings()
+// dashboardSnapshotFromSites builds the live dashboard payload from one
+// already captured site list and one grouped traffic query. Keeping the
+// inputs explicit lets the dashboard bootstrap endpoint share its snapshot
+// with the site table without issuing another ListSites query.
+func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite map[int64]int64, settings SystemSettings) *TrafficSnapshot {
 	billingMode := settings.TrafficBillingMode
-	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)), billingMode)
-	if err != nil {
-		return nil, err
-	}
-	var monthlyTraffic int64
-	for _, value := range monthlyBySite {
-		monthlyTraffic += value
-	}
 	snap := &TrafficSnapshot{
 		TotalSites:      len(sites),
 		LiveSites:       make([]SiteTraffic, 0, len(sites)),
-		MonthlyTraffic:  monthlyTraffic,
 		BillingMode:     trafficBillingModeLabel(billingMode),
 		TrafficResetDay: settings.TrafficResetDay,
+	}
+	for _, value := range monthlyBySite {
+		snap.MonthlyTraffic += value
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	for _, inst := range pm.proxies {
-		if inst.isOperational() {
+		if inst != nil && inst.isOperational() {
 			snap.RunningSites++
 		}
 	}
@@ -402,7 +392,24 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 		snap.LiveSites = append(snap.LiveSites, st)
 	}
 	snap.UptimeSeconds = int64(time.Since(startTime).Seconds())
-	return snap, nil
+	return snap
+}
+
+// TrafficSnapshot builds the authoritative global traffic payload: every DB
+// site, overlaid with live per-instance state for running sites. Dashboard,
+// traffic overview and SSE events all render this single payload.
+func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
+	sites, err := pm.database.ListSites()
+	if err != nil {
+		return nil, err
+	}
+	settings := pm.database.currentSystemSettings()
+	billingMode := settings.TrafficBillingMode
+	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)), billingMode)
+	if err != nil {
+		return nil, err
+	}
+	return pm.dashboardSnapshotFromSites(sites, monthlyBySite, settings), nil
 }
 
 func (pm *ProxyManager) GetRunningCount() int {

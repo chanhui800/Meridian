@@ -191,7 +191,13 @@ func main() {
 	if assetCacheDir == "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
 		assetCacheDir = filepath.Join(filepath.Dir(dbPath), "asset-cache")
 	}
-	pm.SetAssetCache(newAssetCache(assetCacheDir))
+	assetCache := newAssetCache(assetCacheDir)
+	pm.SetAssetCache(assetCache)
+	if assetCache != nil {
+		if err := assetCache.reconcileSizeIndex(); err != nil {
+			log.Printf("[asset-cache] initial size index rebuild failed: %v", err)
+		}
+	}
 	pm.SetTrustedProxies(trustedProxies)
 	pm.SetHostOnlyIngressSafe(panelTLSEnabled || (panelBindIP != nil && panelBindIP.IsLoopback()) || len(trustedProxies) > 0)
 	if err := pm.ConfigureDynamicDiscovery(dynamicRouteKey, panelHost, port, nil); err != nil {
@@ -205,6 +211,7 @@ func main() {
 	// Traffic flush goroutine with context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	assetCache.startReconcile(ctx)
 
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -288,6 +295,7 @@ func main() {
 	// Protected routes
 	mux.HandleFunc("/api/account", cors(app.authMiddleware(app.handleAccount)))
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
+	mux.HandleFunc("/api/dashboard/bootstrap", cors(app.authMiddleware(app.handleDashboardBootstrap)))
 	mux.HandleFunc("/api/dashboard-insights", cors(app.authMiddleware(app.handleDashboardInsights)))
 	mux.HandleFunc("/api/dashboard-trends", cors(app.authMiddleware(app.handleDashboardTrends)))
 	mux.HandleFunc("/api/system-settings", cors(app.authMiddleware(app.handleSystemSettings)))

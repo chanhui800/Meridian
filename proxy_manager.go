@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"golang.org/x/sync/singleflight"
 	"log"
 	"net"
 	"net/http"
@@ -80,6 +81,7 @@ type ProxyManager struct {
 	accountRetention        *accountRetentionTracker
 	trendCacheMu            sync.Mutex
 	trendCache              map[string]dashboardTrendCacheEntry
+	dashboardTrendGroup     singleflight.Group
 }
 
 // ProxyRuntimeStat is a non-persistent edge snapshot. Node scheduling quotas

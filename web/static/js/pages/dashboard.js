@@ -1,6 +1,13 @@
 let dashSSE = null;
 let dashAbortController = null;
 let dashRetryTimer = null;
+let dashboardBootstrapPromise = null;
+let dashboardBootstrapAbortController = null;
+let dashboardInitialAbortController = null;
+let dashboardSecondaryPromise = null;
+let dashboardTrendAbortController = null;
+let dashboardSecondaryRefreshTimer = null;
+let dashboardTrendRefreshTimer = null;
 let dashboardTrendResizeObserver = null;
 let dashboardTrendState = { siteId: 'all', range: 'realtime', customStart: '', customEnd: '' };
 let dashboardTrendCharts = new Map();
@@ -10,6 +17,12 @@ let dashboardSpeedSamples = new Map();
 let dashboardLiveSpeeds = new Map();
 let dashboardRealtimeTrendSamples = new Map();
 let dashboardRealtimeTrendSiteSamples = new Map();
+
+function dashboardCreateAbortController() {
+  if (typeof AbortController === 'function') return new AbortController();
+  const signal = { aborted: false };
+  return { signal, abort() { signal.aborted = true; } };
+}
 
 function renderDashboard() {
   const page = document.getElementById('page-dashboard');
@@ -98,26 +111,71 @@ function renderDashboard() {
     </div>
   `;
 
+  void loadDashboardInitialSnapshot();
   startDashSSE();
   setupDashboardTrendControls();
   observeDashboardTrendResize();
-  loadDashboardTable();
-  loadDashboardInsights();
-  loadDashboardTrends();
+  void loadDashboardBootstrap();
+  const deferTrends = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : fn => setTimeout(fn, 0);
+  deferTrends(() => {
+    if (Router.current === 'dashboard') void loadDashboardTrends();
+  });
 }
 
-async function loadDashboardInsights() {
+async function loadDashboardInitialSnapshot() {
+  if (dashboardInitialAbortController) dashboardInitialAbortController.abort();
+  dashboardInitialAbortController = dashboardCreateAbortController();
+  const signal = dashboardInitialAbortController.signal;
   try {
-    const insights = await API.dashboardInsights();
-    if (!insights || Router.current !== 'dashboard') return;
-    const log = document.querySelector('#dashboard-log-health p');
-    const schedule = document.querySelector('#dashboard-schedule-health p');
-    const latestLog = insights.latest_log_ms ? meridianFormatDateTime(insights.latest_log_ms) : '暂无记录';
-    if (log) log.textContent = insights.log_healthy ? `今日写入 ${formatNumber(insights.log_count_today || 0)} 条 · 最近写入 ${latestLog}` : '已关闭';
-    if (schedule) schedule.textContent = insights.schedule_enabled ? `Telegram 日报 · ${insights.schedule_label || '已启用'}` : 'Telegram 日报 · 未启用';
+    const data = await API.dashboard(signal);
+    if (!signal.aborted && data && Router.current === 'dashboard') updateDashboardLive(data);
   } catch (error) {
-    console.warn('Dashboard insights load error', error);
+    if (error && error.name === 'AbortError') return;
+    console.warn('Dashboard initial snapshot load error', error);
+  } finally {
+    if (dashboardInitialAbortController?.signal === signal) dashboardInitialAbortController = null;
   }
+}
+
+function applyDashboardInsights(insights) {
+  if (!insights || Router.current !== 'dashboard') return;
+  const log = document.querySelector('#dashboard-log-health p');
+  const schedule = document.querySelector('#dashboard-schedule-health p');
+  const latestLog = insights.latest_log_ms ? meridianFormatDateTime(insights.latest_log_ms) : '暂无记录';
+  if (log) log.textContent = insights.log_healthy ? `今日写入 ${formatNumber(insights.log_count_today || 0)} 条 · 最近写入 ${latestLog}` : '已关闭';
+  if (schedule) schedule.textContent = insights.schedule_enabled ? `Telegram 日报 · ${insights.schedule_label || '已启用'}` : 'Telegram 日报 · 未启用';
+}
+
+async function loadDashboardBootstrap() {
+  if (dashboardBootstrapPromise) return dashboardBootstrapPromise;
+  dashboardBootstrapAbortController = dashboardCreateAbortController();
+  const signal = dashboardBootstrapAbortController.signal;
+  dashboardBootstrapPromise = API.dashboardBootstrap(signal).then(data => {
+    if (signal.aborted || !data || Router.current !== 'dashboard') return data;
+    const currentSites = new Map(dashboardSites.map(site => [Number(site.id), site]));
+    dashboardSites = Array.isArray(data.sites) ? data.sites.map(site => {
+      const current = currentSites.get(Number(site.id));
+      const speed = dashboardLiveSpeeds.get(Number(site.id)) || current?._liveSpeed;
+      return speed ? { ...site, _liveSpeed: speed } : site;
+    }) : [];
+    const cacheEl = document.getElementById('s-cache');
+    if (cacheEl) cacheEl.textContent = formatBytes(dashboardSites.reduce((total, site) => total + Number(site.cache_size_bytes || 0), 0));
+    if (data.snapshot) updateDashboardLive(data.snapshot);
+    applyDashboardInsights(data.insights);
+    renderDashboardTrendSites();
+    renderDashboardTableRows();
+    return data;
+  }).catch(error => {
+    if (error && error.name === 'AbortError') return null;
+    console.warn('Dashboard bootstrap load error', error);
+    throw error;
+  }).finally(() => {
+    if (dashboardBootstrapAbortController?.signal === signal) {
+      dashboardBootstrapAbortController = null;
+      dashboardBootstrapPromise = null;
+    }
+  });
+  return dashboardBootstrapPromise;
 }
 
 function dashboardRequestScale(maxValue) {
@@ -596,14 +654,18 @@ function setupDashboardTrendControls() {
 }
 
 async function loadDashboardTrends() {
+  if (dashboardTrendAbortController) dashboardTrendAbortController.abort();
+  dashboardTrendAbortController = dashboardCreateAbortController();
+  const signal = dashboardTrendAbortController.signal;
   try {
     const data = await API.dashboardTrends(
       dashboardTrendState.siteId,
       dashboardTrendState.range,
       dashboardTrendState.customStart,
       dashboardTrendState.customEnd,
+      signal,
     );
-    if (!data || Router.current !== 'dashboard') return;
+    if (signal.aborted || !data || Router.current !== 'dashboard') return;
     if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(data.timezone_offset_minutes);
     const timezone = document.getElementById('dashboard-trend-timezone');
     if (timezone && typeof meridianTimezoneLabel === 'function') timezone.textContent = meridianTimezoneLabel(data.timezone_offset_minutes);
@@ -623,19 +685,18 @@ async function loadDashboardTrends() {
     dashboardTrendSummary(data);
     renderDashboardTrendCharts();
   } catch (error) {
+    if (error && error.name === 'AbortError') return;
     console.warn('Dashboard trends load error', error);
+  } finally {
+    if (dashboardTrendAbortController?.signal === signal) dashboardTrendAbortController = null;
   }
 }
 
-function loadDashboardTrendSites() {
+function renderDashboardTrendSites() {
   const select = document.getElementById('dashboard-trend-site');
   if (!select) return;
-  API.listSites().then(sites => {
-    if (!select || Router.current !== 'dashboard') return;
-    dashboardSites = sites || [];
-    select.innerHTML = '<option value="all">全部站点</option>' + dashboardSites.map(site => `<option value="${Number(site.id)}">${esc(site.name)}</option>`).join('');
-    select.value = dashboardTrendState.siteId;
-  }).catch(error => console.warn('Dashboard trend site list error', error));
+  select.innerHTML = '<option value="all">全部站点</option>' + dashboardSites.map(site => `<option value="${Number(site.id)}">${esc(site.name)}</option>`).join('');
+  select.value = dashboardTrendState.siteId;
 }
 
 function updateDashboardTrendRealtime() {
@@ -651,7 +712,7 @@ function observeDashboardTrendResize() {
   }
   const wrap = document.querySelector('.dashboard-trend-wrap');
   if (!wrap) return;
-  loadDashboardTrendSites();
+  renderDashboardTrendSites();
   if (typeof ResizeObserver !== 'function') return;
   dashboardTrendResizeObserver = new ResizeObserver(() => {
     if (Router.current === 'dashboard') renderDashboardTrendCharts();
@@ -894,6 +955,28 @@ function stopDashSSE() {
     dashAbortController.abort();
     dashAbortController = null;
   }
+  if (dashboardTrendAbortController) {
+    dashboardTrendAbortController.abort();
+    dashboardTrendAbortController = null;
+  }
+  if (dashboardInitialAbortController) {
+    dashboardInitialAbortController.abort();
+    dashboardInitialAbortController = null;
+  }
+  if (dashboardBootstrapAbortController) {
+    dashboardBootstrapAbortController.abort();
+    dashboardBootstrapAbortController = null;
+    dashboardBootstrapPromise = null;
+  }
+  dashboardSecondaryPromise = null;
+  if (dashboardSecondaryRefreshTimer) {
+    clearInterval(dashboardSecondaryRefreshTimer);
+    dashboardSecondaryRefreshTimer = null;
+  }
+  if (dashboardTrendRefreshTimer) {
+    clearInterval(dashboardTrendRefreshTimer);
+    dashboardTrendRefreshTimer = null;
+  }
   if (dashSSE) {
     dashSSE.close();
     dashSSE = null;
@@ -902,6 +985,9 @@ function stopDashSSE() {
 
 async function loadDashboardTable() {
   try {
+    // Kept as a compatibility helper for cached clients and older embedded
+    // test harnesses. The live dashboard now calls loadDashboardBootstrap()
+    // directly, so this legacy path is never used during normal rendering.
     const sites = await API.listSites();
     const tbody = document.getElementById('dash-table');
     if (!tbody) return;
@@ -964,8 +1050,37 @@ function dashboardIngressLabel(site) {
 }
 
 async function loadDashboardData() {
-  loadDashboardTable();
-  if (Router.current === 'dashboard') loadDashboardTrends();
+  if (Router.current === 'dashboard') {
+    await refreshDashboardSecondary();
+  }
+}
+
+function refreshDashboardSecondary() {
+  if (dashboardSecondaryPromise) return dashboardSecondaryPromise;
+  let promise;
+  promise = loadDashboardBootstrap().finally(() => {
+    if (dashboardSecondaryPromise === promise) dashboardSecondaryPromise = null;
+  });
+  dashboardSecondaryPromise = promise;
+  return dashboardSecondaryPromise;
+}
+
+function startDashboardRefreshTimers() {
+  if (dashboardSecondaryRefreshTimer) clearInterval(dashboardSecondaryRefreshTimer);
+  if (dashboardTrendRefreshTimer) clearInterval(dashboardTrendRefreshTimer);
+  dashboardSecondaryRefreshTimer = setInterval(() => {
+    if (Router.current === 'dashboard') void refreshDashboardSecondary();
+  }, 60000);
+  dashboardTrendRefreshTimer = setInterval(() => {
+    if (Router.current === 'dashboard' && dashboardTrendState.range === 'realtime') void loadDashboardTrends();
+  }, 15000);
+}
+
+function stopDashboardRefreshTimers() {
+  if (dashboardSecondaryRefreshTimer) clearInterval(dashboardSecondaryRefreshTimer);
+  if (dashboardTrendRefreshTimer) clearInterval(dashboardTrendRefreshTimer);
+  dashboardSecondaryRefreshTimer = null;
+  dashboardTrendRefreshTimer = null;
 }
 
 const uaClassMap = { infuse: 'pill-blue', web: 'pill-green', client: 'pill-orange', custom: 'pill-purple', passthrough: 'pill-blue' };

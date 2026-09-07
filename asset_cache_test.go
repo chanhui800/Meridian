@@ -154,6 +154,34 @@ func TestAssetCacheSizeBySiteAndClear(t *testing.T) {
 	}
 }
 
+func TestAssetCacheSizeAccountingOverwriteAndExpiry(t *testing.T) {
+	cache := newAssetCache(t.TempDir())
+	site := Site{ID: 44, AssetCacheEnabled: true, AssetCacheTTLSec: 1, AssetCacheMaxBytes: 16 << 20, AssetCacheRules: "*/file/*"}
+	target, _ := url.Parse("https://media.example/file/accounting.jpg")
+	request := httptest.NewRequest(http.MethodGet, "https://proxy.example/file/accounting.jpg", nil)
+	cacheReq := cache.request(site, request, target)
+	response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/jpeg"}}}
+	now := time.Now()
+	if err := cache.write(site, cacheReq, response, []byte("first"), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, total, err := cache.sizeBySite(); err != nil || total != 5 {
+		t.Fatalf("after first write total=%d err=%v, want 5", total, err)
+	}
+	if err := cache.write(site, cacheReq, response, []byte("replacement"), now.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if sizes, total, err := cache.sizeBySite(); err != nil || total != 11 || sizes[site.ID] != 11 {
+		t.Fatalf("after overwrite sizes=%v total=%d err=%v, want 11", sizes, total, err)
+	}
+	if _, err := cache.read(cacheReq, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if sizes, total, err := cache.sizeBySite(); err != nil || total != 0 || len(sizes) != 0 {
+		t.Fatalf("after expiry sizes=%v total=%d err=%v, want empty", sizes, total, err)
+	}
+}
+
 func TestHandleAssetCacheReportsAndClearsCache(t *testing.T) {
 	app := newTestApp(t)
 	cache := newAssetCache(t.TempDir())

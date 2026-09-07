@@ -87,12 +87,13 @@ const API = {
     this.authenticated = false;
   },
 
-  async request(method, path, body) {
+  async request(method, path, body, requestOptions) {
     const opts = {
       method,
       credentials: 'same-origin',
       headers: {},
     };
+    if (requestOptions && requestOptions.signal) opts.signal = requestOptions.signal;
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
@@ -130,15 +131,16 @@ const API = {
   updateAccount(data) { return this.request('PUT', '/api/account', data); },
 
   // Dashboard
-  dashboard() { return this.request('GET', '/api/dashboard'); },
+  dashboard(signal) { return this.request('GET', '/api/dashboard', undefined, { signal }); },
+  dashboardBootstrap(signal) { return this.request('GET', '/api/dashboard/bootstrap', undefined, { signal }); },
   dashboardInsights() { return this.request('GET', '/api/dashboard-insights'); },
-  dashboardTrends(siteId, range, customStart, customEnd) {
+  dashboardTrends(siteId, range, customStart, customEnd, signal) {
     const params = new URLSearchParams({ site_id: siteId || 'all', range: range || 'realtime' });
     if ((range || '').toLowerCase() === 'custom') {
       if (customStart) params.set('start', customStart);
       if (customEnd) params.set('end', customEnd);
     }
-    return this.request('GET', '/api/dashboard-trends?' + params.toString());
+    return this.request('GET', '/api/dashboard-trends?' + params.toString(), undefined, { signal });
   },
   getSystemSettings() { return this.request('GET', '/api/system-settings'); },
   saveSystemSettings(data) { return this.request('POST', '/api/system-settings', data); },

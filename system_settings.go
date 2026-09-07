@@ -206,38 +206,21 @@ func (a *App) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 type dashboardInsights struct {
-	LogHealthy      bool    `json:"log_healthy"`
-	LatestLogMS     int64   `json:"latest_log_ms"`
-	LogCountToday   int64   `json:"log_count_today"`
-	DroppedLogs     uint64  `json:"dropped_logs"`
-	ScheduleEnabled bool    `json:"schedule_enabled"`
-	ScheduleLabel   string  `json:"schedule_label"`
-	LastSentKey     string  `json:"last_sent_key"`
-	HourlyRequests  []int64 `json:"hourly_requests"`
+	LogHealthy      bool   `json:"log_healthy"`
+	LatestLogMS     int64  `json:"latest_log_ms"`
+	LogCountToday   int64  `json:"log_count_today"`
+	DroppedLogs     uint64 `json:"dropped_logs"`
+	ScheduleEnabled bool   `json:"schedule_enabled"`
+	ScheduleLabel   string `json:"schedule_label"`
+	LastSentKey     string `json:"last_sent_key"`
 }
 
-func (a *App) handleDashboardInsights(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET")
-		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
+func (a *App) dashboardInsightsSnapshot() dashboardInsights {
 	location := timezoneLocation(a.db.currentSystemSettings().ScheduleTimezone)
 	now := time.Now().In(location)
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
-	insights := dashboardInsights{HourlyRequests: make([]int64, 24), LogHealthy: a.db.currentSystemSettings().LogEnabled}
+	insights := dashboardInsights{LogHealthy: a.db.currentSystemSettings().LogEnabled}
 	_ = a.db.db.QueryRow(`SELECT COALESCE(MAX(recorded_at_ms),0), COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, start.UnixMilli(), start.AddDate(0, 0, 1).UnixMilli()).Scan(&insights.LatestLogMS, &insights.LogCountToday)
-	rows, err := a.db.db.Query(`SELECT recorded_at_ms FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, start.UnixMilli(), start.AddDate(0, 0, 1).UnixMilli())
-	if err == nil {
-		for rows.Next() {
-			var timestamp int64
-			if rows.Scan(&timestamp) == nil {
-				hour := time.UnixMilli(timestamp).In(location).Hour()
-				insights.HourlyRequests[hour]++
-			}
-		}
-		rows.Close()
-	}
 	insights.DroppedLogs = a.db.DroppedRequestLogs()
 	if stored, err := a.db.telegramReportSettings(); err == nil {
 		insights.ScheduleEnabled = stored.Enabled
@@ -249,5 +232,18 @@ func (a *App) handleDashboardInsights(w http.ResponseWriter, r *http.Request) {
 			insights.ScheduleLabel = "每天 " + insights.ScheduleLabel
 		}
 	}
-	a.jsonOK(w, insights)
+	return insights
+}
+
+func (a *App) handleDashboardInsights(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	started := time.Now()
+	a.jsonOK(w, a.dashboardInsightsSnapshot())
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		logDashboardSlow("/api/dashboard-insights", elapsed)
+	}
 }

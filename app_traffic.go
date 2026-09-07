@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -132,9 +133,12 @@ func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	// A comment is a valid SSE frame and makes proxy buffering observable: the
+	// client receives bytes as soon as the stream is established.
+	_, _ = io.WriteString(w, ": meridian-connected\n\n")
 	flusher.Flush()
 
 	ticker := time.NewTicker(2 * time.Second)
