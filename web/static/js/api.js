@@ -194,9 +194,13 @@ const API = {
     return data;
   },
   listSites() { return this.request('GET', '/api/sites'); },
+  getSiteIconPack() { return this.request('GET', '/api/site-icon-pack'); },
+  saveSiteIconPack(pack, sourceURL = '') { return this.request('POST', '/api/site-icon-pack', { pack, source_url: sourceURL }); },
+  clearSiteIconPack() { return this.request('DELETE', '/api/site-icon-pack'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },
   reorderSites(siteIds) { return this.request('PUT', '/api/sites/reorder', { site_ids: siteIds }); },
   updateSite(id, data) { return this.request('PUT', '/api/sites/' + id, data); },
+  updateSiteIcon(id, iconName, iconURL) { return this.request('PUT', '/api/sites/' + id + '/icon', { icon_name: iconName || '', icon_url: iconURL || '' }); },
   deleteSite(id) { return this.request('DELETE', '/api/sites/' + id); },
   toggleSite(id) { return this.request('POST', '/api/sites/' + id + '/toggle'); },
   diagSite(id) { return this.request('GET', '/api/sites/' + id + '/diag'); },

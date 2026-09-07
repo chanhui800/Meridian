@@ -1865,6 +1865,212 @@ canvas#trafficChart { width: 100% !important; height: 280px !important; }
   .btn-modal { flex: 1; min-height: 44px; padding: 12px 16px; }
 }
 
+/* Site icon packages and per-site icon picker. The icon treatment reuses the
+   existing site card surface, spacing, and color tokens. */
+.sites-toolbar {
+  grid-template-columns: auto minmax(180px, 1fr) auto auto;
+}
+
+.btn-site-icon-pack {
+  min-width: 104px;
+  height: 44px;
+}
+
+.site-icon {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  display: inline-grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--blue) 18%, var(--glass-border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--blue) 9%, var(--surface));
+  color: var(--blue);
+  font-size: .9rem;
+  font-weight: 750;
+  line-height: 1;
+}
+
+.site-icon-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+.site-heading-title-row .site-icon {
+  margin-left: 0;
+}
+
+.site-icon-picker-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+/* The drag handle owns the reserved left gutter. The icon follows it in the
+   normal flex flow so the two controls can never occupy the same pixels. */
+.site-heading-title-row .site-icon-button {
+  margin-left: 0;
+  flex: 0 0 auto;
+}
+
+.site-icon-button {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.site-icon-button:hover .site-icon,
+.site-icon-button:focus-visible .site-icon {
+  border-color: color-mix(in srgb, var(--blue) 58%, var(--glass-border));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--blue) 13%, transparent);
+}
+
+.site-icon-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--blue) 70%, white);
+  outline-offset: 2px;
+}
+
+.site-icon,
+.site-icon-option-preview .site-icon,
+.site-icon-large {
+  border-radius: 50%;
+}
+
+.site-icon-button .site-icon { pointer-events: none; }
+
+.site-icon-large {
+  width: 56px;
+  height: 56px;
+  flex-basis: 56px;
+  font-size: 1.15rem;
+}
+
+.site-icon-option-icon {
+  width: 32px;
+  height: 32px;
+  flex-basis: 32px;
+}
+
+.site-icon-manager-modal { width: min(620px, calc(100vw - 28px)); }
+.site-icon-manager-current {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel-soft) 86%, transparent);
+}
+.site-icon-manager-current strong { display: block; color: var(--white); font-size: 1rem; }
+.site-icon-manager-current p { margin: 4px 0 0; color: var(--white-60); font-size: .78rem; }
+.site-icon-manager-search { position: relative; display: flex; align-items: center; }
+.site-icon-manager-search > span { position: absolute; left: 13px; z-index: 1; color: var(--white-38); pointer-events: none; }
+.site-icon-manager-search .form-input { padding-left: 34px; }
+.site-icon-manager-results { max-height: min(46vh, 340px); margin-top: 12px; }
+.site-icon-manager-help { margin: 12px 0 0; }
+
+@media (max-width: 560px) {
+  .site-heading-title-row { min-height: 32px; display: flex; align-items: center; padding-left: 34px; gap: 7px 8px; }
+  .site-icon-button { width: 38px; height: 38px; min-width: 38px; min-height: 38px; }
+  .site-icon { width: 34px; height: 34px; flex-basis: 34px; }
+  .site-icon-manager-modal { width: calc(100vw - 20px); }
+  .site-icon-manager-modal .modal-footer { flex-wrap: wrap; }
+  .site-icon-manager-modal .modal-footer .btn-modal { flex: 1 1 30%; min-width: 0; padding-inline: 10px; }
+}
+
+.site-icon-picker-heading label { margin-bottom: 0 !important; }
+.site-icon-pack-settings { min-height: 30px; padding: 5px 10px; font-size: .72rem; }
+
+.site-icon-picker-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.site-icon-picker-search > span {
+  position: absolute;
+  left: 12px;
+  z-index: 1;
+  color: var(--white-38);
+  pointer-events: none;
+}
+
+.site-icon-picker-search .form-input { padding-left: 32px; }
+
+.site-icon-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(116px, 1fr));
+  gap: 8px;
+  max-height: 210px;
+  margin-top: 9px;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 72%, var(--panel));
+}
+
+.site-icon-option {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--white-72);
+  text-align: left;
+  cursor: pointer;
+}
+
+.site-icon-option:hover,
+.site-icon-option:focus-visible,
+.site-icon-option.is-selected {
+  border-color: color-mix(in srgb, var(--blue) 35%, var(--glass-border));
+  background: color-mix(in srgb, var(--blue) 10%, var(--surface));
+  color: var(--white);
+  outline: none;
+}
+
+.site-icon-option-preview .site-icon { width: 28px; height: 28px; flex-basis: 28px; border-radius: 8px; }
+.site-icon-option-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .72rem; }
+.site-icon-empty { grid-column: 1 / -1; padding: 18px 8px; color: var(--white-38); font-size: .78rem; text-align: center; }
+.site-icon-clear { margin-top: 8px; min-height: 32px; padding: 6px 11px; font-size: .74rem; }
+
+.site-icon-pack-modal-copy p { margin: 0 0 8px; color: var(--white-72); line-height: 1.5; }
+.site-icon-pack-modal-copy .form-help { margin-bottom: 0; }
+.site-icon-pack-file { padding: 6px 9px !important; }
+.site-icon-pack-divider { display: flex; align-items: center; gap: 10px; margin: 14px 0; color: var(--white-38); font-size: .76rem; }
+.site-icon-pack-divider::before, .site-icon-pack-divider::after { content: ''; height: 1px; flex: 1; background: var(--glass-border); }
+.site-icon-pack-status { min-height: 20px; margin-top: 8px; color: var(--green); font-size: .78rem; line-height: 1.4; }
+.site-icon-pack-status.is-error { color: var(--red); }
+
+@media (max-width: 768px) {
+  .sites-toolbar { grid-template-columns: 1fr; }
+  .sites-toolbar .btn-site-icon-pack,
+  .sites-toolbar .btn-test-all { width: 100%; justify-content: center; }
+  .site-icon-results { grid-template-columns: repeat(auto-fill, minmax(102px, 1fr)); max-height: 190px; }
+}
+
 @media (max-width: 480px) {
   .stats-row { grid-template-columns: 1fr; }
   .login-brand h1 { font-size: 2rem; }
@@ -7181,4 +7387,27 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
   .node-site-card-controls { grid-template-columns: 1fr; }
   .node-site-card-controls .node-check { grid-column: auto; min-height: 44px; }
   .node-site-card-actions .node-button { width: 100%; min-height: 44px; }
+}
+
+/* Site icon package controls are declared last so the responsive console
+   overrides above cannot collapse the four toolbar controls into an implicit
+   overlapping grid column. */
+.sites-toolbar {
+  grid-template-columns: auto minmax(180px, 1fr) auto auto;
+}
+.sites-toolbar .btn-site-icon-pack {
+  min-width: 104px;
+  min-height: 42px;
+  height: 42px;
+}
+.site-heading-title-row .site-icon {
+  margin-left: 0;
+}
+@media (max-width: 768px) {
+  .sites-toolbar { grid-template-columns: 1fr; }
+  .sites-toolbar .btn-site-icon-pack,
+  .sites-toolbar .btn-test-all {
+    width: 100%;
+    justify-content: center;
+  }
 }

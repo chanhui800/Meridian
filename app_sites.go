@@ -91,6 +91,8 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 	case "POST":
 		var req struct {
 			Name                       string                `json:"name"`
+			IconName                   string                `json:"icon_name"`
+			IconURL                    string                `json:"icon_url"`
 			ListenPort                 int                   `json:"listen_port"`
 			PublicHost                 string                `json:"public_host"`
 			RoutePrefix                string                `json:"route_prefix"`
@@ -169,6 +171,23 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Name = strings.TrimSpace(req.Name)
+		req.IconName, req.IconURL, err = normalizeSiteIconSelection(req.IconName, req.IconURL)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.IconName != "" {
+			pack, packErr := a.db.SiteIconPack()
+			if packErr != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "读取站点图标包失败")
+				return
+			}
+			req.IconName, req.IconURL, err = pack.normalizeSelection(req.IconName, req.IconURL)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		req.PrimaryLineName, err = normalizePrimaryLineName(req.PrimaryLineName)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
@@ -306,6 +325,8 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		site, err := a.db.CreateSiteRecord(Site{
 			Name:                          req.Name,
+			IconName:                      req.IconName,
+			IconURL:                       req.IconURL,
 			ListenPort:                    req.ListenPort,
 			PublicHost:                    req.PublicHost,
 			PathPrefix:                    req.PathPrefix,
@@ -412,6 +433,26 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case action == "icon" && r.Method == http.MethodPut:
+		var req struct {
+			IconName string `json:"icon_name"`
+			IconURL  string `json:"icon_url"`
+		}
+		if err := decodeJSONBody(w, r, &req); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, "invalid icon selection")
+			return
+		}
+		site, err := a.db.UpdateSiteIcon(id, req.IconName, req.IconURL)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				a.jsonErr(w, http.StatusNotFound, "site not found")
+				return
+			}
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.jsonOK(w, site)
+
 	case action == "dynamic-observations" && (r.Method == http.MethodGet || r.Method == http.MethodDelete):
 		if _, err := a.db.GetSite(id); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -528,6 +569,8 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		var req struct {
 			Name                       string                 `json:"name"`
+			IconName                   *string                `json:"icon_name"`
+			IconURL                    *string                `json:"icon_url"`
 			ListenPort                 int                    `json:"listen_port"`
 			PublicHost                 *string                `json:"public_host"`
 			RoutePrefix                *string                `json:"route_prefix"`
@@ -767,6 +810,27 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		candidate := *oldSite
 		candidate.Name = req.Name
+		if req.IconName != nil || req.IconURL != nil {
+			if req.IconName == nil || req.IconURL == nil {
+				a.jsonErr(w, http.StatusBadRequest, "icon_name and icon_url must be provided together")
+				return
+			}
+			candidate.IconName, candidate.IconURL, err = normalizeSiteIconSelection(*req.IconName, *req.IconURL)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			pack, packErr := a.db.SiteIconPack()
+			if packErr != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "读取站点图标包失败")
+				return
+			}
+			candidate.IconName, candidate.IconURL, err = pack.normalizeSelection(candidate.IconName, candidate.IconURL)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		candidate.ListenPort = listenPort
 		candidate.PublicHost = publicHost
 		candidate.PathPrefix = pathPrefix
