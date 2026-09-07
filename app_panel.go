@@ -12,6 +12,8 @@ import (
 )
 
 func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	started := time.Now()
 	snap, err := a.pm.TrafficSnapshot()
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "dashboard unavailable")
@@ -19,6 +21,10 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	snap.PanelDomain = a.panelHost
 	snap.PanelAccessURL = a.panelAccessURL()
+	w.Header().Set("Server-Timing", "dashboard;dur="+formatTimingDuration(time.Since(started)))
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		logDashboardSlow("/api/dashboard", elapsed)
+	}
 	a.jsonOK(w, snap)
 }
 

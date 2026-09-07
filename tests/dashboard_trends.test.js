@@ -37,3 +37,17 @@ test('dashboard realtime trend keeps historical points after a page refresh', ()
   assert.match(dashboardSource, /historicalPoints\.slice\(0, offset\)\.concat\(realtimePoints\)/);
   assert.match(dashboardSource, /if \(!realtimePoints\.length \|\| !historicalPoints\.length\) return realtimePoints\.length \? realtimePoints : historicalPoints/);
 });
+
+test('dashboard loads an HTTP snapshot/bootstrap before relying on SSE', () => {
+  assert.match(dashboardSource, /void loadDashboardInitialSnapshot\(\)/);
+  assert.match(dashboardSource, /API\.dashboard\(signal\)/);
+  assert.match(dashboardSource, /API\.dashboardBootstrap\(signal\)/);
+});
+
+test('dashboard coalesces bootstrap and aborts stale trend requests', () => {
+  assert.match(dashboardSource, /if \(dashboardBootstrapPromise\) return dashboardBootstrapPromise/);
+  assert.match(dashboardSource, /dashboardTrendAbortController\.abort\(\)/);
+  assert.match(dashboardSource, /dashboardTrends\([\s\S]*signal/);
+  assert.match(dashboardSource, /setInterval\(\(\) => \{[\s\S]*60000/);
+  assert.match(dashboardSource, /dashboardTrendState\.range === 'realtime'[\s\S]*15000/);
+});

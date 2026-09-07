@@ -191,15 +191,14 @@
 
   function startDashboardRefresh() {
     if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
-    dashboardRefreshTimer = setInterval(() => {
-      if (Router.current === 'dashboard') loadDashboardData();
-    }, 15000);
+    dashboardRefreshTimer = null;
+    if (typeof startDashboardRefreshTimers === 'function') startDashboardRefreshTimers();
   }
 
   function stopDashboardRefresh() {
-    if (!dashboardRefreshTimer) return;
-    clearInterval(dashboardRefreshTimer);
+    if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
     dashboardRefreshTimer = null;
+    if (typeof stopDashboardRefreshTimers === 'function') stopDashboardRefreshTimers();
   }
 
   function teardownAppRuntime() {

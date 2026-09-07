@@ -229,6 +229,29 @@ func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName 
 }
 
 func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customWindow ...time.Time) (*dashboardTrendsResponse, error) {
+	// Coalesce identical cold-cache requests. Dashboard tabs frequently mount
+	// together, and the database is intentionally kept on a single writer
+	// connection; only one caller should execute the trend query.
+	customKey := ""
+	for _, value := range customWindow {
+		customKey += fmt.Sprintf("|%d", value.UnixNano())
+	}
+	siteKey := "all"
+	if siteID != nil {
+		siteKey = strconv.FormatInt(*siteID, 10)
+	}
+	settings := pm.database.currentSystemSettings()
+	flightKey := fmt.Sprintf("%p|%s|%s|%d%s", pm.database, siteKey, strings.ToLower(strings.TrimSpace(rangeName)), settings.ScheduleTimezone, customKey)
+	value, err, _ := pm.dashboardTrendGroup.Do(flightKey, func() (interface{}, error) {
+		return pm.dashboardTrendsUncoalesced(siteID, rangeName, customWindow...)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return value.(*dashboardTrendsResponse), nil
+}
+
+func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName string, customWindow ...time.Time) (*dashboardTrendsResponse, error) {
 	settings := pm.database.currentSystemSettings()
 	billingMode := settings.TrafficBillingMode
 	trendLocation := timezoneLocation(settings.ScheduleTimezone)
@@ -357,10 +380,15 @@ func (a *App) handleDashboardTrends(w http.ResponseWriter, r *http.Request) {
 		}
 		customWindow = []time.Time{start, end}
 	}
+	started := time.Now()
 	trend, err := a.pm.dashboardTrends(siteID, rangeName, customWindow...)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		logDashboardSlow("/api/dashboard-trends", elapsed)
+	}
+	w.Header().Set("Server-Timing", "trend;dur="+formatTimingDuration(time.Since(started)))
 	a.jsonOK(w, trend)
 }

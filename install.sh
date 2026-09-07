@@ -1330,6 +1330,23 @@ server {
     large_client_header_buffers 4 32k;
     access_log /var/log/nginx/meridian_access.log meridian_redacted;
 
+    location = /api/events {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        send_timeout 3600s;
+        add_header X-Accel-Buffering no always;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:${port};
         proxy_http_version 1.1;
