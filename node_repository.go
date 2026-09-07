@@ -32,40 +32,42 @@ var (
 )
 
 type ControlNode struct {
-	ID                  int64  `json:"id"`
-	GUID                string `json:"guid"`
-	Name                string `json:"name"`
-	Address             string `json:"address"`
-	Port                int    `json:"port"`
-	Enabled             bool   `json:"enabled"`
-	Priority            int    `json:"priority"`
-	TrafficQuota        int64  `json:"traffic_quota"`
-	TrafficManualOffset int64  `json:"traffic_manual_offset_bytes"`
-	BillingMode         string `json:"billing_mode"`
-	ResetDay            int    `json:"reset_day"`
-	CycleStartedAtMS    int64  `json:"cycle_started_at_ms"`
-	PeriodRXBytes       int64  `json:"period_rx_bytes"`
-	PeriodTXBytes       int64  `json:"period_tx_bytes"`
-	LifetimeRXBytes     int64  `json:"lifetime_rx_bytes"`
-	LifetimeTXBytes     int64  `json:"lifetime_tx_bytes"`
-	InterfaceName       string `json:"interface_name"`
-	AgentVersion        string `json:"agent_version"`
-	DesiredConfigHash   string `json:"desired_config_hash"`
-	AppliedConfigHash   string `json:"applied_config_hash"`
-	AgentListenerError  string `json:"agent_listener_error"`
-	EventSpoolError     string `json:"event_spool_error"`
-	EventQueueDepth     int    `json:"event_queue_depth"`
-	EventDropped        int64  `json:"event_dropped"`
-	EnrolledAtMS        int64  `json:"enrolled_at_ms"`
-	LastSeenAtMS        int64  `json:"last_seen_at_ms"`
-	CreatedAtMS         int64  `json:"created_at_ms"`
-	UpdatedAtMS         int64  `json:"updated_at_ms"`
-	Status              string `json:"status"`
-	TrafficUsed         int64  `json:"traffic_used"`
-	TrafficRemaining    int64  `json:"traffic_remaining"`
-	EnrollmentAvailable bool   `json:"enrollment_available"`
-	Depleted            bool   `json:"depleted"`
-	Active              bool   `json:"active"`
+	ID                          int64  `json:"id"`
+	GUID                        string `json:"guid"`
+	Name                        string `json:"name"`
+	Address                     string `json:"address"`
+	Port                        int    `json:"port"`
+	Enabled                     bool   `json:"enabled"`
+	Priority                    int    `json:"priority"`
+	TrafficQuota                int64  `json:"traffic_quota"`
+	TrafficManualOffset         int64  `json:"traffic_manual_offset_bytes"`
+	BillingMode                 string `json:"billing_mode"`
+	ResetDay                    int    `json:"reset_day"`
+	CycleStartedAtMS            int64  `json:"cycle_started_at_ms"`
+	PeriodRXBytes               int64  `json:"period_rx_bytes"`
+	PeriodTXBytes               int64  `json:"period_tx_bytes"`
+	LifetimeRXBytes             int64  `json:"lifetime_rx_bytes"`
+	LifetimeTXBytes             int64  `json:"lifetime_tx_bytes"`
+	InterfaceName               string `json:"interface_name"`
+	AgentVersion                string `json:"agent_version"`
+	DesiredConfigHash           string `json:"desired_config_hash"`
+	AppliedConfigHash           string `json:"applied_config_hash"`
+	AgentListenerError          string `json:"agent_listener_error"`
+	EventSpoolError             string `json:"event_spool_error"`
+	EventQueueDepth             int    `json:"event_queue_depth"`
+	EventDropped                int64  `json:"event_dropped"`
+	CacheClearGeneration        int64  `json:"cache_clear_generation"`
+	CacheClearAppliedGeneration int64  `json:"cache_clear_applied_generation"`
+	EnrolledAtMS                int64  `json:"enrolled_at_ms"`
+	LastSeenAtMS                int64  `json:"last_seen_at_ms"`
+	CreatedAtMS                 int64  `json:"created_at_ms"`
+	UpdatedAtMS                 int64  `json:"updated_at_ms"`
+	Status                      string `json:"status"`
+	TrafficUsed                 int64  `json:"traffic_used"`
+	TrafficRemaining            int64  `json:"traffic_remaining"`
+	EnrollmentAvailable         bool   `json:"enrollment_available"`
+	Depleted                    bool   `json:"depleted"`
+	Active                      bool   `json:"active"`
 
 	lastRawRXBytes        int64
 	lastRawTXBytes        int64
@@ -116,24 +118,26 @@ type NodeCreateInput struct {
 }
 
 type NodeReport struct {
-	BootID            string                   `json:"boot_id"`
-	ReportSessionID   string                   `json:"report_session_id,omitempty"`
-	CounterEpoch      string                   `json:"counter_epoch,omitempty"`
-	Sequence          int64                    `json:"sequence"`
-	InterfaceName     string                   `json:"interface_name"`
-	RXBytes           int64                    `json:"rx_bytes"`
-	TXBytes           int64                    `json:"tx_bytes"`
-	AgentVersion      string                   `json:"agent_version"`
-	AppliedConfigHash string                   `json:"applied_config_hash"`
-	ListenerError     string                   `json:"listener_error"`
-	EventSpoolError   string                   `json:"event_spool_error,omitempty"`
-	EventQueueDepth   int                      `json:"event_queue_depth,omitempty"`
-	EventDropped      int64                    `json:"event_dropped,omitempty"`
-	SiteStats         []NodeSiteStat           `json:"site_stats,omitempty"`
-	MediaCounts       []NodeMediaCount         `json:"media_counts,omitempty"`
-	Retention         []NodeRetentionStatus    `json:"retention,omitempty"`
-	Observations      []NodeDynamicObservation `json:"observations,omitempty"`
-	Events            []NodeRequestEvent       `json:"events,omitempty"`
+	BootID               string                   `json:"boot_id"`
+	ReportSessionID      string                   `json:"report_session_id,omitempty"`
+	CounterEpoch         string                   `json:"counter_epoch,omitempty"`
+	SiteCounterEpoch     string                   `json:"site_counter_epoch,omitempty"`
+	Sequence             int64                    `json:"sequence"`
+	InterfaceName        string                   `json:"interface_name"`
+	RXBytes              int64                    `json:"rx_bytes"`
+	TXBytes              int64                    `json:"tx_bytes"`
+	AgentVersion         string                   `json:"agent_version"`
+	AppliedConfigHash    string                   `json:"applied_config_hash"`
+	ListenerError        string                   `json:"listener_error"`
+	EventSpoolError      string                   `json:"event_spool_error,omitempty"`
+	EventQueueDepth      int                      `json:"event_queue_depth,omitempty"`
+	EventDropped         int64                    `json:"event_dropped,omitempty"`
+	CacheClearGeneration int64                    `json:"cache_clear_generation,omitempty"`
+	SiteStats            []NodeSiteStat           `json:"site_stats,omitempty"`
+	MediaCounts          []NodeMediaCount         `json:"media_counts,omitempty"`
+	Retention            []NodeRetentionStatus    `json:"retention,omitempty"`
+	Observations         []NodeDynamicObservation `json:"observations,omitempty"`
+	Events               []NodeRequestEvent       `json:"events,omitempty"`
 }
 
 // NodeReportResult keeps the protocol acknowledgement tied to the exact
@@ -156,6 +160,7 @@ type NodeSiteStat struct {
 	BytesOut           int64  `json:"bytes_out"`
 	CumulativeBytesIn  int64  `json:"cumulative_bytes_in"`
 	CumulativeBytesOut int64  `json:"cumulative_bytes_out"`
+	CacheSizeBytes     int64  `json:"cache_size_bytes,omitempty"`
 }
 
 type NodeMediaCount struct {
@@ -388,7 +393,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
-	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
+	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
 
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
@@ -398,7 +403,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
-		&node.agentTokenHash, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
+		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
 	if err != nil {
 		return ControlNode{}, err
 	}
@@ -699,10 +704,10 @@ func validateNodeReport(report NodeReport) error {
 	report.ReportSessionID = strings.TrimSpace(report.ReportSessionID)
 	report.CounterEpoch = strings.TrimSpace(report.CounterEpoch)
 	report.InterfaceName = strings.TrimSpace(report.InterfaceName)
-	if report.BootID == "" || len(report.BootID) > 128 || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 {
+	if report.BootID == "" || len(report.BootID) > 128 || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 || len(report.SiteCounterEpoch) > 128 {
 		return errors.New("invalid boot_id")
 	}
-	if report.Sequence <= 0 || report.RXBytes < 0 || report.TXBytes < 0 {
+	if report.Sequence <= 0 || report.RXBytes < 0 || report.TXBytes < 0 || report.CacheClearGeneration < 0 {
 		return errors.New("invalid traffic counters")
 	}
 	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ListenerError) > 1024 || len(report.EventSpoolError) > 1024 || report.EventQueueDepth < 0 || report.EventQueueDepth > edgeEventQueueLimit || report.EventDropped < 0 {
@@ -723,7 +728,7 @@ func validateNodeReport(report NodeReport) error {
 		}
 	}
 	for _, stat := range report.SiteStats {
-		if strings.TrimSpace(stat.Host) == "" || len(stat.Host) > 255 || stat.RequestCount < 0 || stat.LastRequestAtMS < 0 || stat.LastStatus < 0 || stat.LastStatus > 999 || stat.BytesIn < 0 || stat.BytesOut < 0 || stat.CumulativeBytesIn < 0 || stat.CumulativeBytesOut < 0 {
+		if strings.TrimSpace(stat.Host) == "" || len(stat.Host) > 255 || stat.RequestCount < 0 || stat.LastRequestAtMS < 0 || stat.LastStatus < 0 || stat.LastStatus > 999 || stat.BytesIn < 0 || stat.BytesOut < 0 || stat.CumulativeBytesIn < 0 || stat.CumulativeBytesOut < 0 || stat.CacheSizeBytes < 0 {
 			return errors.New("invalid site stats")
 		}
 	}
@@ -929,7 +934,7 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 	return err
 }
 
-func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite) error {
+func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite) error {
 	var siteID int64
 	host := requestPublicHost(strings.TrimSpace(stat.Host))
 	for id, site := range allowedSites {
@@ -950,32 +955,51 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeS
 	}
 	var previousBoot string
 	var previousIn, previousOut, previousRequests int64
-	err := tx.QueryRow(`SELECT boot_id,last_bytes_in,last_bytes_out,last_request_count FROM node_site_counters WHERE node_id=? AND site_id=?`, nodeID, siteID).Scan(&previousBoot, &previousIn, &previousOut, &previousRequests)
+	err := tx.QueryRow(`SELECT boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes FROM node_site_counters WHERE node_id=? AND site_id=?`, nodeID, siteID).Scan(&previousBoot, &previousIn, &previousOut, &previousRequests, new(int64))
 	if errors.Is(err, sql.ErrNoRows) {
 		// The first sample is the delta from the Agent runtime's initial zero
 		// state, rather than merely a counter baseline. Persist it immediately
 		// so the first report is visible in history and lifetime site totals.
 		initialIn, initialOut := stat.BytesIn, stat.BytesOut
-		// RequestCount is a cumulative counter, unlike BytesIn/BytesOut which
-		// are report deltas. There is no request baseline in the traffic log on
-		// the first sample, so defer request persistence until the next sample.
-		if initialIn > 0 || initialOut > 0 {
+		// RequestCount is the cumulative count for this Agent runtime epoch. The
+		// first report is the segment from zero, so persist it together with the
+		// first byte deltas instead of silently dropping the first batch.
+		initialRequests := stat.RequestCount
+		if initialIn > 0 || initialOut > 0 || initialRequests > 0 {
 			bucket := (nowMS / 60000) * 60000
-			if _, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, initialIn, initialOut, 0, bucket); err != nil {
+			if _, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, initialIn, initialOut, initialRequests, bucket); err != nil {
 				return err
 			}
 			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, initialIn, initialOut, initialIn, initialOut, siteID); err != nil {
 				return err
 			}
 		}
-		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,updated_at_ms) VALUES(?,?,?,?,?,?,?)`, nodeID, siteID, bootID, currentIn, currentOut, stat.RequestCount, nowMS)
+		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, stat.CacheSizeBytes, nowMS)
 		return err
 	}
 	if err != nil {
 		return err
 	}
 	var deltaIn, deltaOut, deltaRequests int64
-	if previousBoot == bootID && currentIn >= previousIn && currentOut >= previousOut && stat.RequestCount >= previousRequests {
+	if previousBoot != counterEpoch {
+		// A process restart, config apply, or route transition starts a new
+		// Agent-side counter epoch. BytesIn/BytesOut are already report deltas;
+		// RequestCount is cumulative from zero for the same epoch.
+		deltaIn, deltaOut, deltaRequests = stat.BytesIn, stat.BytesOut, stat.RequestCount
+		// Older Agents only reported cumulative site counters. Preserve their
+		// upgrade compatibility when the cumulative value is still monotonic;
+		// a reset (the normal new-runtime case) falls back to the explicit
+		// per-report delta above.
+		if currentIn >= previousIn && stat.BytesIn == 0 {
+			deltaIn = currentIn - previousIn
+		}
+		if currentOut >= previousOut && stat.BytesOut == 0 {
+			deltaOut = currentOut - previousOut
+		}
+		if stat.RequestCount >= previousRequests {
+			deltaRequests = stat.RequestCount - previousRequests
+		}
+	} else if currentIn >= previousIn && currentOut >= previousOut && stat.RequestCount >= previousRequests {
 		deltaIn, deltaOut, deltaRequests = currentIn-previousIn, currentOut-previousOut, stat.RequestCount-previousRequests
 	}
 	if deltaIn > 0 || deltaOut > 0 || deltaRequests > 0 {
@@ -990,7 +1014,7 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeS
 			}
 		}
 	}
-	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, bootID, currentIn, currentOut, stat.RequestCount, nowMS, nodeID, siteID)
+	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,cache_size_bytes=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, counterEpoch, currentIn, currentOut, stat.RequestCount, stat.CacheSizeBytes, nowMS, nodeID, siteID)
 	return err
 }
 
@@ -1035,9 +1059,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	defer tx.Rollback()
 
 	var id, lastSequence, lastRX, lastTX int64
+	var cacheClearGeneration int64
 	var lastBootID, lastSessionID string
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1058,9 +1083,28 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if sessionID == "" {
 		sessionID = legacyBootID
 	}
+	siteEpoch := strings.TrimSpace(report.SiteCounterEpoch)
 	counterEpoch := strings.TrimSpace(report.CounterEpoch)
 	if counterEpoch == "" {
 		counterEpoch = legacyBootID
+	}
+	// Site proxy counters are independent from the host network interface
+	// counters above. Bind them to the Agent report session and the applied
+	// runtime configuration so a process restart or hot apply starts a fresh
+	// epoch even when the kernel boot/interface epoch is unchanged.
+	siteCounterEpoch := sessionID
+	if siteCounterEpoch == "" {
+		siteCounterEpoch = legacyBootID
+	}
+	if siteEpoch != "" {
+		// A monotonic Agent-side apply epoch distinguishes A→B→A route
+		// transitions even when the configuration hash returns to an earlier
+		// value within the same process session.
+		siteCounterEpoch += ":" + siteEpoch
+	} else if appliedHash := strings.TrimSpace(report.AppliedConfigHash); appliedHash != "" {
+		siteCounterEpoch += ":" + appliedHash
+	} else if counterEpoch != "" {
+		siteCounterEpoch += ":" + counterEpoch
 	}
 	deltaRX, deltaTX := int64(0), int64(0)
 	if counterEpoch == lastBootID && report.RXBytes >= lastRX && report.TXBytes >= lastTX && (sessionID != lastSessionID || report.Sequence > lastSequence) {
@@ -1073,9 +1117,9 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 		lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-		last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+		last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
 	}
 
@@ -1110,7 +1154,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			sessionID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID); err != nil {
 			return nodeReportCommitResult{}, err
 		}
-		if err := recordNodeSiteTrafficTx(tx, id, counterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
+		if err := recordNodeSiteTrafficTx(tx, id, siteCounterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
 			return nodeReportCommitResult{}, err
 		}
 	}

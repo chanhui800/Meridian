@@ -148,6 +148,37 @@ func TestNodeReportAdmissionReclaimsIdleEntries(t *testing.T) {
 	}
 }
 
+func TestAgentReportCannotAcknowledgeFutureCacheGeneration(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "cache-generation-guard", Address: "203.0.113.90"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE control_nodes SET cache_clear_generation=3 WHERE id=?", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	for sequence, generation := range []int64{4, 3} {
+		if _, err := app.db.RecordNodeReportResult(token, NodeReport{
+			BootID: "cache-guard", ReportSessionID: "cache-guard", CounterEpoch: "kernel:eth0", Sequence: int64(sequence + 1),
+			InterfaceName: "eth0", CacheClearGeneration: generation,
+		}, now.Add(time.Duration(sequence)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var applied int64
+	if err := app.db.db.QueryRow("SELECT cache_clear_applied_generation FROM control_nodes WHERE id=?", node.ID).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 3 {
+		t.Fatalf("cache clear applied generation=%d, want only the controller-issued generation 3", applied)
+	}
+}
+
 func TestAgentPreAuthAdmissionHasHardEntryLimit(t *testing.T) {
 	admission := newAgentPreAuthAdmission()
 	now := time.Now()

@@ -371,6 +371,8 @@ func (d *DB) migrateOnce() error {
 		event_spool_error TEXT NOT NULL DEFAULT '',
 		event_queue_depth INTEGER NOT NULL DEFAULT 0,
 		event_dropped BIGINT NOT NULL DEFAULT 0,
+		cache_clear_generation BIGINT NOT NULL DEFAULT 0,
+		cache_clear_applied_generation BIGINT NOT NULL DEFAULT 0,
 		enrollment_token_hash TEXT NOT NULL DEFAULT '',
 		enrollment_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 		probe_secret_ciphertext TEXT NOT NULL DEFAULT '',
@@ -446,6 +448,8 @@ func (d *DB) migrateOnce() error {
 		}
 	}
 	for _, migration := range []struct{ column, sql string }{
+		{"cache_clear_generation", "ALTER TABLE control_nodes ADD COLUMN cache_clear_generation BIGINT NOT NULL DEFAULT 0"},
+		{"cache_clear_applied_generation", "ALTER TABLE control_nodes ADD COLUMN cache_clear_applied_generation BIGINT NOT NULL DEFAULT 0"},
 		{"entry_mode", "ALTER TABLE control_nodes ADD COLUMN entry_mode TEXT NOT NULL DEFAULT 'direct'"},
 		{"http_port", "ALTER TABLE control_nodes ADD COLUMN http_port INTEGER NOT NULL DEFAULT 0"},
 		{"https_port", "ALTER TABLE control_nodes ADD COLUMN https_port INTEGER NOT NULL DEFAULT 443"},
@@ -746,6 +750,15 @@ func (d *DB) migrateOnce() error {
 	CREATE INDEX IF NOT EXISTS idx_node_site_traffic_site_time ON node_site_traffic_logs(site_id, recorded_at_ms);
 	CREATE INDEX IF NOT EXISTS idx_node_site_traffic_node_time ON node_site_traffic_logs(node_id, recorded_at_ms);`); err != nil {
 		return err
+	}
+	var cacheSizeColumn int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_site_counters') WHERE name='cache_size_bytes'").Scan(&cacheSizeColumn); err != nil {
+		return err
+	}
+	if cacheSizeColumn == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE node_site_counters ADD COLUMN cache_size_bytes BIGINT NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "UPDATE sites SET traffic_used_in=traffic_used/2, traffic_used_out=traffic_used-(traffic_used/2) WHERE traffic_used_in<0 OR traffic_used_out<0"); err != nil {
 		return err

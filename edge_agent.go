@@ -497,26 +497,28 @@ func (b *edgeProxyBundle) drain(grace time.Duration) {
 }
 
 type edgeAgentRuntime struct {
-	mu              sync.RWMutex
-	stateDir        string
-	nodeGUID        string
-	port            int
-	handler         http.Handler
-	certificate     *tls.Certificate
-	server          *http.Server
-	bundle          *edgeProxyBundle
-	appliedHash     string
-	listenerError   string
-	eventSpoolError string
-	events          edgeEventStore
-	stats           edgeSiteStats
-	telemetryMu     sync.Mutex
-	mediaCounts     map[int64]NodeMediaCount
-	retention       map[int64]NodeRetentionStatus
-	observations    []NodeDynamicObservation
-	siteReported    map[int64]ProxyRuntimeStat
-	resolver        dynamicIPResolver
-	transport       dynamicTransportFactory
+	mu                   sync.RWMutex
+	stateDir             string
+	nodeGUID             string
+	port                 int
+	handler              http.Handler
+	certificate          *tls.Certificate
+	server               *http.Server
+	bundle               *edgeProxyBundle
+	appliedHash          string
+	siteCounterEpoch     uint64
+	cacheClearGeneration int64
+	listenerError        string
+	eventSpoolError      string
+	events               edgeEventStore
+	stats                edgeSiteStats
+	telemetryMu          sync.Mutex
+	mediaCounts          map[int64]NodeMediaCount
+	retention            map[int64]NodeRetentionStatus
+	observations         []NodeDynamicObservation
+	siteReported         map[int64]ProxyRuntimeStat
+	resolver             dynamicIPResolver
+	transport            dynamicTransportFactory
 }
 
 func (runtime *edgeAgentRuntime) queueEvent(event NodeRequestEvent) {
@@ -660,6 +662,7 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		return pending
 	}
 	current := bundle.manager.ProxyRuntimeStats()
+	cacheSizes, _, _ := bundle.manager.AssetCacheSizes()
 	// Baselines are keyed by the Controller's stable SiteID. The in-memory
 	// Edge database is rebuilt whenever configuration changes, so its local
 	// auto-increment IDs must never be used as long-lived identities.
@@ -696,6 +699,7 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		observed.RequestCount = value.Requests
 		observed.BytesIn, observed.BytesOut = inDelta, outDelta
 		observed.CumulativeBytesIn, observed.CumulativeBytesOut = value.CumulativeBytesIn, value.CumulativeBytesOut
+		observed.CacheSizeBytes = cacheSizes[value.SiteID]
 		pending.stats = append(pending.stats, observed)
 	}
 	return pending
@@ -827,6 +831,33 @@ type edgeReplayBody struct {
 	io.Closer
 }
 
+// edgeAssetCacheGeneration is deliberately scoped to one route. A change to
+// another site (or to the surrounding Agent config envelope) must not cold
+// start this site's cache. Only values that affect the upstream response or
+// cache policy participate in the generation fingerprint.
+func edgeAssetCacheGeneration(site Site, route AgentSiteRoute) string {
+	payload := struct {
+		TargetURL         string
+		PlaybackTargetURL string
+		PlaybackMode      string
+		StreamHosts       []string
+		Headers           map[string][]string
+		CacheEnabled      bool
+		CacheTTLSec       int
+		CacheMaxBytes     int64
+		CacheRules        string
+		UpstreamHeaders   string
+	}{
+		TargetURL: site.TargetURL, PlaybackTargetURL: site.PlaybackTargetURL, PlaybackMode: site.PlaybackMode,
+		StreamHosts: route.StreamHosts, Headers: route.Headers, CacheEnabled: site.AssetCacheEnabled,
+		CacheTTLSec: site.AssetCacheTTLSec, CacheMaxBytes: site.AssetCacheMaxBytes, CacheRules: site.AssetCacheRules,
+		UpstreamHeaders: site.StoredUpstreamHeaders,
+	}
+	data, _ := json.Marshal(payload)
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:8])
+}
+
 func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edgeProxyBundle, error) {
 	dynamicKey, err := edgeDecodeKey(config.DynamicKey)
 	if err != nil {
@@ -853,9 +884,6 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
-		if route.SiteID > 0 {
-			site.AssetCacheNamespace = fmt.Sprintf("site-%d-config-%s", route.SiteID, config.ConfigHash)
-		}
 		site.PublicHost = strings.ToLower(strings.TrimSpace(route.Host))
 		site.IngressMode = ingressModeHost
 		site.PathPrefix = ""
@@ -872,6 +900,9 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		// Node-level scheduling owns quota exhaustion. A stale local site counter
 		// must never block traffic after a DNS assignment changes nodes.
 		site.TrafficQuota = 0
+		if route.SiteID > 0 {
+			site.AssetCacheNamespace = fmt.Sprintf("site-%d-config-%s", route.SiteID, edgeAssetCacheGeneration(site, route))
+		}
 		created, createErr := database.CreateSiteRecord(site)
 		if createErr != nil {
 			return fail(fmt.Errorf("site %d runtime config: %w", route.SiteID, createErr))
@@ -905,7 +936,16 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	}
 	manager.dynamicTransportFactory = runtime.transport
 	manager.SetHostOnlyIngressSafe(true)
-	manager.SetAssetCache(newAssetCache(filepath.Join(runtime.stateDir, "asset-cache")))
+	cache := newAssetCache(filepath.Join(runtime.stateDir, "asset-cache"))
+	manager.SetAssetCache(cache)
+	for _, site := range runtimeSites {
+		if site.AssetCacheNamespace == "" {
+			continue
+		}
+		if err := cache.gcSiteGenerations(assetCacheNamespacePrefix(site.AssetCacheNamespace), site.AssetCacheNamespace); err != nil {
+			return fail(fmt.Errorf("gc site %s asset cache generations: %w", site.AssetCacheNamespace, err))
+		}
+	}
 	if err := manager.ConfigureDynamicDiscovery(dynamicKey, "", config.HTTPSPort, nil); err != nil {
 		return fail(err)
 	}
@@ -1013,6 +1053,12 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	runtime.mu.RLock()
 	oldPort, oldServer, oldBundle := runtime.port, runtime.server, runtime.bundle
 	oldNodeGUID, oldCertificate, oldHandler := runtime.nodeGUID, runtime.certificate, runtime.handler
+	oldCacheClearGeneration := runtime.cacheClearGeneration
+	oldSiteCounterEpoch := runtime.siteCounterEpoch
+	oldSiteReported := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
+	for siteID, value := range runtime.siteReported {
+		oldSiteReported[siteID] = value
+	}
 	runtime.mu.RUnlock()
 	needsListener := len(config.Routes) > 0
 	listenerChanged := oldPort != config.HTTPSPort || (oldServer == nil) != !needsListener
@@ -1025,6 +1071,11 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	runtime.certificate = certificate
 	runtime.handler = bundle.handler
 	runtime.bundle = bundle
+	// The in-memory Edge database and proxy counters are rebuilt on every
+	// configuration apply. Drop per-site report baselines as well; the
+	// Controller binds site traffic to AppliedConfigHash, so the next report
+	// must describe the new runtime epoch from zero.
+	runtime.siteReported = make(map[int64]ProxyRuntimeStat)
 	runtime.mu.Unlock()
 	if listenerChanged && needsListener {
 		if err := runtime.startServer(config.HTTPSPort); err != nil {
@@ -1035,6 +1086,8 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 			runtime.certificate = oldCertificate
 			runtime.handler = oldHandler
 			runtime.bundle = oldBundle
+			runtime.siteCounterEpoch = oldSiteCounterEpoch
+			runtime.siteReported = oldSiteReported
 			runtime.listenerError = err.Error()
 			runtime.mu.Unlock()
 			if oldServer != nil {
@@ -1043,8 +1096,32 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 			return err
 		}
 	}
+	if config.CacheClearGeneration > oldCacheClearGeneration {
+		if err := bundle.manager.ClearAssetCache(); err != nil {
+			bundle.close()
+			runtime.mu.Lock()
+			runtime.nodeGUID = oldNodeGUID
+			runtime.port = oldPort
+			runtime.certificate = oldCertificate
+			runtime.handler = oldHandler
+			runtime.bundle = oldBundle
+			runtime.siteCounterEpoch = oldSiteCounterEpoch
+			runtime.siteReported = oldSiteReported
+			runtime.mu.Unlock()
+			if listenerChanged && needsListener {
+				if oldServer != nil {
+					_ = runtime.startServer(oldPort)
+				}
+			}
+			return err
+		}
+	}
 	runtime.mu.Lock()
 	runtime.appliedHash = config.ConfigHash
+	runtime.siteCounterEpoch++
+	if config.CacheClearGeneration > runtime.cacheClearGeneration {
+		runtime.cacheClearGeneration = config.CacheClearGeneration
+	}
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
 	if oldBundle != nil {
@@ -1652,6 +1729,10 @@ func runEdgeAgent() error {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
 			report.AppliedConfigHash, report.ListenerError = runtime.status()
+			runtime.mu.RLock()
+			report.CacheClearGeneration = runtime.cacheClearGeneration
+			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)
+			runtime.mu.RUnlock()
 			report.EventSpoolError, report.EventQueueDepth = runtime.eventSpoolStatus()
 			report.EventDropped = runtime.events.droppedCount()
 			pendingStats := runtime.prepareSiteStats()

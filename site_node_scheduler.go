@@ -70,20 +70,21 @@ type AgentSiteRoute struct {
 }
 
 type AgentRuntimeConfig struct {
-	SchemaVersion    int              `json:"schema_version"`
-	ConfigHash       string           `json:"config_hash"`
-	NodeGUID         string           `json:"node_guid"`
-	EntryMode        string           `json:"entry_mode"`
-	HTTPPort         int              `json:"http_port"`
-	HTTPSPort        int              `json:"https_port"`
-	CertificatePEM   string           `json:"certificate_pem,omitempty"`
-	PrivateKeyPEM    string           `json:"private_key_pem,omitempty"`
-	DynamicKey       string           `json:"dynamic_key,omitempty"`
-	ProbeSecret      string           `json:"probe_secret,omitempty"`
-	AgentVersion     string           `json:"agent_version,omitempty"`
-	AgentSHA256      string           `json:"agent_sha256,omitempty"`
-	AgentDownloadURL string           `json:"agent_download_url,omitempty"`
-	Routes           []AgentSiteRoute `json:"routes"`
+	SchemaVersion        int              `json:"schema_version"`
+	ConfigHash           string           `json:"config_hash"`
+	NodeGUID             string           `json:"node_guid"`
+	EntryMode            string           `json:"entry_mode"`
+	HTTPPort             int              `json:"http_port"`
+	HTTPSPort            int              `json:"https_port"`
+	CertificatePEM       string           `json:"certificate_pem,omitempty"`
+	PrivateKeyPEM        string           `json:"private_key_pem,omitempty"`
+	DynamicKey           string           `json:"dynamic_key,omitempty"`
+	ProbeSecret          string           `json:"probe_secret,omitempty"`
+	AgentVersion         string           `json:"agent_version,omitempty"`
+	AgentSHA256          string           `json:"agent_sha256,omitempty"`
+	AgentDownloadURL     string           `json:"agent_download_url,omitempty"`
+	CacheClearGeneration int64            `json:"cache_clear_generation,omitempty"`
+	Routes               []AgentSiteRoute `json:"routes"`
 }
 
 func deriveNodeRuntimeKey(master []byte, nodeGUID, purpose string) []byte {
@@ -371,6 +372,7 @@ func agentConfigHash(config AgentRuntimeConfig) (string, error) {
 func agentConfigLegacyHash(config AgentRuntimeConfig) (string, error) {
 	config.ConfigHash = ""
 	config.AgentDownloadURL = ""
+	config.CacheClearGeneration = 0
 	// ProbeSecret was added after the legacy Agent contract. Older Agents ignore
 	// the field, so omit it from the compatibility hash while current Agents
 	// use the runtime hash above and authenticate their health probes with it.
@@ -431,9 +433,38 @@ func agentSupportsProbeSecret(version string) bool {
 	return patch >= 43
 }
 
+// agentSupportsCacheClear reports whether the Agent understands the
+// cache_clear_generation field in the runtime config. This field was added in
+// the next controller/Agent rollout after the v1.9.49 wire contract. Older
+// Agents ignore the JSON field, so the controller must calculate the hash over
+// the shape they actually know until they upgrade.
+func agentSupportsCacheClear(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 9 {
+		return minor > 9
+	}
+	return patch >= 50
+}
+
 func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (string, error) {
 	if !agentSupportsProbeSecret(version) {
 		config.ProbeSecret = ""
+	}
+	if !agentSupportsCacheClear(version) {
+		config.CacheClearGeneration = 0
 	}
 	if agentUsesRuntimeConfigHash(version) {
 		return agentConfigHash(config)
@@ -493,8 +524,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if probeErr != nil {
 		return AgentRuntimeConfig{}, probeErr
 	}
-	probeSecret, probeErr := decodeNodeProbeSecret(probeSecretText)
-	if probeErr != nil {
+	if _, probeErr := decodeNodeProbeSecret(probeSecretText); probeErr != nil {
 		return AgentRuntimeConfig{}, probeErr
 	}
 	for rows.Next() {
@@ -570,7 +600,8 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	// Keep the legacy field names in the Agent wire contract during rolling
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, EntryMode: "direct",
-		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: encodeRuntimeKey(probeSecret), Routes: routes}
+		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText,
+		CacheClearGeneration: node.CacheClearGeneration, Routes: routes}
 	// Legacy Agents do not send a platform header. Do not advertise the
 	// controller's local binary to those clients: on a cross-architecture
 	// rollout that checksum would make an old arm64 Agent download an amd64

@@ -461,10 +461,10 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   loadInto(sandbox, 'api.js', 'pages/dashboard.js');
   await vm.runInContext('loadDashboardTable()', sandbox);
 
-  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:100, cumulative_bytes_out:200, bytes_in:100, bytes_out:200, traffic_used:300}])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:100, cumulative_bytes_out:200, bytes_in:100, bytes_out:200, traffic_used:300}], 0, 'bidirectional')", sandbox);
   assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'));
   now = 3000;
-  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:2148, bytes_out:1048776, traffic_used:1050924}])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:2148, bytes_out:1048776, traffic_used:1050924}], 0, 'bidirectional')", sandbox);
   const html = elements['dash-table'].innerHTML;
   assert.ok(html.includes('↓ 512 KB/s'), html);
   assert.ok(html.includes('↑ 1 KB/s'), html);
@@ -472,7 +472,7 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   assert.equal(billedSample, 2 * (2048 + 1048576), 'bidirectional realtime traffic must count both VPS network legs');
 
   const trendLength = vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox);
-  vm.runInContext('updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, requests:0}])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, requests:0}], 3000, 'bidirectional')", sandbox);
   assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox), trendLength, 'an unchanged Agent sample must not append a synthetic trend point');
 
   await vm.runInContext('loadDashboardTable()', sandbox);
@@ -482,7 +482,7 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   assert.ok(!refreshedHTML.includes('dashboard-speed-placeholder'), 'refreshing site metadata must not flash the speed placeholder');
 
   now = 5000;
-  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:1, cumulative_bytes_out:1, bytes_in:1, bytes_out:1, traffic_used:2}])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:1, cumulative_bytes_out:1, bytes_in:1, bytes_out:1, traffic_used:2}], 0, 'bidirectional')", sandbox);
   assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'), 'counter reset must render zero instead of a negative speed or placeholder');
   assert.ok(!elements['dash-table'].innerHTML.includes('dashboard-speed-placeholder'));
 });
@@ -521,6 +521,66 @@ test('dashboard realtime tooltip aligns sparse site samples by timestamp', () =>
   assert.doesNotMatch(tooltip, /Beta[\s\S]*↓ 0 B\/s/);
 });
 
+test('dashboard all-sites speed keeps the latest rate from asynchronous sites', async () => {
+  const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
+  const sandbox = {
+    window: {}, document: makeDocument(elements), console,
+    Date: { now: () => 3000 },
+    Toast: { error() {}, success() {}, info() {} },
+    fetch: async () => okJson([
+      { id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 0, cache_size_bytes: 0 },
+      { id: 2, name: 'Beta', target_url: 'http://b.example', ua_mode: 'infuse', listen_port: 8002, running: true, traffic_used: 0, cache_size_bytes: 0 },
+    ]),
+    Router: { current: 'dashboard' },
+    setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+  await vm.runInContext('loadDashboardTable()', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:1000, cumulative_bytes_in:0, cumulative_bytes_out:0, running:true},{id:2, sampled_at_ms:1000, cumulative_bytes_in:0, cumulative_bytes_out:0, running:true}], 1000, 'outbound')", sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:2000, cumulative_bytes_in:0, cumulative_bytes_out:1000, running:true},{id:2, sampled_at_ms:2000, cumulative_bytes_in:0, cumulative_bytes_out:500, running:true}], 2000, 'outbound')", sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:0, cumulative_bytes_out:2000, running:true},{id:2, sampled_at_ms:2000, cumulative_bytes_in:0, cumulative_bytes_out:500, running:true}], 3000, 'outbound')", sandbox);
+  const aggregate = vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1)", sandbox);
+  assert.equal(aggregate.download_bps, 1500, 'aggregate speed must include the last valid sample from both sites');
+});
+
+test('dashboard clears a stale site speed even when its sample timestamp is unchanged', async () => {
+  const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
+  const sandbox = {
+    window: {}, document: makeDocument(elements), console,
+    Date: { now: () => 3000 },
+    Toast: { error() {}, success() {}, info() {} },
+    fetch: async () => okJson([{ id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 0, cache_size_bytes: 0 }]),
+    Router: { current: 'dashboard' },
+    setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+  await vm.runInContext('loadDashboardTable()', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:1000, cumulative_bytes_in:0, cumulative_bytes_out:0, running:true}], 1000, 'outbound')", sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:2000, cumulative_bytes_in:0, cumulative_bytes_out:1000, running:true}], 2000, 'outbound')", sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:2000, cumulative_bytes_in:0, cumulative_bytes_out:1000, running:false}], 3000, 'outbound')", sandbox);
+  assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'), 'offline sites must not retain their old nonzero speed');
+});
+
+test('dashboard does not calculate realtime traffic until billing mode is known', async () => {
+  const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
+  const sandbox = {
+    window: {}, document: makeDocument(elements), console,
+    Date: { now: () => 2000 },
+    Toast: { error() {}, success() {}, info() {} },
+    fetch: async () => okJson([{ id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 0, cache_size_bytes: 0 }]),
+    Router: { current: 'dashboard' },
+    setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+  await vm.runInContext('loadDashboardTable()', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:1000, cumulative_bytes_in:0, cumulative_bytes_out:0, running:true}], 1000)", sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:2000, cumulative_bytes_in:100, cumulative_bytes_out:200, running:true}], 2000)", sandbox);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1).traffic_bytes", sandbox), undefined);
+});
+
 test('dashboard keeps SSE samples that arrive before the site list and across partial payloads', async () => {
   const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
   let now = 1000;
@@ -535,14 +595,14 @@ test('dashboard keeps SSE samples that arrive before the site list and across pa
   vm.createContext(sandbox);
   loadInto(sandbox, 'api.js', 'pages/dashboard.js');
 
-  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:100, cumulative_bytes_out:200, bytes_in:100, bytes_out:200, traffic_used:300}])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:100, cumulative_bytes_out:200, bytes_in:100, bytes_out:200, traffic_used:300}], 0, 'bidirectional')", sandbox);
   await vm.runInContext('loadDashboardTable()', sandbox);
   assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'), 'the first pre-list sample should render a stable zero rate');
 
   now = 2000;
-  vm.runInContext('updateDashboardSiteSpeeds([])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([], 2000, 'bidirectional')", sandbox);
   now = 3000;
-  vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:0, bytes_out:0, traffic_used:1050924}])', sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:0, bytes_out:0, traffic_used:1050924}], 3000, 'bidirectional')", sandbox);
   assert.ok(elements['dash-table'].innerHTML.includes('↓ 512 KB/s'), 'the sample received before /api/sites must be used');
   assert.ok(elements['dash-table'].innerHTML.includes('↑ 1 KB/s'), 'the bidirectional sample must be retained');
 });

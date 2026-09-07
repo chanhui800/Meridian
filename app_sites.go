@@ -79,7 +79,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		result := make([]SiteWithStatus, len(sites))
 		for i, s := range sites {
 			st := live[s.ID]
-			result[i] = SiteWithStatus{Site: s, Running: st.Running, CacheSizeBytes: cacheSizes[s.ID], MonthlyTraffic: st.MonthlyTraffic}
+			cacheSize := cacheSizes[s.ID]
+			if st.AgentRuntime {
+				cacheSize = st.CacheSizeBytes
+			}
+			result[i] = SiteWithStatus{Site: s, Running: st.Running, CacheSizeBytes: cacheSize, MonthlyTraffic: st.MonthlyTraffic}
 			result[i].TrafficUsed = st.TrafficUsed
 		}
 		a.jsonOK(w, result)

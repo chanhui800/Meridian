@@ -181,7 +181,7 @@ func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboa
 	return result
 }
 
-func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName string, billingMode string, logs []TrafficLog, pending dashboardPendingTraffic) []dashboardTrendPoint {
+func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName string, billingMode string, logs []TrafficLog, pending dashboardPendingTraffic, now ...time.Time) []dashboardTrendPoint {
 	count := int((end.Sub(start) + bucket - time.Nanosecond) / bucket)
 	if count < 1 {
 		count = 1
@@ -203,11 +203,21 @@ func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName 
 		points[index].BytesOut += logRow.BytesOut
 		points[index].Requests += logRow.Requests
 	}
-	if len(points) > 0 {
-		last := &points[len(points)-1]
-		last.BytesIn += pending.BytesIn
-		last.BytesOut += pending.BytesOut
-		last.Requests += pending.Requests
+	// Pending controller-local counters belong to the current wall-clock
+	// bucket only. Historical windows must remain immutable, and a window that
+	// ends in the future must not receive today's pending bytes at its final
+	// (future) bucket.
+	current := time.Now()
+	if len(now) > 0 && !now[0].IsZero() {
+		current = now[0]
+	}
+	if !current.Before(start) && current.Before(end) {
+		index := int((current.UnixMilli() - start.UnixMilli()) / bucketMS)
+		if index >= 0 && index < len(points) {
+			points[index].BytesIn += pending.BytesIn
+			points[index].BytesOut += pending.BytesOut
+			points[index].Requests += pending.Requests
+		}
 	}
 	for i := range points {
 		points[i].Traffic = trafficBillableBytes(billingMode, points[i].BytesIn, points[i].BytesOut)
@@ -241,7 +251,7 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 		siteKey = strconv.FormatInt(*siteID, 10)
 	}
 	settings := pm.database.currentSystemSettings()
-	flightKey := fmt.Sprintf("%p|%s|%s|%d%s", pm.database, siteKey, strings.ToLower(strings.TrimSpace(rangeName)), settings.ScheduleTimezone, customKey)
+	flightKey := fmt.Sprintf("%p|%s|%s|%s|%d%s", pm.database, siteKey, strings.ToLower(strings.TrimSpace(rangeName)), trafficBillingModeLabel(settings.TrafficBillingMode), settings.ScheduleTimezone, customKey)
 	value, err, _ := pm.dashboardTrendGroup.Do(flightKey, func() (interface{}, error) {
 		return pm.dashboardTrendsUncoalesced(siteID, rangeName, customWindow...)
 	})
@@ -271,7 +281,7 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 	if siteID != nil {
 		siteKey = strconv.FormatInt(*siteID, 10)
 	}
-	cacheKey := fmt.Sprintf("%p|%s|%s|%d|%d|%d|%d", pm.database, siteKey, name, start.UnixMilli(), end.UnixMilli(), bucket/time.Second, settings.ScheduleTimezone)
+	cacheKey := fmt.Sprintf("%p|%s|%s|%s|%d|%d|%d|%d", pm.database, siteKey, name, trafficBillingModeLabel(billingMode), start.UnixMilli(), end.UnixMilli(), bucket/time.Second, settings.ScheduleTimezone)
 	cacheTTL := 30 * time.Second
 	if strings.EqualFold(name, "realtime") {
 		cacheTTL = 3 * time.Second
@@ -304,13 +314,13 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 		aggregatePending.BytesOut += value.BytesOut
 		aggregatePending.Requests += value.Requests
 	}
-	points := dashboardTrendPoints(start, end, bucket, name, billingMode, logs, aggregatePending)
+	points := dashboardTrendPoints(start, end, bucket, name, billingMode, logs, aggregatePending, now)
 	siteSeries := make([]dashboardTrendSite, 0, len(selectedSites))
 	for _, site := range selectedSites {
 		siteSeries = append(siteSeries, dashboardTrendSite{
 			SiteID:   site.ID,
 			SiteName: site.Name,
-			Points:   dashboardTrendPoints(start, end, bucket, name, billingMode, logsBySite[site.ID], pendingBySite[site.ID]),
+			Points:   dashboardTrendPoints(start, end, bucket, name, billingMode, logsBySite[site.ID], pendingBySite[site.ID], now),
 		})
 	}
 	response := &dashboardTrendsResponse{

@@ -72,11 +72,15 @@ func (a *App) dashboardBootstrap() (*dashboardBootstrapResponse, error) {
 	views := make([]dashboardSiteView, 0, len(sites))
 	for _, site := range sites {
 		live := liveBySite[site.ID]
+		cacheSize := cacheSizes[site.ID]
+		if live.AgentRuntime {
+			cacheSize = live.CacheSizeBytes
+		}
 		views = append(views, dashboardSiteView{
 			ID: site.ID, Name: site.Name, TargetURL: site.TargetURL, UAMode: site.UAMode,
 			PublicHost: site.PublicHost, PathPrefix: site.PathPrefix, IngressMode: site.IngressMode,
 			ListenPort: site.ListenPort, Running: live.Running, TrafficUsed: live.TrafficUsed,
-			MonthlyTraffic: live.MonthlyTraffic, CacheSizeBytes: cacheSizes[site.ID],
+			MonthlyTraffic: live.MonthlyTraffic, CacheSizeBytes: cacheSize,
 			MediaMovieCount: site.MediaMovieCount, MediaSeriesCount: site.MediaSeriesCount,
 			MediaEpisodeCount: site.MediaEpisodeCount,
 		})
