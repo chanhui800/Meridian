@@ -45,24 +45,25 @@ type dashboardBootstrapResponse struct {
 
 func (a *App) dashboardBootstrap() (*dashboardBootstrapResponse, error) {
 	started := time.Now()
+	now := started
 	settings := a.db.currentSystemSettings()
 	sites, err := a.db.ListSites()
 	if err != nil {
 		return nil, err
 	}
-	monthlyBySite, err := a.db.SumTrafficSinceBySite(
-		trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)),
-		settings.TrafficBillingMode,
-	)
+	snapshot, err := a.pm.dashboardSnapshotWithSites(sites, settings, now)
 	if err != nil {
 		return nil, err
 	}
-	snapshot := a.pm.dashboardSnapshotFromSites(sites, monthlyBySite, settings)
 	snapshot.PanelDomain = a.panelHost
 	snapshot.PanelAccessURL = a.panelAccessURL()
-	cacheSizes, _, err := a.pm.AssetCacheSizes()
-	if err != nil {
-		return nil, err
+	cacheSizes := map[int64]int64{}
+	if sizes, _, cacheErr := a.pm.AssetCacheSizes(); cacheErr != nil {
+		// Cache statistics are supplementary dashboard data. A transient
+		// filesystem error must not hide the authoritative site/traffic snapshot.
+		log.Printf("[dashboard] cache statistics unavailable: %v", cacheErr)
+	} else {
+		cacheSizes = sizes
 	}
 	liveBySite := make(map[int64]SiteTraffic, len(snapshot.LiveSites))
 	for _, live := range snapshot.LiveSites {
@@ -84,7 +85,7 @@ func (a *App) dashboardBootstrap() (*dashboardBootstrapResponse, error) {
 		Snapshot:      snapshot,
 		Sites:         views,
 		Insights:      a.dashboardInsightsSnapshot(),
-		GeneratedAtMS: time.Now().UnixMilli(),
+		GeneratedAtMS: snapshot.GeneratedAtMS,
 	}
 	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
 		// Keep this diagnostic intentionally free of site names, URLs and

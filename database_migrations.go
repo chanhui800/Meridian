@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 29
+	databaseSchemaVersion = 30
 )
 
 func (d *DB) migrate() error {
@@ -77,6 +77,10 @@ func (d *DB) migrateOnce() error {
 			_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		}
 	}()
+	var previousSchemaVersion int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&previousSchemaVersion); err != nil {
+		return err
+	}
 
 	if _, err := conn.ExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
@@ -886,6 +890,25 @@ func (d *DB) migrateOnce() error {
 	}
 	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_traffic_site_time_ms ON traffic_logs(site_id, recorded_at_ms)"); err != nil {
 		return err
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_traffic_time_ms ON traffic_logs(recorded_at_ms)"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_node_site_traffic_time ON node_site_traffic_logs(recorded_at_ms)"); err != nil {
+		return err
+	}
+	// Agent traffic was historically kept only in node_site_traffic_logs. Once
+	// lifetime directional columns are available, fold that history into the
+	// site totals exactly once during the schema 30 migration.
+	if previousSchemaVersion < 30 {
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE sites
+			SET traffic_used_in=traffic_used_in+COALESCE((SELECT SUM(bytes_in) FROM node_site_traffic_logs n WHERE n.site_id=sites.id),0),
+				traffic_used_out=traffic_used_out+COALESCE((SELECT SUM(bytes_out) FROM node_site_traffic_logs n WHERE n.site_id=sites.id),0),
+				traffic_used=traffic_used+COALESCE((SELECT SUM(bytes_in+bytes_out) FROM node_site_traffic_logs n WHERE n.site_id=sites.id),0)
+		`); err != nil {
+			return err
+		}
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)); err != nil {
 		return err

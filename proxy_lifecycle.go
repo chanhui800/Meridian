@@ -322,55 +322,37 @@ func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
 // taken for the whole map, so the view is consistent and there is no N+1 lock
 // churn; the lock order is pm.mu -> trafficMu.
 func (pm *ProxyManager) LiveSiteTraffic(sites []Site) map[int64]SiteTraffic {
-	live := make(map[int64]SiteTraffic, len(sites))
 	settings := pm.database.currentSystemSettings()
-	billingMode := settings.TrafficBillingMode
-	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)), billingMode)
+	snapshot, err := pm.dashboardSnapshotWithSites(sites, settings, time.Now())
 	if err != nil {
-		log.Printf("[traffic] failed to load monthly site totals: %v", err)
-		monthlyBySite = map[int64]int64{}
+		log.Printf("[traffic] failed to load live site totals: %v", err)
+		return make(map[int64]SiteTraffic, len(sites))
 	}
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	for _, s := range sites {
-		persistedIn, persistedOut := siteTrafficDirections(s)
-		st := SiteTraffic{
-			ID:               s.ID,
-			Name:             s.Name,
-			TrafficQuota:     s.TrafficQuota,
-			MonthlyTraffic:   monthlyBySite[s.ID],
-			PersistedTraffic: trafficBillableBytes(billingMode, persistedIn, persistedOut),
-			TrafficUsed:      trafficBillableBytes(billingMode, persistedIn, persistedOut),
-		}
-		pm.overlaySiteTrafficLocked(s, &st)
-		st.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
-		live[s.ID] = st
+	live := make(map[int64]SiteTraffic, len(snapshot.LiveSites))
+	for _, site := range snapshot.LiveSites {
+		live[site.ID] = site
 	}
 	return live
 }
 
 // dashboardSnapshotFromSites builds the live dashboard payload from one
-// already captured site list and one grouped traffic query. Keeping the
-// inputs explicit lets the dashboard bootstrap endpoint share its snapshot
-// with the site table without issuing another ListSites query.
-func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite map[int64]int64, settings SystemSettings) *TrafficSnapshot {
+// already captured site list, grouped persisted totals, and the last Agent
+// samples for sites whose applied node is serving them. Keeping the inputs
+// explicit lets all dashboard-facing endpoints share one data model.
+func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite map[int64]int64, nodeLiveBySite map[int64]NodeSiteLiveTraffic, settings SystemSettings, now time.Time) *TrafficSnapshot {
 	billingMode := settings.TrafficBillingMode
 	snap := &TrafficSnapshot{
 		TotalSites:      len(sites),
 		LiveSites:       make([]SiteTraffic, 0, len(sites)),
 		BillingMode:     trafficBillingModeLabel(billingMode),
 		TrafficResetDay: settings.TrafficResetDay,
+		GeneratedAtMS:   now.UnixMilli(),
 	}
 	for _, value := range monthlyBySite {
 		snap.MonthlyTraffic += value
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	for _, inst := range pm.proxies {
-		if inst != nil && inst.isOperational() {
-			snap.RunningSites++
-		}
-	}
 	for _, s := range sites {
 		persistedIn, persistedOut := siteTrafficDirections(s)
 		st := SiteTraffic{
@@ -385,14 +367,54 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 			snap.OnlineSites++
 		}
 		pm.overlaySiteTrafficLocked(s, &st)
-		st.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
+		if remote, ok := nodeLiveBySite[s.ID]; ok {
+			// Once a site is applied to an Agent, that Agent is the authoritative
+			// runtime source. Its cumulative counters are already represented by
+			// node_site_traffic_logs in the persisted monthly/lifetime totals, so
+			// never add them again as local pending bytes.
+			st.Running = remote.Running
+			st.CumulativeBytesIn = remote.CumulativeBytesIn
+			st.CumulativeBytesOut = remote.CumulativeBytesOut
+			st.Requests = remote.Requests
+			st.SampledAtMS = remote.SampledAtMS
+			st.BytesIn = 0
+			st.BytesOut = 0
+			st.TrafficUsed = st.PersistedTraffic
+		} else {
+			// Controller-local pending bytes are not in the monthly query yet;
+			// merge them into the current snapshot exactly once.
+			st.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
+			snap.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
+			st.SampledAtMS = now.UnixMilli()
+		}
+		if st.Running {
+			snap.RunningSites++
+		}
 		snap.TotalTraffic += st.TrafficUsed
-		snap.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
 		snap.TotalRequests += st.Requests
 		snap.LiveSites = append(snap.LiveSites, st)
 	}
-	snap.UptimeSeconds = int64(time.Since(startTime).Seconds())
+	snap.UptimeSeconds = int64(now.Sub(startTime).Seconds())
+	if snap.UptimeSeconds < 0 {
+		snap.UptimeSeconds = 0
+	}
 	return snap
+}
+
+// dashboardSnapshotWithSites captures the single authoritative dashboard
+// snapshot. All endpoints pass one site list and timestamp through this
+// helper, so Controller and Agent traffic use identical aggregation rules.
+func (pm *ProxyManager) dashboardSnapshotWithSites(sites []Site, settings SystemSettings, now time.Time) (*TrafficSnapshot, error) {
+	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
+	monthlyBySite, err := pm.database.SumTrafficSinceBySite(cycleStart, settings.TrafficBillingMode)
+	if err != nil {
+		return nil, err
+	}
+	nodeLiveBySite, err := pm.database.NodeSiteLiveTrafficSnapshot(now)
+	if err != nil {
+		return nil, err
+	}
+	return pm.dashboardSnapshotFromSites(sites, monthlyBySite, nodeLiveBySite, settings, now), nil
 }
 
 // TrafficSnapshot builds the authoritative global traffic payload: every DB
@@ -404,12 +426,7 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 		return nil, err
 	}
 	settings := pm.database.currentSystemSettings()
-	billingMode := settings.TrafficBillingMode
-	monthlyBySite, err := pm.database.SumTrafficSinceBySite(trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone)), billingMode)
-	if err != nil {
-		return nil, err
-	}
-	return pm.dashboardSnapshotFromSites(sites, monthlyBySite, settings), nil
+	return pm.dashboardSnapshotWithSites(sites, settings, time.Now())
 }
 
 func (pm *ProxyManager) GetRunningCount() int {

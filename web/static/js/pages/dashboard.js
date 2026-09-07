@@ -3,7 +3,6 @@ let dashAbortController = null;
 let dashRetryTimer = null;
 let dashboardBootstrapPromise = null;
 let dashboardBootstrapAbortController = null;
-let dashboardInitialAbortController = null;
 let dashboardSecondaryPromise = null;
 let dashboardTrendAbortController = null;
 let dashboardSecondaryRefreshTimer = null;
@@ -17,6 +16,7 @@ let dashboardSpeedSamples = new Map();
 let dashboardLiveSpeeds = new Map();
 let dashboardRealtimeTrendSamples = new Map();
 let dashboardRealtimeTrendSiteSamples = new Map();
+let dashboardLastSnapshotMS = 0;
 
 function dashboardCreateAbortController() {
   if (typeof AbortController === 'function') return new AbortController();
@@ -111,7 +111,6 @@ function renderDashboard() {
     </div>
   `;
 
-  void loadDashboardInitialSnapshot();
   startDashSSE();
   setupDashboardTrendControls();
   observeDashboardTrendResize();
@@ -120,21 +119,6 @@ function renderDashboard() {
   deferTrends(() => {
     if (Router.current === 'dashboard') void loadDashboardTrends();
   });
-}
-
-async function loadDashboardInitialSnapshot() {
-  if (dashboardInitialAbortController) dashboardInitialAbortController.abort();
-  dashboardInitialAbortController = dashboardCreateAbortController();
-  const signal = dashboardInitialAbortController.signal;
-  try {
-    const data = await API.dashboard(signal);
-    if (!signal.aborted && data && Router.current === 'dashboard') updateDashboardLive(data);
-  } catch (error) {
-    if (error && error.name === 'AbortError') return;
-    console.warn('Dashboard initial snapshot load error', error);
-  } finally {
-    if (dashboardInitialAbortController?.signal === signal) dashboardInitialAbortController = null;
-  }
 }
 
 function applyDashboardInsights(insights) {
@@ -788,6 +772,9 @@ async function startFetchSSE() {
 }
 
 function updateDashboardLive(stats) {
+	const generatedAt = Number(stats?.generated_at_ms || 0);
+	if (generatedAt > 0 && generatedAt < dashboardLastSnapshotMS) return;
+	if (generatedAt > 0) dashboardLastSnapshotMS = generatedAt;
 	const panelDomainEl = document.getElementById('s-panel-domain');
 	const currentPanelURL = dashboardCurrentPanelURL(stats.panel_access_url);
 	if (panelDomainEl && currentPanelURL) panelDomainEl.textContent = currentPanelURL;
@@ -806,15 +793,15 @@ function updateDashboardLive(stats) {
 
   const requestsEl = document.getElementById('s-requests');
   if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
-  updateDashboardSiteSpeeds(stats.live_sites || []);
+  updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt);
   updateDashboardTrendRealtime();
 }
 
-function updateDashboardSiteSpeeds(liveSites) {
-  const now = Date.now();
+function updateDashboardSiteSpeeds(liveSites, snapshotMS) {
   const liveMap = new Map();
   const trendDeltas = new Map();
   const rateSamples = new Map();
+  const changedSiteIDs = new Set();
   let totalDeltaIn = 0;
   let totalDeltaOut = 0;
   let totalRateIn = 0;
@@ -824,16 +811,22 @@ function updateDashboardSiteSpeeds(liveSites) {
     const siteID = Number(site.id);
     if (!Number.isFinite(siteID)) continue;
     liveMap.set(siteID, site);
+    const sourceTimestamp = Number(site.sampled_at_ms || snapshotMS || Date.now());
     const current = {
       trafficUsed: Number(site.monthly_traffic != null ? site.monthly_traffic : (site.traffic_used || 0)),
       bytesIn: Number(site.cumulative_bytes_in != null ? site.cumulative_bytes_in : (site.bytes_in || site.bytes_in_total || 0)),
       bytesOut: Number(site.cumulative_bytes_out != null ? site.cumulative_bytes_out : (site.bytes_out || site.bytes_out_total || 0)),
       requests: Number(site.requests || 0),
-      timestamp: now,
+      timestamp: sourceTimestamp,
     };
     const previous = dashboardSpeedSamples.get(siteID);
-    if (!previous) dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
-    if (previous && current.timestamp > previous.timestamp) {
+    if (!previous) {
+      dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
+      changedSiteIDs.add(siteID);
+      rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
+      trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
+    } else if (current.timestamp > previous.timestamp) {
+      changedSiteIDs.add(siteID);
       const seconds = (current.timestamp - previous.timestamp) / 1000;
       const down = current.bytesOut - previous.bytesOut;
       const up = current.bytesIn - previous.bytesIn;
@@ -853,12 +846,21 @@ function updateDashboardSiteSpeeds(liveSites) {
         // A site process restart resets the cumulative runtime counters. Show
         // zero until the next monotonic pair instead of flashing a placeholder.
         dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
+        rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
+        trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
       }
+    } else if (current.timestamp === previous.timestamp) {
+      // The Agent has not emitted a new sample. Keep the previous speed and
+      // do not append a synthetic zero point to the realtime trend.
+      continue;
+    } else {
+      // A stale sample must never move the counter baseline backwards.
+      continue;
     }
     // Keep the latest sample even when a later SSE payload omits another site.
     dashboardSpeedSamples.set(siteID, current);
   }
-  const sampledAt = now;
+  const sampledAt = Number(snapshotMS || Date.now());
   const appendRealtimeTrendSample = (key, sample) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
     const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));
@@ -876,8 +878,10 @@ function updateDashboardSiteSpeeds(liveSites) {
     // window; the X axis adapts to however many samples are available.
     dashboardRealtimeTrendSamples.set(key, samples.slice(-1800));
   };
-  appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests });
-  for (const siteID of liveMap.keys()) {
+  if (changedSiteIDs.size > 0) {
+    appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests });
+  }
+  for (const siteID of changedSiteIDs) {
     const rate = rateSamples.get(String(siteID)) || {};
     const delta = trendDeltas.get(siteID) || {};
     appendRealtimeTrendSample(String(siteID), { ...rate, ...delta });
@@ -941,6 +945,7 @@ function stopDashSSE() {
   dashboardLiveSpeeds = new Map();
   dashboardRealtimeTrendSamples = new Map();
   dashboardRealtimeTrendSiteSamples = new Map();
+  dashboardLastSnapshotMS = 0;
   dashboardTrendData = null;
   dashboardTrendCharts = new Map();
   if (dashboardTrendResizeObserver) {
@@ -958,10 +963,6 @@ function stopDashSSE() {
   if (dashboardTrendAbortController) {
     dashboardTrendAbortController.abort();
     dashboardTrendAbortController = null;
-  }
-  if (dashboardInitialAbortController) {
-    dashboardInitialAbortController.abort();
-    dashboardInitialAbortController = null;
   }
   if (dashboardBootstrapAbortController) {
     dashboardBootstrapAbortController.abort();
