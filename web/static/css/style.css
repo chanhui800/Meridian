@@ -7433,6 +7433,7 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
   min-width: 0;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 12px;
 }
 .dashboard-site-identity .dashboard-site-icon {
@@ -7449,6 +7450,13 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
   white-space: nowrap;
   font-weight: 650;
   line-height: 1.2;
+}
+
+/* Keep the first column heading aligned with the centered icon/name group
+   beneath it. Other dashboard table columns retain their default alignment. */
+.dashboard-site-status table th:first-child,
+.dashboard-site-status table td:first-child {
+  text-align: center;
 }
 
 @media (max-width: 768px) {

@@ -320,11 +320,25 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 				return cooldownErr
 			}
 			desired = 0
+			fallback := int64(0)
 			for _, candidate := range snapshot.Nodes {
-				if nodeEligible(candidate) && !cooldowns[candidate.ID] {
+				if !nodeEligible(candidate) {
+					continue
+				}
+				// A probe cooldown means "retry this node later"; it must not
+				// make an otherwise online node disappear from the assignment.
+				// Keep a fallback so a single-node deployment continues probing
+				// and can recover as soon as the Agent comes back.
+				if fallback == 0 {
+					fallback = candidate.ID
+				}
+				if !cooldowns[candidate.ID] {
 					desired = candidate.ID
 					break
 				}
+			}
+			if desired == 0 {
+				desired = fallback
 			}
 		}
 		if desired <= 0 || !eligible[desired] {

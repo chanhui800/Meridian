@@ -501,6 +501,93 @@ func TestSiteNodeAutoSchedulingFallsBackAfterProbeCooldown(t *testing.T) {
 	}
 }
 
+func TestSiteNodeAutoSchedulingKeepsSingleOnlineNodeDuringProbeCooldown(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 16, 0, 0, 0, time.UTC)
+	site, err := app.db.CreateSiteRecord(Site{Name: "single", PublicHost: "single.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "only", Address: "203.0.113.30", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "only", Sequence: 1, InterfaceName: "eth0"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.refreshSiteAssignments(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.recordSiteNodeProbeFailure(site.ID, node.ID, errors.New("probe failed"), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.refreshSiteAssignments(now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.DesiredNodeID != node.ID {
+		t.Fatalf("single online node disappeared during probe cooldown: %#v", schedule)
+	}
+}
+
+func TestAgentSiteCacheTelemetryUsesCentralSiteIDAndPreservesUnknownSize(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 16, 30, 0, 0, time.UTC)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "cache-node", Address: "203.0.113.31", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "cache", Sequence: 1, InterfaceName: "eth0"}, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "cache-site", PublicHost: "cache.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	stat := NodeSiteStat{Host: site.PublicHost, RequestCount: 1, BytesIn: 5, CumulativeBytesIn: 5, CacheSizeBytes: 438 << 20, CacheSizeValid: true}
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "cache", Sequence: 2, InterfaceName: "eth0", SiteStats: []NodeSiteStat{stat}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var cacheSize int64
+	if err := app.db.db.QueryRow("SELECT cache_size_bytes FROM node_site_counters WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&cacheSize); err != nil {
+		t.Fatal(err)
+	}
+	if cacheSize != stat.CacheSizeBytes {
+		t.Fatalf("central site cache size=%d, want=%d", cacheSize, stat.CacheSizeBytes)
+	}
+	stat.CacheSizeBytes = 0
+	stat.CacheSizeValid = false
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "cache", Sequence: 3, InterfaceName: "eth0", SiteStats: []NodeSiteStat{stat}}, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT cache_size_bytes FROM node_site_counters WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&cacheSize); err != nil {
+		t.Fatal(err)
+	}
+	if cacheSize != 438<<20 {
+		t.Fatalf("unknown cache size erased value: got=%d", cacheSize)
+	}
+}
+
 func TestSiteNodeSchedulingCanBeDisabledWithoutFixedNode(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 8, 30, 14, 0, 0, 0, time.UTC)
@@ -765,11 +852,16 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 
 func TestNormalizeControllerURLRequiresHTTPSForRemoteHosts(t *testing.T) {
 	if _, err := normalizeControllerURL("http://panel.example.com"); err == nil {
-		t.Fatal("remote HTTP controller URL accepted")
+		t.Fatal("HTTP controller URL accepted")
 	}
-	for _, input := range []string{"https://panel.example.com/", "http://localhost:9090", "http://127.0.0.1:9090"} {
+	for _, input := range []string{"https://panel.example.com/", "https://localhost:9090", "https://127.0.0.1:9090"} {
 		if _, err := normalizeControllerURL(input); err != nil {
 			t.Fatalf("normalizeControllerURL(%q): %v", input, err)
+		}
+	}
+	for _, input := range []string{"http://localhost:9090", "http://127.0.0.1:9090", "http://[::1]:9090"} {
+		if _, err := normalizeControllerURL(input); err == nil {
+			t.Fatalf("HTTP controller URL %q accepted", input)
 		}
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -183,8 +182,8 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 func normalizeControllerURL(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-		return "", errors.New("controller_url must be an absolute HTTP(S) URL")
+	if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
+		return "", errors.New("controller_url must be an absolute HTTPS URL")
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", errors.New("controller_url cannot contain credentials, query, or fragment")
@@ -194,10 +193,6 @@ func normalizeControllerURL(value string) (string, error) {
 	}
 	if parsed.RawPath != "" && parsed.RawPath != "/" {
 		return "", errors.New("controller_url must not contain a path")
-	}
-	hostIP := net.ParseIP(parsed.Hostname())
-	if parsed.Scheme != "https" && parsed.Hostname() != "localhost" && (hostIP == nil || !hostIP.IsLoopback()) {
-		return "", errors.New("public controller_url must use HTTPS")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	parsed.RawPath = ""

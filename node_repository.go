@@ -161,6 +161,10 @@ type NodeSiteStat struct {
 	CumulativeBytesIn  int64  `json:"cumulative_bytes_in"`
 	CumulativeBytesOut int64  `json:"cumulative_bytes_out"`
 	CacheSizeBytes     int64  `json:"cache_size_bytes,omitempty"`
+	// CacheSizeValid distinguishes a failed cache directory read from a real
+	// zero-byte cache. Older Agents omit the field and therefore never erase a
+	// previously known Controller value by reporting an unknown size.
+	CacheSizeValid bool `json:"cache_size_valid,omitempty"`
 }
 
 type NodeMediaCount struct {
@@ -954,8 +958,8 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 		currentOut = stat.BytesOut
 	}
 	var previousBoot string
-	var previousIn, previousOut, previousRequests int64
-	err := tx.QueryRow(`SELECT boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes FROM node_site_counters WHERE node_id=? AND site_id=?`, nodeID, siteID).Scan(&previousBoot, &previousIn, &previousOut, &previousRequests, new(int64))
+	var previousIn, previousOut, previousRequests, previousCacheSize int64
+	err := tx.QueryRow(`SELECT boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes FROM node_site_counters WHERE node_id=? AND site_id=?`, nodeID, siteID).Scan(&previousBoot, &previousIn, &previousOut, &previousRequests, &previousCacheSize)
 	if errors.Is(err, sql.ErrNoRows) {
 		// The first sample is the delta from the Agent runtime's initial zero
 		// state, rather than merely a counter baseline. Persist it immediately
@@ -974,7 +978,11 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 				return err
 			}
 		}
-		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, stat.CacheSizeBytes, nowMS)
+		cacheSize := int64(0)
+		if stat.CacheSizeValid {
+			cacheSize = stat.CacheSizeBytes
+		}
+		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS)
 		return err
 	}
 	if err != nil {
@@ -1014,7 +1022,11 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 			}
 		}
 	}
-	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,cache_size_bytes=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, counterEpoch, currentIn, currentOut, stat.RequestCount, stat.CacheSizeBytes, nowMS, nodeID, siteID)
+	cacheSize := previousCacheSize
+	if stat.CacheSizeValid {
+		cacheSize = stat.CacheSizeBytes
+	}
+	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,cache_size_bytes=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS, nodeID, siteID)
 	return err
 }
 

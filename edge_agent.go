@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -662,7 +663,13 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		return pending
 	}
 	current := bundle.manager.ProxyRuntimeStats()
-	cacheSizes, _, _ := bundle.manager.AssetCacheSizes()
+	cacheSizes, _, cacheErr := bundle.manager.AssetCacheSizes()
+	if cacheErr != nil {
+		// A cache size read is best-effort telemetry. Treating a read failure as
+		// zero would overwrite an accurate Controller value with a false reset.
+		log.Printf("[agent] read asset cache sizes: %v", cacheErr)
+		cacheSizes = nil
+	}
 	// Baselines are keyed by the Controller's stable SiteID. The in-memory
 	// Edge database is rebuilt whenever configuration changes, so its local
 	// auto-increment IDs must never be used as long-lived identities.
@@ -699,7 +706,12 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		observed.RequestCount = value.Requests
 		observed.BytesIn, observed.BytesOut = inDelta, outDelta
 		observed.CumulativeBytesIn, observed.CumulativeBytesOut = value.CumulativeBytesIn, value.CumulativeBytesOut
-		observed.CacheSizeBytes = cacheSizes[value.SiteID]
+		// Asset cache namespaces are keyed by the Controller's stable SiteID,
+		// while value.SiteID belongs to the Agent's ephemeral in-memory DB.
+		if cacheErr == nil {
+			observed.CacheSizeBytes = cacheSizes[centralID]
+			observed.CacheSizeValid = true
+		}
 		pending.stats = append(pending.stats, observed)
 	}
 	return pending
@@ -1005,8 +1017,14 @@ func (runtime *edgeAgentRuntime) stopServer() {
 	runtime.mu.Unlock()
 	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = server.Shutdown(ctx)
+		shutdownErr := server.Shutdown(ctx)
 		cancel()
+		// Shutdown closes the listener promptly, but may leave active handlers
+		// alive until the grace period expires. Close is idempotent and ensures a
+		// failed config transaction can never leave a listener bound to a port.
+		if shutdownErr != nil {
+			_ = server.Close()
+		}
 	}
 }
 
@@ -1077,6 +1095,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	// must describe the new runtime epoch from zero.
 	runtime.siteReported = make(map[int64]ProxyRuntimeStat)
 	runtime.mu.Unlock()
+	newServerStarted := false
 	if listenerChanged && needsListener {
 		if err := runtime.startServer(config.HTTPSPort); err != nil {
 			bundle.close()
@@ -1095,9 +1114,16 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 			}
 			return err
 		}
+		newServerStarted = true
 	}
 	if config.CacheClearGeneration > oldCacheClearGeneration {
 		if err := bundle.manager.ClearAssetCache(); err != nil {
+			// The candidate listener is already bound at this point. Stop it
+			// before restoring the old runtime, otherwise the failed apply leaks a
+			// server that is no longer represented by runtime.server.
+			if newServerStarted {
+				runtime.stopServer()
+			}
 			bundle.close()
 			runtime.mu.Lock()
 			runtime.nodeGUID = oldNodeGUID
@@ -1108,10 +1134,8 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 			runtime.siteCounterEpoch = oldSiteCounterEpoch
 			runtime.siteReported = oldSiteReported
 			runtime.mu.Unlock()
-			if listenerChanged && needsListener {
-				if oldServer != nil {
-					_ = runtime.startServer(oldPort)
-				}
+			if oldServer != nil {
+				_ = runtime.startServer(oldPort)
 			}
 			return err
 		}
