@@ -404,6 +404,43 @@ func agentUsesRuntimeConfigHash(version string) bool {
 	return patch >= 30
 }
 
+// agentSupportsProbeSecret reports whether the Agent understands the
+// probe_secret field that was added to the runtime configuration contract in
+// v1.9.43. Older Agents ignore unknown JSON fields, but their configuration
+// hash cannot include a field they never saw. Keep that field out of the hash
+// during the rolling upgrade window so they can validate and apply the config
+// before downloading the current Agent binary.
+func agentSupportsProbeSecret(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 9 {
+		return minor > 9
+	}
+	return patch >= 43
+}
+
+func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (string, error) {
+	if !agentSupportsProbeSecret(version) {
+		config.ProbeSecret = ""
+	}
+	if agentUsesRuntimeConfigHash(version) {
+		return agentConfigHash(config)
+	}
+	return agentConfigLegacyHash(config)
+}
+
 func readBoundedPrivateFile(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("TLS file path is unavailable")
@@ -560,11 +597,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 			return AgentRuntimeConfig{}, fmt.Errorf("edge TLS certificate/key pair is invalid: %w", err)
 		}
 	}
-	if agentUsesRuntimeConfigHash(clientVersion) {
-		config.ConfigHash, err = agentConfigHash(config)
-	} else {
-		config.ConfigHash, err = agentConfigLegacyHash(config)
-	}
+	config.ConfigHash, err = agentConfigHashForVersion(config, clientVersion)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
