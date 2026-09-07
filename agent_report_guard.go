@@ -310,8 +310,9 @@ func (a *App) agentPreAuthAdmission() *agentPreAuthAdmission {
 }
 
 // withAgentPreAuth is shared by every credential-bearing Agent endpoint. It
-// runs before endpoint-specific parsing or SQLite authentication so invalid
-// credentials cannot rotate between URLs to evade the admission budget.
+// runs before endpoint-specific parsing and covers the credential lookup so
+// invalid credentials cannot rotate between URLs to evade the admission
+// budget. The slot is released before endpoint work begins.
 func (a *App) withAgentPreAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		release, retryAfter, admitted := a.agentPreAuthAdmission().admit(requestClientKey(r, a.trustedProxies), time.Now())
