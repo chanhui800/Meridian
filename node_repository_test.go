@@ -850,6 +850,49 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	}
 }
 
+func TestAgentConfigHashIgnoresSiteIconMetadata(t *testing.T) {
+	config := AgentRuntimeConfig{
+		SchemaVersion: agentConfigSchemaVersion,
+		NodeGUID:      "icon-hash-node",
+		HTTPSPort:     9090,
+		DynamicKey:    testEdgeRuntimeKey(t),
+		ProbeSecret:   encodeRuntimeKey(bytes.Repeat([]byte{0x37}, 32)),
+		Routes: []AgentSiteRoute{{
+			SiteID:    1,
+			Host:      "media.example.test",
+			TargetURL: "https://origin.example.test",
+			Site: Site{
+				ID:       1,
+				Name:     "Icon site",
+				IconName: "Emby",
+				IconURL:  "https://icons.example.test/emby.png",
+			},
+		}},
+	}
+	withIcons, err := agentConfigHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutIcons := config
+	withoutIcons.Routes = append([]AgentSiteRoute(nil), config.Routes...)
+	withoutIcons.Routes[0].Site.IconName = ""
+	withoutIcons.Routes[0].Site.IconURL = ""
+	withoutIconsHash, err := agentConfigHash(withoutIcons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withIcons != withoutIconsHash {
+		t.Fatalf("site icon metadata changed Agent config hash: %q != %q", withIcons, withoutIconsHash)
+	}
+	payload, err := json.Marshal(agentConfigHashPayload(config, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(payload, []byte(`"icon_name"`)) || bytes.Contains(payload, []byte(`"icon_url"`)) {
+		t.Fatalf("Agent hash payload includes UI-only icon metadata: %s", payload)
+	}
+}
+
 func TestNormalizeControllerURLRequiresHTTPSForRemoteHosts(t *testing.T) {
 	if _, err := normalizeControllerURL("http://panel.example.com"); err == nil {
 		t.Fatal("HTTP controller URL accepted")
