@@ -470,6 +470,10 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   const billedSample = vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1).traffic_bytes", sandbox);
   assert.equal(billedSample, 2 * (2048 + 1048576), 'bidirectional realtime traffic must count both VPS network legs');
 
+  const trendLength = vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox);
+  vm.runInContext('updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, requests:0}])', sandbox);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox), trendLength, 'an unchanged Agent sample must not append a synthetic trend point');
+
   await vm.runInContext('loadDashboardTable()', sandbox);
   const refreshedHTML = elements['dash-table'].innerHTML;
   assert.ok(refreshedHTML.includes('↓ 512 KB/s'), 'periodic site refresh must preserve the last live download speed');

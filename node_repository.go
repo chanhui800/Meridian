@@ -952,6 +952,22 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeS
 	var previousIn, previousOut, previousRequests int64
 	err := tx.QueryRow(`SELECT boot_id,last_bytes_in,last_bytes_out,last_request_count FROM node_site_counters WHERE node_id=? AND site_id=?`, nodeID, siteID).Scan(&previousBoot, &previousIn, &previousOut, &previousRequests)
 	if errors.Is(err, sql.ErrNoRows) {
+		// The first sample is the delta from the Agent runtime's initial zero
+		// state, rather than merely a counter baseline. Persist it immediately
+		// so the first report is visible in history and lifetime site totals.
+		initialIn, initialOut := stat.BytesIn, stat.BytesOut
+		// RequestCount is a cumulative counter, unlike BytesIn/BytesOut which
+		// are report deltas. There is no request baseline in the traffic log on
+		// the first sample, so defer request persistence until the next sample.
+		if initialIn > 0 || initialOut > 0 {
+			bucket := (nowMS / 60000) * 60000
+			if _, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, initialIn, initialOut, 0, bucket); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, initialIn, initialOut, initialIn, initialOut, siteID); err != nil {
+				return err
+			}
+		}
 		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,updated_at_ms) VALUES(?,?,?,?,?,?,?)`, nodeID, siteID, bootID, currentIn, currentOut, stat.RequestCount, nowMS)
 		return err
 	}
@@ -967,6 +983,11 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, bootID string, stat NodeS
 		_, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, deltaIn, deltaOut, deltaRequests, bucket)
 		if err != nil {
 			return err
+		}
+		if deltaIn > 0 || deltaOut > 0 {
+			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, deltaIn, deltaOut, deltaIn, deltaOut, siteID); err != nil {
+				return err
+			}
 		}
 	}
 	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, bootID, currentIn, currentOut, stat.RequestCount, nowMS, nodeID, siteID)

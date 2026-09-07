@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -36,6 +37,7 @@ type SiteTraffic struct {
 	TrafficUsed        int64  `json:"traffic_used"`
 	MonthlyTraffic     int64  `json:"monthly_traffic"`
 	Requests           int64  `json:"requests"`
+	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
 }
 
 // TrafficSnapshot is the single authoritative global traffic payload shared by
@@ -52,7 +54,20 @@ type TrafficSnapshot struct {
 	UptimeSeconds   int64         `json:"uptime_seconds"`
 	PanelDomain     string        `json:"panel_domain,omitempty"`
 	PanelAccessURL  string        `json:"panel_access_url,omitempty"`
+	GeneratedAtMS   int64         `json:"generated_at_ms"`
 	LiveSites       []SiteTraffic `json:"live_sites"`
+}
+
+// NodeSiteLiveTraffic is the last persisted runtime sample from an applied
+// Agent. The dashboard overlays it after taking the local proxy snapshot.
+type NodeSiteLiveTraffic struct {
+	SiteID             int64
+	NodeID             int64
+	Running            bool
+	CumulativeBytesIn  int64
+	CumulativeBytesOut int64
+	Requests           int64
+	SampledAtMS        int64
 }
 
 // TrafficHistory is the single-site envelope returned by
@@ -188,10 +203,21 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 // same text format as trafficMinuteBucket instead of UTC serialization.
 func (d *DB) SumTrafficSince(start time.Time, billingMode string) (int64, error) {
 	var bytesIn, bytesOut int64
-	err := d.db.QueryRow(
-		"SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0) FROM traffic_logs WHERE recorded_at >= ?",
-		start.In(time.Local).Format("2006-01-02 15:04:05"),
-	).Scan(&bytesIn, &bytesOut)
+	startMS := start.UnixMilli()
+	startText := start.In(time.Local).Format("2006-01-02 15:04:05")
+	err := d.db.QueryRow(`
+		WITH source AS (
+			SELECT bytes_in, bytes_out
+			FROM traffic_logs
+			WHERE recorded_at_ms >= ? OR (recorded_at_ms = 0 AND recorded_at >= ?)
+			UNION ALL
+			SELECT bytes_in, bytes_out
+			FROM node_site_traffic_logs
+			WHERE recorded_at_ms >= ?
+		)
+		SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0)
+		FROM source
+	`, startMS, startText, startMS).Scan(&bytesIn, &bytesOut)
 	return trafficBillableBytes(billingMode, bytesIn, bytesOut), err
 }
 
@@ -199,10 +225,22 @@ func (d *DB) SumTrafficSince(start time.Time, billingMode string) (int64, error)
 // SumTrafficSince, grouped by site so dashboards can show each node's current
 // month usage without issuing one query per site.
 func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int64]int64, error) {
-	rows, err := d.db.Query(
-		"SELECT site_id, COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0) FROM traffic_logs WHERE recorded_at >= ? GROUP BY site_id",
-		start.In(time.Local).Format("2006-01-02 15:04:05"),
-	)
+	startMS := start.UnixMilli()
+	startText := start.In(time.Local).Format("2006-01-02 15:04:05")
+	rows, err := d.db.Query(`
+		WITH source AS (
+			SELECT site_id, bytes_in, bytes_out
+			FROM traffic_logs
+			WHERE recorded_at_ms >= ? OR (recorded_at_ms = 0 AND recorded_at >= ?)
+			UNION ALL
+			SELECT site_id, bytes_in, bytes_out
+			FROM node_site_traffic_logs
+			WHERE recorded_at_ms >= ?
+		)
+		SELECT site_id, COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0)
+		FROM source
+		GROUP BY site_id
+	`, startMS, startText, startMS)
 	if err != nil {
 		return nil, err
 	}
@@ -226,11 +264,66 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 // the information needed to recalculate the current cycle.
 func (d *DB) SumTrafficSinceForSite(siteID int64, start time.Time, billingMode string) (int64, error) {
 	var bytesIn, bytesOut int64
-	err := d.db.QueryRow(
-		"SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0) FROM traffic_logs WHERE site_id=? AND recorded_at >= ?",
-		siteID, start.In(time.Local).Format("2006-01-02 15:04:05"),
-	).Scan(&bytesIn, &bytesOut)
+	startMS := start.UnixMilli()
+	startText := start.In(time.Local).Format("2006-01-02 15:04:05")
+	err := d.db.QueryRow(`
+		WITH source AS (
+			SELECT bytes_in, bytes_out
+			FROM traffic_logs
+			WHERE site_id=? AND (recorded_at_ms >= ? OR (recorded_at_ms = 0 AND recorded_at >= ?))
+			UNION ALL
+			SELECT bytes_in, bytes_out
+			FROM node_site_traffic_logs
+			WHERE site_id=? AND recorded_at_ms >= ?
+		)
+		SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0)
+		FROM source
+	`, siteID, startMS, startText, siteID, startMS).Scan(&bytesIn, &bytesOut)
 	return trafficBillableBytes(billingMode, bytesIn, bytesOut), err
+}
+
+// NodeSiteLiveTrafficSnapshot returns the last Agent sample for each site
+// whose applied node is currently serving it. During a scheduler transition
+// the applied node remains authoritative until DNS and config converge.
+func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveTraffic, error) {
+	rows, err := d.db.Query(`
+		SELECT
+			sch.site_id,
+			sch.applied_node_id,
+			COALESCE(c.last_bytes_in, 0),
+			COALESCE(c.last_bytes_out, 0),
+			COALESCE(c.last_request_count, sch.agent_request_count, 0),
+			COALESCE(c.updated_at_ms, 0),
+			COALESCE(n.last_seen_at_ms, 0),
+			COALESCE(n.enabled, 0),
+			COALESCE(n.agent_listener_error, ''),
+			COALESCE(sch.dns_status, '')
+		FROM site_node_schedules sch
+		JOIN sites s ON s.id=sch.site_id
+		JOIN control_nodes n ON n.id=sch.applied_node_id
+		LEFT JOIN node_site_counters c
+			ON c.site_id=sch.site_id AND c.node_id=sch.applied_node_id
+		WHERE sch.enabled=1 AND s.enabled=1 AND sch.applied_node_id IS NOT NULL
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int64]NodeSiteLiveTraffic)
+	for rows.Next() {
+		var value NodeSiteLiveTraffic
+		var nodeLastSeenMS int64
+		var nodeEnabled int
+		var listenerError, dnsStatus string
+		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus); err != nil {
+			return nil, err
+		}
+		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow
+		siteFresh := value.SampledAtMS > 0 && now.Sub(time.UnixMilli(value.SampledAtMS)) <= nodeOnlineWindow
+		value.Running = nodeEnabled != 0 && nodeFresh && siteFresh && strings.TrimSpace(listenerError) == "" && strings.EqualFold(strings.TrimSpace(dnsStatus), "active")
+		result[value.SiteID] = value
+	}
+	return result, rows.Err()
 }
 
 // GetTrafficTrendLogs returns traffic rows in the requested wall-clock window.

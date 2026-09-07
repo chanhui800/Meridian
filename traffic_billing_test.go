@@ -197,6 +197,92 @@ func TestTrafficBillingModeAppliesToAllTrafficSnapshots(t *testing.T) {
 	}
 }
 
+func TestTrafficAggregatesIncludeControllerAndAgentSources(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("mixed-sources", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	now := time.Now().In(time.Local)
+	start := now.Add(-time.Hour)
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 100, 200, 1, now.Add(-20*time.Minute)); err != nil {
+		t.Fatalf("controller traffic: %v", err)
+	}
+	if _, err := app.db.db.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?)`, 77, site.ID, 300, 400, 2, now.Add(-10*time.Minute).UnixMilli()); err != nil {
+		t.Fatalf("agent traffic: %v", err)
+	}
+	if got, err := app.db.SumTrafficSince(start, trafficBillingModeBidirectional); err != nil || got != 2000 {
+		t.Fatalf("SumTrafficSince = %d, %v; want 2000", got, err)
+	}
+	bySite, err := app.db.SumTrafficSinceBySite(start, trafficBillingModeBidirectional)
+	if err != nil || bySite[site.ID] != 2000 {
+		t.Fatalf("SumTrafficSinceBySite = %v, %v; want site 2000", bySite, err)
+	}
+	if got, err := app.db.SumTrafficSinceForSite(site.ID, start, trafficBillingModeOutbound); err != nil || got != 600 {
+		t.Fatalf("SumTrafficSinceForSite = %d, %v; want 600 outbound", got, err)
+	}
+}
+
+func TestDashboardIncludesScheduledAgentTraffic(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "dashboard-agent", Address: "203.0.113.90", Port: 9090}, now)
+	if err != nil {
+		t.Fatalf("CreateControlNode: %v", err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatalf("EnrollControlNode: %v", err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "dashboard-scheduled", PublicHost: "dashboard-scheduled.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatalf("SaveSiteNodeSchedule: %v", err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,dns_status='active' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatalf("apply schedule: %v", err)
+	}
+	report := NodeReport{
+		BootID:          "dashboard-boot",
+		ReportSessionID: "dashboard-session",
+		CounterEpoch:    "dashboard-counter",
+		Sequence:        1,
+		InterfaceName:   "eth0",
+		SiteStats:       []NodeSiteStat{{Host: site.PublicHost, RequestCount: 7, LastRequestAtMS: now.UnixMilli(), LastStatus: 200, BytesIn: 300, BytesOut: 400, CumulativeBytesIn: 300, CumulativeBytesOut: 400}},
+	}
+	if _, err := app.db.RecordNodeReport(token, report, now); err != nil {
+		t.Fatalf("RecordNodeReport: %v", err)
+	}
+	sites, err := app.db.ListSites()
+	if err != nil {
+		t.Fatalf("ListSites: %v", err)
+	}
+	settings := app.db.currentSystemSettings()
+	snapshot, err := app.pm.dashboardSnapshotWithSites(sites, settings, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("dashboard snapshot: %v", err)
+	}
+	live := findLiveSite(t, snapshot, site.ID)
+	if !live.Running || live.CumulativeBytesIn != 300 || live.CumulativeBytesOut != 400 || live.Requests != 7 {
+		t.Fatalf("scheduled Agent live site = %+v", live)
+	}
+	if live.MonthlyTraffic != 1400 || snapshot.MonthlyTraffic != 1400 || snapshot.TotalTraffic != 1400 || snapshot.TotalRequests != 7 {
+		t.Fatalf("scheduled Agent dashboard totals = snapshot=%+v live=%+v", snapshot, live)
+	}
+	if snapshot.GeneratedAtMS != now.Add(time.Second).UnixMilli() {
+		t.Fatalf("snapshot GeneratedAtMS=%d, want %d", snapshot.GeneratedAtMS, now.Add(time.Second).UnixMilli())
+	}
+	bootstrap, err := app.dashboardBootstrap()
+	if err != nil {
+		t.Fatalf("dashboard bootstrap: %v", err)
+	}
+	if len(bootstrap.Sites) != 1 || bootstrap.Sites[0].TrafficUsed != 1400 || !bootstrap.Sites[0].Running {
+		t.Fatalf("dashboard bootstrap site = %+v", bootstrap.Sites)
+	}
+}
+
 func TestLegacyTrafficDirectionsAreInitializedFromTotal(t *testing.T) {
 	in, out := legacyTrafficDirections(101)
 	if in != 50 || out != 51 || in+out != 101 {
