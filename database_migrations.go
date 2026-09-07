@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 30
+	databaseSchemaVersion = 31
 )
 
 func (d *DB) migrate() error {
@@ -94,6 +94,8 @@ func (d *DB) migrateOnce() error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			sort_order INTEGER NOT NULL DEFAULT 0,
 			name TEXT NOT NULL,
+			icon_name TEXT NOT NULL DEFAULT '',
+			icon_url TEXT NOT NULL DEFAULT '',
 			listen_port INTEGER NOT NULL UNIQUE,
 			public_host TEXT NOT NULL DEFAULT '',
 			path_prefix TEXT NOT NULL DEFAULT '',
@@ -340,6 +342,15 @@ func (d *DB) migrateOnce() error {
 		log_search_mode TEXT NOT NULL DEFAULT 'like', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO system_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS site_icon_pack (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		pack_name TEXT NOT NULL DEFAULT '',
+		description TEXT NOT NULL DEFAULT '',
+		source_url TEXT NOT NULL DEFAULT '',
+		icons_json TEXT NOT NULL DEFAULT '[]',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	INSERT OR IGNORE INTO site_icon_pack (id) VALUES (1);
 	CREATE TABLE IF NOT EXISTS control_nodes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		guid TEXT NOT NULL UNIQUE,
@@ -472,6 +483,8 @@ func (d *DB) migrateOnce() error {
 		column string
 		sql    string
 	}{
+		{"icon_name", "ALTER TABLE sites ADD COLUMN icon_name TEXT NOT NULL DEFAULT ''"},
+		{"icon_url", "ALTER TABLE sites ADD COLUMN icon_url TEXT NOT NULL DEFAULT ''"},
 		{"playback_target_url", "ALTER TABLE sites ADD COLUMN playback_target_url TEXT NOT NULL DEFAULT ''"},
 		{"playback_mode", "ALTER TABLE sites ADD COLUMN playback_mode TEXT NOT NULL DEFAULT 'direct'"},
 		{"main_video_stream_mode", "ALTER TABLE sites ADD COLUMN main_video_stream_mode TEXT NOT NULL DEFAULT 'proxy'"},
@@ -521,6 +534,16 @@ func (d *DB) migrateOnce() error {
 				}
 			}
 		}
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS site_icon_pack (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		pack_name TEXT NOT NULL DEFAULT '',
+		description TEXT NOT NULL DEFAULT '',
+		source_url TEXT NOT NULL DEFAULT '',
+		icons_json TEXT NOT NULL DEFAULT '[]',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	); INSERT OR IGNORE INTO site_icon_pack (id) VALUES (1);`); err != nil {
+		return err
 	}
 	// Probe secrets were introduced after the original control node table. Keep
 	// existing databases upgradeable without exposing the plaintext secret.

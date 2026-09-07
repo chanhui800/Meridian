@@ -1162,6 +1162,31 @@ async function loadDashboardTable() {
   }
 }
 
+function dashboardSiteIconMarkup(site) {
+  // sites.js is loaded in the normal application shell, but keep the
+  // dashboard renderer self-contained for cached pages and test harnesses.
+  if (typeof renderSiteIcon === 'function') return renderSiteIcon(site, 'dashboard-site-icon');
+  const name = String(site && site.name || '?').trim();
+  const iconName = String(site && site.icon_name || '').trim();
+  const iconURL = String(site && site.icon_url || '').trim();
+  const fallback = esc(name.slice(0, 1) || '?');
+  if (!iconName || !/^https:\/\//i.test(iconURL)) {
+    return `<span class="site-icon dashboard-site-icon" aria-hidden="true"><span class="site-icon-fallback">${fallback}</span></span>`;
+  }
+  return `<span class="site-icon dashboard-site-icon" title="${esc(iconName)}"><img class="site-icon-image" src="${esc(iconURL)}" alt="" loading="lazy" referrerpolicy="no-referrer"><span class="site-icon-fallback" hidden>${fallback}</span></span>`;
+}
+
+function bindDashboardSiteIconFallbacks(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  root.querySelectorAll('.dashboard-site-icon .site-icon-image').forEach(image => {
+    image.addEventListener('error', () => {
+      image.hidden = true;
+      const fallback = image.parentElement && image.parentElement.querySelector('.site-icon-fallback');
+      if (fallback) fallback.hidden = false;
+    }, { once: true });
+  });
+}
+
 function renderDashboardTableRows() {
   const tbody = document.getElementById('dash-table');
   if (!tbody) return;
@@ -1181,7 +1206,7 @@ function renderDashboardTableRows() {
   for (const siteID of dashboardRealtimeTrendSiteSamples.keys()) if (!known.has(Number(siteID))) dashboardRealtimeTrendSiteSamples.delete(siteID);
   tbody.innerHTML = dashboardSites.map(s => `
       <tr>
-        <td style="font-weight:600">${esc(s.name)}</td>
+        <td><div class="dashboard-site-identity">${dashboardSiteIconMarkup(s)}<span class="dashboard-site-name">${esc(s.name)}</span></div></td>
         <td><span class="status-badge"><span class="status-led ${s.running ? 'on' : 'off'}"></span>${s.running ? '运行中' : '已停止'}</span></td>
         <td class="mono">${esc(s.target_url)}</td>
         <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></td>
@@ -1191,6 +1216,7 @@ function renderDashboardTableRows() {
         <td>${formatBytes(s.cache_size_bytes)}</td>
       </tr>
     `).join('');
+  bindDashboardSiteIconFallbacks(tbody);
 }
 
 function dashboardSpeedMarkup(speed) {

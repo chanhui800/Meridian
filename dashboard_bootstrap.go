@@ -21,6 +21,8 @@ func logDashboardSlow(path string, duration time.Duration) {
 type dashboardSiteView struct {
 	ID                int64  `json:"id"`
 	Name              string `json:"name"`
+	IconName          string `json:"icon_name"`
+	IconURL           string `json:"icon_url"`
 	TargetURL         string `json:"target_url"`
 	UAMode            string `json:"ua_mode"`
 	PublicHost        string `json:"public_host"`
@@ -77,7 +79,8 @@ func (a *App) dashboardBootstrap() (*dashboardBootstrapResponse, error) {
 			cacheSize = live.CacheSizeBytes
 		}
 		views = append(views, dashboardSiteView{
-			ID: site.ID, Name: site.Name, TargetURL: site.TargetURL, UAMode: site.UAMode,
+			ID: site.ID, Name: site.Name, IconName: site.IconName, IconURL: site.IconURL,
+			TargetURL: site.TargetURL, UAMode: site.UAMode,
 			PublicHost: site.PublicHost, PathPrefix: site.PathPrefix, IngressMode: site.IngressMode,
 			ListenPort: site.ListenPort, Running: live.Running, TrafficUsed: live.TrafficUsed,
 			MonthlyTraffic: live.MonthlyTraffic, CacheSizeBytes: cacheSize,

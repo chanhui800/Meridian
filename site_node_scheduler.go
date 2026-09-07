@@ -320,11 +320,25 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 				return cooldownErr
 			}
 			desired = 0
+			fallback := int64(0)
 			for _, candidate := range snapshot.Nodes {
-				if nodeEligible(candidate) && !cooldowns[candidate.ID] {
+				if !nodeEligible(candidate) {
+					continue
+				}
+				// A probe cooldown means "retry this node later"; it must not
+				// make an otherwise online node disappear from the assignment.
+				// Keep a fallback so a single-node deployment continues probing
+				// and can recover as soon as the Agent comes back.
+				if fallback == 0 {
+					fallback = candidate.ID
+				}
+				if !cooldowns[candidate.ID] {
 					desired = candidate.ID
 					break
 				}
+			}
+			if desired == 0 {
+				desired = fallback
 			}
 		}
 		if desired <= 0 || !eligible[desired] {
@@ -350,15 +364,107 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	return nil
 }
 
-// agentConfigHash covers only the runtime behavior applied by the Agent.
-// Release metadata is intentionally excluded so a GitHub outage or a new
-// checksum cannot cause a route/config restart by itself.
-func agentConfigHash(config AgentRuntimeConfig) (string, error) {
+// agentSiteHashBase lets the runtime hash use the Site wire shape without
+// making the UI-only icon fields part of the Agent contract. Older Agents
+// ignore icon_name/icon_url while decoding a route, so including those fields
+// in the Controller hash would make them reject otherwise valid configs.
+type agentSiteHashBase Site
+
+type agentSiteHash struct {
+	agentSiteHashBase
+	IconName string `json:"icon_name,omitempty"`
+	IconURL  string `json:"icon_url,omitempty"`
+}
+
+type agentSiteRouteHash struct {
+	SiteID            int64               `json:"site_id"`
+	Host              string              `json:"host"`
+	TargetURL         string              `json:"target_url"`
+	PlaybackTargetURL string              `json:"playback_target_url,omitempty"`
+	StreamHosts       []string            `json:"stream_hosts,omitempty"`
+	PlaybackMode      string              `json:"playback_mode,omitempty"`
+	Headers           map[string][]string `json:"headers,omitempty"`
+	Site              agentSiteHash       `json:"site"`
+	FailoverTargets   string              `json:"failover_targets_raw,omitempty"`
+	FailoverLines     string              `json:"failover_lines_raw,omitempty"`
+	StreamHostsRaw    string              `json:"stream_hosts_raw,omitempty"`
+	UpstreamHeaders   string              `json:"upstream_headers_raw,omitempty"`
+	DynamicSources    string              `json:"dynamic_sources_raw,omitempty"`
+	DynamicRules      string              `json:"dynamic_rules_raw,omitempty"`
+}
+
+type agentRuntimeConfigHash struct {
+	SchemaVersion        int                  `json:"schema_version"`
+	ConfigHash           string               `json:"config_hash"`
+	NodeGUID             string               `json:"node_guid"`
+	EntryMode            string               `json:"entry_mode"`
+	HTTPPort             int                  `json:"http_port"`
+	HTTPSPort            int                  `json:"https_port"`
+	CertificatePEM       string               `json:"certificate_pem,omitempty"`
+	PrivateKeyPEM        string               `json:"private_key_pem,omitempty"`
+	DynamicKey           string               `json:"dynamic_key,omitempty"`
+	ProbeSecret          string               `json:"probe_secret,omitempty"`
+	AgentVersion         string               `json:"agent_version,omitempty"`
+	AgentSHA256          string               `json:"agent_sha256,omitempty"`
+	AgentDownloadURL     string               `json:"agent_download_url,omitempty"`
+	CacheClearGeneration int64                `json:"cache_clear_generation,omitempty"`
+	Routes               []agentSiteRouteHash `json:"routes"`
+}
+
+func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntimeConfigHash {
 	config.ConfigHash = ""
-	config.AgentVersion = ""
-	config.AgentSHA256 = ""
+	if !legacy {
+		config.AgentVersion = ""
+		config.AgentSHA256 = ""
+	}
 	config.AgentDownloadURL = ""
-	data, err := json.Marshal(config)
+	if legacy {
+		config.CacheClearGeneration = 0
+		// ProbeSecret was added after the legacy Agent contract. Older Agents
+		// ignore the field, so omit it from the compatibility hash while current
+		// Agents use the runtime hash above and authenticate their health probes.
+		config.ProbeSecret = ""
+	}
+	routes := make([]agentSiteRouteHash, len(config.Routes))
+	for i, route := range config.Routes {
+		routes[i] = agentSiteRouteHash{
+			SiteID:            route.SiteID,
+			Host:              route.Host,
+			TargetURL:         route.TargetURL,
+			PlaybackTargetURL: route.PlaybackTargetURL,
+			StreamHosts:       route.StreamHosts,
+			PlaybackMode:      route.PlaybackMode,
+			Headers:           route.Headers,
+			Site:              agentSiteHash{agentSiteHashBase: agentSiteHashBase(route.Site)},
+			FailoverTargets:   route.FailoverTargets,
+			FailoverLines:     route.FailoverLines,
+			StreamHostsRaw:    route.StreamHostsRaw,
+			UpstreamHeaders:   route.UpstreamHeaders,
+			DynamicSources:    route.DynamicSources,
+			DynamicRules:      route.DynamicRules,
+		}
+	}
+	return agentRuntimeConfigHash{
+		SchemaVersion:        config.SchemaVersion,
+		ConfigHash:           config.ConfigHash,
+		NodeGUID:             config.NodeGUID,
+		EntryMode:            config.EntryMode,
+		HTTPPort:             config.HTTPPort,
+		HTTPSPort:            config.HTTPSPort,
+		CertificatePEM:       config.CertificatePEM,
+		PrivateKeyPEM:        config.PrivateKeyPEM,
+		DynamicKey:           config.DynamicKey,
+		ProbeSecret:          config.ProbeSecret,
+		AgentVersion:         config.AgentVersion,
+		AgentSHA256:          config.AgentSHA256,
+		AgentDownloadURL:     config.AgentDownloadURL,
+		CacheClearGeneration: config.CacheClearGeneration,
+		Routes:               routes,
+	}
+}
+
+func hashAgentConfigPayload(config AgentRuntimeConfig, legacy bool) (string, error) {
+	data, err := json.Marshal(agentConfigHashPayload(config, legacy))
 	if err != nil {
 		return "", err
 	}
@@ -366,23 +472,20 @@ func agentConfigHash(config AgentRuntimeConfig) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
+// agentConfigHash covers only the runtime behavior applied by the Agent.
+// Release metadata and UI-only site icon fields are intentionally excluded so
+// a GitHub outage, a new checksum, or an icon change cannot cause a route
+// config restart by itself.
+func agentConfigHash(config AgentRuntimeConfig) (string, error) {
+	return hashAgentConfigPayload(config, false)
+}
+
 // agentConfigLegacyHash preserves the v1.9.29 wire/hash contract for Agents
 // that have not started sending their version header yet. v1.9.29 knew about
-// AgentVersion and AgentSHA256, but not AgentDownloadURL.
+// AgentVersion and AgentSHA256, but not AgentDownloadURL, ProbeSecret, or
+// CacheClearGeneration.
 func agentConfigLegacyHash(config AgentRuntimeConfig) (string, error) {
-	config.ConfigHash = ""
-	config.AgentDownloadURL = ""
-	config.CacheClearGeneration = 0
-	// ProbeSecret was added after the legacy Agent contract. Older Agents ignore
-	// the field, so omit it from the compatibility hash while current Agents
-	// use the runtime hash above and authenticate their health probes with it.
-	config.ProbeSecret = ""
-	data, err := json.Marshal(config)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:]), nil
+	return hashAgentConfigPayload(config, true)
 }
 
 func agentUsesRuntimeConfigHash(version string) bool {
