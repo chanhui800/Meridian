@@ -108,6 +108,9 @@ func dNodeProbeSecret(db *DB, node ControlNode) (string, error) {
 		}
 		return rotateNodeProbeSecret(db, node)
 	}
+	if jwtSecretEphemeral {
+		return "", errPersistentJWTRequired
+	}
 	secret, err := newNodeProbeSecret()
 	if err != nil {
 		return "", err

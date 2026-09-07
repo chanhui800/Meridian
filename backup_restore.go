@@ -2684,26 +2684,25 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(oldHeaderKey) == 32 {
-			tempDir, tempErr := os.MkdirTemp("", ".meridian-header-check-*")
-			if tempErr != nil {
-				a.jsonErr(w, http.StatusInternalServerError, "恢复校验失败")
-				return
-			}
-			tempDB := filepath.Join(tempDir, backupDatabaseEntry)
-			writeErr := copyPrivateFile(entries[backupDatabaseEntry], tempDB)
+			// The database entry is already a private, fully staged file on the
+			// restore filesystem. Open it directly for the header-presence check;
+			// copying the whole database into the system temp directory wastes
+			// space and can make otherwise valid restores fail on small /tmp or
+			// tmpfs filesystems.
+			tempDB := entries[backupDatabaseEntry]
+			var writeErr error
 			hasHeaders := false
-			if writeErr == nil {
-				checkDB, openErr := sql.Open("sqlite", "file:"+filepath.ToSlash(tempDB)+"?mode=ro&_pragma=query_only(1)")
-				if openErr == nil {
-					var count int
-					writeErr = checkDB.QueryRow("SELECT COUNT(*) FROM sites WHERE upstream_headers <> '' AND upstream_headers <> '[]'").Scan(&count)
-					hasHeaders = count > 0
-					_ = checkDB.Close()
-				} else {
-					writeErr = openErr
+			checkDB, openErr := sql.Open("sqlite", "file:"+filepath.ToSlash(tempDB)+"?mode=ro&_pragma=query_only(1)")
+			if openErr == nil {
+				var count int
+				writeErr = checkDB.QueryRow("SELECT COUNT(*) FROM sites WHERE upstream_headers <> '' AND upstream_headers <> '[]'").Scan(&count)
+				hasHeaders = count > 0
+				if closeErr := checkDB.Close(); writeErr == nil {
+					writeErr = closeErr
 				}
+			} else {
+				writeErr = openErr
 			}
-			_ = os.RemoveAll(tempDir)
 			if writeErr != nil {
 				a.jsonErr(w, http.StatusBadRequest, "恢复校验失败：无法检查自定义上游请求头")
 				return

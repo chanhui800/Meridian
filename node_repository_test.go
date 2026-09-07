@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -143,6 +145,39 @@ func TestNodeCredentialsRejectEphemeralJWTSecret(t *testing.T) {
 	// create a ciphertext that will be undecryptable after restart.
 	if _, _, err := app.db.EnrollControlNode("invalid", time.Now()); err == nil || !strings.Contains(err.Error(), "persistent JWT_SECRET") {
 		t.Fatalf("ephemeral enrollment error = %v", err)
+	}
+}
+
+func TestLegacyNodeProbeSecretDoesNotPersistWithEphemeralJWT(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "legacy-probe", Address: "203.0.113.72"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE control_nodes SET probe_secret_ciphertext='' WHERE id=?", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	previousSecret, previousEphemeral := jwtSecret, jwtSecretEphemeral
+	t.Cleanup(func() { jwtSecret, jwtSecretEphemeral = previousSecret, previousEphemeral })
+	jwtSecret = nil
+	jwtSecretEphemeral = true
+	loaded, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dNodeProbeSecret(app.db, loaded); !errors.Is(err, errPersistentJWTRequired) {
+		t.Fatalf("legacy probe secret with ephemeral JWT error = %v", err)
+	}
+	var ciphertext string
+	if err := app.db.db.QueryRow("SELECT probe_secret_ciphertext FROM control_nodes WHERE id=?", node.ID).Scan(&ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if ciphertext != "" {
+		t.Fatalf("ephemeral JWT persisted probe secret ciphertext %q", ciphertext)
 	}
 }
 
@@ -616,6 +651,7 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 		AgentVersion:     "v1.9.30",
 		AgentSHA256:      strings.Repeat("a", 64),
 		AgentDownloadURL: "https://github.com/chanhui800/Meridian/releases/download/v1.9.30/meridian-agent-linux-amd64",
+		ProbeSecret:      encodeRuntimeKey(bytes.Repeat([]byte{0x42}, 32)),
 		Routes:           []AgentSiteRoute{},
 	}
 	runtimeHash, err := agentConfigHash(config)
@@ -656,6 +692,49 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	}
 	if got, err := agentConfigHashForVersion(config, "v1.9.43"); err != nil || got != runtimeHash {
 		t.Fatalf("v1.9.43 config hash changed unexpectedly: got=%q want=%q err=%v", got, runtimeHash, err)
+	}
+	if runtimeHash == preProbeHash {
+		t.Fatal("probe secret did not change the current runtime hash")
+	}
+	// Freeze the v1.9.42 wire shape rather than comparing two current structs.
+	// This catches future fields that JSON-unmarshal would silently discard on
+	// an old Agent and ensures the compatibility hash is calculated over what
+	// that Agent actually understood.
+	type agentRuntimeConfigV1942 struct {
+		SchemaVersion  int              `json:"schema_version"`
+		ConfigHash     string           `json:"config_hash"`
+		NodeGUID       string           `json:"node_guid"`
+		EntryMode      string           `json:"entry_mode"`
+		HTTPPort       int              `json:"http_port"`
+		HTTPSPort      int              `json:"https_port"`
+		CertificatePEM string           `json:"certificate_pem,omitempty"`
+		PrivateKeyPEM  string           `json:"private_key_pem,omitempty"`
+		DynamicKey     string           `json:"dynamic_key,omitempty"`
+		AgentVersion   string           `json:"agent_version,omitempty"`
+		AgentSHA256    string           `json:"agent_sha256,omitempty"`
+		Routes         []AgentSiteRoute `json:"routes"`
+	}
+	wire, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozen agentRuntimeConfigV1942
+	if err := json.Unmarshal(wire, &frozen); err != nil {
+		t.Fatal(err)
+	}
+	frozenHash, err := agentConfigHash(AgentRuntimeConfig{
+		SchemaVersion: frozen.SchemaVersion, ConfigHash: frozen.ConfigHash,
+		NodeGUID: frozen.NodeGUID, EntryMode: frozen.EntryMode,
+		HTTPPort: frozen.HTTPPort, HTTPSPort: frozen.HTTPSPort,
+		CertificatePEM: frozen.CertificatePEM, PrivateKeyPEM: frozen.PrivateKeyPEM,
+		DynamicKey: frozen.DynamicKey, AgentVersion: frozen.AgentVersion,
+		AgentSHA256: frozen.AgentSHA256, Routes: frozen.Routes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := agentConfigHashForVersion(config, "v1.9.42"); err != nil || got != frozenHash {
+		t.Fatalf("v1.9.42 frozen wire hash mismatch: got=%q want=%q err=%v", got, frozenHash, err)
 	}
 }
 

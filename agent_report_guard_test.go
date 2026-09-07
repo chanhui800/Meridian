@@ -8,6 +8,55 @@ import (
 	"time"
 )
 
+type panicBody struct{}
+
+func (panicBody) Read([]byte) (int, error) { panic("request body was decoded before authentication") }
+func (panicBody) Close() error             { return nil }
+
+func TestAgentPreAuthAuthenticatesBeforeBodyDecode(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "preauth", Address: "203.0.113.80"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	handler := app.withAgentPreAuth(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		identity, ok := agentCredentialFromContext(r.Context())
+		if !ok || !identity.HasNode || identity.Node.ID != node.ID || identity.Token != agentToken {
+			t.Errorf("missing authenticated Agent identity: %#v, %v", identity, ok)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/agent/report", panicBody{})
+	request.Header.Set("Authorization", "Bearer "+agentToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || !called {
+		t.Fatalf("authenticated request = status %d called=%v", response.Code, called)
+	}
+
+	invalid := httptest.NewRequest(http.MethodPost, "/api/agent/report", panicBody{})
+	invalid.Header.Set("Authorization", "Bearer invalid")
+	invalidResponse := httptest.NewRecorder()
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("invalid credentials caused body decode: %v", recovered)
+			}
+		}()
+		handler.ServeHTTP(invalidResponse, invalid)
+	}()
+	if invalidResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid credentials status = %d, want 401", invalidResponse.Code)
+	}
+}
+
 func TestAgentPreAuthCannotBeBypassedByEndpointRotation(t *testing.T) {
 	app := &App{}
 	handler := app.withAgentPreAuth(func(w http.ResponseWriter, _ *http.Request) {

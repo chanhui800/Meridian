@@ -1609,7 +1609,9 @@ func runEdgeAgent() error {
 	bootID := edgeBootID()
 	sequence := int64(0)
 	const configRefreshInterval = 60 * time.Second
+	const agentUpdateRetryInterval = 5 * time.Minute
 	lastConfigAt := time.Time{}
+	lastUpdateAttempt := time.Time{}
 	for {
 		if lastConfigAt.IsZero() || time.Since(lastConfigAt) >= configRefreshInterval {
 			var config AgentRuntimeConfig
@@ -1620,19 +1622,28 @@ func runEdgeAgent() error {
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
-			} else if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
-				if errors.Is(updateErr, errEdgeAgentUpdated) {
-					return updateErr
-				}
-				fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
 			} else {
+				// Applying a valid runtime configuration must not depend on the
+				// availability of the optional Agent release service. A GitHub
+				// outage should leave the current proxy converged while update
+				// retries happen independently in the background.
+				now := time.Now()
+				if lastUpdateAttempt.IsZero() || now.Sub(lastUpdateAttempt) >= agentUpdateRetryInterval {
+					lastUpdateAttempt = now
+					if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
+						if errors.Is(updateErr, errEdgeAgentUpdated) {
+							return updateErr
+						}
+						fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
+					}
+				}
 				applied, _ := runtime.status()
 				if config.ConfigHash != applied {
 					if err := runtime.apply(config); err != nil {
 						fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
 					}
 				}
-				lastConfigAt = time.Now()
+				lastConfigAt = now
 			}
 		}
 		sequence++

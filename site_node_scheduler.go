@@ -464,9 +464,15 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 }
 
 func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now time.Time, platform, clientVersion string) (AgentRuntimeConfig, error) {
-	node, err := a.db.nodeByAgentToken(token, now)
-	if err != nil {
-		return AgentRuntimeConfig{}, err
+	var node ControlNode
+	var err error
+	if identity, ok := agentCredentialFromContext(ctx); ok && identity.HasNode && identity.Token == token {
+		node = identity.Node
+	} else {
+		node, err = a.db.nodeByAgentToken(token, now)
+		if err != nil {
+			return AgentRuntimeConfig{}, err
+		}
 	}
 	if err := a.refreshSiteAssignments(now); err != nil {
 		return AgentRuntimeConfig{}, err
