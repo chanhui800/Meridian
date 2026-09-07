@@ -28,6 +28,7 @@ var (
 	errInvalidNodeToken      = errors.New("invalid or expired node token")
 	errInvalidAgentToken     = errors.New("invalid agent token")
 	errManualNodeUnavailable = errors.New("manual node is unavailable")
+	errPersistentJWTRequired = errors.New("Agent nodes require a persistent JWT_SECRET")
 )
 
 type ControlNode struct {
@@ -338,6 +339,9 @@ func (d *DB) resetDueNodeCycles(now time.Time) error {
 }
 
 func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNode, string, error) {
+	if jwtSecretEphemeral {
+		return ControlNode{}, "", errPersistentJWTRequired
+	}
 	input, err := normalizeNodeInput(input)
 	if err != nil {
 		return ControlNode{}, "", err
@@ -646,6 +650,9 @@ func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
 }
 
 func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string, error) {
+	if jwtSecretEphemeral {
+		return ControlNode{}, "", errPersistentJWTRequired
+	}
 	agentToken, err := newNodeToken()
 	if err != nil {
 		return ControlNode{}, "", err

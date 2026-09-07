@@ -256,6 +256,8 @@ func writeNodeAPIError(a *App, w http.ResponseWriter, err error) {
 		a.jsonErr(w, http.StatusConflict, "node name already exists")
 	case errors.Is(err, errManualNodeUnavailable):
 		a.jsonErr(w, http.StatusConflict, err.Error())
+	case errors.Is(err, errPersistentJWTRequired):
+		a.jsonErr(w, http.StatusConflict, "请先配置持久 JWT_SECRET，再创建或注册 Agent 节点")
 	default:
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 	}
@@ -624,6 +626,10 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	node, agentToken, err := a.db.EnrollControlNode(requestBearerToken(r), time.Now())
 	if err != nil {
+		if errors.Is(err, errPersistentJWTRequired) {
+			a.jsonErr(w, http.StatusConflict, "请先配置持久 JWT_SECRET，再注册 Agent 节点")
+			return
+		}
 		a.jsonErr(w, http.StatusUnauthorized, "invalid enrollment token")
 		return
 	}
@@ -648,19 +654,8 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	preRelease, retryAfter, preAdmitted := a.agentPreAuthAdmission().admit(requestClientKey(r, a.trustedProxies), time.Now())
-	if !preAdmitted {
-		seconds := int(retryAfter.Seconds())
-		if seconds < 1 {
-			seconds = 1
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(seconds))
-		a.jsonErr(w, http.StatusTooManyRequests, "agent authentication rate limit exceeded")
-		return
-	}
 	token := requestBearerToken(r)
 	node, authErr := a.db.nodeByAgentToken(token, time.Now())
-	preRelease()
 	if authErr != nil {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return

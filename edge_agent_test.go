@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +128,63 @@ func TestEdgeAgentHealthProbeRequiresSecret(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("health probe status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestScheduledProbeUsesWireProbeSecret(t *testing.T) {
+	probeSecret := make([]byte, sha256.Size)
+	if _, err := rand.Read(probeSecret); err != nil {
+		t.Fatal(err)
+	}
+	const nodeGUID = "scheduled-probe-node"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("X-Meridian-Probe"), encodeRuntimeKey(probeSecret); got != want {
+			t.Fatalf("probe header=%q, want %q", got, want)
+		}
+		w.Header().Set("X-Meridian-Node", nodeGUID)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	certificate, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "127.0.0.1"
+	if len(certificate.DNSNames) > 0 {
+		host = certificate.DNSNames[0]
+	}
+	address, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := ControlNode{GUID: nodeGUID, Address: address, Port: port}
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	if err := probeScheduledNodeWithRoots(context.Background(), node, host, probeSecret, roots); err != nil {
+		t.Fatalf("scheduled probe failed: %v", err)
+	}
+}
+
+func TestNodeProbeSecretWireRoundTrip(t *testing.T) {
+	plaintext, err := newNodeProbeSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := decodeNodeProbeSecret(plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != sha256.Size {
+		t.Fatalf("decoded probe secret length=%d, want %d", len(raw), sha256.Size)
+	}
+	wire := encodeRuntimeKey(raw)
+	decoded, err := edgeDecodeKey(wire)
+	if err != nil || len(decoded) != sha256.Size || string(decoded) != string(raw) {
+		t.Fatalf("probe secret wire round trip failed: len=%d err=%v", len(decoded), err)
 	}
 }
 
@@ -367,6 +426,26 @@ func TestBuildAgentConfigCarriesCompleteDynamicSiteWithoutNestedQueryDeadlock(t 
 		if len(config.Routes) != 1 || !config.Routes[0].Site.DynamicDiscoveryEnabled || config.DynamicKey == "" {
 			t.Fatalf("incomplete runtime config: %#v", config)
 		}
+		decodedProbe, decodeErr := edgeDecodeKey(config.ProbeSecret)
+		if decodeErr != nil || len(decodedProbe) != sha256.Size {
+			t.Fatalf("Agent config probe secret is not a 32-byte wire key: len=%d err=%v", len(decodedProbe), decodeErr)
+		}
+		// Exercise the same wire envelope through the production Agent runtime,
+		// rather than only decoding a hand-built value. A free listener port keeps
+		// this Controller -> Config -> Agent regression test hermetic.
+		port := freePort(t)
+		releasePort(port)
+		config.HTTPSPort = port
+		config.ConfigHash, err = agentConfigLegacyHash(config)
+		if err != nil {
+			t.Fatalf("recompute test config hash: %v", err)
+		}
+		runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+		if err := runtime.apply(config); err != nil {
+			runtime.close()
+			t.Fatalf("current Agent rejected Controller config: %v", err)
+		}
+		runtime.close()
 	case <-time.After(3 * time.Second):
 		t.Fatal("buildAgentConfig deadlocked while expanding routes")
 	}

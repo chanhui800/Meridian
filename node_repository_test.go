@@ -130,6 +130,56 @@ func TestRefreshNodeEnrollmentKeepsOldAgentUntilReplacement(t *testing.T) {
 	}
 }
 
+func TestNodeCredentialsRejectEphemeralJWTSecret(t *testing.T) {
+	app := newTestApp(t)
+	previousSecret, previousEphemeral := jwtSecret, jwtSecretEphemeral
+	t.Cleanup(func() { jwtSecret, jwtSecretEphemeral = previousSecret, previousEphemeral })
+	jwtSecret = nil
+	jwtSecretEphemeral = true
+	if _, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "ephemeral", Address: "203.0.113.70"}, time.Now()); err == nil {
+		t.Fatal("node creation succeeded with an ephemeral JWT secret")
+	}
+	// Enrollment is checked before token lookup so a pending token can never
+	// create a ciphertext that will be undecryptable after restart.
+	if _, _, err := app.db.EnrollControlNode("invalid", time.Now()); err == nil || !strings.Contains(err.Error(), "persistent JWT_SECRET") {
+		t.Fatalf("ephemeral enrollment error = %v", err)
+	}
+}
+
+func TestBrokenProbeSecretCanBeRotatedWithStableJWT(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "probe-rotate", Address: "203.0.113.71"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalGUID := node.GUID
+	if _, err := app.db.db.Exec("UPDATE control_nodes SET probe_secret_ciphertext=? WHERE id=?", "v1:broken", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := dNodeProbeSecret(app.db, loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeNodeProbeSecret(rotated); err != nil {
+		t.Fatalf("rotated probe secret is invalid: %v", err)
+	}
+	if loaded.GUID != originalGUID {
+		t.Fatalf("node GUID changed during probe rotation: %q", loaded.GUID)
+	}
+	if _, err := app.db.nodeByAgentToken(agentToken, now); err != nil {
+		t.Fatalf("agent token changed during probe rotation: %v", err)
+	}
+}
+
 func TestRefreshNodeEnrollmentPreservesRuntimeStateAndTrafficBaseline(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)

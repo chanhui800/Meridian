@@ -257,12 +257,12 @@ func main() {
 	mux.HandleFunc("/api/auth/login", cors(app.csrfMiddleware(app.handleLogin)))
 	mux.HandleFunc("/api/auth/logout", cors(app.csrfMiddleware(app.handleLogout)))
 	mux.HandleFunc("/api/auth/check", cors(app.handleAuthCheck))
-	mux.HandleFunc("/api/agent/binary", app.handleAgentBinary)
-	mux.HandleFunc("/api/agent/manifest", app.handleAgentManifest)
+	mux.HandleFunc("/api/agent/binary", app.withAgentPreAuth(app.handleAgentBinary))
+	mux.HandleFunc("/api/agent/manifest", app.withAgentPreAuth(app.handleAgentManifest))
 	mux.HandleFunc("/api/agent/install.sh", app.handleAgentInstallScript)
-	mux.HandleFunc("/api/agent/enroll", app.handleAgentEnroll)
-	mux.HandleFunc("/api/agent/report", app.handleAgentReport)
-	mux.HandleFunc("/api/agent/config", app.handleAgentConfig)
+	mux.HandleFunc("/api/agent/enroll", app.withAgentPreAuth(app.handleAgentEnroll))
+	mux.HandleFunc("/api/agent/report", app.withAgentPreAuth(app.handleAgentReport))
+	mux.HandleFunc("/api/agent/config", app.withAgentPreAuth(app.handleAgentConfig))
 	mux.Handle("/api/agent/ws", websocket.Server{
 		Handshake: func(config *websocket.Config, request *http.Request) error {
 			preRelease, retryAfter, admitted := app.agentPreAuthAdmission().admit(requestClientKey(request, app.trustedProxies), time.Now())

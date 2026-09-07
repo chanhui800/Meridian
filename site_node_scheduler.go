@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -445,7 +446,11 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	pending := make([]pendingRoute, 0)
 	dynamicKey := deriveNodeRuntimeKey(a.dynamicRouteKey, node.GUID, "dynamic-routes")
-	probeSecret, probeErr := dNodeProbeSecret(a.db, node)
+	probeSecretText, probeErr := dNodeProbeSecret(a.db, node)
+	if probeErr != nil {
+		return AgentRuntimeConfig{}, probeErr
+	}
+	probeSecret, probeErr := decodeNodeProbeSecret(probeSecretText)
 	if probeErr != nil {
 		return AgentRuntimeConfig{}, probeErr
 	}
@@ -522,7 +527,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	// Keep the legacy field names in the Agent wire contract during rolling
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, EntryMode: "direct",
-		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: encodeRuntimeKey([]byte(probeSecret)), Routes: routes}
+		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: encodeRuntimeKey(probeSecret), Routes: routes}
 	// Legacy Agents do not send a platform header. Do not advertise the
 	// controller's local binary to those clients: on a cross-architecture
 	// rollout that checksum would make an old arm64 Agent download an amd64
@@ -779,6 +784,10 @@ func nodeHTTPSProbePort(node ControlNode) int {
 }
 
 func probeScheduledNode(ctx context.Context, node ControlNode, host string, probeSecret []byte) error {
+	return probeScheduledNodeWithRoots(ctx, node, host, probeSecret, nil)
+}
+
+func probeScheduledNodeWithRoots(ctx context.Context, node ControlNode, host string, probeSecret []byte, roots *x509.CertPool) error {
 	if len(probeSecret) == 0 {
 		return errors.New("node health probe secret is unavailable")
 	}
@@ -792,7 +801,7 @@ func probeScheduledNode(ctx context.Context, node ControlNode, host string, prob
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, address)
 		},
-		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host},
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host, RootCAs: roots},
 		DisableKeepAlives: true,
 	}
 	defer transport.CloseIdleConnections()
@@ -856,7 +865,7 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if err != nil {
 		return readinessError(readinessProbe, err)
 	}
-	probeSecret, err := base64.RawURLEncoding.DecodeString(probeSecretText)
+	probeSecret, err := decodeNodeProbeSecret(probeSecretText)
 	if err != nil {
 		return readinessError(readinessProbe, errors.New("node health probe secret is invalid"))
 	}

@@ -5,10 +5,14 @@ let siteSchedulesSnapshot = { sites: [] };
 // replaces the server snapshot. Drafts are cleared after a successful save or
 // when the page is recreated.
 let siteScheduleDrafts = new Map();
+const siteScheduleReactionDelay = 280;
+const siteScheduleReactionTimers = new Map();
 
 function stopNodesRefresh() {
   if (nodesRefreshTimer) clearInterval(nodesRefreshTimer);
   nodesRefreshTimer = null;
+  siteScheduleReactionTimers.forEach(timer => clearTimeout(timer));
+  siteScheduleReactionTimers.clear();
 }
 
 function nodeBytes(value) {
@@ -219,15 +223,32 @@ function syncSiteScheduleRow(row) {
   refreshSiteScheduleRowState(row);
 }
 
+// Keep checkbox/select state changes just behind the pointer event. The small
+// debounce prevents a fast five-second refresh or double tap from making the
+// controls jump while the unsaved draft is being captured.
+function queueSiteScheduleRowSync(row) {
+  const siteID = Number(row?.dataset?.siteId);
+  if (!Number.isFinite(siteID) || siteID <= 0) return;
+  const previous = siteScheduleReactionTimers.get(siteID);
+  if (previous) clearTimeout(previous);
+  row.classList.add('is-schedule-pending');
+  const timer = setTimeout(() => {
+    siteScheduleReactionTimers.delete(siteID);
+    row.classList.remove('is-schedule-pending');
+    syncSiteScheduleRow(row);
+  }, siteScheduleReactionDelay);
+  siteScheduleReactionTimers.set(siteID, timer);
+}
+
 async function handleSiteScheduleAction(event) {
   const row = event.target.closest('.node-site-row');
   if (!row) return;
   if (event.target.matches('[data-field="enabled"]')) {
-    syncSiteScheduleRow(row);
+    queueSiteScheduleRowSync(row);
     return;
   }
   if (event.target.matches('[data-field="mode"]')) {
-    syncSiteScheduleRow(row);
+    queueSiteScheduleRowSync(row);
     return;
   }
   if (event.target.matches('[data-field="fixed-node"]')) {

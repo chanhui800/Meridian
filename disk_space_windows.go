@@ -3,5 +3,5 @@
 package main
 
 func diskAvailableBytes(string) (int64, error) {
-	return 0, nil
+	return 0, errDiskSpaceUnsupported
 }

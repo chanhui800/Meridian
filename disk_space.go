@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 // diskSpaceProvider is replaceable by tests so low-space behavior can be
 // verified without filling the host filesystem.
 var diskSpaceProvider = diskAvailableBytes
+
+var errDiskSpaceUnsupported = errors.New("disk space check unsupported")
 
 // ensureDiskSpace fails before a backup/restore transaction starts when the
 // filesystem cannot hold its temporary copies. Platforms without a portable
@@ -19,8 +22,14 @@ func ensureDiskSpace(path string, required int64) error {
 		return nil
 	}
 	available, err := diskSpaceProvider(path)
-	if err != nil || available <= 0 {
+	if errors.Is(err, errDiskSpaceUnsupported) {
 		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("检查磁盘剩余空间失败: %w", err)
+	}
+	if available <= 0 {
+		return errors.New("无法确定磁盘剩余空间")
 	}
 	if available < required {
 		return fmt.Errorf("磁盘剩余空间不足：需要至少 %d MiB，可用 %d MiB", required>>20, available>>20)

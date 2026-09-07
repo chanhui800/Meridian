@@ -853,11 +853,127 @@ func parseBackupArchiveFile(path string) (backupManifest, map[string][]byte, err
 	return parseBackupZipReader(reader)
 }
 
+// backupArchiveInspection performs all central-directory checks before any
+// archive entry is extracted. This gives restore a disk-space decision point
+// while the target filesystem is still untouched.
+type backupArchiveInspection struct {
+	Manifest      backupManifest
+	Entries       []*zip.File
+	EntryCount    int
+	ExpandedBytes int64
+	DatabaseBytes int64
+	TLSBytes      int64
+}
+
+func inspectBackupArchiveFile(path string) (backupArchiveInspection, error) {
+	var result backupArchiveInspection
+	file, err := os.Open(path) // #nosec G304 -- path is an internal restore staging file.
+	if err != nil {
+		return result, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return result, err
+	}
+	reader, err := zip.NewReader(file, info.Size())
+	if err != nil {
+		return result, errors.New("备份压缩包损坏")
+	}
+	if len(reader.File) < 2 || len(reader.File) > backupMaxFiles {
+		return result, errors.New("备份文件数量无效")
+	}
+	seen := make(map[string]struct{}, len(reader.File))
+	result.Entries = append([]*zip.File(nil), reader.File...)
+	var manifestFile *zip.File
+	for _, archiveEntry := range reader.File {
+		limit, allowed := backupEntryLimit(archiveEntry.Name)
+		if !allowed || filepath.ToSlash(filepath.Clean(archiveEntry.Name)) != archiveEntry.Name || strings.HasPrefix(archiveEntry.Name, "/") {
+			return result, fmt.Errorf("备份包含不允许的文件: %s", archiveEntry.Name)
+		}
+		if _, duplicate := seen[archiveEntry.Name]; duplicate {
+			return result, fmt.Errorf("备份包含重复文件: %s", archiveEntry.Name)
+		}
+		seen[archiveEntry.Name] = struct{}{}
+		if archiveEntry.UncompressedSize64 > uint64(limit) || archiveEntry.UncompressedSize64 > uint64(backupMaxExpandedBytes) { // #nosec G115 -- fixed positive limits.
+			return result, fmt.Errorf("%s 解压后过大", archiveEntry.Name)
+		}
+		if archiveEntry.CompressedSize64 > uint64(backupMaxUploadBytes) { // #nosec G115 -- fixed positive limits.
+			return result, fmt.Errorf("%s 压缩数据过大", archiveEntry.Name)
+		}
+		if archiveEntry.UncompressedSize64 > uint64(backupMaxExpandedBytes)-uint64(result.ExpandedBytes) { // #nosec G115 -- fixed positive limits.
+			return result, errors.New("备份解压后总大小超出限制")
+		}
+		result.ExpandedBytes += int64(archiveEntry.UncompressedSize64)
+		if archiveEntry.Name == backupDatabaseEntry {
+			result.DatabaseBytes = int64(archiveEntry.UncompressedSize64)
+		}
+		if strings.HasPrefix(archiveEntry.Name, "tls/") {
+			result.TLSBytes += int64(archiveEntry.UncompressedSize64)
+		}
+		if archiveEntry.Name == backupManifestEntry {
+			manifestFile = archiveEntry
+		}
+	}
+	if manifestFile == nil {
+		return result, errors.New("备份缺少清单")
+	}
+	manifestData, err := readZipEntry(manifestFile, 1<<20)
+	if err != nil {
+		return result, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(manifestData))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result.Manifest); err != nil {
+		return result, errors.New("备份清单无效")
+	}
+	if result.Manifest.Format != "meridian-backup" || (result.Manifest.FormatVersion != backupFormatVersion && result.Manifest.FormatVersion != backupLegacyFormatVersion) {
+		return result, errors.New("不支持的备份格式版本")
+	}
+	if result.Manifest.DatabaseSchemaVersion > databaseSchemaVersion {
+		return result, errors.New("该备份由更高数据库版本的 Meridian 创建，请先升级 Meridian 后再恢复")
+	}
+	if result.DatabaseBytes <= 0 {
+		return result, errors.New("备份缺少数据库")
+	}
+	if !manifestIncludesTLS(result.Manifest) {
+		for name := range seen {
+			if strings.HasPrefix(name, "tls/") {
+				return result, errors.New("备份清单声明不包含 TLS，但压缩包中存在 TLS 文件")
+			}
+		}
+	}
+	declared := make(map[string]struct{}, len(result.Manifest.Files)+1)
+	declared[backupManifestEntry] = struct{}{}
+	for _, name := range result.Manifest.Files {
+		if _, allowed := backupEntryLimit(name); !allowed || name == backupManifestEntry {
+			return result, errors.New("备份清单文件列表无效")
+		}
+		if _, duplicate := declared[name]; duplicate {
+			return result, errors.New("备份清单文件列表无效")
+		}
+		declared[name] = struct{}{}
+	}
+	if len(declared) != len(seen) {
+		return result, errors.New("备份清单与文件内容不一致")
+	}
+	for name := range seen {
+		if _, ok := declared[name]; !ok {
+			return result, errors.New("备份清单与文件内容不一致")
+		}
+	}
+	result.EntryCount = len(reader.File)
+	return result, nil
+}
+
 // parseBackupArchiveFileToPaths validates a decrypted archive while keeping
 // each entry on disk. The restore path uses this variant so a legal large
 // backup never becomes an in-memory map[string][]byte.
 func parseBackupArchiveFileToPaths(path, entriesDir string) (backupManifest, map[string]string, error) {
 	var manifest backupManifest
+	if _, err := inspectBackupArchiveFile(path); err != nil {
+		return manifest, nil, err
+	}
 	file, err := os.Open(path) // #nosec G304 -- path is an internal restore staging file.
 	if err != nil {
 		return manifest, nil, err
@@ -898,6 +1014,15 @@ func parseBackupArchiveFileToPaths(path, entriesDir string) (backupManifest, map
 		if err := copyZipEntryToFile(archiveEntry, limit, entryPath); err != nil {
 			return manifest, nil, err
 		}
+		actualInfo, statErr := os.Stat(entryPath)
+		if statErr != nil {
+			return manifest, nil, statErr
+		}
+		expandedBefore := expanded - int64(archiveEntry.UncompressedSize64)
+		if actualInfo.Size() > limit || actualInfo.Size() > backupMaxExpandedBytes-expandedBefore {
+			return manifest, nil, errors.New("备份解压后总大小超出限制")
+		}
+		expanded = expandedBefore + actualInfo.Size()
 		entries[archiveEntry.Name] = entryPath
 	}
 	manifestPath, ok := entries[backupManifestEntry]
@@ -1017,6 +1142,30 @@ func ensureRestoreDiskSpace(dbPath string, entries map[string]string) error {
 	// state is similarly copied into pending and rollback namespaces. Keep a
 	// generous fixed margin for SQLite journals and directory metadata.
 	required := incomingDB*2 + currentDB + incomingTLS*2 + (64 << 20)
+	return ensureDiskSpace(filepath.Dir(dbPath), required)
+}
+
+func ensureRestoreDiskSpaceInspection(dbPath string, inspection backupArchiveInspection, encryptedBytes, plainBytes int64) error {
+	if strings.TrimSpace(dbPath) == "" {
+		return nil
+	}
+	if inspection.DatabaseBytes <= 0 {
+		return errors.New("备份缺少数据库")
+	}
+	var currentDB int64
+	if info, err := os.Stat(dbPath); err == nil {
+		currentDB = info.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	// Before extraction, account for the encrypted upload, decrypted ZIP,
+	// extracted entries, staged database/TLS tree, and rollback copies. This is
+	// intentionally conservative: failing closed is preferable to filling the
+	// filesystem halfway through a restore.
+	if encryptedBytes < 0 || plainBytes < 0 {
+		return errors.New("备份大小无效")
+	}
+	required := inspection.DatabaseBytes*2 + currentDB + inspection.TLSBytes*2 + encryptedBytes + plainBytes + (64 << 20)
 	return ensureDiskSpace(filepath.Dir(dbPath), required)
 }
 
@@ -2357,25 +2506,11 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusConflict, "当前数据库模式不支持恢复")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, backupMaxUploadBytes+(1<<20))
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		a.jsonErr(w, http.StatusBadRequest, "上传文件过大或表单无效")
-		return
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	password := r.FormValue("password")
-	if r.FormValue("confirm") != "恢复" {
-		a.jsonErr(w, http.StatusBadRequest, "请输入“恢复”确认操作")
-		return
-	}
-	file, _, err := r.FormFile("backup")
-	if err != nil {
-		a.jsonErr(w, http.StatusBadRequest, "请选择 Meridian 备份文件")
-		return
-	}
-	defer file.Close()
+	// Parse multipart parts directly into the private restore directory. Using
+	// ParseMultipartForm would spill large file parts to the system temp
+	// directory and retain form metadata in memory before we can perform a disk
+	// preflight.
+	r.Body = http.MaxBytesReader(w, r.Body, backupMaxUploadBytes+(4<<20))
 	restoreTemp, err := os.MkdirTemp(filepath.Dir(a.dbPath), ".meridian-restore-upload-*")
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "恢复暂存目录创建失败")
@@ -2383,15 +2518,71 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(restoreTemp)
 	encryptedPath := filepath.Join(restoreTemp, "backup.mrbak")
-	encrypted, err := os.OpenFile(encryptedPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- encryptedPath is inside a private restore directory.
+	reader, err := r.MultipartReader()
 	if err != nil {
-		a.jsonErr(w, http.StatusInternalServerError, "恢复暂存文件创建失败")
+		a.jsonErr(w, http.StatusBadRequest, "上传文件过大或表单无效")
 		return
 	}
-	readBytes, copyErr := io.Copy(encrypted, io.LimitReader(file, backupMaxUploadBytes+1))
-	closeErr := encrypted.Close()
-	if copyErr != nil || closeErr != nil || readBytes > backupMaxUploadBytes {
-		a.jsonErr(w, http.StatusBadRequest, "备份文件读取失败或超过 256 MiB")
+	var password, confirmation string
+	var readBytes int64
+	var havePassword, haveConfirmation, haveBackup bool
+	var encrypted *os.File
+	for {
+		part, nextErr := reader.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			a.jsonErr(w, http.StatusBadRequest, "上传文件过大或表单无效")
+			return
+		}
+		name := part.FormName()
+		if name == "password" || name == "confirm" {
+			if (name == "password" && havePassword) || (name == "confirm" && haveConfirmation) {
+				_ = part.Close()
+				a.jsonErr(w, http.StatusBadRequest, "表单字段重复")
+				return
+			}
+			value, valueErr := io.ReadAll(io.LimitReader(part, backupMaxPasswordBytes+1))
+			_ = part.Close()
+			if valueErr != nil || len(value) > backupMaxPasswordBytes {
+				a.jsonErr(w, http.StatusBadRequest, "备份密码或确认信息无效")
+				return
+			}
+			if name == "password" {
+				password, havePassword = string(value), true
+			} else {
+				confirmation, haveConfirmation = string(value), true
+			}
+			continue
+		}
+		if name != "backup" || haveBackup {
+			_ = part.Close()
+			a.jsonErr(w, http.StatusBadRequest, "表单字段无效")
+			return
+		}
+		haveBackup = true
+		var openErr error
+		encrypted, openErr = os.OpenFile(encryptedPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- encryptedPath is inside a private restore directory.
+		if openErr != nil {
+			_ = part.Close()
+			a.jsonErr(w, http.StatusInternalServerError, "恢复暂存文件创建失败")
+			return
+		}
+		readBytes, err = io.Copy(encrypted, io.LimitReader(part, backupMaxUploadBytes+1))
+		closeErr := encrypted.Close()
+		_ = part.Close()
+		if err != nil || closeErr != nil || readBytes > backupMaxUploadBytes {
+			a.jsonErr(w, http.StatusBadRequest, "备份文件读取失败或超过 256 MiB")
+			return
+		}
+	}
+	if !havePassword || !haveConfirmation || confirmation != "恢复" {
+		a.jsonErr(w, http.StatusBadRequest, "请输入“恢复”确认操作")
+		return
+	}
+	if !haveBackup {
+		a.jsonErr(w, http.StatusBadRequest, "请选择 Meridian 备份文件")
 		return
 	}
 	if err := ensureDiskSpace(restoreTemp, readBytes*3+64<<20); err != nil {
@@ -2443,6 +2634,20 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	if decryptErr != nil {
 		a.jsonErr(w, http.StatusBadRequest, decryptErr.Error())
+		return
+	}
+	plainInfo, statErr := os.Stat(plainPath)
+	if statErr != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "恢复解密文件检查失败")
+		return
+	}
+	inspection, inspectErr := inspectBackupArchiveFile(plainPath)
+	if inspectErr != nil {
+		a.jsonErr(w, http.StatusBadRequest, inspectErr.Error())
+		return
+	}
+	if err := ensureRestoreDiskSpaceInspection(a.dbPath, inspection, readBytes, plainInfo.Size()); err != nil {
+		a.jsonErr(w, http.StatusInsufficientStorage, err.Error())
 		return
 	}
 	a.backupMu.Lock()
