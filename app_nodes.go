@@ -419,12 +419,10 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	token := requestBearerToken(r)
-	if err := a.db.AuthorizeEnrollmentToken(token, time.Now()); err != nil {
-		if _, agentErr := a.db.nodeByAgentToken(token, time.Now()); agentErr != nil {
-			a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
-			return
-		}
+	identity, authErr := agentIdentityForRequest(a, r)
+	if authErr != nil || (!identity.HasNode && !identity.Enrollment) {
+		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		return
 	}
 	platform, err := requestedAgentPlatform(r)
 	if err != nil {
@@ -575,12 +573,10 @@ func (a *App) handleAgentManifest(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	token := requestBearerToken(r)
-	if err := a.db.AuthorizeEnrollmentToken(token, time.Now()); err != nil {
-		if _, agentErr := a.db.nodeByAgentToken(token, time.Now()); agentErr != nil {
-			a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
-			return
-		}
+	identity, authErr := agentIdentityForRequest(a, r)
+	if authErr != nil || (!identity.HasNode && !identity.Enrollment) {
+		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		return
 	}
 	platform, err := requestedAgentPlatform(r)
 	if err != nil {
@@ -624,7 +620,12 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	node, agentToken, err := a.db.EnrollControlNode(requestBearerToken(r), time.Now())
+	identity, authErr := agentIdentityForRequest(a, r)
+	if authErr != nil || !identity.Enrollment {
+		a.jsonErr(w, http.StatusUnauthorized, "invalid enrollment token")
+		return
+	}
+	node, agentToken, err := a.db.EnrollControlNode(identity.Token, time.Now())
 	if err != nil {
 		if errors.Is(err, errPersistentJWTRequired) {
 			a.jsonErr(w, http.StatusConflict, "请先配置持久 JWT_SECRET，再注册 Agent 节点")
@@ -654,12 +655,13 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	token := requestBearerToken(r)
-	node, authErr := a.db.nodeByAgentToken(token, time.Now())
+	identity, authErr := agentNodeIdentityForRequest(a, r)
 	if authErr != nil {
 		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 		return
 	}
+	token := identity.Token
+	node := identity.Node
 	release, retryAfter, admitted := a.agentReports().admit(node.ID, time.Now())
 	if !admitted {
 		seconds := int(retryAfter.Seconds())

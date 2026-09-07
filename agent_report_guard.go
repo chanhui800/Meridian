@@ -2,12 +2,42 @@ package main
 
 import (
 	"container/list"
+	"context"
 	"math"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// agentCredentialIdentity is attached to a request after the short pre-auth
+// admission window has authenticated its bearer credential. Keeping the
+// result in context avoids repeating the SQLite lookup in each handler while
+// ensuring the global admission slot is released before any slow work such as
+// a GitHub binary proxy begins.
+type agentCredentialIdentity struct {
+	Token      string
+	Node       ControlNode
+	HasNode    bool
+	Enrollment bool
+}
+
+type agentCredentialContextKey struct{}
+
+func withAgentCredential(r *http.Request, identity agentCredentialIdentity) *http.Request {
+	if r == nil {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), agentCredentialContextKey{}, identity))
+}
+
+func agentCredentialFromContext(ctx context.Context) (agentCredentialIdentity, bool) {
+	if ctx == nil {
+		return agentCredentialIdentity{}, false
+	}
+	identity, ok := ctx.Value(agentCredentialContextKey{}).(agentCredentialIdentity)
+	return identity, ok && identity.Token != ""
+}
 
 const (
 	nodeReportRatePerSecond = 1.0
@@ -294,7 +324,57 @@ func (a *App) withAgentPreAuth(next http.HandlerFunc) http.HandlerFunc {
 			a.jsonErr(w, http.StatusTooManyRequests, "agent authentication rate limit exceeded")
 			return
 		}
-		defer release()
-		next(w, r)
+		// A few unit-test embedders use this admission helper without a DB. Keep
+		// that lightweight behavior, while the production router always has a DB
+		// and authenticates before handing control to the endpoint.
+		if a == nil || a.db == nil || a.db.db == nil {
+			release()
+			next(w, r)
+			return
+		}
+		identity, err := a.authenticateAgentRequest(r)
+		release()
+		if err != nil {
+			a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+			return
+		}
+		next(w, withAgentCredential(r, identity))
 	}
+}
+
+// authenticateAgentRequest performs the only credential lookups protected by
+// the global pre-auth concurrency budget. Enrollment credentials are retained
+// because the binary, manifest, and enroll endpoints intentionally accept the
+// one-time enrollment token.
+func (a *App) authenticateAgentRequest(r *http.Request) (agentCredentialIdentity, error) {
+	if a == nil || a.db == nil || a.db.db == nil {
+		return agentCredentialIdentity{}, errInvalidAgentToken
+	}
+	token := requestBearerToken(r)
+	if token == "" {
+		return agentCredentialIdentity{}, errInvalidAgentToken
+	}
+	now := time.Now()
+	if node, err := a.db.nodeByAgentToken(token, now); err == nil {
+		return agentCredentialIdentity{Token: token, Node: node, HasNode: true}, nil
+	}
+	if err := a.db.AuthorizeEnrollmentToken(token, now); err == nil {
+		return agentCredentialIdentity{Token: token, Enrollment: true}, nil
+	}
+	return agentCredentialIdentity{}, errInvalidAgentToken
+}
+
+func agentIdentityForRequest(a *App, r *http.Request) (agentCredentialIdentity, error) {
+	if identity, ok := agentCredentialFromContext(r.Context()); ok {
+		return identity, nil
+	}
+	return a.authenticateAgentRequest(r)
+}
+
+func agentNodeIdentityForRequest(a *App, r *http.Request) (agentCredentialIdentity, error) {
+	identity, err := agentIdentityForRequest(a, r)
+	if err != nil || !identity.HasNode || identity.Enrollment {
+		return agentCredentialIdentity{}, errInvalidAgentToken
+	}
+	return identity, nil
 }

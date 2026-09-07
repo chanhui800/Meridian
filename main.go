@@ -269,15 +269,15 @@ func main() {
 			if !admitted {
 				return fmt.Errorf("agent authentication rate limit exceeded; retry after %s", retryAfter.Round(time.Millisecond))
 			}
-			node, err := app.db.nodeByAgentToken(requestBearerToken(request), time.Now())
+			identity, err := app.authenticateAgentRequest(request)
 			preRelease()
-			if err != nil {
+			if err != nil || !identity.HasNode || identity.Enrollment {
 				return errors.New("invalid agent token")
 			}
 			// x/net/websocket passes the same request pointer to the handler. Carry
 			// the authenticated node through its context so the handler never
 			// performs a second SQLite token lookup for this connection.
-			*request = *withAgentWebSocketNode(request, node)
+			*request = *withAgentCredential(withAgentWebSocketNode(request, identity.Node), identity)
 			// Agent clients are not browsers; token authentication is the origin
 			// boundary, so do not apply the package's browser Origin check.
 			return nil
