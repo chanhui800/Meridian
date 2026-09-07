@@ -184,7 +184,9 @@ test('drag handle aligns with the site title without shifting the media summary'
     .map(match => match[1])
     .find(rule => rule.includes('position: relative')) || '';
   const handleRule = css.match(/\.site-drag-handle\s*\{([^}]*)\}/)?.[1] || '';
-  const titleRule = css.match(/\.site-heading-title-row\s*\{([^}]*)\}/)?.[1] || '';
+  const titleRule = [...css.matchAll(/\.site-heading-title-row\s*\{([^}]*)\}/g)]
+    .map(match => match[1])
+    .find(rule => rule.includes('min-height: 60px')) || '';
   const mediaRule = css.match(/\.site-media-counts\s*\{([^}]*)\}/)?.[1] || '';
   const mediaIconRule = css.match(/\.site-media-icon\s*\{([^}]*)\}/)?.[1] || '';
   const siteTopRule = [...css.matchAll(/\.site-top\s*\{([^}]*)\}/g)].at(-1)?.[1] || '';
@@ -192,15 +194,16 @@ test('drag handle aligns with the site title without shifting the media summary'
   const handle = source.indexOf('class="site-drag-handle"', card);
   const top = source.indexOf('class="site-top"', card);
 
-  assert.ok(card < handle && handle < top);
+  assert.ok(card < top && top < handle);
   assert.match(cardRule, /position:\s*relative/);
-  assert.match(handleRule, /position:\s*absolute/);
-  assert.match(handleRule, /top:\s*16px/);
-  assert.match(handleRule, /left:\s*10px/);
-  assert.match(handleRule, /height:\s*32px/);
-  assert.match(titleRule, /min-height:\s*32px/);
+  assert.match(handleRule, /position:\s*relative/);
+  assert.match(handleRule, /top:\s*auto/);
+  assert.match(handleRule, /left:\s*auto/);
+  assert.match(handleRule, /height:\s*40px/);
+  assert.doesNotMatch(handleRule, /transform:/);
+  assert.match(titleRule, /min-height:\s*60px/);
   assert.match(titleRule, /align-items:\s*center/);
-  assert.match(titleRule, /padding-left:\s*34px/);
+  assert.match(titleRule, /padding-left:\s*0/);
   assert.match(mediaRule, /width:\s*100%/);
   assert.match(mediaRule, /margin-left:\s*0/);
   assert.match(mediaIconRule, /width:\s*7px/);
@@ -208,6 +211,20 @@ test('drag handle aligns with the site title without shifting the media summary'
   assert.match(mediaIconRule, /justify-content:\s*center/);
   assert.match(siteTopRule, /margin-bottom:\s*6px/);
   assert.doesNotMatch(css, /--site-media-label-shift/);
+});
+
+test('site identity icons stay circular and transparent in cards and dashboard rows', () => {
+  const dashboard = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'dashboard.js'), 'utf8');
+  const sites = loadSitesSource();
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
+
+  assert.match(sites, /renderSiteIconButton\(s\)/);
+  assert.match(dashboard, /dashboardSiteIconMarkup\(s\)/);
+  assert.match(dashboard, /dashboard-site-identity/);
+  assert.match(css, /\.site-icon\s*\{[\s\S]*?border-radius:\s*50%;[\s\S]*?background:\s*transparent;/);
+  assert.match(css, /\.site-icon-button\s*\{[\s\S]*?width:\s*60px;[\s\S]*?background:\s*transparent;/);
+  assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?align-items:\s*center;/);
+  assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?width:\s*42px;[\s\S]*?background:\s*transparent;/);
 });
 
 test('advanced settings keep cache and account limits in separate vertical columns', () => {
