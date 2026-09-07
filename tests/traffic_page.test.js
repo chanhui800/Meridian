@@ -79,6 +79,7 @@ function makeTrafficHarness(options) {
     'traffic-hours-select': makeElement('traffic-hours-select', { value: '24' }),
     'traffic-totals': makeElement('traffic-totals'),
     trafficChart: makeElement('trafficChart'),
+    'dashboard-trend-site': makeElement('dashboard-trend-site'),
   };
 
   const intervals = [];
@@ -484,6 +485,40 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   vm.runInContext('updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:1, cumulative_bytes_out:1, bytes_in:1, bytes_out:1, traffic_used:2}])', sandbox);
   assert.ok(elements['dash-table'].innerHTML.includes('↓ 0 B/s'), 'counter reset must render zero instead of a negative speed or placeholder');
   assert.ok(!elements['dash-table'].innerHTML.includes('dashboard-speed-placeholder'));
+});
+
+test('dashboard realtime tooltip aligns sparse site samples by timestamp', () => {
+  const h = makeTrafficHarness();
+  h.elements['dashboard-trend-site'].selectedOptions = [{ textContent: '全部站点' }];
+  const tooltip = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardSites = [{ id: 1, name: 'Alpha' }, { id: 2, name: 'Beta' }];
+    dashboardTrendData = { points: [], site_series: [] };
+    dashboardRealtimeTrendSamples = new Map([
+      ['all', [
+        { timestamp_ms: 1000, download_bps: 0, upload_bps: 0 },
+        { timestamp_ms: 2000, download_bps: 300, upload_bps: 0 },
+      ]],
+    ]);
+    dashboardRealtimeTrendSiteSamples = new Map([
+      ['1', [
+        { timestamp_ms: 1000, download_bps: 100, upload_bps: 0 },
+      ]],
+      ['2', [
+        { timestamp_ms: 1000, download_bps: 200, upload_bps: 0 },
+      ]],
+    ]);
+    return dashboardTrendTooltip(
+      { timestamp_ms: 2000, download_bps: 300, upload_bps: 0 },
+      'speed',
+      'realtime',
+      1,
+    );
+  })()`, h.sandbox);
+  assert.match(tooltip, /Alpha[\s\S]*↓ 100 B\/s/, 'the first site should use its latest sample at the hovered time');
+  assert.match(tooltip, /Beta[\s\S]*↓ 200 B\/s/, 'a sparse second site series must not fall back to zero');
+  assert.doesNotMatch(tooltip, /Alpha[\s\S]*↓ 0 B\/s/);
+  assert.doesNotMatch(tooltip, /Beta[\s\S]*↓ 0 B\/s/);
 });
 
 test('dashboard keeps SSE samples that arrive before the site list and across partial payloads', async () => {
