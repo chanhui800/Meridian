@@ -39,12 +39,14 @@ function renderNodeCards() {
     const usage = node.traffic_quota > 0 ? `${nodeBytes(node.traffic_used)} / ${nodeBytes(node.traffic_quota)}` : `${nodeBytes(node.traffic_used)} / 不限`;
     const reset = node.reset_day === 0 ? '不自动重置' : `每月 ${node.reset_day} 日重置`;
     const entry = `HTTPS :${node.port}`;
-    const configState = node.agent_listener_error ? `监听异常：${node.agent_listener_error}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用配置');
+    const applyError = String(node.agent_apply_error || '').trim();
+    const listenerError = String(node.agent_listener_error || '').trim();
+    const configState = applyError ? `应用失败：${applyError}` : (listenerError ? `监听异常：${listenerError}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用配置'));
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
       <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(node.address || '未填写地址')} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
       <div class="node-stats"><span><b>${usage}</b><small>${esc(node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费')}</small></span><span><b>${esc(reset)}</b><small>独立流量周期</small></span><span><b>${node.priority}</b><small>优先级${node.active ? ' · 当前选中' : ''}</small></span></div>
-      <div class="node-entry-state"><span>${esc(entry)}</span><small class="${node.agent_listener_error ? 'is-error' : ''}">${esc(configState)}</small></div>
+      <div class="node-entry-state"><span>${esc(entry)}</span><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div>
       <div class="node-actions"><button type="button" data-action="edit" data-id="${node.id}">编辑</button><button type="button" data-action="enroll" data-id="${node.id}">重新生成脚本</button><button type="button" class="is-danger" data-action="delete" data-id="${node.id}">删除</button></div>
     </article>`;
   }).join('');

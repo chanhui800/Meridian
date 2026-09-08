@@ -18,6 +18,12 @@ test('node scheduling is a first-level page with refresh cleanup', () => {
   assert.match(router, /previous === 'nodes'.*stopNodesRefresh/s);
 });
 
+test('node page surfaces Agent configuration apply errors before generic waiting', () => {
+  assert.match(page, /agent_apply_error/);
+  assert.match(page, /应用失败：\$\{applyError\}/);
+  assert.match(page, /const listenerError = String\(node\.agent_listener_error/);
+});
+
 test('node API exposes CRUD, enrollment refresh, and scheduler verbs', () => {
   assert.match(api, /getNodes\(\).*'GET', '\/api\/nodes'/s);
   assert.match(api, /createNode\(data\).*'POST', '\/api\/nodes'/s);

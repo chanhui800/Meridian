@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 32
+	databaseSchemaVersion = 33
 )
 
 func (d *DB) migrate() error {
@@ -378,6 +378,9 @@ func (d *DB) migrateOnce() error {
 		agent_version TEXT NOT NULL DEFAULT '',
 		desired_config_hash TEXT NOT NULL DEFAULT '',
 		applied_config_hash TEXT NOT NULL DEFAULT '',
+		agent_apply_error TEXT NOT NULL DEFAULT '',
+		agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0,
+		agent_apply_failures BIGINT NOT NULL DEFAULT 0,
 		agent_listener_error TEXT NOT NULL DEFAULT '',
 		event_spool_error TEXT NOT NULL DEFAULT '',
 		event_queue_depth INTEGER NOT NULL DEFAULT 0,
@@ -467,6 +470,9 @@ func (d *DB) migrateOnce() error {
 		{"https_port", "ALTER TABLE control_nodes ADD COLUMN https_port INTEGER NOT NULL DEFAULT 443"},
 		{"desired_config_hash", "ALTER TABLE control_nodes ADD COLUMN desired_config_hash TEXT NOT NULL DEFAULT ''"},
 		{"applied_config_hash", "ALTER TABLE control_nodes ADD COLUMN applied_config_hash TEXT NOT NULL DEFAULT ''"},
+		{"agent_apply_error", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error TEXT NOT NULL DEFAULT ''"},
+		{"agent_apply_error_at_ms", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"agent_apply_failures", "ALTER TABLE control_nodes ADD COLUMN agent_apply_failures BIGINT NOT NULL DEFAULT 0"},
 		{"agent_listener_error", "ALTER TABLE control_nodes ADD COLUMN agent_listener_error TEXT NOT NULL DEFAULT ''"},
 	} {
 		var found int
