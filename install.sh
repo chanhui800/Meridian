@@ -35,6 +35,7 @@ PREVIOUS_AGENT_BIN_AMD64="${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}.previous"
 PREVIOUS_AGENT_BIN_ARM64="${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.previous"
 ASSUME_YES="${MERIDIAN_ASSUME_YES:-0}"
 PURGE_DATA=0
+UNINSTALL_KEEP_DATA=0
 DOMAIN_MODE="ask"
 REQUESTED_DOMAIN=""
 CERTBOT_EMAIL=""
@@ -2194,7 +2195,7 @@ do_uninstall() {
     if [ "$ASSUME_YES" != "1" ]; then
         if [ "$PURGE_DATA" = "1" ]; then
             warn "已指定 --purge，数据目录将在确认卸载后删除: $DATA_DIR"
-        else
+        elif [ "$UNINSTALL_KEEP_DATA" != "1" ]; then
             if ask_yes_no "是否同时删除数据目录 ${DATA_DIR}（数据库和密钥）？" 0; then
                 remove_data=1
             fi
@@ -2255,7 +2256,7 @@ Meridian 一键安装工具
   -y, --yes        非交互确认；安装未指定域名时保留现有配置，首次安装则使用 IP
   --purge          卸载时删除数据目录；不会删除备份、Nginx、Certbot 或证书
 
-不带参数运行时进入四项菜单。
+不带参数运行时进入交互式菜单，可选择安装、更新、修改密码、卸载（保留数据）或卸载并删除数据。
 USAGE
 }
 
@@ -2267,14 +2268,16 @@ main_menu() {
     printf '  1) 安装\n'
     printf '  2) 更新到最新版\n'
     printf '  3) 修改管理员密码\n'
-    printf '  4) 卸载\n'
+    printf '  4) 卸载（保留数据）\n'
+    printf '  5) 卸载并删除数据\n'
     printf '  0) 退出\n\n'
-    read -r -p "请选择 [0-4]: " choice
+    read -r -p "请选择 [0-5]: " choice
     case "$choice" in
         1) do_install ;;
         2) do_update ;;
         3) do_password ;;
-        4) do_uninstall ;;
+        4) PURGE_DATA=0; UNINSTALL_KEEP_DATA=1; do_uninstall ;;
+        5) PURGE_DATA=1; UNINSTALL_KEEP_DATA=0; do_uninstall ;;
         0) exit 0 ;;
         *) fail "无效选项" ;;
     esac
