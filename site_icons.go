@@ -213,20 +213,29 @@ func (p SiteIconPack) icon(name string) (SiteIcon, bool) {
 	return SiteIcon{}, false
 }
 
-func (p SiteIconPack) normalizeSelection(name, imageURL string) (string, string, error) {
+// validateNewSelection validates a selection the operator is actively making
+// against the currently loaded icon pack. Existing persisted selections are
+// intentionally handled by the site update path so replacing a pack cannot
+// invalidate unrelated edits.
+func (p SiteIconPack) validateNewSelection(name, imageURL string) (string, string, error) {
 	name, imageURL, err := normalizeSiteIconSelection(name, imageURL)
 	if err != nil || name == "" {
 		return name, imageURL, err
 	}
-	if icon, ok := p.icon(name); ok {
-		if imageURL != icon.URL {
-			return "", "", errors.New("icon url does not match the selected icon pack entry")
-		}
-		return icon.Name, icon.URL, nil
+	icon, ok := p.icon(name)
+	if !ok {
+		return "", "", errors.New("selected icon does not exist in the current icon pack")
 	}
-	// Keep an existing selection usable after an icon pack is replaced. The URL
-	// has already passed the strict HTTPS validation above.
-	return name, imageURL, nil
+	if imageURL != icon.URL {
+		return "", "", errors.New("icon url does not match the selected icon pack entry")
+	}
+	return icon.Name, icon.URL, nil
+}
+
+// normalizeSelection is kept as a compatibility name for callers that mean
+// an explicit picker selection. It is deliberately strict for new values.
+func (p SiteIconPack) normalizeSelection(name, imageURL string) (string, string, error) {
+	return p.validateNewSelection(name, imageURL)
 }
 
 func iconPackUpdatedAt() string { return time.Now().UTC().Format(time.RFC3339) }

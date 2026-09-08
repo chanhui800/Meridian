@@ -46,6 +46,7 @@ type SiteNodeSchedule struct {
 	AgentRequestCount    int64  `json:"agent_request_count"`
 	AgentLastRequestAtMS int64  `json:"agent_last_request_at_ms"`
 	AgentLastStatus      int    `json:"agent_last_status"`
+	ConfigPendingSinceMS int64  `json:"config_pending_since_ms"`
 	UpdatedAtMS          int64  `json:"updated_at_ms"`
 	cfZoneID             string
 	cfRecordID           string
@@ -110,7 +111,7 @@ func scanSiteNodeSchedule(scanner interface{ Scan(...any) error }) (SiteNodeSche
 	err := scanner.Scan(&value.SiteID, &value.SiteName, &value.PublicHost, &enabled, &value.Mode, &fixed, &desired, &applied,
 		&value.cfZoneID, &value.cfRecordID, &value.cfRecordType, &value.AppliedAddress, &value.DNSStatus,
 		&value.ConfigHash, &value.LastError, &value.DesiredNodeName, &value.AppliedNodeName, &value.AppliedNodePort,
-		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.UpdatedAtMS)
+		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.ConfigPendingSinceMS, &value.UpdatedAtMS)
 	value.Enabled = enabled != 0
 	if fixed.Valid {
 		value.FixedNodeID = fixed.Int64
@@ -128,7 +129,7 @@ const siteNodeScheduleSelect = `SELECT s.id,s.name,s.public_host,COALESCE(n.enab
 	n.fixed_node_id,n.desired_node_id,n.applied_node_id,COALESCE(n.cf_zone_id,''),COALESCE(n.cf_record_id,''),
 	COALESCE(n.cf_record_type,''),COALESCE(n.applied_address,''),COALESCE(n.dns_status,'disabled'),
 	COALESCE(n.config_hash,''),COALESCE(n.last_error,''),COALESCE(d.name,''),COALESCE(an.name,''),COALESCE(an.https_port,0),
-	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.updated_at_ms,0)
+	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.config_pending_since_ms,0),COALESCE(n.updated_at_ms,0)
 	FROM sites s LEFT JOIN site_node_schedules n ON n.site_id=s.id
 	LEFT JOIN control_nodes d ON d.id=n.desired_node_id LEFT JOIN control_nodes an ON an.id=n.applied_node_id`
 
@@ -190,15 +191,38 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 	} else if mode != "fixed" {
 		fixedNodeID = 0
 	}
+	var oldEnabled int
+	var oldMode string
+	var oldFixed sql.NullInt64
+	var oldPendingSince int64
+	lookupErr := d.db.QueryRow("SELECT enabled,mode,fixed_node_id,config_pending_since_ms FROM site_node_schedules WHERE site_id=?", siteID).
+		Scan(&oldEnabled, &oldMode, &oldFixed, &oldPendingSince)
+	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+		return SiteNodeSchedule{}, lookupErr
+	}
+	pendingSince := int64(0)
+	if enabled {
+		pendingSince = now.UnixMilli()
+		oldFixedID := int64(0)
+		if oldFixed.Valid {
+			oldFixedID = oldFixed.Int64
+		}
+		if lookupErr == nil && oldEnabled != 0 && oldMode == mode && oldFixedID == fixedNodeID {
+			// Saving an unchanged form must not restart the configuration
+			// application deadline. Only a real assignment/config change starts it.
+			pendingSince = oldPendingSince
+		}
+	}
 	status := "disabled"
 	if enabled {
 		status = "pending"
 	}
 	_, err = d.db.Exec(`INSERT INTO site_node_schedules
-		(site_id,enabled,mode,fixed_node_id,dns_status,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id) DO UPDATE SET enabled=excluded.enabled,mode=excluded.mode,
-		fixed_node_id=excluded.fixed_node_id,dns_status=excluded.dns_status,last_error='',updated_at_ms=excluded.updated_at_ms`,
-		siteID, sqliteBool(enabled), mode, nullableNodeID(fixedNodeID), status, now.UnixMilli(), now.UnixMilli())
+		(site_id,enabled,mode,fixed_node_id,dns_status,config_pending_since_ms,created_at_ms,updated_at_ms)
+		VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(site_id) DO UPDATE SET enabled=excluded.enabled,mode=excluded.mode,
+		fixed_node_id=excluded.fixed_node_id,dns_status=excluded.dns_status,config_pending_since_ms=excluded.config_pending_since_ms,
+		last_error='',updated_at_ms=excluded.updated_at_ms`,
+		siteID, sqliteBool(enabled), mode, nullableNodeID(fixedNodeID), status, pendingSince, now.UnixMilli(), now.UnixMilli())
 	if err != nil {
 		return SiteNodeSchedule{}, err
 	}
@@ -354,9 +378,14 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		if desired != value.DesiredNodeID {
 			status = "pending"
 		}
-		if desired != value.DesiredNodeID || status != value.DNSStatus || lastError != value.LastError {
-			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
-				nullableNodeID(desired), status, lastError, now.UnixMilli(), value.SiteID); err != nil {
+		if desired != value.DesiredNodeID {
+			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,config_pending_since_ms=?,updated_at_ms=? WHERE site_id=?`,
+				nullableNodeID(desired), status, lastError, now.UnixMilli(), now.UnixMilli(), value.SiteID); err != nil {
+				return err
+			}
+		} else if status != value.DNSStatus || lastError != value.LastError {
+			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
+				status, lastError, now.UnixMilli(), value.SiteID); err != nil {
 				return err
 			}
 		}
@@ -745,7 +774,10 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	_, err = a.db.db.Exec("UPDATE site_node_schedules SET config_hash=?,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?", config.ConfigHash, now.UnixMilli(), node.ID)
+	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET
+		config_pending_since_ms=CASE WHEN config_hash<>? THEN ? ELSE config_pending_since_ms END,
+		config_hash=?,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?`,
+		config.ConfigHash, now.UnixMilli(), config.ConfigHash, now.UnixMilli(), node.ID)
 	return config, err
 }
 
@@ -1111,8 +1143,8 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 				var schedulerMode string
 				if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
 					shouldCooldown := readiness.Kind == readinessCertificate || readiness.Kind == readinessListener || readiness.Kind == readinessProbe
-					if readiness.Kind == readinessConfig && value.UpdatedAtMS > 0 {
-						shouldCooldown = now.Sub(time.UnixMilli(value.UpdatedAtMS)) >= 90*time.Second
+					if readiness.Kind == readinessConfig && value.ConfigPendingSinceMS > 0 {
+						shouldCooldown = now.Sub(time.UnixMilli(value.ConfigPendingSinceMS)) >= 90*time.Second
 					}
 					if shouldCooldown {
 						if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {

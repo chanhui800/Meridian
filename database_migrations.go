@@ -418,6 +418,7 @@ func (d *DB) migrateOnce() error {
 		dns_status TEXT NOT NULL DEFAULT 'disabled',
 		config_hash TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
+		config_pending_since_ms INTEGER NOT NULL DEFAULT 0,
 		created_at_ms INTEGER NOT NULL DEFAULT 0,
 		updated_at_ms INTEGER NOT NULL DEFAULT 0
 	);
@@ -716,6 +717,7 @@ func (d *DB) migrateOnce() error {
 		{"site_node_schedules", "agent_request_count", "ALTER TABLE site_node_schedules ADD COLUMN agent_request_count BIGINT NOT NULL DEFAULT 0"},
 		{"site_node_schedules", "agent_last_request_at_ms", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_request_at_ms INTEGER NOT NULL DEFAULT 0"},
 		{"site_node_schedules", "agent_last_status", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_status INTEGER NOT NULL DEFAULT 0"},
+		{"site_node_schedules", "config_pending_since_ms", "ALTER TABLE site_node_schedules ADD COLUMN config_pending_since_ms INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", migration.table, migration.column).Scan(&exists); err != nil {

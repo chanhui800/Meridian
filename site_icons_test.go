@@ -118,4 +118,45 @@ func TestUpdateSiteIconOnlyChangesIconMetadata(t *testing.T) {
 	if _, err := db.UpdateSiteIcon(site.ID, "", "https://cdn.example.test/emby.png"); err == nil {
 		t.Fatal("expected incomplete icon selection to be rejected")
 	}
+	if _, err := db.UpdateSiteIcon(site.ID, "Custom", "https://cdn.example.test/custom.png"); err == nil {
+		t.Fatal("unknown icon selection unexpectedly accepted")
+	}
+}
+
+func TestSiteEditPreservesIconAfterPackReplacement(t *testing.T) {
+	db, err := openDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	oldURL := "https://cdn.example.test/v1/emby.png"
+	newURL := "https://cdn.example.test/v2/emby.png"
+	if err := db.SaveSiteIconPack(SiteIconPack{Icons: []SiteIcon{{Name: "Emby", URL: oldURL}}}); err != nil {
+		t.Fatal(err)
+	}
+	site, err := db.CreateSiteRecord(Site{Name: "before", IconName: "Emby", IconURL: oldURL, ListenPort: 18097, IngressMode: ingressModePort, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: passthroughUAMode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveSiteIconPack(SiteIconPack{Icons: []SiteIcon{{Name: "Emby", URL: newURL}}}); err != nil {
+		t.Fatal(err)
+	}
+	site.Name = "after"
+	if err := db.UpdateSiteRecord(*site); err != nil {
+		t.Fatalf("editing site after icon pack replacement: %v", err)
+	}
+	updated, err := db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "after" || updated.IconName != "Emby" || updated.IconURL != oldURL {
+		t.Fatalf("site edit changed persisted icon: %#v", updated)
+	}
+	if _, err := db.UpdateSiteIcon(site.ID, "Emby", newURL); err != nil {
+		t.Fatalf("selecting replacement icon: %v", err)
+	}
+	updated, err = db.GetSite(site.ID)
+	if err != nil || updated.IconURL != newURL {
+		t.Fatalf("replacement icon not applied: %#v err=%v", updated, err)
+	}
 }

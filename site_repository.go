@@ -236,6 +236,16 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	if err != nil {
 		return nil, err
 	}
+	if site.IconName != "" {
+		pack, packErr := d.SiteIconPack()
+		if packErr != nil {
+			return nil, packErr
+		}
+		site.IconName, site.IconURL, err = pack.validateNewSelection(site.IconName, site.IconURL)
+		if err != nil {
+			return nil, err
+		}
+	}
 	site.PrimaryLineName, err = normalizePrimaryLineName(site.PrimaryLineName)
 	if err != nil {
 		return nil, err
@@ -409,7 +419,7 @@ func (d *DB) UpdateSiteIcon(id int64, name, imageURL string) (*Site, error) {
 	if err != nil {
 		return nil, err
 	}
-	name, imageURL, err = pack.normalizeSelection(name, imageURL)
+	name, imageURL, err = pack.validateNewSelection(name, imageURL)
 	if err != nil {
 		return nil, err
 	}
@@ -437,6 +447,28 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	site.IconName, site.IconURL, err = normalizeSiteIconSelection(site.IconName, site.IconURL)
 	if err != nil {
 		return err
+	}
+	// A normal site edit often round-trips the icon fields from an older pack.
+	// Preserve that exact persisted pair when it is unchanged, even if the
+	// current pack now contains the same name at a different URL. Only a new
+	// selection is checked against the current pack.
+	var storedIconName, storedIconURL string
+	iconLookupErr := d.db.QueryRow("SELECT icon_name,icon_url FROM sites WHERE id=?", site.ID).Scan(&storedIconName, &storedIconURL)
+	if iconLookupErr != nil && !errors.Is(iconLookupErr, sql.ErrNoRows) {
+		return iconLookupErr
+	}
+	unchangedIcon := iconLookupErr == nil && strings.EqualFold(strings.TrimSpace(site.IconName), strings.TrimSpace(storedIconName)) && site.IconURL == storedIconURL
+	if unchangedIcon {
+		site.IconName, site.IconURL = storedIconName, storedIconURL
+	} else if site.IconName != "" {
+		pack, packErr := d.SiteIconPack()
+		if packErr != nil {
+			return packErr
+		}
+		site.IconName, site.IconURL, err = pack.validateNewSelection(site.IconName, site.IconURL)
+		if err != nil {
+			return err
+		}
 	}
 	site.PrimaryLineName, err = normalizePrimaryLineName(site.PrimaryLineName)
 	if err != nil {

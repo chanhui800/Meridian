@@ -163,7 +163,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meridian-release-binaries
-          path: meridian-*
+          path: |
+            meridian-*
+            install.sh
 
   release:
     needs: [verify, build, docker]
@@ -183,13 +185,14 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
-        run: sha256sum meridian-* > SHA256SUMS
+        run: sha256sum meridian-* install.sh > SHA256SUMS
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.2
         with:
           subject-path: |
             meridian-*
+            install.sh
             SHA256SUMS
 
       - name: Create Release
@@ -198,6 +201,7 @@ jobs:
           tag_name: ${{ needs.verify.outputs.release_tag }}
           files: |
             meridian-*
+            install.sh
             SHA256SUMS
           generate_release_notes: true
           draft: true

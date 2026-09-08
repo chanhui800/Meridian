@@ -520,6 +520,20 @@ type edgeAgentRuntime struct {
 	siteReported         map[int64]ProxyRuntimeStat
 	resolver             dynamicIPResolver
 	transport            dynamicTransportFactory
+	listen               func(string, string) (net.Listener, error)
+}
+
+type edgeAgentRuntimeState struct {
+	port                 int
+	server               *http.Server
+	bundle               *edgeProxyBundle
+	nodeGUID             string
+	certificate          *tls.Certificate
+	handler              http.Handler
+	cacheClearGeneration int64
+	siteCounterEpoch     uint64
+	siteReported         map[int64]ProxyRuntimeStat
+	listenerError        string
 }
 
 func (runtime *edgeAgentRuntime) queueEvent(event NodeRequestEvent) {
@@ -1029,7 +1043,11 @@ func (runtime *edgeAgentRuntime) stopServer() {
 }
 
 func (runtime *edgeAgentRuntime) startServer(port int) error {
-	listener, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	listen := runtime.listen
+	if listen == nil {
+		listen = net.Listen
+	}
+	listener, err := listen("tcp", ":"+strconv.Itoa(port))
 	if err != nil {
 		return err
 	}
@@ -1046,6 +1064,44 @@ func (runtime *edgeAgentRuntime) startServer(port int) error {
 		}
 	}()
 	return nil
+}
+
+// rollbackApply restores the in-memory candidate state and, when the old
+// listener was stopped for the attempted transition, puts that listener back.
+// A failed listener restore is part of the returned error; silently reporting
+// the old state as healthy would leave the Agent unreachable while its status
+// claims that the rollback succeeded.
+func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listenerWasStopped, newServerStarted bool, cause error) error {
+	if newServerStarted {
+		runtime.stopServer()
+	}
+	runtime.mu.Lock()
+	runtime.nodeGUID = old.nodeGUID
+	runtime.port = old.port
+	runtime.certificate = old.certificate
+	runtime.handler = old.handler
+	runtime.bundle = old.bundle
+	runtime.cacheClearGeneration = old.cacheClearGeneration
+	runtime.siteCounterEpoch = old.siteCounterEpoch
+	runtime.siteReported = old.siteReported
+	runtime.listenerError = old.listenerError
+	if listenerWasStopped {
+		runtime.server = nil
+	} else {
+		runtime.server = old.server
+	}
+	runtime.mu.Unlock()
+	if listenerWasStopped && old.server != nil {
+		if err := runtime.startServer(old.port); err != nil {
+			restoreErr := fmt.Errorf("restore old listener on port %d: %w", old.port, err)
+			runtime.mu.Lock()
+			runtime.listenerError = restoreErr.Error()
+			runtime.server = nil
+			runtime.mu.Unlock()
+			return errors.Join(cause, restoreErr)
+		}
+	}
+	return cause
 }
 
 func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
@@ -1069,17 +1125,20 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 		return err
 	}
 	runtime.mu.RLock()
-	oldPort, oldServer, oldBundle := runtime.port, runtime.server, runtime.bundle
-	oldNodeGUID, oldCertificate, oldHandler := runtime.nodeGUID, runtime.certificate, runtime.handler
-	oldCacheClearGeneration := runtime.cacheClearGeneration
-	oldSiteCounterEpoch := runtime.siteCounterEpoch
+	oldState := edgeAgentRuntimeState{
+		port: runtime.port, server: runtime.server, bundle: runtime.bundle,
+		nodeGUID: runtime.nodeGUID, certificate: runtime.certificate, handler: runtime.handler,
+		cacheClearGeneration: runtime.cacheClearGeneration, siteCounterEpoch: runtime.siteCounterEpoch,
+		listenerError: runtime.listenerError,
+	}
 	oldSiteReported := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
 	for siteID, value := range runtime.siteReported {
 		oldSiteReported[siteID] = value
 	}
 	runtime.mu.RUnlock()
+	oldState.siteReported = oldSiteReported
 	needsListener := len(config.Routes) > 0
-	listenerChanged := oldPort != config.HTTPSPort || (oldServer == nil) != !needsListener
+	listenerChanged := oldState.port != config.HTTPSPort || (oldState.server == nil) != !needsListener
 	if listenerChanged {
 		runtime.stopServer()
 	}
@@ -1099,45 +1158,19 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	if listenerChanged && needsListener {
 		if err := runtime.startServer(config.HTTPSPort); err != nil {
 			bundle.close()
-			runtime.mu.Lock()
-			runtime.nodeGUID = oldNodeGUID
-			runtime.port = oldPort
-			runtime.certificate = oldCertificate
-			runtime.handler = oldHandler
-			runtime.bundle = oldBundle
-			runtime.siteCounterEpoch = oldSiteCounterEpoch
-			runtime.siteReported = oldSiteReported
-			runtime.listenerError = err.Error()
-			runtime.mu.Unlock()
-			if oldServer != nil {
-				_ = runtime.startServer(oldPort)
-			}
-			return err
+			return runtime.rollbackApply(oldState, listenerChanged, false, err)
 		}
 		newServerStarted = true
 	}
-	if config.CacheClearGeneration > oldCacheClearGeneration {
+	if config.CacheClearGeneration > oldState.cacheClearGeneration {
 		if err := bundle.manager.ClearAssetCache(); err != nil {
-			// The candidate listener is already bound at this point. Stop it
-			// before restoring the old runtime, otherwise the failed apply leaks a
-			// server that is no longer represented by runtime.server.
+			// Close the candidate listener before tearing down its proxy bundle;
+			// otherwise a request racing the rollback could observe a closed bundle.
 			if newServerStarted {
 				runtime.stopServer()
 			}
 			bundle.close()
-			runtime.mu.Lock()
-			runtime.nodeGUID = oldNodeGUID
-			runtime.port = oldPort
-			runtime.certificate = oldCertificate
-			runtime.handler = oldHandler
-			runtime.bundle = oldBundle
-			runtime.siteCounterEpoch = oldSiteCounterEpoch
-			runtime.siteReported = oldSiteReported
-			runtime.mu.Unlock()
-			if oldServer != nil {
-				_ = runtime.startServer(oldPort)
-			}
-			return err
+			return runtime.rollbackApply(oldState, listenerChanged, false, err)
 		}
 	}
 	runtime.mu.Lock()
@@ -1148,11 +1181,11 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
 	}
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
-	if oldBundle != nil {
+	if oldState.bundle != nil {
 		// A config refresh must not cancel requests that were admitted by the
 		// previous bundle. Stop accepting new requests on it, let active streams
 		// drain, and only force-close them after the bounded grace period.
-		go oldBundle.drain(15 * time.Second)
+		go oldState.bundle.drain(15 * time.Second)
 	}
 	return nil
 }
