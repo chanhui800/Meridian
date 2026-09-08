@@ -88,6 +88,48 @@ func TestControlNodeEnrollmentTrafficAndDelete(t *testing.T) {
 	}
 }
 
+func TestUpdateControlNodePortInvalidatesRuntimeConfig(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 12, 30, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "runtime-node", Address: "203.0.113.152", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "runtime-site", PublicHost: "runtime.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	const appliedHash = "runtime-config-v1"
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET desired_config_hash=?,applied_config_hash=? WHERE id=?`, appliedHash, appliedHash, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,config_hash=?,config_pending_since_ms=0 WHERE site_id=?`, node.ID, node.ID, appliedHash, site.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := app.db.UpdateControlNode(node.ID, NodeCreateInput{
+		Name: node.Name, Address: node.Address, Port: 9091, Priority: node.Priority,
+		TrafficQuota: node.TrafficQuota, BillingMode: node.BillingMode, ResetDay: node.ResetDay,
+		TrafficManualOffsetBytes: node.TrafficManualOffset,
+	}, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DesiredConfigHash != "" {
+		t.Fatalf("port change left desired config hash=%q", updated.DesiredConfigHash)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.ConfigHash != "" || schedule.ConfigPendingSinceMS != now.Add(time.Second).UnixMilli() {
+		t.Fatalf("port change did not invalidate schedule: %#v", schedule)
+	}
+}
+
 func TestRecordNodeReportPersistsAndClearsApplyError(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()
@@ -564,6 +606,58 @@ func TestAgentConfigPollingDoesNotResetPendingSince(t *testing.T) {
 	}
 	if clearedSchedule.ConfigPendingSinceMS != 0 {
 		t.Fatalf("applied config did not clear pending timer: %#v", clearedSchedule)
+	}
+}
+
+func TestAgentColdStartMismatchStartsPendingConfigTimer(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 14, 15, 0, 0, time.UTC)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "cold-start-node", Address: "203.0.113.151", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "cold-start-site", PublicHost: "cold-start.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	const desiredHash = "cold-start-config-v1"
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET desired_config_hash=?,applied_config_hash='' WHERE id=?`, desiredHash, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,config_hash=?,config_pending_since_ms=0 WHERE site_id=?`, node.ID, desiredHash, site.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The Agent has restarted and has not applied the desired hash yet. The
+	// first heartbeat must start the pending clock even though the hash itself
+	// did not change during this process restart.
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "cold-boot", Sequence: 1, InterfaceName: "eth0"}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.ConfigPendingSinceMS != now.Add(time.Second).UnixMilli() {
+		t.Fatalf("cold-start mismatch pending_since=%d, want %d", schedule.ConfigPendingSinceMS, now.Add(time.Second).UnixMilli())
+	}
+
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "cold-boot", Sequence: 2, InterfaceName: "eth0", AppliedConfigHash: desiredHash}, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err = app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.ConfigPendingSinceMS != 0 {
+		t.Fatalf("matching applied hash did not clear pending timer: %#v", schedule)
 	}
 }
 

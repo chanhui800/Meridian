@@ -591,19 +591,37 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	if err != nil {
 		return ControlNode{}, err
 	}
-	current, err := d.controlNodeByID(id, now)
+	// Read the timezone before opening the write transaction. The database is
+	// intentionally configured with a single SQLite connection, so issuing a
+	// nested query while the transaction is open would deadlock.
+	scheduleTimezone := d.currentSystemSettings().ScheduleTimezone
+	tx, err := d.db.Begin()
 	if err != nil {
 		return ControlNode{}, err
 	}
+	defer tx.Rollback()
+	var currentAddress string
+	var currentPort, currentResetDay int
+	if err := tx.QueryRow("SELECT address,https_port,reset_day FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentPort, &currentResetDay); errors.Is(err, sql.ErrNoRows) {
+		return ControlNode{}, errNodeNotFound
+	} else if err != nil {
+		return ControlNode{}, err
+	}
+
+	// Address and HTTPS port are part of the Agent's runtime reachability.
+	// Changing either one must invalidate the applied config before the next
+	// scheduler reconciliation; otherwise the scheduler can probe an old
+	// endpoint while the node still advertises the old config hash.
+	runtimeChanged := strings.TrimSpace(currentAddress) != strings.TrimSpace(input.Address) || currentPort != input.Port
 	var result sql.Result
-	if current.ResetDay != input.ResetDay {
-		cycleStart := nodeCycleStart(now, input.ResetDay, d.currentSystemSettings().ScheduleTimezone)
-		result, err = d.db.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
-			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
+	if currentResetDay != input.ResetDay {
+		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
+			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, sqliteBool(runtimeChanged), now.UnixMilli(), id)
 	} else {
-		result, err = d.db.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, sqliteBool(runtimeChanged), now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -617,6 +635,18 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	}
 	if rows != 1 {
 		return ControlNode{}, errNodeNotFound
+	}
+	if runtimeChanged {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET
+			config_hash='',
+			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
+			updated_at_ms=?
+			WHERE desired_node_id=? OR applied_node_id=?`, now.UnixMilli(), now.UnixMilli(), id, id); err != nil {
+			return ControlNode{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ControlNode{}, err
 	}
 	return d.controlNodeByID(id, now)
 }
@@ -1200,9 +1230,24 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
 	}
-	if appliedHash := strings.TrimSpace(report.AppliedConfigHash); appliedHash != "" && appliedHash == strings.TrimSpace(desiredConfigHash) {
-		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_pending_since_ms=0
-			WHERE enabled=1 AND desired_node_id=? AND config_hash=? AND config_pending_since_ms>0`, id, appliedHash); err != nil {
+	// A cold-started Agent may report before it has successfully applied the
+	// desired runtime config. Start the scheduler's pending clock from that
+	// report even when the config hash itself did not change (for example after
+	// an Agent process restart). Without this, a persistent apply failure leaves
+	// config_pending_since_ms at zero and the automatic failover cooldown can
+	// never begin.
+	appliedHash := strings.TrimSpace(report.AppliedConfigHash)
+	desiredHash := strings.TrimSpace(desiredConfigHash)
+	if desiredHash != "" && appliedHash != desiredHash {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET
+			config_pending_since_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE config_pending_since_ms END,
+			updated_at_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE updated_at_ms END
+			WHERE enabled=1 AND desired_node_id=? AND config_hash=?`, now.UnixMilli(), now.UnixMilli(), id, desiredHash); err != nil {
+			return nodeReportCommitResult{}, err
+		}
+	} else if appliedHash != "" && appliedHash == desiredHash {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_pending_since_ms=0,updated_at_ms=?
+			WHERE enabled=1 AND desired_node_id=? AND config_hash=? AND config_pending_since_ms>0`, now.UnixMilli(), id, appliedHash); err != nil {
 			return nodeReportCommitResult{}, err
 		}
 	}
