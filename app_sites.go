@@ -815,20 +815,25 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, http.StatusBadRequest, "icon_name and icon_url must be provided together")
 				return
 			}
-			candidate.IconName, candidate.IconURL, err = normalizeSiteIconSelection(*req.IconName, *req.IconURL)
+			incomingName, incomingURL, normalizeErr := normalizeSiteIconSelection(*req.IconName, *req.IconURL)
+			err = normalizeErr
 			if err != nil {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			pack, packErr := a.db.SiteIconPack()
-			if packErr != nil {
-				a.jsonErr(w, http.StatusInternalServerError, "读取站点图标包失败")
-				return
-			}
-			candidate.IconName, candidate.IconURL, err = pack.normalizeSelection(candidate.IconName, candidate.IconURL)
-			if err != nil {
-				a.jsonErr(w, http.StatusBadRequest, err.Error())
-				return
+			if strings.EqualFold(incomingName, oldSite.IconName) && incomingURL == oldSite.IconURL {
+				candidate.IconName, candidate.IconURL = oldSite.IconName, oldSite.IconURL
+			} else {
+				pack, packErr := a.db.SiteIconPack()
+				if packErr != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "读取站点图标包失败")
+					return
+				}
+				candidate.IconName, candidate.IconURL, err = pack.validateNewSelection(incomingName, incomingURL)
+				if err != nil {
+					a.jsonErr(w, http.StatusBadRequest, err.Error())
+					return
+				}
 			}
 		}
 		candidate.ListenPort = listenPort

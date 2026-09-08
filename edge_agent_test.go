@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -26,6 +27,26 @@ func testEdgeRuntimeKey(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return base64.RawURLEncoding.EncodeToString(value)
+}
+
+func TestEdgeAgentRollbackSurfacesListenerRestoreFailure(t *testing.T) {
+	cause := errors.New("clear asset cache failed")
+	listenErr := errors.New("address already in use")
+	runtime := &edgeAgentRuntime{listen: func(string, string) (net.Listener, error) {
+		return nil, listenErr
+	}}
+	oldServer := &http.Server{}
+	err := runtime.rollbackApply(edgeAgentRuntimeState{port: 9090, server: oldServer}, true, false, cause)
+	if !errors.Is(err, cause) || !errors.Is(err, listenErr) {
+		t.Fatalf("rollback error=%v, want cause and listener error", err)
+	}
+	if runtime.server != nil {
+		t.Fatal("runtime retained a server after listener restore failed")
+	}
+	_, listenerError := runtime.status()
+	if !strings.Contains(listenerError, "restore old listener on port 9090") {
+		t.Fatalf("listener error=%q, want restore failure", listenerError)
+	}
 }
 
 func TestEdgeEventSpoolUsesIndependentKeyAcrossReenrollment(t *testing.T) {

@@ -1072,9 +1072,9 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 
 	var id, lastSequence, lastRX, lastTX int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID string
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration)
+	var lastBootID, lastSessionID, desiredConfigHash string
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1133,6 +1133,12 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
 		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
+	}
+	if appliedHash := strings.TrimSpace(report.AppliedConfigHash); appliedHash != "" && appliedHash == strings.TrimSpace(desiredConfigHash) {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_pending_since_ms=0
+			WHERE enabled=1 AND desired_node_id=? AND config_hash=? AND config_pending_since_ms>0`, id, appliedHash); err != nil {
+			return nodeReportCommitResult{}, err
+		}
 	}
 
 	for _, stat := range report.SiteStats {

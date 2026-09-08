@@ -455,6 +455,69 @@ func TestSiteNodeSchedulingIsOptInAndCanFollowGlobalNode(t *testing.T) {
 	}
 }
 
+func TestAgentConfigPollingDoesNotResetPendingSince(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 14, 0, 0, 0, time.UTC)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "config-node", Address: "203.0.113.15", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "config-boot", Sequence: 1, InterfaceName: "eth0", AgentVersion: "test"}, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "config-site", PublicHost: "config.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	// A config request with no enabled site routes still exercises the exact
+	// schedule hash update used by real Agents, without requiring a certificate.
+	if _, err := app.db.db.Exec("UPDATE sites SET enabled=0 WHERE id=?", site.ID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := app.buildAgentConfigForPlatform(agentToken, now.Add(time.Second), "")
+	if err != nil {
+		t.Fatalf("first config: %v", err)
+	}
+	firstSchedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSchedule.ConfigPendingSinceMS == 0 || first.ConfigHash == "" {
+		t.Fatalf("initial config did not start pending timer: schedule=%#v config=%#v", firstSchedule, first)
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "config-boot", Sequence: 2, InterfaceName: "eth0", AgentVersion: "test"}, now.Add(60*time.Second)); err != nil {
+		t.Fatalf("keep node online for polling: %v", err)
+	}
+	second, err := app.buildAgentConfigForPlatform(agentToken, now.Add(60*time.Second), "")
+	if err != nil {
+		t.Fatalf("polled config: %v", err)
+	}
+	secondSchedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondSchedule.ConfigPendingSinceMS != firstSchedule.ConfigPendingSinceMS {
+		t.Fatalf("config polling reset pending timer: first=%d second=%d hashes=%q/%q", firstSchedule.ConfigPendingSinceMS, secondSchedule.ConfigPendingSinceMS, first.ConfigHash, second.ConfigHash)
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, NodeReport{BootID: "config-boot", Sequence: 3, InterfaceName: "eth0", AgentVersion: "test", AppliedConfigHash: second.ConfigHash}, now.Add(70*time.Second)); err != nil {
+		t.Fatalf("applied config report: %v", err)
+	}
+	clearedSchedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clearedSchedule.ConfigPendingSinceMS != 0 {
+		t.Fatalf("applied config did not clear pending timer: %#v", clearedSchedule)
+	}
+}
+
 func TestSiteNodeAutoSchedulingFallsBackAfterProbeCooldown(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 8, 30, 15, 0, 0, 0, time.UTC)
