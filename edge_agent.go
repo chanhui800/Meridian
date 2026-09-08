@@ -911,6 +911,12 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
+		// Site icons are Controller/UI metadata. The Agent's ephemeral site
+		// database has no uploaded icon pack, so carrying these fields into
+		// CreateSiteRecord would make an otherwise valid runtime config fail
+		// with “selected icon does not exist in the current icon pack”.
+		site.IconName = ""
+		site.IconURL = ""
 		site.PublicHost = strings.ToLower(strings.TrimSpace(route.Host))
 		site.IngressMode = ingressModeHost
 		site.PathPrefix = ""

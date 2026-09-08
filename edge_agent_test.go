@@ -64,6 +64,33 @@ func TestEdgeAgentApplyFailureIsExposedInRuntimeStatus(t *testing.T) {
 	}
 }
 
+func TestBuildEdgeProxyIgnoresControllerOnlySiteIconMetadata(t *testing.T) {
+	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+	config := AgentRuntimeConfig{
+		SchemaVersion: 1,
+		NodeGUID:      "edge-icon-node",
+		HTTPSPort:     19090,
+		DynamicKey:    testEdgeRuntimeKey(t),
+		Routes: []AgentSiteRoute{{
+			SiteID:    17,
+			Host:      "icon.example.test",
+			TargetURL: "http://127.0.0.1:18096",
+			Site: Site{
+				Name: "Icon site", PublicHost: "icon.example.test", IngressMode: ingressModeHost,
+				TargetURL: "http://127.0.0.1:18096", PlaybackMode: "direct", MainVideoStreamMode: "proxy",
+				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
+				IconName: "Emby", IconURL: "https://icons.example.test/emby.png",
+			},
+			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: "[]", DynamicRules: "[]",
+		}},
+	}
+	bundle, err := buildEdgeProxy(config, runtime)
+	if err != nil {
+		t.Fatalf("build edge proxy with UI icon metadata: %v", err)
+	}
+	bundle.close()
+}
+
 func TestEdgeEventSpoolUsesIndependentKeyAcrossReenrollment(t *testing.T) {
 	dir := t.TempDir()
 	key := make([]byte, 32)
