@@ -7456,11 +7456,24 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
   line-height: 1.2;
 }
 
-/* Keep the first column heading aligned with the centered icon/name group
-   beneath it. Other dashboard table columns retain their default alignment. */
+/* Keep the first column heading aligned with the site name track beneath it.
+   The empty first track mirrors the circular icon so the heading does not
+   drift toward the middle of the widened mobile column. */
+.dashboard-site-column-heading {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+}
+.dashboard-site-column-heading > span:first-child {
+  display: block;
+  width: 54px;
+  height: 1px;
+}
 .dashboard-site-status table th:first-child,
 .dashboard-site-status table td:first-child {
-  text-align: center;
+  text-align: left;
 }
 
 @media (max-width: 768px) {

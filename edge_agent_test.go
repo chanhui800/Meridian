@@ -91,6 +91,48 @@ func TestBuildEdgeProxyIgnoresControllerOnlySiteIconMetadata(t *testing.T) {
 	bundle.close()
 }
 
+func TestEdgeProxyReportsMediaCountsWithCentralSiteID(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isMediaLibraryCountsPath(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"MovieCount":12,"SeriesCount":34,"EpisodeCount":56}`)
+	}))
+	defer upstream.Close()
+	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+	config := AgentRuntimeConfig{
+		SchemaVersion: 1, NodeGUID: "media-count-node", HTTPSPort: 19090, DynamicKey: testEdgeRuntimeKey(t),
+		Routes: []AgentSiteRoute{{
+			SiteID: 73, Host: "counts.example.test", TargetURL: upstream.URL,
+			Site: Site{
+				Name: "counts", PublicHost: "counts.example.test", IngressMode: ingressModeHost,
+				TargetURL: upstream.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy",
+				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
+			},
+			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: "[]", DynamicRules: "[]",
+		}},
+	}
+	bundle, err := buildEdgeProxy(config, runtime)
+	if err != nil {
+		t.Fatalf("build edge proxy: %v", err)
+	}
+	defer bundle.close()
+	response := httptest.NewRecorder()
+	bundle.handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://counts.example.test/Items/Counts", nil))
+	if response.Code != http.StatusOK || response.Body.String() != `{"MovieCount":12,"SeriesCount":34,"EpisodeCount":56}` {
+		t.Fatalf("media count response = %d %q", response.Code, response.Body.String())
+	}
+	media, _, _ := runtime.telemetrySnapshot()
+	if len(media) != 1 {
+		t.Fatalf("media telemetry = %#v, want one event", media)
+	}
+	if media[0].SiteID != 73 || media[0].MovieCount != 12 || media[0].SeriesCount != 34 || media[0].EpisodeCount != 56 {
+		t.Fatalf("media telemetry = %#v, want central site 73 with counts", media[0])
+	}
+}
+
 func TestEdgeEventSpoolUsesIndependentKeyAcrossReenrollment(t *testing.T) {
 	dir := t.TempDir()
 	key := make([]byte, 32)

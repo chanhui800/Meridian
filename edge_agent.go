@@ -568,6 +568,37 @@ type edgeTelemetryEvent struct {
 	Observation dynamicObservationEvent
 }
 
+// edgeTelemetryEventSiteID converts the ephemeral site ID used by the
+// Agent's in-memory proxy database back to the stable Controller site ID.
+// Runtime routes are rebuilt from every config apply, so their local
+// auto-increment IDs must never cross the Agent report boundary.
+func edgeTelemetryEventSiteID(event edgeTelemetryEvent, localSites map[int64]edgeSiteIdentity) (edgeTelemetryEvent, bool) {
+	var localID int64
+	switch event.Kind {
+	case "media_counts":
+		localID = event.Media.SiteID
+	case "retention":
+		localID = event.Retention.SiteID
+	case "observation":
+		localID = event.Observation.SiteID
+	default:
+		return event, false
+	}
+	identity, ok := localSites[localID]
+	if !ok || identity.centralID <= 0 {
+		return event, false
+	}
+	switch event.Kind {
+	case "media_counts":
+		event.Media.SiteID = identity.centralID
+	case "retention":
+		event.Retention.SiteID = identity.centralID
+	case "observation":
+		event.Observation.SiteID = identity.centralID
+	}
+	return event, true
+}
+
 func (runtime *edgeAgentRuntime) recordTelemetry(event edgeTelemetryEvent) {
 	if runtime == nil {
 		return
@@ -901,8 +932,14 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		return nil, err
 	}
 	database.edgeEphemeral = true
-	database.edgeTelemetrySink = runtime.recordTelemetry
 	bundle := &edgeProxyBundle{database: database, localSites: make(map[int64]edgeSiteIdentity)}
+	database.edgeTelemetrySink = func(event edgeTelemetryEvent) {
+		mapped, ok := edgeTelemetryEventSiteID(event, bundle.localSites)
+		if !ok {
+			return
+		}
+		runtime.recordTelemetry(mapped)
+	}
 	fail := func(err error) (*edgeProxyBundle, error) {
 		bundle.close()
 		return nil, err
