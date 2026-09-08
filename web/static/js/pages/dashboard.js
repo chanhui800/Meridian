@@ -106,7 +106,7 @@ function renderDashboard() {
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>实时网速</th><th>已用流量</th><th>缓存大小</th>
+            <th><span class="dashboard-site-column-heading"><span aria-hidden="true"></span><span>站点</span></span></th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>实时网速</th><th>已用流量</th><th>缓存大小</th>
           </tr></thead>
           <tbody id="dash-table"></tbody>
         </table>

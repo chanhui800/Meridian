@@ -227,7 +227,9 @@ test('site identity icons stay circular and transparent in cards and dashboard r
   assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?justify-content:\s*center;/);
   assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*54px\s+minmax\(0,\s*1fr\);/);
   assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?justify-self:\s*center;/);
-  assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?text-align:\s*center;/);
+  assert.match(dashboard, /dashboard-site-column-heading[\s\S]*?站点/);
+  assert.match(css, /\.dashboard-site-column-heading\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*54px\s+minmax\(0,\s*1fr\);[\s\S]*?gap:\s*12px;/);
+  assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?text-align:\s*left;/);
   assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?width:\s*42px;[\s\S]*?background:\s*transparent;/);
   assert.match(css, /\.dashboard-site-status table\s*\{[\s\S]*?min-width:\s*980px;[\s\S]*?table-layout:\s*auto;/);
   assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?min-width:\s*210px;/);
