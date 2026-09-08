@@ -7431,15 +7431,19 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
    circular icon that matches the site management cards. */
 .dashboard-site-identity {
   min-width: 0;
-  display: inline-flex;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
   align-items: center;
   justify-content: center;
   gap: 12px;
+  text-align: left;
 }
 .dashboard-site-identity .dashboard-site-icon {
   width: 42px;
   height: 42px;
   flex: 0 0 42px;
+  justify-self: center;
   border-color: color-mix(in srgb, var(--white-60) 30%, transparent);
   background: transparent;
 }
