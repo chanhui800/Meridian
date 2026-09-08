@@ -602,6 +602,9 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 		WHERE site_id=?`, nowMS, nowMS, site.ID); err != nil {
 		return err
 	}
+	if err := markAgentConfigsDirtyTx(tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -689,6 +692,9 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 			config_pending_since_ms=CASE WHEN enabled=1 AND ?=1 THEN ? ELSE 0 END,
 			updated_at_ms=?
 		WHERE site_id=?`, value, nowMS, nowMS, id); err != nil {
+		return err
+	}
+	if err := markAgentConfigsDirtyTx(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

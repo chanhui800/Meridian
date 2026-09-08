@@ -200,13 +200,20 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
 		return SiteNodeSchedule{}, lookupErr
 	}
+	oldFixedID := int64(0)
+	if oldFixed.Valid {
+		oldFixedID = oldFixed.Int64
+	}
+	unchanged := lookupErr == nil && oldEnabled == sqliteBool(enabled) && oldMode == mode && oldFixedID == fixedNodeID
+	if unchanged {
+		// Re-saving the same scheduler form is a no-op. In particular, do not
+		// turn an already active DNS record back into pending or clear its
+		// readiness fields.
+		return d.siteNodeSchedule(siteID)
+	}
 	pendingSince := int64(0)
 	if enabled {
 		pendingSince = now.UnixMilli()
-		oldFixedID := int64(0)
-		if oldFixed.Valid {
-			oldFixedID = oldFixed.Int64
-		}
 		if lookupErr == nil && oldEnabled != 0 && oldMode == mode && oldFixedID == fixedNodeID {
 			// Saving an unchanged form must not restart the configuration
 			// application deadline. Only a real assignment/config change starts it.
@@ -217,13 +224,24 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 	if enabled {
 		status = "pending"
 	}
-	_, err = d.db.Exec(`INSERT INTO site_node_schedules
+	tx, err := d.db.Begin()
+	if err != nil {
+		return SiteNodeSchedule{}, err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO site_node_schedules
 		(site_id,enabled,mode,fixed_node_id,dns_status,config_pending_since_ms,created_at_ms,updated_at_ms)
 		VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(site_id) DO UPDATE SET enabled=excluded.enabled,mode=excluded.mode,
 		fixed_node_id=excluded.fixed_node_id,dns_status=excluded.dns_status,config_pending_since_ms=excluded.config_pending_since_ms,
 		last_error='',updated_at_ms=excluded.updated_at_ms`,
 		siteID, sqliteBool(enabled), mode, nullableNodeID(fixedNodeID), status, pendingSince, now.UnixMilli(), now.UnixMilli())
 	if err != nil {
+		return SiteNodeSchedule{}, err
+	}
+	if err := markAgentConfigsDirtyTx(tx); err != nil {
+		return SiteNodeSchedule{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return SiteNodeSchedule{}, err
 	}
 	return d.siteNodeSchedule(siteID)
@@ -343,6 +361,7 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	if err != nil {
 		return err
 	}
+	assignmentsChanged := false
 	for _, value := range values {
 		if !value.Enabled {
 			continue
@@ -395,6 +414,7 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 			status = "pending"
 		}
 		if desired != value.DesiredNodeID {
+			assignmentsChanged = true
 			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,config_pending_since_ms=?,updated_at_ms=? WHERE site_id=?`,
 				nullableNodeID(desired), status, lastError, now.UnixMilli(), now.UnixMilli(), value.SiteID); err != nil {
 				return err
@@ -404,6 +424,11 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 				status, lastError, now.UnixMilli(), value.SiteID); err != nil {
 				return err
 			}
+		}
+	}
+	if assignmentsChanged {
+		if _, err := a.db.db.Exec("UPDATE control_nodes SET config_dirty=1,updated_at_ms=? WHERE enabled=1 AND agent_token_hash<>''", now.UnixMilli()); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -791,7 +816,12 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	_, err = a.db.db.Exec("UPDATE control_nodes SET desired_config_hash=?,updated_at_ms=? WHERE id=?", config.ConfigHash, now.UnixMilli(), node.ID)
+	// A configuration fetch also records the desired hash. Keep config_dirty set
+	// until a subsequent Agent report confirms that exact hash was applied.
+	_, err = a.db.db.Exec(`UPDATE control_nodes SET
+		desired_config_hash=?,
+		config_dirty=CASE WHEN desired_config_hash<>? THEN 1 ELSE config_dirty END,
+		updated_at_ms=? WHERE id=?`, config.ConfigHash, config.ConfigHash, now.UnixMilli(), node.ID)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}

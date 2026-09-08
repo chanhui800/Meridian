@@ -648,6 +648,71 @@ func validTLSNodeGUID(guid string) bool {
 	return true
 }
 
+// removeManagedEdgeNodeTLS removes only the Meridian-owned state for one
+// deleted node. External certificate paths and legacy edge-nodes directories
+// are operator-owned and are never touched here.
+func removeManagedEdgeNodeTLS(dbPath, nodeGUID string) error {
+	if strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	if !validTLSNodeGUID(nodeGUID) {
+		return errors.New("node GUID is invalid")
+	}
+	root := edgeNodeTLSRoot(dbPath)
+	if root == "" {
+		return nil
+	}
+	root = filepath.Clean(root)
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("TLS_STATE_DIR edge namespace is not a real directory")
+	}
+	target := filepath.Join(root, nodeGUID)
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return errors.New("edge TLS path escapes TLS_STATE_DIR")
+	}
+	// Refuse to follow an operator-created symlink anywhere in the path. The
+	// target may not exist, so missing ancestors are allowed after the root.
+	for current := target; ; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return errors.New("edge TLS path contains a symlink")
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		if current == root {
+			break
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return errors.New("edge TLS path has no TLS_STATE_DIR ancestor")
+		}
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return os.Remove(target)
+	}
+	return os.RemoveAll(target)
+}
+
 const (
 	legacyEdgeCertificateMaxBytes = 4 << 20
 	legacyEdgePrivateKeyMaxBytes  = 1 << 20

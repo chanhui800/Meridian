@@ -14,6 +14,7 @@ import (
 
 type DB struct {
 	db                 *sql.DB
+	dbPath             string
 	edgeEphemeral      bool
 	edgeRequestLogSink func(requestLogEvent)
 	edgeTelemetrySink  func(edgeTelemetryEvent)
@@ -47,7 +48,7 @@ func openDB(path string) (*DB, error) {
 		return nil, err
 	}
 	sqlDB.SetMaxOpenConns(1)
-	d := &DB{db: sqlDB, agentSecurityLastLog: make(map[string]time.Time)}
+	d := &DB{db: sqlDB, dbPath: path, agentSecurityLastLog: make(map[string]time.Time)}
 	if err := d.migrate(); err != nil {
 		sqlDB.Close()
 		return nil, err

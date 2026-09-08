@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +90,47 @@ func TestControlNodeEnrollmentTrafficAndDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteControlNodeRemovesOnlyManagedEdgeTLS(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "meridian.db")
+	t.Setenv("TLS_STATE_DIR", filepath.Join(dir, "tls-state"))
+	t.Setenv("EDGE_TLS_CERT_FILE", filepath.Join(dir, "external", "edge.pem"))
+	t.Setenv("EDGE_TLS_KEY_FILE", filepath.Join(dir, "external", "edge.key"))
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node, _, err := db.CreateControlNode(NodeCreateInput{Name: "tls-delete", Address: "203.0.113.10", Port: 443}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedRoot := filepath.Join(tlsStateDir(dbPath), "edge-nodes", node.GUID)
+	if err := os.MkdirAll(managedRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managedRoot, "sentinel"), []byte("managed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot := filepath.Join(filepath.Dir(filepath.Join(dir, "external", "edge.pem")), "edge-nodes")
+	if err := os.MkdirAll(filepath.Join(legacyRoot, "unrelated-node"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacySentinel := filepath.Join(legacyRoot, "unrelated-node", "sentinel.txt")
+	if err := os.WriteFile(legacySentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteControlNode(node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(managedRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed node TLS root still exists, err=%v", err)
+	}
+	if data, err := os.ReadFile(legacySentinel); err != nil || string(data) != "keep" {
+		t.Fatalf("legacy external TLS state changed: data=%q err=%v", data, err)
+	}
+}
+
 func TestUpdateControlNodePortInvalidatesRuntimeConfig(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 8, 30, 12, 30, 0, 0, time.UTC)
@@ -127,6 +170,30 @@ func TestUpdateControlNodePortInvalidatesRuntimeConfig(t *testing.T) {
 	}
 	if schedule.ConfigHash != "" || schedule.ConfigPendingSinceMS != now.Add(time.Second).UnixMilli() {
 		t.Fatalf("port change did not invalidate schedule: %#v", schedule)
+	}
+}
+
+func TestUpdateControlNodeAddressKeepsRuntimeConfig(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 12, 45, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "address-node", Address: "203.0.113.152", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const appliedHash = "address-config-v1"
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET desired_config_hash=?,applied_config_hash=? WHERE id=?`, appliedHash, appliedHash, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := app.db.UpdateControlNode(node.ID, NodeCreateInput{
+		Name: node.Name, Address: "203.0.113.153", Port: node.Port, Priority: node.Priority,
+		TrafficQuota: node.TrafficQuota, BillingMode: node.BillingMode, ResetDay: node.ResetDay,
+		TrafficManualOffsetBytes: node.TrafficManualOffset,
+	}, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DesiredConfigHash != appliedHash || updated.ConfigDirty {
+		t.Fatalf("address change invalidated runtime config: %#v", updated)
 	}
 }
 
@@ -543,6 +610,30 @@ func TestSiteNodeSchedulingIsOptInAndCanFollowGlobalNode(t *testing.T) {
 	schedule, err = app.db.siteNodeSchedule(site.ID)
 	if err != nil || schedule.DesiredNodeID != node.ID || schedule.DNSStatus == "active" {
 		t.Fatalf("assigned schedule = %#v, %v", schedule, err)
+	}
+}
+
+func TestNodeReportConfigChangedIncludesDirtyAndBlankDesiredHash(t *testing.T) {
+	if !nodeReportConfigChanged(ControlNode{DesiredConfigHash: "same", ConfigDirty: true}, "same") {
+		t.Fatal("dirty node did not request an immediate config refresh")
+	}
+	if !nodeReportConfigChanged(ControlNode{}, "") {
+		t.Fatal("blank desired hash did not request an initial config refresh")
+	}
+	if nodeReportConfigChanged(ControlNode{DesiredConfigHash: "same"}, "same") {
+		t.Fatal("matching clean hashes incorrectly requested a refresh")
+	}
+}
+
+func TestManualSchedulerRejectsUnavailableNode(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "offline-manual", Address: "203.0.113.190", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.UpdateNodeScheduler("manual", node.ID, now); !errors.Is(err, errManualNodeUnavailable) {
+		t.Fatalf("manual scheduler error=%v, want unavailable-node error", err)
 	}
 }
 

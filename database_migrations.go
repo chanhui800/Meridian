@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 33
+	databaseSchemaVersion = 35
 )
 
 func (d *DB) migrate() error {
@@ -380,6 +380,7 @@ func (d *DB) migrateOnce() error {
 		interface_name TEXT NOT NULL DEFAULT '',
 		agent_version TEXT NOT NULL DEFAULT '',
 		desired_config_hash TEXT NOT NULL DEFAULT '',
+		config_dirty INTEGER NOT NULL DEFAULT 0,
 		applied_config_hash TEXT NOT NULL DEFAULT '',
 		agent_apply_error TEXT NOT NULL DEFAULT '',
 		agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -472,6 +473,7 @@ func (d *DB) migrateOnce() error {
 		{"http_port", "ALTER TABLE control_nodes ADD COLUMN http_port INTEGER NOT NULL DEFAULT 0"},
 		{"https_port", "ALTER TABLE control_nodes ADD COLUMN https_port INTEGER NOT NULL DEFAULT 443"},
 		{"desired_config_hash", "ALTER TABLE control_nodes ADD COLUMN desired_config_hash TEXT NOT NULL DEFAULT ''"},
+		{"config_dirty", "ALTER TABLE control_nodes ADD COLUMN config_dirty INTEGER NOT NULL DEFAULT 0"},
 		{"applied_config_hash", "ALTER TABLE control_nodes ADD COLUMN applied_config_hash TEXT NOT NULL DEFAULT ''"},
 		{"agent_apply_error", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error TEXT NOT NULL DEFAULT ''"},
 		{"agent_apply_error_at_ms", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0"},
@@ -738,6 +740,16 @@ func (d *DB) migrateOnce() error {
 			}
 		}
 	}
+	if previousSchemaVersion < 34 {
+		// A pre-34 database had no durable invalidation bit. Preserve ready
+		// nodes, but force a config fetch for any node whose desired snapshot is
+		// blank or not yet applied.
+		if _, err := conn.ExecContext(ctx, `UPDATE control_nodes SET config_dirty=CASE
+			WHEN desired_config_hash='' OR desired_config_hash<>applied_config_hash THEN 1
+			ELSE config_dirty END`); err != nil {
+			return err
+		}
+	}
 	// Schema 32 introduced the per-site configuration application deadline.
 	// Older databases have no reliable timestamp for schedules that were
 	// already waiting on an Agent, so start their cooldown during migration.
@@ -770,6 +782,7 @@ func (d *DB) migrateOnce() error {
 		event_id BIGINT NOT NULL,
 		event_uid TEXT NOT NULL DEFAULT '',
 		received_at_ms INTEGER NOT NULL,
+		processed_at_ms INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY(node_id, agent_boot_id, event_id)
 	) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS idx_node_request_events_received ON node_request_events(received_at_ms);`); err != nil {
 		return err
@@ -786,6 +799,25 @@ func (d *DB) migrateOnce() error {
 	}
 	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_node_request_events_uid ON node_request_events(node_id,event_uid) WHERE event_uid <> ''"); err != nil {
 		return err
+	}
+	var processedEventColumnCount int
+	processedEventColumnAdded := false
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_request_events') WHERE name='processed_at_ms'").Scan(&processedEventColumnCount); err != nil {
+		return err
+	}
+	if processedEventColumnCount == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE node_request_events ADD COLUMN processed_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		processedEventColumnAdded = true
+	}
+	if processedEventColumnAdded {
+		// Rows recorded by older Controllers already had their request-log side
+		// effects applied before an ACK was emitted. Mark them complete so the
+		// first post-upgrade duplicate delivery does not replay history/metadata.
+		if _, err := conn.ExecContext(ctx, "UPDATE node_request_events SET processed_at_ms=received_at_ms WHERE processed_at_ms=0"); err != nil {
+			return err
+		}
 	}
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_site_counters (
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
