@@ -225,6 +225,8 @@ test('site identity icons stay circular and transparent in cards and dashboard r
   assert.match(css, /\.site-icon-button\s*\{[\s\S]*?width:\s*60px;[\s\S]*?background:\s*transparent;/);
   assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?align-items:\s*center;/);
   assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?justify-content:\s*center;/);
+  assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*54px\s+minmax\(0,\s*1fr\);/);
+  assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?justify-self:\s*center;/);
   assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?text-align:\s*center;/);
   assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?width:\s*42px;[\s\S]*?background:\s*transparent;/);
 });

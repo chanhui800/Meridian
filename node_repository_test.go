@@ -88,6 +88,54 @@ func TestControlNodeEnrollmentTrafficAndDelete(t *testing.T) {
 	}
 }
 
+func TestRecordNodeReportPersistsAndClearsApplyError(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "apply-error", Address: "203.0.113.90"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := NodeReport{BootID: "apply-boot", ReportSessionID: "apply-session", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0", AgentVersion: "test"}
+	if _, err := app.db.RecordNodeReport(token, base, now); err != nil {
+		t.Fatal(err)
+	}
+	failure := base
+	failure.Sequence = 2
+	failure.ApplyError = "listen tcp :9090: bind: address already in use"
+	reported, err := app.db.RecordNodeReport(token, failure, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported.AgentApplyError != failure.ApplyError || reported.AgentApplyFailures != 1 || reported.AgentApplyErrorAtMS != now.Add(time.Second).UnixMilli() {
+		t.Fatalf("apply failure was not persisted: %#v", reported)
+	}
+	failure.Sequence = 3
+	reported, err = app.db.RecordNodeReport(token, failure, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported.AgentApplyFailures != 2 {
+		t.Fatalf("repeated apply failure count=%d, want 2", reported.AgentApplyFailures)
+	}
+	if _, err := app.db.db.Exec("UPDATE control_nodes SET desired_config_hash=? WHERE id=?", "config-ok", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	success := base
+	success.Sequence = 4
+	success.AppliedConfigHash = "config-ok"
+	reported, err = app.db.RecordNodeReport(token, success, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported.AgentApplyError != "" || reported.AgentApplyFailures != 0 || reported.AgentApplyErrorAtMS != 0 {
+		t.Fatalf("successful apply did not clear diagnostics: %#v", reported)
+	}
+}
+
 func TestRefreshNodeEnrollmentKeepsOldAgentUntilReplacement(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now()
@@ -640,8 +688,8 @@ func TestSchema32BackfillsPendingSiteConfigurationTimers(t *testing.T) {
 	if err := app.db.db.QueryRow("PRAGMA user_version").Scan(&schemaVersion); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 32 {
-		t.Fatalf("schema version=%d, want 32", schemaVersion)
+	if schemaVersion != databaseSchemaVersion {
+		t.Fatalf("schema version=%d, want %d", schemaVersion, databaseSchemaVersion)
 	}
 }
 

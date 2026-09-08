@@ -1066,6 +1066,12 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if err != nil {
 		return readinessError(readinessListener, err)
 	}
+	if applyErr := strings.TrimSpace(node.AgentApplyError); applyErr != "" {
+		return readinessError(readinessConfig, fmt.Errorf("Agent configuration apply failed: %s", applyErr))
+	}
+	if listenerErr := strings.TrimSpace(node.AgentListenerError); listenerErr != "" {
+		return readinessError(readinessListener, errors.New(listenerErr))
+	}
 	if !siteScheduleConfigReady(schedule, node) {
 		return readinessError(readinessConfig, errors.New("Agent has not applied the site configuration"))
 	}
@@ -1078,9 +1084,6 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	}
 	if err := certificateCoversHost(edgeCertFile, schedule.PublicHost); err != nil {
 		return readinessError(readinessCertificate, err)
-	}
-	if node.AgentListenerError != "" {
-		return readinessError(readinessListener, errors.New(node.AgentListenerError))
 	}
 	probeSecretText, err := dNodeProbeSecret(a.db, node)
 	if err != nil {

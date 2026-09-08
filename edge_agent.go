@@ -510,6 +510,7 @@ type edgeAgentRuntime struct {
 	siteCounterEpoch     uint64
 	cacheClearGeneration int64
 	listenerError        string
+	applyError           string
 	eventSpoolError      string
 	events               edgeEventStore
 	stats                edgeSiteStats
@@ -910,6 +911,12 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
+		// Site icons are Controller/UI metadata. The Agent's ephemeral site
+		// database has no uploaded icon pack, so carrying these fields into
+		// CreateSiteRecord would make an otherwise valid runtime config fail
+		// with “selected icon does not exist in the current icon pack”.
+		site.IconName = ""
+		site.IconURL = ""
 		site.PublicHost = strings.ToLower(strings.TrimSpace(route.Host))
 		site.IngressMode = ingressModeHost
 		site.PathPrefix = ""
@@ -1060,6 +1067,12 @@ func (runtime *edgeAgentRuntime) startServer(port int) error {
 	runtime.mu.Unlock()
 	go func() {
 		if err := server.Serve(tls.NewListener(listener, server.TLSConfig)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			runtime.mu.Lock()
+			if runtime.server == server {
+				runtime.listenerError = agentStatusError(err)
+				runtime.server = nil
+			}
+			runtime.mu.Unlock()
 			fmt.Fprintf(os.Stderr, "Meridian Agent listener failed: %v\n", err)
 		}
 	}()
@@ -1104,7 +1117,16 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 	return cause
 }
 
-func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) error {
+func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error) {
+	defer func() {
+		runtime.mu.Lock()
+		if retErr != nil {
+			runtime.applyError = agentStatusError(retErr)
+		} else {
+			runtime.applyError = ""
+		}
+		runtime.mu.Unlock()
+	}()
 	if err := validateAgentConfigEnvelope(config); err != nil {
 		return err
 	}
@@ -1212,10 +1234,23 @@ func validateAgentConfigEnvelope(config AgentRuntimeConfig) error {
 	return nil
 }
 
-func (runtime *edgeAgentRuntime) status() (string, string) {
+const maxAgentStatusErrorLength = 1024
+
+func agentStatusError(err error) string {
+	if err == nil {
+		return ""
+	}
+	value := strings.TrimSpace(err.Error())
+	if len(value) <= maxAgentStatusErrorLength {
+		return value
+	}
+	return value[:maxAgentStatusErrorLength]
+}
+
+func (runtime *edgeAgentRuntime) status() (string, string, string) {
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
-	return runtime.appliedHash, runtime.listenerError
+	return runtime.appliedHash, runtime.listenerError, runtime.applyError
 }
 
 func (runtime *edgeAgentRuntime) close() {
@@ -1744,10 +1779,20 @@ func runEdgeAgent() error {
 	sequence := int64(0)
 	const configRefreshInterval = 60 * time.Second
 	const agentUpdateRetryInterval = 5 * time.Minute
+	const agentApplyRetryBase = 5 * time.Second
+	const agentApplyRetryMax = 60 * time.Second
 	lastConfigAt := time.Time{}
 	lastUpdateAttempt := time.Time{}
+	nextApplyAttempt := time.Time{}
+	applyFailures := 0
+	var pendingConfig *AgentRuntimeConfig
 	for {
-		if lastConfigAt.IsZero() || time.Since(lastConfigAt) >= configRefreshInterval {
+		now := time.Now()
+		if lastConfigAt.IsZero() || now.Sub(lastConfigAt) >= configRefreshInterval {
+			// Record the attempt even when the Controller is temporarily
+			// unavailable, otherwise a network outage would create a tight fetch
+			// loop while the normal report loop is still running.
+			lastConfigAt = now
 			var config AgentRuntimeConfig
 			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, http.Header{
 				agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
@@ -1757,11 +1802,20 @@ func runEdgeAgent() error {
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else {
+				// Refresh the pending payload when the Controller sends a newer
+				// hash, but do not reset an in-progress retry backoff when the
+				// same failing configuration is fetched again after a report ACK.
+				if pendingConfig == nil || pendingConfig.ConfigHash != config.ConfigHash {
+					pendingConfig = &config
+					nextApplyAttempt = now
+					applyFailures = 0
+				} else {
+					pendingConfig = &config
+				}
 				// Applying a valid runtime configuration must not depend on the
 				// availability of the optional Agent release service. A GitHub
 				// outage should leave the current proxy converged while update
 				// retries happen independently in the background.
-				now := time.Now()
 				if lastUpdateAttempt.IsZero() || now.Sub(lastUpdateAttempt) >= agentUpdateRetryInterval {
 					lastUpdateAttempt = now
 					if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
@@ -1771,13 +1825,30 @@ func runEdgeAgent() error {
 						fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
 					}
 				}
-				applied, _ := runtime.status()
-				if config.ConfigHash != applied {
-					if err := runtime.apply(config); err != nil {
-						fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
+			}
+		}
+		if pendingConfig != nil && (nextApplyAttempt.IsZero() || !now.Before(nextApplyAttempt)) {
+			applied, _, _ := runtime.status()
+			if pendingConfig.ConfigHash == applied {
+				pendingConfig = nil
+				applyFailures = 0
+				nextApplyAttempt = time.Time{}
+			} else if err := runtime.apply(*pendingConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
+				applyFailures++
+				delay := agentApplyRetryBase
+				for attempt := 1; attempt < applyFailures && delay < agentApplyRetryMax; attempt++ {
+					delay *= 2
+					if delay >= agentApplyRetryMax {
+						delay = agentApplyRetryMax
+						break
 					}
 				}
-				lastConfigAt = now
+				nextApplyAttempt = now.Add(delay)
+			} else {
+				pendingConfig = nil
+				applyFailures = 0
+				nextApplyAttempt = time.Time{}
 			}
 		}
 		sequence++
@@ -1785,7 +1856,7 @@ func runEdgeAgent() error {
 		if collectErr != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
-			report.AppliedConfigHash, report.ListenerError = runtime.status()
+			report.AppliedConfigHash, report.ListenerError, report.ApplyError = runtime.status()
 			runtime.mu.RLock()
 			report.CacheClearGeneration = runtime.cacheClearGeneration
 			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)
@@ -1849,10 +1920,21 @@ func runEdgeAgent() error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(func() time.Duration {
-			if runtime.events.depth() > 0 {
-				return time.Second
+			wait := 15 * time.Second
+			if pendingConfig != nil && !nextApplyAttempt.IsZero() {
+				if until := time.Until(nextApplyAttempt); until < wait {
+					wait = until
+				}
 			}
-			return 15 * time.Second
+			if runtime.events.depth() > 0 {
+				if wait > time.Second {
+					return time.Second
+				}
+			}
+			if wait < 0 {
+				return 0
+			}
+			return wait
 		}()):
 		}
 	}

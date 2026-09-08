@@ -52,6 +52,9 @@ type ControlNode struct {
 	AgentVersion                string `json:"agent_version"`
 	DesiredConfigHash           string `json:"desired_config_hash"`
 	AppliedConfigHash           string `json:"applied_config_hash"`
+	AgentApplyError             string `json:"agent_apply_error"`
+	AgentApplyErrorAtMS         int64  `json:"agent_apply_error_at_ms"`
+	AgentApplyFailures          int64  `json:"agent_apply_failures"`
 	AgentListenerError          string `json:"agent_listener_error"`
 	EventSpoolError             string `json:"event_spool_error"`
 	EventQueueDepth             int    `json:"event_queue_depth"`
@@ -128,6 +131,7 @@ type NodeReport struct {
 	TXBytes              int64                    `json:"tx_bytes"`
 	AgentVersion         string                   `json:"agent_version"`
 	AppliedConfigHash    string                   `json:"applied_config_hash"`
+	ApplyError           string                   `json:"apply_error,omitempty"`
 	ListenerError        string                   `json:"listener_error"`
 	EventSpoolError      string                   `json:"event_spool_error,omitempty"`
 	EventQueueDepth      int                      `json:"event_queue_depth,omitempty"`
@@ -396,7 +400,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
-	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
+	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
 
@@ -406,7 +410,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
-		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
+		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
 		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
 	if err != nil {
 		return ControlNode{}, err
@@ -477,7 +481,7 @@ func (d *DB) listControlNodes(now time.Time) ([]ControlNode, error) {
 }
 
 func nodeEligible(node ControlNode) bool {
-	return node.Enabled && node.Status == "online" && !node.Depleted && strings.TrimSpace(node.AgentListenerError) == ""
+	return node.Enabled && node.Status == "online" && !node.Depleted && strings.TrimSpace(node.AgentListenerError) == "" && strings.TrimSpace(node.AgentApplyError) == ""
 }
 
 func (d *DB) NodeControlSnapshot(now time.Time) (NodeControlSnapshot, error) {
@@ -714,7 +718,7 @@ func validateNodeReport(report NodeReport) error {
 	if report.Sequence <= 0 || report.RXBytes < 0 || report.TXBytes < 0 || report.CacheClearGeneration < 0 {
 		return errors.New("invalid traffic counters")
 	}
-	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ListenerError) > 1024 || len(report.EventSpoolError) > 1024 || report.EventQueueDepth < 0 || report.EventQueueDepth > edgeEventQueueLimit || report.EventDropped < 0 {
+	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ApplyError) > 1024 || len(report.ListenerError) > 1024 || len(report.EventSpoolError) > 1024 || report.EventQueueDepth < 0 || report.EventQueueDepth > edgeEventQueueLimit || report.EventDropped < 0 {
 		return errors.New("invalid agent metadata")
 	}
 	if len(report.SiteStats) > 512 {
@@ -1071,10 +1075,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	defer tx.Rollback()
 
 	var id, lastSequence, lastRX, lastTX int64
+	var previousApplyFailures int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID, desiredConfigHash string
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash)
+	var lastBootID, lastSessionID, desiredConfigHash, previousApplyError string
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,agent_apply_error,agent_apply_failures FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &previousApplyError, &previousApplyFailures)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1127,11 +1132,33 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		deltaRX, deltaTX = 0, 0
 		report.RXBytes, report.TXBytes, report.Sequence = lastRX, lastTX, lastSequence
 	}
+	applyError := strings.TrimSpace(report.ApplyError)
+	if applyError == "" && strings.TrimSpace(report.AppliedConfigHash) == "" {
+		// Older Agents do not know about apply_error. Preserve an existing
+		// diagnostic until a report confirms that the desired configuration was
+		// actually applied, instead of letting a legacy heartbeat erase it.
+		applyError = strings.TrimSpace(previousApplyError)
+	}
+	applyErrorAtMS := int64(0)
+	applyFailures := int64(0)
+	if applyError != "" {
+		applyErrorAtMS = now.UnixMilli()
+		if applyError == strings.TrimSpace(previousApplyError) {
+			applyFailures = previousApplyFailures + 1
+		} else {
+			applyFailures = 1
+		}
+	} else if strings.TrimSpace(report.AppliedConfigHash) == strings.TrimSpace(desiredConfigHash) && strings.TrimSpace(desiredConfigHash) != "" {
+		// A matching applied hash is the only successful completion signal. It
+		// clears the previous failure and its counters atomically with the report.
+		applyErrorAtMS = 0
+		applyFailures = 0
+	}
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
-		lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-		last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+			lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
+			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
 	}
 	if appliedHash := strings.TrimSpace(report.AppliedConfigHash); appliedHash != "" && appliedHash == strings.TrimSpace(desiredConfigHash) {
