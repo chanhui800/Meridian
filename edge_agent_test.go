@@ -133,6 +133,33 @@ func TestEdgeProxyReportsMediaCountsWithCentralSiteID(t *testing.T) {
 	}
 }
 
+func TestEdgeTelemetryMapsRetentionAndObservationToCentralSiteID(t *testing.T) {
+	localSites := map[int64]edgeSiteIdentity{
+		3: {centralID: 91, host: "mapped.example.test"},
+	}
+	retention, ok := edgeTelemetryEventSiteID(edgeTelemetryEvent{
+		Kind:      "retention",
+		Retention: accountRetentionCompletionEvent{SiteID: 3, ExpectedStartedAtMS: 10, CompletedAtMS: 20},
+	}, localSites)
+	if !ok || retention.Retention.SiteID != 91 {
+		t.Fatalf("retention mapping = %#v, ok=%t", retention.Retention, ok)
+	}
+	observation, ok := edgeTelemetryEventSiteID(edgeTelemetryEvent{
+		Kind:        "observation",
+		Observation: dynamicObservationEvent{SiteID: 3, CanonicalAuthority: "mapped.example.test", Source: dynamicObservationSourceHLS, Decision: "allow", ReasonCode: dynamicObservationReasonCandidateAllowed},
+	}, localSites)
+	if !ok || observation.Observation.SiteID != 91 {
+		t.Fatalf("observation mapping = %#v, ok=%t", observation.Observation, ok)
+	}
+}
+
+func TestEdgeTelemetryDropsUnknownLocalSiteID(t *testing.T) {
+	event := edgeTelemetryEvent{Kind: "retention", Retention: accountRetentionCompletionEvent{SiteID: 404}}
+	if _, ok := edgeTelemetryEventSiteID(event, map[int64]edgeSiteIdentity{3: {centralID: 91}}); ok {
+		t.Fatal("unknown local site ID was accepted")
+	}
+}
+
 func TestEdgeEventSpoolUsesIndependentKeyAcrossReenrollment(t *testing.T) {
 	dir := t.TempDir()
 	key := make([]byte, 32)

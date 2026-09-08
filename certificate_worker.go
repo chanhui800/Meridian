@@ -21,10 +21,12 @@ type certificateWorker struct {
 	manager *panelCertificateManager
 	ctx     context.Context
 	cancel  context.CancelFunc
-	jobs    chan certificateJob
 	wg      sync.WaitGroup
 	mu      sync.Mutex
-	pending map[int64]int
+	pending map[int64]certificateJob
+	running map[int64]struct{}
+	retry   map[int64]struct{}
+	wake    chan struct{}
 }
 
 var certificateRetryDelays = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour}
@@ -34,7 +36,13 @@ func newCertificateWorker(parent context.Context, db *DB, manager *panelCertific
 		return nil
 	}
 	ctx, cancel := context.WithCancel(parent)
-	w := &certificateWorker{db: db, manager: manager, ctx: ctx, cancel: cancel, jobs: make(chan certificateJob, 64), pending: make(map[int64]int)}
+	w := &certificateWorker{
+		db: db, manager: manager, ctx: ctx, cancel: cancel,
+		pending: make(map[int64]certificateJob),
+		running: make(map[int64]struct{}),
+		retry:   make(map[int64]struct{}),
+		wake:    make(chan struct{}, 1),
+	}
 	w.wg.Add(1)
 	go w.run()
 	return w
@@ -49,26 +57,51 @@ func (w *certificateWorker) enqueue(nodeID int64) {
 		w.mu.Unlock()
 		return
 	}
-	w.pending[nodeID] = 0
+	if _, exists := w.running[nodeID]; exists {
+		w.mu.Unlock()
+		return
+	}
+	if _, exists := w.retry[nodeID]; exists {
+		w.mu.Unlock()
+		return
+	}
+	w.pending[nodeID] = certificateJob{nodeID: nodeID}
 	w.mu.Unlock()
-	w.queue(certificateJob{nodeID: nodeID})
+	w.signal()
 }
 
-// queue never blocks the caller. Enrollment must remain a fast operation even
-// when a large fleet has filled the bounded ACME work queue; the job stays in
-// pending and is retried once capacity is available.
+// queue schedules a retry without recursively creating short-lived timers.
+// The worker keeps one pending job per node and wakes its single consumer when
+// the retry becomes due. This prevents a full queue from creating a timer storm
+// during large enrollments or an ACME outage.
 func (w *certificateWorker) queue(job certificateJob) {
 	if w == nil {
 		return
 	}
-	select {
-	case w.jobs <- job:
-	case <-w.ctx.Done():
-		w.mu.Lock()
-		delete(w.pending, job.nodeID)
+	if w.ctx.Err() != nil {
+		return
+	}
+	w.mu.Lock()
+	if _, exists := w.running[job.nodeID]; exists {
 		w.mu.Unlock()
+		return
+	}
+	if existing, exists := w.pending[job.nodeID]; exists && existing.attempt >= job.attempt {
+		w.mu.Unlock()
+		return
+	}
+	w.pending[job.nodeID] = job
+	w.mu.Unlock()
+	w.signal()
+}
+
+func (w *certificateWorker) signal() {
+	if w == nil {
+		return
+	}
+	select {
+	case w.wake <- struct{}{}:
 	default:
-		time.AfterFunc(250*time.Millisecond, func() { w.queue(job) })
 	}
 }
 
@@ -76,12 +109,29 @@ func (w *certificateWorker) run() {
 	defer w.wg.Done()
 	for {
 		select {
-		case job := <-w.jobs:
-			w.process(job)
+		case <-w.wake:
+			for {
+				job, ok := w.takePending()
+				if !ok {
+					break
+				}
+				w.process(job)
+			}
 		case <-w.ctx.Done():
 			return
 		}
 	}
+}
+
+func (w *certificateWorker) takePending() (certificateJob, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for nodeID, job := range w.pending {
+		delete(w.pending, nodeID)
+		w.running[nodeID] = struct{}{}
+		return job, true
+	}
+	return certificateJob{}, false
 }
 
 func (w *certificateWorker) process(job certificateJob) {
@@ -93,13 +143,13 @@ func (w *certificateWorker) process(job certificateJob) {
 	}
 	if err == nil {
 		w.mu.Lock()
-		delete(w.pending, job.nodeID)
+		delete(w.running, job.nodeID)
 		w.mu.Unlock()
 		return
 	}
 	if job.attempt >= len(certificateRetryDelays) {
 		w.mu.Lock()
-		delete(w.pending, job.nodeID)
+		delete(w.running, job.nodeID)
 		w.mu.Unlock()
 		log.Printf("[edge-certificate] node %d provisioning failed after retries: %v", job.nodeID, err)
 		return
@@ -107,7 +157,14 @@ func (w *certificateWorker) process(job certificateJob) {
 	delay := certificateRetryDelays[job.attempt]
 	next := certificateJob{nodeID: job.nodeID, attempt: job.attempt + 1}
 	log.Printf("[edge-certificate] node %d provisioning failed: %v; retrying in %s", job.nodeID, err, delay)
+	w.mu.Lock()
+	delete(w.running, job.nodeID)
+	w.retry[job.nodeID] = struct{}{}
+	w.mu.Unlock()
 	time.AfterFunc(delay, func() {
+		w.mu.Lock()
+		delete(w.retry, next.nodeID)
+		w.mu.Unlock()
 		w.queue(next)
 	})
 }
