@@ -337,7 +337,7 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	}
 	eligible := make(map[int64]bool, len(snapshot.Nodes))
 	for _, node := range snapshot.Nodes {
-		eligible[node.ID] = nodeEligible(node)
+		eligible[node.ID] = nodeAssignmentEligible(node)
 	}
 	values, err := a.db.ListSiteNodeSchedules()
 	if err != nil {
@@ -362,7 +362,7 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 			desired = 0
 			fallback := int64(0)
 			for _, candidate := range snapshot.Nodes {
-				if !nodeEligible(candidate) {
+				if !nodeAssignmentEligible(candidate) {
 					continue
 				}
 				// A probe cooldown means "retry this node later"; it must not
@@ -726,6 +726,11 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 			return AgentRuntimeConfig{}, getErr
 		}
 		route.Site = *site
+		// Site icons are presentation-only metadata for the Controller UI. Do
+		// not send them to Agents or let a later icon-pack change invalidate the
+		// runtime route configuration.
+		route.Site.IconName = ""
+		route.Site.IconURL = ""
 		route.Site.TrafficQuota = 0
 		route.Site.TrafficUsed = 0
 		route.Site.TrafficUsedIn = 0
@@ -1128,6 +1133,22 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 		}
 	}
 	recordID, err := cf.writeAddressRecord(ctx, zoneID, schedule.cfRecordID, recordType, schedule.PublicHost, ip.String())
+	if err != nil && schedule.cfRecordID != "" && isCloudflareRecordNotFoundError(err) {
+		// A tracked record may have been removed outside Meridian. Re-resolve
+		// the zone and recreate only when the exact name is still unoccupied;
+		// never overwrite an operator-created untracked record.
+		zoneID, err = cf.findZone(ctx, schedule.PublicHost)
+		if err == nil {
+			var records []cloudflareAddressRecord
+			records, err = cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
+			if err == nil && len(records) > 0 {
+				err = errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
+			}
+		}
+		if err == nil {
+			recordID, err = cf.writeAddressRecord(ctx, zoneID, "", recordType, schedule.PublicHost, ip.String())
+		}
+	}
 	if err != nil {
 		return err
 	}

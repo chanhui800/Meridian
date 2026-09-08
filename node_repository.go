@@ -132,6 +132,8 @@ type NodeReport struct {
 	AgentVersion         string                   `json:"agent_version"`
 	AppliedConfigHash    string                   `json:"applied_config_hash"`
 	ApplyError           string                   `json:"apply_error,omitempty"`
+	ApplyErrorAtMS       int64                    `json:"apply_error_at_ms,omitempty"`
+	ApplyFailures        int64                    `json:"apply_failures,omitempty"`
 	ListenerError        string                   `json:"listener_error"`
 	EventSpoolError      string                   `json:"event_spool_error,omitempty"`
 	EventQueueDepth      int                      `json:"event_queue_depth,omitempty"`
@@ -480,8 +482,25 @@ func (d *DB) listControlNodes(now time.Time) ([]ControlNode, error) {
 	return nodes, rows.Err()
 }
 
+// nodeAssignmentEligible answers whether a node may remain the desired
+// assignment. Runtime readiness is checked separately during reconciliation;
+// an apply failure must not make the scheduler erase the desired node and
+// create a self-reinforcing "no eligible node" loop.
+func nodeAssignmentEligible(node ControlNode) bool {
+	return node.Enabled && node.Status == "online" && !node.Depleted &&
+		strings.TrimSpace(node.AgentListenerError) == ""
+}
+
+func nodeRuntimeReady(node ControlNode) bool {
+	return nodeAssignmentEligible(node) &&
+		strings.TrimSpace(node.AgentListenerError) == "" &&
+		strings.TrimSpace(node.AgentApplyError) == ""
+}
+
+// Keep the historical helper name for callers that only need assignment
+// eligibility. Readiness-sensitive paths must call nodeRuntimeReady explicitly.
 func nodeEligible(node ControlNode) bool {
-	return node.Enabled && node.Status == "online" && !node.Depleted && strings.TrimSpace(node.AgentListenerError) == "" && strings.TrimSpace(node.AgentApplyError) == ""
+	return nodeAssignmentEligible(node)
 }
 
 func (d *DB) NodeControlSnapshot(now time.Time) (NodeControlSnapshot, error) {
@@ -1132,21 +1151,41 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		deltaRX, deltaTX = 0, 0
 		report.RXBytes, report.TXBytes, report.Sequence = lastRX, lastTX, lastSequence
 	}
-	applyError := strings.TrimSpace(report.ApplyError)
+	reportedApplyError := strings.TrimSpace(report.ApplyError)
+	applyError := reportedApplyError
+	legacyDiagnostic := false
 	if applyError == "" && strings.TrimSpace(report.AppliedConfigHash) == "" {
 		// Older Agents do not know about apply_error. Preserve an existing
 		// diagnostic until a report confirms that the desired configuration was
 		// actually applied, instead of letting a legacy heartbeat erase it.
 		applyError = strings.TrimSpace(previousApplyError)
+		legacyDiagnostic = applyError != ""
 	}
 	applyErrorAtMS := int64(0)
 	applyFailures := int64(0)
 	if applyError != "" {
-		applyErrorAtMS = now.UnixMilli()
-		if applyError == strings.TrimSpace(previousApplyError) {
+		if !legacyDiagnostic && (report.ApplyFailures > 0 || report.ApplyErrorAtMS > 0) {
+			// Current Agents report the number and timestamp of the actual apply
+			// attempt. Heartbeats must not increment these values.
+			applyFailures = report.ApplyFailures
+			if applyFailures < 1 {
+				applyFailures = 1
+			}
+			applyErrorAtMS = report.ApplyErrorAtMS
+			if applyErrorAtMS <= 0 {
+				applyErrorAtMS = now.UnixMilli()
+			}
+		} else if legacyDiagnostic {
+			// A legacy heartbeat only carries the previous error. Preserve its
+			// counters rather than treating every heartbeat as another attempt.
+			applyFailures = previousApplyFailures
+			applyErrorAtMS = now.UnixMilli()
+		} else if applyError == strings.TrimSpace(previousApplyError) {
 			applyFailures = previousApplyFailures + 1
+			applyErrorAtMS = now.UnixMilli()
 		} else {
 			applyFailures = 1
+			applyErrorAtMS = now.UnixMilli()
 		}
 	} else if strings.TrimSpace(report.AppliedConfigHash) == strings.TrimSpace(desiredConfigHash) && strings.TrimSpace(desiredConfigHash) != "" {
 		// A matching applied hash is the only successful completion signal. It

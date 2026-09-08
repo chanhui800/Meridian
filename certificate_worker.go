@@ -51,12 +51,24 @@ func (w *certificateWorker) enqueue(nodeID int64) {
 	}
 	w.pending[nodeID] = 0
 	w.mu.Unlock()
+	w.queue(certificateJob{nodeID: nodeID})
+}
+
+// queue never blocks the caller. Enrollment must remain a fast operation even
+// when a large fleet has filled the bounded ACME work queue; the job stays in
+// pending and is retried once capacity is available.
+func (w *certificateWorker) queue(job certificateJob) {
+	if w == nil {
+		return
+	}
 	select {
-	case w.jobs <- certificateJob{nodeID: nodeID}:
+	case w.jobs <- job:
 	case <-w.ctx.Done():
 		w.mu.Lock()
-		delete(w.pending, nodeID)
+		delete(w.pending, job.nodeID)
 		w.mu.Unlock()
+	default:
+		time.AfterFunc(250*time.Millisecond, func() { w.queue(job) })
 	}
 }
 
@@ -96,13 +108,7 @@ func (w *certificateWorker) process(job certificateJob) {
 	next := certificateJob{nodeID: job.nodeID, attempt: job.attempt + 1}
 	log.Printf("[edge-certificate] node %d provisioning failed: %v; retrying in %s", job.nodeID, err, delay)
 	time.AfterFunc(delay, func() {
-		select {
-		case w.jobs <- next:
-		case <-w.ctx.Done():
-			w.mu.Lock()
-			delete(w.pending, job.nodeID)
-			w.mu.Unlock()
-		}
+		w.queue(next)
 	})
 }
 

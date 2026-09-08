@@ -7480,4 +7480,35 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
     height: 46px;
     flex-basis: 46px;
   }
+
+  /* Keep the realtime table readable on narrow screens. The table scrolls
+     horizontally instead of allowing identity/status cells to collapse into
+     icon-only or one-character-per-line columns. */
+  .dashboard-site-status > div {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .dashboard-site-status table {
+    min-width: 980px;
+    table-layout: auto;
+  }
+  .dashboard-site-status table th:first-child,
+  .dashboard-site-status table td:first-child {
+    min-width: 210px;
+  }
+  .dashboard-site-status table th:nth-child(2),
+  .dashboard-site-status table td:nth-child(2) {
+    min-width: 120px;
+    white-space: nowrap;
+  }
+  .dashboard-site-status table th:nth-child(3),
+  .dashboard-site-status table td:nth-child(3) {
+    min-width: 250px;
+  }
+  .dashboard-site-identity {
+    grid-template-columns: 54px minmax(120px, 1fr);
+  }
+  .dashboard-site-name {
+    display: block;
+  }
 }
