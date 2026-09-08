@@ -194,11 +194,12 @@ func (d *DB) ListSites() ([]Site, error) {
 	return sites, nil
 }
 
-func (d *DB) GetSite(id int64) (*Site, error) {
+const siteSelectColumns = `id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at`
+
+func scanSite(scanner rowScanner) (*Site, error) {
 	var s Site
 	var enabled, dynamicEnabled, dynamicDowngrade, assetCacheEnabled, watchHistoryEnabled int
-	err := d.db.QueryRow("SELECT id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.SortOrder, &s.Name, &s.IconName, &s.IconURL, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &watchHistoryEnabled, &s.AccountRetentionDays, &s.AccountRetentionStartedMS, &s.AccountRetentionCompletedMS, &s.MediaMovieCount, &s.MediaSeriesCount, &s.MediaEpisodeCount, &s.MediaCountUpdatedMS, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.TrafficUsedIn, &s.TrafficUsedOut, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	err := scanner.Scan(&s.ID, &s.SortOrder, &s.Name, &s.IconName, &s.IconURL, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &watchHistoryEnabled, &s.AccountRetentionDays, &s.AccountRetentionStartedMS, &s.AccountRetentionCompletedMS, &s.MediaMovieCount, &s.MediaSeriesCount, &s.MediaEpisodeCount, &s.MediaCountUpdatedMS, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.TrafficUsedIn, &s.TrafficUsedOut, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +208,17 @@ func (d *DB) GetSite(id int64) (*Site, error) {
 		return nil, fmt.Errorf("site %d: %w", s.ID, err)
 	}
 	return &s, nil
+}
+
+func (d *DB) GetSite(id int64) (*Site, error) {
+	return scanSite(d.db.QueryRow("SELECT "+siteSelectColumns+" FROM sites WHERE id=?", id))
+}
+
+func getSiteTx(tx *sql.Tx, id int64) (*Site, error) {
+	if tx == nil {
+		return nil, errors.New("nil database transaction")
+	}
+	return scanSite(tx.QueryRow("SELECT "+siteSelectColumns+" FROM sites WHERE id=?", id))
 }
 
 func (d *DB) CreateSite(name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode string, quota int64, speedLimit int) (*Site, error) {
@@ -602,7 +614,7 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 		WHERE site_id=?`, nowMS, nowMS, site.ID); err != nil {
 		return err
 	}
-	if err := markAgentConfigsDirtyTx(tx); err != nil {
+	if err := markAgentConfigsDirtyForSiteTx(tx, site.ID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -694,7 +706,7 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 		WHERE site_id=?`, value, nowMS, nowMS, id); err != nil {
 		return err
 	}
-	if err := markAgentConfigsDirtyTx(tx); err != nil {
+	if err := markAgentConfigsDirtyForSiteTx(tx, id); err != nil {
 		return err
 	}
 	return tx.Commit()

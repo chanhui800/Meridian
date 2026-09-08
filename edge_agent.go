@@ -507,6 +507,7 @@ type edgeAgentRuntime struct {
 	server               *http.Server
 	bundle               *edgeProxyBundle
 	appliedHash          string
+	appliedRevision      int64
 	siteCounterEpoch     uint64
 	cacheClearGeneration int64
 	listenerError        string
@@ -531,6 +532,8 @@ type edgeAgentRuntimeState struct {
 	server               *http.Server
 	bundle               *edgeProxyBundle
 	nodeGUID             string
+	appliedHash          string
+	appliedRevision      int64
 	certificate          *tls.Certificate
 	handler              http.Handler
 	cacheClearGeneration int64
@@ -1129,6 +1132,8 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 	}
 	runtime.mu.Lock()
 	runtime.nodeGUID = old.nodeGUID
+	runtime.appliedHash = old.appliedHash
+	runtime.appliedRevision = old.appliedRevision
 	runtime.port = old.port
 	runtime.certificate = old.certificate
 	runtime.handler = old.handler
@@ -1192,7 +1197,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.mu.RLock()
 	oldState := edgeAgentRuntimeState{
 		port: runtime.port, server: runtime.server, bundle: runtime.bundle,
-		nodeGUID: runtime.nodeGUID, certificate: runtime.certificate, handler: runtime.handler,
+		nodeGUID: runtime.nodeGUID, appliedHash: runtime.appliedHash, appliedRevision: runtime.appliedRevision, certificate: runtime.certificate, handler: runtime.handler,
 		cacheClearGeneration: runtime.cacheClearGeneration, siteCounterEpoch: runtime.siteCounterEpoch,
 		listenerError: runtime.listenerError,
 	}
@@ -1243,6 +1248,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	runtime.mu.Lock()
 	runtime.appliedHash = config.ConfigHash
+	runtime.appliedRevision = config.ConfigRevision
 	runtime.siteCounterEpoch++
 	if config.CacheClearGeneration > runtime.cacheClearGeneration {
 		runtime.cacheClearGeneration = config.CacheClearGeneration
@@ -1293,10 +1299,10 @@ func agentStatusError(err error) string {
 	return value[:maxAgentStatusErrorLength]
 }
 
-func (runtime *edgeAgentRuntime) status() (string, string, string, int64, int64) {
+func (runtime *edgeAgentRuntime) status() (string, int64, string, string, int64, int64) {
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
-	return runtime.appliedHash, runtime.listenerError, runtime.applyError, runtime.applyErrorAtMS, runtime.applyFailures
+	return runtime.appliedHash, runtime.appliedRevision, runtime.listenerError, runtime.applyError, runtime.applyErrorAtMS, runtime.applyFailures
 }
 
 func (runtime *edgeAgentRuntime) close() {
@@ -1851,7 +1857,7 @@ func runEdgeAgent() error {
 				// Refresh the pending payload when the Controller sends a newer
 				// hash, but do not reset an in-progress retry backoff when the
 				// same failing configuration is fetched again after a report ACK.
-				if pendingConfig == nil || pendingConfig.ConfigHash != config.ConfigHash {
+				if pendingConfig == nil || !agentConfigIdentityEqual(*pendingConfig, config) {
 					pendingConfig = &config
 					nextApplyAttempt = now
 					applyFailures = 0
@@ -1874,8 +1880,8 @@ func runEdgeAgent() error {
 			}
 		}
 		if pendingConfig != nil && (nextApplyAttempt.IsZero() || !now.Before(nextApplyAttempt)) {
-			applied, _, _, _, _ := runtime.status()
-			if pendingConfig.ConfigHash == applied {
+			applied, appliedRevision, _, _, _, _ := runtime.status()
+			if agentConfigIdentityEqual(*pendingConfig, AgentRuntimeConfig{ConfigHash: applied, ConfigRevision: appliedRevision}) {
 				pendingConfig = nil
 				applyFailures = 0
 				nextApplyAttempt = time.Time{}
@@ -1903,7 +1909,7 @@ func runEdgeAgent() error {
 		if collectErr != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
-			report.AppliedConfigHash, report.ListenerError, report.ApplyError, report.ApplyErrorAtMS, report.ApplyFailures = runtime.status()
+			report.AppliedConfigHash, report.AppliedConfigRevision, report.ListenerError, report.ApplyError, report.ApplyErrorAtMS, report.ApplyFailures = runtime.status()
 			runtime.mu.RLock()
 			report.CacheClearGeneration = runtime.cacheClearGeneration
 			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)
@@ -1992,4 +1998,14 @@ func runEdgeAgent() error {
 		}()):
 		}
 	}
+}
+
+// agentConfigIdentityEqual includes the monotonic revision alongside the
+// content hash. A revision can change while the serialized runtime content
+// returns to an earlier value (for example an edit is reverted); treating the
+// hash alone as an acknowledgement would leave the Controller's CAS revision
+// permanently pending.
+func agentConfigIdentityEqual(left, right AgentRuntimeConfig) bool {
+	return strings.TrimSpace(left.ConfigHash) == strings.TrimSpace(right.ConfigHash) &&
+		left.ConfigRevision == right.ConfigRevision
 }

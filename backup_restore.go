@@ -506,7 +506,9 @@ func (a *App) databaseSnapshot() (string, func(), error) {
 		return "", func() {}, err
 	}
 	if a.pm != nil {
-		a.pm.FlushTraffic()
+		if err := a.pm.FlushTrafficStrict(); err != nil {
+			return "", func() {}, fmt.Errorf("刷新流量计数: %w", err)
+		}
 	}
 	if err := a.db.flushDynamicObservations(); err != nil {
 		return "", func() {}, fmt.Errorf("刷新日志队列: %w", err)
@@ -699,6 +701,29 @@ func (a *App) buildBackupToFile(password string, includeTLS bool) (builtBackupFi
 		// Back up the resolved pair under stable archive names; restore rebuilds
 		// each node's current directory from these files.
 		if edgeRoot := edgeNodeTLSRoot(a.dbPath); edgeRoot != "" {
+			// Only database-owned node GUIDs belong in a restorable TLS backup.
+			// Leftover directories from deleted nodes are cleanup candidates, not
+			// live Meridian state, and must never be resurrected by a restore.
+			knownGUIDs := make(map[string]struct{})
+			rows, queryErr := a.db.db.Query("SELECT guid FROM control_nodes WHERE TRIM(guid) <> ''")
+			if queryErr != nil {
+				return builtBackupFile{}, fmt.Errorf("读取 Edge 节点清单: %w", queryErr)
+			}
+			for rows.Next() {
+				var guid string
+				if scanErr := rows.Scan(&guid); scanErr != nil {
+					_ = rows.Close()
+					return builtBackupFile{}, fmt.Errorf("读取 Edge 节点清单: %w", scanErr)
+				}
+				if validTLSNodeGUID(guid) {
+					knownGUIDs[guid] = struct{}{}
+				}
+			}
+			if rowsErr := rows.Err(); rowsErr != nil {
+				_ = rows.Close()
+				return builtBackupFile{}, fmt.Errorf("读取 Edge 节点清单: %w", rowsErr)
+			}
+			_ = rows.Close()
 			entries, readErr := os.ReadDir(edgeRoot)
 			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 				return builtBackupFile{}, fmt.Errorf("读取 Edge 节点证书目录: %w", readErr)
@@ -708,6 +733,9 @@ func (a *App) buildBackupToFile(password string, includeTLS bool) (builtBackupFi
 					continue
 				}
 				guid := entry.Name()
+				if _, known := knownGUIDs[guid]; !known {
+					continue
+				}
 				for _, filename := range []string{"fullchain.pem", "privkey.pem"} {
 					name := backupTLSEdgeNodesPrefix + guid + "/" + filename
 					path := filepath.Join(edgeRoot, guid, "current", filename)

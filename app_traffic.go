@@ -113,7 +113,10 @@ func (a *App) handleAssetCache(w http.ResponseWriter, r *http.Request) {
 		}
 		nowMS := time.Now().UnixMilli()
 		result, err := a.db.db.Exec(`UPDATE control_nodes
-			SET cache_clear_generation=cache_clear_generation+1,config_dirty=1,updated_at_ms=?
+			SET cache_clear_generation=cache_clear_generation+1,
+				config_revision=config_revision+1,
+				desired_config_hash='',desired_config_revision=0,
+				config_dirty=1,updated_at_ms=?
 			WHERE enabled=1 AND agent_token_hash<>''`, nowMS)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "schedule agent cache clear failed")

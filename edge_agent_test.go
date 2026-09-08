@@ -43,7 +43,7 @@ func TestEdgeAgentRollbackSurfacesListenerRestoreFailure(t *testing.T) {
 	if runtime.server != nil {
 		t.Fatal("runtime retained a server after listener restore failed")
 	}
-	_, listenerError, applyError, _, _ := runtime.status()
+	_, _, listenerError, applyError, _, _ := runtime.status()
 	if !strings.Contains(listenerError, "restore old listener on port 9090") {
 		t.Fatalf("listener error=%q, want restore failure", listenerError)
 	}
@@ -58,9 +58,22 @@ func TestEdgeAgentApplyFailureIsExposedInRuntimeStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid configuration unexpectedly applied")
 	}
-	_, _, applyError, _, _ := runtime.status()
+	_, _, _, applyError, _, _ := runtime.status()
 	if applyError == "" || !strings.Contains(applyError, "Agent configuration is invalid") {
 		t.Fatalf("apply error=%q, want the runtime apply failure", applyError)
+	}
+}
+
+func TestAgentConfigIdentityRequiresRevisionAndHash(t *testing.T) {
+	base := AgentRuntimeConfig{ConfigHash: "same", ConfigRevision: 7}
+	if !agentConfigIdentityEqual(base, AgentRuntimeConfig{ConfigHash: "same", ConfigRevision: 7}) {
+		t.Fatal("matching config hash and revision were not recognized")
+	}
+	if agentConfigIdentityEqual(base, AgentRuntimeConfig{ConfigHash: "same", ConfigRevision: 8}) {
+		t.Fatal("different config revision was incorrectly acknowledged")
+	}
+	if agentConfigIdentityEqual(base, AgentRuntimeConfig{ConfigHash: "other", ConfigRevision: 7}) {
+		t.Fatal("different config hash was incorrectly acknowledged")
 	}
 }
 
