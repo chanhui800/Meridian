@@ -60,27 +60,19 @@ docker compose logs -f meridian
 
 首次启动时日志会输出一次管理员初始化令牌。打开 `http://服务器地址:9090` 完成初始化。数据库、TLS 状态和缓存位于 `./data`，更新容器不会删除它们。`network_mode: host` 会让面板和站点端口直接使用宿主机网络，请先确认端口没有被其他服务占用。
 
-生产环境可以把 `latest` 换成固定版本，例如 `ghcr.io/chanhui800/meridian:v1.9.58`。固定版本便于回滚和排查问题。
+生产环境可以把 `latest` 换成固定版本。固定版本便于回滚和排查问题。
 
 ### Linux 原生安装
 
-从固定 Release 安装（推荐）：
+安装最新正式版：
 
 ```bash
-VERSION=v1.9.58
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-  -o "$tmp_dir/install.sh" \
-  "https://github.com/chanhui800/Meridian/releases/download/${VERSION}/install.sh"
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-  -o "$tmp_dir/SHA256SUMS" \
-  "https://github.com/chanhui800/Meridian/releases/download/${VERSION}/SHA256SUMS"
-(cd "$tmp_dir" && grep ' install.sh$' SHA256SUMS | sha256sum -c -)
-sudo bash "$tmp_dir/install.sh" install -y --no-domain
+curl -fsSL \
+  https://github.com/chanhui800/Meridian/releases/latest/download/install.sh \
+  | sudo bash -s -- install -y --no-domain
 ```
 
-安装器和校验文件均来自同一个固定 Release。升级时将 `VERSION` 改为目标版本；不要从可变的 `main` 分支直接执行安装脚本。
+安装器会自动获取最新正式 Release，并校验实际下载的程序。需要固定版本或在高安全环境中安装时，再使用固定 Release 的校验流程；不要从可变的 `main` 分支直接执行安装脚本。
 
 默认数据库为 `/var/lib/meridian/meridian.db`，服务名为 `meridian`：
 
