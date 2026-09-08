@@ -1229,13 +1229,16 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	if config.CacheClearGeneration > oldState.cacheClearGeneration {
 		if err := bundle.manager.ClearAssetCache(); err != nil {
-			// Close the candidate listener before tearing down its proxy bundle;
-			// otherwise a request racing the rollback could observe a closed bundle.
+			// Stop accepting new candidate requests, restore the old handler, and
+			// only then drain the failed bundle. Shutdown may time out while an
+			// admitted request is still using the candidate, so closing it before
+			// the runtime points back at the old bundle can race that request.
 			if newServerStarted {
 				runtime.stopServer()
 			}
-			bundle.close()
-			return runtime.rollbackApply(oldState, listenerChanged, false, err)
+			rollbackErr := runtime.rollbackApply(oldState, listenerChanged, false, err)
+			go bundle.drain(15 * time.Second)
+			return rollbackErr
 		}
 	}
 	runtime.mu.Lock()
@@ -1894,6 +1897,7 @@ func runEdgeAgent() error {
 				nextApplyAttempt = time.Time{}
 			}
 		}
+		refreshImmediately := false
 		sequence++
 		report, collectErr := edgeCollect(bootID, sequence)
 		if collectErr != nil {
@@ -1953,11 +1957,18 @@ func runEdgeAgent() error {
 				}
 				if ack.ConfigChanged {
 					lastConfigAt = time.Time{}
+					refreshImmediately = true
 				}
 			}
 		}
 		if *once {
 			return nil
+		}
+		if refreshImmediately {
+			// The controller has explicitly invalidated this Agent's runtime
+			// snapshot. Skip the normal 15-second heartbeat sleep and fetch the
+			// replacement configuration immediately.
+			continue
 		}
 		select {
 		case <-ctx.Done():

@@ -51,6 +51,7 @@ type ControlNode struct {
 	InterfaceName               string `json:"interface_name"`
 	AgentVersion                string `json:"agent_version"`
 	DesiredConfigHash           string `json:"desired_config_hash"`
+	ConfigDirty                 bool   `json:"config_dirty"`
 	AppliedConfigHash           string `json:"applied_config_hash"`
 	AgentApplyError             string `json:"agent_apply_error"`
 	AgentApplyErrorAtMS         int64  `json:"agent_apply_error_at_ms"`
@@ -402,22 +403,23 @@ type rowScanner interface{ Scan(...interface{}) error }
 
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
-	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
+	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
 
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
-	var enabled int
+	var enabled, configDirty int
 	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
-		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
+		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
 		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
 	if err != nil {
 		return ControlNode{}, err
 	}
 	node.Enabled = enabled != 0
+	node.ConfigDirty = configDirty != 0
 	node.EnrollmentAvailable = node.enrollmentTokenHash != "" && now.UnixMilli() < node.enrollmentExpiresMS
 	if node.LastSeenAtMS > 0 && now.Sub(time.UnixMilli(node.LastSeenAtMS)) <= nodeOnlineWindow {
 		node.Status = "online"
@@ -565,6 +567,18 @@ func nullableNodeID(id int64) interface{} {
 	return id
 }
 
+// markAgentConfigsDirtyTx invalidates runtime snapshots for enrolled Agents.
+// Site and scheduler edits can change the route set of whichever node is
+// currently selected, so keeping a single durable dirty bit per node is safer
+// than relying on the next 60-second poll to discover the change.
+func markAgentConfigsDirtyTx(tx *sql.Tx) error {
+	if tx == nil {
+		return errors.New("nil database transaction")
+	}
+	_, err := tx.Exec("UPDATE control_nodes SET config_dirty=1,updated_at_ms=? WHERE enabled=1 AND agent_token_hash<>''", time.Now().UnixMilli())
+	return err
+}
+
 func (d *DB) UpdateNodeScheduler(mode string, manualNodeID int64, now time.Time) (NodeControlSnapshot, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode != "auto" && mode != "manual" {
@@ -574,13 +588,20 @@ func (d *DB) UpdateNodeScheduler(mode string, manualNodeID int64, now time.Time)
 		if manualNodeID <= 0 {
 			return NodeControlSnapshot{}, errors.New("manual mode requires a node")
 		}
-		if _, err := d.controlNodeByID(manualNodeID, now); err != nil {
+		node, err := d.controlNodeByID(manualNodeID, now)
+		if err != nil {
 			return NodeControlSnapshot{}, err
+		}
+		if !nodeAssignmentEligible(node) {
+			return NodeControlSnapshot{}, errManualNodeUnavailable
 		}
 	} else {
 		manualNodeID = 0
 	}
 	if _, err := d.db.Exec("UPDATE node_scheduler_settings SET mode=?,manual_node_id=?,updated_at_ms=? WHERE id=1", mode, nullableNodeID(manualNodeID), now.UnixMilli()); err != nil {
+		return NodeControlSnapshot{}, err
+	}
+	if _, err := d.db.Exec("UPDATE control_nodes SET config_dirty=1,updated_at_ms=? WHERE enabled=1 AND agent_token_hash<>''", now.UnixMilli()); err != nil {
 		return NodeControlSnapshot{}, err
 	}
 	return d.NodeControlSnapshot(now)
@@ -601,27 +622,26 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	}
 	defer tx.Rollback()
 	var currentAddress string
-	var currentPort, currentResetDay int
-	if err := tx.QueryRow("SELECT address,https_port,reset_day FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentPort, &currentResetDay); errors.Is(err, sql.ErrNoRows) {
+	var currentPort, currentResetDay, currentEnabled int
+	if err := tx.QueryRow("SELECT address,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errNodeNotFound
 	} else if err != nil {
 		return ControlNode{}, err
 	}
 
-	// Address and HTTPS port are part of the Agent's runtime reachability.
-	// Changing either one must invalidate the applied config before the next
-	// scheduler reconciliation; otherwise the scheduler can probe an old
-	// endpoint while the node still advertises the old config hash.
-	runtimeChanged := strings.TrimSpace(currentAddress) != strings.TrimSpace(input.Address) || currentPort != input.Port
+	portChanged := currentPort != input.Port
+	enabledChanged := currentEnabled != sqliteBool(enabled)
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
 		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
-			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, sqliteBool(runtimeChanged), now.UnixMilli(), id)
+			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,
+			config_dirty=CASE WHEN ? THEN 1 ELSE config_dirty END,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
+			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, sqliteBool(portChanged), sqliteBool(portChanged), now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, sqliteBool(runtimeChanged), now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,
+			config_dirty=CASE WHEN ? THEN 1 ELSE config_dirty END,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, sqliteBool(portChanged), sqliteBool(portChanged), now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -636,12 +656,17 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	if rows != 1 {
 		return ControlNode{}, errNodeNotFound
 	}
-	if runtimeChanged {
+	if portChanged {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_hash='',
 			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
 			updated_at_ms=?
-			WHERE desired_node_id=? OR applied_node_id=?`, now.UnixMilli(), now.UnixMilli(), id, id); err != nil {
+			WHERE desired_node_id=?`, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+			return ControlNode{}, err
+		}
+	}
+	if portChanged || enabledChanged {
+		if err := markAgentConfigsDirtyTx(tx); err != nil {
 			return ControlNode{}, err
 		}
 	}
@@ -678,6 +703,12 @@ func (d *DB) DeleteControlNode(id int64) error {
 		return err
 	}
 	defer tx.Rollback()
+	var guid string
+	if err := tx.QueryRow("SELECT guid FROM control_nodes WHERE id=?", id).Scan(&guid); errors.Is(err, sql.ErrNoRows) {
+		return errNodeNotFound
+	} else if err != nil {
+		return err
+	}
 	if _, err := tx.Exec("UPDATE node_scheduler_settings SET manual_node_id=NULL,active_node_id=NULL WHERE manual_node_id=? OR active_node_id=?", id, id); err != nil {
 		return err
 	}
@@ -696,7 +727,16 @@ func (d *DB) DeleteControlNode(id int64) error {
 	if rows != 1 {
 		return errNodeNotFound
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// The database deletion is authoritative. TLS cleanup is deliberately
+	// best-effort after commit: an operator-owned filesystem issue must not
+	// resurrect a node that has already been removed from the control plane.
+	if err := removeManagedEdgeNodeTLS(d.dbPath, guid); err != nil {
+		log.Printf("[node] removed node %d but could not clean managed Edge TLS: %v", id, err)
+	}
+	return nil
 }
 
 func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
@@ -1087,6 +1127,7 @@ type nodeReportCommitResult struct {
 	node              ControlNode
 	acceptedNew       []NodeRequestEvent
 	acceptedDuplicate []NodeRequestEvent
+	pendingEffects    []NodeRequestEvent
 	discardedIDs      []int64
 	discardedUIDs     []string
 }
@@ -1127,8 +1168,9 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
 	var lastBootID, lastSessionID, desiredConfigHash, previousApplyError string
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,agent_apply_error,agent_apply_failures FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &previousApplyError, &previousApplyFailures)
+	var configDirty int
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1225,9 +1267,12 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 			lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? <> '' AND ? = desired_config_hash THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped, report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
+		strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.AppliedConfigHash),
+		report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration,
+		now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
 	}
 	// A cold-started Agent may report before it has successfully applied the
@@ -1322,7 +1367,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			appendNodeEventIdentity(&result.discardedIDs, &result.discardedUIDs, event)
 			continue
 		}
-		inserted, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,event_uid,received_at_ms) VALUES(?,?,?,?,?)`, id, sessionID, event.EventID, event.EventUID, now.UnixMilli())
+		inserted, err := tx.Exec(`INSERT OR IGNORE INTO node_request_events(node_id,agent_boot_id,event_id,event_uid,received_at_ms,processed_at_ms) VALUES(?,?,?,?,?,0)`, id, sessionID, event.EventID, event.EventUID, now.UnixMilli())
 		if err != nil {
 			return nodeReportCommitResult{}, err
 		}
@@ -1333,7 +1378,8 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		if rows == 0 {
 			var existingBoot, existingUID string
 			var existingID int64
-			lookupErr := tx.QueryRow(`SELECT agent_boot_id,event_id,event_uid FROM node_request_events WHERE node_id=? AND ((agent_boot_id=? AND event_id=?) OR (event_uid<>'' AND event_uid=?)) LIMIT 1`, id, sessionID, event.EventID, event.EventUID).Scan(&existingBoot, &existingID, &existingUID)
+			var processedAtMS int64
+			lookupErr := tx.QueryRow(`SELECT agent_boot_id,event_id,event_uid,processed_at_ms FROM node_request_events WHERE node_id=? AND ((agent_boot_id=? AND event_id=?) OR (event_uid<>'' AND event_uid=?)) LIMIT 1`, id, sessionID, event.EventID, event.EventUID).Scan(&existingBoot, &existingID, &existingUID, &processedAtMS)
 			if errors.Is(lookupErr, sql.ErrNoRows) {
 				return nodeReportCommitResult{}, errors.New(`event insert was ignored without an existing identity`)
 			}
@@ -1346,7 +1392,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 				appendNodeEventIdentity(&result.discardedIDs, &result.discardedUIDs, event)
 				continue
 			}
-			result.acceptedDuplicate = append(result.acceptedDuplicate, event)
+			if processedAtMS > 0 {
+				result.acceptedDuplicate = append(result.acceptedDuplicate, event)
+			} else {
+				result.pendingEffects = append(result.pendingEffects, event)
+			}
 			continue
 		}
 		if !event.SkipRequestLog {
@@ -1354,7 +1404,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 				return nodeReportCommitResult{}, err
 			}
 		}
-		result.acceptedNew = append(result.acceptedNew, event)
+		result.pendingEffects = append(result.pendingEffects, event)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1364,13 +1414,19 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if err != nil {
 		return nodeReportCommitResult{}, err
 	}
-	// Derived in-process effects run only for newly committed events. Duplicate
-	// deliveries are acknowledged without replaying request/watch/metadata work.
-	for _, event := range result.acceptedNew {
-		if event.ResponseBody != "" {
-			d.recordNodeMetadataEvent(event)
+	// Derived effects are acknowledged only after they have been accepted by
+	// their bounded queue/observer. If an effect fails, leave processed_at_ms at
+	// zero so the Agent retries the event instead of deleting it permanently.
+	for _, event := range result.pendingEffects {
+		if err := d.processNodeEvent(event); err != nil {
+			log.Printf("[node-event] deferred event node=%d site=%d: %v", id, event.SiteID, err)
+			continue
 		}
-		d.recordNodeWatchHistoryEvent(event)
+		if _, markErr := d.db.Exec(`UPDATE node_request_events SET processed_at_ms=? WHERE node_id=? AND ((agent_boot_id=? AND event_id=?) OR (event_uid<>'' AND event_uid=?))`, now.UnixMilli(), id, sessionID, event.EventID, event.EventUID); markErr != nil {
+			log.Printf("[node-event] could not mark event processed node=%d site=%d: %v", id, event.SiteID, markErr)
+			continue
+		}
+		result.acceptedNew = append(result.acceptedNew, event)
 	}
 	_, _ = d.NodeControlSnapshot(now)
 	return result, nil
@@ -1404,22 +1460,22 @@ func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now ti
 	return result, nil
 }
 
-func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) {
+func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) error {
 	if d == nil || event.Body == "" || event.StatusCode < 200 || event.StatusCode >= 300 {
-		return
+		return nil
 	}
 	site, err := d.GetSite(event.SiteID)
 	if err != nil || !site.WatchHistoryEnabled {
-		return
+		return nil
 	}
 	parsed, err := url.Parse("https://" + event.Host + event.Path)
 	if err != nil {
-		return
+		return err
 	}
 	parsed.RawQuery = event.Query
 	req, err := http.NewRequest(event.Method, parsed.String(), strings.NewReader(event.Body))
 	if err != nil {
-		return
+		return err
 	}
 	req.Header.Set("User-Agent", event.UserAgent)
 	if event.ContentType != "" {
@@ -1434,33 +1490,36 @@ func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) {
 	req.ContentLength = int64(len(event.Body))
 	capture := startWatchHistoryCapture(*site, req, requestLogCategoryPlaybackSync, d)
 	if capture == nil {
-		return
+		return nil
 	}
 	_, _ = io.Copy(io.Discard, capture)
 	if history, ok := watchHistoryEventFromCapture(capture, d, *site, req, nil, event.StatusCode, time.UnixMilli(event.RecordedAtMS)); ok {
-		_ = d.EnqueueWatchHistory(history)
+		if !d.EnqueueWatchHistory(history) {
+			return errors.New("watch history queue is full")
+		}
 	}
+	return nil
 }
 
 // recordNodeMetadataEvent replays the Agent's bounded JSON metadata response
 // through the same in-process observer used by the controller proxy. This
 // keeps media enrichment identical for direct-node and controller traffic.
-func (d *DB) recordNodeMetadataEvent(event NodeRequestEvent) {
+func (d *DB) recordNodeMetadataEvent(event NodeRequestEvent) error {
 	if d == nil || event.ResponseBody == "" || event.StatusCode < 200 || event.StatusCode >= 300 {
-		return
+		return nil
 	}
 	site, err := d.GetSite(event.SiteID)
 	if err != nil || !site.WatchHistoryEnabled {
-		return
+		return nil
 	}
 	parsed, err := url.Parse("https://" + event.Host + event.Path)
 	if err != nil {
-		return
+		return err
 	}
 	parsed.RawQuery = event.Query
 	req, err := http.NewRequest(http.MethodGet, parsed.String(), nil)
 	if err != nil {
-		return
+		return err
 	}
 	response := &http.Response{
 		StatusCode:    event.StatusCode,
@@ -1476,9 +1535,19 @@ func (d *DB) recordNodeMetadataEvent(event NodeRequestEvent) {
 		response.Header.Set("Content-Encoding", event.ResponseContentEncoding)
 	}
 	if err := captureWatchHistoryMetadata(response, d, event.SiteID); err != nil {
-		return
+		return err
 	}
 	_, _ = io.Copy(io.Discard, response.Body)
+	return nil
+}
+
+func (d *DB) processNodeEvent(event NodeRequestEvent) error {
+	if event.ResponseBody != "" {
+		if err := d.recordNodeMetadataEvent(event); err != nil {
+			return err
+		}
+	}
+	return d.recordNodeWatchHistoryEvent(event)
 }
 
 func (node ControlNode) String() string {

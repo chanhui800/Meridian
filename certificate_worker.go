@@ -25,7 +25,7 @@ type certificateWorker struct {
 	mu      sync.Mutex
 	pending map[int64]certificateJob
 	running map[int64]struct{}
-	retry   map[int64]struct{}
+	retry   map[int64]*time.Timer
 	wake    chan struct{}
 }
 
@@ -40,7 +40,7 @@ func newCertificateWorker(parent context.Context, db *DB, manager *panelCertific
 		db: db, manager: manager, ctx: ctx, cancel: cancel,
 		pending: make(map[int64]certificateJob),
 		running: make(map[int64]struct{}),
-		retry:   make(map[int64]struct{}),
+		retry:   make(map[int64]*time.Timer),
 		wake:    make(chan struct{}, 1),
 	}
 	w.wg.Add(1)
@@ -53,15 +53,17 @@ func (w *certificateWorker) enqueue(nodeID int64) {
 		return
 	}
 	w.mu.Lock()
+	// A manual enqueue is an explicit request to retry now. Cancel any
+	// outstanding backoff timer so it cannot race a manually triggered job.
+	if timer, exists := w.retry[nodeID]; exists {
+		timer.Stop()
+		delete(w.retry, nodeID)
+	}
 	if _, exists := w.pending[nodeID]; exists {
 		w.mu.Unlock()
 		return
 	}
 	if _, exists := w.running[nodeID]; exists {
-		w.mu.Unlock()
-		return
-	}
-	if _, exists := w.retry[nodeID]; exists {
 		w.mu.Unlock()
 		return
 	}
@@ -159,14 +161,23 @@ func (w *certificateWorker) process(job certificateJob) {
 	log.Printf("[edge-certificate] node %d provisioning failed: %v; retrying in %s", job.nodeID, err, delay)
 	w.mu.Lock()
 	delete(w.running, job.nodeID)
-	w.retry[job.nodeID] = struct{}{}
-	w.mu.Unlock()
-	time.AfterFunc(delay, func() {
+	// Keep one timer per node. The timer callback verifies that it is still
+	// the current timer before re-queueing, so a manual enqueue or shutdown
+	// cannot be followed by a stale retry callback.
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
 		w.mu.Lock()
-		delete(w.retry, next.nodeID)
+		current, exists := w.retry[next.nodeID]
+		if exists && current == timer {
+			delete(w.retry, next.nodeID)
+		}
 		w.mu.Unlock()
-		w.queue(next)
+		if exists && current == timer {
+			w.queue(next)
+		}
 	})
+	w.retry[job.nodeID] = timer
+	w.mu.Unlock()
 }
 
 func (w *certificateWorker) close() {
@@ -174,5 +185,11 @@ func (w *certificateWorker) close() {
 		return
 	}
 	w.cancel()
+	w.mu.Lock()
+	for nodeID, timer := range w.retry {
+		timer.Stop()
+		delete(w.retry, nodeID)
+	}
+	w.mu.Unlock()
 	w.wg.Wait()
 }

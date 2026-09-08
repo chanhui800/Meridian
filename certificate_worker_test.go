@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestCertificateWorkerDeduplicatesPendingAndRunningJobs(t *testing.T) {
@@ -12,7 +13,7 @@ func TestCertificateWorkerDeduplicatesPendingAndRunningJobs(t *testing.T) {
 		ctx:     ctx,
 		pending: make(map[int64]certificateJob),
 		running: make(map[int64]struct{}),
-		retry:   make(map[int64]struct{}),
+		retry:   make(map[int64]*time.Timer),
 		wake:    make(chan struct{}, 1),
 	}
 
@@ -47,7 +48,7 @@ func TestCertificateWorkerQueueDoesNotCreateOverflowTimers(t *testing.T) {
 		ctx:     ctx,
 		pending: make(map[int64]certificateJob),
 		running: make(map[int64]struct{}),
-		retry:   make(map[int64]struct{}),
+		retry:   make(map[int64]*time.Timer),
 		wake:    make(chan struct{}, 1),
 	}
 
@@ -66,5 +67,28 @@ func TestCertificateWorkerQueueDoesNotCreateOverflowTimers(t *testing.T) {
 	case <-w.wake:
 		t.Fatal("duplicate queue operations created extra wake work")
 	default:
+	}
+}
+
+func TestCertificateWorkerManualEnqueueCancelsRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	w := &certificateWorker{
+		ctx:     ctx,
+		pending: make(map[int64]certificateJob),
+		running: make(map[int64]struct{}),
+		retry:   map[int64]*time.Timer{17: timer},
+		wake:    make(chan struct{}, 1),
+	}
+
+	w.enqueue(17)
+	if _, exists := w.retry[17]; exists {
+		t.Fatal("manual enqueue left the retry timer installed")
+	}
+	job, ok := w.pending[17]
+	if !ok || job.attempt != 0 {
+		t.Fatalf("manual enqueue job=%#v, ok=%t; want immediate attempt zero", job, ok)
 	}
 }
