@@ -614,14 +614,52 @@ func TestSiteNodeSchedulingIsOptInAndCanFollowGlobalNode(t *testing.T) {
 }
 
 func TestNodeReportConfigChangedIncludesDirtyAndBlankDesiredHash(t *testing.T) {
-	if !nodeReportConfigChanged(ControlNode{DesiredConfigHash: "same", ConfigDirty: true}, "same") {
+	if !nodeReportConfigChanged(ControlNode{DesiredConfigHash: "same", ConfigDirty: true}, "same", 0) {
 		t.Fatal("dirty node did not request an immediate config refresh")
 	}
-	if !nodeReportConfigChanged(ControlNode{}, "") {
+	if !nodeReportConfigChanged(ControlNode{}, "", 0) {
 		t.Fatal("blank desired hash did not request an initial config refresh")
 	}
-	if nodeReportConfigChanged(ControlNode{DesiredConfigHash: "same"}, "same") {
+	if nodeReportConfigChanged(ControlNode{DesiredConfigHash: "same"}, "same", 0) {
 		t.Fatal("matching clean hashes incorrectly requested a refresh")
+	}
+}
+
+func TestLegacyHeartbeatCannotClearNewConfigRevision(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "revision-race", Address: "203.0.113.201"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET config_revision=5,desired_config_revision=5,applied_config_revision=5,
+		desired_config_hash='old-hash',applied_config_hash='old-hash',config_dirty=0 WHERE id=?`, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := markAgentConfigsDirtyTx(tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	reported, err := app.db.RecordNodeReport(agentToken, NodeReport{
+		BootID: "revision-boot", ReportSessionID: "revision-session", CounterEpoch: "revision-epoch",
+		Sequence: 1, InterfaceName: "eth0", AgentVersion: "test", AppliedConfigHash: "old-hash", AppliedConfigRevision: 5,
+	}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reported.ConfigDirty || reported.DesiredConfigHash != "" || reported.ConfigRevision != 6 {
+		t.Fatalf("old heartbeat cleared a newer config revision: %#v", reported)
 	}
 }
 

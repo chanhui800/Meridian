@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 35
+	databaseSchemaVersion = 37
 )
 
 func (d *DB) migrate() error {
@@ -382,6 +382,9 @@ func (d *DB) migrateOnce() error {
 		desired_config_hash TEXT NOT NULL DEFAULT '',
 		config_dirty INTEGER NOT NULL DEFAULT 0,
 		applied_config_hash TEXT NOT NULL DEFAULT '',
+		config_revision BIGINT NOT NULL DEFAULT 0,
+		desired_config_revision BIGINT NOT NULL DEFAULT 0,
+		applied_config_revision BIGINT NOT NULL DEFAULT 0,
 		agent_apply_error TEXT NOT NULL DEFAULT '',
 		agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0,
 		agent_apply_failures BIGINT NOT NULL DEFAULT 0,
@@ -439,6 +442,13 @@ func (d *DB) migrateOnce() error {
 		PRIMARY KEY(site_id,node_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_probe_failures_until ON site_node_probe_failures(site_id,failed_until_ms);
+	CREATE TABLE IF NOT EXISTS node_tls_cleanup_jobs (
+		node_guid TEXT PRIMARY KEY,
+		created_at_ms INTEGER NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		updated_at_ms INTEGER NOT NULL
+	);
 	`); err != nil {
 		return err
 	}
@@ -475,6 +485,9 @@ func (d *DB) migrateOnce() error {
 		{"desired_config_hash", "ALTER TABLE control_nodes ADD COLUMN desired_config_hash TEXT NOT NULL DEFAULT ''"},
 		{"config_dirty", "ALTER TABLE control_nodes ADD COLUMN config_dirty INTEGER NOT NULL DEFAULT 0"},
 		{"applied_config_hash", "ALTER TABLE control_nodes ADD COLUMN applied_config_hash TEXT NOT NULL DEFAULT ''"},
+		{"config_revision", "ALTER TABLE control_nodes ADD COLUMN config_revision BIGINT NOT NULL DEFAULT 0"},
+		{"desired_config_revision", "ALTER TABLE control_nodes ADD COLUMN desired_config_revision BIGINT NOT NULL DEFAULT 0"},
+		{"applied_config_revision", "ALTER TABLE control_nodes ADD COLUMN applied_config_revision BIGINT NOT NULL DEFAULT 0"},
 		{"agent_apply_error", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error TEXT NOT NULL DEFAULT ''"},
 		{"agent_apply_error_at_ms", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0"},
 		{"agent_apply_failures", "ALTER TABLE control_nodes ADD COLUMN agent_apply_failures BIGINT NOT NULL DEFAULT 0"},
@@ -747,6 +760,18 @@ func (d *DB) migrateOnce() error {
 		if _, err := conn.ExecContext(ctx, `UPDATE control_nodes SET config_dirty=CASE
 			WHEN desired_config_hash='' OR desired_config_hash<>applied_config_hash THEN 1
 			ELSE config_dirty END`); err != nil {
+			return err
+		}
+	}
+	if previousSchemaVersion < 36 {
+		// Revision zero is reserved for legacy Agents that do not send the
+		// revision field. Give every already-invalidated node a non-zero
+		// generation so the first modern config fetch cannot be acknowledged by
+		// an old heartbeat from before this migration.
+		if _, err := conn.ExecContext(ctx, `UPDATE control_nodes SET
+			config_revision=CASE WHEN config_revision=0 AND (config_dirty=1 OR desired_config_hash='' OR desired_config_hash<>applied_config_hash) THEN 1 ELSE config_revision END,
+			desired_config_revision=CASE WHEN desired_config_hash<>'' THEN CASE WHEN config_revision>0 THEN config_revision ELSE 1 END ELSE 0 END,
+			applied_config_revision=CASE WHEN desired_config_hash<>'' AND desired_config_hash=applied_config_hash THEN CASE WHEN config_revision>0 THEN config_revision ELSE 1 END ELSE 0 END`); err != nil {
 			return err
 		}
 	}

@@ -90,17 +90,30 @@ func (pm *ProxyManager) StartAllEnabled() (int, error) {
 // the pending counters and is logged here, so the next tick retries the same
 // values.
 func (pm *ProxyManager) FlushTraffic() {
+	_ = pm.FlushTrafficStrict()
+}
+
+// FlushTrafficStrict is used by operations that require a durable snapshot.
+// Unlike the periodic best-effort flusher it returns every persistence error
+// so callers can abort before taking a backup of incomplete traffic state.
+func (pm *ProxyManager) FlushTrafficStrict() error {
+	if pm == nil {
+		return nil
+	}
 	pm.mu.RLock()
 	instances := make([]*ProxyInstance, 0, len(pm.proxies))
 	for _, inst := range pm.proxies {
 		instances = append(instances, inst)
 	}
 	pm.mu.RUnlock()
+	var failures []error
 	for _, inst := range instances {
 		if err := pm.flushProxyTraffic(inst); err != nil {
 			log.Printf("[%s] failed to flush traffic: %v", inst.Site.Name, err)
+			failures = append(failures, fmt.Errorf("%s: %w", inst.Site.Name, err))
 		}
 	}
+	return errors.Join(failures...)
 }
 
 // flushProxyTraffic persists inst's pending bytes and requests into the DB and

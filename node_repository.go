@@ -53,6 +53,9 @@ type ControlNode struct {
 	DesiredConfigHash           string `json:"desired_config_hash"`
 	ConfigDirty                 bool   `json:"config_dirty"`
 	AppliedConfigHash           string `json:"applied_config_hash"`
+	ConfigRevision              int64  `json:"config_revision"`
+	DesiredConfigRevision       int64  `json:"desired_config_revision"`
+	AppliedConfigRevision       int64  `json:"applied_config_revision"`
 	AgentApplyError             string `json:"agent_apply_error"`
 	AgentApplyErrorAtMS         int64  `json:"agent_apply_error_at_ms"`
 	AgentApplyFailures          int64  `json:"agent_apply_failures"`
@@ -122,29 +125,30 @@ type NodeCreateInput struct {
 }
 
 type NodeReport struct {
-	BootID               string                   `json:"boot_id"`
-	ReportSessionID      string                   `json:"report_session_id,omitempty"`
-	CounterEpoch         string                   `json:"counter_epoch,omitempty"`
-	SiteCounterEpoch     string                   `json:"site_counter_epoch,omitempty"`
-	Sequence             int64                    `json:"sequence"`
-	InterfaceName        string                   `json:"interface_name"`
-	RXBytes              int64                    `json:"rx_bytes"`
-	TXBytes              int64                    `json:"tx_bytes"`
-	AgentVersion         string                   `json:"agent_version"`
-	AppliedConfigHash    string                   `json:"applied_config_hash"`
-	ApplyError           string                   `json:"apply_error,omitempty"`
-	ApplyErrorAtMS       int64                    `json:"apply_error_at_ms,omitempty"`
-	ApplyFailures        int64                    `json:"apply_failures,omitempty"`
-	ListenerError        string                   `json:"listener_error"`
-	EventSpoolError      string                   `json:"event_spool_error,omitempty"`
-	EventQueueDepth      int                      `json:"event_queue_depth,omitempty"`
-	EventDropped         int64                    `json:"event_dropped,omitempty"`
-	CacheClearGeneration int64                    `json:"cache_clear_generation,omitempty"`
-	SiteStats            []NodeSiteStat           `json:"site_stats,omitempty"`
-	MediaCounts          []NodeMediaCount         `json:"media_counts,omitempty"`
-	Retention            []NodeRetentionStatus    `json:"retention,omitempty"`
-	Observations         []NodeDynamicObservation `json:"observations,omitempty"`
-	Events               []NodeRequestEvent       `json:"events,omitempty"`
+	BootID                string                   `json:"boot_id"`
+	ReportSessionID       string                   `json:"report_session_id,omitempty"`
+	CounterEpoch          string                   `json:"counter_epoch,omitempty"`
+	SiteCounterEpoch      string                   `json:"site_counter_epoch,omitempty"`
+	Sequence              int64                    `json:"sequence"`
+	InterfaceName         string                   `json:"interface_name"`
+	RXBytes               int64                    `json:"rx_bytes"`
+	TXBytes               int64                    `json:"tx_bytes"`
+	AgentVersion          string                   `json:"agent_version"`
+	AppliedConfigHash     string                   `json:"applied_config_hash"`
+	AppliedConfigRevision int64                    `json:"applied_config_revision,omitempty"`
+	ApplyError            string                   `json:"apply_error,omitempty"`
+	ApplyErrorAtMS        int64                    `json:"apply_error_at_ms,omitempty"`
+	ApplyFailures         int64                    `json:"apply_failures,omitempty"`
+	ListenerError         string                   `json:"listener_error"`
+	EventSpoolError       string                   `json:"event_spool_error,omitempty"`
+	EventQueueDepth       int                      `json:"event_queue_depth,omitempty"`
+	EventDropped          int64                    `json:"event_dropped,omitempty"`
+	CacheClearGeneration  int64                    `json:"cache_clear_generation,omitempty"`
+	SiteStats             []NodeSiteStat           `json:"site_stats,omitempty"`
+	MediaCounts           []NodeMediaCount         `json:"media_counts,omitempty"`
+	Retention             []NodeRetentionStatus    `json:"retention,omitempty"`
+	Observations          []NodeDynamicObservation `json:"observations,omitempty"`
+	Events                []NodeRequestEvent       `json:"events,omitempty"`
 }
 
 // NodeReportResult keeps the protocol acknowledgement tied to the exact
@@ -404,6 +408,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
+	config_revision,desired_config_revision,applied_config_revision,
 	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
 
@@ -413,7 +418,9 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
-		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped, &node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
+		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
+		&node.ConfigRevision, &node.DesiredConfigRevision, &node.AppliedConfigRevision,
+		&node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
 		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
 	if err != nil {
 		return ControlNode{}, err
@@ -575,7 +582,94 @@ func markAgentConfigsDirtyTx(tx *sql.Tx) error {
 	if tx == nil {
 		return errors.New("nil database transaction")
 	}
-	_, err := tx.Exec("UPDATE control_nodes SET config_dirty=1,updated_at_ms=? WHERE enabled=1 AND agent_token_hash<>''", time.Now().UnixMilli())
+	_, err := tx.Exec(`UPDATE control_nodes SET
+		config_revision=config_revision+1,
+		desired_config_hash='',
+		desired_config_revision=0,
+		config_dirty=1,
+		updated_at_ms=?
+		WHERE enabled=1 AND agent_token_hash<>''`, time.Now().UnixMilli())
+	return err
+}
+
+func markAgentConfigsDirtyForNodeIDsTx(tx *sql.Tx, nodeIDs ...int64) error {
+	if tx == nil {
+		return errors.New("nil database transaction")
+	}
+	seen := make(map[int64]struct{}, len(nodeIDs))
+	args := make([]interface{}, 0, len(nodeIDs)+1)
+	placeholders := make([]string, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID <= 0 {
+			continue
+		}
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		placeholders = append(placeholders, "?")
+		args = append(args, nodeID)
+	}
+	if len(placeholders) == 0 {
+		return nil
+	}
+	args = append([]interface{}{time.Now().UnixMilli()}, args...)
+	// #nosec G202 -- only the number of parameter placeholders is generated; all values remain bound arguments.
+	_, err := tx.Exec(`UPDATE control_nodes SET
+		config_revision=config_revision+1,
+		desired_config_hash='',
+		desired_config_revision=0,
+		config_dirty=1,
+		updated_at_ms=?
+		WHERE enabled=1 AND agent_token_hash<>'' AND id IN (`+strings.Join(placeholders, ",")+")", args...)
+	return err
+}
+
+func markAgentConfigsDirtyForSiteTx(tx *sql.Tx, siteID int64) error {
+	if tx == nil || siteID <= 0 {
+		return nil
+	}
+	rows, err := tx.Query("SELECT desired_node_id,applied_node_id FROM site_node_schedules WHERE site_id=?", siteID)
+	if err != nil {
+		return err
+	}
+	var nodeIDs []int64
+	for rows.Next() {
+		var desired, applied sql.NullInt64
+		if err := rows.Scan(&desired, &applied); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if desired.Valid {
+			nodeIDs = append(nodeIDs, desired.Int64)
+		}
+		if applied.Valid {
+			nodeIDs = append(nodeIDs, applied.Int64)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return markAgentConfigsDirtyForNodeIDsTx(tx, nodeIDs...)
+}
+
+// markAgentConfigDirty invalidates one enrolled Agent after an out-of-band
+// runtime input (such as a renewed Edge certificate) changes its config.
+func (d *DB) markAgentConfigDirty(nodeID int64) error {
+	if d == nil || d.db == nil || nodeID <= 0 {
+		return nil
+	}
+	_, err := d.db.Exec(`UPDATE control_nodes SET
+		config_revision=config_revision+1,
+		desired_config_hash='',
+		desired_config_revision=0,
+		config_dirty=1,
+		updated_at_ms=?
+		WHERE id=? AND enabled=1 AND agent_token_hash<>''`, time.Now().UnixMilli(), nodeID)
 	return err
 }
 
@@ -598,10 +692,18 @@ func (d *DB) UpdateNodeScheduler(mode string, manualNodeID int64, now time.Time)
 	} else {
 		manualNodeID = 0
 	}
-	if _, err := d.db.Exec("UPDATE node_scheduler_settings SET mode=?,manual_node_id=?,updated_at_ms=? WHERE id=1", mode, nullableNodeID(manualNodeID), now.UnixMilli()); err != nil {
+	tx, err := d.db.Begin()
+	if err != nil {
 		return NodeControlSnapshot{}, err
 	}
-	if _, err := d.db.Exec("UPDATE control_nodes SET config_dirty=1,updated_at_ms=? WHERE enabled=1 AND agent_token_hash<>''", now.UnixMilli()); err != nil {
+	defer tx.Rollback()
+	if _, err := tx.Exec("UPDATE node_scheduler_settings SET mode=?,manual_node_id=?,updated_at_ms=? WHERE id=1", mode, nullableNodeID(manualNodeID), now.UnixMilli()); err != nil {
+		return NodeControlSnapshot{}, err
+	}
+	if err := markAgentConfigsDirtyTx(tx); err != nil {
+		return NodeControlSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return NodeControlSnapshot{}, err
 	}
 	return d.NodeControlSnapshot(now)
@@ -635,13 +737,11 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
 		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
-			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,
-			config_dirty=CASE WHEN ? THEN 1 ELSE config_dirty END,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, sqliteBool(portChanged), sqliteBool(portChanged), now.UnixMilli(), id)
+			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
+			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,desired_config_hash=CASE WHEN ? THEN '' ELSE desired_config_hash END,
-			config_dirty=CASE WHEN ? THEN 1 ELSE config_dirty END,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, sqliteBool(portChanged), sqliteBool(portChanged), now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -657,6 +757,9 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, errNodeNotFound
 	}
 	if portChanged {
+		if _, err := tx.Exec(`UPDATE control_nodes SET desired_config_hash='',desired_config_revision=0 WHERE id=?`, id); err != nil {
+			return ControlNode{}, err
+		}
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_hash='',
 			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
@@ -665,8 +768,12 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 			return ControlNode{}, err
 		}
 	}
-	if portChanged || enabledChanged {
+	if enabledChanged {
 		if err := markAgentConfigsDirtyTx(tx); err != nil {
+			return ControlNode{}, err
+		}
+	} else if portChanged {
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, id); err != nil {
 			return ControlNode{}, err
 		}
 	}
@@ -709,6 +816,15 @@ func (d *DB) DeleteControlNode(id int64) error {
 	} else if err != nil {
 		return err
 	}
+	// Keep a durable cleanup handle before removing the node row. If the
+	// managed TLS directory is temporarily unavailable, the scheduler can retry
+	// cleanup without resurrecting the deleted control node.
+	if validTLSNodeGUID(guid) {
+		if _, err := tx.Exec(`INSERT INTO node_tls_cleanup_jobs(node_guid,created_at_ms,attempts,last_error,updated_at_ms)
+			VALUES(?,?,0,'',?) ON CONFLICT(node_guid) DO UPDATE SET last_error='',updated_at_ms=excluded.updated_at_ms`, guid, time.Now().UnixMilli(), time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec("UPDATE node_scheduler_settings SET manual_node_id=NULL,active_node_id=NULL WHERE manual_node_id=? OR active_node_id=?", id, id); err != nil {
 		return err
 	}
@@ -730,13 +846,56 @@ func (d *DB) DeleteControlNode(id int64) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// The database deletion is authoritative. TLS cleanup is deliberately
-	// best-effort after commit: an operator-owned filesystem issue must not
-	// resurrect a node that has already been removed from the control plane.
-	if err := removeManagedEdgeNodeTLS(d.dbPath, guid); err != nil {
-		log.Printf("[node] removed node %d but could not clean managed Edge TLS: %v", id, err)
+	// The database deletion is authoritative. Complete the cleanup immediately
+	// when possible; failures remain durable for the scheduler retry loop.
+	if err := d.retryNodeTLSCleanup(guid); err != nil {
+		log.Printf("[node] removed node %d but managed Edge TLS cleanup is pending: %v", id, err)
 	}
 	return nil
+}
+
+func (d *DB) retryNodeTLSCleanup(onlyGUID string) error {
+	if d == nil || d.db == nil {
+		return nil
+	}
+	query := "SELECT node_guid FROM node_tls_cleanup_jobs"
+	args := []interface{}{}
+	if strings.TrimSpace(onlyGUID) != "" {
+		query += " WHERE node_guid=?"
+		args = append(args, onlyGUID)
+	}
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	guids := make([]string, 0)
+	for rows.Next() {
+		var guid string
+		if err := rows.Scan(&guid); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		guids = append(guids, guid)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	var failures []error
+	for _, guid := range guids {
+		if err := removeManagedEdgeNodeTLS(d.dbPath, guid); err != nil {
+			failures = append(failures, fmt.Errorf("node %s: %w", guid, err))
+			_, _ = d.db.Exec(`UPDATE node_tls_cleanup_jobs SET attempts=attempts+1,last_error=?,updated_at_ms=? WHERE node_guid=?`, err.Error(), time.Now().UnixMilli(), guid)
+			continue
+		}
+		if _, err := d.db.Exec("DELETE FROM node_tls_cleanup_jobs WHERE node_guid=?", guid); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
@@ -1168,9 +1327,9 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
 	var lastBootID, lastSessionID, desiredConfigHash, previousApplyError string
-	var configDirty int
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures)
+	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1225,8 +1384,21 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	reportedApplyError := strings.TrimSpace(report.ApplyError)
 	applyError := reportedApplyError
+	appliedHash := strings.TrimSpace(report.AppliedConfigHash)
+	desiredHash := strings.TrimSpace(desiredConfigHash)
+	clearAppliedConfig := false
+	if report.AppliedConfigRevision > 0 {
+		clearAppliedConfig = report.AppliedConfigRevision == configRevision &&
+			report.AppliedConfigRevision == desiredConfigRevision &&
+			appliedHash != "" && appliedHash == desiredHash
+	} else {
+		// Legacy Agents do not send a revision. They may acknowledge a
+		// non-blank desired hash, but can never clear a deliberate blank
+		// invalidation marker left by a newer configuration revision.
+		clearAppliedConfig = appliedHash != "" && desiredHash != "" && appliedHash == desiredHash
+	}
 	legacyDiagnostic := false
-	if applyError == "" && strings.TrimSpace(report.AppliedConfigHash) == "" {
+	if applyError == "" && appliedHash == "" {
 		// Older Agents do not know about apply_error. Preserve an existing
 		// diagnostic until a report confirms that the desired configuration was
 		// actually applied, instead of letting a legacy heartbeat erase it.
@@ -1259,7 +1431,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			applyFailures = 1
 			applyErrorAtMS = now.UnixMilli()
 		}
-	} else if strings.TrimSpace(report.AppliedConfigHash) == strings.TrimSpace(desiredConfigHash) && strings.TrimSpace(desiredConfigHash) != "" {
+	} else if clearAppliedConfig {
 		// A matching applied hash is the only successful completion signal. It
 		// clears the previous failure and its counters atomically with the report.
 		applyErrorAtMS = 0
@@ -1267,10 +1439,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 			lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? <> '' AND ? = desired_config_hash THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), strings.TrimSpace(report.AppliedConfigHash), applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
-		strings.TrimSpace(report.AppliedConfigHash), strings.TrimSpace(report.AppliedConfigHash),
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), appliedHash, report.AppliedConfigRevision, applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
+		clearAppliedConfig,
 		report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration,
 		now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
@@ -1281,8 +1453,6 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	// an Agent process restart). Without this, a persistent apply failure leaves
 	// config_pending_since_ms at zero and the automatic failover cooldown can
 	// never begin.
-	appliedHash := strings.TrimSpace(report.AppliedConfigHash)
-	desiredHash := strings.TrimSpace(desiredConfigHash)
 	if desiredHash != "" && appliedHash != desiredHash {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_pending_since_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE config_pending_since_ms END,
@@ -1494,8 +1664,11 @@ func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) error {
 	}
 	_, _ = io.Copy(io.Discard, capture)
 	if history, ok := watchHistoryEventFromCapture(capture, d, *site, req, nil, event.StatusCode, time.UnixMilli(event.RecordedAtMS)); ok {
-		if !d.EnqueueWatchHistory(history) {
-			return errors.New("watch history queue is full")
+		// Agent events are acknowledged only after the derived watch history is
+		// committed. The proxy hot path may remain asynchronous, but replayed
+		// control-plane events must not be ACKed while they only exist in memory.
+		if _, err := d.writeWatchHistoryBatch([]watchHistoryEvent{history}); err != nil {
+			return fmt.Errorf("persist watch history: %w", err)
 		}
 	}
 	return nil

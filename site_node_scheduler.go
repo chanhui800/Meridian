@@ -73,6 +73,7 @@ type AgentSiteRoute struct {
 type AgentRuntimeConfig struct {
 	SchemaVersion        int              `json:"schema_version"`
 	ConfigHash           string           `json:"config_hash"`
+	ConfigRevision       int64            `json:"config_revision,omitempty"`
 	NodeGUID             string           `json:"node_guid"`
 	EntryMode            string           `json:"entry_mode"`
 	HTTPPort             int              `json:"http_port"`
@@ -193,10 +194,10 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 	}
 	var oldEnabled int
 	var oldMode string
-	var oldFixed sql.NullInt64
+	var oldFixed, oldDesired, oldApplied sql.NullInt64
 	var oldPendingSince int64
-	lookupErr := d.db.QueryRow("SELECT enabled,mode,fixed_node_id,config_pending_since_ms FROM site_node_schedules WHERE site_id=?", siteID).
-		Scan(&oldEnabled, &oldMode, &oldFixed, &oldPendingSince)
+	lookupErr := d.db.QueryRow("SELECT enabled,mode,fixed_node_id,desired_node_id,applied_node_id,config_pending_since_ms FROM site_node_schedules WHERE site_id=?", siteID).
+		Scan(&oldEnabled, &oldMode, &oldFixed, &oldDesired, &oldApplied, &oldPendingSince)
 	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
 		return SiteNodeSchedule{}, lookupErr
 	}
@@ -238,7 +239,17 @@ func (d *DB) SaveSiteNodeSchedule(siteID int64, enabled bool, mode string, fixed
 	if err != nil {
 		return SiteNodeSchedule{}, err
 	}
-	if err := markAgentConfigsDirtyTx(tx); err != nil {
+	nodeIDs := []int64{fixedNodeID}
+	if oldFixed.Valid {
+		nodeIDs = append(nodeIDs, oldFixed.Int64)
+	}
+	if oldDesired.Valid {
+		nodeIDs = append(nodeIDs, oldDesired.Int64)
+	}
+	if oldApplied.Valid {
+		nodeIDs = append(nodeIDs, oldApplied.Int64)
+	}
+	if err := markAgentConfigsDirtyForNodeIDsTx(tx, nodeIDs...); err != nil {
 		return SiteNodeSchedule{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -361,7 +372,16 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	if err != nil {
 		return err
 	}
-	assignmentsChanged := false
+	type assignmentUpdate struct {
+		siteID        int64
+		desired       int64
+		status        string
+		lastError     string
+		pendingSince  int64
+		desiredChange bool
+	}
+	updates := make([]assignmentUpdate, 0)
+	changedNodeIDs := make([]int64, 0)
 	for _, value := range values {
 		if !value.Enabled {
 			continue
@@ -413,25 +433,53 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		if desired != value.DesiredNodeID {
 			status = "pending"
 		}
-		if desired != value.DesiredNodeID {
-			assignmentsChanged = true
-			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,config_pending_since_ms=?,updated_at_ms=? WHERE site_id=?`,
-				nullableNodeID(desired), status, lastError, now.UnixMilli(), now.UnixMilli(), value.SiteID); err != nil {
-				return err
+		desiredChanged := desired != value.DesiredNodeID
+		statusChanged := status != value.DNSStatus || lastError != value.LastError
+		if desiredChanged || statusChanged {
+			pendingSince := value.ConfigPendingSinceMS
+			if desiredChanged {
+				pendingSince = now.UnixMilli()
 			}
-		} else if status != value.DNSStatus || lastError != value.LastError {
-			if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
-				status, lastError, now.UnixMilli(), value.SiteID); err != nil {
-				return err
+			updates = append(updates, assignmentUpdate{
+				siteID:        value.SiteID,
+				desired:       desired,
+				status:        status,
+				lastError:     lastError,
+				pendingSince:  pendingSince,
+				desiredChange: desiredChanged,
+			})
+			if desiredChanged {
+				changedNodeIDs = append(changedNodeIDs, value.DesiredNodeID, desired)
 			}
 		}
 	}
-	if assignmentsChanged {
-		if _, err := a.db.db.Exec("UPDATE control_nodes SET config_dirty=1,updated_at_ms=? WHERE enabled=1 AND agent_token_hash<>''", now.UnixMilli()); err != nil {
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	assignmentsChanged := false
+	for _, update := range updates {
+		if update.desiredChange {
+			if _, err := tx.Exec(`UPDATE site_node_schedules SET desired_node_id=?,dns_status=?,last_error=?,config_pending_since_ms=?,updated_at_ms=? WHERE site_id=?`,
+				nullableNodeID(update.desired), update.status, update.lastError, update.pendingSince, now.UnixMilli(), update.siteID); err != nil {
+				return err
+			}
+			assignmentsChanged = true
+		} else if _, err := tx.Exec(`UPDATE site_node_schedules SET dns_status=?,last_error=?,updated_at_ms=? WHERE site_id=?`,
+			update.status, update.lastError, now.UnixMilli(), update.siteID); err != nil {
 			return err
 		}
 	}
-	return nil
+	if assignmentsChanged {
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, changedNodeIDs...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // agentSiteHashBase lets the runtime hash use the Site wire shape without
@@ -464,8 +512,10 @@ type agentSiteRouteHash struct {
 }
 
 type agentRuntimeConfigHash struct {
-	SchemaVersion        int                  `json:"schema_version"`
-	ConfigHash           string               `json:"config_hash"`
+	SchemaVersion int    `json:"schema_version"`
+	ConfigHash    string `json:"config_hash"`
+	// ConfigRevision is an ordering/acknowledgement field, not runtime
+	// behavior, so deliberately keep it outside both legacy and modern hashes.
 	NodeGUID             string               `json:"node_guid"`
 	EntryMode            string               `json:"entry_mode"`
 	HTTPPort             int                  `json:"http_port"`
@@ -681,12 +731,6 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err := a.refreshSiteAssignments(now); err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	rows, err := a.db.db.Query(`SELECT s.id,s.public_host,s.target_url,s.playback_target_url,s.playback_mode,s.stream_hosts,s.upstream_headers
-		FROM site_node_schedules n JOIN sites s ON s.id=n.site_id
-		WHERE n.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND s.enabled=1 ORDER BY s.id`, node.ID, node.ID)
-	if err != nil {
-		return AgentRuntimeConfig{}, err
-	}
 	type pendingRoute struct {
 		route                      AgentSiteRoute
 		storedHeaders, streamHosts string
@@ -699,6 +743,24 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	if _, probeErr := decodeNodeProbeSecret(probeSecretText); probeErr != nil {
 		return AgentRuntimeConfig{}, probeErr
+	}
+	// Hold one SQLite read/write transaction for the route snapshot and the
+	// desired-hash publication below. This prevents a site edit from being
+	// observed half-way through config construction.
+	tx, err := a.db.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AgentRuntimeConfig{}, err
+	}
+	defer tx.Rollback()
+	node, err = scanControlNode(tx.QueryRow(controlNodeSelect+" WHERE id=?", node.ID), now)
+	if err != nil {
+		return AgentRuntimeConfig{}, err
+	}
+	rows, err := tx.Query(`SELECT s.id,s.public_host,s.target_url,s.playback_target_url,s.playback_mode,s.stream_hosts,s.upstream_headers
+		FROM site_node_schedules n JOIN sites s ON s.id=n.site_id
+		WHERE n.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND s.enabled=1 ORDER BY s.id`, node.ID, node.ID)
+	if err != nil {
+		return AgentRuntimeConfig{}, err
 	}
 	for rows.Next() {
 		var value pendingRoute
@@ -746,7 +808,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		if len(policy.values) > 0 {
 			route.Headers = map[string][]string(policy.values)
 		}
-		site, getErr := a.db.GetSite(route.SiteID)
+		site, getErr := getSiteTx(tx, route.SiteID)
 		if getErr != nil {
 			return AgentRuntimeConfig{}, getErr
 		}
@@ -777,7 +839,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	// Keep the legacy field names in the Agent wire contract during rolling
 	// upgrades. Their values now describe one HTTPS-only listener.
-	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, EntryMode: "direct",
+	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigRevision: node.ConfigRevision, NodeGUID: node.GUID, EntryMode: "direct",
 		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText,
 		CacheClearGeneration: node.CacheClearGeneration, Routes: routes}
 	// Legacy Agents do not send a platform header. Do not advertise the
@@ -816,20 +878,33 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	// A configuration fetch also records the desired hash. Keep config_dirty set
-	// until a subsequent Agent report confirms that exact hash was applied.
-	_, err = a.db.db.Exec(`UPDATE control_nodes SET
-		desired_config_hash=?,
-		config_dirty=CASE WHEN desired_config_hash<>? THEN 1 ELSE config_dirty END,
-		updated_at_ms=? WHERE id=?`, config.ConfigHash, config.ConfigHash, now.UnixMilli(), node.ID)
+	// Publish the snapshot with a compare-and-swap. If a site/node mutation
+	// increments config_revision while this response was being assembled, do
+	// not let the stale route set become the desired configuration.
+	result, err := tx.Exec(`UPDATE control_nodes SET
+		desired_config_hash=?, desired_config_revision=?,
+		config_dirty=1, updated_at_ms=?
+		WHERE id=? AND config_revision=?`, config.ConfigHash, config.ConfigRevision, now.UnixMilli(), node.ID, node.ConfigRevision)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return AgentRuntimeConfig{}, err
+	}
+	if rowsAffected != 1 {
+		return AgentRuntimeConfig{}, errors.New("agent configuration changed while it was being built; retry")
+	}
+	if _, err := tx.Exec(`UPDATE site_node_schedules SET
 		config_pending_since_ms=CASE WHEN config_hash<>? THEN ? ELSE config_pending_since_ms END,
 		config_hash=?,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?`,
-		config.ConfigHash, now.UnixMilli(), config.ConfigHash, now.UnixMilli(), node.ID)
-	return config, err
+		config.ConfigHash, now.UnixMilli(), config.ConfigHash, now.UnixMilli(), node.ID); err != nil {
+		return AgentRuntimeConfig{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AgentRuntimeConfig{}, err
+	}
+	return config, nil
 }
 
 func (a *App) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
@@ -1016,15 +1091,25 @@ func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedul
 	if err != nil {
 		return err
 	}
-	if schedule.cfZoneID == "" {
-		return errors.New("tracked DNS zone is missing")
-	}
-	if err := cf.deleteRecord(ctx, schedule.cfZoneID, schedule.cfRecordID); err != nil {
+	if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
 		return err
 	}
 	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET cf_zone_id='',cf_record_id='',cf_record_type='',applied_node_id=NULL,
 		applied_address='',dns_status='disabled',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), schedule.SiteID)
 	return err
+}
+
+func deleteTrackedSiteDNSRemote(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule) error {
+	if schedule.cfRecordID == "" {
+		return nil
+	}
+	if cf == nil {
+		return errors.New("Cloudflare DNS client is unavailable")
+	}
+	if schedule.cfZoneID == "" {
+		return errors.New("tracked DNS zone is missing")
+	}
+	return cf.deleteRecord(ctx, schedule.cfZoneID, schedule.cfRecordID)
 }
 
 func nodeDialAddress(address string, port int) (string, error) {
@@ -1190,6 +1275,9 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	now := time.Now()
+	if err := a.db.retryNodeTLSCleanup(""); err != nil {
+		log.Printf("[node-scheduler] managed Edge TLS cleanup retry failed: %v", err)
+	}
 	if err := a.refreshSiteAssignments(now); err != nil {
 		log.Printf("[node-scheduler] refresh assignments failed: %v", err)
 		return
@@ -1259,12 +1347,31 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 	if err != nil && !errors.Is(err, errNodeNotFound) {
 		return err
 	}
-	if err == nil && value.cfRecordID != "" {
-		if err := a.deleteTrackedSiteDNS(ctx, value); err != nil {
+	if err != nil {
+		return nil
+	}
+	// Freeze the local schedule before touching Cloudflare. This is the first
+	// phase of the deletion saga: a failed remote delete must never leave an
+	// enabled row that the scheduler can use to recreate DNS.
+	if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), siteID); err != nil {
+		return err
+	}
+	if value.cfRecordID != "" {
+		cf, err := a.cloudflareForScheduling()
+		if err != nil {
+			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), siteID)
+			return err
+		}
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, value); err != nil {
+			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), siteID)
 			return err
 		}
 	}
-	_, err = a.db.db.Exec("DELETE FROM site_node_schedules WHERE site_id=?", siteID)
+	// Keep the child row as the durable deletion handle until DeleteSite's
+	// database transaction commits. This avoids the partial-commit window where
+	// Cloudflare has been cleaned but a later site-row deletion fails.
+	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
+		applied_node_id=NULL,cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',dns_status='disabled',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), siteID)
 	return err
 }
 
@@ -1273,19 +1380,55 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	if err != nil {
 		return err
 	}
+	affected := make([]SiteNodeSchedule, 0)
 	for _, value := range values {
 		if value.FixedNodeID != nodeID && value.DesiredNodeID != nodeID && value.AppliedNodeID != nodeID {
 			continue
 		}
-		if value.cfRecordID != "" {
-			if err := a.deleteTrackedSiteDNS(ctx, value); err != nil {
-				return err
-			}
-		}
-		if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
-			applied_node_id=NULL,dns_status='disabled',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), value.SiteID); err != nil {
+		affected = append(affected, value)
+	}
+	if len(affected) == 0 {
+		return nil
+	}
+	cf, err := a.cloudflareForScheduling()
+	if err != nil {
+		return err
+	}
+	// Freeze every affected row in one local transaction before the remote phase.
+	// This makes a partial Cloudflare failure safe: all rows are disabled and
+	// retain their record IDs for retry, so the scheduler cannot recreate a
+	// record that was already deleted earlier in the batch.
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, value := range affected {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), value.SiteID); err != nil {
 			return err
 		}
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, value := range affected {
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, value); err != nil {
+			// Keep every row disabled and retain tracked IDs so a later delete
+			// request can resume the remote phase idempotently.
+			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), value.SiteID)
+			return err
+		}
+	}
+	tx, err = a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, value := range affected {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
+			applied_node_id=NULL,cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',dns_status='disabled',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), value.SiteID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -161,6 +162,10 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 	if _, err := db.db.Exec(`INSERT INTO users (username, password_hash) VALUES ('admin', 'hash')`); err != nil {
 		t.Fatal(err)
 	}
+	node, _, err := db.CreateControlNode(NodeCreateInput{Name: "backup-edge", Address: "203.0.113.10", Port: 443}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
 	tlsDir := filepath.Join(dir, "tls")
 	if err := os.MkdirAll(tlsDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -175,7 +180,7 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	edgeDir := filepath.Join(tlsDir, "edge-nodes", "node-a", "current")
+	edgeDir := filepath.Join(tlsDir, "edge-nodes", node.GUID, "current")
 	if err := os.MkdirAll(edgeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +236,7 @@ func TestBuildBackupIncludesTLSOnlyWhenSelected(t *testing.T) {
 			t.Fatalf("selected TLS backup is missing %s", name)
 		}
 	}
-	for _, name := range []string{backupTLSEdgeNodesPrefix + "node-a/fullchain.pem", backupTLSEdgeNodesPrefix + "node-a/privkey.pem"} {
+	for _, name := range []string{backupTLSEdgeNodesPrefix + node.GUID + "/fullchain.pem", backupTLSEdgeNodesPrefix + node.GUID + "/privkey.pem"} {
 		if _, ok := entries[name]; !ok {
 			t.Fatalf("selected TLS backup is missing %s", name)
 		}

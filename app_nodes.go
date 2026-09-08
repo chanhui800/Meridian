@@ -685,7 +685,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	configChanged := nodeReportConfigChanged(result.Node, report.AppliedConfigHash)
+	configChanged := nodeReportConfigChanged(result.Node, report.AppliedConfigHash, report.AppliedConfigRevision)
 	a.jsonOK(w, map[string]interface{}{
 		"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
 		"accepted_event_ids": result.AcceptedEventIDs, "accepted_event_uids": result.AcceptedEventUIDs,
@@ -698,9 +698,12 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 // nodeReportConfigChanged tells an Agent to fetch immediately when the
 // controller has invalidated its runtime snapshot. A blank desired hash is a
 // deliberate invalidation marker, so it must also trigger a refresh.
-func nodeReportConfigChanged(node ControlNode, appliedHash string) bool {
+func nodeReportConfigChanged(node ControlNode, appliedHash string, appliedRevision int64) bool {
 	desired := strings.TrimSpace(node.DesiredConfigHash)
 	applied := strings.TrimSpace(appliedHash)
+	if appliedRevision > 0 && node.DesiredConfigRevision > 0 && appliedRevision != node.DesiredConfigRevision {
+		return true
+	}
 	return node.ConfigDirty || desired == "" || desired != applied
 }
 
@@ -779,7 +782,7 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 			"accepted_event_ids": result.AcceptedEventIDs, "accepted_event_uids": result.AcceptedEventUIDs,
 			"discarded_event_ids": result.DiscardedEventIDs, "discarded_event_uids": result.DiscardedEventUIDs,
 			"config_hash":    result.Node.DesiredConfigHash,
-			"config_changed": nodeReportConfigChanged(result.Node, report.AppliedConfigHash),
+			"config_changed": nodeReportConfigChanged(result.Node, report.AppliedConfigHash, report.AppliedConfigRevision),
 		}
 		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 			return

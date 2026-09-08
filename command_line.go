@@ -297,6 +297,9 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 			continue
 		} else if changed {
 			installed++
+			if dirtyErr := db.markAgentConfigDirty(node.ID); dirtyErr != nil {
+				failures = append(failures, fmt.Errorf("node %s mark config dirty: %w", node.Name, dirtyErr))
+			}
 		}
 	}
 	if err := errors.Join(failures...); err != nil {

@@ -117,11 +117,15 @@ func renewEdgeCertificatesIfDue(ctx context.Context, db *DB, manager *panelCerti
 			continue
 		}
 		nodeCtx, cancel := context.WithTimeout(ctx, edgeCertificateRenewalTimeout)
-		_, ensureErr := ensureEdgeCertificateForNode(nodeCtx, settings, token, manager, node)
+		changed, ensureErr := ensureEdgeCertificateForNode(nodeCtx, settings, token, manager, node)
 		cancel()
 		if ensureErr != nil {
 			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, ensureErr))
 			log.Printf("[edge-certificate] node %s renewal failed: %v", node.Name, ensureErr)
+		} else if changed {
+			if dirtyErr := db.markAgentConfigDirty(node.ID); dirtyErr != nil {
+				failures = append(failures, fmt.Errorf("node %s mark config dirty: %w", node.Name, dirtyErr))
+			}
 		}
 	}
 	return errors.Join(failures...)
@@ -179,8 +183,11 @@ func provisionEdgeCertificateForNode(ctx context.Context, db *DB, manager *panel
 	if err != nil {
 		return errors.New("无法解密已保存的 DNS API Token")
 	}
-	_, err = ensureEdgeCertificateForNode(ctx, settings, token, manager, node)
-	return err
+	changed, err := ensureEdgeCertificateForNode(ctx, settings, token, manager, node)
+	if err != nil || !changed {
+		return err
+	}
+	return db.markAgentConfigDirty(node.ID)
 }
 
 // disableExpiredPanelTLSIfNeeded makes an expired certificate a recoverable
