@@ -784,6 +784,68 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 	}
 }
 
+// syncSiteTrafficLimits updates the live quota baseline without rebuilding
+// the proxy bundle. TrafficCycleUsage is Controller-authoritative usage for
+// the current billing cycle; keeping it outside the config hash lets normal
+// telemetry refresh the quota state without restarting every site.
+func (runtime *edgeAgentRuntime) syncSiteTrafficLimits(config AgentRuntimeConfig) {
+	if runtime == nil {
+		return
+	}
+	runtime.mu.RLock()
+	bundle := runtime.bundle
+	runtime.mu.RUnlock()
+	if bundle == nil || bundle.manager == nil || bundle.database == nil {
+		return
+	}
+	bundle.manager.mu.RLock()
+	defer bundle.manager.mu.RUnlock()
+	for _, route := range config.Routes {
+		cycleMode := route.TrafficBillingMode
+		if cycleMode != trafficBillingModeOutbound && cycleMode != trafficBillingModeBidirectional {
+			settings := bundle.database.currentSystemSettings()
+			cycleMode = trafficBillingModeLabel(settings.TrafficBillingMode)
+		}
+		cycleStart := time.Time{}
+		if route.TrafficCycleStartMS > 0 {
+			cycleStart = time.UnixMilli(route.TrafficCycleStartMS)
+		} else if route.TrafficBillingMode == "" {
+			// A legacy Controller did not send a cycle marker. Reconstruct the
+			// local default only for that wire contract; an empty marker from a
+			// current Controller means the configured cycle intentionally has no
+			// reset boundary.
+			settings := bundle.database.currentSystemSettings()
+			cycleStart = trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
+		}
+		cycleUsage := route.TrafficCycleUsage
+		// Older Controllers did not send a cycle baseline. Preserve their
+		// previous behavior as a compatibility fallback; current Controllers
+		// always send TrafficCycleStartMS and therefore use the authoritative
+		// cycle value above (which may legitimately be zero).
+		if route.TrafficCycleStartMS == 0 && route.TrafficBillingMode == "" {
+			cycleUsage = route.Site.TrafficUsed
+		}
+		for localID, identity := range bundle.localSites {
+			if identity.centralID != route.SiteID {
+				continue
+			}
+			inst := bundle.manager.proxies[localID]
+			if inst == nil {
+				continue
+			}
+			inst.trafficMu.Lock()
+			inst.Site.TrafficQuota = route.Site.TrafficQuota
+			inst.Site.TrafficUsed = route.Site.TrafficUsed
+			inst.Site.TrafficUsedIn = route.Site.TrafficUsedIn
+			inst.Site.TrafficUsedOut = route.Site.TrafficUsedOut
+			inst.trafficCycleStart = cycleStart
+			inst.trafficCycleMode = cycleMode
+			inst.trafficCycleUsage = cycleUsage
+			inst.trafficMu.Unlock()
+		}
+	}
+}
+
 func (runtime *edgeAgentRuntime) siteStatsSnapshot() []NodeSiteStat {
 	pending := runtime.prepareSiteStats()
 	runtime.commitSiteStats(pending)
@@ -972,9 +1034,6 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		site.StoredDynamicDiscoverySources = route.DynamicSources
 		site.StoredDynamicDomainRules = route.DynamicRules
 		site.Enabled = true
-		// Node-level scheduling owns quota exhaustion. A stale local site counter
-		// must never block traffic after a DNS assignment changes nodes.
-		site.TrafficQuota = 0
 		if route.SiteID > 0 {
 			site.AssetCacheNamespace = fmt.Sprintf("site-%d-config-%s", route.SiteID, edgeAssetCacheGeneration(site, route))
 		}
@@ -1854,6 +1913,7 @@ func runEdgeAgent() error {
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else {
+				runtime.syncSiteTrafficLimits(config)
 				// Refresh the pending payload when the Controller sends a newer
 				// hash, but do not reset an in-progress retry backoff when the
 				// same failing configuration is fetched again after a report ACK.

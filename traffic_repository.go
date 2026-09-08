@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"errors"
 	"log"
 	"sort"
 	"strings"
@@ -266,10 +268,29 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 // Directional columns remain raw so changing the billing mode never destroys
 // the information needed to recalculate the current cycle.
 func (d *DB) SumTrafficSinceForSite(siteID int64, start time.Time, billingMode string) (int64, error) {
+	return sumTrafficSinceForSiteQuery(d.db, siteID, start, billingMode)
+}
+
+// sumTrafficSinceForSiteTx is the transaction-scoped equivalent used while
+// building an Agent route snapshot. Keeping the usage read in that snapshot
+// transaction makes the quota baseline consistent with the site assignment
+// and avoids a second connection racing a telemetry flush.
+func sumTrafficSinceForSiteTx(tx *sql.Tx, siteID int64, start time.Time, billingMode string) (int64, error) {
+	if tx == nil {
+		return 0, errors.New("nil traffic transaction")
+	}
+	return sumTrafficSinceForSiteQuery(tx, siteID, start, billingMode)
+}
+
+type trafficQueryer interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func sumTrafficSinceForSiteQuery(queryer trafficQueryer, siteID int64, start time.Time, billingMode string) (int64, error) {
 	var bytesIn, bytesOut int64
 	startMS := start.UnixMilli()
 	startText := start.In(time.Local).Format("2006-01-02 15:04:05")
-	err := d.db.QueryRow(`
+	err := queryer.QueryRow(`
 		WITH source AS (
 			SELECT bytes_in, bytes_out
 			FROM traffic_logs
@@ -281,7 +302,7 @@ func (d *DB) SumTrafficSinceForSite(siteID int64, start time.Time, billingMode s
 		)
 		SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0)
 		FROM source
-	`, siteID, startMS, startText, siteID, startMS).Scan(&bytesIn, &bytesOut)
+		`, siteID, startMS, startText, siteID, startMS).Scan(&bytesIn, &bytesOut)
 	return trafficBillableBytes(billingMode, bytesIn, bytesOut), err
 }
 

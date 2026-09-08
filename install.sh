@@ -725,16 +725,6 @@ set_panel_env() {
     install_env_file "$tmp_file" || return 1
 }
 
-write_rotated_env() {
-    local secret="$1" output="$2" env_file
-    env_file=$(env_file_path) || return 1
-    # $1 is an awk field reference, not a shell variable.
-    # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "JWT_SECRET" { print }' "$env_file" > "$output" || return 1
-    printf 'JWT_SECRET=%s\n' "$secret" >> "$output" || return 1
-    chmod 0600 "$output" || return 1
-}
-
 remove_loopback_proxies() {
     local current="$1" item result="" old_ifs="$IFS"
     IFS=','
@@ -2067,7 +2057,7 @@ cleanup_password_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$PASSWORD_TRANSACTION" = "1" ] \
         && [ -n "$PASSWORD_SNAPSHOT_DIR" ] && [ -n "$PASSWORD_DB_PATH" ]; then
-        warn "密码修改中断，正在恢复旧密码和 JWT 配置..."
+        warn "密码修改中断，正在恢复旧密码..."
         as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
         if ! restore_auth_snapshot "$PASSWORD_SNAPSHOT_DIR" "$PASSWORD_DB_PATH" >/dev/null 2>&1; then
             warn "自动恢复凭据失败，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
@@ -2082,7 +2072,7 @@ cleanup_password_transaction() {
     if [ -n "$PASSWORD_TMP_DIR" ] && [ -d "$PASSWORD_TMP_DIR" ] && [ "$PASSWORD_TMP_DIR" != "/" ]; then
         as_root rm -rf -- "$PASSWORD_TMP_DIR"
     fi
-    unset password password_again new_secret 2>/dev/null || true
+    unset password password_again 2>/dev/null || true
     return "$exit_code"
 }
 
@@ -2092,7 +2082,7 @@ abort_password_transaction() {
 }
 
 do_password() {
-    local password password_again length db_path tmp_dir snapshot_dir rotated_env new_secret mutated=0
+    local password password_again length db_path tmp_dir snapshot_dir mutated=0
     local current_binary="${INSTALL_DIR}/${BIN_NAME}"
     [ -x "$current_binary" ] || fail "Meridian 尚未安装"
     is_systemd || fail "自动修改密码要求 Meridian 由 systemd 管理"
@@ -2119,7 +2109,6 @@ do_password() {
     tmp_dir=$(mktemp -d)
     chmod 0700 "$tmp_dir"
     snapshot_dir="${tmp_dir}/snapshot"
-    rotated_env="${tmp_dir}/env.rotated"
     PASSWORD_TMP_DIR="$tmp_dir"
     PASSWORD_SNAPSHOT_DIR="$snapshot_dir"
     PASSWORD_DB_PATH="$db_path"
@@ -2135,19 +2124,17 @@ do_password() {
     trap cleanup_password_transaction EXIT
     trap abort_password_transaction INT TERM
 
-    new_secret=$(generate_secret)
-    write_rotated_env "$new_secret" "$rotated_env"
     if printf '%s\n' "$password" | as_root "$current_binary" admin reset-password --db "$db_path" --password-stdin; then
         mutated=1
     fi
     unset password password_again
     if [ "$mutated" != "1" ]; then
-        fail "管理员密码修改失败，将自动恢复旧密码与 JWT 配置"
+        fail "管理员密码修改失败，将自动恢复旧密码"
     fi
 
-    if ! install_env_file "$rotated_env" || ! fix_database_permissions "$db_path" \
+    if ! fix_database_permissions "$db_path" \
         || ! as_root systemctl restart "$SERVICE_NAME" || ! wait_for_health 20; then
-        warn "重启或健康检查失败，正在恢复旧密码与 JWT 配置..."
+        warn "重启或健康检查失败，正在恢复旧密码..."
         fail "密码修改失败，将自动执行凭据回滚"
     fi
 
@@ -2157,7 +2144,6 @@ do_password() {
     PASSWORD_DB_PATH=""
     as_root rm -rf -- "$tmp_dir"
     trap - EXIT INT TERM
-    unset new_secret
     ok "管理员密码已修改，所有旧登录令牌已失效"
 }
 

@@ -382,6 +382,25 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	newHeader := sha256.Sum256([]byte("new-upstream-header-key-material"))
 	path := filepath.Join(t.TempDir(), "backup.db")
 	makeBackupDatabase(t, path, oldJWT, oldHeader[:])
+	watchTokenCiphertext, err := encryptWatchHistoryTokenWithSecret("watch-token-value", oldJWT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watchDB.Exec(`INSERT INTO media_items (site_id,upstream_item_id,created_at_ms,updated_at_ms) VALUES (1,'watch-item',1,1)`); err != nil {
+		watchDB.Close()
+		t.Fatal(err)
+	}
+	if _, err := watchDB.Exec(`INSERT INTO watch_sessions (site_id,media_item_id,session_hash,started_at_ms,last_seen_at_ms,token_ciphertext) VALUES (1,1,'watch-session',1,1,?)`, watchTokenCiphertext); err != nil {
+		watchDB.Close()
+		t.Fatal(err)
+	}
+	if err := watchDB.Close(); err != nil {
+		t.Fatal(err)
+	}
 	before, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -451,6 +470,23 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	}
 	if _, err := decryptTMDBReadTokenWithSecret(tmdbCiphertext, oldJWT); err == nil {
 		t.Fatal("old JWT secret still decrypts migrated TMDB token")
+	}
+	var migratedWatchCiphertext string
+	if err := db.QueryRow("SELECT token_ciphertext FROM watch_sessions WHERE session_hash='watch-session'").Scan(&migratedWatchCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := decryptWatchHistoryTokenWithSecret(migratedWatchCiphertext, newJWT); err != nil || value != "watch-token-value" {
+		t.Fatalf("watch history token = %q, %v", value, err)
+	}
+	if _, err := decryptWatchHistoryTokenWithSecret(migratedWatchCiphertext, oldJWT); err == nil {
+		t.Fatal("old JWT secret still decrypts migrated watch history token")
+	}
+	var sessionVersion int
+	if err := db.QueryRow("SELECT session_version FROM users WHERE username='admin'").Scan(&sessionVersion); err != nil {
+		t.Fatal(err)
+	}
+	if sessionVersion != 2 {
+		t.Fatalf("restored session version=%d, want 2", sessionVersion)
 	}
 }
 

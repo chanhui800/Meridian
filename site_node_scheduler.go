@@ -68,6 +68,13 @@ type AgentSiteRoute struct {
 	UpstreamHeaders   string              `json:"upstream_headers_raw,omitempty"`
 	DynamicSources    string              `json:"dynamic_sources_raw,omitempty"`
 	DynamicRules      string              `json:"dynamic_rules_raw,omitempty"`
+	// TrafficCycleUsage is the Controller's authoritative usage for the
+	// currently active billing cycle. It is intentionally excluded from the
+	// runtime config hash because it changes with telemetry, while the quota
+	// itself remains part of the route identity.
+	TrafficCycleUsage   int64  `json:"traffic_cycle_usage,omitempty"`
+	TrafficCycleStartMS int64  `json:"traffic_cycle_start_ms,omitempty"`
+	TrafficBillingMode  string `json:"traffic_billing_mode,omitempty"`
 }
 
 type AgentRuntimeConfig struct {
@@ -547,6 +554,13 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 	}
 	routes := make([]agentSiteRouteHash, len(config.Routes))
 	for i, route := range config.Routes {
+		hashSite := route.Site
+		// Traffic usage is a live accounting value. It is delivered in the
+		// route so an Agent can enforce the quota, but must not participate in
+		// the runtime identity or every report would force a full proxy apply.
+		hashSite.TrafficUsed = 0
+		hashSite.TrafficUsedIn = 0
+		hashSite.TrafficUsedOut = 0
 		routes[i] = agentSiteRouteHash{
 			SiteID:            route.SiteID,
 			Host:              route.Host,
@@ -555,7 +569,7 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 			StreamHosts:       route.StreamHosts,
 			PlaybackMode:      route.PlaybackMode,
 			Headers:           route.Headers,
-			Site:              agentSiteHash{agentSiteHashBase: agentSiteHashBase(route.Site)},
+			Site:              agentSiteHash{agentSiteHashBase: agentSiteHashBase(hashSite)},
 			FailoverTargets:   route.FailoverTargets,
 			FailoverLines:     route.FailoverLines,
 			StreamHostsRaw:    route.StreamHostsRaw,
@@ -731,6 +745,9 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err := a.refreshSiteAssignments(now); err != nil {
 		return AgentRuntimeConfig{}, err
 	}
+	settings := a.db.currentSystemSettings()
+	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
+	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
 	type pendingRoute struct {
 		route                      AgentSiteRoute
 		storedHeaders, streamHosts string
@@ -818,10 +835,6 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		// runtime route configuration.
 		route.Site.IconName = ""
 		route.Site.IconURL = ""
-		route.Site.TrafficQuota = 0
-		route.Site.TrafficUsed = 0
-		route.Site.TrafficUsedIn = 0
-		route.Site.TrafficUsedOut = 0
 		route.Site.MediaMovieCount = 0
 		route.Site.MediaSeriesCount = 0
 		route.Site.MediaEpisodeCount = 0
@@ -829,6 +842,14 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		route.Site.CreatedAt = ""
 		route.Site.UpdatedAt = ""
 		route.Site.UpstreamHeaders = nil
+		route.TrafficCycleUsage, err = sumTrafficSinceForSiteTx(tx, route.SiteID, cycleStart, cycleMode)
+		if err != nil {
+			return AgentRuntimeConfig{}, fmt.Errorf("site %d traffic usage: %w", route.SiteID, err)
+		}
+		if !cycleStart.IsZero() {
+			route.TrafficCycleStartMS = cycleStart.UnixMilli()
+		}
+		route.TrafficBillingMode = cycleMode
 		route.FailoverTargets = site.FailoverTargets
 		route.FailoverLines = site.StoredFailoverLines
 		route.StreamHostsRaw = site.StreamHosts
@@ -842,18 +863,6 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigRevision: node.ConfigRevision, NodeGUID: node.GUID, EntryMode: "direct",
 		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText,
 		CacheClearGeneration: node.CacheClearGeneration, Routes: routes}
-	// Legacy Agents do not send a platform header. Do not advertise the
-	// controller's local binary to those clients: on a cross-architecture
-	// rollout that checksum would make an old arm64 Agent download an amd64
-	// executable and fail with ENOEXEC. New Agents identify their platform and
-	// receive the matching version/digest below.
-	if platform != "" {
-		manifest, manifestErr := agentReleaseManifestForPlatform(ctx, platform)
-		if manifestErr == nil {
-			config.AgentVersion = manifest.Version
-			config.AgentSHA256 = manifest.SHA256
-		}
-	}
 	if len(routes) > 0 {
 		if a.panelCertificates == nil {
 			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")
@@ -903,6 +912,17 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	if err := tx.Commit(); err != nil {
 		return AgentRuntimeConfig{}, err
+	}
+	// Release metadata is advisory and deliberately excluded from the runtime
+	// hash. Fetch it after the SQLite transaction so a slow/unavailable GitHub
+	// request never monopolizes the controller's single database connection.
+	// Legacy Agents do not send a platform header and therefore receive no
+	// update metadata, preserving cross-architecture rollout safety.
+	if platform != "" {
+		if manifest, manifestErr := agentReleaseManifestForPlatform(ctx, platform); manifestErr == nil {
+			config.AgentVersion = manifest.Version
+			config.AgentSHA256 = manifest.SHA256
+		}
 	}
 	return config, nil
 }
@@ -1390,9 +1410,19 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	if len(affected) == 0 {
 		return nil
 	}
-	cf, err := a.cloudflareForScheduling()
-	if err != nil {
-		return err
+	needsCloudflare := false
+	for _, value := range affected {
+		if strings.TrimSpace(value.cfRecordID) != "" {
+			needsCloudflare = true
+			break
+		}
+	}
+	var cf *cloudflareClient
+	if needsCloudflare {
+		cf, err = a.cloudflareForScheduling()
+		if err != nil {
+			return err
+		}
 	}
 	// Freeze every affected row in one local transaction before the remote phase.
 	// This makes a partial Cloudflare failure safe: all rows are disabled and
@@ -1412,6 +1442,9 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 		return err
 	}
 	for _, value := range affected {
+		if strings.TrimSpace(value.cfRecordID) == "" {
+			continue
+		}
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, value); err != nil {
 			// Keep every row disabled and retain tracked IDs so a later delete
 			// request can resume the remote phase idempotently.

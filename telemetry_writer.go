@@ -107,6 +107,7 @@ func (d *DB) runDynamicObservationWriter() {
 			select {
 			case command = <-d.dynamicObservationQueue:
 			case <-ticker.C:
+				d.drainWatchHistoryInbox(time.Now())
 				if err := d.pruneDynamicObservations(); err != nil {
 					d.droppedDynamicObservations.Add(1)
 					log.Printf("[dynamic-observations] optional retention write failed: %v", err)
@@ -202,7 +203,20 @@ func (d *DB) runDynamicObservationWriter() {
 			}
 			skipped, err := d.writeWatchHistoryBatch(watchHistoryBatch)
 			if err != nil {
-				d.droppedWatchHistory.Add(uint64(len(watchHistoryBatch)))
+				// A transient SQLite failure must not silently discard completed
+				// playback sessions. Move valid events to the durable inbox so the
+				// maintenance pass can retry them after the database recovers.
+				queued, inboxErr := d.persistWatchHistoryInboxBatch(watchHistoryBatch)
+				validCount := len(watchHistoryBatch) - skipped
+				if validCount < 0 {
+					validCount = 0
+				}
+				if lost := validCount - queued; lost > 0 {
+					d.droppedWatchHistory.Add(uint64(lost))
+				}
+				if inboxErr != nil {
+					log.Printf("[watch-history] durable inbox write failed: %v", inboxErr)
+				}
 				log.Printf("[watch-history] optional batch write failed: %v", err)
 			} else if skipped > 0 {
 				d.droppedWatchHistory.Add(uint64(skipped))

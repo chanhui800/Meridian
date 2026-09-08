@@ -1316,6 +1316,12 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 		return err
 	}
 	defer tx.Rollback()
+	// Restoring a database must never revive a JWT issued from that snapshot,
+	// including when the destination happens to use the same JWT secret. Bump
+	// every administrator session version while the staged DB is still offline.
+	if _, err := tx.Exec(`UPDATE users SET session_version=CASE WHEN session_version<1 THEN 2 ELSE session_version+1 END`); err != nil {
+		return err
+	}
 	rows, err := tx.Query("SELECT id, target_url, upstream_headers FROM sites WHERE upstream_headers <> '' AND upstream_headers <> '[]'")
 	if err != nil {
 		return err
@@ -1480,6 +1486,51 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 		}
 		for _, item := range updates {
 			if _, err := tx.Exec("UPDATE control_nodes SET probe_secret_ciphertext=? WHERE id=?", item.ciphertext, item.id); err != nil {
+				return err
+			}
+		}
+	}
+	if hasWatchToken, err := backupSQLiteColumnExists(tx, "watch_sessions", "token_ciphertext"); err != nil {
+		return err
+	} else if hasWatchToken {
+		rows, err := tx.Query("SELECT id,token_ciphertext FROM watch_sessions WHERE token_ciphertext<>''")
+		if err != nil {
+			return err
+		}
+		type watchTokenUpdate struct {
+			id         int64
+			ciphertext string
+		}
+		updates := make([]watchTokenUpdate, 0)
+		for rows.Next() {
+			var item watchTokenUpdate
+			if err := rows.Scan(&item.id, &item.ciphertext); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			// Prefer the destination secret first. This makes restores idempotent
+			// (and avoids re-encrypting with a fresh nonce when the source already
+			// uses the current secret), while still migrating legacy ciphertext.
+			if _, currentErr := decryptWatchHistoryTokenWithSecret(item.ciphertext, newJWT); currentErr == nil {
+				continue
+			}
+			token, oldErr := decryptWatchHistoryTokenWithSecret(item.ciphertext, oldJWT)
+			if oldErr != nil {
+				_ = rows.Close()
+				return fmt.Errorf("无法解密观看历史 Token: %w", oldErr)
+			}
+			migrated, err := encryptWatchHistoryTokenWithSecret(token, newJWT)
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("无法迁移观看历史 Token: %w", err)
+			}
+			updates = append(updates, watchTokenUpdate{id: item.id, ciphertext: migrated})
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, item := range updates {
+			if _, err := tx.Exec("UPDATE watch_sessions SET token_ciphertext=? WHERE id=?", item.ciphertext, item.id); err != nil {
 				return err
 			}
 		}
