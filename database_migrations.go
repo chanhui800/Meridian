@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 31
+	databaseSchemaVersion = 32
 )
 
 func (d *DB) migrate() error {
@@ -727,6 +727,32 @@ func (d *DB) migrateOnce() error {
 			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
 				return err
 			}
+		}
+	}
+	// Schema 32 introduced the per-site configuration application deadline.
+	// Older databases have no reliable timestamp for schedules that were
+	// already waiting on an Agent, so start their cooldown during migration.
+	// Schedules whose hashes already agree remain ready and keep the zero value.
+	if previousSchemaVersion < 32 {
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE site_node_schedules
+			SET config_pending_since_ms=?
+			WHERE enabled=1
+			  AND desired_node_id IS NOT NULL
+			  AND config_pending_since_ms=0
+			  AND EXISTS (
+				  SELECT 1
+				  FROM control_nodes n
+				  WHERE n.id=site_node_schedules.desired_node_id
+				    AND (
+					    site_node_schedules.config_hash=''
+					    OR n.desired_config_hash=''
+					    OR n.applied_config_hash<>n.desired_config_hash
+					    OR site_node_schedules.config_hash<>n.desired_config_hash
+				    )
+			  )
+		`, time.Now().UnixMilli()); err != nil {
+			return err
 		}
 	}
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_request_events (

@@ -264,6 +264,22 @@ func readinessError(kind string, err error) error {
 	return &nodeReadinessError{Kind: kind, Err: err}
 }
 
+// siteScheduleConfigReady keeps DNS cutover tied to the route that is about
+// to receive traffic. A node-level hash can still match while a newly moved
+// site is waiting for the Agent to fetch and apply its next configuration.
+func siteScheduleConfigReady(schedule SiteNodeSchedule, node ControlNode) bool {
+	if schedule.ConfigPendingSinceMS > 0 {
+		return false
+	}
+	scheduleHash := strings.TrimSpace(schedule.ConfigHash)
+	desiredHash := strings.TrimSpace(node.DesiredConfigHash)
+	appliedHash := strings.TrimSpace(node.AppliedConfigHash)
+	if scheduleHash == "" || desiredHash == "" || appliedHash == "" {
+		return false
+	}
+	return scheduleHash == desiredHash && scheduleHash == appliedHash
+}
+
 func (d *DB) siteNodeProbeCooldowns(siteID int64, now time.Time) (map[int64]bool, error) {
 	rows, err := d.db.Query("SELECT node_id FROM site_node_probe_failures WHERE site_id=? AND failed_until_ms>?", siteID, now.UnixMilli())
 	if err != nil {
@@ -1050,6 +1066,9 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if err != nil {
 		return readinessError(readinessListener, err)
 	}
+	if !siteScheduleConfigReady(schedule, node) {
+		return readinessError(readinessConfig, errors.New("Agent has not applied the site configuration"))
+	}
 	if a.panelCertificates == nil {
 		return readinessError(readinessCertificate, errors.New("edge TLS certificate is unavailable"))
 	}
@@ -1059,9 +1078,6 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	}
 	if err := certificateCoversHost(edgeCertFile, schedule.PublicHost); err != nil {
 		return readinessError(readinessCertificate, err)
-	}
-	if node.DesiredConfigHash == "" || node.AppliedConfigHash != node.DesiredConfigHash {
-		return readinessError(readinessConfig, errors.New("Agent has not applied the desired configuration"))
 	}
 	if node.AgentListenerError != "" {
 		return readinessError(readinessListener, errors.New(node.AgentListenerError))
