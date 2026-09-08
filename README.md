@@ -60,14 +60,14 @@ docker compose logs -f meridian
 
 首次启动时日志会输出一次管理员初始化令牌。打开 `http://服务器地址:9090` 完成初始化。数据库、TLS 状态和缓存位于 `./data`，更新容器不会删除它们。`network_mode: host` 会让面板和站点端口直接使用宿主机网络，请先确认端口没有被其他服务占用。
 
-生产环境可以把 `latest` 换成固定版本，例如 `ghcr.io/chanhui800/meridian:v1.9.52`。固定版本便于回滚和排查问题。
+生产环境可以把 `latest` 换成固定版本，例如 `ghcr.io/chanhui800/meridian:v1.9.53`。固定版本便于回滚和排查问题。
 
 ### Linux 原生安装
 
 从固定 Release 安装（推荐）：
 
 ```bash
-VERSION=v1.9.52
+VERSION=v1.9.53
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \

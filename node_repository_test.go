@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -515,6 +516,132 @@ func TestAgentConfigPollingDoesNotResetPendingSince(t *testing.T) {
 	}
 	if clearedSchedule.ConfigPendingSinceMS != 0 {
 		t.Fatalf("applied config did not clear pending timer: %#v", clearedSchedule)
+	}
+}
+
+func TestSiteScheduleReadinessBlocksDNSUntilSiteConfigIsApplied(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 14, 30, 0, 0, time.UTC)
+	site, err := app.db.CreateSiteRecord(Site{
+		Name:        "site-readiness",
+		PublicHost:  "site-readiness.example.com",
+		IngressMode: ingressModeHost,
+		TargetURL:   "http://127.0.0.1:8096",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name:    "site-readiness-node",
+		Address: "203.0.113.45",
+		Port:    9090,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`
+		UPDATE control_nodes
+		SET desired_config_hash=?, applied_config_hash=?
+		WHERE id=?`, "site-config-v1", "site-config-v1", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`
+		UPDATE site_node_schedules
+		SET desired_node_id=?, config_hash=?, config_pending_since_ms=?
+		WHERE site_id=?`, node.ID, "site-config-v1", now.UnixMilli(), site.ID); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = app.reconcileOneSiteSchedule(context.Background(), schedule, now)
+	var readiness *nodeReadinessError
+	if !errors.As(err, &readiness) || readiness.Kind != readinessConfig {
+		t.Fatalf("reconcile error = %v, want config readiness error", err)
+	}
+	if !strings.Contains(err.Error(), "site configuration") {
+		t.Fatalf("reconcile error = %q, want site configuration detail", err)
+	}
+}
+
+func TestSchema32BackfillsPendingSiteConfigurationTimers(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 15, 0, 0, 0, time.UTC)
+	stableNode, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "stable-schema-node", Address: "203.0.113.46"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingNode, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "pending-schema-node", Address: "203.0.113.47"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stableSite, err := app.db.CreateSiteRecord(Site{Name: "stable-schema-site", ListenPort: freePort(t), PublicHost: "stable-schema.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSite, err := app.db.CreateSiteRecord(Site{Name: "pending-schema-site", ListenPort: freePort(t), PublicHost: "pending-schema.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		nodeID int64
+		siteID int64
+		hash   string
+	}{
+		{stableNode.ID, stableSite.ID, "stable-config"},
+		{pendingNode.ID, pendingSite.ID, "pending-config"},
+	} {
+		if _, err := app.db.SaveSiteNodeSchedule(item.siteID, true, "fixed", item.nodeID, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.db.db.Exec(`
+			UPDATE site_node_schedules
+			SET desired_node_id=?, config_hash=?, config_pending_since_ms=0
+			WHERE site_id=?`, item.nodeID, item.hash, item.siteID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := app.db.db.Exec(`
+		UPDATE control_nodes
+		SET desired_config_hash=?, applied_config_hash=?
+		WHERE id=?`, "stable-config", "stable-config", stableNode.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`
+		UPDATE control_nodes
+		SET desired_config_hash=?, applied_config_hash=?
+		WHERE id=?`, "pending-config", "old-config", pendingNode.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("PRAGMA user_version = 31"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.migrate(); err != nil {
+		t.Fatalf("schema 32 migration: %v", err)
+	}
+	var stablePending, pendingSince int64
+	if err := app.db.db.QueryRow("SELECT config_pending_since_ms FROM site_node_schedules WHERE site_id=?", stableSite.ID).Scan(&stablePending); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT config_pending_since_ms FROM site_node_schedules WHERE site_id=?", pendingSite.ID).Scan(&pendingSince); err != nil {
+		t.Fatal(err)
+	}
+	if stablePending != 0 {
+		t.Fatalf("stable schedule pending_since=%d, want 0", stablePending)
+	}
+	if pendingSince <= 0 {
+		t.Fatalf("inconsistent schedule pending_since=%d, want migration timestamp", pendingSince)
+	}
+	var schemaVersion int
+	if err := app.db.db.QueryRow("PRAGMA user_version").Scan(&schemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if schemaVersion != 32 {
+		t.Fatalf("schema version=%d, want 32", schemaVersion)
 	}
 }
 
