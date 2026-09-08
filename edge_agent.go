@@ -511,6 +511,8 @@ type edgeAgentRuntime struct {
 	cacheClearGeneration int64
 	listenerError        string
 	applyError           string
+	applyErrorAtMS       int64
+	applyFailures        int64
 	eventSpoolError      string
 	events               edgeEventStore
 	stats                edgeSiteStats
@@ -1122,8 +1124,12 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 		runtime.mu.Lock()
 		if retErr != nil {
 			runtime.applyError = agentStatusError(retErr)
+			runtime.applyErrorAtMS = time.Now().UnixMilli()
+			runtime.applyFailures++
 		} else {
 			runtime.applyError = ""
+			runtime.applyErrorAtMS = 0
+			runtime.applyFailures = 0
 		}
 		runtime.mu.Unlock()
 	}()
@@ -1247,10 +1253,10 @@ func agentStatusError(err error) string {
 	return value[:maxAgentStatusErrorLength]
 }
 
-func (runtime *edgeAgentRuntime) status() (string, string, string) {
+func (runtime *edgeAgentRuntime) status() (string, string, string, int64, int64) {
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
-	return runtime.appliedHash, runtime.listenerError, runtime.applyError
+	return runtime.appliedHash, runtime.listenerError, runtime.applyError, runtime.applyErrorAtMS, runtime.applyFailures
 }
 
 func (runtime *edgeAgentRuntime) close() {
@@ -1828,7 +1834,7 @@ func runEdgeAgent() error {
 			}
 		}
 		if pendingConfig != nil && (nextApplyAttempt.IsZero() || !now.Before(nextApplyAttempt)) {
-			applied, _, _ := runtime.status()
+			applied, _, _, _, _ := runtime.status()
 			if pendingConfig.ConfigHash == applied {
 				pendingConfig = nil
 				applyFailures = 0
@@ -1856,7 +1862,7 @@ func runEdgeAgent() error {
 		if collectErr != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
-			report.AppliedConfigHash, report.ListenerError, report.ApplyError = runtime.status()
+			report.AppliedConfigHash, report.ListenerError, report.ApplyError, report.ApplyErrorAtMS, report.ApplyFailures = runtime.status()
 			runtime.mu.RLock()
 			report.CacheClearGeneration = runtime.cacheClearGeneration
 			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)

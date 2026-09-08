@@ -168,6 +168,39 @@ func TestReviewSchedulerSkipsListenerFailure(t *testing.T) {
 	}
 }
 
+func TestReviewSchedulerKeepsAssignmentOnApplyFailure(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "apply-failed", Priority: 100, Address: "203.0.113.11", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "apply-failed", Sequence: 1, InterfaceName: "eth0", ApplyError: "invalid route"}, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(reviewRoute(0, "apply-failed.example.test", "https://origin.example.test").Site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.refreshSiteAssignments(now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.DesiredNodeID != node.ID {
+		t.Fatalf("apply failure cleared desired assignment: got %d want %d", schedule.DesiredNodeID, node.ID)
+	}
+}
+
 func TestReviewOldNodeRetainsRouteUntilDNSCommit(t *testing.T) {
 	app := newTestApp(t)
 	installReviewCertificate(t, app)

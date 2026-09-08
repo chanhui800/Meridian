@@ -81,6 +81,9 @@ func (d *DB) migrateOnce() error {
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&previousSchemaVersion); err != nil {
 		return err
 	}
+	if previousSchemaVersion > databaseSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", previousSchemaVersion, databaseSchemaVersion)
+	}
 
 	if _, err := conn.ExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS users (

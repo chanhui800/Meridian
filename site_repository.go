@@ -590,6 +590,18 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	if err != nil {
 		return err
 	}
+	// Any persisted site runtime change invalidates the Agent route snapshot in
+	// the same transaction. Without this, an Agent can continue serving the
+	// previous target/headers while the scheduler believes its config is
+	// current.
+	nowMS := time.Now().UnixMilli()
+	if _, err := tx.Exec(`UPDATE site_node_schedules
+		SET config_hash='',
+			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
+			updated_at_ms=?
+		WHERE site_id=?`, nowMS, nowMS, site.ID); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -644,8 +656,10 @@ func (d *DB) ToggleSite(id int64) (bool, error) {
 		return false, err
 	}
 	newVal := 1 - enabled
-	_, err := d.db.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", newVal, id)
-	return newVal == 1, err
+	if err := d.SetSiteEnabled(id, newVal == 1); err != nil {
+		return false, err
+	}
+	return newVal == 1, nil
 }
 
 func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
@@ -653,7 +667,12 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 	if enabled {
 		value = 1
 	}
-	result, err := d.db.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", value, id)
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", value, id)
 	if err != nil {
 		return err
 	}
@@ -664,5 +683,13 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 	if rows != 1 {
 		return fmt.Errorf("updated %d site rows, want 1", rows)
 	}
-	return nil
+	nowMS := time.Now().UnixMilli()
+	if _, err := tx.Exec(`UPDATE site_node_schedules
+		SET config_hash='',
+			config_pending_since_ms=CASE WHEN enabled=1 AND ?=1 THEN ? ELSE 0 END,
+			updated_at_ms=?
+		WHERE site_id=?`, value, nowMS, nowMS, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

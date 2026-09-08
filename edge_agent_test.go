@@ -43,7 +43,7 @@ func TestEdgeAgentRollbackSurfacesListenerRestoreFailure(t *testing.T) {
 	if runtime.server != nil {
 		t.Fatal("runtime retained a server after listener restore failed")
 	}
-	_, listenerError, applyError := runtime.status()
+	_, listenerError, applyError, _, _ := runtime.status()
 	if !strings.Contains(listenerError, "restore old listener on port 9090") {
 		t.Fatalf("listener error=%q, want restore failure", listenerError)
 	}
@@ -58,7 +58,7 @@ func TestEdgeAgentApplyFailureIsExposedInRuntimeStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid configuration unexpectedly applied")
 	}
-	_, _, applyError := runtime.status()
+	_, _, applyError, _, _ := runtime.status()
 	if applyError == "" || !strings.Contains(applyError, "Agent configuration is invalid") {
 		t.Fatalf("apply error=%q, want the runtime apply failure", applyError)
 	}

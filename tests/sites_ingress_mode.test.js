@@ -229,6 +229,9 @@ test('site identity icons stay circular and transparent in cards and dashboard r
   assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?justify-self:\s*center;/);
   assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?text-align:\s*center;/);
   assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?width:\s*42px;[\s\S]*?background:\s*transparent;/);
+  assert.match(css, /\.dashboard-site-status table\s*\{[\s\S]*?min-width:\s*980px;[\s\S]*?table-layout:\s*auto;/);
+  assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?min-width:\s*210px;/);
+  assert.match(css, /\.dashboard-site-status table th:nth-child\(2\),[\s\S]*?\.dashboard-site-status table td:nth-child\(2\)\s*\{[\s\S]*?white-space:\s*nowrap;/);
 });
 
 test('advanced settings keep cache and account limits in separate vertical columns', () => {
