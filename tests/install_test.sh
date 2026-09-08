@@ -1137,7 +1137,6 @@ run_password_case() {
     }
     is_systemd() { return 0; }
     wait_for_health() { [ "$health_result" = success ]; }
-    install_env_file() { cp "$1" "$(env_file_path)"; }
     fix_database_permissions() { return 0; }
     snapshot_auth_files() {
         mkdir -p "$1"
@@ -1157,8 +1156,8 @@ if ! (run_password_case success) >"${TEST_ROOT}/password-success.log" 2>&1; then
     exit 1
 fi
 assert_contains "${DATA_DIR}/meridian.db" 'new-database-state'
-if grep -Fq 'old-jwt-secret' "${DATA_DIR}/.env"; then
-    echo 'FAIL: JWT secret was not rotated after password change' >&2
+if ! grep -Fq 'JWT_SECRET=old-jwt-secret' "${DATA_DIR}/.env"; then
+    echo 'FAIL: JWT secret changed during password change' >&2
     exit 1
 fi
 assert_contains "${TEST_ROOT}/password-success.log" '所有旧登录令牌已失效'

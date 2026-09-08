@@ -19,7 +19,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 37
+	databaseSchemaVersion = 38
 )
 
 func (d *DB) migrate() error {
@@ -866,6 +866,17 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_node_site_traffic_site_time ON node_site_traffic_logs(site_id, recorded_at_ms);
 	CREATE INDEX IF NOT EXISTS idx_node_site_traffic_node_time ON node_site_traffic_logs(node_id, recorded_at_ms);`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS watch_history_inbox (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		payload_json TEXT NOT NULL,
+		created_at_ms INTEGER NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_watch_history_inbox_due ON watch_history_inbox(next_attempt_at_ms, id);`); err != nil {
 		return err
 	}
 	var cacheSizeColumn int

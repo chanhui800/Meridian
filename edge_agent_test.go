@@ -146,6 +146,42 @@ func TestEdgeProxyReportsMediaCountsWithCentralSiteID(t *testing.T) {
 	}
 }
 
+func TestEdgeProxyEnforcesControllerTrafficQuotaAfterConfigRefresh(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "should-not-be-reached")
+	}))
+	defer upstream.Close()
+	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+	settings := defaultSystemSettings()
+	cycleStart := trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
+	config := AgentRuntimeConfig{
+		SchemaVersion: 1, NodeGUID: "quota-node", HTTPSPort: 19090, DynamicKey: testEdgeRuntimeKey(t),
+		Routes: []AgentSiteRoute{{
+			SiteID: 74, Host: "quota.example.test", TargetURL: upstream.URL,
+			TrafficCycleUsage: 100, TrafficCycleStartMS: cycleStart.UnixMilli(), TrafficBillingMode: trafficBillingModeBidirectional,
+			Site: Site{
+				Name: "quota", PublicHost: "quota.example.test", IngressMode: ingressModeHost,
+				TargetURL: upstream.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy",
+				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
+				TrafficQuota: 100, TrafficUsed: 100,
+			},
+			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: "[]", DynamicRules: "[]",
+		}},
+	}
+	bundle, err := buildEdgeProxy(config, runtime)
+	if err != nil {
+		t.Fatalf("build edge proxy: %v", err)
+	}
+	defer bundle.close()
+	runtime.bundle = bundle
+	runtime.syncSiteTrafficLimits(config)
+	response := httptest.NewRecorder()
+	bundle.handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://quota.example.test/Items", nil))
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "traffic quota exceeded") {
+		t.Fatalf("quota response = %d %q, want 403 quota exceeded", response.Code, response.Body.String())
+	}
+}
+
 func TestEdgeTelemetryMapsRetentionAndObservationToCentralSiteID(t *testing.T) {
 	localSites := map[int64]edgeSiteIdentity{
 		3: {centralID: 91, host: "mapped.example.test"},

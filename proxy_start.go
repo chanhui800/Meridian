@@ -328,7 +328,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				requestLogEntry.BackendAddress = tracker.Get()
 			}
 			if event, ok := watchHistoryEventFromCapture(watchHistoryCapture, pm.database, site, r, inst.trustedProxies, requestLogEntry.StatusCode, requestEndedAt); ok {
-				pm.database.EnqueueWatchHistory(event)
+				if !pm.database.EnqueueWatchHistory(event) {
+					log.Printf("[watch-history] event could not be queued site=%d", event.SiteID)
+				}
 			}
 			pm.accountRetention.Observe(site, r, inst.trustedProxies, requestLogEntry.ResourceCategory, requestLogEntry.StatusCode, requestStartedAt, requestEndedAt)
 			pm.database.EnqueueRequestLog(requestLogEntry)
@@ -352,11 +354,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		inst.reqCount.Add(1)
 		inst.pendingRequests.Add(1)
 
-		if site.TrafficQuota > 0 {
+		// The Controller can refresh quota usage on an already running Agent
+		// without rebuilding the proxy bundle. Read the live quota baseline from
+		// the instance so a scheduled route cannot retain a stale zero quota.
+		inst.trafficMu.Lock()
+		trafficQuota := inst.Site.TrafficQuota
+		inst.trafficMu.Unlock()
+		if trafficQuota > 0 {
 			currentUsed, usageErr := pm.currentTrafficCycleUsage(inst, time.Now())
 			if usageErr != nil {
 				log.Printf("[%s] failed to calculate current traffic cycle usage: %v", site.Name, usageErr)
-			} else if currentUsed >= site.TrafficQuota {
+			} else if currentUsed >= trafficQuota {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				w.Write([]byte(`{"error":"traffic quota exceeded"}`))

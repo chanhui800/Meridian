@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,6 +31,7 @@ const (
 	watchHistoryQueueCapacity     = 1024
 	watchHistoryBatchSize         = 64
 	watchHistoryGlobalRowLimit    = 50000
+	watchHistoryInboxLimit        = 10000
 	watchHistoryMaxIDBytes        = 256
 	watchHistoryMaxTitleBytes     = 512
 	watchHistoryMaxTextBytes      = 4096
@@ -151,11 +153,15 @@ func encryptWatchHistoryToken(token string) (string, error) {
 	if jwtSecretEphemeral {
 		return "", errors.New("watch history token storage requires a stable JWT secret")
 	}
+	return encryptWatchHistoryTokenWithSecret(token, jwtSecret)
+}
+
+func encryptWatchHistoryTokenWithSecret(token string, secret []byte) (string, error) {
 	token = strings.TrimSpace(token)
-	if token == "" || len(token) > watchHistoryMaxTokenBytes || strings.ContainsAny(token, "\r\n") {
+	if len(secret) < 32 || token == "" || len(token) > watchHistoryMaxTokenBytes || strings.ContainsAny(token, "\r\n") {
 		return "", errors.New("invalid watch history token")
 	}
-	block, err := aes.NewCipher(watchHistoryTokenKeyForSecret(jwtSecret))
+	block, err := aes.NewCipher(watchHistoryTokenKeyForSecret(secret))
 	if err != nil {
 		return "", err
 	}
@@ -172,6 +178,13 @@ func encryptWatchHistoryToken(token string) (string, error) {
 }
 
 func decryptWatchHistoryToken(ciphertext string) (string, error) {
+	if jwtSecretEphemeral {
+		return "", errors.New("watch history token storage requires a stable JWT secret")
+	}
+	return decryptWatchHistoryTokenWithSecret(ciphertext, jwtSecret)
+}
+
+func decryptWatchHistoryTokenWithSecret(ciphertext string, secret []byte) (string, error) {
 	if !strings.HasPrefix(ciphertext, watchHistoryTokenCipherPrefix) {
 		return "", errors.New("invalid watch history token ciphertext")
 	}
@@ -179,7 +192,10 @@ func decryptWatchHistoryToken(ciphertext string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	block, err := aes.NewCipher(watchHistoryTokenKeyForSecret(jwtSecret))
+	if len(secret) < 32 {
+		return "", errors.New("invalid watch history token secret")
+	}
+	block, err := aes.NewCipher(watchHistoryTokenKeyForSecret(secret))
 	if err != nil {
 		return "", err
 	}
@@ -1147,8 +1163,127 @@ func (d *DB) EnqueueWatchHistory(event watchHistoryEvent) bool {
 	case d.dynamicObservationQueue <- command:
 		return true
 	default:
+		if d.persistWatchHistoryInbox(event) {
+			return true
+		}
 		d.droppedWatchHistory.Add(1)
 		return false
+	}
+}
+
+// persistWatchHistoryInbox is the durable overflow path for the asynchronous
+// watch-history writer. Playback must not silently lose a completed session
+// merely because the in-memory queue is full or the writer is restarting.
+func (d *DB) persistWatchHistoryInbox(event watchHistoryEvent) bool {
+	inserted, err := d.persistWatchHistoryInboxBatch([]watchHistoryEvent{event})
+	return err == nil && inserted == 1
+}
+
+// persistWatchHistoryInboxBatch makes the asynchronous writer failure path
+// durable in one transaction. Invalid events are skipped because they cannot
+// be made valid by retrying; valid events remain recoverable across restarts.
+func (d *DB) persistWatchHistoryInboxBatch(events []watchHistoryEvent) (int, error) {
+	if d == nil || d.db == nil || d.edgeEphemeral {
+		return 0, errors.New("watch history inbox unavailable")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM watch_history_inbox").Scan(&count); err != nil || count >= watchHistoryInboxLimit {
+		if err == nil {
+			err = errors.New("watch history inbox is full")
+		}
+		return 0, err
+	}
+	inserted := 0
+	createdAt := time.Now().UnixMilli()
+	for _, event := range events {
+		if !validWatchHistoryEvent(event) {
+			continue
+		}
+		payload, marshalErr := json.Marshal(event)
+		if marshalErr != nil || len(payload) > watchHistoryBodyLimit {
+			continue
+		}
+		if count+inserted >= watchHistoryInboxLimit {
+			return inserted, errors.New("watch history inbox is full")
+		}
+		if _, err := tx.Exec("INSERT INTO watch_history_inbox(payload_json,created_at_ms) VALUES(?,?,?)", string(payload), createdAt); err != nil {
+			return inserted, err
+		}
+		inserted++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
+func (d *DB) drainWatchHistoryInbox(now time.Time) {
+	if d == nil || d.db == nil || d.edgeEphemeral {
+		return
+	}
+	rows, err := d.db.Query("SELECT id,payload_json,attempts FROM watch_history_inbox WHERE next_attempt_at_ms<=? ORDER BY id LIMIT ?", now.UnixMilli(), watchHistoryBatchSize)
+	if err != nil {
+		log.Printf("[watch-history] inbox read failed: %v", err)
+		return
+	}
+	type item struct {
+		id       int64
+		payload  string
+		attempts int
+	}
+	items := make([]item, 0, watchHistoryBatchSize)
+	for rows.Next() {
+		var value item
+		if err := rows.Scan(&value.id, &value.payload, &value.attempts); err != nil {
+			_ = rows.Close()
+			log.Printf("[watch-history] inbox row read failed: %v", err)
+			return
+		}
+		items = append(items, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		log.Printf("[watch-history] inbox rows failed: %v", err)
+		return
+	}
+	_ = rows.Close()
+	if len(items) == 0 {
+		return
+	}
+	events := make([]watchHistoryEvent, 0, len(items))
+	for _, value := range items {
+		var event watchHistoryEvent
+		if err := json.Unmarshal([]byte(value.payload), &event); err != nil || !validWatchHistoryEvent(event) {
+			_, _ = d.db.Exec("DELETE FROM watch_history_inbox WHERE id=?", value.id)
+			continue
+		}
+		events = append(events, event)
+	}
+	if len(events) == 0 {
+		return
+	}
+	if _, err := d.writeWatchHistoryBatch(events); err != nil {
+		for _, value := range items {
+			attempts := value.attempts + 1
+			if attempts > 8 {
+				attempts = 8
+			}
+			delay := time.Second * time.Duration(1<<uint(attempts-1))
+			if delay > 15*time.Minute {
+				delay = 15 * time.Minute
+			}
+			_, _ = d.db.Exec("UPDATE watch_history_inbox SET attempts=?,next_attempt_at_ms=?,last_error=? WHERE id=?", attempts, now.Add(delay).UnixMilli(), requestLogSafeText(err.Error(), 512), value.id)
+		}
+		log.Printf("[watch-history] inbox write failed: %v", err)
+		return
+	}
+	for _, value := range items {
+		_, _ = d.db.Exec("DELETE FROM watch_history_inbox WHERE id=?", value.id)
 	}
 }
 

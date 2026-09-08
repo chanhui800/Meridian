@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -121,7 +122,19 @@ func (s *tmdbService) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		s.runOne(ctx, time.Now())
+		const tmdbJobsPerWake = 10
+		for i := 0; i < tmdbJobsPerWake; i++ {
+			processed, err := s.runOne(ctx, time.Now())
+			if err != nil {
+				// runOne records retry state for claimable jobs. Keep the worker
+				// alive so one transient database/network error cannot stop all
+				// subsequent metadata processing.
+				log.Printf("[tmdb] worker error: %v", err)
+			}
+			if !processed {
+				break
+			}
+		}
 	}
 }
 
@@ -139,49 +152,53 @@ func tmdbRetryDelay(attempts int) time.Duration {
 	return delay
 }
 
-func (s *tmdbService) runOne(ctx context.Context, now time.Time) {
+func (s *tmdbService) runOne(ctx context.Context, now time.Time) (bool, error) {
 	stored, err := s.db.tmdbSettings()
 	if err != nil || !stored.Enabled || stored.TokenCiphertext == "" || stored.CredentialState == tmdbCredentialInvalid {
-		return
+		return false, err
 	}
 	token, err := decryptTMDBReadToken(stored.TokenCiphertext)
 	if err != nil {
 		_ = s.db.markTMDBCredentialResult(tmdbCredentialInvalid, "decrypt", now.UnixMilli())
-		return
+		return false, err
 	}
 	job, found, err := s.db.claimTMDBJob(now.UnixMilli())
-	if err != nil || !found {
-		return
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
 	}
 	if cached, ok, cacheErr := s.db.cachedTMDBMetadata(job, stored.Language, now.UnixMilli()); cacheErr == nil && ok {
-		_ = s.db.completeTMDBJob(job.ID, job.JobRevision, cached, stored.Language, now.UnixMilli())
-		return
+		return true, s.db.completeTMDBJob(job.ID, job.JobRevision, cached, stored.Language, now.UnixMilli())
 	}
 	metadata, lookupErr := s.client.lookupMedia(ctx, token, stored.Language, job)
 	if lookupErr == nil {
-		if err := s.db.completeTMDBJob(job.ID, job.JobRevision, metadata, stored.Language, now.UnixMilli()); err == nil {
+		completeErr := s.db.completeTMDBJob(job.ID, job.JobRevision, metadata, stored.Language, now.UnixMilli())
+		if completeErr == nil {
 			_ = s.db.markTMDBCredentialResult(tmdbCredentialReady, "", now.UnixMilli())
+			return true, nil
 		}
-		return
+		return true, completeErr
 	}
 	var apiErr *tmdbAPIError
 	if !errors.As(lookupErr, &apiErr) {
-		_ = s.db.retryTMDBJob(job.ID, job.JobRevision, jobAttempts(job.ID, s.db), "network", now.Add(tmdbRetryDelay(1)).UnixMilli())
-		return
+		attempts := jobAttempts(job.ID, s.db)
+		return true, s.db.retryTMDBJob(job.ID, job.JobRevision, attempts, "network", now.Add(tmdbRetryDelay(attempts)).UnixMilli())
 	}
 	switch apiErr.Code {
 	case "auth":
 		_ = s.db.markTMDBCredentialResult(tmdbCredentialInvalid, "auth", now.UnixMilli())
-		_ = s.db.retryTMDBJob(job.ID, job.JobRevision, 1, "auth", now.Add(6*time.Hour).UnixMilli())
+		return true, s.db.retryTMDBJob(job.ID, job.JobRevision, 1, "auth", now.Add(6*time.Hour).UnixMilli())
 	case "no_confident_match", "insufficient_metadata", "unsupported_media_type", "client_error", "redirect":
-		_ = s.db.finishTMDBJobWithoutMatch(job.ID, job.JobRevision, apiErr.Code, now.UnixMilli())
+		return true, s.db.finishTMDBJobWithoutMatch(job.ID, job.JobRevision, apiErr.Code, now.UnixMilli())
 	default:
 		wait := apiErr.RetryAfter
 		attempts := jobAttempts(job.ID, s.db)
 		if wait <= 0 {
 			wait = tmdbRetryDelay(attempts)
 		}
-		_ = s.db.retryTMDBJob(job.ID, job.JobRevision, attempts, apiErr.Code, now.Add(wait).UnixMilli())
+		return true, s.db.retryTMDBJob(job.ID, job.JobRevision, attempts, apiErr.Code, now.Add(wait).UnixMilli())
 	}
 }
 
