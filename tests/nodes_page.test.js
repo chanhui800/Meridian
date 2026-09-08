@@ -22,6 +22,19 @@ test('node page surfaces Agent configuration apply errors before generic waiting
   assert.match(page, /agent_apply_error/);
   assert.match(page, /应用失败：\$\{applyError\}/);
   assert.match(page, /const listenerError = String\(node\.agent_listener_error/);
+  assert.match(page, /等待 Agent 应用站点配置/);
+});
+
+test('site scheduling distinguishes normal config wait from errors and overdue waits', () => {
+  const sandbox = { Date, Number, String, Math, Map, console };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  const pending = sandbox.siteScheduleFeedback({ enabled: true, config_pending_since_ms: 1000, last_error: 'Agent has not applied the site configuration' }, 5000);
+  assert.deepEqual({ kind: pending.kind, text: pending.text }, { kind: 'pending', text: '等待 Agent 应用站点配置' });
+  const overdue = sandbox.siteScheduleFeedback({ enabled: true, config_pending_since_ms: 1000, last_error: 'Agent has not applied the site configuration' }, 91001);
+  assert.deepEqual({ kind: overdue.kind, text: overdue.text }, { kind: 'warning', text: 'Agent 长时间未应用配置' });
+  const failed = sandbox.siteScheduleFeedback({ enabled: true, config_pending_since_ms: 1000, last_error: 'Agent configuration apply failed: runtime key is invalid' }, 5000);
+  assert.deepEqual({ kind: failed.kind, text: failed.text }, { kind: 'error', text: 'Agent 应用配置失败：runtime key is invalid' });
 });
 
 test('node API exposes CRUD, enrollment refresh, and scheduler verbs', () => {

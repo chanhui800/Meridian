@@ -7,6 +7,8 @@ let siteSchedulesSnapshot = { sites: [] };
 let siteScheduleDrafts = new Map();
 const siteScheduleReactionDelay = 280;
 const siteScheduleReactionTimers = new Map();
+const siteScheduleConfigPendingWarningMS = 90 * 1000;
+const siteScheduleConfigPendingMessage = 'Agent has not applied the site configuration';
 
 function stopNodesRefresh() {
   if (nodesRefreshTimer) clearInterval(nodesRefreshTimer);
@@ -28,6 +30,31 @@ function nodeStatusLabel(node) {
   return { online: '在线', offline: '离线', pending: '待安装' }[node.status] || node.status;
 }
 
+function siteScheduleFeedback(site, now = Date.now()) {
+  const enabled = site?.enabled === true;
+  const lastError = String(site?.last_error || '').trim();
+  const pendingSince = Number(site?.config_pending_since_ms || 0);
+  if (!enabled) return { kind: 'disabled', className: '', text: '未启用节点调度，继续使用原面板入口' };
+
+  // The scheduler uses this readiness error while an Agent is still fetching
+  // the first snapshot. It is expected progress, not a failed operation.
+  const waitingForConfig = lastError === siteScheduleConfigPendingMessage || pendingSince > 0 && !lastError;
+  if (waitingForConfig) {
+    const overdue = pendingSince > 0 && Math.max(0, now - pendingSince) >= siteScheduleConfigPendingWarningMS;
+    return overdue
+      ? { kind: 'warning', className: 'is-warning', text: 'Agent 长时间未应用配置' }
+      : { kind: 'pending', className: 'is-pending', text: '等待 Agent 应用站点配置' };
+  }
+  if (lastError) {
+    const applyPrefix = 'Agent configuration apply failed:';
+    if (lastError.startsWith(applyPrefix)) {
+      return { kind: 'error', className: 'is-error', text: `Agent 应用配置失败：${lastError.slice(applyPrefix.length).trim()}` };
+    }
+    return { kind: 'error', className: 'is-error', text: `调度异常：${lastError}` };
+  }
+  return { kind: 'ready', className: '', text: 'DNS 只会在 Agent 配置与入口健康检查通过后生效' };
+}
+
 function renderNodeCards() {
   const container = document.getElementById('node-list');
   if (!container) return;
@@ -41,7 +68,7 @@ function renderNodeCards() {
     const entry = `HTTPS :${node.port}`;
     const applyError = String(node.agent_apply_error || '').trim();
     const listenerError = String(node.agent_listener_error || '').trim();
-    const configState = applyError ? `应用失败：${applyError}` : (listenerError ? `监听异常：${listenerError}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用配置'));
+    const configState = applyError ? `应用失败：${applyError}` : (listenerError ? `监听异常：${listenerError}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用站点配置'));
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
       <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(node.address || '未填写地址')} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
@@ -171,11 +198,14 @@ function renderSiteSchedules() {
     const formEnabled = view.enabled === true;
     const savedEnabled = site.enabled === true;
     const dirty = !!draft;
+    const feedback = siteScheduleFeedback(site);
     const stateLabel = dirty
       ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
-      : (savedEnabled ? '调度已启用' : '使用面板入口');
+      : (feedback.kind === 'pending' || feedback.kind === 'warning' || feedback.kind === 'error'
+        ? feedback.text
+        : (savedEnabled ? '调度已启用' : '使用面板入口'));
     const nodeOptions = nodesSnapshot.nodes.map(node => `<option value="${node.id}" ${Number(view.fixed_node_id) === Number(node.id) ? 'selected' : ''}>${esc(node.name)}</option>`).join('');
-    const error = site.last_error ? `<small class="is-error">${esc(site.last_error)}</small>` : `<small>${savedEnabled ? 'DNS 只会在 Agent 配置与入口健康检查通过后生效' : '未启用节点调度，继续使用原面板入口'}</small>`;
+    const error = `<small class="${feedback.className}">${esc(feedback.text)}</small>`;
     const dirtyNote = dirty ? '<small class="node-site-dirty">当前修改尚未保存，保存后才会生效</small>' : '';
     return `<article class="node-site-row node-site-card" data-site-id="${site.site_id}">
       <header class="node-site-card-head"><div class="node-site-identity"><strong>${esc(site.site_name)}</strong><span>${esc(site.public_host || '未配置站点域名')}</span></div><span class="node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}" data-role="site-state" aria-live="polite">${stateLabel}</span></header>
@@ -201,9 +231,12 @@ function refreshSiteScheduleRowState(row) {
   const state = row.querySelector('[data-role="site-state"]');
   if (state) {
     state.className = `node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}`;
+    const feedback = siteScheduleFeedback(server);
     state.textContent = dirty
       ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
-      : (savedEnabled ? '调度已启用' : '使用面板入口');
+      : (feedback.kind === 'pending' || feedback.kind === 'warning' || feedback.kind === 'error'
+        ? feedback.text
+        : (savedEnabled ? '调度已启用' : '使用面板入口'));
   }
   const status = row.querySelector('.node-site-status');
   if (!status) return;
