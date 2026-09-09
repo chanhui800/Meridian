@@ -4952,7 +4952,11 @@ html {
 .dashboard-insight-card, .dashboard-trend-card { padding: 24px; border: 1px solid var(--panel-border); border-radius: var(--ui-radius); background: var(--panel); box-shadow: var(--page-shadow); }
 .dashboard-insight-head { display: flex; justify-content: space-between; align-items: center; }
 .dashboard-insight-head h2 { font-size: 22px; }
-.dashboard-health-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--green); }
+.dashboard-health-dot { width: 12px; height: 12px; flex: 0 0 12px; border-radius: 50%; background: var(--white-38); box-shadow: 0 0 0 4px color-mix(in srgb, var(--white-38) 14%, transparent); transition: background-color .2s ease, box-shadow .2s ease; }
+.dashboard-health-dot.is-healthy { background: var(--green); box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 16%, transparent); }
+.dashboard-health-dot.is-degraded { background: var(--orange); box-shadow: 0 0 0 4px color-mix(in srgb, var(--orange) 16%, transparent); }
+.dashboard-health-dot.is-error { background: var(--red); box-shadow: 0 0 0 4px color-mix(in srgb, var(--red) 16%, transparent); }
+.dashboard-health-dot.is-disabled { background: var(--white-38); box-shadow: 0 0 0 4px color-mix(in srgb, var(--white-38) 14%, transparent); }
 .dashboard-insight-card p { margin-top: 18px; color: var(--white-60); font-size: 16px; }
 .dashboard-trend-card { margin-top: 18px; }
 .dashboard-trend-wrap { width: 100%; }

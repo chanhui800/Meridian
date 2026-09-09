@@ -456,14 +456,62 @@ func (d *DB) UpdateSiteIcon(id int64, name, imageURL string) (*Site, error) {
 	return d.GetSite(id)
 }
 
+type siteHostAliasSnapshot struct {
+	NodeID                  int64
+	PublicHost              string
+	ExpiresAtMS             int64
+	CreatedAtMS             int64
+	AckedAtMS               int64
+	FinalizationExpiresAtMS int64
+}
+
+type siteUpdateSnapshot struct {
+	Site        Site
+	HostAliases []siteHostAliasSnapshot
+}
+
+func (d *DB) snapshotSiteUpdate(site Site) (siteUpdateSnapshot, error) {
+	snapshot := siteUpdateSnapshot{Site: site, HostAliases: []siteHostAliasSnapshot{}}
+	rows, err := d.db.Query(`SELECT node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms
+		FROM site_node_host_aliases WHERE site_id=? ORDER BY node_id,public_host`, site.ID)
+	if err != nil {
+		return siteUpdateSnapshot{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var alias siteHostAliasSnapshot
+		if err := rows.Scan(&alias.NodeID, &alias.PublicHost, &alias.ExpiresAtMS, &alias.CreatedAtMS, &alias.AckedAtMS, &alias.FinalizationExpiresAtMS); err != nil {
+			return siteUpdateSnapshot{}, err
+		}
+		snapshot.HostAliases = append(snapshot.HostAliases, alias)
+	}
+	if err := rows.Err(); err != nil {
+		return siteUpdateSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
 func (d *DB) restoreSiteRecord(site Site) error {
-	if site.DynamicPolicyRevision < 1 {
+	snapshot, err := d.snapshotSiteUpdate(site)
+	if err != nil {
+		return err
+	}
+	return d.restoreSiteSnapshot(snapshot)
+}
+
+func (d *DB) restoreSiteSnapshot(snapshot siteUpdateSnapshot) error {
+	if snapshot.Site.DynamicPolicyRevision < 1 {
 		return fmt.Errorf("cannot restore a dynamic policy revision below 1")
 	}
-	return d.updateSiteRecord(site, true)
+	aliases := append([]siteHostAliasSnapshot(nil), snapshot.HostAliases...)
+	return d.updateSiteRecordWithAliases(snapshot.Site, true, &aliases)
 }
 
 func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
+	return d.updateSiteRecordWithAliases(site, restoreRevision, nil)
+}
+
+func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasSnapshot *[]siteHostAliasSnapshot) error {
 	var err error
 	site.IconName, site.IconURL, err = normalizeSiteIconSelection(site.IconName, site.IconURL)
 	if err != nil {
@@ -580,13 +628,26 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 			site.StoredUpstreamHeaders = "[]"
 		}
 	}
+	// Restore the exact alias lifecycle captured before a failed update. A
+	// rollback must not create an alias for the failed candidate host.
+	if aliasSnapshot != nil {
+		if _, err := tx.Exec("DELETE FROM site_node_host_aliases WHERE site_id=?", site.ID); err != nil {
+			return err
+		}
+		for _, alias := range *aliasSnapshot {
+			if _, err := tx.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms)
+				VALUES(?,?,?,?,?,?,?)`, site.ID, alias.NodeID, alias.PublicHost, alias.ExpiresAtMS, alias.CreatedAtMS, alias.AckedAtMS, alias.FinalizationExpiresAtMS); err != nil {
+				return err
+			}
+		}
+	}
 	// Keep the former public host as a short-lived alias for nodes that may
 	// still have buffered events from the previous Agent route. This is
 	// site-specific authorization state; the old host is never accepted for a
 	// different site and the alias expires automatically.
 	oldHost := strings.ToLower(strings.TrimSpace(currentPublicHost))
 	newHost := strings.ToLower(strings.TrimSpace(site.PublicHost))
-	if oldHost != "" && oldHost != newHost {
+	if aliasSnapshot == nil && oldHost != "" && oldHost != newHost {
 		aliasRows, aliasErr := tx.Query(`SELECT desired_node_id, applied_node_id
 			FROM site_node_schedules WHERE site_id=?`, site.ID)
 		if aliasErr != nil {

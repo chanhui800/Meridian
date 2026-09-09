@@ -207,10 +207,12 @@ func (a *App) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 
 type dashboardInsights struct {
 	LogHealthy      bool   `json:"log_healthy"`
+	LogStatus       string `json:"log_status"`
 	LatestLogMS     int64  `json:"latest_log_ms"`
 	LogCountToday   int64  `json:"log_count_today"`
 	DroppedLogs     uint64 `json:"dropped_logs"`
 	ScheduleEnabled bool   `json:"schedule_enabled"`
+	ScheduleStatus  string `json:"schedule_status"`
 	ScheduleLabel   string `json:"schedule_label"`
 	LastSentKey     string `json:"last_sent_key"`
 }
@@ -219,13 +221,23 @@ func (a *App) dashboardInsightsSnapshot() dashboardInsights {
 	location := timezoneLocation(a.db.currentSystemSettings().ScheduleTimezone)
 	now := time.Now().In(location)
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
-	insights := dashboardInsights{LogHealthy: a.db.currentSystemSettings().LogEnabled}
+	settings := a.db.currentSystemSettings()
+	insights := dashboardInsights{LogHealthy: settings.LogEnabled, LogStatus: "disabled", ScheduleStatus: "disabled"}
 	_ = a.db.db.QueryRow(`SELECT COALESCE(MAX(recorded_at_ms),0), COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, start.UnixMilli(), start.AddDate(0, 0, 1).UnixMilli()).Scan(&insights.LatestLogMS, &insights.LogCountToday)
 	insights.DroppedLogs = a.db.DroppedRequestLogs()
+	if insights.LogHealthy {
+		insights.LogStatus = "healthy"
+		if insights.DroppedLogs > 0 {
+			insights.LogStatus = "degraded"
+		}
+	}
 	if stored, err := a.db.telegramReportSettings(); err == nil {
 		insights.ScheduleEnabled = stored.Enabled
+		if stored.Enabled {
+			insights.ScheduleStatus = "healthy"
+		}
 		insights.LastSentKey = stored.LastSentKey
-		insights.ScheduleLabel = stored.ScheduleTime + " " + timezoneLabel(a.db.currentSystemSettings().ScheduleTimezone)
+		insights.ScheduleLabel = stored.ScheduleTime + " " + timezoneLabel(settings.ScheduleTimezone)
 		if stored.Frequency == "weekly" {
 			insights.ScheduleLabel = "每周 " + insights.ScheduleLabel
 		} else {

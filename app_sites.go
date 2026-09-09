@@ -567,6 +567,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 404, "site not found")
 			return
 		}
+		oldSiteSnapshot, err := a.db.snapshotSiteUpdate(*oldSite)
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, fmt.Sprintf("snapshot site before update: %v", err))
+			return
+		}
 		var req struct {
 			Name                       string                 `json:"name"`
 			IconName                   *string                `json:"icon_name"`
@@ -980,7 +985,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			// never points at a configuration that never ran, then bring the
 			// pre-stopped instance back from a fresh read. Any failure in the
 			// rollback itself is reported explicitly.
-			if rollbackErr := a.db.restoreSiteRecord(*oldSite); rollbackErr != nil {
+			if rollbackErr := a.db.restoreSiteSnapshot(oldSiteSnapshot); rollbackErr != nil {
 				a.jsonErr(w, 500, fmt.Sprintf("reload updated site: %v; rollback update: %v", err, rollbackErr))
 				return
 			}
@@ -1000,7 +1005,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		if site.Enabled {
 			if err := a.pm.StartSite(*site); err != nil {
-				if rollbackErr := a.db.restoreSiteRecord(*oldSite); rollbackErr != nil {
+				if rollbackErr := a.db.restoreSiteSnapshot(oldSiteSnapshot); rollbackErr != nil {
 					a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; rollback update: %v", err, rollbackErr))
 					return
 				}
@@ -1019,7 +1024,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if err := a.pm.RegisterSiteHost(*site); err != nil {
-			if rollbackErr := a.db.restoreSiteRecord(*oldSite); rollbackErr != nil {
+			if rollbackErr := a.db.restoreSiteSnapshot(oldSiteSnapshot); rollbackErr != nil {
 				a.jsonErr(w, 500, fmt.Sprintf("register updated public host: %v; rollback update: %v", err, rollbackErr))
 				return
 			}
