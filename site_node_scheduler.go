@@ -548,6 +548,17 @@ type agentRuntimeConfigHash struct {
 }
 
 func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntimeConfigHash {
+	return agentConfigHashPayloadForVersion(config, legacy, true)
+}
+
+// agentConfigHashPayloadForVersion preserves the wire/hash contract used by
+// the requested Agent generation. Agents before v1.9.61 included the live
+// traffic counters in their hash, while newer Agents receive those counters
+// as mutable quota state and deliberately exclude them from the runtime
+// identity. Keeping this distinction here lets an old Agent validate one
+// config, reach edgeMaybeUpdate, and upgrade itself instead of rejecting the
+// config before the update path runs.
+func agentConfigHashPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiveTraffic bool) agentRuntimeConfigHash {
 	config.ConfigHash = ""
 	if !legacy {
 		config.AgentVersion = ""
@@ -572,12 +583,14 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 	routes := make([]agentSiteRouteHash, len(config.Routes))
 	for i, route := range config.Routes {
 		hashSite := route.Site
-		// Traffic usage is a live accounting value. It is delivered in the
-		// route so an Agent can enforce the quota, but must not participate in
-		// the runtime identity or every report would force a full proxy apply.
-		hashSite.TrafficUsed = 0
-		hashSite.TrafficUsedIn = 0
-		hashSite.TrafficUsedOut = 0
+		// Traffic usage is a live accounting value for modern Agents. Older
+		// Agents (before v1.9.61) included the value in their hash because the
+		// Controller did not yet separate quota state from route identity.
+		if zeroLiveTraffic {
+			hashSite.TrafficUsed = 0
+			hashSite.TrafficUsedIn = 0
+			hashSite.TrafficUsedOut = 0
+		}
 		routes[i] = agentSiteRouteHash{
 			SiteID:            route.SiteID,
 			Host:              route.Host,
@@ -616,7 +629,11 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 }
 
 func hashAgentConfigPayload(config AgentRuntimeConfig, legacy bool) (string, error) {
-	data, err := json.Marshal(agentConfigHashPayload(config, legacy))
+	return hashAgentConfigPayloadForVersion(config, legacy, true)
+}
+
+func hashAgentConfigPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiveTraffic bool) (string, error) {
+	data, err := json.Marshal(agentConfigHashPayloadForVersion(config, legacy, zeroLiveTraffic))
 	if err != nil {
 		return "", err
 	}
@@ -748,9 +765,34 @@ func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (strin
 		config.CacheClearGeneration = 0
 	}
 	if agentUsesRuntimeConfigHash(version) {
-		return agentConfigHash(config)
+		return hashAgentConfigPayloadForVersion(config, false, agentSupportsTrafficBaseline(version))
 	}
-	return agentConfigLegacyHash(config)
+	return hashAgentConfigPayloadForVersion(config, true, agentSupportsTrafficBaseline(version))
+}
+
+// agentSupportsTrafficBaseline reports whether the Agent understands the
+// Controller's separated traffic-cycle state introduced in v1.9.61. Before
+// that release TrafficUsed was part of the route hash and must remain in the
+// compatibility hash during a rolling upgrade.
+func agentSupportsTrafficBaseline(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 9 {
+		return minor > 9
+	}
+	return patch >= 61
 }
 
 func readBoundedPrivateFile(path string) (string, error) {

@@ -1580,6 +1580,53 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	}
 }
 
+func TestAgentConfigHashPreservesPreTrafficBaselineCompatibility(t *testing.T) {
+	config := AgentRuntimeConfig{
+		SchemaVersion: agentConfigSchemaVersion,
+		NodeGUID:      "traffic-hash-node",
+		HTTPSPort:     9090,
+		DynamicKey:    testEdgeRuntimeKey(t),
+		Routes: []AgentSiteRoute{{
+			SiteID: 7,
+			Host:   "media.example.test",
+			Site: Site{
+				TrafficQuota: 10_000,
+				TrafficUsed:  3_000,
+			},
+		}},
+	}
+
+	legacyHash, err := agentConfigHashForVersion(config, "v1.9.60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLegacyHash, err := hashAgentConfigPayloadForVersion(config, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyHash != wantLegacyHash {
+		t.Fatalf("pre-v1.9.61 hash did not preserve live traffic fields: got=%q want=%q", legacyHash, wantLegacyHash)
+	}
+
+	modernHash, err := agentConfigHashForVersion(config, "v1.9.61")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantModernHash, err := agentConfigHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modernHash != wantModernHash {
+		t.Fatalf("v1.9.61 hash changed unexpectedly: got=%q want=%q", modernHash, wantModernHash)
+	}
+	if legacyHash == modernHash {
+		t.Fatal("traffic baseline compatibility hashes unexpectedly matched")
+	}
+	if agentSupportsTrafficBaseline("v1.9.60") || !agentSupportsTrafficBaseline("v1.9.61") {
+		t.Fatal("traffic baseline compatibility gate is incorrect")
+	}
+}
+
 func TestAgentConfigHashIgnoresSiteIconMetadata(t *testing.T) {
 	config := AgentRuntimeConfig{
 		SchemaVersion: agentConfigSchemaVersion,
