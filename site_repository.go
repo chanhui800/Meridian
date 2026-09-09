@@ -800,9 +800,17 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 				return err
 			}
 		}
+		// The revocation set includes current and drain-only generations. Mark
+		// that exact set dirty so every Agent receives the ForceStop command
+		// promptly; the site schedule helper only knows desired/applied nodes.
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, nodeIDs...); err != nil {
+			return err
+		}
 	}
-	if err := markAgentConfigsDirtyForSiteTx(tx, id); err != nil {
-		return err
+	if enabled {
+		if err := markAgentConfigsDirtyForSiteTx(tx, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

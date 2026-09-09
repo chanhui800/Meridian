@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -555,8 +554,13 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 		config.AgentSHA256 = ""
 	}
 	config.AgentDownloadURL = ""
-	config.ForceStopSiteIDs = append([]int64(nil), config.ForceStopSiteIDs...)
-	sort.Slice(config.ForceStopSiteIDs, func(i, j int) bool { return config.ForceStopSiteIDs[i] < config.ForceStopSiteIDs[j] })
+	// ForceStopSiteIDs is a one-shot command carried by a config revision, not
+	// route runtime state. Excluding it from the hash means adding the command
+	// still triggers one apply through ConfigRevision, while expiry of a
+	// revocation tombstone does not cause a second full hot-apply when routes are
+	// otherwise unchanged. It also keeps the hash identical for older Agents
+	// that ignore this newer JSON field.
+	config.ForceStopSiteIDs = nil
 	if legacy {
 		config.CacheClearGeneration = 0
 		config.ForceStopSiteIDs = nil
@@ -708,6 +712,32 @@ func agentSupportsCacheClear(version string) bool {
 		return minor > 9
 	}
 	return patch >= 50
+}
+
+// agentSupportsForceStop reports whether an Agent understands the
+// force_stop_site_ids command added in v1.9.65. Older Agents ignore unknown
+// JSON fields, so the Controller must omit this command from their hash until
+// they have upgraded; otherwise they reject an otherwise valid configuration
+// because their locally computed hash has no such field.
+func agentSupportsForceStop(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 9 {
+		return minor > 9
+	}
+	return patch >= 65
 }
 
 func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (string, error) {
@@ -1356,6 +1386,13 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire node drains: %v", err)
 	}
+	// Revocation tombstones are deliberately retained after an Agent reports
+	// its config as applied so paginated tail telemetry remains authorized. The
+	// same bounded window used for drains is the cleanup boundary; expiry also
+	// removes ForceStop commands from the next config snapshot naturally.
+	if _, err := a.db.db.Exec("DELETE FROM agent_route_revocations WHERE created_at_ms>0 AND created_at_ms+?<=?", siteNodeDrainWindow.Milliseconds(), now.UnixMilli()); err != nil {
+		log.Printf("[node-scheduler] expire Agent route revocations: %v", err)
+	}
 	if _, err := a.db.db.Exec("DELETE FROM site_node_host_aliases WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire site host aliases: %v", err)
 	}
@@ -1518,32 +1555,15 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	if err != nil {
 		return err
 	}
-	drainSites := make(map[int64]struct{})
-	drainRows, drainErr := a.db.db.Query("SELECT site_id FROM site_node_drains WHERE node_id=?", nodeID)
-	if drainErr != nil {
-		return drainErr
-	}
-	for drainRows.Next() {
-		var siteID int64
-		if scanErr := drainRows.Scan(&siteID); scanErr != nil {
-			drainRows.Close()
-			return scanErr
-		}
-		drainSites[siteID] = struct{}{}
-	}
-	if drainErr := drainRows.Err(); drainErr != nil {
-		drainRows.Close()
-		return drainErr
-	}
-	if drainErr := drainRows.Close(); drainErr != nil {
-		return drainErr
-	}
 	affected := make([]SiteNodeSchedule, 0)
 	for _, value := range values {
 		if value.FixedNodeID != nodeID && value.DesiredNodeID != nodeID && value.AppliedNodeID != nodeID {
-			if _, draining := drainSites[value.SiteID]; !draining {
-				continue
-			}
+			// A drain-only row represents a retired generation that no longer
+			// owns the site's current schedule. Deleting that old node must not
+			// disable the site, clear the active assignment, or delete current
+			// DNS on the replacement node. The node row deletion/foreign-key
+			// cleanup is sufficient for the stale drain record itself.
+			continue
 		}
 		affected = append(affected, value)
 	}
