@@ -1049,6 +1049,61 @@ func TestReviewHostAliasLifecycleStartsOnConfigAck(t *testing.T) {
 	}
 }
 
+func TestReviewFailedSiteHostUpdateRestoresAliasSnapshot(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "rollback-alias-node", Address: "203.0.113.246", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "rollback-alias-site", PublicHost: "stable.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	created, expires, acked, finalized := now.Add(-time.Hour).UnixMilli(), now.Add(time.Hour).UnixMilli(), now.Add(-time.Minute).UnixMilli(), now.Add(30*time.Minute).UnixMilli()
+	if _, err := app.db.db.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms) VALUES(?,?,?,?,?,?,?)`, site.ID, node.ID, "legacy.example.test", expires, created, acked, finalized); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := app.db.snapshotSiteUpdate(*site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := *site
+	candidate.PublicHost = "candidate.example.test"
+	if err := app.db.UpdateSiteRecord(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.restoreSiteSnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.PublicHost != "stable.example.test" {
+		t.Fatalf("restored public host=%q, want stable.example.test", restored.PublicHost)
+	}
+	var count int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM site_node_host_aliases WHERE site_id=? AND public_host=?", site.ID, "candidate.example.test").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed candidate host left %d alias rows", count)
+	}
+	var gotNode int64
+	var gotHost string
+	var gotExpires, gotCreated, gotAcked, gotFinalized int64
+	if err := app.db.db.QueryRow(`SELECT node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms FROM site_node_host_aliases WHERE site_id=?`, site.ID).Scan(&gotNode, &gotHost, &gotExpires, &gotCreated, &gotAcked, &gotFinalized); err != nil {
+		t.Fatal(err)
+	}
+	if gotNode != node.ID || gotHost != "legacy.example.test" || gotExpires != expires || gotCreated != created || gotAcked != acked || gotFinalized != finalized {
+		t.Fatalf("alias lifecycle changed during rollback: node=%d host=%q expires=%d created=%d acked=%d finalized=%d", gotNode, gotHost, gotExpires, gotCreated, gotAcked, gotFinalized)
+	}
+}
+
 func TestReviewScheduledSiteRemovalInvalidatesOwningAgent(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()

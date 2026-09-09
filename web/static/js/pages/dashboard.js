@@ -20,6 +20,7 @@ let dashboardRealtimeTrendSiteSamples = new Map();
 let dashboardLatestRatesBySite = new Map();
 let dashboardBillingMode = null;
 let dashboardLastSnapshotMS = 0;
+let dashboardLastObservedSiteCount = -1;
 
 function dashboardCreateAbortController() {
   if (typeof AbortController === 'function') return new AbortController();
@@ -95,8 +96,8 @@ function renderDashboard() {
       <section class="dashboard-trend-card" data-dashboard-chart="traffic"><div class="glass-card-header"><div><div class="glass-card-title">流量</div><span class="dashboard-trend-unit" id="dashboard-traffic-unit">计费流量总数</span></div><strong class="dashboard-trend-summary" id="dashboard-traffic-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardTrafficTrend" aria-label="流量趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="traffic"></i>计费流量</span></div></section>
     </div>
     <div class="dashboard-insights-grid fade-up stagger-5">
-      <section class="dashboard-insight-card" id="dashboard-log-health"><div class="dashboard-insight-head"><h2>日志写入</h2><span class="dashboard-health-dot"></span></div><p>正在读取…</p></section>
-      <section class="dashboard-insight-card" id="dashboard-schedule-health"><div class="dashboard-insight-head"><h2>定时任务</h2><span class="dashboard-health-dot"></span></div><p>正在读取…</p></section>
+      <section class="dashboard-insight-card" id="dashboard-log-health"><div class="dashboard-insight-head"><h2>日志写入</h2><span class="dashboard-health-dot is-disabled" aria-hidden="true"></span></div><p>正在读取…</p></section>
+      <section class="dashboard-insight-card" id="dashboard-schedule-health"><div class="dashboard-insight-head"><h2>定时任务</h2><span class="dashboard-health-dot is-disabled" aria-hidden="true"></span></div><p>正在读取…</p></section>
     </div>
     <div class="glass-card dashboard-site-status fade-up stagger-5">
       <div class="glass-card-header">
@@ -126,11 +127,30 @@ function renderDashboard() {
 
 function applyDashboardInsights(insights) {
   if (!insights || Router.current !== 'dashboard') return;
+  const setHealthState = (id, state) => {
+    const dot = document.querySelector(`#${id} .dashboard-health-dot`);
+    if (!dot) return;
+    dot.classList.remove('is-healthy', 'is-degraded', 'is-disabled', 'is-error');
+    dot.classList.add(`is-${state || 'disabled'}`);
+  };
   const log = document.querySelector('#dashboard-log-health p');
   const schedule = document.querySelector('#dashboard-schedule-health p');
   const latestLog = insights.latest_log_ms ? meridianFormatDateTime(insights.latest_log_ms) : '暂无记录';
+  const logStatus = insights.log_status || (insights.log_healthy ? (insights.dropped_logs ? 'degraded' : 'healthy') : 'disabled');
+  const scheduleStatus = insights.schedule_status || (insights.schedule_enabled ? 'healthy' : 'disabled');
+  setHealthState('dashboard-log-health', logStatus);
+  setHealthState('dashboard-schedule-health', scheduleStatus);
   if (log) log.textContent = insights.log_healthy ? `今日写入 ${formatNumber(insights.log_count_today || 0)} 条 · 最近写入 ${latestLog}` : '已关闭';
+  if (log && logStatus === 'degraded') log.textContent += ' · 有日志丢弃';
   if (schedule) schedule.textContent = insights.schedule_enabled ? `Telegram 日报 · ${insights.schedule_label || '已启用'}` : 'Telegram 日报 · 未启用';
+}
+
+function reconcileDashboardTrendSiteSelection() {
+  if (dashboardTrendState.siteId === 'all') return false;
+  const exists = dashboardSites.some(site => String(site.id) === String(dashboardTrendState.siteId));
+  if (exists) return false;
+  dashboardTrendState.siteId = 'all';
+  return true;
 }
 
 async function loadDashboardBootstrap() {
@@ -146,12 +166,14 @@ async function loadDashboardBootstrap() {
       return speed ? { ...site, _liveSpeed: speed } : site;
     }) : [];
     dashboardSitesInitialized = true;
+    const selectionReset = reconcileDashboardTrendSiteSelection();
     const cacheEl = document.getElementById('s-cache');
     if (cacheEl) cacheEl.textContent = formatBytes(dashboardSites.reduce((total, site) => total + Number(site.cache_size_bytes || 0), 0));
     if (data.snapshot) updateDashboardLive(data.snapshot);
     applyDashboardInsights(data.insights);
     renderDashboardTrendSites();
     renderDashboardTableRows();
+    if (selectionReset && dashboardTrendState.range) void loadDashboardTrends();
     return data;
   }).catch(error => {
     if (error && error.name === 'AbortError') return null;
@@ -204,7 +226,7 @@ function dashboardTrendValueLabel(value, metric) {
   return formatNumber(Math.round(value));
 }
 
-function dashboardTrendPointerState(rect, geometry, event, pointCount) {
+function dashboardTrendPointerState(rect, geometry, event, pointsOrCount, chartStartMS = 0, chartEndMS = 0) {
   const width = Math.max(1, Number(rect?.width) || 1);
   const height = Math.max(1, Number(rect?.height) || 1);
   const scaleX = Math.max(1, Number(geometry?.width) || width) / width;
@@ -217,7 +239,22 @@ function dashboardTrendPointerState(rect, geometry, event, pointCount) {
   const plotH = Math.max(1, Number(geometry?.plotH) || 1);
   const x = Math.max(left, Math.min(left + plotW, Number.isFinite(rawX) ? rawX : left));
   const y = Math.max(top, Math.min(top + plotH, Number.isFinite(rawY) ? rawY : top));
-  const index = Math.max(0, Math.min(Math.max(0, pointCount - 1), Math.round(((x - left) / plotW) * Math.max(0, pointCount - 1))));
+  const points = Array.isArray(pointsOrCount) ? pointsOrCount : null;
+  const pointCount = points ? points.length : Math.max(0, Number(pointsOrCount) || 0);
+  let index = Math.max(0, Math.min(Math.max(0, pointCount - 1), Math.round(((x - left) / plotW) * Math.max(0, pointCount - 1))));
+  if (points && points.length > 1) {
+    const start = Number(chartStartMS || points[0]?.timestamp_ms || 0);
+    const end = Number(chartEndMS || points[points.length - 1]?.timestamp_ms || start);
+    if (end > start) {
+      const target = start + ((x - left) / plotW) * (end - start);
+      let bestDistance = Infinity;
+      points.forEach((point, candidate) => {
+        const timestamp = Number(point?.timestamp_ms || 0);
+        const distance = Math.abs(timestamp - target);
+        if (distance < bestDistance) { bestDistance = distance; index = candidate; }
+      });
+    }
+  }
   return { x, y, index };
 }
 
@@ -355,6 +392,21 @@ function dashboardRealtimeTrendPoints() {
   return dashboardRealtimeTrendSamples.get(key) || [];
 }
 
+function dashboardRealtimeWindowStartMS() {
+  const configured = Number(dashboardTrendData?.start_ms || 0);
+  return configured > 0 ? configured : Date.now() - 30 * 60 * 1000;
+}
+
+function pruneDashboardRealtimeSamples(samples) {
+  if (!Array.isArray(samples) || !samples.length) return samples;
+  const startMS = dashboardRealtimeWindowStartMS();
+  let first = 0;
+  while (first < samples.length && Number(samples[first]?.timestamp_ms || 0) < startMS) first += 1;
+  if (first > 0) samples.splice(0, first);
+  if (samples.length > 2000) samples.splice(0, samples.length - 2000);
+  return samples;
+}
+
 function dashboardTrendRealtimeOffset() {
   const historical = dashboardTrendData?.points || [];
   const realtime = dashboardRealtimeTrendPoints();
@@ -442,6 +494,11 @@ function drawDashboardTrendChart(metric) {
   const left = Math.min(Math.max(50, Math.ceil(yLabelWidth) + 16), Math.floor(width * .36));
   const right = 12, top = 14, bottom = 30;
   const plotW = Math.max(1, width - left - right), plotH = Math.max(1, height - top - bottom);
+  const chartStartMS = Number(dashboardTrendData?.start_ms || points[0]?.timestamp_ms || 0);
+  const chartEndMS = Math.max(chartStartMS, Number(dashboardTrendData?.end_ms || points[points.length - 1]?.timestamp_ms || chartStartMS));
+  const xForTimestamp = timestamp => chartEndMS > chartStartMS
+    ? left + plotW * Math.max(0, Math.min(1, (Number(timestamp || chartStartMS) - chartStartMS) / (chartEndMS - chartStartMS)))
+    : left + plotW / 2;
   chart.geometry = { width, height, left, right, top, bottom, plotW, plotH };
   ctx.textBaseline = 'middle';
   ctx.fillStyle = 'var(--white-60)';
@@ -456,7 +513,7 @@ function drawDashboardTrendChart(metric) {
   }
   if (ctx.setLineDash) ctx.setLineDash([]);
   const canvasSeries = series.map(item => ({ ...item, points: item.values.map((value, index) => ({
-    x: left + plotW * index / Math.max(1, points.length - 1),
+    x: xForTimestamp(points[index]?.timestamp_ms),
     y: top + plotH * (1 - (value / (scale.max || 1))),
   })) }));
   canvasSeries.forEach(item => {
@@ -629,7 +686,14 @@ function setupDashboardTrendControls() {
         return;
       }
       const geometry = chart.geometry || { width: rect.width, height: rect.height, left: 0, top: 0, plotW: rect.width, plotH: rect.height };
-      const pointer = dashboardTrendPointerState(rect, geometry, event, points.length);
+      const pointer = dashboardTrendPointerState(
+        rect,
+        geometry,
+        event,
+        points,
+        Number(dashboardTrendData?.start_ms || points[0]?.timestamp_ms || 0),
+        Number(dashboardTrendData?.end_ms || points[points.length - 1]?.timestamp_ms || 0),
+      );
       chart.hoverIndex = pointer.index;
       chart.hoverX = pointer.x;
       chart.hoverY = pointer.y;
@@ -698,11 +762,9 @@ async function loadDashboardTrends() {
       if (endInput) endInput.value = customDefault.end;
     }
     dashboardTrendData = data;
-    if (Array.isArray(data.site_series)) {
-      data.site_series.forEach(series => {
-        if (!dashboardSites.some(site => Number(site.id) === Number(series.site_id))) dashboardSites.push({ id: series.site_id, name: series.site_name });
-      });
-    }
+    for (const samples of dashboardRealtimeTrendSamples.values()) pruneDashboardRealtimeSamples(samples);
+    for (const samples of dashboardRealtimeTrendSiteSamples.values()) pruneDashboardRealtimeSamples(samples);
+    reconcileDashboardTrendSiteSelection();
     dashboardTrendSummary(data);
     renderDashboardTrendCharts();
   } catch (error) {
@@ -826,8 +888,15 @@ function updateDashboardLive(stats) {
 	const panelDomainEl = document.getElementById('s-panel-domain');
 	const currentPanelURL = dashboardCurrentPanelURL(stats.panel_access_url);
 	if (panelDomainEl && currentPanelURL) panelDomainEl.textContent = currentPanelURL;
-  animateValue('s-total', stats.total_sites || 0);
-  animateValue('s-running', stats.running_sites || 0);
+	animateValue('s-total', stats.total_sites || 0);
+	animateValue('s-running', stats.running_sites || 0);
+	const totalSites = Number(stats?.total_sites);
+	if (Number.isFinite(totalSites)) {
+		if (dashboardLastObservedSiteCount >= 0 && dashboardLastObservedSiteCount !== totalSites && dashboardSitesInitialized && dashboardSites.length !== totalSites) {
+			void refreshDashboardSecondary();
+		}
+		dashboardLastObservedSiteCount = totalSites;
+	}
 
   const trafficEl = document.getElementById('s-traffic');
   if (trafficEl) trafficEl.textContent = formatBytes(stats.monthly_traffic != null ? stats.monthly_traffic : (stats.total_traffic || 0));
@@ -980,7 +1049,7 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     }
   }
   const sampledAt = Number(snapshotMS || Date.now());
-  const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt, contributions = null) => {
+	const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt, contributions = null) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
     const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));
     const bytesOut = Math.max(0, Number(sample?.bytesOut || 0));
@@ -995,10 +1064,8 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     if (billingKnown) point.traffic_bytes = billingMode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut);
     if (contributions && Object.keys(contributions).length) point.site_contributions = contributions;
     samples.push(point);
-    // Keep the active dashboard session responsive without imposing a time
-    // window; the X axis adapts to however many samples are available.
-    if (samples.length > 1800) samples.splice(0, samples.length - 1800);
-    dashboardRealtimeTrendSamples.set(key, samples);
+		pruneDashboardRealtimeSamples(samples);
+		dashboardRealtimeTrendSamples.set(key, samples);
   };
   if (changedSiteIDs.size > 0) {
     const contributions = {};
@@ -1036,7 +1103,7 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     // aggregate series still uses the controller snapshot timestamp.
     appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, siteSampledAt);
     siteSamples.push(siteSample);
-    if (siteSamples.length > 1800) siteSamples.splice(0, siteSamples.length - 1800);
+		pruneDashboardRealtimeSamples(siteSamples);
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples);
   }
   dashboardSites = dashboardSites.map(site => {
@@ -1090,6 +1157,7 @@ function stopDashSSE() {
   dashboardRealtimeTrendSamples = new Map();
   dashboardRealtimeTrendSiteSamples = new Map();
   dashboardLastSnapshotMS = 0;
+  dashboardLastObservedSiteCount = -1;
   dashboardTrendData = null;
   dashboardSitesInitialized = false;
   dashboardTrendCharts = new Map();
