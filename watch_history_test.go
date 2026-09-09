@@ -851,6 +851,18 @@ func TestPersistWatchHistoryInboxBatchCommitsAndUsesMetadata(t *testing.T) {
 
 func TestPersistWatchHistoryInboxBatchCommitsPartialBatchAtLimit(t *testing.T) {
 	database := openWatchHistoryTestDB(t)
+	// Stop the asynchronous maintenance writer for this boundary test. The
+	// partial commit is intentionally observed before the inbox consumer can
+	// drain a row, and racing that consumer makes the count assertion depend on
+	// scheduler timing (especially under -race).
+	database.dynamicObservationGate.Lock()
+	database.dynamicObservationClosed.Store(true)
+	database.dynamicObservationGate.Unlock()
+	stopResult := make(chan error, 1)
+	database.dynamicObservationQueue <- dynamicObservationCommand{kind: dynamicObservationCommandStop, result: stopResult}
+	<-stopResult
+	<-database.dynamicObservationDone
+	database.dynamicObservationQueue = nil
 	payload := `{"SiteID":1,"SessionHash":"legacy","ObservedAtMS":1}`
 	tx, err := database.db.Begin()
 	if err != nil {

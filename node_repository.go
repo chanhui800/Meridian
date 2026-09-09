@@ -1402,9 +1402,6 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 			cacheSize = stat.CacheSizeBytes
 		}
 		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS)
-		if err == nil && stat.Final {
-			_, err = tx.Exec("DELETE FROM site_node_drains WHERE site_id=? AND node_id=?", siteID, nodeID)
-		}
 		return err
 	}
 	if err != nil {
@@ -1426,7 +1423,12 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 		if currentOut >= previousOut && stat.BytesOut == 0 {
 			deltaOut = currentOut - previousOut
 		}
-		if stat.RequestCount >= previousRequests {
+		// Explicit per-site epochs are emitted by current Agents and reset the
+		// cumulative request counter to zero for the new route generation. Only
+		// legacy reports without CounterEpoch may use the old monotonic
+		// subtraction compatibility path; subtracting an older generation here
+		// would silently drop the first requests of the new generation.
+		if stat.CounterEpoch == 0 && stat.RequestCount >= previousRequests {
 			deltaRequests = stat.RequestCount - previousRequests
 		}
 	} else if currentIn >= previousIn && currentOut >= previousOut && stat.RequestCount >= previousRequests {
@@ -1452,11 +1454,9 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 	if err != nil {
 		return err
 	}
-	if stat.Final {
-		if _, err := tx.Exec("DELETE FROM site_node_drains WHERE site_id=? AND node_id=?", siteID, nodeID); err != nil {
-			return err
-		}
-	}
+	// Final is an Agent-side counter watermark, not proof that every paginated
+	// telemetry/event queue is empty. Keep the drain authorization tombstone
+	// until its bounded expiry so later pages remain accepted.
 	return nil
 }
 
@@ -1664,11 +1664,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			return nodeReportCommitResult{}, err
 		}
 	}
-	if clearAppliedConfig {
-		if _, err := tx.Exec("DELETE FROM agent_route_revocations WHERE node_id=?", id); err != nil {
-			return nodeReportCommitResult{}, err
-		}
-	}
+	// A matching applied config only acknowledges the runtime transition. It
+	// does not acknowledge every paginated telemetry/event queue. Revocation
+	// tombstones remain available for the bounded drain window and are cleaned
+	// by expiry, preventing late pages from being discarded prematurely.
 
 	for _, stat := range report.SiteStats {
 		host := strings.ToLower(strings.TrimSpace(stat.Host))

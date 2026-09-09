@@ -713,6 +713,90 @@ func TestControlNodeManualTrafficOffsetAndSiteStats(t *testing.T) {
 	}
 }
 
+func TestNodeSiteTrafficExplicitEpochKeepsFirstRequestBatch(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "epoch-node", Address: "203.0.113.220"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "epoch-site", PublicHost: "epoch.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=? WHERE site_id=?", node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	first := NodeReport{BootID: "boot", ReportSessionID: "session-a", CounterEpoch: "kernel-a", SiteCounterEpoch: "1", Sequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, RequestCount: 3, CounterEpoch: 1, LastRequestAtMS: now.UnixMilli(), LastStatus: 200}}}
+	if _, err := app.db.RecordNodeReport(token, first, now); err != nil {
+		t.Fatal(err)
+	}
+	second := NodeReport{BootID: "boot", ReportSessionID: "session-b", CounterEpoch: "kernel-a", SiteCounterEpoch: "2", Sequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, RequestCount: 10, CounterEpoch: 1, LastRequestAtMS: now.Add(time.Second).UnixMilli(), LastStatus: 200}}}
+	if _, err := app.db.RecordNodeReport(token, second, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var requests int64
+	if err := app.db.db.QueryRow("SELECT COALESCE(SUM(requests),0) FROM node_site_traffic_logs WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 13 {
+		t.Fatalf("explicit epoch request total=%d, want 13 (3 + 10)", requests)
+	}
+}
+
+func TestDisabledSiteRevocationSurvivesAppliedConfigAndFinalStat(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "final-node", Address: "203.0.113.221"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "final-site", PublicHost: "final.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,config_hash='applied' WHERE site_id=?", node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.SetSiteEnabled(site.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE control_nodes SET desired_config_hash='applied',desired_config_revision=4,config_revision=4,applied_config_revision=0 WHERE id=?", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	report := NodeReport{BootID: "final", ReportSessionID: "final", CounterEpoch: "final", AppliedConfigHash: "applied", AppliedConfigRevision: 4, Sequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, RequestCount: 1, CounterEpoch: 1, Final: true, LastRequestAtMS: now.UnixMilli(), LastStatus: 200}}}
+	if _, err := app.db.RecordNodeReportResult(token, report, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var revocations, drains int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM agent_route_revocations WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&revocations); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM site_node_drains WHERE node_id=? AND site_id=?", node.ID, site.ID).Scan(&drains); err != nil {
+		t.Fatal(err)
+	}
+	if revocations != 1 {
+		t.Fatalf("revocation tombstone was removed after config ACK: %d", revocations)
+	}
+	if drains != 0 {
+		t.Fatalf("unexpected drain row for disabled site: %d", drains)
+	}
+}
+
 func TestNodeHTTPSProbePortFollowsNodePort(t *testing.T) {
 	if got := nodeHTTPSProbePort(ControlNode{Port: 9090}); got != 9090 {
 		t.Fatalf("probe port = %d, want 9090", got)
@@ -1399,6 +1483,23 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	}
 	if agentSupportsCacheClear("v1.9.49") || !agentSupportsCacheClear("v1.9.50") {
 		t.Fatal("cache clear compatibility gate is incorrect")
+	}
+	if agentSupportsForceStop("v1.9.64") || !agentSupportsForceStop("v1.9.65") {
+		t.Fatal("force-stop compatibility gate is incorrect")
+	}
+	forceStopConfig := config
+	forceStopConfig.ForceStopSiteIDs = []int64{42, 7}
+	withoutForceStop := forceStopConfig
+	withoutForceStop.ForceStopSiteIDs = nil
+	wantPreForceStopHash, err := agentConfigHash(withoutForceStop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := agentConfigHashForVersion(forceStopConfig, "v1.9.64"); err != nil || got != wantPreForceStopHash {
+		t.Fatalf("v1.9.64 hash included unknown force-stop field: got=%q want=%q err=%v", got, wantPreForceStopHash, err)
+	}
+	if got, err := agentConfigHashForVersion(forceStopConfig, "v1.9.65"); err != nil || got != wantPreForceStopHash {
+		t.Fatalf("v1.9.65 force-stop command changed runtime hash: got=%q want=%q err=%v", got, wantPreForceStopHash, err)
 	}
 	cacheGenerationConfig := config
 	cacheGenerationConfig.CacheClearGeneration = 7
