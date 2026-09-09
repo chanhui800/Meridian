@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,11 +27,11 @@ import (
 
 const (
 	agentConfigSchemaVersion = 1
-	// siteNodeDrainWindow gives an already-admitted stream several report
-	// intervals to finish and publish its final cumulative counters after DNS
-	// points at the replacement node. New requests are prevented by the new
-	// Agent configuration; this is telemetry authorization only.
-	siteNodeDrainWindow = 2 * time.Minute
+	// siteNodeDrainWindow is an emergency upper bound only. Normal drains are
+	// retired by a final SiteStats snapshot (NodeSiteStat.Final) and its ACK;
+	// the long TTL prevents a long-lived playback from losing billable traffic
+	// while still bounding stale authorization after an Agent disappears.
+	siteNodeDrainWindow = 24 * time.Hour
 )
 
 type SiteNodeSchedule struct {
@@ -100,6 +101,7 @@ type AgentRuntimeConfig struct {
 	AgentSHA256          string           `json:"agent_sha256,omitempty"`
 	AgentDownloadURL     string           `json:"agent_download_url,omitempty"`
 	CacheClearGeneration int64            `json:"cache_clear_generation,omitempty"`
+	ForceStopSiteIDs     []int64          `json:"force_stop_site_ids,omitempty"`
 	Routes               []AgentSiteRoute `json:"routes"`
 }
 
@@ -542,6 +544,7 @@ type agentRuntimeConfigHash struct {
 	AgentSHA256          string               `json:"agent_sha256,omitempty"`
 	AgentDownloadURL     string               `json:"agent_download_url,omitempty"`
 	CacheClearGeneration int64                `json:"cache_clear_generation,omitempty"`
+	ForceStopSiteIDs     []int64              `json:"force_stop_site_ids,omitempty"`
 	Routes               []agentSiteRouteHash `json:"routes"`
 }
 
@@ -552,8 +555,11 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 		config.AgentSHA256 = ""
 	}
 	config.AgentDownloadURL = ""
+	config.ForceStopSiteIDs = append([]int64(nil), config.ForceStopSiteIDs...)
+	sort.Slice(config.ForceStopSiteIDs, func(i, j int) bool { return config.ForceStopSiteIDs[i] < config.ForceStopSiteIDs[j] })
 	if legacy {
 		config.CacheClearGeneration = 0
+		config.ForceStopSiteIDs = nil
 		// ProbeSecret was added after the legacy Agent contract. Older Agents
 		// ignore the field, so omit it from the compatibility hash while current
 		// Agents use the runtime hash above and authenticate their health probes.
@@ -600,6 +606,7 @@ func agentConfigHashPayload(config AgentRuntimeConfig, legacy bool) agentRuntime
 		AgentSHA256:          config.AgentSHA256,
 		AgentDownloadURL:     config.AgentDownloadURL,
 		CacheClearGeneration: config.CacheClearGeneration,
+		ForceStopSiteIDs:     config.ForceStopSiteIDs,
 		Routes:               routes,
 	}
 }
@@ -871,6 +878,23 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigRevision: node.ConfigRevision, NodeGUID: node.GUID, EntryMode: "direct",
 		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText,
 		CacheClearGeneration: node.CacheClearGeneration, Routes: routes}
+	forceRows, forceErr := tx.Query("SELECT site_id FROM agent_route_revocations WHERE node_id=? ORDER BY site_id", node.ID)
+	if forceErr != nil {
+		return AgentRuntimeConfig{}, forceErr
+	}
+	for forceRows.Next() {
+		var siteID int64
+		if err := forceRows.Scan(&siteID); err != nil {
+			_ = forceRows.Close()
+			return AgentRuntimeConfig{}, err
+		}
+		if siteID > 0 {
+			config.ForceStopSiteIDs = append(config.ForceStopSiteIDs, siteID)
+		}
+	}
+	if err := forceRows.Close(); err != nil {
+		return AgentRuntimeConfig{}, err
+	}
 	if len(routes) > 0 {
 		if a.panelCertificates == nil {
 			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")
@@ -1306,9 +1330,9 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	defer tx.Rollback()
 	if schedule.AppliedNodeID != node.ID {
 		if schedule.AppliedNodeID > 0 {
-			if _, err = tx.Exec(`INSERT INTO site_node_drains(site_id,node_id,expires_at_ms,created_at_ms) VALUES(?,?,?,?)
-				ON CONFLICT(site_id) DO UPDATE SET node_id=excluded.node_id,expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`,
-				schedule.SiteID, schedule.AppliedNodeID, now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli()); err != nil {
+			if _, err = tx.Exec(`INSERT INTO site_node_drains(site_id,node_id,public_host,expires_at_ms,created_at_ms) VALUES(?,?,?,?,?)
+				ON CONFLICT(site_id,node_id) DO UPDATE SET public_host=excluded.public_host,expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`,
+				schedule.SiteID, schedule.AppliedNodeID, strings.ToLower(strings.TrimSpace(schedule.PublicHost)), now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli()); err != nil {
 				return err
 			}
 		}
@@ -1331,6 +1355,9 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	now := time.Now()
 	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire node drains: %v", err)
+	}
+	if _, err := a.db.db.Exec("DELETE FROM site_node_host_aliases WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
+		log.Printf("[node-scheduler] expire site host aliases: %v", err)
 	}
 	if err := a.db.retryNodeTLSCleanup(""); err != nil {
 		log.Printf("[node-scheduler] managed Edge TLS cleanup retry failed: %v", err)
@@ -1416,6 +1443,13 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 		return err
 	}
 	defer tx.Rollback()
+	for _, nodeID := range []int64{value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID} {
+		if nodeID > 0 {
+			if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,created_at_ms) VALUES(?,?,?)", nodeID, siteID, time.Now().UnixMilli()); err != nil {
+				return err
+			}
+		}
+	}
 	if err := markAgentConfigsDirtyForNodeIDsTx(tx, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID); err != nil {
 		return err
 	}
@@ -1483,6 +1517,13 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	}
 	defer tx.Rollback()
 	for _, value := range affected {
+		for _, nodeID := range []int64{value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID} {
+			if nodeID > 0 {
+				if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,created_at_ms) VALUES(?,?,?)", nodeID, value.SiteID, time.Now().UnixMilli()); err != nil {
+					return err
+				}
+			}
+		}
 		if err := markAgentConfigsDirtyForNodeIDsTx(tx, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID); err != nil {
 			return err
 		}

@@ -1597,7 +1597,10 @@ func writePrivateFileAtomic(filename string, data []byte) error {
 			return err
 		}
 	}
-	return os.Rename(tmpName, filename) // #nosec G703 G304 -- both paths are generated within the private TLS directory.
+	if err := os.Rename(tmpName, filename); err != nil { // #nosec G703 G304 -- both paths are generated within the private TLS directory.
+		return err
+	}
+	return syncDirectory(filepath.Dir(filename))
 }
 
 func fulfillCloudflareDNSAuthorization(ctx context.Context, acmeClient *acme.Client, cf *cloudflareClient, authorizationURL, routeDomain string) error {

@@ -1840,6 +1840,9 @@ func writeRestorePendingFromPaths(dbPath string, manifest backupManifest, entrie
 	if err := os.Rename(tmp, pending); err != nil {
 		return 0, err
 	}
+	if err := syncDirectory(filepath.Dir(pending)); err != nil {
+		return 0, err
+	}
 	return resetIngressCount, nil
 }
 
@@ -2505,6 +2508,9 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	if err := os.Rename(filepath.Join(pending, backupDatabaseEntry), dbPath); err != nil { // #nosec G703 G304 -- source is the fixed database archive entry in pending.
 		return nil, err
 	}
+	if err := syncDirectory(filepath.Dir(dbPath)); err != nil {
+		return nil, err
+	}
 	if markerIncludesTLS(marker) {
 		panelPairRestored := false
 		var pairErr error
@@ -2544,6 +2550,9 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		source := filepath.Join(rollback, backupDatabaseEntry+suffix)
 		if _, err := os.Stat(source); err == nil { // #nosec G703 G304 -- source is the fixed rollback database entry.
 			if err := os.Rename(source, dbPath+suffix); err != nil {
+				return err
+			}
+			if err := syncDirectory(filepath.Dir(dbPath)); err != nil {
 				return err
 			}
 		} else if suffix == "" {
