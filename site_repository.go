@@ -618,9 +618,9 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 				continue
 			}
 			seenNodes[nodeID] = struct{}{}
-			if _, execErr := tx.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms)
-				VALUES(?,?,?,?,?) ON CONFLICT(site_id,node_id,public_host) DO UPDATE SET expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`,
-				site.ID, nodeID, oldHost, nowAlias.Add(siteNodeDrainWindow).UnixMilli(), nowAlias.UnixMilli()); execErr != nil {
+			if _, execErr := tx.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms)
+				VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id,node_id,public_host) DO UPDATE SET expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms,acked_at_ms=0,finalization_expires_at_ms=0`,
+				site.ID, nodeID, oldHost, nowAlias.Add(siteNodeDrainWindow).UnixMilli(), nowAlias.UnixMilli(), 0, 0); execErr != nil {
 				return execErr
 			}
 		}
