@@ -24,7 +24,14 @@ import (
 	"time"
 )
 
-const agentConfigSchemaVersion = 1
+const (
+	agentConfigSchemaVersion = 1
+	// siteNodeDrainWindow gives an already-admitted stream several report
+	// intervals to finish and publish its final cumulative counters after DNS
+	// points at the replacement node. New requests are prevented by the new
+	// Agent configuration; this is telemetry authorization only.
+	siteNodeDrainWindow = 2 * time.Minute
+)
 
 type SiteNodeSchedule struct {
 	SiteID               int64  `json:"site_id"`
@@ -775,7 +782,8 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	rows, err := tx.Query(`SELECT s.id,s.public_host,s.target_url,s.playback_target_url,s.playback_mode,s.stream_hosts,s.upstream_headers
 		FROM site_node_schedules n JOIN sites s ON s.id=n.site_id
-		WHERE n.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND s.enabled=1 ORDER BY s.id`, node.ID, node.ID)
+		WHERE n.enabled=1 AND s.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?)
+		ORDER BY s.id`, node.ID, node.ID)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
@@ -1287,14 +1295,43 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	if err != nil {
 		return err
 	}
-	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET applied_node_id=?,cf_zone_id=?,cf_record_id=?,cf_record_type=?,
+	// DNS is an external side effect and is complete at this point. Publish the
+	// replacement and both Agent invalidations atomically. The previous applied
+	// node retains only a bounded drain route so existing streams can report a
+	// final counter; it is not left to the next sixty-second config poll.
+	tx, beginErr := a.db.db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer tx.Rollback()
+	if schedule.AppliedNodeID != node.ID {
+		if schedule.AppliedNodeID > 0 {
+			if _, err = tx.Exec(`INSERT INTO site_node_drains(site_id,node_id,expires_at_ms,created_at_ms) VALUES(?,?,?,?)
+				ON CONFLICT(site_id) DO UPDATE SET node_id=excluded.node_id,expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`,
+				schedule.SiteID, schedule.AppliedNodeID, now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli()); err != nil {
+				return err
+			}
+		}
+		if err = markAgentConfigsDirtyForNodeIDsTx(tx, schedule.AppliedNodeID, node.ID); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(`UPDATE site_node_schedules SET applied_node_id=?,cf_zone_id=?,cf_record_id=?,cf_record_type=?,
 		applied_address=?,dns_status='active',last_error='',updated_at_ms=? WHERE site_id=?`, node.ID, zoneID, recordID,
-		recordType, ip.String(), now.UnixMilli(), schedule.SiteID)
-	return err
+		recordType, ip.String(), now.UnixMilli(), schedule.SiteID); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	now := time.Now()
+	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
+		log.Printf("[node-scheduler] expire node drains: %v", err)
+	}
 	if err := a.db.retryNodeTLSCleanup(""); err != nil {
 		log.Printf("[node-scheduler] managed Edge TLS cleanup retry failed: %v", err)
 	}

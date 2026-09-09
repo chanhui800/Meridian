@@ -483,14 +483,12 @@ func (b *edgeProxyBundle) close() {
 	}
 }
 
-func (b *edgeProxyBundle) drain(grace time.Duration) {
+func (b *edgeProxyBundle) drain(ctx context.Context) {
 	if b == nil {
 		return
 	}
 	if b.manager != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), grace)
 		b.manager.DrainShutdown(ctx)
-		cancel()
 	}
 	if b.database != nil {
 		b.database.Close()
@@ -506,6 +504,9 @@ type edgeAgentRuntime struct {
 	certificate          *tls.Certificate
 	server               *http.Server
 	bundle               *edgeProxyBundle
+	drainContext         context.Context
+	drainCancel          context.CancelFunc
+	drainingBundles      map[*edgeProxyBundle]struct{}
 	appliedHash          string
 	appliedRevision      int64
 	siteCounterEpoch     uint64
@@ -523,9 +524,38 @@ type edgeAgentRuntime struct {
 	observations         []NodeDynamicObservation
 	siteReported         map[int64]ProxyRuntimeStat
 	trafficCounters      map[int64]*edgeSiteTrafficCounter
-	resolver             dynamicIPResolver
-	transport            dynamicTransportFactory
-	listen               func(string, string) (net.Listener, error)
+	// trafficHosts keeps the Controller host alongside the process-stable
+	// counter. A route can disappear from the current bundle while an admitted
+	// stream is still draining; its counter must remain reportable.
+	trafficHosts map[int64]string
+	resolver     dynamicIPResolver
+	transport    dynamicTransportFactory
+	listen       func(string, string) (net.Listener, error)
+}
+
+// beginBundleDrain rejects new work on an old generation but gives streams
+// admitted before a hot apply an unbounded lifetime. Runtime shutdown/revoke
+// cancels this context and therefore remains an immediate security boundary.
+func (runtime *edgeAgentRuntime) beginBundleDrain(bundle *edgeProxyBundle) {
+	if runtime == nil || bundle == nil {
+		return
+	}
+	runtime.mu.Lock()
+	if runtime.drainContext == nil || runtime.drainCancel == nil {
+		runtime.drainContext, runtime.drainCancel = context.WithCancel(context.Background())
+	}
+	if runtime.drainingBundles == nil {
+		runtime.drainingBundles = make(map[*edgeProxyBundle]struct{})
+	}
+	runtime.drainingBundles[bundle] = struct{}{}
+	ctx := runtime.drainContext
+	runtime.mu.Unlock()
+	go func() {
+		bundle.drain(ctx)
+		runtime.mu.Lock()
+		delete(runtime.drainingBundles, bundle)
+		runtime.mu.Unlock()
+	}()
 }
 
 type edgeAgentRuntimeState struct {
@@ -543,7 +573,7 @@ type edgeAgentRuntimeState struct {
 	listenerError        string
 }
 
-func (runtime *edgeAgentRuntime) trafficCounterFor(siteID int64) *edgeSiteTrafficCounter {
+func (runtime *edgeAgentRuntime) trafficCounterFor(siteID int64, hosts ...string) *edgeSiteTrafficCounter {
 	if runtime == nil || siteID <= 0 {
 		return nil
 	}
@@ -551,6 +581,12 @@ func (runtime *edgeAgentRuntime) trafficCounterFor(siteID int64) *edgeSiteTraffi
 	defer runtime.mu.Unlock()
 	if runtime.trafficCounters == nil {
 		runtime.trafficCounters = make(map[int64]*edgeSiteTrafficCounter)
+	}
+	if len(hosts) > 0 && strings.TrimSpace(hosts[0]) != "" {
+		if runtime.trafficHosts == nil {
+			runtime.trafficHosts = make(map[int64]string)
+		}
+		runtime.trafficHosts[siteID] = requestPublicHost(hosts[0])
 	}
 	if counter := runtime.trafficCounters[siteID]; counter != nil {
 		return counter
@@ -679,34 +715,72 @@ func (runtime *edgeAgentRuntime) prepareTelemetry() edgeTelemetryPending {
 	return pending
 }
 
-func (runtime *edgeAgentRuntime) commitTelemetry(pending edgeTelemetryPending) {
+func acknowledgedSiteIDs(accepted, discarded []int64) map[int64]bool {
+	result := make(map[int64]bool, len(accepted)+len(discarded))
+	for _, siteID := range accepted {
+		if siteID > 0 {
+			result[siteID] = true
+		}
+	}
+	for _, siteID := range discarded {
+		if siteID > 0 {
+			// A discarded item is an explicit, final Controller disposition. It
+			// is safe to remove locally; an HTTP success without this field is not.
+			result[siteID] = true
+		}
+	}
+	return result
+}
+
+func (runtime *edgeAgentRuntime) commitTelemetryWithACK(pending edgeTelemetryPending, mediaACK, retentionACK, observationACK map[int64]bool) {
 	if runtime == nil {
 		return
 	}
 	runtime.telemetryMu.Lock()
 	defer runtime.telemetryMu.Unlock()
 	for _, sent := range pending.media {
-		if current, ok := runtime.mediaCounts[sent.SiteID]; ok && current == sent {
-			delete(runtime.mediaCounts, sent.SiteID)
+		if mediaACK[sent.SiteID] {
+			if current, ok := runtime.mediaCounts[sent.SiteID]; ok && current == sent {
+				delete(runtime.mediaCounts, sent.SiteID)
+			}
 		}
 	}
 	for _, sent := range pending.retention {
-		if current, ok := runtime.retention[sent.SiteID]; ok && current == sent {
-			delete(runtime.retention, sent.SiteID)
+		if retentionACK[sent.SiteID] {
+			if current, ok := runtime.retention[sent.SiteID]; ok && current == sent {
+				delete(runtime.retention, sent.SiteID)
+			}
 		}
 	}
 	if len(pending.observations) > 0 && len(runtime.observations) >= len(pending.observations) {
-		matches := true
-		for i := range pending.observations {
-			if runtime.observations[i] != pending.observations[i] {
-				matches = false
-				break
+		remaining := runtime.observations[:0]
+		for index, current := range runtime.observations {
+			if index < len(pending.observations) && current == pending.observations[index] && observationACK[current.SiteID] {
+				continue
 			}
+			remaining = append(remaining, current)
 		}
-		if matches {
-			runtime.observations = append([]NodeDynamicObservation(nil), runtime.observations[len(pending.observations):]...)
-		}
+		runtime.observations = append([]NodeDynamicObservation(nil), remaining...)
 	}
+}
+
+// commitTelemetry is retained for local diagnostic snapshots and tests. A
+// network report must use commitTelemetryWithACK so it cannot silently lose a
+// category the Controller did not accept.
+func (runtime *edgeAgentRuntime) commitTelemetry(pending edgeTelemetryPending) {
+	media := make(map[int64]bool, len(pending.media))
+	retention := make(map[int64]bool, len(pending.retention))
+	observations := make(map[int64]bool, len(pending.observations))
+	for _, value := range pending.media {
+		media[value.SiteID] = true
+	}
+	for _, value := range pending.retention {
+		retention[value.SiteID] = true
+	}
+	for _, value := range pending.observations {
+		observations[value.SiteID] = true
+	}
+	runtime.commitTelemetryWithACK(pending, media, retention, observations)
 }
 
 func (runtime *edgeAgentRuntime) telemetrySnapshot() (media []NodeMediaCount, retention []NodeRetentionStatus, observations []NodeDynamicObservation) {
@@ -727,40 +801,51 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 	}
 	runtime.mu.RLock()
 	bundle := runtime.bundle
-	runtime.mu.RUnlock()
-	if bundle == nil || bundle.manager == nil {
-		return pending
-	}
-	current := bundle.manager.ProxyRuntimeStats()
-	cacheSizes, _, cacheErr := bundle.manager.AssetCacheSizes()
-	if cacheErr != nil {
-		// A cache size read is best-effort telemetry. Treating a read failure as
-		// zero would overwrite an accurate Controller value with a false reset.
-		log.Printf("[agent] read asset cache sizes: %v", cacheErr)
-		cacheSizes = nil
-	}
-	// Baselines are keyed by the Controller's stable SiteID. The in-memory
-	// Edge database is rebuilt whenever configuration changes, so its local
-	// auto-increment IDs must never be used as long-lived identities.
-	pending.current = make(map[int64]ProxyRuntimeStat, len(current))
-	requestStats := runtime.stats.snapshot()
-	byHost := make(map[string]NodeSiteStat, len(requestStats))
-	for _, value := range requestStats {
-		byHost[value.Host] = value
-	}
-	runtime.mu.RLock()
 	previous := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
 	for siteID, value := range runtime.siteReported {
 		previous[siteID] = value
 	}
+	counters := make(map[int64]*edgeSiteTrafficCounter, len(runtime.trafficCounters))
+	hosts := make(map[int64]string, len(runtime.trafficHosts))
+	for siteID, counter := range runtime.trafficCounters {
+		counters[siteID] = counter
+		hosts[siteID] = runtime.trafficHosts[siteID]
+	}
 	runtime.mu.RUnlock()
-	pending.stats = make([]NodeSiteStat, 0, len(current))
-	for _, value := range current {
-		identity, ok := bundle.localSites[value.SiteID]
-		if !ok {
+
+	// Request metadata and cache size belong to the current bundle, but byte
+	// counters deliberately do not. The latter are process-stable so a route
+	// removed during a draining connection still gets a final report.
+	requestStats := runtime.stats.snapshot()
+	byHost := make(map[string]NodeSiteStat, len(requestStats))
+	for _, value := range requestStats {
+		byHost[requestPublicHost(value.Host)] = value
+	}
+	cacheSizes := map[int64]int64(nil)
+	cacheErr := error(nil)
+	if bundle != nil && bundle.manager != nil {
+		cacheSizes, _, cacheErr = bundle.manager.AssetCacheSizes()
+		if cacheErr != nil {
+			log.Printf("[agent] read asset cache sizes: %v", cacheErr)
+			cacheSizes = nil
+		}
+	}
+	pending.current = make(map[int64]ProxyRuntimeStat, len(counters))
+	pending.stats = make([]NodeSiteStat, 0, len(counters))
+	for centralID, counter := range counters {
+		if centralID <= 0 || counter == nil {
 			continue
 		}
-		centralID := identity.centralID
+		host := requestPublicHost(hosts[centralID])
+		if host == "" {
+			continue
+		}
+		value := ProxyRuntimeStat{
+			SiteID:             centralID,
+			Requests:           counter.requests.Load(),
+			CumulativeBytesIn:  counter.cumulativeIn.Load(),
+			CumulativeBytesOut: counter.cumulativeOut.Load(),
+		}
 		pending.current[centralID] = value
 		prior := previous[centralID]
 		inDelta, outDelta := value.CumulativeBytesIn-prior.CumulativeBytesIn, value.CumulativeBytesOut-prior.CumulativeBytesOut
@@ -770,13 +855,12 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		if outDelta < 0 {
 			outDelta = value.CumulativeBytesOut
 		}
-		observed := byHost[identity.host]
-		observed.Host = identity.host
+		observed := byHost[host]
+		observed.SiteID = centralID
+		observed.Host = host
 		observed.RequestCount = value.Requests
 		observed.BytesIn, observed.BytesOut = inDelta, outDelta
 		observed.CumulativeBytesIn, observed.CumulativeBytesOut = value.CumulativeBytesIn, value.CumulativeBytesOut
-		// Asset cache namespaces are keyed by the Controller's stable SiteID,
-		// while value.SiteID belongs to the Agent's ephemeral in-memory DB.
 		if cacheErr == nil {
 			observed.CacheSizeBytes = cacheSizes[centralID]
 			observed.CacheSizeValid = true
@@ -786,7 +870,7 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 	return pending
 }
 
-func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
+func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPending, acknowledged map[int64]bool) {
 	if runtime == nil || len(pending.current) == 0 {
 		return
 	}
@@ -796,6 +880,9 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 	}
 	deltas := make(map[int64]ProxyRuntimeStat, len(pending.current))
 	for siteID, sent := range pending.current {
+		if !acknowledged[siteID] {
+			continue
+		}
 		current := runtime.siteReported[siteID]
 		delta := ProxyRuntimeStat{SiteID: siteID}
 		if sent.CumulativeBytesIn >= current.CumulativeBytesIn {
@@ -817,8 +904,8 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 		runtime.siteReported[siteID] = sent
 	}
 	bundle := runtime.bundle
-	reported := make(map[int64]ProxyRuntimeStat, len(pending.current))
-	for siteID := range pending.current {
+	reported := make(map[int64]ProxyRuntimeStat, len(deltas))
+	for siteID := range deltas {
 		reported[siteID] = runtime.siteReported[siteID]
 	}
 	runtime.mu.Unlock()
@@ -849,6 +936,14 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 			inst.trafficMu.Unlock()
 		}
 	}
+}
+
+func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
+	acknowledged := make(map[int64]bool, len(pending.current))
+	for siteID := range pending.current {
+		acknowledged[siteID] = true
+	}
+	runtime.commitSiteStatsWithACK(pending, acknowledged)
 }
 
 // syncSiteTrafficLimits updates the live quota baseline without rebuilding
@@ -1099,7 +1194,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
-		site.runtimeTrafficCounter = runtime.trafficCounterFor(route.SiteID)
+		site.runtimeTrafficCounter = runtime.trafficCounterFor(route.SiteID, route.Host)
 		// Site icons are Controller/UI metadata. The Agent's ephemeral site
 		// database has no uploaded icon pack, so carrying these fields into
 		// CreateSiteRecord would make an otherwise valid runtime config fail
@@ -1404,7 +1499,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 				runtime.stopServer()
 			}
 			rollbackErr := runtime.rollbackApply(oldState, listenerChanged, false, err)
-			go bundle.drain(15 * time.Second)
+			runtime.beginBundleDrain(bundle)
 			return rollbackErr
 		}
 	}
@@ -1422,10 +1517,9 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
 	if oldState.bundle != nil {
-		// A config refresh must not cancel requests that were admitted by the
-		// previous bundle. Stop accepting new requests on it, let active streams
-		// drain, and only force-close them after the bounded grace period.
-		go oldState.bundle.drain(15 * time.Second)
+		// Hot config changes are not a security revocation. Existing playback and
+		// WebSocket streams finish naturally; close() cancels them on shutdown.
+		runtime.beginBundleDrain(oldState.bundle)
 	}
 	return nil
 }
@@ -1476,7 +1570,13 @@ func (runtime *edgeAgentRuntime) close() {
 	runtime.mu.Lock()
 	bundle := runtime.bundle
 	runtime.bundle = nil
+	cancel := runtime.drainCancel
+	runtime.drainCancel = nil
+	runtime.drainContext = nil
 	runtime.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	bundle.close()
 }
 
@@ -1549,6 +1649,22 @@ func (e *edgeAPIError) Error() string {
 func isEdgeAgentRevoked(err error) bool {
 	var apiErr *edgeAPIError
 	return errors.As(err, &apiErr) && strings.EqualFold(strings.TrimSpace(apiErr.AgentState), "revoked")
+}
+
+// edgeQuiesceRevoked closes the data plane before recording the durable
+// marker. If the disk is unavailable, returning would let systemd restart the
+// same revoked credential forever; stay inert until an operator stops or
+// repairs the service instead.
+func edgeQuiesceRevoked(ctx context.Context, runtime *edgeAgentRuntime, marker string) error {
+	if runtime != nil {
+		runtime.close()
+	}
+	if err := os.WriteFile(marker, []byte("revoked\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "Meridian Agent is revoked but cannot persist revoked state: %v; remaining offline until stopped\n", err)
+		<-ctx.Done()
+		return nil
+	}
+	return nil
 }
 
 func edgeEnrollmentTokenAvailable(path string) bool {
@@ -1629,12 +1745,20 @@ func edgeAPIRequestWithHeaders(ctx context.Context, client *http.Client, method,
 }
 
 type edgeReportAck struct {
-	AcceptedEventIDs   []int64  `json:"accepted_event_ids"`
-	AcceptedEventUIDs  []string `json:"accepted_event_uids"`
-	DiscardedEventIDs  []int64  `json:"discarded_event_ids"`
-	DiscardedEventUIDs []string `json:"discarded_event_uids"`
-	ConfigHash         string   `json:"config_hash"`
-	ConfigChanged      bool     `json:"config_changed"`
+	AcceptedSiteIDs             []int64  `json:"accepted_site_ids"`
+	DiscardedSiteIDs            []int64  `json:"discarded_site_ids"`
+	AcceptedMediaSiteIDs        []int64  `json:"accepted_media_site_ids"`
+	DiscardedMediaSiteIDs       []int64  `json:"discarded_media_site_ids"`
+	AcceptedRetentionSiteIDs    []int64  `json:"accepted_retention_site_ids"`
+	DiscardedRetentionSiteIDs   []int64  `json:"discarded_retention_site_ids"`
+	AcceptedObservationSiteIDs  []int64  `json:"accepted_observation_site_ids"`
+	DiscardedObservationSiteIDs []int64  `json:"discarded_observation_site_ids"`
+	AcceptedEventIDs            []int64  `json:"accepted_event_ids"`
+	AcceptedEventUIDs           []string `json:"accepted_event_uids"`
+	DiscardedEventIDs           []int64  `json:"discarded_event_ids"`
+	DiscardedEventUIDs          []string `json:"discarded_event_uids"`
+	ConfigHash                  string   `json:"config_hash"`
+	ConfigChanged               bool     `json:"config_changed"`
 }
 
 type edgeWSReportClient struct {
@@ -2068,8 +2192,7 @@ func runEdgeAgent() error {
 				agentVersionHeader:  []string{appVersion},
 			}); err != nil {
 				if isEdgeAgentRevoked(err) {
-					_ = os.WriteFile(revokedMarker, []byte("revoked\n"), 0o600)
-					return nil
+					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
@@ -2156,13 +2279,17 @@ func runEdgeAgent() error {
 			}
 			if wsErr != nil {
 				if isEdgeAgentRevoked(wsErr) {
-					_ = os.WriteFile(revokedMarker, []byte("revoked\n"), 0o600)
-					return nil
+					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", wsErr)
 			} else {
-				runtime.commitSiteStats(pendingStats)
-				runtime.commitTelemetry(pendingTelemetry)
+				runtime.commitSiteStatsWithACK(pendingStats, acknowledgedSiteIDs(ack.AcceptedSiteIDs, ack.DiscardedSiteIDs))
+				runtime.commitTelemetryWithACK(
+					pendingTelemetry,
+					acknowledgedSiteIDs(ack.AcceptedMediaSiteIDs, ack.DiscardedMediaSiteIDs),
+					acknowledgedSiteIDs(ack.AcceptedRetentionSiteIDs, ack.DiscardedRetentionSiteIDs),
+					acknowledgedSiteIDs(ack.AcceptedObservationSiteIDs, ack.DiscardedObservationSiteIDs),
+				)
 				accepted := make(map[int64]bool, len(ack.AcceptedEventIDs))
 				for _, id := range ack.AcceptedEventIDs {
 					accepted[id] = true

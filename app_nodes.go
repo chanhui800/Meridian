@@ -415,7 +415,11 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity, authErr := agentIdentityForRequest(a, r)
-	if authErr != nil || (!identity.HasNode && !identity.Enrollment) {
+	if authErr != nil {
+		writeAgentAuthenticationError(a, w, r, authErr)
+		return
+	}
+	if !identity.HasNode && !identity.Enrollment {
 		writeAgentAuthFailure(a, w, r)
 		return
 	}
@@ -569,7 +573,11 @@ func (a *App) handleAgentManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity, authErr := agentIdentityForRequest(a, r)
-	if authErr != nil || (!identity.HasNode && !identity.Enrollment) {
+	if authErr != nil {
+		writeAgentAuthenticationError(a, w, r, authErr)
+		return
+	}
+	if !identity.HasNode && !identity.Enrollment {
 		writeAgentAuthFailure(a, w, r)
 		return
 	}
@@ -616,7 +624,11 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity, authErr := agentIdentityForRequest(a, r)
-	if authErr != nil || !identity.Enrollment {
+	if authErr != nil {
+		writeAgentAuthenticationError(a, w, r, authErr)
+		return
+	}
+	if !identity.Enrollment {
 		writeAgentAuthFailure(a, w, r)
 		return
 	}
@@ -652,7 +664,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	}
 	identity, authErr := agentNodeIdentityForRequest(a, r)
 	if authErr != nil {
-		writeAgentAuthFailure(a, w, r)
+		writeAgentAuthenticationError(a, w, r, authErr)
 		return
 	}
 	token := identity.Token
@@ -688,6 +700,10 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	configChanged := nodeReportConfigChanged(result.Node, report.AppliedConfigHash, report.AppliedConfigRevision)
 	a.jsonOK(w, map[string]interface{}{
 		"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
+		"accepted_site_ids": result.AcceptedSiteIDs, "discarded_site_ids": result.DiscardedSiteIDs,
+		"accepted_media_site_ids": result.AcceptedMediaSiteIDs, "discarded_media_site_ids": result.DiscardedMediaSiteIDs,
+		"accepted_retention_site_ids": result.AcceptedRetentionSiteIDs, "discarded_retention_site_ids": result.DiscardedRetentionSiteIDs,
+		"accepted_observation_site_ids": result.AcceptedObservationSiteIDs, "discarded_observation_site_ids": result.DiscardedObservationSiteIDs,
 		"accepted_event_ids": result.AcceptedEventIDs, "accepted_event_uids": result.AcceptedEventUIDs,
 		"discarded_event_ids": result.DiscardedEventIDs, "discarded_event_uids": result.DiscardedEventUIDs,
 		"config_hash":    result.Node.DesiredConfigHash,
@@ -779,6 +795,10 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		}
 		ack := map[string]interface{}{
 			"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
+			"accepted_site_ids": result.AcceptedSiteIDs, "discarded_site_ids": result.DiscardedSiteIDs,
+			"accepted_media_site_ids": result.AcceptedMediaSiteIDs, "discarded_media_site_ids": result.DiscardedMediaSiteIDs,
+			"accepted_retention_site_ids": result.AcceptedRetentionSiteIDs, "discarded_retention_site_ids": result.DiscardedRetentionSiteIDs,
+			"accepted_observation_site_ids": result.AcceptedObservationSiteIDs, "discarded_observation_site_ids": result.DiscardedObservationSiteIDs,
 			"accepted_event_ids": result.AcceptedEventIDs, "accepted_event_uids": result.AcceptedEventUIDs,
 			"discarded_event_ids": result.DiscardedEventIDs, "discarded_event_uids": result.DiscardedEventUIDs,
 			"config_hash":    result.Node.DesiredConfigHash,

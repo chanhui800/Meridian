@@ -3,6 +3,7 @@ package main
 import (
 	"container/list"
 	"context"
+	"errors"
 	"math"
 	"net/http"
 	"strconv"
@@ -336,7 +337,7 @@ func (a *App) withAgentPreAuth(next http.HandlerFunc) http.HandlerFunc {
 		identity, err := a.authenticateAgentRequest(r)
 		release()
 		if err != nil {
-			writeAgentAuthFailure(a, w, r)
+			writeAgentAuthenticationError(a, w, r, err)
 			return
 		}
 		next(w, withAgentCredential(r, identity))
@@ -354,6 +355,18 @@ func writeAgentAuthFailure(a *App, w http.ResponseWriter, r *http.Request) {
 	a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 }
 
+// writeAgentAuthenticationError deliberately reserves the Agent revocation
+// signal for a credential that was conclusively rejected. A transient SQLite
+// or filesystem failure must remain retryable: an Agent persists `revoked`
+// and would otherwise take itself permanently offline after one failed lookup.
+func writeAgentAuthenticationError(a *App, w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errInvalidAgentToken) || errors.Is(err, errInvalidNodeToken) {
+		writeAgentAuthFailure(a, w, r)
+		return
+	}
+	a.jsonErr(w, http.StatusServiceUnavailable, "agent authentication temporarily unavailable")
+}
+
 // authenticateAgentRequest performs the only credential lookups protected by
 // the global pre-auth concurrency budget. Enrollment credentials are retained
 // because the binary, manifest, and enroll endpoints intentionally accept the
@@ -369,9 +382,13 @@ func (a *App) authenticateAgentRequest(r *http.Request) (agentCredentialIdentity
 	now := time.Now()
 	if node, err := a.db.nodeByAgentToken(token, now); err == nil {
 		return agentCredentialIdentity{Token: token, Node: node, HasNode: true}, nil
+	} else if !errors.Is(err, errInvalidAgentToken) {
+		return agentCredentialIdentity{}, err
 	}
 	if err := a.db.AuthorizeEnrollmentToken(token, now); err == nil {
 		return agentCredentialIdentity{Token: token, Enrollment: true}, nil
+	} else if !errors.Is(err, errInvalidNodeToken) {
+		return agentCredentialIdentity{}, err
 	}
 	return agentCredentialIdentity{}, errInvalidAgentToken
 }
@@ -385,7 +402,10 @@ func agentIdentityForRequest(a *App, r *http.Request) (agentCredentialIdentity, 
 
 func agentNodeIdentityForRequest(a *App, r *http.Request) (agentCredentialIdentity, error) {
 	identity, err := agentIdentityForRequest(a, r)
-	if err != nil || !identity.HasNode || identity.Enrollment {
+	if err != nil {
+		return agentCredentialIdentity{}, err
+	}
+	if !identity.HasNode || identity.Enrollment {
 		return agentCredentialIdentity{}, errInvalidAgentToken
 	}
 	return identity, nil
