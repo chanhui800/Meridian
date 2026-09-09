@@ -5263,10 +5263,10 @@ func TestSiteUpdateRestartsPreStoppedInstanceWhenRecordUpdateFails(t *testing.T)
 	}
 }
 
-// DELETE restarts the stopped enabled site when the row deletion fails: the
-// instance is never left stopped while the enabled row survives. The failure
-// is injected with a trigger that aborts row deletion after the stop flush.
-func TestDeleteSiteRestartsInstanceWhenDeleteFails(t *testing.T) {
+// DELETE leaves a disabled cleanup-pending row when the final delete fails
+// after schedule/DNS cleanup. The row is retained as a retry handle and the
+// proxy is not restarted with stale routing state.
+func TestDeleteSiteLeavesCleanupPendingWhenDeleteFails(t *testing.T) {
 	app := newTestApp(t)
 	port := freePort(t)
 	site, err := app.db.CreateSite("del-restore", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
@@ -5294,8 +5294,8 @@ func TestDeleteSiteRestartsInstanceWhenDeleteFails(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/api/sites/"+jsonNumber64(site.ID), nil)
 	app.handleSiteByID(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("DELETE status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("DELETE status = %d, want 503; body=%s", rr.Code, rr.Body.String())
 	}
 	if !strings.Contains(rr.Body.String(), "delete blocked") {
 		t.Fatalf("DELETE error must report the delete failure: %s", rr.Body.String())
@@ -5305,26 +5305,17 @@ func TestDeleteSiteRestartsInstanceWhenDeleteFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSite: %v", err)
 	}
-	if !reloaded.Enabled {
-		t.Fatal("site row was mutated despite the failed delete")
+	if reloaded.Enabled {
+		t.Fatal("site row must be disabled while cleanup is pending")
 	}
 	if reloaded.TrafficUsed != 15 {
 		t.Fatalf("traffic_used = %d, want 15 (the stop flush persisted pending bytes)", reloaded.TrafficUsed)
 	}
-	if !app.pm.IsRunning(site.ID) {
-		t.Fatal("the stopped instance was not restarted after the failed delete")
+	if app.pm.IsRunning(site.ID) {
+		t.Fatal("the stopped instance must remain stopped until deletion is retried")
 	}
-	app.pm.mu.RLock()
-	restarted := app.pm.proxies[site.ID]
-	app.pm.mu.RUnlock()
-	if restarted == nil || restarted == inst {
-		t.Fatal("expected a fresh instance for the surviving row")
-	}
-	if got := restarted.persistedTraffic.Load(); got != 15 {
-		t.Fatalf("restarted persistedTraffic = %d, want 15", got)
-	}
-	if in, out := restarted.bytesIn.Load(), restarted.bytesOut.Load(); in != 0 || out != 0 {
-		t.Fatalf("restarted pending counters = in:%d out:%d, want 0/0", in, out)
+	if _, ok := app.pm.PublicHostSiteID(site.PublicHost); ok {
+		t.Fatal("stale public host registration survived cleanup-pending deletion")
 	}
 }
 

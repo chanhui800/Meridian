@@ -1179,6 +1179,16 @@ func (d *DB) persistWatchHistoryInbox(event watchHistoryEvent) bool {
 	return err == nil && inserted == 1
 }
 
+func (d *DB) signalWatchHistoryInboxWake() {
+	if d == nil || d.watchHistoryInboxWake == nil {
+		return
+	}
+	select {
+	case d.watchHistoryInboxWake <- struct{}{}:
+	default:
+	}
+}
+
 // persistWatchHistoryInboxBatch makes the asynchronous writer failure path
 // durable in one transaction. Invalid events are skipped because they cannot
 // be made valid by retrying; valid events remain recoverable across restarts.
@@ -1209,15 +1219,28 @@ func (d *DB) persistWatchHistoryInboxBatch(events []watchHistoryEvent) (int, err
 			continue
 		}
 		if count+inserted >= watchHistoryInboxLimit {
+			// Commit the rows already inserted before reporting that the
+			// remaining batch could not fit. Returning a positive count without
+			// committing would make callers believe events were durable when the
+			// deferred rollback had discarded them.
+			if err := tx.Commit(); err != nil {
+				return 0, err
+			}
+			d.signalWatchHistoryInboxWake()
 			return inserted, errors.New("watch history inbox is full")
 		}
-		if _, err := tx.Exec("INSERT INTO watch_history_inbox(payload_json,created_at_ms) VALUES(?,?,?)", string(payload), createdAt); err != nil {
+		if _, err := tx.Exec(`INSERT INTO watch_history_inbox(
+			site_id,session_hash,observed_at_ms,payload_json,created_at_ms
+		) VALUES(?,?,?,?,?)`, event.SiteID, event.SessionHash, event.ObservedAtMS, string(payload), createdAt); err != nil {
 			return inserted, err
 		}
 		inserted++
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	if inserted > 0 {
+		d.signalWatchHistoryInboxWake()
 	}
 	return inserted, nil
 }
@@ -1737,6 +1760,12 @@ func (d *DB) clearWatchHistoryRows(siteID int64) error {
 	}
 	defer tx.Rollback()
 	if siteID > 0 {
+		// The inbox is a second durable event channel. Clear it in the same
+		// transaction so an event queued before this command cannot recreate
+		// history after the API reports success.
+		if _, err := tx.Exec("DELETE FROM watch_history_inbox WHERE site_id=? OR site_id=0", siteID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec("DELETE FROM tmdb_jobs WHERE media_item_id IN (SELECT id FROM media_items WHERE site_id=?)", siteID); err != nil {
 			return err
 		}
@@ -1752,6 +1781,9 @@ func (d *DB) clearWatchHistoryRows(siteID int64) error {
 			return err
 		}
 	} else {
+		if _, err := tx.Exec("DELETE FROM watch_history_inbox"); err != nil {
+			return err
+		}
 		if _, err := tx.Exec("DELETE FROM tmdb_jobs"); err != nil {
 			return err
 		}
@@ -1777,10 +1809,14 @@ func (d *DB) deleteWatchHistoryRow(historyID int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	var mediaItemID int64
-	if err := tx.QueryRow("SELECT media_item_id FROM watch_sessions WHERE id=?", historyID).Scan(&mediaItemID); errors.Is(err, sql.ErrNoRows) {
+	var mediaItemID, siteID int64
+	var sessionHash string
+	if err := tx.QueryRow("SELECT media_item_id,site_id,session_hash FROM watch_sessions WHERE id=?", historyID).Scan(&mediaItemID, &siteID, &sessionHash); errors.Is(err, sql.ErrNoRows) {
 		return sql.ErrNoRows
 	} else if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM watch_history_inbox WHERE site_id=? AND session_hash=?", siteID, sessionHash); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM watch_sessions WHERE id=?", historyID); err != nil {

@@ -92,6 +92,8 @@ func (d *DB) runDynamicObservationWriter() {
 	defer close(d.dynamicObservationDone)
 	ticker := time.NewTicker(dynamicObservationMaintenanceInterval)
 	defer ticker.Stop()
+	inboxTicker := time.NewTicker(5 * time.Second)
+	defer inboxTicker.Stop()
 
 	batch := make([]queuedDynamicObservation, 0, dynamicObservationBatchSize)
 	requestBatch := make([]queuedRequestLog, 0, requestLogBatchSize)
@@ -119,6 +121,12 @@ func (d *DB) runDynamicObservationWriter() {
 				if err := d.pruneWatchHistory(); err != nil {
 					log.Printf("[watch-history] optional retention write failed: %v", err)
 				}
+				continue
+			case <-inboxTicker.C:
+				d.drainWatchHistoryInbox(time.Now())
+				continue
+			case <-d.watchHistoryInboxWake:
+				d.drainWatchHistoryInbox(time.Now())
 				continue
 			}
 		}
@@ -271,6 +279,7 @@ func (d *DB) runDynamicObservationWriter() {
 
 		switch command.kind {
 		case dynamicObservationCommandFlush:
+			d.drainWatchHistoryInbox(time.Now())
 			command.result <- nil
 		case dynamicObservationCommandClear:
 			_, err := d.db.Exec("DELETE FROM dynamic_observations WHERE site_id=?", command.siteID)

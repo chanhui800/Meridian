@@ -39,22 +39,25 @@ type ProxyInstance struct {
 	// single-site history snapshot and the live overlay in global snapshots.
 	// Lock order is pm.mu -> trafficMu; helpers that take trafficMu (e.g.
 	// flushProxyTraffic) must never be called from code that already holds it.
-	trafficMu          sync.Mutex
-	bytesIn            atomic.Int64
-	bytesOut           atomic.Int64
-	cumulativeBytesIn  atomic.Int64
-	cumulativeBytesOut atomic.Int64
-	persistedBytesIn   atomic.Int64
-	persistedBytesOut  atomic.Int64
-	reqCount           atomic.Int64
-	pendingRequests    atomic.Int64
-	persistedTraffic   atomic.Int64
-	trafficCycleStart  time.Time
-	trafficCycleMode   string
-	trafficCycleUsage  int64
-	trustedProxies     []*net.IPNet
-	dynamicState       *dynamicSiteState
-	failoverState      *upstreamFailoverState
+	trafficMu                 sync.Mutex
+	bytesIn                   atomic.Int64
+	bytesOut                  atomic.Int64
+	cumulativeBytesIn         atomic.Int64
+	cumulativeBytesOut        atomic.Int64
+	persistedBytesIn          atomic.Int64
+	persistedBytesOut         atomic.Int64
+	reqCount                  atomic.Int64
+	pendingRequests           atomic.Int64
+	persistedTraffic          atomic.Int64
+	trafficCycleStart         time.Time
+	trafficCycleMode          string
+	trafficCycleUsage         int64
+	trafficAckedCumulativeIn  int64
+	trafficAckedCumulativeOut int64
+	trafficCycleAuthoritative bool
+	trustedProxies            []*net.IPNet
+	dynamicState              *dynamicSiteState
+	failoverState             *upstreamFailoverState
 }
 
 type ProxyManager struct {

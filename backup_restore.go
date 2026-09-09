@@ -1535,6 +1535,67 @@ func reencryptRestoredSecrets(path string, oldJWT, oldHeaderKey, newJWT, newHead
 			}
 		}
 	}
+	// Durable inbox rows can outlive the process that captured them. Their
+	// serialized watch-history events may contain Emby tokens encrypted with the
+	// source controller's JWT secret, so migrate them alongside watch_sessions.
+	if hasInboxPayload, err := backupSQLiteColumnExists(tx, "watch_history_inbox", "payload_json"); err != nil {
+		return err
+	} else if hasInboxPayload {
+		rows, err := tx.Query("SELECT id,payload_json FROM watch_history_inbox WHERE payload_json<>''")
+		if err != nil {
+			return err
+		}
+		type inboxTokenUpdate struct {
+			id      int64
+			payload string
+		}
+		updates := make([]inboxTokenUpdate, 0)
+		for rows.Next() {
+			var id int64
+			var payload string
+			if err := rows.Scan(&id, &payload); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			var event watchHistoryEvent
+			if err := json.Unmarshal([]byte(payload), &event); err != nil {
+				// The inbox drain path already treats malformed payloads as
+				// discardable; do not make an otherwise valid backup unrecoverable.
+				continue
+			}
+			if event.TokenCiphertext == "" {
+				continue
+			}
+			if _, currentErr := decryptWatchHistoryTokenWithSecret(event.TokenCiphertext, newJWT); currentErr == nil {
+				continue
+			}
+			token, oldErr := decryptWatchHistoryTokenWithSecret(event.TokenCiphertext, oldJWT)
+			if oldErr != nil {
+				_ = rows.Close()
+				return fmt.Errorf("无法解密观看历史收件箱 Token: %w", oldErr)
+			}
+			migrated, err := encryptWatchHistoryTokenWithSecret(token, newJWT)
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("无法迁移观看历史收件箱 Token: %w", err)
+			}
+			event.TokenCiphertext = migrated
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				_ = rows.Close()
+				return err
+			}
+			updates = append(updates, inboxTokenUpdate{id: id, payload: string(encoded)})
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, item := range updates {
+			if _, err := tx.Exec("UPDATE watch_history_inbox SET payload_json=? WHERE id=?", item.payload, item.id); err != nil {
+				return err
+			}
+		}
+	}
 	return tx.Commit()
 }
 
