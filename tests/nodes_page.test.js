@@ -25,6 +25,12 @@ test('node page surfaces Agent configuration apply errors before generic waiting
   assert.match(page, /等待 Agent 应用站点配置/);
 });
 
+test('node cards display the reported Agent version', () => {
+  assert.match(page, /node\.agent_version \|\| '未上报'/);
+  assert.match(page, /class="node-agent-version"/);
+  assert.match(style, /\.node-agent-version\s*\{/);
+});
+
 test('site scheduling distinguishes normal config wait from errors and overdue waits', () => {
   const sandbox = { Date, Number, String, Math, Map, console };
   vm.createContext(sandbox);

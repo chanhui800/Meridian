@@ -73,7 +73,7 @@ function renderNodeCards() {
       <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(node.address || '未填写地址')} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
       <div class="node-stats"><span><b>${usage}</b><small>${esc(node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费')}</small></span><span><b>${esc(reset)}</b><small>独立流量周期</small></span><span><b>${node.priority}</b><small>优先级${node.active ? ' · 当前选中' : ''}</small></span></div>
-      <div class="node-entry-state"><span>${esc(entry)}</span><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div>
+      <div class="node-entry-state"><div class="node-entry-details"><span>${esc(entry)}</span><small class="node-agent-version">Agent ${esc(node.agent_version || '未上报')}</small></div><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div>
       <div class="node-actions"><button type="button" data-action="edit" data-id="${node.id}">编辑</button><button type="button" data-action="enroll" data-id="${node.id}">重新生成脚本</button><button type="button" class="is-danger" data-action="delete" data-id="${node.id}">删除</button></div>
     </article>`;
   }).join('');
