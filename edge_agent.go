@@ -471,6 +471,10 @@ type edgeProxyBundle struct {
 	manager    *ProxyManager
 	handler    http.Handler
 	localSites map[int64]edgeSiteIdentity
+	// centralSites is keyed by the stable Controller SiteID. localSites is
+	// intentionally keyed by the ephemeral in-memory SQLite ID and must never
+	// be used for lifecycle checks against Controller IDs.
+	centralSites map[int64]struct{}
 }
 
 func (b *edgeProxyBundle) close() {
@@ -514,6 +518,10 @@ type edgeAgentRuntime struct {
 	appliedHash          string
 	appliedRevision      int64
 	siteCounterEpoch     uint64
+	siteCounterEpochs    map[int64]uint64
+	siteStatsCursor      int64
+	mediaCursor          int64
+	retentionCursor      int64
 	cacheClearGeneration int64
 	listenerError        string
 	applyError           string
@@ -538,8 +546,8 @@ type edgeAgentRuntime struct {
 }
 
 // beginBundleDrain rejects new work on an old generation but gives streams
-// admitted before a hot apply an unbounded lifetime. Runtime shutdown/revoke
-// cancels this context and therefore remains an immediate security boundary.
+// admitted before a hot apply time to finish. Runtime shutdown/revoke cancels
+// this context and therefore remains an immediate security boundary.
 func (runtime *edgeAgentRuntime) beginBundleDrain(bundle *edgeProxyBundle) {
 	if runtime == nil || bundle == nil {
 		return
@@ -552,14 +560,65 @@ func (runtime *edgeAgentRuntime) beginBundleDrain(bundle *edgeProxyBundle) {
 		runtime.drainingBundles = make(map[*edgeProxyBundle]struct{})
 	}
 	runtime.drainingBundles[bundle] = struct{}{}
-	ctx := runtime.drainContext
+	parent := runtime.drainContext
 	runtime.mu.Unlock()
+	// Normal drains finish when admitted handlers and final counters are
+	// acknowledged. Keep an emergency bound so a wedged handler cannot pin a
+	// complete old generation forever or outlive the Controller drain window.
+	ctx, cancel := context.WithTimeout(parent, siteNodeDrainWindow)
 	go func() {
+		defer cancel()
 		bundle.drain(ctx)
 		runtime.mu.Lock()
 		delete(runtime.drainingBundles, bundle)
 		runtime.mu.Unlock()
 	}()
+}
+
+// forceStopCentralSites applies an explicit revocation to the current bundle
+// and every generation that is still draining. A route can be absent from the
+// current config while an older generation continues to own live streams.
+func (runtime *edgeAgentRuntime) forceStopCentralSites(ctx context.Context, siteIDs []int64, extraBundles ...*edgeProxyBundle) {
+	if runtime == nil || len(siteIDs) == 0 {
+		return
+	}
+	wanted := make(map[int64]struct{}, len(siteIDs))
+	for _, siteID := range siteIDs {
+		if siteID > 0 {
+			wanted[siteID] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return
+	}
+	runtime.mu.RLock()
+	bundles := make(map[*edgeProxyBundle]struct{}, len(runtime.drainingBundles)+1)
+	if runtime.bundle != nil {
+		bundles[runtime.bundle] = struct{}{}
+	}
+	for bundle := range runtime.drainingBundles {
+		bundles[bundle] = struct{}{}
+	}
+	for _, bundle := range extraBundles {
+		if bundle != nil {
+			bundles[bundle] = struct{}{}
+		}
+	}
+	runtime.mu.RUnlock()
+	for bundle := range bundles {
+		if bundle == nil || bundle.manager == nil {
+			continue
+		}
+		localIDs := make(map[int64]struct{})
+		for localID, identity := range bundle.localSites {
+			if _, ok := wanted[identity.centralID]; ok {
+				localIDs[localID] = struct{}{}
+			}
+		}
+		if len(localIDs) > 0 {
+			bundle.manager.ForceStopSites(ctx, localIDs)
+		}
+	}
 }
 
 type edgeAgentRuntimeState struct {
@@ -595,7 +654,15 @@ func (runtime *edgeAgentRuntime) trafficCounterFor(siteID int64, hosts ...string
 	if counter := runtime.trafficCounters[siteID]; counter != nil {
 		return counter
 	}
-	counter := &edgeSiteTrafficCounter{}
+	if runtime.siteCounterEpochs == nil {
+		runtime.siteCounterEpochs = make(map[int64]uint64)
+	}
+	epoch := runtime.siteCounterEpochs[siteID] + 1
+	if epoch == 0 {
+		epoch = 1
+	}
+	runtime.siteCounterEpochs[siteID] = epoch
+	counter := &edgeSiteTrafficCounter{epoch: epoch}
 	runtime.trafficCounters[siteID] = counter
 	return counter
 }
@@ -693,9 +760,11 @@ func (runtime *edgeAgentRuntime) recordTelemetry(event edgeTelemetryEvent) {
 }
 
 type edgeTelemetryPending struct {
-	media        []NodeMediaCount
-	retention    []NodeRetentionStatus
-	observations []NodeDynamicObservation
+	media          []NodeMediaCount
+	retention      []NodeRetentionStatus
+	observations   []NodeDynamicObservation
+	mediaOrder     []int64
+	retentionOrder []int64
 }
 
 func (runtime *edgeAgentRuntime) prepareTelemetry() edgeTelemetryPending {
@@ -705,11 +774,29 @@ func (runtime *edgeAgentRuntime) prepareTelemetry() edgeTelemetryPending {
 	runtime.telemetryMu.Lock()
 	defer runtime.telemetryMu.Unlock()
 	pending := edgeTelemetryPending{}
-	for _, value := range runtime.mediaCounts {
-		pending.media = append(pending.media, value)
+	mediaIDs := make([]int64, 0, len(runtime.mediaCounts))
+	for siteID := range runtime.mediaCounts {
+		mediaIDs = append(mediaIDs, siteID)
 	}
-	for _, value := range runtime.retention {
-		pending.retention = append(pending.retention, value)
+	sort.Slice(mediaIDs, func(i, j int) bool { return mediaIDs[i] < mediaIDs[j] })
+	mediaStart := telemetryCursorStart(mediaIDs, runtime.mediaCursor)
+	for offset := 0; offset < len(mediaIDs) && len(pending.media) < maxNodeTelemetryItemsPerReport; offset++ {
+		index := (mediaStart + offset) % len(mediaIDs)
+		siteID := mediaIDs[index]
+		pending.mediaOrder = append(pending.mediaOrder, siteID)
+		pending.media = append(pending.media, runtime.mediaCounts[siteID])
+	}
+	retentionIDs := make([]int64, 0, len(runtime.retention))
+	for siteID := range runtime.retention {
+		retentionIDs = append(retentionIDs, siteID)
+	}
+	sort.Slice(retentionIDs, func(i, j int) bool { return retentionIDs[i] < retentionIDs[j] })
+	retentionStart := telemetryCursorStart(retentionIDs, runtime.retentionCursor)
+	for offset := 0; offset < len(retentionIDs) && len(pending.retention) < maxNodeTelemetryItemsPerReport; offset++ {
+		index := (retentionStart + offset) % len(retentionIDs)
+		siteID := retentionIDs[index]
+		pending.retentionOrder = append(pending.retentionOrder, siteID)
+		pending.retention = append(pending.retention, runtime.retention[siteID])
 	}
 	end := len(runtime.observations)
 	if end > maxNodeTelemetryItemsPerReport {
@@ -717,6 +804,18 @@ func (runtime *edgeAgentRuntime) prepareTelemetry() edgeTelemetryPending {
 	}
 	pending.observations = append([]NodeDynamicObservation(nil), runtime.observations[:end]...)
 	return pending
+}
+
+func telemetryCursorStart(ids []int64, cursor int64) int {
+	if len(ids) == 0 || cursor <= 0 {
+		return 0
+	}
+	for index, siteID := range ids {
+		if siteID >= cursor {
+			return index
+		}
+	}
+	return 0
 }
 
 func acknowledgedSiteIDs(accepted, discarded []int64) map[int64]bool {
@@ -742,6 +841,21 @@ func (runtime *edgeAgentRuntime) commitTelemetryWithACK(pending edgeTelemetryPen
 	}
 	runtime.telemetryMu.Lock()
 	defer runtime.telemetryMu.Unlock()
+	advanceCursor := func(order []int64, acknowledged map[int64]bool) int64 {
+		var next int64
+		for _, siteID := range order {
+			if acknowledged[siteID] {
+				next = siteID + 1
+			}
+		}
+		return next
+	}
+	if next := advanceCursor(pending.mediaOrder, mediaACK); next > 0 {
+		runtime.mediaCursor = next
+	}
+	if next := advanceCursor(pending.retentionOrder, retentionACK); next > 0 {
+		runtime.retentionCursor = next
+	}
 	for _, sent := range pending.media {
 		if mediaACK[sent.SiteID] {
 			if current, ok := runtime.mediaCounts[sent.SiteID]; ok && current == sent {
@@ -794,9 +908,11 @@ func (runtime *edgeAgentRuntime) telemetrySnapshot() (media []NodeMediaCount, re
 }
 
 type edgeSiteStatsPending struct {
-	stats   []NodeSiteStat
-	current map[int64]ProxyRuntimeStat
-	final   map[int64]bool
+	stats      []NodeSiteStat
+	current    map[int64]ProxyRuntimeStat
+	final      map[int64]bool
+	order      []int64
+	nextCursor int64
 }
 
 func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
@@ -806,6 +922,7 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 	}
 	runtime.mu.RLock()
 	bundle := runtime.bundle
+	statsCursor := runtime.siteStatsCursor
 	previous := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
 	for siteID, value := range runtime.siteReported {
 		previous[siteID] = value
@@ -843,7 +960,9 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		centralIDs = append(centralIDs, centralID)
 	}
 	sort.Slice(centralIDs, func(i, j int) bool { return centralIDs[i] < centralIDs[j] })
-	for _, centralID := range centralIDs {
+	start := telemetryCursorStart(centralIDs, statsCursor)
+	for offset := 0; offset < len(centralIDs); offset++ {
+		centralID := centralIDs[(start+offset)%len(centralIDs)]
 		counter := counters[centralID]
 		if len(pending.stats) >= maxNodeSiteStatsPerReport {
 			break
@@ -879,10 +998,11 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		// A removed route is final only after all requests admitted by the old
 		// bundle have finished. The Controller uses this marker to retire the
 		// corresponding drain generation and ACK the counter before GC.
-		if bundle != nil && bundle.localSites != nil {
-			_, stillRouted := bundle.localSites[centralID]
-			observed.Final = !stillRouted && counter.pendingRequest.Load() == 0
+		if bundle != nil && bundle.centralSites != nil {
+			_, stillRouted := bundle.centralSites[centralID]
+			observed.Final = !stillRouted && counter.activeRequests.Load() == 0
 		}
+		observed.CounterEpoch = counter.epoch
 		if observed.Final {
 			pending.final[centralID] = true
 		}
@@ -891,6 +1011,10 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 			observed.CacheSizeValid = true
 		}
 		pending.stats = append(pending.stats, observed)
+		pending.order = append(pending.order, centralID)
+	}
+	if len(pending.order) > 0 {
+		pending.nextCursor = pending.order[len(pending.order)-1] + 1
 	}
 	return pending
 }
@@ -904,6 +1028,11 @@ func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPen
 		runtime.siteReported = make(map[int64]ProxyRuntimeStat)
 	}
 	deltas := make(map[int64]ProxyRuntimeStat, len(pending.current))
+	for index, siteID := range pending.order {
+		if acknowledged[siteID] {
+			runtime.siteStatsCursor = pending.order[index] + 1
+		}
+	}
 	for siteID, sent := range pending.current {
 		if !acknowledged[siteID] {
 			continue
@@ -982,11 +1111,11 @@ func (runtime *edgeAgentRuntime) gcRetiredTrafficCounters(finalAcked map[int64]b
 		if !finalAcked[siteID] {
 			continue
 		}
-		if counter == nil || counter.pendingRequest.Load() != 0 {
+		if counter == nil || counter.activeRequests.Load() != 0 {
 			continue
 		}
 		if runtime.bundle != nil {
-			if _, ok := runtime.bundle.localSites[siteID]; ok {
+			if _, ok := runtime.bundle.centralSites[siteID]; ok {
 				continue
 			}
 		}
@@ -1232,7 +1361,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		return nil, err
 	}
 	database.edgeEphemeral = true
-	bundle := &edgeProxyBundle{database: database, localSites: make(map[int64]edgeSiteIdentity)}
+	bundle := &edgeProxyBundle{database: database, localSites: make(map[int64]edgeSiteIdentity), centralSites: make(map[int64]struct{})}
 	database.edgeTelemetrySink = func(event edgeTelemetryEvent) {
 		mapped, ok := edgeTelemetryEventSiteID(event, bundle.localSites)
 		if !ok {
@@ -1309,6 +1438,9 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		siteIDs[site.PublicHost] = route.SiteID
 		localSites[created.ID] = edgeSiteIdentity{centralID: route.SiteID, host: site.PublicHost}
 		bundle.localSites[created.ID] = localSites[created.ID]
+		if route.SiteID > 0 {
+			bundle.centralSites[route.SiteID] = struct{}{}
+		}
 		runtimeSites[site.PublicHost] = *created
 	}
 	database.edgeRequestLogSink = func(event requestLogEvent) {
@@ -1584,22 +1716,12 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
+	if len(config.ForceStopSiteIDs) > 0 {
+		forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		runtime.forceStopCentralSites(forceCtx, config.ForceStopSiteIDs, oldState.bundle)
+		forceCancel()
+	}
 	if oldState.bundle != nil {
-		if len(config.ForceStopSiteIDs) > 0 {
-			forced := make(map[int64]struct{}, len(config.ForceStopSiteIDs))
-			for _, centralID := range config.ForceStopSiteIDs {
-				for localID, identity := range oldState.bundle.localSites {
-					if identity.centralID == centralID {
-						forced[localID] = struct{}{}
-					}
-				}
-			}
-			if len(forced) > 0 {
-				forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				oldState.bundle.manager.ForceStopSites(forceCtx, forced)
-				forceCancel()
-			}
-		}
 		// Hot config changes are not a security revocation. Existing playback and
 		// WebSocket streams finish naturally; close() cancels them on shutdown.
 		runtime.beginBundleDrain(oldState.bundle)
@@ -2043,6 +2165,40 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
 }
 
+// edgeReportEventsByBudget takes both the protocol item limit and the encoded
+// JSON budget into account. Without the byte budget a queue containing large
+// metadata responses can exceed the Controller limit forever: the same head
+// events are retried on every heartbeat and no ACK is ever possible.
+func edgeReportEventsByBudget(report NodeReport, events []NodeRequestEvent) []NodeRequestEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	if len(events) > maxNodeRequestEventsPerReport {
+		events = events[:maxNodeRequestEventsPerReport]
+	}
+	selected := make([]NodeRequestEvent, 0, len(events))
+	for _, event := range events {
+		candidate := append(append([]NodeRequestEvent(nil), selected...), event)
+		report.Events = candidate
+		encoded, err := json.Marshal(report)
+		if err != nil {
+			break
+		}
+		if len(encoded) > targetAgentReportBytes {
+			// A single event is bounded well below the report limit. If the
+			// non-event payload itself ever grows beyond the target, retain no
+			// event in this report so the queue can still make progress after
+			// the base payload is reduced by a later protocol change.
+			if len(selected) == 0 {
+				return nil
+			}
+			break
+		}
+		selected = candidate
+	}
+	return selected
+}
+
 func edgeExecutableDigest() (string, string, error) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -2358,7 +2514,7 @@ func runEdgeAgent() error {
 			pendingTelemetry := runtime.prepareTelemetry()
 			report.SiteStats = pendingStats.stats
 			report.MediaCounts, report.Retention, report.Observations = pendingTelemetry.media, pendingTelemetry.retention, pendingTelemetry.observations
-			report.Events = runtime.events.snapshot()
+			report.Events = edgeReportEventsByBudget(report, runtime.events.snapshot())
 			ack, wsErr := wsReporter.report(ctx, report)
 			if wsErr != nil {
 				wsErr = edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/report", state.Token, report, &ack)

@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 42
+	databaseSchemaVersion = 43
 )
 
 func (d *DB) migrate() error {
@@ -476,7 +476,10 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE TABLE IF NOT EXISTS agent_route_revocations (
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
-		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		-- Deliberately no sites foreign key: a revocation is a durable
+		-- force-stop tombstone and must survive the site row being deleted.
+		site_id INTEGER NOT NULL,
+		public_host TEXT NOT NULL DEFAULT '',
 		created_at_ms INTEGER NOT NULL,
 		PRIMARY KEY(node_id,site_id)
 	) WITHOUT ROWID;
@@ -844,6 +847,9 @@ func (d *DB) migrateOnce() error {
 		return err
 	}
 	if err := ensureSiteNodeDrainsSchema(ctx, conn); err != nil {
+		return err
+	}
+	if err := ensureAgentRouteRevocationsSchema(ctx, conn); err != nil {
 		return err
 	}
 	var eventUIDColumnCount int
@@ -1224,6 +1230,83 @@ func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
 		CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
 	`); err != nil {
 		return fmt.Errorf("migrate site node drain ledger: %w", err)
+	}
+	return nil
+}
+
+// ensureAgentRouteRevocationsSchema keeps force-stop tombstones independent
+// from the sites table. Deleting a site must not cascade away the marker before
+// the next Agent config fetch can stop an old generation.
+func ensureAgentRouteRevocationsSchema(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, "PRAGMA table_info('agent_route_revocations')")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !columns["node_id"] || !columns["site_id"] {
+		return errors.New("agent_route_revocations table has an invalid schema")
+	}
+	if !columns["public_host"] {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE agent_route_revocations ADD COLUMN public_host TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	// Existing releases declared a sites foreign key. Rebuild the table when
+	// that legacy definition is present; SQLite has no ALTER TABLE DROP FK.
+	fkRows, err := conn.QueryContext(ctx, "PRAGMA foreign_key_list('agent_route_revocations')")
+	if err != nil {
+		return err
+	}
+	hasSitesFK := false
+	for fkRows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := fkRows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			fkRows.Close()
+			return err
+		}
+		if strings.EqualFold(table, "sites") {
+			hasSitesFK = true
+		}
+	}
+	if err := fkRows.Err(); err != nil {
+		fkRows.Close()
+		return err
+	}
+	if err := fkRows.Close(); err != nil {
+		return err
+	}
+	if !hasSitesFK {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, `
+		CREATE TABLE agent_route_revocations_new (
+			node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+			site_id INTEGER NOT NULL,
+			public_host TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(node_id,site_id)
+		) WITHOUT ROWID;
+		INSERT OR REPLACE INTO agent_route_revocations_new(node_id,site_id,public_host,created_at_ms)
+			SELECT r.node_id,r.site_id,LOWER(TRIM(COALESCE(r.public_host,s.public_host,''))),r.created_at_ms
+			FROM agent_route_revocations r LEFT JOIN sites s ON s.id=r.site_id;
+		DROP TABLE agent_route_revocations;
+		ALTER TABLE agent_route_revocations_new RENAME TO agent_route_revocations;
+	`); err != nil {
+		return fmt.Errorf("migrate agent route revocations: %w", err)
 	}
 	return nil
 }

@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -93,6 +95,19 @@ func TestEdgeTrafficCounterSurvivesHotApply(t *testing.T) {
 	}
 }
 
+func TestEdgeTrafficCounterEpochAdvancesAfterRetirement(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	first := runtime.trafficCounterFor(42, "epoch.example.test")
+	if first.epoch != 1 {
+		t.Fatalf("first counter epoch=%d, want 1", first.epoch)
+	}
+	runtime.trafficCounters = make(map[int64]*edgeSiteTrafficCounter)
+	second := runtime.trafficCounterFor(42, "epoch.example.test")
+	if second.epoch != 2 {
+		t.Fatalf("recreated counter epoch=%d, want 2", second.epoch)
+	}
+}
+
 func TestEdgeSiteStatsRetainRemovedRouteUntilControllerAcknowledgesIt(t *testing.T) {
 	runtime := &edgeAgentRuntime{}
 	counter := runtime.trafficCounterFor(42, "tail.example.test")
@@ -113,6 +128,85 @@ func TestEdgeSiteStatsRetainRemovedRouteUntilControllerAcknowledgesIt(t *testing
 	}
 }
 
+func TestEdgeSiteStatsUseStableControllerSiteIndex(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	counter := runtime.trafficCounterFor(42, "stable.example.test")
+	bundle := &edgeProxyBundle{
+		localSites:   map[int64]edgeSiteIdentity{1: {centralID: 42}},
+		centralSites: map[int64]struct{}{42: {}},
+	}
+	runtime.bundle = bundle
+	pending := runtime.prepareSiteStats()
+	if len(pending.stats) != 1 || pending.stats[0].Final {
+		t.Fatalf("current route with local ID 1 and controller ID 42 was marked final: %#v", pending.stats)
+	}
+	counter.cumulativeOut.Store(1)
+	runtime.siteReported = map[int64]ProxyRuntimeStat{42: {SiteID: 42, CumulativeBytesOut: 1}}
+	runtime.commitSiteStatsWithACK(pending, map[int64]bool{42: true})
+	if _, ok := runtime.trafficCounters[42]; !ok {
+		t.Fatal("active route counter was garbage-collected")
+	}
+}
+
+func TestEdgeSiteStatsWaitForActiveRequestsBeforeFinal(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	counter := runtime.trafficCounterFor(42, "draining.example.test")
+	counter.activeRequests.Add(1)
+	runtime.bundle = &edgeProxyBundle{centralSites: map[int64]struct{}{}}
+	pending := runtime.prepareSiteStats()
+	if len(pending.stats) != 1 || pending.stats[0].Final {
+		t.Fatal("active request was ignored when deciding final site stats")
+	}
+	counter.activeRequests.Add(-1)
+	pending = runtime.prepareSiteStats()
+	if len(pending.stats) != 1 || !pending.stats[0].Final {
+		t.Fatal("site was not marked final after the active request ended")
+	}
+}
+
+func TestEdgeSiteStatsRoundRobinPaging(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	bundle := &edgeProxyBundle{centralSites: make(map[int64]struct{})}
+	for siteID := int64(1); siteID <= 600; siteID++ {
+		runtime.trafficCounterFor(siteID, fmt.Sprintf("site-%d.example.test", siteID))
+		bundle.centralSites[siteID] = struct{}{}
+	}
+	runtime.bundle = bundle
+	first := runtime.prepareSiteStats()
+	if len(first.stats) != maxNodeSiteStatsPerReport || first.stats[0].SiteID != 1 {
+		t.Fatalf("first site stats page=%d first=%d", len(first.stats), first.stats[0].SiteID)
+	}
+	ack := make(map[int64]bool, len(first.current))
+	for siteID := range first.current {
+		ack[siteID] = true
+	}
+	runtime.commitSiteStatsWithACK(first, ack)
+	second := runtime.prepareSiteStats()
+	if len(second.stats) == 0 || second.stats[0].SiteID != 513 {
+		t.Fatalf("second site stats page first=%d, want 513", second.stats[0].SiteID)
+	}
+}
+
+func TestEdgeReportEventsRespectEncodedByteBudget(t *testing.T) {
+	base := NodeReport{BootID: "boot", ReportSessionID: "session", CounterEpoch: "epoch", Sequence: 1, InterfaceName: "eth0"}
+	events := make([]NodeRequestEvent, 40)
+	for index := range events {
+		events[index] = NodeRequestEvent{EventID: int64(index + 1), SiteID: 1, Host: "site.example.test", Method: "GET", Path: "/Items", StatusCode: 200, ResponseBody: strings.Repeat("x", 60<<10), RecordedAtMS: 1}
+	}
+	selected := edgeReportEventsByBudget(base, events)
+	if len(selected) == 0 || len(selected) >= len(events) {
+		t.Fatalf("byte budget did not page large events: selected=%d total=%d", len(selected), len(events))
+	}
+	base.Events = selected
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > targetAgentReportBytes {
+		t.Fatalf("encoded event page=%d exceeds target=%d", len(encoded), targetAgentReportBytes)
+	}
+}
+
 func TestEdgeTelemetryNeedsCategoryAcknowledgement(t *testing.T) {
 	runtime := &edgeAgentRuntime{mediaCounts: map[int64]NodeMediaCount{7: {SiteID: 7, MovieCount: 1, ObservedAtMS: 1}}}
 	pending := runtime.prepareTelemetry()
@@ -123,6 +217,31 @@ func TestEdgeTelemetryNeedsCategoryAcknowledgement(t *testing.T) {
 	runtime.commitTelemetryWithACK(pending, map[int64]bool{7: true}, nil, nil)
 	if _, ok := runtime.mediaCounts[7]; ok {
 		t.Fatal("acknowledged telemetry remained pending")
+	}
+}
+
+func TestEdgeTelemetryRoundRobinPaging(t *testing.T) {
+	runtime := &edgeAgentRuntime{mediaCounts: make(map[int64]NodeMediaCount), retention: make(map[int64]NodeRetentionStatus)}
+	for siteID := int64(1); siteID <= 256; siteID++ {
+		runtime.mediaCounts[siteID] = NodeMediaCount{SiteID: siteID, MovieCount: 1, ObservedAtMS: siteID}
+		runtime.retention[siteID] = NodeRetentionStatus{SiteID: siteID, ExpectedStartedAtMS: 1, CompletedAtMS: siteID, Done: true}
+	}
+	first := runtime.prepareTelemetry()
+	if len(first.media) != maxNodeTelemetryItemsPerReport || len(first.retention) != maxNodeTelemetryItemsPerReport {
+		t.Fatalf("first telemetry page sizes media=%d retention=%d", len(first.media), len(first.retention))
+	}
+	mediaACK := make(map[int64]bool, len(first.media))
+	retentionACK := make(map[int64]bool, len(first.retention))
+	for _, value := range first.media {
+		mediaACK[value.SiteID] = true
+	}
+	for _, value := range first.retention {
+		retentionACK[value.SiteID] = true
+	}
+	runtime.commitTelemetryWithACK(first, mediaACK, retentionACK, nil)
+	second := runtime.prepareTelemetry()
+	if len(second.media) == 0 || second.media[0].SiteID != 129 || len(second.retention) == 0 || second.retention[0].SiteID != 129 {
+		t.Fatalf("second telemetry page did not advance cursor: media=%d retention=%d", second.media[0].SiteID, second.retention[0].SiteID)
 	}
 }
 

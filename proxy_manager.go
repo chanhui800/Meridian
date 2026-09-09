@@ -76,6 +76,11 @@ type edgeSiteTrafficCounter struct {
 	cumulativeOut  atomic.Int64
 	requests       atomic.Int64
 	pendingRequest atomic.Int64
+	// activeRequests tracks handlers admitted to this site generation. It is
+	// deliberately separate from pendingRequest, which counts traffic waiting
+	// for persistence and may remain non-zero after a request has completed.
+	activeRequests atomic.Int64
+	epoch          uint64
 }
 
 func (inst *ProxyInstance) trafficBytesIn() *atomic.Int64 {
@@ -202,10 +207,16 @@ func (inst *ProxyInstance) beginRequest() bool {
 		return false
 	}
 	inst.activeRequests.Add(1)
+	if inst.trafficCounter != nil {
+		inst.trafficCounter.activeRequests.Add(1)
+	}
 	return true
 }
 
 func (inst *ProxyInstance) endRequest() {
+	if inst.trafficCounter != nil {
+		inst.trafficCounter.activeRequests.Add(-1)
+	}
 	inst.activeRequests.Done()
 }
 
@@ -221,6 +232,9 @@ func (inst *ProxyInstance) beginHTTPRequest(w http.ResponseWriter) (*http.Respon
 	}
 	inst.activeHTTP[controller] = struct{}{}
 	inst.activeRequests.Add(1)
+	if inst.trafficCounter != nil {
+		inst.trafficCounter.activeRequests.Add(1)
+	}
 	return controller, true
 }
 
@@ -228,6 +242,9 @@ func (inst *ProxyInstance) endHTTPRequest(controller *http.ResponseController) {
 	inst.lifecycleMu.Lock()
 	delete(inst.activeHTTP, controller)
 	inst.lifecycleMu.Unlock()
+	if inst.trafficCounter != nil {
+		inst.trafficCounter.activeRequests.Add(-1)
+	}
 	inst.activeRequests.Done()
 }
 
