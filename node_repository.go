@@ -597,10 +597,9 @@ func nullableNodeID(id int64) interface{} {
 	return id
 }
 
-// markAgentConfigsDirtyTx invalidates runtime snapshots for enrolled Agents.
-// Site and scheduler edits can change the route set of whichever node is
-// currently selected, so keeping a single durable dirty bit per node is safer
-// than relying on the next 60-second poll to discover the change.
+// markAgentConfigsDirtyTx invalidates runtime snapshots for every enrolled
+// Agent. Enrollment and scheduling eligibility are separate concerns: a
+// disabled Agent may still need a route-removal or force-stop command.
 func markAgentConfigsDirtyTx(tx *sql.Tx) error {
 	if tx == nil {
 		return errors.New("nil database transaction")
@@ -611,7 +610,7 @@ func markAgentConfigsDirtyTx(tx *sql.Tx) error {
 		desired_config_revision=0,
 		config_dirty=1,
 		updated_at_ms=?
-		WHERE enabled=1 AND agent_token_hash<>''`, time.Now().UnixMilli())
+		WHERE agent_token_hash<>''`, time.Now().UnixMilli())
 	return err
 }
 
@@ -644,7 +643,7 @@ func markAgentConfigsDirtyForNodeIDsTx(tx *sql.Tx, nodeIDs ...int64) error {
 		desired_config_revision=0,
 		config_dirty=1,
 		updated_at_ms=?
-		WHERE enabled=1 AND agent_token_hash<>'' AND id IN (`+strings.Join(placeholders, ",")+")", args...)
+		WHERE agent_token_hash<>'' AND id IN (`+strings.Join(placeholders, ",")+")", args...)
 	return err
 }
 
@@ -1125,12 +1124,14 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 	if err := revocationRows.Close(); err != nil {
 		return nil, err
 	}
-	// Public-host renames do not create DNS drain rows. Keep old hosts as
-	// bounded aliases so events buffered by an Agent remain valid for the same
-	// site without widening authorization to another site.
+	// Public-host renames do not create DNS drain rows. Keep old hosts pending
+	// until the replacement config is acknowledged, then retain them only for
+	// the bounded finalization window so offline Agents do not lose buffered
+	// events without widening authorization to another site.
 	aliasRows, err := tx.Query(`SELECT site_id, LOWER(TRIM(public_host))
 		FROM site_node_host_aliases
-		WHERE node_id=? AND expires_at_ms>?`, nodeID, nowMS)
+		WHERE node_id=?
+		  AND (acked_at_ms<=0 OR finalization_expires_at_ms<=0 OR finalization_expires_at_ms>?)`, nodeID, nowMS)
 	if err != nil {
 		return nil, err
 	}
@@ -1685,6 +1686,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 				WHERE node_id=? AND acked_at_ms<=0`, ackMS, finalizeMS, id); err != nil {
 				return nodeReportCommitResult{}, err
 			}
+		}
+		if _, err := tx.Exec(`UPDATE site_node_host_aliases SET acked_at_ms=?,finalization_expires_at_ms=?
+			WHERE node_id=? AND acked_at_ms<=0`, ackMS, finalizeMS, id); err != nil {
+			return nodeReportCommitResult{}, err
 		}
 	}
 

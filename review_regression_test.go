@@ -775,6 +775,165 @@ func TestReviewDisablingSiteDirtiesCurrentAndDrainNodes(t *testing.T) {
 	}
 }
 
+func TestReviewDisabledNodeForceStopInvalidation(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "disabled-force-stop", Address: "203.0.113.242", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET enabled=0,config_revision=7,config_dirty=0 WHERE id=?`, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := markAgentConfigsDirtyForNodeIDsTx(tx, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var revision, dirty int64
+	if err := app.db.db.QueryRow(`SELECT config_revision,config_dirty FROM control_nodes WHERE id=?`, node.ID).Scan(&revision, &dirty); err != nil {
+		t.Fatal(err)
+	}
+	if revision != 8 || dirty != 1 {
+		t.Fatalf("disabled enrolled Agent was not invalidated: revision=%d dirty=%d", revision, dirty)
+	}
+}
+
+func TestReviewLegacyDisabledNodeForceStopFallback(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "legacy-disabled-force-stop", Address: "203.0.113.243", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "legacy-disabled-site", PublicHost: "legacy-disabled.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := now.Add(-legacyForceStopGrace - time.Second).UnixMilli()
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET enabled=0,agent_version=? WHERE id=?`, "v1.9.64", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`INSERT INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms) VALUES(?,?,?,?)`, node.ID, site.ID, site.PublicHost, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.revokeLegacyAgentsWithPendingForceStops(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.nodeByAgentToken(token, now); !errors.Is(err, errInvalidAgentToken) {
+		t.Fatalf("disabled legacy Agent credential remained valid after fallback: %v", err)
+	}
+}
+
+func TestReviewDrainLifecycleResetsOnABABTransition(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "drain-reused", Address: "203.0.113.244", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "drain-reused-site", PublicHost: "drain-reused.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := now.Add(-23 * time.Hour)
+	if _, err := app.db.db.Exec(`INSERT INTO site_node_drains(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms) VALUES(?,?,?,?,?,?,?)`, site.ID, node.ID, site.PublicHost, ack.Add(siteNodeDrainWindow).UnixMilli(), now.Add(-24*time.Hour).UnixMilli(), ack.UnixMilli(), ack.Add(siteNodeDrainWindow).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertSiteNodeDrainTx(tx, site.ID, node.ID, site.PublicHost, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var gotAck, gotFinal int64
+	if err := app.db.db.QueryRow(`SELECT acked_at_ms,finalization_expires_at_ms FROM site_node_drains WHERE site_id=? AND node_id=?`, site.ID, node.ID).Scan(&gotAck, &gotFinal); err != nil {
+		t.Fatal(err)
+	}
+	if gotAck != 0 || gotFinal != 0 {
+		t.Fatalf("reused drain inherited prior lifecycle: ack=%d final=%d", gotAck, gotFinal)
+	}
+}
+
+func TestReviewHostAliasLifecycleStartsOnConfigAck(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "host-alias-lifecycle", Address: "203.0.113.245", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "host-alias-site", PublicHost: "new-host.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,config_hash=? WHERE site_id=?`, node.ID, node.ID, "alias-config", site.ID); err != nil {
+		t.Fatal(err)
+	}
+	oldHost := "old-host.example.test"
+	if _, err := app.db.db.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms) VALUES(?,?,?,?,?,?,?)`, site.ID, node.ID, oldHost, now.Add(-time.Hour).UnixMilli(), now.Add(-48*time.Hour).UnixMilli(), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(at time.Time) bool {
+		t.Helper()
+		tx, txErr := app.db.db.Begin()
+		if txErr != nil {
+			t.Fatal(txErr)
+		}
+		defer tx.Rollback()
+		allowed, lookupErr := authorizedNodeSitesTx(tx, node.ID, at.UnixMilli())
+		if lookupErr != nil {
+			t.Fatal(lookupErr)
+		}
+		return authorizedNodeSiteHost(allowed, site.ID, oldHost)
+	}
+	if !lookup(now.Add(48 * time.Hour)) {
+		t.Fatal("unacknowledged host alias expired from creation-time TTL")
+	}
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET config_revision=3,desired_config_revision=3,desired_config_hash=?,applied_config_hash='' WHERE id=?`, "alias-config", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	report := NodeReport{BootID: "alias-boot", ReportSessionID: "alias-session", CounterEpoch: "alias-epoch", AppliedConfigHash: "alias-config", AppliedConfigRevision: 3, AgentVersion: "v1.9.69", Sequence: 1, InterfaceName: "eth0"}
+	if _, err := app.db.RecordNodeReportResult(token, report, now); err != nil {
+		t.Fatal(err)
+	}
+	var acked, finalized int64
+	if err := app.db.db.QueryRow(`SELECT acked_at_ms,finalization_expires_at_ms FROM site_node_host_aliases WHERE site_id=? AND node_id=?`, site.ID, node.ID).Scan(&acked, &finalized); err != nil {
+		t.Fatal(err)
+	}
+	if acked != now.UnixMilli() || finalized != now.Add(siteNodeDrainWindow).UnixMilli() {
+		t.Fatalf("host alias lifecycle did not start on ACK: ack=%d final=%d", acked, finalized)
+	}
+	if !lookup(now.Add(23 * time.Hour)) {
+		t.Fatal("acked host alias disappeared before finalization")
+	}
+	if lookup(now.Add(25 * time.Hour)) {
+		t.Fatal("acked host alias remained after finalization")
+	}
+}
+
 func TestReviewScheduledSiteRemovalInvalidatesOwningAgent(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()

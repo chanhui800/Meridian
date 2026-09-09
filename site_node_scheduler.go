@@ -1431,9 +1431,7 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	defer tx.Rollback()
 	if schedule.AppliedNodeID != node.ID {
 		if schedule.AppliedNodeID > 0 {
-			if _, err = tx.Exec(`INSERT INTO site_node_drains(site_id,node_id,public_host,expires_at_ms,created_at_ms) VALUES(?,?,?,?,?)
-				ON CONFLICT(site_id,node_id) DO UPDATE SET public_host=excluded.public_host,expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`,
-				schedule.SiteID, schedule.AppliedNodeID, strings.ToLower(strings.TrimSpace(schedule.PublicHost)), now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli()); err != nil {
+			if err = upsertSiteNodeDrainTx(tx, schedule.SiteID, schedule.AppliedNodeID, schedule.PublicHost, now); err != nil {
 				return err
 			}
 		}
@@ -1452,6 +1450,19 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	return nil
 }
 
+// upsertSiteNodeDrainTx starts a fresh lifecycle whenever a site returns to a
+// node that has drained an earlier generation. ACK/finalization timestamps are
+// generation state and must never be inherited through the (site,node) key.
+func upsertSiteNodeDrainTx(tx *sql.Tx, siteID, nodeID int64, publicHost string, now time.Time) error {
+	if tx == nil || siteID <= 0 || nodeID <= 0 {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO site_node_drains(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms) VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(site_id,node_id) DO UPDATE SET public_host=excluded.public_host,expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms,acked_at_ms=0,finalization_expires_at_ms=0`,
+		siteID, nodeID, strings.ToLower(strings.TrimSpace(publicHost)), now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli(), 0, 0)
+	return err
+}
+
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	now := time.Now()
 	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE acked_at_ms>0 AND finalization_expires_at_ms>0 AND finalization_expires_at_ms<=?", now.UnixMilli()); err != nil {
@@ -1467,7 +1478,7 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	if err := a.revokeLegacyAgentsWithPendingForceStops(now); err != nil {
 		log.Printf("[node-scheduler] legacy Agent force-stop fallback failed: %v", err)
 	}
-	if _, err := a.db.db.Exec("DELETE FROM site_node_host_aliases WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
+	if _, err := a.db.db.Exec("DELETE FROM site_node_host_aliases WHERE acked_at_ms>0 AND finalization_expires_at_ms>0 AND finalization_expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire site host aliases: %v", err)
 	}
 	if err := a.db.retryNodeTLSCleanup(""); err != nil {
@@ -1527,7 +1538,7 @@ func (a *App) revokeLegacyAgentsWithPendingForceStops(now time.Time) error {
 	rows, err := a.db.db.Query(`SELECT DISTINCT n.id,n.agent_version
 		FROM control_nodes n
 		JOIN agent_route_revocations r ON r.node_id=n.id
-		WHERE n.enabled=1 AND n.agent_token_hash<>''
+		WHERE n.agent_token_hash<>''
 		  AND r.acked_at_ms<=0
 		  AND r.created_at_ms>0
 		  AND r.created_at_ms+?<=?`, legacyForceStopGrace.Milliseconds(), now.UnixMilli())

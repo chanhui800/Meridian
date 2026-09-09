@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 44
+	databaseSchemaVersion = 45
 )
 
 func (d *DB) migrate() error {
@@ -457,15 +457,18 @@ func (d *DB) migrateOnce() error {
 		PRIMARY KEY(site_id,node_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
-	-- Former public hosts remain accepted for a short period while an Agent
-	-- drains a previously applied route. This is separate from DNS/node drains
-	-- because a site rename can happen without a node move.
+	-- Former public hosts remain accepted until the Agent acknowledges the
+	-- replacement configuration, followed by a bounded finalization window.
+	-- This is separate from DNS/node drains because a site rename can happen
+	-- without a node move.
 	CREATE TABLE IF NOT EXISTS site_node_host_aliases (
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
 		public_host TEXT NOT NULL,
 		expires_at_ms INTEGER NOT NULL,
 		created_at_ms INTEGER NOT NULL,
+		acked_at_ms INTEGER NOT NULL DEFAULT 0,
+		finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY(site_id,node_id,public_host)
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_host_aliases_node_expiry ON site_node_host_aliases(node_id,expires_at_ms);
@@ -854,6 +857,9 @@ func (d *DB) migrateOnce() error {
 		return err
 	}
 	if err := ensureAgentRouteRevocationsSchema(ctx, conn); err != nil {
+		return err
+	}
+	if err := ensureSiteNodeHostAliasesSchema(ctx, conn); err != nil {
 		return err
 	}
 	var eventUIDColumnCount int
@@ -1252,6 +1258,44 @@ func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
 		CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
 	`); err != nil {
 		return fmt.Errorf("migrate site node drain ledger: %w", err)
+	}
+	return nil
+}
+
+// ensureSiteNodeHostAliasesSchema upgrades host-rename aliases to the same
+// acknowledgement-safe lifecycle used by node drains. Existing aliases stay
+// pending until an Agent confirms the configuration that contains the new
+// host; only then does their finalization window begin.
+func ensureSiteNodeHostAliasesSchema(ctx context.Context, conn *sql.Conn) error {
+	addedLifecycle := false
+	for _, migration := range []struct {
+		column string
+		sql    string
+	}{
+		{"acked_at_ms", "ALTER TABLE site_node_host_aliases ADD COLUMN acked_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"finalization_expires_at_ms", "ALTER TABLE site_node_host_aliases ADD COLUMN finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var found int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('site_node_host_aliases') WHERE name=?", migration.column).Scan(&found); err != nil {
+			return err
+		}
+		if found != 0 {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+			return err
+		}
+		addedLifecycle = true
+	}
+	if addedLifecycle {
+		// Aliases created by pre-45 releases already had a creation-time TTL.
+		// Preserve that historical deadline during the one-time migration rather
+		// than turning old rows into immortal, unacknowledged aliases.
+		if _, err := conn.ExecContext(ctx, `UPDATE site_node_host_aliases
+			SET acked_at_ms=created_at_ms,finalization_expires_at_ms=expires_at_ms
+			WHERE acked_at_ms=0 AND finalization_expires_at_ms=0`); err != nil {
+			return err
+		}
 	}
 	return nil
 }
