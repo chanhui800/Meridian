@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 45
+	databaseSchemaVersion = 46
 )
 
 func (d *DB) migrate() error {
@@ -862,6 +862,20 @@ func (d *DB) migrateOnce() error {
 	if err := ensureSiteNodeHostAliasesSchema(ctx, conn); err != nil {
 		return err
 	}
+	// Schema 45 briefly treated legacy host aliases as acknowledged during
+	// migration. That could expire an offline Agent's old-host authorization
+	// before it delivered its final buffered events. Schema 46 repairs only the
+	// values written by that migration; genuinely acknowledged aliases retain
+	// their lifecycle, while repaired rows remain pending until a real config
+	// acknowledgement is recorded.
+	if previousSchemaVersion == 45 {
+		if _, err := conn.ExecContext(ctx, `UPDATE site_node_host_aliases
+			SET acked_at_ms=0,finalization_expires_at_ms=0
+			WHERE acked_at_ms=created_at_ms
+			  AND finalization_expires_at_ms=expires_at_ms`); err != nil {
+			return err
+		}
+	}
 	var eventUIDColumnCount int
 	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_request_events') WHERE name=?", "event_uid").Scan(&eventUIDColumnCount); err != nil {
 		return err
@@ -1267,7 +1281,6 @@ func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
 // pending until an Agent confirms the configuration that contains the new
 // host; only then does their finalization window begin.
 func ensureSiteNodeHostAliasesSchema(ctx context.Context, conn *sql.Conn) error {
-	addedLifecycle := false
 	for _, migration := range []struct {
 		column string
 		sql    string
@@ -1283,17 +1296,6 @@ func ensureSiteNodeHostAliasesSchema(ctx context.Context, conn *sql.Conn) error 
 			continue
 		}
 		if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
-			return err
-		}
-		addedLifecycle = true
-	}
-	if addedLifecycle {
-		// Aliases created by pre-45 releases already had a creation-time TTL.
-		// Preserve that historical deadline during the one-time migration rather
-		// than turning old rows into immortal, unacknowledged aliases.
-		if _, err := conn.ExecContext(ctx, `UPDATE site_node_host_aliases
-			SET acked_at_ms=created_at_ms,finalization_expires_at_ms=expires_at_ms
-			WHERE acked_at_ms=0 AND finalization_expires_at_ms=0`); err != nil {
 			return err
 		}
 	}

@@ -1457,9 +1457,31 @@ func upsertSiteNodeDrainTx(tx *sql.Tx, siteID, nodeID int64, publicHost string, 
 	if tx == nil || siteID <= 0 || nodeID <= 0 {
 		return nil
 	}
+	normalizedHost := strings.ToLower(strings.TrimSpace(publicHost))
+	// The drain table keeps the latest generation for a (site,node) pair for
+	// compatibility with existing databases. Before replacing that row, retain
+	// its host and acknowledgement lifecycle as a site-scoped alias. This
+	// preserves every older generation in the alias ledger during rapid
+	// A→B→A→B transitions, so late events from any admitted bundle remain
+	// authorized until the corresponding acknowledgement/finalization window.
+	var previousHost string
+	var previousExpires, previousCreated, previousAcked, previousFinalization int64
+	lookupErr := tx.QueryRow(`SELECT public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms
+		FROM site_node_drains WHERE site_id=? AND node_id=?`, siteID, nodeID).
+		Scan(&previousHost, &previousExpires, &previousCreated, &previousAcked, &previousFinalization)
+	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+		return lookupErr
+	}
+	if lookupErr == nil && strings.TrimSpace(previousHost) != "" && !strings.EqualFold(strings.TrimSpace(previousHost), normalizedHost) {
+		if _, err := tx.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms)
+			VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id,node_id,public_host) DO NOTHING`,
+			siteID, nodeID, strings.ToLower(strings.TrimSpace(previousHost)), previousExpires, previousCreated, previousAcked, previousFinalization); err != nil {
+			return err
+		}
+	}
 	_, err := tx.Exec(`INSERT INTO site_node_drains(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms) VALUES(?,?,?,?,?,?,?)
 		ON CONFLICT(site_id,node_id) DO UPDATE SET public_host=excluded.public_host,expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms,acked_at_ms=0,finalization_expires_at_ms=0`,
-		siteID, nodeID, strings.ToLower(strings.TrimSpace(publicHost)), now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli(), 0, 0)
+		siteID, nodeID, normalizedHost, now.Add(siteNodeDrainWindow).UnixMilli(), now.UnixMilli(), 0, 0)
 	return err
 }
 
