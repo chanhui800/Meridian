@@ -155,14 +155,25 @@ type NodeReport struct {
 // validation/commit decision made by the controller. Handlers must not infer
 // ACKs from their original request slice after invalid events are filtered.
 type NodeReportResult struct {
-	Node               ControlNode
-	AcceptedEventIDs   []int64
-	AcceptedEventUIDs  []string
-	DiscardedEventIDs  []int64
-	DiscardedEventUIDs []string
+	Node                        ControlNode
+	AcceptedSiteIDs             []int64
+	DiscardedSiteIDs            []int64
+	AcceptedMediaSiteIDs        []int64
+	DiscardedMediaSiteIDs       []int64
+	AcceptedRetentionSiteIDs    []int64
+	DiscardedRetentionSiteIDs   []int64
+	AcceptedObservationSiteIDs  []int64
+	DiscardedObservationSiteIDs []int64
+	AcceptedEventIDs            []int64
+	AcceptedEventUIDs           []string
+	DiscardedEventIDs           []int64
+	DiscardedEventUIDs          []string
 }
 
 type NodeSiteStat struct {
+	// SiteID is the Controller-stable identity. Host is retained for protocol
+	// compatibility and must agree with SiteID when both are supplied.
+	SiteID             int64  `json:"site_id,omitempty"`
 	Host               string `json:"host"`
 	RequestCount       int64  `json:"request_count"`
 	LastRequestAtMS    int64  `json:"last_request_at_ms"`
@@ -1002,7 +1013,7 @@ func validateNodeReport(report NodeReport) error {
 		}
 	}
 	for _, stat := range report.SiteStats {
-		if strings.TrimSpace(stat.Host) == "" || len(stat.Host) > 255 || stat.RequestCount < 0 || stat.LastRequestAtMS < 0 || stat.LastStatus < 0 || stat.LastStatus > 999 || stat.BytesIn < 0 || stat.BytesOut < 0 || stat.CumulativeBytesIn < 0 || stat.CumulativeBytesOut < 0 || stat.CacheSizeBytes < 0 {
+		if stat.SiteID < 0 || strings.TrimSpace(stat.Host) == "" || len(stat.Host) > 255 || stat.RequestCount < 0 || stat.LastRequestAtMS < 0 || stat.LastStatus < 0 || stat.LastStatus > 999 || stat.BytesIn < 0 || stat.BytesOut < 0 || stat.CumulativeBytesIn < 0 || stat.CumulativeBytesOut < 0 || stat.CacheSizeBytes < 0 {
 			return errors.New("invalid site stats")
 		}
 	}
@@ -1037,17 +1048,19 @@ type authorizedNodeSite struct {
 }
 
 // authorizedNodeSitesTx is the single source of truth for report-side site
-// authorization. A site remains authorized during a scheduler transition
-// while either desired_node_id or applied_node_id points at the reporting node.
-func authorizedNodeSitesTx(tx *sql.Tx, nodeID int64) (map[int64]authorizedNodeSite, error) {
+// authorization. A site remains authorized while desired/applied points at the
+// reporting node and, after a completed DNS move, through its bounded drain
+// window so admitted streams can report their final traffic.
+func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorizedNodeSite, error) {
 	rows, err := tx.Query(`
 		SELECT s.id, LOWER(TRIM(s.public_host))
 		FROM site_node_schedules n
 		JOIN sites s ON s.id=n.site_id
+		LEFT JOIN site_node_drains d ON d.site_id=n.site_id
 		WHERE n.enabled=1
 		  AND s.enabled=1
-		  AND (n.desired_node_id=? OR n.applied_node_id=?)
-	`, nodeID, nodeID)
+		  AND (n.desired_node_id=? OR n.applied_node_id=? OR (d.node_id=? AND d.expires_at_ms>?))
+	`, nodeID, nodeID, nodeID, nowMS)
 	if err != nil {
 		return nil, err
 	}
@@ -1072,6 +1085,22 @@ func authorizedNodeSiteHost(sites map[int64]authorizedNodeSite, siteID int64, ho
 	return normalized != "" && strings.EqualFold(normalized, site.PublicHost)
 }
 
+// authorizedNodeSiteForStat accepts legacy Host-only reports but requires the
+// supplied host to match when a current Agent includes its stable SiteID.
+func authorizedNodeSiteForStat(sites map[int64]authorizedNodeSite, stat NodeSiteStat) (authorizedNodeSite, bool) {
+	if stat.SiteID > 0 {
+		site, ok := sites[stat.SiteID]
+		return site, ok && authorizedNodeSiteHost(sites, stat.SiteID, stat.Host)
+	}
+	host := requestPublicHost(strings.TrimSpace(stat.Host))
+	for _, site := range sites {
+		if strings.EqualFold(site.PublicHost, host) {
+			return site, true
+		}
+	}
+	return authorizedNodeSite{}, false
+}
+
 func (d *DB) authorizedNodeSitesForAgentToken(token string) (int64, map[int64]authorizedNodeSite, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -1084,7 +1113,7 @@ func (d *DB) authorizedNodeSitesForAgentToken(token string) (int64, map[int64]au
 	} else if err != nil {
 		return 0, nil, err
 	}
-	sites, err := authorizedNodeSitesTx(tx, nodeID)
+	sites, err := authorizedNodeSitesTx(tx, nodeID, time.Now().UnixMilli())
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1209,17 +1238,11 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 }
 
 func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite) error {
-	var siteID int64
-	host := requestPublicHost(strings.TrimSpace(stat.Host))
-	for id, site := range allowedSites {
-		if strings.EqualFold(site.PublicHost, host) {
-			siteID = id
-			break
-		}
-	}
-	if siteID <= 0 {
+	site, ok := authorizedNodeSiteForStat(allowedSites, stat)
+	if !ok {
 		return nil
 	}
+	siteID := site.ID
 	currentIn, currentOut := stat.CumulativeBytesIn, stat.CumulativeBytesOut
 	if currentIn == 0 && stat.BytesIn > 0 {
 		currentIn = stat.BytesIn
@@ -1301,12 +1324,32 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 }
 
 type nodeReportCommitResult struct {
-	node              ControlNode
-	acceptedNew       []NodeRequestEvent
-	acceptedDuplicate []NodeRequestEvent
-	pendingEffects    []NodeRequestEvent
-	discardedIDs      []int64
-	discardedUIDs     []string
+	node                        ControlNode
+	acceptedSiteIDs             []int64
+	discardedSiteIDs            []int64
+	acceptedMediaSiteIDs        []int64
+	discardedMediaSiteIDs       []int64
+	acceptedRetentionSiteIDs    []int64
+	discardedRetentionSiteIDs   []int64
+	acceptedObservationSiteIDs  []int64
+	discardedObservationSiteIDs []int64
+	acceptedNew                 []NodeRequestEvent
+	acceptedDuplicate           []NodeRequestEvent
+	pendingEffects              []NodeRequestEvent
+	discardedIDs                []int64
+	discardedUIDs               []string
+}
+
+func appendUniqueNodeSiteID(ids *[]int64, siteID int64) {
+	if siteID <= 0 {
+		return
+	}
+	for _, existing := range *ids {
+		if existing == siteID {
+			return
+		}
+	}
+	*ids = append(*ids, siteID)
 }
 
 func appendNodeEventIdentity(ids *[]int64, uids *[]string, event NodeRequestEvent) {
@@ -1358,7 +1401,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	// Authorization and every report mutation use one transaction. A scheduler
 	// transition therefore resolves as either authorized-and-committed or
 	// unauthorized-and-discarded; ACKs are never inferred from a preflight.
-	allowedSites, err := authorizedNodeSitesTx(tx, id)
+	allowedSites, err := authorizedNodeSitesTx(tx, id, now.UnixMilli())
 	if err != nil {
 		return nodeReportCommitResult{}, err
 	}
@@ -1490,20 +1533,18 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		if host == "" || len(host) > 255 || stat.RequestCount < 0 || stat.LastRequestAtMS < 0 || stat.LastStatus < 0 || stat.LastStatus > 999 {
 			continue
 		}
-		var scheduleID int64
+		authorizedSite, authorized := authorizedNodeSiteForStat(allowedSites, stat)
+		if !authorized {
+			d.recordAgentSecurityRejection(id, stat.SiteID, "site-stats")
+			appendUniqueNodeSiteID(&result.discardedSiteIDs, stat.SiteID)
+			continue
+		}
+		scheduleID := authorizedSite.ID
 		var previousBoot string
 		var previousCount int64
-		err := tx.QueryRow(`SELECT n.site_id,n.agent_boot_id,n.agent_request_count FROM site_node_schedules n JOIN sites s ON s.id=n.site_id WHERE n.enabled=1 AND s.enabled=1 AND (n.desired_node_id=? OR n.applied_node_id=?) AND lower(s.public_host)=?`, id, id, host).Scan(&scheduleID, &previousBoot, &previousCount)
-		if errors.Is(err, sql.ErrNoRows) {
-			d.recordAgentSecurityRejection(id, 0, "site-stats")
-			continue
-		}
+		err := tx.QueryRow(`SELECT agent_boot_id,agent_request_count FROM site_node_schedules WHERE site_id=?`, scheduleID).Scan(&previousBoot, &previousCount)
 		if err != nil {
 			return nodeReportCommitResult{}, err
-		}
-		if !authorizedNodeSiteHost(allowedSites, scheduleID, host) {
-			d.recordAgentSecurityRejection(id, scheduleID, "site-stats")
-			continue
 		}
 		count := stat.RequestCount
 		if previousBoot != sessionID || count < previousCount {
@@ -1519,34 +1560,41 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		if err := recordNodeSiteTrafficTx(tx, id, siteCounterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
 			return nodeReportCommitResult{}, err
 		}
+		appendUniqueNodeSiteID(&result.acceptedSiteIDs, scheduleID)
 	}
 
 	for _, count := range report.MediaCounts {
 		if _, allowed := allowedSites[count.SiteID]; !allowed {
 			d.recordAgentSecurityRejection(id, count.SiteID, "media-counts")
+			appendUniqueNodeSiteID(&result.discardedMediaSiteIDs, count.SiteID)
 			continue
 		}
 		if _, err := tx.Exec(`UPDATE sites SET media_movie_count=?,media_series_count=?,media_episode_count=?,media_count_updated_at_ms=? WHERE id=? AND media_count_updated_at_ms<?`, count.MovieCount, count.SeriesCount, count.EpisodeCount, count.ObservedAtMS, count.SiteID, count.ObservedAtMS); err != nil {
 			return nodeReportCommitResult{}, err
 		}
+		appendUniqueNodeSiteID(&result.acceptedMediaSiteIDs, count.SiteID)
 	}
 	for _, status := range report.Retention {
 		if _, allowed := allowedSites[status.SiteID]; !allowed {
 			d.recordAgentSecurityRejection(id, status.SiteID, "retention")
+			appendUniqueNodeSiteID(&result.discardedRetentionSiteIDs, status.SiteID)
 			continue
 		}
 		if _, err := tx.Exec(`UPDATE sites SET account_retention_started_at_ms=?,account_retention_last_completed_at_ms=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND account_retention_days>0 AND account_retention_started_at_ms=?`, status.CompletedAtMS, status.CompletedAtMS, status.SiteID, status.ExpectedStartedAtMS); err != nil {
 			return nodeReportCommitResult{}, err
 		}
+		appendUniqueNodeSiteID(&result.acceptedRetentionSiteIDs, status.SiteID)
 	}
 	for _, observation := range report.Observations {
 		if _, allowed := allowedSites[observation.SiteID]; !allowed {
 			d.recordAgentSecurityRejection(id, observation.SiteID, "observation")
+			appendUniqueNodeSiteID(&result.discardedObservationSiteIDs, observation.SiteID)
 			continue
 		}
 		if _, err := tx.Exec(`INSERT INTO dynamic_observations(site_id,canonical_authority,source,decision,reason_code,first_seen_ms,last_seen_ms,count) VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(site_id,canonical_authority,source,decision,reason_code) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,count=count+1`, observation.SiteID, observation.CanonicalAuthority, observation.Source, observation.Decision, observation.ReasonCode, observation.ObservedAtMS, observation.ObservedAtMS); err != nil {
 			return nodeReportCommitResult{}, err
 		}
+		appendUniqueNodeSiteID(&result.acceptedObservationSiteIDs, observation.SiteID)
 	}
 
 	for _, event := range report.Events {
@@ -1637,6 +1685,14 @@ func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now ti
 		return NodeReportResult{}, err
 	}
 	result := NodeReportResult{Node: committed.node}
+	result.AcceptedSiteIDs = committed.acceptedSiteIDs
+	result.DiscardedSiteIDs = committed.discardedSiteIDs
+	result.AcceptedMediaSiteIDs = committed.acceptedMediaSiteIDs
+	result.DiscardedMediaSiteIDs = committed.discardedMediaSiteIDs
+	result.AcceptedRetentionSiteIDs = committed.acceptedRetentionSiteIDs
+	result.DiscardedRetentionSiteIDs = committed.discardedRetentionSiteIDs
+	result.AcceptedObservationSiteIDs = committed.acceptedObservationSiteIDs
+	result.DiscardedObservationSiteIDs = committed.discardedObservationSiteIDs
 	for _, event := range committed.acceptedNew {
 		appendNodeEventIdentity(&result.AcceptedEventIDs, &result.AcceptedEventUIDs, event)
 	}

@@ -493,6 +493,7 @@ func TestReviewAgentReportCannotModifyUnauthorizedSite(t *testing.T) {
 	unauthorizedUID := strings.Repeat("b", 32)
 	result, err := app.db.RecordNodeReportResult(tokenA, NodeReport{
 		BootID: "auth-session", ReportSessionID: "auth-session", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0",
+		SiteStats:    []NodeSiteStat{{SiteID: siteB.ID, Host: siteB.PublicHost, RequestCount: 1, LastRequestAtMS: now.UnixMilli(), LastStatus: 200}},
 		MediaCounts:  []NodeMediaCount{{SiteID: siteB.ID, MovieCount: 99, SeriesCount: 88, EpisodeCount: 77, ObservedAtMS: now.UnixMilli()}},
 		Observations: []NodeDynamicObservation{{SiteID: siteB.ID, CanonicalAuthority: "https://auth-b.example.com:443", Source: dynamicObservationSourceRedirect, Decision: dynamicObservationDecisionAllowed, ReasonCode: dynamicObservationReasonRedirectAllowed, ObservedAtMS: now.UnixMilli()}},
 		Events: []NodeRequestEvent{
@@ -508,6 +509,9 @@ func TestReviewAgentReportCannotModifyUnauthorizedSite(t *testing.T) {
 	}
 	if len(result.DiscardedEventUIDs) != 1 || result.DiscardedEventUIDs[0] != unauthorizedUID {
 		t.Fatalf("unauthorized event UID was not discarded: %#v", result)
+	}
+	if len(result.DiscardedSiteIDs) != 1 || result.DiscardedSiteIDs[0] != siteB.ID || len(result.DiscardedMediaSiteIDs) != 1 || result.DiscardedMediaSiteIDs[0] != siteB.ID || len(result.DiscardedObservationSiteIDs) != 1 || result.DiscardedObservationSiteIDs[0] != siteB.ID {
+		t.Fatalf("controller did not return explicit telemetry dispositions: %#v", result)
 	}
 	var movieCount int
 	if err := app.db.db.QueryRow("SELECT media_movie_count FROM sites WHERE id=?", siteB.ID).Scan(&movieCount); err != nil {
@@ -533,6 +537,52 @@ func TestReviewAgentReportCannotModifyUnauthorizedSite(t *testing.T) {
 	}, now.Add(time.Second))
 	if err != nil || len(result.DiscardedEventIDs) != 1 || result.DiscardedEventIDs[0] != 12 {
 		t.Fatalf("mismatched Site/Host event was accepted: result=%#v err=%v", result, err)
+	}
+}
+
+func TestReviewCompletedDNSMoveKeepsTailTrafficAuthorizedOnlyDuringDrain(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	oldNode, oldEnrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "drain-old", Address: "203.0.113.70", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newNode, newEnrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "drain-new", Address: "203.0.113.71", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, oldToken, err := app.db.EnrollControlNode(oldEnrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(newEnrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "drain-site", PublicHost: "drain.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", newNode.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=? WHERE site_id=?`, newNode.ID, newNode.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`INSERT INTO site_node_drains(site_id,node_id,expires_at_ms,created_at_ms) VALUES(?,?,?,?)`, site.ID, oldNode.ID, now.Add(time.Minute).UnixMilli(), now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	report := NodeReport{BootID: "drain", ReportSessionID: "drain", CounterEpoch: "epoch", SiteCounterEpoch: "drain:1", Sequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, RequestCount: 1, LastRequestAtMS: now.UnixMilli(), LastStatus: 200, BytesOut: 100, CumulativeBytesOut: 100}}}
+	result, err := app.db.RecordNodeReportResult(oldToken, report, now)
+	if err != nil || len(result.AcceptedSiteIDs) != 1 || result.AcceptedSiteIDs[0] != site.ID {
+		t.Fatalf("draining tail report=%#v err=%v, want accepted", result, err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_drains SET expires_at_ms=? WHERE site_id=?`, now.Add(-time.Second).UnixMilli(), site.ID); err != nil {
+		t.Fatal(err)
+	}
+	report.Sequence = 2
+	result, err = app.db.RecordNodeReportResult(oldToken, report, now.Add(time.Second))
+	if err != nil || len(result.DiscardedSiteIDs) != 1 || result.DiscardedSiteIDs[0] != site.ID {
+		t.Fatalf("expired drain report=%#v err=%v, want discarded", result, err)
 	}
 }
 

@@ -57,6 +57,35 @@ func TestAgentPreAuthAuthenticatesBeforeBodyDecode(t *testing.T) {
 	}
 }
 
+func TestAgentPreAuthDatabaseFailureIsRetryableNotRevoked(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	_, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "preauth-db-failure", Address: "203.0.113.81"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handler := app.withAgentPreAuth(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("request reached endpoint after authentication storage failure")
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/config", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("database failure status=%d, want 503", response.Code)
+	}
+	if state := response.Header().Get("X-Meridian-Agent-State"); state != "" {
+		t.Fatalf("database failure emitted Agent state %q, want no revocation", state)
+	}
+}
+
 func TestAgentPreAuthCannotBeBypassedByEndpointRotation(t *testing.T) {
 	app := &App{}
 	handler := app.withAgentPreAuth(func(w http.ResponseWriter, _ *http.Request) {

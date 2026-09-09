@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 39
+	databaseSchemaVersion = 40
 )
 
 func (d *DB) migrate() error {
@@ -443,6 +443,16 @@ func (d *DB) migrateOnce() error {
 		PRIMARY KEY(site_id,node_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_probe_failures_until ON site_node_probe_failures(site_id,failed_until_ms);
+	-- A completed DNS move leaves the former node authorized only long enough
+	-- to report already-admitted stream traffic. This is Controller-owned
+	-- lifecycle state, never an external TLS/DNS namespace.
+	CREATE TABLE IF NOT EXISTS site_node_drains (
+		site_id INTEGER PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		expires_at_ms INTEGER NOT NULL,
+		created_at_ms INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
 	CREATE TABLE IF NOT EXISTS node_tls_cleanup_jobs (
 		node_guid TEXT PRIMARY KEY,
 		created_at_ms INTEGER NOT NULL,

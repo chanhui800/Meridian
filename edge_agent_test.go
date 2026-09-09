@@ -93,6 +93,79 @@ func TestEdgeTrafficCounterSurvivesHotApply(t *testing.T) {
 	}
 }
 
+func TestEdgeSiteStatsRetainRemovedRouteUntilControllerAcknowledgesIt(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	counter := runtime.trafficCounterFor(42, "tail.example.test")
+	counter.cumulativeIn.Store(123)
+	counter.cumulativeOut.Store(456)
+	counter.requests.Store(7)
+	pending := runtime.prepareSiteStats()
+	if len(pending.stats) != 1 || pending.stats[0].SiteID != 42 || pending.stats[0].CumulativeBytesOut != 456 {
+		t.Fatalf("tail route stats=%#v, want stable removed-route report", pending.stats)
+	}
+	runtime.commitSiteStatsWithACK(pending, nil)
+	if _, ok := runtime.siteReported[42]; ok {
+		t.Fatal("unacknowledged tail stats advanced local watermark")
+	}
+	runtime.commitSiteStatsWithACK(pending, map[int64]bool{42: true})
+	if got := runtime.siteReported[42].CumulativeBytesOut; got != 456 {
+		t.Fatalf("acknowledged tail watermark=%d, want 456", got)
+	}
+}
+
+func TestEdgeTelemetryNeedsCategoryAcknowledgement(t *testing.T) {
+	runtime := &edgeAgentRuntime{mediaCounts: map[int64]NodeMediaCount{7: {SiteID: 7, MovieCount: 1, ObservedAtMS: 1}}}
+	pending := runtime.prepareTelemetry()
+	runtime.commitTelemetryWithACK(pending, nil, nil, nil)
+	if _, ok := runtime.mediaCounts[7]; !ok {
+		t.Fatal("unacknowledged telemetry was discarded")
+	}
+	runtime.commitTelemetryWithACK(pending, map[int64]bool{7: true}, nil, nil)
+	if _, ok := runtime.mediaCounts[7]; ok {
+		t.Fatal("acknowledged telemetry remained pending")
+	}
+}
+
+func TestEdgeRevocationMarkerFailureStaysQuiescent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := edgeQuiesceRevoked(ctx, &edgeAgentRuntime{}, filepath.Join(t.TempDir(), "missing", "agent.revoked")); err != nil {
+		t.Fatalf("quiesce revoked: %v", err)
+	}
+}
+
+func TestEdgeHotReloadDrainDoesNotForceCloseActiveRequest(t *testing.T) {
+	instance := &ProxyInstance{}
+	instance.activeRequests.Add(1)
+	bundle := &edgeProxyBundle{manager: &ProxyManager{proxies: map[int64]*ProxyInstance{1: instance}}}
+	runtime := &edgeAgentRuntime{}
+	runtime.beginBundleDrain(bundle)
+	deadline := time.Now().Add(time.Second)
+	for {
+		runtime.mu.RLock()
+		_, draining := runtime.drainingBundles[bundle]
+		runtime.mu.RUnlock()
+		if draining || time.Now().After(deadline) {
+			if !draining {
+				t.Fatal("hot reload drain ended before its active request completed")
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	instance.activeRequests.Done()
+	for time.Now().Before(deadline) {
+		runtime.mu.RLock()
+		_, draining := runtime.drainingBundles[bundle]
+		runtime.mu.RUnlock()
+		if !draining {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("hot reload drain did not finish after active request completed")
+}
+
 func TestCommitSiteStatsRebasesAuthoritativeQuotaImmediately(t *testing.T) {
 	counter := &edgeSiteTrafficCounter{}
 	inst := &ProxyInstance{
