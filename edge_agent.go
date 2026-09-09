@@ -522,6 +522,7 @@ type edgeAgentRuntime struct {
 	retention            map[int64]NodeRetentionStatus
 	observations         []NodeDynamicObservation
 	siteReported         map[int64]ProxyRuntimeStat
+	trafficCounters      map[int64]*edgeSiteTrafficCounter
 	resolver             dynamicIPResolver
 	transport            dynamicTransportFactory
 	listen               func(string, string) (net.Listener, error)
@@ -540,6 +541,23 @@ type edgeAgentRuntimeState struct {
 	siteCounterEpoch     uint64
 	siteReported         map[int64]ProxyRuntimeStat
 	listenerError        string
+}
+
+func (runtime *edgeAgentRuntime) trafficCounterFor(siteID int64) *edgeSiteTrafficCounter {
+	if runtime == nil || siteID <= 0 {
+		return nil
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.trafficCounters == nil {
+		runtime.trafficCounters = make(map[int64]*edgeSiteTrafficCounter)
+	}
+	if counter := runtime.trafficCounters[siteID]; counter != nil {
+		return counter
+	}
+	counter := &edgeSiteTrafficCounter{}
+	runtime.trafficCounters[siteID] = counter
+	return counter
 }
 
 func (runtime *edgeAgentRuntime) queueEvent(event NodeRequestEvent) {
@@ -776,10 +794,27 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 	if runtime.siteReported == nil {
 		runtime.siteReported = make(map[int64]ProxyRuntimeStat)
 	}
+	deltas := make(map[int64]ProxyRuntimeStat, len(pending.current))
 	for siteID, sent := range pending.current {
-		if current := runtime.siteReported[siteID]; current == sent || current.CumulativeBytesIn <= sent.CumulativeBytesIn && current.CumulativeBytesOut <= sent.CumulativeBytesOut {
-			runtime.siteReported[siteID] = sent
+		current := runtime.siteReported[siteID]
+		delta := ProxyRuntimeStat{SiteID: siteID}
+		if sent.CumulativeBytesIn >= current.CumulativeBytesIn {
+			delta.CumulativeBytesIn = sent.CumulativeBytesIn - current.CumulativeBytesIn
+		} else {
+			delta.CumulativeBytesIn = sent.CumulativeBytesIn
 		}
+		if sent.CumulativeBytesOut >= current.CumulativeBytesOut {
+			delta.CumulativeBytesOut = sent.CumulativeBytesOut - current.CumulativeBytesOut
+		} else {
+			delta.CumulativeBytesOut = sent.CumulativeBytesOut
+		}
+		if sent.Requests >= current.Requests {
+			delta.Requests = sent.Requests - current.Requests
+		} else {
+			delta.Requests = sent.Requests
+		}
+		deltas[siteID] = delta
+		runtime.siteReported[siteID] = sent
 	}
 	bundle := runtime.bundle
 	reported := make(map[int64]ProxyRuntimeStat, len(pending.current))
@@ -802,6 +837,13 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 		}
 		if inst := bundle.manager.proxies[localID]; inst != nil {
 			inst.trafficMu.Lock()
+			if inst.trafficCycleAuthoritative {
+				delta := deltas[identity.centralID]
+				// Rebase the Controller baseline and ACK watermark together.
+				// The just-committed report must remain billable immediately;
+				// it must not disappear until the next config refresh.
+				inst.trafficCycleUsage += trafficBillableBytes(inst.trafficCycleMode, delta.CumulativeBytesIn, delta.CumulativeBytesOut)
+			}
 			inst.trafficAckedCumulativeIn = stat.CumulativeBytesIn
 			inst.trafficAckedCumulativeOut = stat.CumulativeBytesOut
 			inst.trafficMu.Unlock()
@@ -1057,6 +1099,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
+		site.runtimeTrafficCounter = runtime.trafficCounterFor(route.SiteID)
 		// Site icons are Controller/UI metadata. The Agent's ephemeral site
 		// database has no uploaded icon pack, so carrying these fields into
 		// CreateSiteRecord would make an otherwise valid runtime config fail
@@ -1105,6 +1148,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		created.runtimeTrafficCycleConfigured = site.runtimeTrafficCycleConfigured
 		created.runtimeTrafficAckedCumulativeIn = site.runtimeTrafficAckedCumulativeIn
 		created.runtimeTrafficAckedCumulativeOut = site.runtimeTrafficAckedCumulativeOut
+		created.runtimeTrafficCounter = site.runtimeTrafficCounter
 		siteIDs[site.PublicHost] = route.SiteID
 		localSites[created.ID] = edgeSiteIdentity{centralID: route.SiteID, host: site.PublicHost}
 		bundle.localSites[created.ID] = localSites[created.ID]
@@ -1337,17 +1381,10 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.certificate = certificate
 	runtime.handler = bundle.handler
 	runtime.bundle = bundle
-	// The in-memory Edge database and proxy counters are rebuilt on every
-	// configuration apply. Keep the Controller ACK watermark for sites that are
-	// still present so the new zeroed counters represent only post-apply local
-	// traffic and cannot be charged twice against the Controller baseline.
-	retainedReports := make(map[int64]ProxyRuntimeStat, len(config.Routes))
-	for _, route := range config.Routes {
-		if stat, ok := oldState.siteReported[route.SiteID]; ok {
-			retainedReports[route.SiteID] = stat
-		}
-	}
-	runtime.siteReported = retainedReports
+	// siteReported is a Controller ACK watermark. Stable per-site counters are
+	// shared by old and new bundles, so this watermark remains valid across a
+	// routing-only hot apply.
+	runtime.siteReported = oldState.siteReported
 	runtime.mu.Unlock()
 	newServerStarted := false
 	if listenerChanged && needsListener {
@@ -1374,7 +1411,11 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.mu.Lock()
 	runtime.appliedHash = config.ConfigHash
 	runtime.appliedRevision = config.ConfigRevision
-	runtime.siteCounterEpoch++
+	// A counter epoch identifies the Agent process, not a routing bundle. Keep
+	// it stable across hot applies so draining requests remain in one stream.
+	if runtime.siteCounterEpoch == 0 {
+		runtime.siteCounterEpoch = 1
+	}
 	if config.CacheClearGeneration > runtime.cacheClearGeneration {
 		runtime.cacheClearGeneration = config.CacheClearGeneration
 	}
@@ -1492,6 +1533,32 @@ func edgeSaveState(path string, state edgeAgentState) error {
 	return os.Rename(name, path)
 }
 
+type edgeAPIError struct {
+	StatusCode int
+	AgentState string
+	Message    string
+}
+
+func (e *edgeAPIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+func isEdgeAgentRevoked(err error) bool {
+	var apiErr *edgeAPIError
+	return errors.As(err, &apiErr) && strings.EqualFold(strings.TrimSpace(apiErr.AgentState), "revoked")
+}
+
+func edgeEnrollmentTokenAvailable(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- the enrollment path is supplied by the service configuration.
+	return err == nil && strings.TrimSpace(string(data)) != ""
+}
+
 func edgeAPIRequest(ctx context.Context, client *http.Client, method, endpoint, token string, body, output any) error {
 	return edgeAPIRequestWithHeaders(ctx, client, method, endpoint, token, body, output, nil)
 }
@@ -1541,13 +1608,18 @@ func edgeAPIRequestWithHeaders(ctx context.Context, client *http.Client, method,
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var failure struct {
-			Error string `json:"error"`
+			Error      string `json:"error"`
+			AgentState string `json:"agent_state"`
 		}
 		_ = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&failure)
 		if failure.Error == "" {
 			failure.Error = response.Status
 		}
-		return errors.New(failure.Error)
+		state := strings.TrimSpace(response.Header.Get("X-Meridian-Agent-State"))
+		if state == "" {
+			state = failure.AgentState
+		}
+		return &edgeAPIError{StatusCode: response.StatusCode, AgentState: state, Message: failure.Error}
 	}
 	if output == nil {
 		_, err = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
@@ -1912,6 +1984,26 @@ func runEdgeAgent() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	client := &http.Client{Timeout: 2 * time.Minute, Transport: edgeHTTPTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	revokedMarker := *statePath + ".revoked"
+	if _, statErr := os.Stat(revokedMarker); statErr == nil {
+		if !edgeEnrollmentTokenAvailable(*tokenFile) {
+			fmt.Fprintln(os.Stderr, "Meridian Agent token was revoked; run the generated re-enrollment script to start it again.")
+			// Keep the service quiescent instead of returning into a
+			// Restart=always loop. The process has no listener or runtime at this
+			// point; an operator-provided enrollment token causes the service to be
+			// stopped and started again, at which point enrollment can proceed.
+			<-ctx.Done()
+			return nil
+		}
+		// The current state contains the credential that the Controller revoked.
+		// Remove it before loading state so a manually supplied enrollment token
+		// (or an interrupted --reenroll install) cannot accidentally keep using
+		// the stale token instead of completing enrollment.
+		if err := os.Remove(*statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove revoked Agent state: %w", err)
+		}
+		_ = os.Remove(revokedMarker)
+	}
 	state, err := edgeLoadState(*statePath)
 	if err != nil {
 		return err
@@ -1975,11 +2067,22 @@ func runEdgeAgent() error {
 				agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
 				agentVersionHeader:  []string{appVersion},
 			}); err != nil {
+				if isEdgeAgentRevoked(err) {
+					_ = os.WriteFile(revokedMarker, []byte("revoked\n"), 0o600)
+					return nil
+				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else {
-				runtime.syncSiteTrafficLimits(config)
+				// A new identity must be applied atomically. Updating the old
+				// bundle before apply would leak a failed candidate's quota into
+				// the still-serving configuration. Hash-stable refreshes are the
+				// only path allowed to mutate the live baseline in place.
+				appliedHash, appliedRevision, _, _, _, _ := runtime.status()
+				if agentConfigIdentityEqual(config, AgentRuntimeConfig{ConfigHash: appliedHash, ConfigRevision: appliedRevision}) {
+					runtime.syncSiteTrafficLimits(config)
+				}
 				// Refresh the pending payload when the Controller sends a newer
 				// hash, but do not reset an in-progress retry backoff when the
 				// same failing configuration is fetched again after a report ACK.
@@ -2052,6 +2155,10 @@ func runEdgeAgent() error {
 				wsErr = edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/report", state.Token, report, &ack)
 			}
 			if wsErr != nil {
+				if isEdgeAgentRevoked(wsErr) {
+					_ = os.WriteFile(revokedMarker, []byte("revoked\n"), 0o600)
+					return nil
+				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", wsErr)
 			} else {
 				runtime.commitSiteStats(pendingStats)

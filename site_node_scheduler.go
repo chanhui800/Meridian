@@ -939,7 +939,7 @@ func (a *App) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	config, err := a.buildAgentConfigForRequest(r.Context(), requestBearerToken(r), time.Now(), platform, r.Header.Get(agentVersionHeader))
 	if errors.Is(err, errInvalidAgentToken) {
-		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		writeAgentAuthFailure(a, w, r)
 		return
 	}
 	if err != nil {
@@ -1370,10 +1370,22 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 	if err != nil {
 		return nil
 	}
-	// Freeze the local schedule before touching Cloudflare. This is the first
-	// phase of the deletion saga: a failed remote delete must never leave an
-	// enabled row that the scheduler can use to recreate DNS.
-	if _, err := a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), siteID); err != nil {
+	// Freeze the local schedule before touching Cloudflare. Invalidate every
+	// Agent that currently owns the site before clearing its node references;
+	// otherwise the old Agent would not learn that the route was removed until
+	// its periodic config poll.
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := markAgentConfigsDirtyForNodeIDsTx(tx, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), siteID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	if value.cfRecordID != "" {
@@ -1434,6 +1446,9 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	}
 	defer tx.Rollback()
 	for _, value := range affected {
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), value.SiteID); err != nil {
 			return err
 		}

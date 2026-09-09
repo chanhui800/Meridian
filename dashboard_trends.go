@@ -172,9 +172,9 @@ func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboa
 		}
 		inst.trafficMu.Lock()
 		result[id] = dashboardPendingTraffic{
-			BytesIn:  inst.bytesIn.Load(),
-			BytesOut: inst.bytesOut.Load(),
-			Requests: inst.pendingRequests.Load(),
+			BytesIn:  inst.trafficBytesIn().Load(),
+			BytesOut: inst.trafficBytesOut().Load(),
+			Requests: inst.trafficPendingRequests().Load(),
 		}
 		inst.trafficMu.Unlock()
 	}

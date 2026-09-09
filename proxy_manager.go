@@ -55,9 +55,69 @@ type ProxyInstance struct {
 	trafficAckedCumulativeIn  int64
 	trafficAckedCumulativeOut int64
 	trafficCycleAuthoritative bool
-	trustedProxies            []*net.IPNet
-	dynamicState              *dynamicSiteState
-	failoverState             *upstreamFailoverState
+	// trafficCounter is shared by every bundle that represents the same
+	// controller site. Config hot-apply replaces routing bundles while active
+	// requests from the old bundle drain; sharing these counters keeps that
+	// traffic in one continuous accounting stream.
+	trafficCounter *edgeSiteTrafficCounter
+	trustedProxies []*net.IPNet
+	dynamicState   *dynamicSiteState
+	failoverState  *upstreamFailoverState
+}
+
+// edgeSiteTrafficCounter is the stable, per-controller-site counter owned by
+// an Agent runtime. It deliberately lives outside ProxyInstance so a routing
+// bundle can be replaced without resetting counters or losing bytes from
+// requests that are still draining on the previous bundle.
+type edgeSiteTrafficCounter struct {
+	bytesIn        atomic.Int64
+	bytesOut       atomic.Int64
+	cumulativeIn   atomic.Int64
+	cumulativeOut  atomic.Int64
+	requests       atomic.Int64
+	pendingRequest atomic.Int64
+}
+
+func (inst *ProxyInstance) trafficBytesIn() *atomic.Int64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.bytesIn
+	}
+	return &inst.bytesIn
+}
+
+func (inst *ProxyInstance) trafficBytesOut() *atomic.Int64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.bytesOut
+	}
+	return &inst.bytesOut
+}
+
+func (inst *ProxyInstance) trafficCumulativeIn() *atomic.Int64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.cumulativeIn
+	}
+	return &inst.cumulativeBytesIn
+}
+
+func (inst *ProxyInstance) trafficCumulativeOut() *atomic.Int64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.cumulativeOut
+	}
+	return &inst.cumulativeBytesOut
+}
+
+func (inst *ProxyInstance) trafficRequests() *atomic.Int64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.requests
+	}
+	return &inst.reqCount
+}
+
+func (inst *ProxyInstance) trafficPendingRequests() *atomic.Int64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.pendingRequest
+	}
+	return &inst.pendingRequests
 }
 
 type ProxyManager struct {
@@ -104,7 +164,7 @@ func (pm *ProxyManager) ProxyRuntimeStats() []ProxyRuntimeStat {
 		if inst == nil || inst.Site.ID <= 0 {
 			continue
 		}
-		stats = append(stats, ProxyRuntimeStat{SiteID: inst.Site.ID, CumulativeBytesIn: inst.cumulativeBytesIn.Load(), CumulativeBytesOut: inst.cumulativeBytesOut.Load(), Requests: inst.reqCount.Load()})
+		stats = append(stats, ProxyRuntimeStat{SiteID: inst.Site.ID, CumulativeBytesIn: inst.trafficCumulativeIn().Load(), CumulativeBytesOut: inst.trafficCumulativeOut().Load(), Requests: inst.trafficRequests().Load()})
 	}
 	return stats
 }

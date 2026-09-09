@@ -133,16 +133,16 @@ func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) error {
 // pending counters are zeroed first, the baseline moves only after the DB
 // transaction commits, and all counters are restored verbatim on any error.
 func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
-	in := inst.bytesIn.Swap(0)
-	out := inst.bytesOut.Swap(0)
-	requests := inst.pendingRequests.Swap(0)
+	in := inst.trafficBytesIn().Swap(0)
+	out := inst.trafficBytesOut().Swap(0)
+	requests := inst.trafficPendingRequests().Swap(0)
 	if in == 0 && out == 0 && requests == 0 {
 		return nil
 	}
 	if err := pm.database.addTrafficWithRequests(inst.Site.ID, in, out, requests); err != nil {
-		inst.bytesIn.Add(in)
-		inst.bytesOut.Add(out)
-		inst.pendingRequests.Add(requests)
+		inst.trafficBytesIn().Add(in)
+		inst.trafficBytesOut().Add(out)
+		inst.trafficPendingRequests().Add(requests)
 		return err
 	}
 	delta := in + out
@@ -155,7 +155,7 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	settings := pm.database.currentSystemSettings()
 	cycleStart := trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
 	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
-	if inst.trafficCycleMode == cycleMode && inst.trafficCycleStart.Equal(cycleStart) {
+	if !inst.trafficCycleAuthoritative && inst.trafficCycleMode == cycleMode && inst.trafficCycleStart.Equal(cycleStart) {
 		inst.trafficCycleUsage += trafficBillableBytes(cycleMode, in, out)
 	}
 	return nil
@@ -172,13 +172,13 @@ func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.T
 	// billing mode, and persisted baseline. Never replace those values with the
 	// Agent's local in-memory database defaults.
 	if inst.trafficCycleAuthoritative && (inst.trafficCycleMode == trafficBillingModeOutbound || inst.trafficCycleMode == trafficBillingModeBidirectional) {
-		localIn := inst.cumulativeBytesIn.Load() - inst.trafficAckedCumulativeIn
-		localOut := inst.cumulativeBytesOut.Load() - inst.trafficAckedCumulativeOut
+		localIn := inst.trafficCumulativeIn().Load() - inst.trafficAckedCumulativeIn
+		localOut := inst.trafficCumulativeOut().Load() - inst.trafficAckedCumulativeOut
 		if localIn < 0 {
-			localIn = inst.cumulativeBytesIn.Load()
+			localIn = inst.trafficCumulativeIn().Load()
 		}
 		if localOut < 0 {
-			localOut = inst.cumulativeBytesOut.Load()
+			localOut = inst.trafficCumulativeOut().Load()
 		}
 		return inst.trafficCycleUsage + trafficBillableBytes(inst.trafficCycleMode, localIn, localOut), nil
 	}
@@ -193,10 +193,10 @@ func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.T
 		inst.trafficCycleStart = cycleStart
 		inst.trafficCycleMode = cycleMode
 		inst.trafficCycleUsage = persisted
-		inst.trafficAckedCumulativeIn = inst.cumulativeBytesIn.Load()
-		inst.trafficAckedCumulativeOut = inst.cumulativeBytesOut.Load()
+		inst.trafficAckedCumulativeIn = inst.trafficCumulativeIn().Load()
+		inst.trafficAckedCumulativeOut = inst.trafficCumulativeOut().Load()
 	}
-	return inst.trafficCycleUsage + trafficBillableBytes(cycleMode, inst.bytesIn.Load(), inst.bytesOut.Load()), nil
+	return inst.trafficCycleUsage + trafficBillableBytes(cycleMode, inst.trafficBytesIn().Load(), inst.trafficBytesOut().Load()), nil
 }
 
 func (inst *ProxyInstance) persistedDirections() (int64, int64) {
@@ -332,13 +332,13 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 	snap.Running = inst.isOperational()
 	persistedIn, persistedOut = inst.persistedDirections()
 	snap.PersistedTraffic = trafficBillableBytes(billingMode, persistedIn, persistedOut)
-	snap.BytesIn = inst.bytesIn.Load()
-	snap.BytesOut = inst.bytesOut.Load()
-	snap.CumulativeBytesIn = inst.cumulativeBytesIn.Load()
-	snap.CumulativeBytesOut = inst.cumulativeBytesOut.Load()
+	snap.BytesIn = inst.trafficBytesIn().Load()
+	snap.BytesOut = inst.trafficBytesOut().Load()
+	snap.CumulativeBytesIn = inst.trafficCumulativeIn().Load()
+	snap.CumulativeBytesOut = inst.trafficCumulativeOut().Load()
 	snap.TrafficUsed = snap.PersistedTraffic + trafficBillableBytes(billingMode, snap.BytesIn, snap.BytesOut)
-	snap.Requests = inst.reqCount.Load()
-	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut, inst.pendingRequests.Load())
+	snap.Requests = inst.trafficRequests().Load()
+	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut, inst.trafficPendingRequests().Load())
 	return &TrafficHistory{Snapshot: snap, Logs: logs, BillingMode: billingMode}, nil
 }
 
@@ -355,12 +355,12 @@ func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
 		persistedIn, persistedOut := inst.persistedDirections()
 		billingMode := pm.database.currentSystemSettings().TrafficBillingMode
 		st.PersistedTraffic = trafficBillableBytes(billingMode, persistedIn, persistedOut)
-		st.BytesIn = inst.bytesIn.Load()
-		st.BytesOut = inst.bytesOut.Load()
-		st.CumulativeBytesIn = inst.cumulativeBytesIn.Load()
-		st.CumulativeBytesOut = inst.cumulativeBytesOut.Load()
+		st.BytesIn = inst.trafficBytesIn().Load()
+		st.BytesOut = inst.trafficBytesOut().Load()
+		st.CumulativeBytesIn = inst.trafficCumulativeIn().Load()
+		st.CumulativeBytesOut = inst.trafficCumulativeOut().Load()
 		st.TrafficUsed = st.PersistedTraffic + trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
-		st.Requests = inst.reqCount.Load()
+		st.Requests = inst.trafficRequests().Load()
 		inst.trafficMu.Unlock()
 	}
 }
@@ -499,7 +499,7 @@ func (pm *ProxyManager) GetSiteRuntime(id int64) (requests int64, startedAt time
 	if !ok {
 		return 0, time.Time{}, false, false
 	}
-	return inst.reqCount.Load(), inst.startedAt, inst.isOperational(), inst.portServing.Load()
+	return inst.trafficRequests().Load(), inst.startedAt, inst.isOperational(), inst.portServing.Load()
 }
 
 // GracefulShutdown stops all proxies gracefully

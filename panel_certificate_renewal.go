@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -117,7 +118,9 @@ func renewEdgeCertificatesIfDue(ctx context.Context, db *DB, manager *panelCerti
 			continue
 		}
 		nodeCtx, cancel := context.WithTimeout(ctx, edgeCertificateRenewalTimeout)
-		changed, ensureErr := ensureEdgeCertificateForNode(nodeCtx, settings, token, manager, node)
+		changed, ensureErr := ensureEdgeCertificateForNodeGuarded(nodeCtx, settings, token, manager, node, &db.nodeTLSMutationMu, func() error {
+			return verifyEdgeCertificateNodeStillEnrolled(db, node)
+		})
 		cancel()
 		if ensureErr != nil {
 			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, ensureErr))
@@ -135,6 +138,10 @@ func renewEdgeCertificatesIfDue(ctx context.Context, db *DB, manager *panelCerti
 // node's certificate. A valid pair is reused, preventing an administrator
 // retry or a scheduler tick from needlessly consuming ACME issuance quota.
 func ensureEdgeCertificateForNode(ctx context.Context, settings PanelSettings, token string, manager *panelCertificateManager, node ControlNode) (bool, error) {
+	return ensureEdgeCertificateForNodeGuarded(ctx, settings, token, manager, node, nil, nil)
+}
+
+func ensureEdgeCertificateForNodeGuarded(ctx context.Context, settings PanelSettings, token string, manager *panelCertificateManager, node ControlNode, mutationMu *sync.Mutex, verify func() error) (bool, error) {
 	if manager == nil || !edgeCertificateRequired(node) || strings.TrimSpace(node.GUID) == "" {
 		return false, nil
 	}
@@ -158,11 +165,34 @@ func ensureEdgeCertificateForNode(ctx context.Context, settings PanelSettings, t
 	if issueErr != nil {
 		return false, issueErr
 	}
+	if mutationMu != nil {
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
+	}
+	if verify != nil {
+		if verifyErr := verify(); verifyErr != nil {
+			return false, verifyErr
+		}
+	}
 	if installErr := installCertificatePairAtomic(certFile, keyFile, issued.certPEM, issued.keyPEM); installErr != nil {
 		return false, installErr
 	}
 	log.Printf("[edge-certificate] certificate provisioned for node %s (%s + %s)", node.Name, wildcard, uniqueHost)
 	return true, nil
+}
+
+func verifyEdgeCertificateNodeStillEnrolled(db *DB, expected ControlNode) error {
+	if db == nil || expected.ID <= 0 || strings.TrimSpace(expected.GUID) == "" {
+		return errNodeNotFound
+	}
+	current, err := db.controlNodeByID(expected.ID, time.Now())
+	if err != nil {
+		return err
+	}
+	if current.GUID != expected.GUID || !current.Enabled || current.EnrolledAtMS <= 0 || current.agentTokenHash == "" {
+		return errors.New("node is no longer enrolled")
+	}
+	return nil
 }
 
 func provisionEdgeCertificateForNode(ctx context.Context, db *DB, manager *panelCertificateManager, node ControlNode) error {
@@ -183,7 +213,9 @@ func provisionEdgeCertificateForNode(ctx context.Context, db *DB, manager *panel
 	if err != nil {
 		return errors.New("无法解密已保存的 DNS API Token")
 	}
-	changed, err := ensureEdgeCertificateForNode(ctx, settings, token, manager, node)
+	changed, err := ensureEdgeCertificateForNodeGuarded(ctx, settings, token, manager, node, &db.nodeTLSMutationMu, func() error {
+		return verifyEdgeCertificateNodeStillEnrolled(db, node)
+	})
 	if err != nil || !changed {
 		return err
 	}

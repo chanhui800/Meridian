@@ -663,14 +663,24 @@ func (d *DB) markAgentConfigDirty(nodeID int64) error {
 	if d == nil || d.db == nil || nodeID <= 0 {
 		return nil
 	}
-	_, err := d.db.Exec(`UPDATE control_nodes SET
+	result, err := d.db.Exec(`UPDATE control_nodes SET
 		config_revision=config_revision+1,
 		desired_config_hash='',
 		desired_config_revision=0,
 		config_dirty=1,
 		updated_at_ms=?
 		WHERE id=? AND enabled=1 AND agent_token_hash<>''`, time.Now().UnixMilli(), nodeID)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return errNodeNotFound
+	}
+	return nil
 }
 
 func (d *DB) UpdateNodeScheduler(mode string, manualNodeID int64, now time.Time) (NodeControlSnapshot, error) {
@@ -805,6 +815,8 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 }
 
 func (d *DB) DeleteControlNode(id int64) error {
+	d.nodeTLSMutationMu.Lock()
+	defer d.nodeTLSMutationMu.Unlock()
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -848,13 +860,19 @@ func (d *DB) DeleteControlNode(id int64) error {
 	}
 	// The database deletion is authoritative. Complete the cleanup immediately
 	// when possible; failures remain durable for the scheduler retry loop.
-	if err := d.retryNodeTLSCleanup(guid); err != nil {
+	if err := d.retryNodeTLSCleanupUnlocked(guid); err != nil {
 		log.Printf("[node] removed node %d but managed Edge TLS cleanup is pending: %v", id, err)
 	}
 	return nil
 }
 
 func (d *DB) retryNodeTLSCleanup(onlyGUID string) error {
+	d.nodeTLSMutationMu.Lock()
+	defer d.nodeTLSMutationMu.Unlock()
+	return d.retryNodeTLSCleanupUnlocked(onlyGUID)
+}
+
+func (d *DB) retryNodeTLSCleanupUnlocked(onlyGUID string) error {
 	if d == nil || d.db == nil {
 		return nil
 	}
