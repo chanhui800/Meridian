@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 43
+	databaseSchemaVersion = 44
 )
 
 func (d *DB) migrate() error {
@@ -452,6 +452,8 @@ func (d *DB) migrateOnce() error {
 		public_host TEXT NOT NULL DEFAULT '',
 		expires_at_ms INTEGER NOT NULL,
 		created_at_ms INTEGER NOT NULL,
+		acked_at_ms INTEGER NOT NULL DEFAULT 0,
+		finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY(site_id,node_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
@@ -481,6 +483,8 @@ func (d *DB) migrateOnce() error {
 		site_id INTEGER NOT NULL,
 		public_host TEXT NOT NULL DEFAULT '',
 		created_at_ms INTEGER NOT NULL,
+		acked_at_ms INTEGER NOT NULL DEFAULT 0,
+		finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY(node_id,site_id)
 	) WITHOUT ROWID;
 	`); err != nil {
@@ -1190,6 +1194,8 @@ func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
 	defer rows.Close()
 	var sitePK, nodePK int
 	hasPublicHost := false
+	hasAckedAt := false
+	hasFinalizationExpiry := false
 	for rows.Next() {
 		var cid int
 		var name, columnType string
@@ -1205,12 +1211,26 @@ func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
 			nodePK = pk
 		case "public_host":
 			hasPublicHost = true
+		case "acked_at_ms":
+			hasAckedAt = true
+		case "finalization_expires_at_ms":
+			hasFinalizationExpiry = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	if sitePK == 1 && nodePK == 2 && hasPublicHost {
+		if !hasAckedAt {
+			if _, err := conn.ExecContext(ctx, "ALTER TABLE site_node_drains ADD COLUMN acked_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+		}
+		if !hasFinalizationExpiry {
+			if _, err := conn.ExecContext(ctx, "ALTER TABLE site_node_drains ADD COLUMN finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if _, err := conn.ExecContext(ctx, `
@@ -1220,10 +1240,12 @@ func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
 			public_host TEXT NOT NULL DEFAULT '',
 			expires_at_ms INTEGER NOT NULL,
 			created_at_ms INTEGER NOT NULL,
+			acked_at_ms INTEGER NOT NULL DEFAULT 0,
+			finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(site_id,node_id)
 		);
-		INSERT OR REPLACE INTO site_node_drains_new(site_id,node_id,public_host,expires_at_ms,created_at_ms)
-			SELECT d.site_id,d.node_id,LOWER(TRIM(COALESCE(s.public_host,''))),d.expires_at_ms,d.created_at_ms
+		INSERT OR REPLACE INTO site_node_drains_new(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms)
+			SELECT d.site_id,d.node_id,LOWER(TRIM(COALESCE(s.public_host,''))),d.expires_at_ms,d.created_at_ms,0,0
 			FROM site_node_drains d LEFT JOIN sites s ON s.id=d.site_id;
 		DROP TABLE site_node_drains;
 		ALTER TABLE site_node_drains_new RENAME TO site_node_drains;
@@ -1264,6 +1286,16 @@ func ensureAgentRouteRevocationsSchema(ctx context.Context, conn *sql.Conn) erro
 			return err
 		}
 	}
+	if !columns["acked_at_ms"] {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE agent_route_revocations ADD COLUMN acked_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	if !columns["finalization_expires_at_ms"] {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE agent_route_revocations ADD COLUMN finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
 	// Existing releases declared a sites foreign key. Rebuild the table when
 	// that legacy definition is present; SQLite has no ALTER TABLE DROP FK.
 	fkRows, err := conn.QueryContext(ctx, "PRAGMA foreign_key_list('agent_route_revocations')")
@@ -1298,10 +1330,12 @@ func ensureAgentRouteRevocationsSchema(ctx context.Context, conn *sql.Conn) erro
 			site_id INTEGER NOT NULL,
 			public_host TEXT NOT NULL DEFAULT '',
 			created_at_ms INTEGER NOT NULL,
+			acked_at_ms INTEGER NOT NULL DEFAULT 0,
+			finalization_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(node_id,site_id)
 		) WITHOUT ROWID;
-		INSERT OR REPLACE INTO agent_route_revocations_new(node_id,site_id,public_host,created_at_ms)
-			SELECT r.node_id,r.site_id,LOWER(TRIM(COALESCE(r.public_host,s.public_host,''))),r.created_at_ms
+		INSERT OR REPLACE INTO agent_route_revocations_new(node_id,site_id,public_host,created_at_ms,acked_at_ms,finalization_expires_at_ms)
+			SELECT r.node_id,r.site_id,LOWER(TRIM(COALESCE(r.public_host,s.public_host,''))),r.created_at_ms,0,0
 			FROM agent_route_revocations r LEFT JOIN sites s ON s.id=r.site_id;
 		DROP TABLE agent_route_revocations;
 		ALTER TABLE agent_route_revocations_new RENAME TO agent_route_revocations;

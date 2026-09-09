@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,11 @@ const (
 	// the long TTL prevents a long-lived playback from losing billable traffic
 	// while still bounding stale authorization after an Agent disappears.
 	siteNodeDrainWindow = 24 * time.Hour
+	// Legacy Agents do not understand ForceStopSiteIDs. Give an updated Agent
+	// a bounded opportunity to self-upgrade; if it keeps reporting an old (or
+	// unknown) version while a revocation is pending, the whole Agent
+	// credential is revoked so the old data-plane listener cannot drain forever.
+	legacyForceStopGrace = 10 * time.Minute
 )
 
 type SiteNodeSchedule struct {
@@ -809,6 +815,37 @@ func readBoundedPrivateFile(path string) (string, error) {
 	return string(data), nil
 }
 
+// readNodeEdgeCertificatePair snapshots one complete Edge certificate
+// generation. The current directory is resolved once before either file is
+// opened, so cert and key are read from the same immutable generation even if
+// renewal atomically switches the current symlink immediately afterwards. The
+// caller holds nodeTLSMutationMu while constructing a config transaction.
+func (a *App) readNodeEdgeCertificatePair(nodeGUID string) (string, string, error) {
+	if a == nil || a.db == nil || a.panelCertificates == nil {
+		return "", "", errors.New("edge TLS certificate is unavailable")
+	}
+	certFile, keyFile, err := a.panelCertificates.nodeEdgeTLSPaths(nodeGUID)
+	if err != nil {
+		return "", "", err
+	}
+	if resolvedDir, resolveErr := filepath.EvalSymlinks(filepath.Dir(certFile)); resolveErr == nil {
+		certFile = filepath.Join(resolvedDir, filepath.Base(certFile))
+		keyFile = filepath.Join(resolvedDir, filepath.Base(keyFile))
+	}
+	certPEM, err := readBoundedPrivateFile(certFile)
+	if err != nil {
+		return "", "", fmt.Errorf("read edge TLS certificate: %w", err)
+	}
+	keyPEM, err := readBoundedPrivateFile(keyFile)
+	if err != nil {
+		return "", "", fmt.Errorf("read edge TLS private key: %w", err)
+	}
+	if _, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM)); err != nil {
+		return "", "", fmt.Errorf("edge TLS certificate/key pair is invalid: %w", err)
+	}
+	return certPEM, keyPEM, nil
+}
+
 func (a *App) buildAgentConfig(token string, now time.Time) (AgentRuntimeConfig, error) {
 	return a.buildAgentConfigForPlatform(token, now, "")
 }
@@ -847,6 +884,12 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if _, probeErr := decodeNodeProbeSecret(probeSecretText); probeErr != nil {
 		return AgentRuntimeConfig{}, probeErr
 	}
+	// Keep lock ordering consistent with certificate renewal/cleanup: acquire
+	// the TLS mutation lock before opening the SQLite snapshot transaction. This
+	// prevents a renewal from holding the lock while waiting for the sole DB
+	// connection as this function waits on the same lock.
+	a.db.nodeTLSMutationMu.Lock()
+	defer a.db.nodeTLSMutationMu.Unlock()
 	// Hold one SQLite read/write transaction for the route snapshot and the
 	// desired-hash publication below. This prevents a site edit from being
 	// observed half-way through config construction.
@@ -968,23 +1011,9 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		return AgentRuntimeConfig{}, err
 	}
 	if len(routes) > 0 {
-		if a.panelCertificates == nil {
-			return AgentRuntimeConfig{}, errors.New("edge TLS certificate is unavailable")
-		}
-		edgeCertFile, edgeKeyFile, pathErr := a.panelCertificates.nodeEdgeTLSPaths(node.GUID)
-		if pathErr != nil {
-			return AgentRuntimeConfig{}, pathErr
-		}
-		config.CertificatePEM, err = readBoundedPrivateFile(edgeCertFile)
+		config.CertificatePEM, config.PrivateKeyPEM, err = a.readNodeEdgeCertificatePair(node.GUID)
 		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("read edge TLS certificate: %w", err)
-		}
-		config.PrivateKeyPEM, err = readBoundedPrivateFile(edgeKeyFile)
-		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("read edge TLS private key: %w", err)
-		}
-		if _, err := tls.X509KeyPair([]byte(config.CertificatePEM), []byte(config.PrivateKeyPEM)); err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("edge TLS certificate/key pair is invalid: %w", err)
+			return AgentRuntimeConfig{}, err
 		}
 	}
 	config.ConfigHash, err = agentConfigHashForVersion(config, clientVersion)
@@ -1425,15 +1454,18 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	now := time.Now()
-	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
+	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE acked_at_ms>0 AND finalization_expires_at_ms>0 AND finalization_expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire node drains: %v", err)
 	}
-	// Revocation tombstones are deliberately retained after an Agent reports
-	// its config as applied so paginated tail telemetry remains authorized. The
-	// same bounded window used for drains is the cleanup boundary; expiry also
-	// removes ForceStop commands from the next config snapshot naturally.
-	if _, err := a.db.db.Exec("DELETE FROM agent_route_revocations WHERE created_at_ms>0 AND created_at_ms+?<=?", siteNodeDrainWindow.Milliseconds(), now.UnixMilli()); err != nil {
+	// Revocation tombstones are retained until the Agent has acknowledged the
+	// exact config revision carrying ForceStop. The finalization window starts
+	// at that acknowledgement, so an offline Agent cannot lose the command just
+	// because a wall-clock TTL elapsed while it was disconnected.
+	if _, err := a.db.db.Exec("DELETE FROM agent_route_revocations WHERE acked_at_ms>0 AND finalization_expires_at_ms>0 AND finalization_expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire Agent route revocations: %v", err)
+	}
+	if err := a.revokeLegacyAgentsWithPendingForceStops(now); err != nil {
+		log.Printf("[node-scheduler] legacy Agent force-stop fallback failed: %v", err)
 	}
 	if _, err := a.db.db.Exec("DELETE FROM site_node_host_aliases WHERE expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire site host aliases: %v", err)
@@ -1479,6 +1511,75 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// revokeLegacyAgentsWithPendingForceStops is the compatibility safety net for
+// Agents older than v1.9.65. They ignore the site-level ForceStop command, so
+// retaining the tombstone alone cannot close an already admitted stream. The
+// Agent gets a bounded self-update grace period; if it still reports an old or
+// unknown version, removing its long-lived credential causes the existing
+// revoked-token path to quiesce the entire legacy listener on its next
+// control-plane request.
+func (a *App) revokeLegacyAgentsWithPendingForceStops(now time.Time) error {
+	if a == nil || a.db == nil || a.db.db == nil {
+		return nil
+	}
+	rows, err := a.db.db.Query(`SELECT DISTINCT n.id,n.agent_version
+		FROM control_nodes n
+		JOIN agent_route_revocations r ON r.node_id=n.id
+		WHERE n.enabled=1 AND n.agent_token_hash<>''
+		  AND r.acked_at_ms<=0
+		  AND r.created_at_ms>0
+		  AND r.created_at_ms+?<=?`, legacyForceStopGrace.Milliseconds(), now.UnixMilli())
+	if err != nil {
+		return err
+	}
+	type candidate struct {
+		id      int64
+		version string
+	}
+	candidates := make([]candidate, 0)
+	for rows.Next() {
+		var value candidate
+		if err := rows.Scan(&value.id, &value.version); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if !agentSupportsForceStop(value.version) {
+			candidates = append(candidates, value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, value := range candidates {
+		result, err := tx.Exec(`UPDATE control_nodes SET agent_token_hash='',
+			desired_config_hash='',desired_config_revision=0,config_dirty=1,updated_at_ms=?
+			WHERE id=? AND agent_token_hash<>''`, now.UnixMilli(), value.id)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed > 0 {
+			log.Printf("[node-scheduler] revoked legacy Agent credential for node %d pending site force-stop (version=%q)", value.id, strings.TrimSpace(value.version))
+		}
+	}
+	return tx.Commit()
 }
 
 func runSiteNodeScheduler(ctx context.Context, app *App) {

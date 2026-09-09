@@ -1100,7 +1100,7 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 		FROM agent_route_revocations r
 		LEFT JOIN sites s ON s.id=r.site_id
 		WHERE r.node_id=? AND s.id IS NOT NULL
-		  AND (r.created_at_ms<=0 OR r.created_at_ms+? > ?)`, nodeID, siteNodeDrainWindow.Milliseconds(), nowMS)
+		  AND (r.acked_at_ms<=0 OR r.finalization_expires_at_ms<=0 OR r.finalization_expires_at_ms > ?)`, nodeID, nowMS)
 	if err != nil {
 		return nil, err
 	}
@@ -1162,7 +1162,7 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 	// host as an alias so late events from an admitted old bundle remain valid.
 	drainRows, err := tx.Query(`SELECT d.site_id, LOWER(TRIM(d.public_host))
 		FROM site_node_drains d JOIN sites s ON s.id=d.site_id
-		WHERE d.node_id=? AND d.expires_at_ms>?`, nodeID, nowMS)
+		WHERE d.node_id=? AND (d.acked_at_ms<=0 OR d.finalization_expires_at_ms<=0 OR d.finalization_expires_at_ms > ?)`, nodeID, nowMS)
 	if err != nil {
 		return nil, err
 	}
@@ -1524,10 +1524,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var id, lastSequence, lastRX, lastTX int64
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID, desiredConfigHash, previousApplyError string
+	var lastBootID, lastSessionID, desiredConfigHash, previousApplyError, previousAgentVersion string
 	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1664,10 +1664,29 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			return nodeReportCommitResult{}, err
 		}
 	}
-	// A matching applied config only acknowledges the runtime transition. It
-	// does not acknowledge every paginated telemetry/event queue. Revocation
-	// tombstones remain available for the bounded drain window and are cleaned
-	// by expiry, preventing late pages from being discarded prematurely.
+	// A matching revision is the Agent's acknowledgement that it received the
+	// complete transition payload. Start the finalization window only then;
+	// commands and drain authorization must survive an offline Agent rather than
+	// expiring from their creation timestamp. Legacy Agents that do not support
+	// ForceStopSiteIDs stay pending and are handled by the scheduler fallback.
+	if clearAppliedConfig && report.AppliedConfigRevision > 0 {
+		ackMS := now.UnixMilli()
+		finalizeMS := now.Add(siteNodeDrainWindow).UnixMilli()
+		if _, err := tx.Exec(`UPDATE site_node_drains SET acked_at_ms=?,finalization_expires_at_ms=?
+			WHERE node_id=? AND acked_at_ms<=0`, ackMS, finalizeMS, id); err != nil {
+			return nodeReportCommitResult{}, err
+		}
+		effectiveAgentVersion := strings.TrimSpace(report.AgentVersion)
+		if effectiveAgentVersion == "" {
+			effectiveAgentVersion = strings.TrimSpace(previousAgentVersion)
+		}
+		if agentSupportsForceStop(effectiveAgentVersion) {
+			if _, err := tx.Exec(`UPDATE agent_route_revocations SET acked_at_ms=?,finalization_expires_at_ms=?
+				WHERE node_id=? AND acked_at_ms<=0`, ackMS, finalizeMS, id); err != nil {
+				return nodeReportCommitResult{}, err
+			}
+		}
+	}
 
 	for _, stat := range report.SiteStats {
 		host := strings.ToLower(strings.TrimSpace(stat.Host))
