@@ -558,8 +558,8 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 		return err
 	}
 	defer tx.Rollback()
-	var currentTargetURL, currentHeaders string
-	queryErr := tx.QueryRow("SELECT target_url, upstream_headers FROM sites WHERE id=?", site.ID).Scan(&currentTargetURL, &currentHeaders)
+	var currentTargetURL, currentHeaders, currentPublicHost string
+	queryErr := tx.QueryRow("SELECT target_url, upstream_headers, public_host FROM sites WHERE id=?", site.ID).Scan(&currentTargetURL, &currentHeaders, &currentPublicHost)
 	if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
 		return queryErr
 	}
@@ -578,6 +578,51 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 			// encrypted v2 values for the new authority; unchanged ciphertext is
 			// always cleared here, even if a caller bypasses the handler checks.
 			site.StoredUpstreamHeaders = "[]"
+		}
+	}
+	// Keep the former public host as a short-lived alias for nodes that may
+	// still have buffered events from the previous Agent route. This is
+	// site-specific authorization state; the old host is never accepted for a
+	// different site and the alias expires automatically.
+	oldHost := strings.ToLower(strings.TrimSpace(currentPublicHost))
+	newHost := strings.ToLower(strings.TrimSpace(site.PublicHost))
+	if oldHost != "" && oldHost != newHost {
+		aliasRows, aliasErr := tx.Query(`SELECT desired_node_id, applied_node_id
+			FROM site_node_schedules WHERE site_id=?`, site.ID)
+		if aliasErr != nil {
+			return aliasErr
+		}
+		var nodeIDs []int64
+		for aliasRows.Next() {
+			var desiredID, appliedID sql.NullInt64
+			if scanErr := aliasRows.Scan(&desiredID, &appliedID); scanErr != nil {
+				aliasRows.Close()
+				return scanErr
+			}
+			for _, value := range []sql.NullInt64{desiredID, appliedID} {
+				if !value.Valid || value.Int64 <= 0 {
+					continue
+				}
+				nodeIDs = append(nodeIDs, value.Int64)
+			}
+		}
+		if rowsErr := aliasRows.Err(); rowsErr != nil {
+			aliasRows.Close()
+			return rowsErr
+		}
+		aliasRows.Close()
+		nowAlias := time.Now()
+		seenNodes := make(map[int64]struct{})
+		for _, nodeID := range nodeIDs {
+			if _, seen := seenNodes[nodeID]; seen {
+				continue
+			}
+			seenNodes[nodeID] = struct{}{}
+			if _, execErr := tx.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms)
+				VALUES(?,?,?,?,?) ON CONFLICT(site_id,node_id,public_host) DO UPDATE SET expires_at_ms=excluded.expires_at_ms,created_at_ms=excluded.created_at_ms`,
+				site.ID, nodeID, oldHost, nowAlias.Add(siteNodeDrainWindow).UnixMilli(), nowAlias.UnixMilli()); execErr != nil {
+				return execErr
+			}
 		}
 	}
 	dynamicEnabled := sqliteBool(site.DynamicDiscoveryEnabled)
@@ -696,6 +741,10 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 		return err
 	}
 	defer tx.Rollback()
+	var fixedNodeID, desiredNodeID, appliedNodeID sql.NullInt64
+	if err := tx.QueryRow("SELECT fixed_node_id,desired_node_id,applied_node_id FROM site_node_schedules WHERE site_id=?", id).Scan(&fixedNodeID, &desiredNodeID, &appliedNodeID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	result, err := tx.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", value, id)
 	if err != nil {
 		return err
@@ -714,6 +763,20 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 			updated_at_ms=?
 		WHERE site_id=?`, value, nowMS, nowMS, id); err != nil {
 		return err
+	}
+	if enabled {
+		if _, err := tx.Exec("DELETE FROM agent_route_revocations WHERE site_id=?", id); err != nil {
+			return err
+		}
+	} else {
+		for _, value := range []sql.NullInt64{fixedNodeID, desiredNodeID, appliedNodeID} {
+			if !value.Valid || value.Int64 <= 0 {
+				continue
+			}
+			if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,created_at_ms) VALUES(?,?,?)", value.Int64, id, time.Now().UnixMilli()); err != nil {
+				return err
+			}
+		}
 	}
 	if err := markAgentConfigsDirtyForSiteTx(tx, id); err != nil {
 		return err

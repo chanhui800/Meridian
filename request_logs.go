@@ -436,6 +436,16 @@ func pruneRequestLogsTx(tx *sql.Tx, now time.Time, retention time.Duration) erro
 	if _, err := tx.Exec("DELETE FROM request_logs WHERE recorded_at_ms<?", cutoffMS); err != nil {
 		return err
 	}
+	if retention < 24*time.Hour {
+		retention = 24 * time.Hour
+	}
+	// The event ledger is only a replay/deduplication window. Keep pending
+	// (processed_at_ms=0) rows forever, but retire acknowledged identities after
+	// the request-log retention plus one extra day so an offline Agent can replay
+	// safely without allowing the table to grow without bound.
+	if _, err := tx.Exec(`DELETE FROM node_request_events WHERE processed_at_ms>0 AND received_at_ms<?`, now.Add(-retention-24*time.Hour).UnixMilli()); err != nil {
+		return err
+	}
 	_, err := tx.Exec(`
 		DELETE FROM request_logs
 		WHERE id IN (

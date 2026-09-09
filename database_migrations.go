@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 40
+	databaseSchemaVersion = 42
 )
 
 func (d *DB) migrate() error {
@@ -447,12 +447,26 @@ func (d *DB) migrateOnce() error {
 	-- to report already-admitted stream traffic. This is Controller-owned
 	-- lifecycle state, never an external TLS/DNS namespace.
 	CREATE TABLE IF NOT EXISTS site_node_drains (
-		site_id INTEGER PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		public_host TEXT NOT NULL DEFAULT '',
 		expires_at_ms INTEGER NOT NULL,
-		created_at_ms INTEGER NOT NULL
+		created_at_ms INTEGER NOT NULL,
+		PRIMARY KEY(site_id,node_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
+	-- Former public hosts remain accepted for a short period while an Agent
+	-- drains a previously applied route. This is separate from DNS/node drains
+	-- because a site rename can happen without a node move.
+	CREATE TABLE IF NOT EXISTS site_node_host_aliases (
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		public_host TEXT NOT NULL,
+		expires_at_ms INTEGER NOT NULL,
+		created_at_ms INTEGER NOT NULL,
+		PRIMARY KEY(site_id,node_id,public_host)
+	);
+	CREATE INDEX IF NOT EXISTS idx_site_node_host_aliases_node_expiry ON site_node_host_aliases(node_id,expires_at_ms);
 	CREATE TABLE IF NOT EXISTS node_tls_cleanup_jobs (
 		node_guid TEXT PRIMARY KEY,
 		created_at_ms INTEGER NOT NULL,
@@ -460,6 +474,12 @@ func (d *DB) migrateOnce() error {
 		last_error TEXT NOT NULL DEFAULT '',
 		updated_at_ms INTEGER NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS agent_route_revocations (
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		created_at_ms INTEGER NOT NULL,
+		PRIMARY KEY(node_id,site_id)
+	) WITHOUT ROWID;
 	`); err != nil {
 		return err
 	}
@@ -823,6 +843,9 @@ func (d *DB) migrateOnce() error {
 	) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS idx_node_request_events_received ON node_request_events(received_at_ms);`); err != nil {
 		return err
 	}
+	if err := ensureSiteNodeDrainsSchema(ctx, conn); err != nil {
+		return err
+	}
 	var eventUIDColumnCount int
 	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_request_events') WHERE name=?", "event_uid").Scan(&eventUIDColumnCount); err != nil {
 		return err
@@ -1145,6 +1168,62 @@ func ensurePanelSettingsListenPortSchema(ctx context.Context, conn *sql.Conn) er
 		if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ensureSiteNodeDrainsSchema upgrades the original site_id-only drain table to
+// a per-site/per-node ledger. A fast A→B→C sequence must retain both A and B
+// until their admitted streams have delivered a final snapshot. The migration
+// also captures the former public host for late request events.
+func ensureSiteNodeDrainsSchema(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, "PRAGMA table_info('site_node_drains')")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var sitePK, nodePK int
+	hasPublicHost := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		switch name {
+		case "site_id":
+			sitePK = pk
+		case "node_id":
+			nodePK = pk
+		case "public_host":
+			hasPublicHost = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if sitePK == 1 && nodePK == 2 && hasPublicHost {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, `
+		CREATE TABLE site_node_drains_new (
+			site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+			node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+			public_host TEXT NOT NULL DEFAULT '',
+			expires_at_ms INTEGER NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			PRIMARY KEY(site_id,node_id)
+		);
+		INSERT OR REPLACE INTO site_node_drains_new(site_id,node_id,public_host,expires_at_ms,created_at_ms)
+			SELECT d.site_id,d.node_id,LOWER(TRIM(COALESCE(s.public_host,''))),d.expires_at_ms,d.created_at_ms
+			FROM site_node_drains d LEFT JOIN sites s ON s.id=d.site_id;
+		DROP TABLE site_node_drains;
+		ALTER TABLE site_node_drains_new RENAME TO site_node_drains;
+		CREATE INDEX IF NOT EXISTS idx_site_node_drains_node_expiry ON site_node_drains(node_id,expires_at_ms);
+	`); err != nil {
+		return fmt.Errorf("migrate site node drain ledger: %w", err)
 	}
 	return nil
 }

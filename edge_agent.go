@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -235,7 +236,10 @@ func (s *edgeEventStore) persistLocked() error {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, s.path)
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(s.path))
 }
 
 func newEdgeEventUID() (string, error) {
@@ -792,6 +796,7 @@ func (runtime *edgeAgentRuntime) telemetrySnapshot() (media []NodeMediaCount, re
 type edgeSiteStatsPending struct {
 	stats   []NodeSiteStat
 	current map[int64]ProxyRuntimeStat
+	final   map[int64]bool
 }
 
 func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
@@ -831,8 +836,18 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		}
 	}
 	pending.current = make(map[int64]ProxyRuntimeStat, len(counters))
+	pending.final = make(map[int64]bool)
 	pending.stats = make([]NodeSiteStat, 0, len(counters))
-	for centralID, counter := range counters {
+	centralIDs := make([]int64, 0, len(counters))
+	for centralID := range counters {
+		centralIDs = append(centralIDs, centralID)
+	}
+	sort.Slice(centralIDs, func(i, j int) bool { return centralIDs[i] < centralIDs[j] })
+	for _, centralID := range centralIDs {
+		counter := counters[centralID]
+		if len(pending.stats) >= maxNodeSiteStatsPerReport {
+			break
+		}
 		if centralID <= 0 || counter == nil {
 			continue
 		}
@@ -861,6 +876,16 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		observed.RequestCount = value.Requests
 		observed.BytesIn, observed.BytesOut = inDelta, outDelta
 		observed.CumulativeBytesIn, observed.CumulativeBytesOut = value.CumulativeBytesIn, value.CumulativeBytesOut
+		// A removed route is final only after all requests admitted by the old
+		// bundle have finished. The Controller uses this marker to retire the
+		// corresponding drain generation and ACK the counter before GC.
+		if bundle != nil && bundle.localSites != nil {
+			_, stillRouted := bundle.localSites[centralID]
+			observed.Final = !stillRouted && counter.pendingRequest.Load() == 0
+		}
+		if observed.Final {
+			pending.final[centralID] = true
+		}
 		if cacheErr == nil {
 			observed.CacheSizeBytes = cacheSizes[centralID]
 			observed.CacheSizeValid = true
@@ -909,6 +934,13 @@ func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPen
 		reported[siteID] = runtime.siteReported[siteID]
 	}
 	runtime.mu.Unlock()
+	finalAcked := make(map[int64]bool)
+	for siteID := range pending.final {
+		if acknowledged[siteID] {
+			finalAcked[siteID] = true
+		}
+	}
+	runtime.gcRetiredTrafficCounters(finalAcked)
 	// Move the ACK watermark into the live instances immediately. Otherwise a
 	// successful report would remain part of the local delta until the next
 	// config refresh and could be charged twice against a quota.
@@ -935,6 +967,36 @@ func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPen
 			inst.trafficAckedCumulativeOut = stat.CumulativeBytesOut
 			inst.trafficMu.Unlock()
 		}
+	}
+}
+
+// gcRetiredTrafficCounters releases process-stable counters only after the
+// Controller ACKed their final snapshot and no request remains admitted.
+func (runtime *edgeAgentRuntime) gcRetiredTrafficCounters(finalAcked map[int64]bool) {
+	if runtime == nil {
+		return
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	for siteID, counter := range runtime.trafficCounters {
+		if !finalAcked[siteID] {
+			continue
+		}
+		if counter == nil || counter.pendingRequest.Load() != 0 {
+			continue
+		}
+		if runtime.bundle != nil {
+			if _, ok := runtime.bundle.localSites[siteID]; ok {
+				continue
+			}
+		}
+		reported, ok := runtime.siteReported[siteID]
+		if !ok || reported.CumulativeBytesIn != counter.cumulativeIn.Load() || reported.CumulativeBytesOut != counter.cumulativeOut.Load() || reported.Requests != counter.requests.Load() {
+			continue
+		}
+		delete(runtime.trafficCounters, siteID)
+		delete(runtime.trafficHosts, siteID)
+		delete(runtime.siteReported, siteID)
 	}
 }
 
@@ -1331,19 +1393,23 @@ func (runtime *edgeAgentRuntime) getCertificate(*tls.ClientHelloInfo) (*tls.Cert
 	return certificate, nil
 }
 
-func (runtime *edgeAgentRuntime) stopServer() {
+func (runtime *edgeAgentRuntime) stopServer(force ...bool) {
 	runtime.mu.Lock()
 	server := runtime.server
 	runtime.server = nil
 	runtime.mu.Unlock()
 	if server != nil {
+		forceClose := true
+		if len(force) > 0 {
+			forceClose = force[0]
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		shutdownErr := server.Shutdown(ctx)
 		cancel()
 		// Shutdown closes the listener promptly, but may leave active handlers
 		// alive until the grace period expires. Close is idempotent and ensures a
 		// failed config transaction can never leave a listener bound to a port.
-		if shutdownErr != nil {
+		if shutdownErr != nil && forceClose {
 			_ = server.Close()
 		}
 	}
@@ -1468,7 +1534,9 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	needsListener := len(config.Routes) > 0
 	listenerChanged := oldState.port != config.HTTPSPort || (oldState.server == nil) != !needsListener
 	if listenerChanged {
-		runtime.stopServer()
+		// Closing the listener stops new connections, while a non-forcing
+		// shutdown leaves already admitted playback/WebSocket handlers alive.
+		runtime.stopServer(false)
 	}
 	runtime.mu.Lock()
 	runtime.nodeGUID = config.NodeGUID
@@ -1517,6 +1585,21 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
 	if oldState.bundle != nil {
+		if len(config.ForceStopSiteIDs) > 0 {
+			forced := make(map[int64]struct{}, len(config.ForceStopSiteIDs))
+			for _, centralID := range config.ForceStopSiteIDs {
+				for localID, identity := range oldState.bundle.localSites {
+					if identity.centralID == centralID {
+						forced[localID] = struct{}{}
+					}
+				}
+			}
+			if len(forced) > 0 {
+				forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				oldState.bundle.manager.ForceStopSites(forceCtx, forced)
+				forceCancel()
+			}
+		}
 		// Hot config changes are not a security revocation. Existing playback and
 		// WebSocket streams finish naturally; close() cancels them on shutdown.
 		runtime.beginBundleDrain(oldState.bundle)
@@ -1630,7 +1713,10 @@ func edgeSaveState(path string, state edgeAgentState) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 type edgeAPIError struct {

@@ -187,6 +187,9 @@ type NodeSiteStat struct {
 	// zero-byte cache. Older Agents omit the field and therefore never erase a
 	// previously known Controller value by reporting an unknown size.
 	CacheSizeValid bool `json:"cache_size_valid,omitempty"`
+	// Final marks the last snapshot for a route removed from an Agent bundle.
+	// The Controller retires only that node's drain generation after accepting it.
+	Final bool `json:"final,omitempty"`
 }
 
 type NodeMediaCount struct {
@@ -254,6 +257,7 @@ const maxNodeRequestEventResponseBodyBytes = 64 << 10
 const maxAgentReportBodyBytes = 2 << 20
 const maxNodeRequestEventsPerReport = 128
 const maxNodeTelemetryItemsPerReport = 128
+const maxNodeSiteStatsPerReport = 512
 
 func newNodeToken() (string, error) {
 	value := make([]byte, 32)
@@ -1043,8 +1047,9 @@ func validateNodeRequestEvent(event NodeRequestEvent) error {
 }
 
 type authorizedNodeSite struct {
-	ID         int64
-	PublicHost string
+	ID          int64
+	PublicHost  string
+	HostAliases map[string]struct{}
 }
 
 // authorizedNodeSitesTx is the single source of truth for report-side site
@@ -1056,11 +1061,10 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 		SELECT s.id, LOWER(TRIM(s.public_host))
 		FROM site_node_schedules n
 		JOIN sites s ON s.id=n.site_id
-		LEFT JOIN site_node_drains d ON d.site_id=n.site_id
 		WHERE n.enabled=1
 		  AND s.enabled=1
-		  AND (n.desired_node_id=? OR n.applied_node_id=? OR (d.node_id=? AND d.expires_at_ms>?))
-	`, nodeID, nodeID, nodeID, nowMS)
+		  AND (n.desired_node_id=? OR n.applied_node_id=?)
+	`, nodeID, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1071,9 +1075,76 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 		if err := rows.Scan(&site.ID, &site.PublicHost); err != nil {
 			return nil, err
 		}
+		site.HostAliases = map[string]struct{}{site.PublicHost: {}}
 		result[site.ID] = site
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Public-host renames do not create DNS drain rows. Keep old hosts as
+	// bounded aliases so events buffered by an Agent remain valid for the same
+	// site without widening authorization to another site.
+	aliasRows, err := tx.Query(`SELECT site_id, LOWER(TRIM(public_host))
+		FROM site_node_host_aliases
+		WHERE node_id=? AND expires_at_ms>?`, nodeID, nowMS)
+	if err != nil {
+		return nil, err
+	}
+	for aliasRows.Next() {
+		var siteID int64
+		var host string
+		if err := aliasRows.Scan(&siteID, &host); err != nil {
+			return nil, err
+		}
+		if host == "" {
+			continue
+		}
+		if site, ok := result[siteID]; ok {
+			if site.HostAliases == nil {
+				site.HostAliases = make(map[string]struct{})
+			}
+			site.HostAliases[host] = struct{}{}
+			result[siteID] = site
+		}
+	}
+	if err := aliasRows.Err(); err != nil {
+		aliasRows.Close()
+		return nil, err
+	}
+	if err := aliasRows.Close(); err != nil {
+		return nil, err
+	}
+	// A site may have multiple in-flight drain generations. Keep each former
+	// host as an alias so late events from an admitted old bundle remain valid.
+	drainRows, err := tx.Query(`SELECT d.site_id, LOWER(TRIM(d.public_host))
+		FROM site_node_drains d JOIN sites s ON s.id=d.site_id
+		WHERE d.node_id=? AND d.expires_at_ms>? AND s.enabled=1`, nodeID, nowMS)
+	if err != nil {
+		return nil, err
+	}
+	defer drainRows.Close()
+	for drainRows.Next() {
+		var siteID int64
+		var host string
+		if err := drainRows.Scan(&siteID, &host); err != nil {
+			return nil, err
+		}
+		if site, ok := result[siteID]; ok {
+			if site.HostAliases == nil {
+				site.HostAliases = make(map[string]struct{})
+			}
+			if host != "" {
+				site.HostAliases[host] = struct{}{}
+			}
+			result[siteID] = site
+		} else {
+			var currentHost string
+			if err := tx.QueryRow("SELECT LOWER(TRIM(public_host)) FROM sites WHERE id=? AND enabled=1", siteID).Scan(&currentHost); err == nil {
+				result[siteID] = authorizedNodeSite{ID: siteID, PublicHost: currentHost, HostAliases: map[string]struct{}{host: {}}}
+			}
+		}
+	}
+	return result, drainRows.Err()
 }
 
 func authorizedNodeSiteHost(sites map[int64]authorizedNodeSite, siteID int64, host string) bool {
@@ -1082,7 +1153,18 @@ func authorizedNodeSiteHost(sites map[int64]authorizedNodeSite, siteID int64, ho
 		return false
 	}
 	normalized := requestPublicHost(strings.TrimSpace(host))
-	return normalized != "" && strings.EqualFold(normalized, site.PublicHost)
+	if normalized == "" {
+		return false
+	}
+	if strings.EqualFold(normalized, site.PublicHost) {
+		return true
+	}
+	for alias := range site.HostAliases {
+		if strings.EqualFold(normalized, alias) {
+			return true
+		}
+	}
+	return false
 }
 
 // authorizedNodeSiteForStat accepts legacy Host-only reports but requires the
@@ -1276,6 +1358,9 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 			cacheSize = stat.CacheSizeBytes
 		}
 		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS)
+		if err == nil && stat.Final {
+			_, err = tx.Exec("DELETE FROM site_node_drains WHERE site_id=? AND node_id=?", siteID, nodeID)
+		}
 		return err
 	}
 	if err != nil {
@@ -1320,7 +1405,15 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 		cacheSize = stat.CacheSizeBytes
 	}
 	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,cache_size_bytes=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS, nodeID, siteID)
-	return err
+	if err != nil {
+		return err
+	}
+	if stat.Final {
+		if _, err := tx.Exec("DELETE FROM site_node_drains WHERE site_id=? AND node_id=?", siteID, nodeID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type nodeReportCommitResult struct {
@@ -1524,6 +1617,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	} else if appliedHash != "" && appliedHash == desiredHash {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_pending_since_ms=0,updated_at_ms=?
 			WHERE enabled=1 AND desired_node_id=? AND config_hash=? AND config_pending_since_ms>0`, now.UnixMilli(), id, appliedHash); err != nil {
+			return nodeReportCommitResult{}, err
+		}
+	}
+	if clearAppliedConfig {
+		if _, err := tx.Exec("DELETE FROM agent_route_revocations WHERE node_id=?", id); err != nil {
 			return nodeReportCommitResult{}, err
 		}
 	}

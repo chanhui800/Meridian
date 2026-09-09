@@ -55,6 +55,38 @@ func (pm *ProxyManager) StopSite(id int64) error {
 	return nil
 }
 
+// ForceStopSites closes only the explicitly revoked controller sites. It is
+// used for administrative disable/delete and credential revocation; ordinary
+// config migration uses DrainShutdown so admitted playback can finish.
+func (pm *ProxyManager) ForceStopSites(ctx context.Context, siteIDs map[int64]struct{}) {
+	if pm == nil || len(siteIDs) == 0 {
+		return
+	}
+	pm.lifecycleMu.Lock()
+	defer pm.lifecycleMu.Unlock()
+	pm.mu.RLock()
+	targets := make(map[int64]*ProxyInstance)
+	for localID, inst := range pm.proxies {
+		if inst != nil {
+			if _, ok := siteIDs[inst.Site.ID]; ok {
+				targets[localID] = inst
+			}
+		}
+	}
+	pm.mu.RUnlock()
+	for localID, inst := range targets {
+		if err := inst.shutdown(ctx); err != nil {
+			log.Printf("[%s] forced stop failed: %v", inst.Site.Name, err)
+			continue
+		}
+		pm.mu.Lock()
+		if pm.proxies[localID] == inst {
+			delete(pm.proxies, localID)
+		}
+		pm.mu.Unlock()
+	}
+}
+
 func (pm *ProxyManager) IsRunning(id int64) bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()

@@ -373,6 +373,45 @@ func TestBrokenProbeSecretCanBeRotatedWithStableJWT(t *testing.T) {
 	}
 }
 
+func TestAuthorizedNodeSiteAcceptsBufferedHostAfterRename(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "alias-node", Address: "203.0.113.90"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "alias-site", PublicHost: "old.alias.example", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=?, applied_node_id=? WHERE site_id=?", node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated := *site
+	updated.PublicHost = "new.alias.example"
+	if err := app.db.UpdateSiteRecord(updated); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := authorizedNodeSitesTx(tx, node.ID, time.Now().UnixMilli())
+	_ = tx.Rollback()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authorizedNodeSiteHost(allowed, site.ID, "new.alias.example") || !authorizedNodeSiteHost(allowed, site.ID, "old.alias.example") {
+		t.Fatalf("authorized hosts after rename = %#v", allowed[site.ID])
+	}
+	if authorizedNodeSiteHost(allowed, site.ID, "other.alias.example") {
+		t.Fatal("unrelated host was authorized")
+	}
+}
+
 func TestRefreshNodeEnrollmentPreservesRuntimeStateAndTrafficBaseline(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
