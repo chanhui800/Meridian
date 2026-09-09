@@ -742,7 +742,11 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 	}
 	defer tx.Rollback()
 	var fixedNodeID, desiredNodeID, appliedNodeID sql.NullInt64
+	var publicHost string
 	if err := tx.QueryRow("SELECT fixed_node_id,desired_node_id,applied_node_id FROM site_node_schedules WHERE site_id=?", id).Scan(&fixedNodeID, &desiredNodeID, &appliedNodeID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := tx.QueryRow("SELECT public_host FROM sites WHERE id=?", id).Scan(&publicHost); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	result, err := tx.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", value, id)
@@ -769,11 +773,30 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 			return err
 		}
 	} else {
-		for _, value := range []sql.NullInt64{fixedNodeID, desiredNodeID, appliedNodeID} {
-			if !value.Valid || value.Int64 <= 0 {
-				continue
-			}
-			if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,created_at_ms) VALUES(?,?,?)", value.Int64, id, time.Now().UnixMilli()); err != nil {
+		nodeIDs, err := siteNodeRevocationIDsTx(tx, id,
+			func() int64 {
+				if fixedNodeID.Valid {
+					return fixedNodeID.Int64
+				}
+				return 0
+			}(),
+			func() int64 {
+				if desiredNodeID.Valid {
+					return desiredNodeID.Int64
+				}
+				return 0
+			}(),
+			func() int64 {
+				if appliedNodeID.Valid {
+					return appliedNodeID.Int64
+				}
+				return 0
+			}())
+		if err != nil {
+			return err
+		}
+		for _, nodeID := range nodeIDs {
+			if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms) VALUES(?,?,?,?)", nodeID, id, strings.ToLower(strings.TrimSpace(publicHost)), time.Now().UnixMilli()); err != nil {
 				return err
 			}
 		}

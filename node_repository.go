@@ -187,6 +187,10 @@ type NodeSiteStat struct {
 	// zero-byte cache. Older Agents omit the field and therefore never erase a
 	// previously known Controller value by reporting an unknown size.
 	CacheSizeValid bool `json:"cache_size_valid,omitempty"`
+	// CounterEpoch changes when an Agent recreates a retired site counter. It
+	// lets the Controller distinguish an A→B→A route transition from a
+	// monotonic continuation of the old cumulative values.
+	CounterEpoch uint64 `json:"counter_epoch,omitempty"`
 	// Final marks the last snapshot for a route removed from an Agent bundle.
 	// The Controller retires only that node's drain generation after accepting it.
 	Final bool `json:"final,omitempty"`
@@ -255,6 +259,10 @@ const (
 const maxNodeRequestEventBodyBytes = 8 << 10
 const maxNodeRequestEventResponseBodyBytes = 64 << 10
 const maxAgentReportBodyBytes = 2 << 20
+
+// Leave headroom below the Controller's hard 2 MiB limit so an event batch is
+// accepted consistently by both the JSON HTTP fallback and WebSocket path.
+const targetAgentReportBytes = 1536 << 10
 const maxNodeRequestEventsPerReport = 128
 const maxNodeTelemetryItemsPerReport = 128
 const maxNodeSiteStatsPerReport = 512
@@ -1081,6 +1089,42 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// A disabled route remains authorized for the short finalization window
+	// represented by its revocation tombstone. This lets the Agent flush its
+	// last counters and queued events after ForceStop without reopening the
+	// route for scheduling. Deleted sites have no durable application state to
+	// update, so they are intentionally omitted here while the tombstone still
+	// drives the Agent-side force stop.
+	revocationRows, err := tx.Query(`SELECT r.site_id,
+		LOWER(TRIM(COALESCE(NULLIF(r.public_host,''),s.public_host,'')))
+		FROM agent_route_revocations r
+		LEFT JOIN sites s ON s.id=r.site_id
+		WHERE r.node_id=? AND s.id IS NOT NULL
+		  AND (r.created_at_ms<=0 OR r.created_at_ms+? > ?)`, nodeID, siteNodeDrainWindow.Milliseconds(), nowMS)
+	if err != nil {
+		return nil, err
+	}
+	for revocationRows.Next() {
+		var siteID int64
+		var host string
+		if err := revocationRows.Scan(&siteID, &host); err != nil {
+			revocationRows.Close()
+			return nil, err
+		}
+		if siteID <= 0 || host == "" {
+			continue
+		}
+		if _, exists := result[siteID]; !exists {
+			result[siteID] = authorizedNodeSite{ID: siteID, PublicHost: host, HostAliases: map[string]struct{}{host: {}}}
+		}
+	}
+	if err := revocationRows.Err(); err != nil {
+		revocationRows.Close()
+		return nil, err
+	}
+	if err := revocationRows.Close(); err != nil {
+		return nil, err
+	}
 	// Public-host renames do not create DNS drain rows. Keep old hosts as
 	// bounded aliases so events buffered by an Agent remain valid for the same
 	// site without widening authorization to another site.
@@ -1118,7 +1162,7 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 	// host as an alias so late events from an admitted old bundle remain valid.
 	drainRows, err := tx.Query(`SELECT d.site_id, LOWER(TRIM(d.public_host))
 		FROM site_node_drains d JOIN sites s ON s.id=d.site_id
-		WHERE d.node_id=? AND d.expires_at_ms>? AND s.enabled=1`, nodeID, nowMS)
+		WHERE d.node_id=? AND d.expires_at_ms>?`, nodeID, nowMS)
 	if err != nil {
 		return nil, err
 	}
@@ -1139,7 +1183,7 @@ func authorizedNodeSitesTx(tx *sql.Tx, nodeID, nowMS int64) (map[int64]authorize
 			result[siteID] = site
 		} else {
 			var currentHost string
-			if err := tx.QueryRow("SELECT LOWER(TRIM(public_host)) FROM sites WHERE id=? AND enabled=1", siteID).Scan(&currentHost); err == nil {
+			if err := tx.QueryRow("SELECT LOWER(TRIM(public_host)) FROM sites WHERE id=?", siteID).Scan(&currentHost); err == nil {
 				result[siteID] = authorizedNodeSite{ID: siteID, PublicHost: currentHost, HostAliases: map[string]struct{}{host: {}}}
 			}
 		}
@@ -1176,7 +1220,7 @@ func authorizedNodeSiteForStat(sites map[int64]authorizedNodeSite, stat NodeSite
 	}
 	host := requestPublicHost(strings.TrimSpace(stat.Host))
 	for _, site := range sites {
-		if strings.EqualFold(site.PublicHost, host) {
+		if authorizedNodeSiteHost(sites, site.ID, host) {
 			return site, true
 		}
 	}
@@ -1655,7 +1699,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			sessionID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID); err != nil {
 			return nodeReportCommitResult{}, err
 		}
-		if err := recordNodeSiteTrafficTx(tx, id, siteCounterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
+		statCounterEpoch := siteCounterEpoch
+		if stat.CounterEpoch > 0 {
+			statCounterEpoch = fmt.Sprintf("%s:%d", siteCounterEpoch, stat.CounterEpoch)
+		}
+		if err := recordNodeSiteTrafficTx(tx, id, statCounterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
 			return nodeReportCommitResult{}, err
 		}
 		appendUniqueNodeSiteID(&result.acceptedSiteIDs, scheduleID)

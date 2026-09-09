@@ -498,6 +498,135 @@ func TestRecordNodeReportResultRetiresInvalidEvents(t *testing.T) {
 	}
 }
 
+func TestRecordNodeReportRejectsUnauthorizedSiteData(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	nodeA, enrollmentA, err := app.db.CreateControlNode(NodeCreateInput{Name: "report-a", Address: "203.0.113.70"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tokenA, err := app.db.EnrollControlNode(enrollmentA, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeB, enrollmentB, err := app.db.CreateControlNode(NodeCreateInput{Name: "report-b", Address: "203.0.113.71"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollmentB, now); err != nil {
+		t.Fatal(err)
+	}
+	siteA, err := app.db.CreateSiteRecord(Site{Name: "report-site-a", ListenPort: 18083, PublicHost: "report-a.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	siteB, err := app.db.CreateSiteRecord(Site{Name: "report-site-b", ListenPort: 18084, PublicHost: "report-b.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18081"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []struct {
+		siteID, nodeID int64
+	}{
+		{siteA.ID, nodeA.ID},
+		{siteB.ID, nodeB.ID},
+	} {
+		if _, err := app.db.SaveSiteNodeSchedule(value.siteID, true, "fixed", value.nodeID, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=? WHERE site_id=?", value.nodeID, value.nodeID, value.siteID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := app.db.RecordNodeReportResult(tokenA, NodeReport{
+		BootID: "report", ReportSessionID: "report", CounterEpoch: "report-epoch", Sequence: 1, InterfaceName: "eth0",
+		SiteStats: []NodeSiteStat{
+			{SiteID: siteB.ID, Host: siteB.PublicHost, RequestCount: 2, BytesIn: 11, CumulativeBytesIn: 11, LastRequestAtMS: now.UnixMilli(), LastStatus: 200},
+			{SiteID: siteA.ID, Host: siteB.PublicHost, RequestCount: 3, LastRequestAtMS: now.UnixMilli(), LastStatus: 200},
+		},
+		MediaCounts:  []NodeMediaCount{{SiteID: siteB.ID, MovieCount: 99, SeriesCount: 99, EpisodeCount: 99, ObservedAtMS: now.UnixMilli()}},
+		Retention:    []NodeRetentionStatus{{SiteID: siteB.ID, ExpectedStartedAtMS: now.UnixMilli() - 1000, CompletedAtMS: now.UnixMilli()}},
+		Observations: []NodeDynamicObservation{{SiteID: siteB.ID, CanonicalAuthority: "https://cdn.example.com:443", Source: "hls", Decision: "denied", ReasonCode: "parse_failure", ObservedAtMS: now.UnixMilli()}},
+		Events: []NodeRequestEvent{
+			{EventID: 1, EventUID: strings.Repeat("a", 32), SiteID: siteB.ID, Host: siteB.PublicHost, Method: "GET", Path: "/Items", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+			{EventID: 2, EventUID: strings.Repeat("b", 32), SiteID: siteA.ID, Host: siteB.PublicHost, Method: "GET", Path: "/Items", StatusCode: 200, RecordedAtMS: now.UnixMilli()},
+		},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.AcceptedSiteIDs) != 0 || len(result.DiscardedSiteIDs) != 2 || len(result.DiscardedMediaSiteIDs) != 1 || len(result.DiscardedRetentionSiteIDs) != 1 || len(result.DiscardedObservationSiteIDs) != 1 || len(result.DiscardedEventIDs) != 2 {
+		t.Fatalf("unexpected authorization result: %#v", result)
+	}
+	var count int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM node_site_counters WHERE node_id=? AND site_id=?", nodeA.ID, siteB.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("unauthorized site stats created a counter")
+	}
+	if err := app.db.db.QueryRow("SELECT media_movie_count FROM sites WHERE id=?", siteB.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count == 99 {
+		t.Fatalf("unauthorized media count changed site B: %d", count)
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM dynamic_observations WHERE site_id=?", siteB.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("unauthorized observation was persisted")
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM node_request_events WHERE node_id=?", nodeA.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("unauthorized request event was persisted")
+	}
+}
+
+func TestRecordNodeReportAcceptsDisabledSiteFinalization(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "disabled-tail", Address: "203.0.113.72"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "disabled-tail-site", PublicHost: "disabled-tail.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18082"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=? WHERE site_id=?", node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.SetSiteEnabled(site.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	result, err := app.db.RecordNodeReportResult(token, NodeReport{
+		BootID: "disabled", ReportSessionID: "disabled", CounterEpoch: "disabled-epoch", Sequence: 1, InterfaceName: "eth0",
+		SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, RequestCount: 1, BytesIn: 17, CumulativeBytesIn: 17, LastRequestAtMS: now.UnixMilli(), LastStatus: 200}},
+	}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.AcceptedSiteIDs) != 1 || result.AcceptedSiteIDs[0] != site.ID {
+		t.Fatalf("disabled final stat was not accepted: %#v", result)
+	}
+	var used int64
+	if err := app.db.db.QueryRow("SELECT traffic_used FROM sites WHERE id=?", site.ID).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used != 17 {
+		t.Fatalf("disabled site final traffic=%d, want 17", used)
+	}
+}
+
 func TestControlNodePortValidation(t *testing.T) {
 	custom, err := normalizeNodeInput(NodeCreateInput{Name: "custom", Port: 9090})
 	if err != nil || custom.Port != 9090 {

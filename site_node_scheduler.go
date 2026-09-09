@@ -1419,6 +1419,37 @@ func runSiteNodeScheduler(ctx context.Context, app *App) {
 	}
 }
 
+func siteNodeRevocationIDsTx(tx *sql.Tx, siteID int64, nodeIDs ...int64) ([]int64, error) {
+	seen := make(map[int64]struct{})
+	result := make([]int64, 0, len(nodeIDs)+2)
+	for _, nodeID := range nodeIDs {
+		if nodeID > 0 {
+			if _, ok := seen[nodeID]; !ok {
+				seen[nodeID] = struct{}{}
+				result = append(result, nodeID)
+			}
+		}
+	}
+	rows, err := tx.Query("SELECT node_id FROM site_node_drains WHERE site_id=?", siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeID int64
+		if err := rows.Scan(&nodeID); err != nil {
+			return nil, err
+		}
+		if nodeID > 0 {
+			if _, ok := seen[nodeID]; !ok {
+				seen[nodeID] = struct{}{}
+				result = append(result, nodeID)
+			}
+		}
+	}
+	return result, rows.Err()
+}
+
 func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 	var exists int
 	if err := a.db.db.QueryRow("SELECT COUNT(*) FROM site_node_schedules WHERE site_id=?", siteID).Scan(&exists); err != nil {
@@ -1443,14 +1474,18 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, nodeID := range []int64{value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID} {
+	revocationIDs, err := siteNodeRevocationIDsTx(tx, siteID, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID)
+	if err != nil {
+		return err
+	}
+	for _, nodeID := range revocationIDs {
 		if nodeID > 0 {
-			if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,created_at_ms) VALUES(?,?,?)", nodeID, siteID, time.Now().UnixMilli()); err != nil {
+			if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms) VALUES(?,?,?,?)", nodeID, siteID, strings.ToLower(strings.TrimSpace(value.PublicHost)), time.Now().UnixMilli()); err != nil {
 				return err
 			}
 		}
 	}
-	if err := markAgentConfigsDirtyForNodeIDsTx(tx, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID); err != nil {
+	if err := markAgentConfigsDirtyForNodeIDsTx(tx, revocationIDs...); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), siteID); err != nil {
@@ -1483,10 +1518,32 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	if err != nil {
 		return err
 	}
+	drainSites := make(map[int64]struct{})
+	drainRows, drainErr := a.db.db.Query("SELECT site_id FROM site_node_drains WHERE node_id=?", nodeID)
+	if drainErr != nil {
+		return drainErr
+	}
+	for drainRows.Next() {
+		var siteID int64
+		if scanErr := drainRows.Scan(&siteID); scanErr != nil {
+			drainRows.Close()
+			return scanErr
+		}
+		drainSites[siteID] = struct{}{}
+	}
+	if drainErr := drainRows.Err(); drainErr != nil {
+		drainRows.Close()
+		return drainErr
+	}
+	if drainErr := drainRows.Close(); drainErr != nil {
+		return drainErr
+	}
 	affected := make([]SiteNodeSchedule, 0)
 	for _, value := range values {
 		if value.FixedNodeID != nodeID && value.DesiredNodeID != nodeID && value.AppliedNodeID != nodeID {
-			continue
+			if _, draining := drainSites[value.SiteID]; !draining {
+				continue
+			}
 		}
 		affected = append(affected, value)
 	}
@@ -1517,14 +1574,18 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	}
 	defer tx.Rollback()
 	for _, value := range affected {
-		for _, nodeID := range []int64{value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID} {
+		revocationIDs, revocationErr := siteNodeRevocationIDsTx(tx, value.SiteID, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID)
+		if revocationErr != nil {
+			return revocationErr
+		}
+		for _, nodeID := range revocationIDs {
 			if nodeID > 0 {
-				if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,created_at_ms) VALUES(?,?,?)", nodeID, value.SiteID, time.Now().UnixMilli()); err != nil {
+				if _, err := tx.Exec("INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms) VALUES(?,?,?,?)", nodeID, value.SiteID, strings.ToLower(strings.TrimSpace(value.PublicHost)), time.Now().UnixMilli()); err != nil {
 					return err
 				}
 			}
 		}
-		if err := markAgentConfigsDirtyForNodeIDsTx(tx, value.FixedNodeID, value.DesiredNodeID, value.AppliedNodeID); err != nil {
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, revocationIDs...); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), value.SiteID); err != nil {
