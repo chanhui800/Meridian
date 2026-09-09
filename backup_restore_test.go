@@ -386,6 +386,13 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	inboxEvent, err := json.Marshal(watchHistoryEvent{
+		SiteID: 1, SessionHash: "inbox-session", UpstreamItemID: "inbox-item",
+		EventType: "stop", ObservedAtMS: 2, TokenCiphertext: watchTokenCiphertext,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	watchDB, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -395,6 +402,10 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := watchDB.Exec(`INSERT INTO watch_sessions (site_id,media_item_id,session_hash,started_at_ms,last_seen_at_ms,token_ciphertext) VALUES (1,1,'watch-session',1,1,?)`, watchTokenCiphertext); err != nil {
+		watchDB.Close()
+		t.Fatal(err)
+	}
+	if _, err := watchDB.Exec(`INSERT INTO watch_history_inbox (site_id,session_hash,observed_at_ms,payload_json,created_at_ms) VALUES (1,'inbox-session',2,?,2)`, string(inboxEvent)); err != nil {
 		watchDB.Close()
 		t.Fatal(err)
 	}
@@ -480,6 +491,20 @@ func TestReencryptRestoredSecrets(t *testing.T) {
 	}
 	if _, err := decryptWatchHistoryTokenWithSecret(migratedWatchCiphertext, oldJWT); err == nil {
 		t.Fatal("old JWT secret still decrypts migrated watch history token")
+	}
+	var migratedInboxPayload string
+	if err := db.QueryRow("SELECT payload_json FROM watch_history_inbox WHERE session_hash='inbox-session'").Scan(&migratedInboxPayload); err != nil {
+		t.Fatal(err)
+	}
+	var migratedInboxEvent watchHistoryEvent
+	if err := json.Unmarshal([]byte(migratedInboxPayload), &migratedInboxEvent); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := decryptWatchHistoryTokenWithSecret(migratedInboxEvent.TokenCiphertext, newJWT); err != nil || value != "watch-token-value" {
+		t.Fatalf("watch history inbox token = %q, %v", value, err)
+	}
+	if _, err := decryptWatchHistoryTokenWithSecret(migratedInboxEvent.TokenCiphertext, oldJWT); err == nil {
+		t.Fatal("old JWT secret still decrypts migrated watch history inbox token")
 	}
 	var sessionVersion int
 	if err := db.QueryRow("SELECT session_version FROM users WHERE username='admin'").Scan(&sessionVersion); err != nil {

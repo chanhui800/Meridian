@@ -173,8 +173,9 @@ func TestEdgeProxyEnforcesControllerTrafficQuotaAfterConfigRefresh(t *testing.T)
 		t.Fatalf("build edge proxy: %v", err)
 	}
 	defer bundle.close()
+	runtime.mu.Lock()
 	runtime.bundle = bundle
-	runtime.syncSiteTrafficLimits(config)
+	runtime.mu.Unlock()
 	response := httptest.NewRecorder()
 	bundle.handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://quota.example.test/Items", nil))
 	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "traffic quota exceeded") {

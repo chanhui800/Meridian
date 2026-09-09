@@ -830,6 +830,55 @@ func TestEnqueueWatchHistoryNeverBlocksWhenQueueIsFull(t *testing.T) {
 	}
 }
 
+func TestPersistWatchHistoryInboxBatchCommitsAndUsesMetadata(t *testing.T) {
+	database := openWatchHistoryTestDB(t)
+	event := watchHistoryTestEvent(7, "inbox", time.Now().UnixMilli(), 100)
+	inserted, err := database.persistWatchHistoryInboxBatch([]watchHistoryEvent{event})
+	if err != nil || inserted != 1 {
+		t.Fatalf("persist inbox: inserted=%d err=%v", inserted, err)
+	}
+	var siteID int64
+	var sessionHash string
+	var observedAt int64
+	var payload string
+	if err := database.db.QueryRow("SELECT site_id,session_hash,observed_at_ms,payload_json FROM watch_history_inbox").Scan(&siteID, &sessionHash, &observedAt, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if siteID != event.SiteID || sessionHash != event.SessionHash || observedAt != event.ObservedAtMS || payload == "" {
+		t.Fatalf("inbox metadata = %d/%q/%d/%q, want event metadata", siteID, sessionHash, observedAt, payload)
+	}
+}
+
+func TestPersistWatchHistoryInboxBatchCommitsPartialBatchAtLimit(t *testing.T) {
+	database := openWatchHistoryTestDB(t)
+	payload := `{"SiteID":1,"SessionHash":"legacy","ObservedAtMS":1}`
+	tx, err := database.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < watchHistoryInboxLimit-1; i++ {
+		if _, err := tx.Exec("INSERT INTO watch_history_inbox(site_id,session_hash,observed_at_ms,payload_json,created_at_ms) VALUES(1,'legacy',1,?,1)", payload); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	events := []watchHistoryEvent{watchHistoryTestEvent(1, "first", 2, 100), watchHistoryTestEvent(1, "second", 3, 100)}
+	inserted, err := database.persistWatchHistoryInboxBatch(events)
+	if inserted != 1 || err == nil {
+		t.Fatalf("partial inbox batch = inserted:%d err:%v, want one committed row and full error", inserted, err)
+	}
+	var count int
+	if err := database.db.QueryRow("SELECT COUNT(*) FROM watch_history_inbox").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != watchHistoryInboxLimit {
+		t.Fatalf("inbox count=%d, want %d", count, watchHistoryInboxLimit)
+	}
+}
+
 func TestClearAndDeleteWatchHistoryRemoveChildrenWithoutForeignKeys(t *testing.T) {
 	database := openWatchHistoryTestDB(t)
 	site := createWatchHistoryTestSite(t, database, true)
@@ -845,6 +894,17 @@ func TestClearAndDeleteWatchHistoryRemoveChildrenWithoutForeignKeys(t *testing.T
 	}
 	if err := database.ClearWatchHistory(site.ID); err != nil {
 		t.Fatal(err)
+	}
+	queued := watchHistoryTestEvent(site.ID, "queued-before-clear", nowMS, 100)
+	if !database.persistWatchHistoryInbox(queued) {
+		t.Fatal("persist inbox event")
+	}
+	if err := database.ClearWatchHistory(site.ID); err != nil {
+		t.Fatal(err)
+	}
+	var inboxCount int
+	if err := database.db.QueryRow("SELECT COUNT(*) FROM watch_history_inbox WHERE site_id=?", site.ID).Scan(&inboxCount); err != nil || inboxCount != 0 {
+		t.Fatalf("inbox after clear: count=%d err=%v", inboxCount, err)
 	}
 	for _, table := range []string{"watch_sessions", "media_items", "tmdb_jobs", "tmdb_cache"} {
 		var count int

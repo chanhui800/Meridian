@@ -21,6 +21,7 @@ type DB struct {
 
 	dynamicObservationQueue     chan dynamicObservationCommand
 	dynamicObservationDone      chan struct{}
+	watchHistoryInboxWake       chan struct{}
 	dynamicObservationGate      sync.RWMutex
 	dynamicObservationCloseOnce sync.Once
 	dynamicObservationClosed    atomic.Bool
@@ -70,6 +71,7 @@ func openDB(path string) (*DB, error) {
 	}
 	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity+requestLogQueueCapacity+watchHistoryQueueCapacity)
 	d.dynamicObservationDone = make(chan struct{})
+	d.watchHistoryInboxWake = make(chan struct{}, 1)
 	go d.runDynamicObservationWriter()
 	return d, nil
 }

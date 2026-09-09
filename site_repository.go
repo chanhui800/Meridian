@@ -72,6 +72,14 @@ type Site struct {
 	// SQLite rows whenever a configuration is applied, so cache identity must
 	// come from the controller rather than the local row ID.
 	AssetCacheNamespace string `json:"-"`
+	// Agent runtime-only quota state. These values are populated from the
+	// Controller's route snapshot and never persisted in the site row.
+	runtimeTrafficCycleUsage         int64
+	runtimeTrafficCycleStartMS       int64
+	runtimeTrafficBillingMode        string
+	runtimeTrafficCycleConfigured    bool
+	runtimeTrafficAckedCumulativeIn  int64
+	runtimeTrafficAckedCumulativeOut int64
 }
 
 func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade, assetCacheEnabled, watchHistoryEnabled int) error {

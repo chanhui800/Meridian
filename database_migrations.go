@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 38
+	databaseSchemaVersion = 39
 )
 
 func (d *DB) migrate() error {
@@ -870,6 +871,9 @@ func (d *DB) migrateOnce() error {
 	}
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS watch_history_inbox (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		site_id INTEGER NOT NULL DEFAULT 0,
+		session_hash TEXT NOT NULL DEFAULT '',
+		observed_at_ms INTEGER NOT NULL DEFAULT 0,
 		payload_json TEXT NOT NULL,
 		created_at_ms INTEGER NOT NULL,
 		attempts INTEGER NOT NULL DEFAULT 0,
@@ -878,6 +882,56 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_watch_history_inbox_due ON watch_history_inbox(next_attempt_at_ms, id);`); err != nil {
 		return err
+	}
+	for _, migration := range []struct{ column, sql string }{
+		{"site_id", "ALTER TABLE watch_history_inbox ADD COLUMN site_id INTEGER NOT NULL DEFAULT 0"},
+		{"session_hash", "ALTER TABLE watch_history_inbox ADD COLUMN session_hash TEXT NOT NULL DEFAULT ''"},
+		{"observed_at_ms", "ALTER TABLE watch_history_inbox ADD COLUMN observed_at_ms INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var found int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('watch_history_inbox') WHERE name=?", migration.column).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	// Recover metadata for inbox rows created before the columns existed. Rows
+	// that are malformed remain marked with site_id=0 and will be discarded by
+	// the normal inbox validator rather than being assigned to an arbitrary site.
+	rows, err := conn.QueryContext(ctx, "SELECT id,payload_json FROM watch_history_inbox WHERE site_id=0 OR session_hash='' OR observed_at_ms=0")
+	if err != nil {
+		return err
+	}
+	type inboxMetadata struct {
+		id    int64
+		event watchHistoryEvent
+	}
+	metadata := make([]inboxMetadata, 0)
+	for rows.Next() {
+		var item inboxMetadata
+		var payload string
+		if err := rows.Scan(&item.id, &payload); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := json.Unmarshal([]byte(payload), &item.event); err == nil && item.event.SiteID > 0 && item.event.SessionHash != "" && item.event.ObservedAtMS > 0 {
+			metadata = append(metadata, item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range metadata {
+		if _, err := conn.ExecContext(ctx, "UPDATE watch_history_inbox SET site_id=?,session_hash=?,observed_at_ms=? WHERE id=?", item.event.SiteID, item.event.SessionHash, item.event.ObservedAtMS, item.id); err != nil {
+			return err
+		}
 	}
 	var cacheSizeColumn int
 	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_site_counters') WHERE name='cache_size_bytes'").Scan(&cacheSizeColumn); err != nil {

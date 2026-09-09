@@ -1050,22 +1050,16 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.db.DeleteSite(id); err != nil {
-			// The row survived the delete, so an enabled site must not be left
-			// without a running instance: restart it from a fresh read (which
-			// includes the traffic StopSite flushed). Failures in the restore
-			// are reported explicitly instead of claiming success.
-			restored, getErr := a.db.GetSite(id)
-			if getErr != nil {
-				a.jsonErr(w, 500, fmt.Sprintf("delete site: %v; site stopped and reload failed: %v", err, getErr))
+			// StopSite, schedule freeze, and remote DNS cleanup are already past
+			// their irreversible boundary. Never restart an enabled row here: that
+			// would make the local proxy look healthy while its schedule/DNS state
+			// has been removed. Keep the row disabled as an explicit retry handle.
+			if disableErr := a.db.SetSiteEnabled(id, false); disableErr != nil {
+				a.jsonErr(w, http.StatusInternalServerError, fmt.Sprintf("delete site: %v; disable cleanup-pending site: %v", err, disableErr))
 				return
 			}
-			if restored.Enabled {
-				if restartErr := a.pm.StartSite(*restored); restartErr != nil {
-					a.jsonErr(w, 500, fmt.Sprintf("delete site: %v; restore instance: %v", err, restartErr))
-					return
-				}
-			}
-			a.jsonErr(w, 500, err.Error())
+			a.pm.UnregisterSiteHost(id)
+			a.jsonErr(w, http.StatusServiceUnavailable, fmt.Sprintf("delete deferred; site disabled; retry deletion: %v", err))
 			return
 		}
 		a.pm.UnregisterSiteHost(id)

@@ -166,12 +166,25 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 // once per reset boundary or billing-mode change, then advanced by successful
 // traffic flushes while trafficMu prevents a swap/query race.
 func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.Time) (int64, error) {
+	inst.trafficMu.Lock()
+	defer inst.trafficMu.Unlock()
+	// An Agent route carries the Controller's authoritative cycle boundary,
+	// billing mode, and persisted baseline. Never replace those values with the
+	// Agent's local in-memory database defaults.
+	if inst.trafficCycleAuthoritative && (inst.trafficCycleMode == trafficBillingModeOutbound || inst.trafficCycleMode == trafficBillingModeBidirectional) {
+		localIn := inst.cumulativeBytesIn.Load() - inst.trafficAckedCumulativeIn
+		localOut := inst.cumulativeBytesOut.Load() - inst.trafficAckedCumulativeOut
+		if localIn < 0 {
+			localIn = inst.cumulativeBytesIn.Load()
+		}
+		if localOut < 0 {
+			localOut = inst.cumulativeBytesOut.Load()
+		}
+		return inst.trafficCycleUsage + trafficBillableBytes(inst.trafficCycleMode, localIn, localOut), nil
+	}
 	settings := pm.database.currentSystemSettings()
 	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
 	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
-
-	inst.trafficMu.Lock()
-	defer inst.trafficMu.Unlock()
 	if inst.trafficCycleMode != cycleMode || !inst.trafficCycleStart.Equal(cycleStart) {
 		persisted, err := pm.database.SumTrafficSinceForSite(inst.Site.ID, cycleStart, cycleMode)
 		if err != nil {
@@ -180,6 +193,8 @@ func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.T
 		inst.trafficCycleStart = cycleStart
 		inst.trafficCycleMode = cycleMode
 		inst.trafficCycleUsage = persisted
+		inst.trafficAckedCumulativeIn = inst.cumulativeBytesIn.Load()
+		inst.trafficAckedCumulativeOut = inst.cumulativeBytesOut.Load()
 	}
 	return inst.trafficCycleUsage + trafficBillableBytes(cycleMode, inst.bytesIn.Load(), inst.bytesOut.Load()), nil
 }

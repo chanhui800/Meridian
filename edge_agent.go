@@ -773,13 +773,38 @@ func (runtime *edgeAgentRuntime) commitSiteStats(pending edgeSiteStatsPending) {
 		return
 	}
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
 	if runtime.siteReported == nil {
 		runtime.siteReported = make(map[int64]ProxyRuntimeStat)
 	}
 	for siteID, sent := range pending.current {
 		if current := runtime.siteReported[siteID]; current == sent || current.CumulativeBytesIn <= sent.CumulativeBytesIn && current.CumulativeBytesOut <= sent.CumulativeBytesOut {
 			runtime.siteReported[siteID] = sent
+		}
+	}
+	bundle := runtime.bundle
+	reported := make(map[int64]ProxyRuntimeStat, len(pending.current))
+	for siteID := range pending.current {
+		reported[siteID] = runtime.siteReported[siteID]
+	}
+	runtime.mu.Unlock()
+	// Move the ACK watermark into the live instances immediately. Otherwise a
+	// successful report would remain part of the local delta until the next
+	// config refresh and could be charged twice against a quota.
+	if bundle == nil || bundle.manager == nil {
+		return
+	}
+	bundle.manager.mu.RLock()
+	defer bundle.manager.mu.RUnlock()
+	for localID, identity := range bundle.localSites {
+		stat, ok := reported[identity.centralID]
+		if !ok {
+			continue
+		}
+		if inst := bundle.manager.proxies[localID]; inst != nil {
+			inst.trafficMu.Lock()
+			inst.trafficAckedCumulativeIn = stat.CumulativeBytesIn
+			inst.trafficAckedCumulativeOut = stat.CumulativeBytesOut
+			inst.trafficMu.Unlock()
 		}
 	}
 }
@@ -798,11 +823,18 @@ func (runtime *edgeAgentRuntime) syncSiteTrafficLimits(config AgentRuntimeConfig
 	if bundle == nil || bundle.manager == nil || bundle.database == nil {
 		return
 	}
+	runtime.mu.RLock()
+	ackedReports := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
+	for siteID, stat := range runtime.siteReported {
+		ackedReports[siteID] = stat
+	}
+	runtime.mu.RUnlock()
 	bundle.manager.mu.RLock()
 	defer bundle.manager.mu.RUnlock()
 	for _, route := range config.Routes {
 		cycleMode := route.TrafficBillingMode
-		if cycleMode != trafficBillingModeOutbound && cycleMode != trafficBillingModeBidirectional {
+		controllerCycle := cycleMode == trafficBillingModeOutbound || cycleMode == trafficBillingModeBidirectional || route.TrafficCycleStartMS != 0
+		if !controllerCycle {
 			settings := bundle.database.currentSystemSettings()
 			cycleMode = trafficBillingModeLabel(settings.TrafficBillingMode)
 		}
@@ -841,6 +873,10 @@ func (runtime *edgeAgentRuntime) syncSiteTrafficLimits(config AgentRuntimeConfig
 			inst.trafficCycleStart = cycleStart
 			inst.trafficCycleMode = cycleMode
 			inst.trafficCycleUsage = cycleUsage
+			inst.trafficCycleAuthoritative = controllerCycle
+			acked := ackedReports[route.SiteID]
+			inst.trafficAckedCumulativeIn = acked.CumulativeBytesIn
+			inst.trafficAckedCumulativeOut = acked.CumulativeBytesOut
 			inst.trafficMu.Unlock()
 		}
 	}
@@ -1012,6 +1048,12 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	siteIDs := make(map[string]int64, len(config.Routes))
 	localSites := make(map[int64]edgeSiteIdentity, len(config.Routes))
 	runtimeSites := make(map[string]Site, len(config.Routes))
+	runtime.mu.RLock()
+	ackedReports := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
+	for siteID, stat := range runtime.siteReported {
+		ackedReports[siteID] = stat
+	}
+	runtime.mu.RUnlock()
 	for _, route := range config.Routes {
 		site := route.Site
 		site.ID = 0
@@ -1034,6 +1076,15 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		site.StoredDynamicDiscoverySources = route.DynamicSources
 		site.StoredDynamicDomainRules = route.DynamicRules
 		site.Enabled = true
+		if route.TrafficBillingMode == trafficBillingModeOutbound || route.TrafficBillingMode == trafficBillingModeBidirectional || route.TrafficCycleStartMS != 0 {
+			site.runtimeTrafficCycleConfigured = true
+			site.runtimeTrafficCycleUsage = route.TrafficCycleUsage
+			site.runtimeTrafficCycleStartMS = route.TrafficCycleStartMS
+			site.runtimeTrafficBillingMode = route.TrafficBillingMode
+			acked := ackedReports[route.SiteID]
+			site.runtimeTrafficAckedCumulativeIn = acked.CumulativeBytesIn
+			site.runtimeTrafficAckedCumulativeOut = acked.CumulativeBytesOut
+		}
 		if route.SiteID > 0 {
 			site.AssetCacheNamespace = fmt.Sprintf("site-%d-config-%s", route.SiteID, edgeAssetCacheGeneration(site, route))
 		}
@@ -1045,6 +1096,15 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 			return fail(updateErr)
 		}
 		created.AssetCacheNamespace = site.AssetCacheNamespace
+		// CreateSiteRecord hydrates the persisted fields from the ephemeral
+		// database, so copy the controller-authoritative quota snapshot back onto
+		// the runtime-only fields before StartSite installs the proxy instance.
+		created.runtimeTrafficCycleUsage = site.runtimeTrafficCycleUsage
+		created.runtimeTrafficCycleStartMS = site.runtimeTrafficCycleStartMS
+		created.runtimeTrafficBillingMode = site.runtimeTrafficBillingMode
+		created.runtimeTrafficCycleConfigured = site.runtimeTrafficCycleConfigured
+		created.runtimeTrafficAckedCumulativeIn = site.runtimeTrafficAckedCumulativeIn
+		created.runtimeTrafficAckedCumulativeOut = site.runtimeTrafficAckedCumulativeOut
 		siteIDs[site.PublicHost] = route.SiteID
 		localSites[created.ID] = edgeSiteIdentity{centralID: route.SiteID, host: site.PublicHost}
 		bundle.localSites[created.ID] = localSites[created.ID]
@@ -1278,10 +1338,16 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.handler = bundle.handler
 	runtime.bundle = bundle
 	// The in-memory Edge database and proxy counters are rebuilt on every
-	// configuration apply. Drop per-site report baselines as well; the
-	// Controller binds site traffic to AppliedConfigHash, so the next report
-	// must describe the new runtime epoch from zero.
-	runtime.siteReported = make(map[int64]ProxyRuntimeStat)
+	// configuration apply. Keep the Controller ACK watermark for sites that are
+	// still present so the new zeroed counters represent only post-apply local
+	// traffic and cannot be charged twice against the Controller baseline.
+	retainedReports := make(map[int64]ProxyRuntimeStat, len(config.Routes))
+	for _, route := range config.Routes {
+		if stat, ok := oldState.siteReported[route.SiteID]; ok {
+			retainedReports[route.SiteID] = stat
+		}
+	}
+	runtime.siteReported = retainedReports
 	runtime.mu.Unlock()
 	newServerStarted := false
 	if listenerChanged && needsListener {

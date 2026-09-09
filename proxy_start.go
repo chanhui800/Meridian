@@ -129,6 +129,16 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	inst.persistedTraffic.Store(site.TrafficUsed)
 	inst.persistedBytesIn.Store(site.TrafficUsedIn)
 	inst.persistedBytesOut.Store(site.TrafficUsedOut)
+	if site.runtimeTrafficCycleConfigured {
+		inst.trafficCycleUsage = site.runtimeTrafficCycleUsage
+		inst.trafficCycleMode = site.runtimeTrafficBillingMode
+		if site.runtimeTrafficCycleStartMS > 0 {
+			inst.trafficCycleStart = time.UnixMilli(site.runtimeTrafficCycleStartMS)
+		}
+		inst.trafficAckedCumulativeIn = site.runtimeTrafficAckedCumulativeIn
+		inst.trafficAckedCumulativeOut = site.runtimeTrafficAckedCumulativeOut
+		inst.trafficCycleAuthoritative = true
+	}
 	if inst.persistedBytesIn.Load() == 0 && inst.persistedBytesOut.Load() == 0 && site.TrafficUsed > 0 {
 		legacyIn, legacyOut := legacyTrafficDirections(site.TrafficUsed)
 		inst.persistedBytesIn.Store(legacyIn)
