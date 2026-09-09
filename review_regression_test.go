@@ -871,6 +871,121 @@ func TestReviewDrainLifecycleResetsOnABABTransition(t *testing.T) {
 	}
 }
 
+func TestReviewDrainPreservesMultipleHostGenerations(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "drain-generations", Address: "203.0.113.246", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "drain-generations-site", PublicHost: "h3.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=? WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	upsert := func(host string, at time.Time) {
+		t.Helper()
+		tx, txErr := app.db.db.Begin()
+		if txErr != nil {
+			t.Fatal(txErr)
+		}
+		if err := upsertSiteNodeDrainTx(tx, site.ID, node.ID, host, at); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upsert("h1.example.test", now)
+	upsert("h2.example.test", now.Add(time.Minute))
+	upsert("h3.example.test", now.Add(2*time.Minute))
+
+	var drainHost string
+	if err := app.db.db.QueryRow("SELECT public_host FROM site_node_drains WHERE site_id=? AND node_id=?", site.ID, node.ID).Scan(&drainHost); err != nil {
+		t.Fatal(err)
+	}
+	if drainHost != "h3.example.test" {
+		t.Fatalf("latest drain host=%q, want h3.example.test", drainHost)
+	}
+	rows, err := app.db.db.Query("SELECT public_host,acked_at_ms,finalization_expires_at_ms FROM site_node_host_aliases WHERE site_id=? AND node_id=? ORDER BY public_host", site.ID, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := make(map[string][2]int64)
+	for rows.Next() {
+		var host string
+		var acked, finalized int64
+		if err := rows.Scan(&host, &acked, &finalized); err != nil {
+			t.Fatal(err)
+		}
+		seen[host] = [2]int64{acked, finalized}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"h1.example.test", "h2.example.test"} {
+		lifecycle, ok := seen[host]
+		if !ok {
+			t.Fatalf("missing preserved drain generation %q", host)
+		}
+		if lifecycle != [2]int64{} {
+			t.Fatalf("generation %q unexpectedly acknowledged: %#v", host, lifecycle)
+		}
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	allowed, err := authorizedNodeSitesTx(tx, node.ID, now.Add(3*time.Minute).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"h1.example.test", "h2.example.test", "h3.example.test"} {
+		if !authorizedNodeSiteHost(allowed, site.ID, host) {
+			t.Fatalf("host generation %q was not authorized", host)
+		}
+	}
+}
+
+func TestReviewSchema46RepairsLegacyAliasLifecycle(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "alias-migration", Address: "203.0.113.247", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "alias-migration-site", PublicHost: "new-alias.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := now.Add(-time.Hour).UnixMilli()
+	expires := now.Add(-time.Minute).UnixMilli()
+	if _, err := app.db.db.Exec(`INSERT INTO site_node_host_aliases(site_id,node_id,public_host,expires_at_ms,created_at_ms,acked_at_ms,finalization_expires_at_ms) VALUES(?,?,?,?,?,?,?)`, site.ID, node.ID, "old-alias.example.test", expires, created, created, expires); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("PRAGMA user_version = 45"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	var acked, finalized int64
+	if err := app.db.db.QueryRow(`SELECT acked_at_ms,finalization_expires_at_ms FROM site_node_host_aliases WHERE site_id=? AND node_id=?`, site.ID, node.ID).Scan(&acked, &finalized); err != nil {
+		t.Fatal(err)
+	}
+	if acked != 0 || finalized != 0 {
+		t.Fatalf("schema 46 did not repair legacy alias lifecycle: ack=%d final=%d", acked, finalized)
+	}
+}
+
 func TestReviewHostAliasLifecycleStartsOnConfigAck(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()
