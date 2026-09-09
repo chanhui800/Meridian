@@ -80,6 +80,7 @@ type Site struct {
 	runtimeTrafficCycleConfigured    bool
 	runtimeTrafficAckedCumulativeIn  int64
 	runtimeTrafficAckedCumulativeOut int64
+	runtimeTrafficCounter            *edgeSiteTrafficCounter
 }
 
 func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade, assetCacheEnabled, watchHistoryEnabled int) error {

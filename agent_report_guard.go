@@ -336,11 +336,22 @@ func (a *App) withAgentPreAuth(next http.HandlerFunc) http.HandlerFunc {
 		identity, err := a.authenticateAgentRequest(r)
 		release()
 		if err != nil {
-			a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+			writeAgentAuthFailure(a, w, r)
 			return
 		}
 		next(w, withAgentCredential(r, identity))
 	}
+}
+
+// writeAgentAuthFailure keeps ordinary HTTP authentication semantics while
+// giving an already-enrolled Agent an explicit revocation signal. A stale or
+// replaced Agent token must stop its data-plane listener; a missing bearer
+// token remains a normal 401 for callers that have not authenticated.
+func writeAgentAuthFailure(a *App, w http.ResponseWriter, r *http.Request) {
+	if requestBearerToken(r) != "" {
+		w.Header().Set("X-Meridian-Agent-State", "revoked")
+	}
+	a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
 }
 
 // authenticateAgentRequest performs the only credential lookups protected by

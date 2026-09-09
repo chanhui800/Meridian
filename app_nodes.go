@@ -416,7 +416,7 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	}
 	identity, authErr := agentIdentityForRequest(a, r)
 	if authErr != nil || (!identity.HasNode && !identity.Enrollment) {
-		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		writeAgentAuthFailure(a, w, r)
 		return
 	}
 	platform, err := requestedAgentPlatform(r)
@@ -570,7 +570,7 @@ func (a *App) handleAgentManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	identity, authErr := agentIdentityForRequest(a, r)
 	if authErr != nil || (!identity.HasNode && !identity.Enrollment) {
-		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		writeAgentAuthFailure(a, w, r)
 		return
 	}
 	platform, err := requestedAgentPlatform(r)
@@ -617,7 +617,7 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	identity, authErr := agentIdentityForRequest(a, r)
 	if authErr != nil || !identity.Enrollment {
-		a.jsonErr(w, http.StatusUnauthorized, "invalid enrollment token")
+		writeAgentAuthFailure(a, w, r)
 		return
 	}
 	node, agentToken, err := a.db.EnrollControlNode(identity.Token, time.Now())
@@ -652,7 +652,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	}
 	identity, authErr := agentNodeIdentityForRequest(a, r)
 	if authErr != nil {
-		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		writeAgentAuthFailure(a, w, r)
 		return
 	}
 	token := identity.Token
@@ -678,7 +678,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := a.db.RecordNodeReportResult(token, report, time.Now())
 	if errors.Is(err, errInvalidAgentToken) {
-		a.jsonErr(w, http.StatusUnauthorized, "invalid agent token")
+		writeAgentAuthFailure(a, w, r)
 		return
 	}
 	if err != nil {

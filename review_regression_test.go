@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -532,6 +533,49 @@ func TestReviewAgentReportCannotModifyUnauthorizedSite(t *testing.T) {
 	}, now.Add(time.Second))
 	if err != nil || len(result.DiscardedEventIDs) != 1 || result.DiscardedEventIDs[0] != 12 {
 		t.Fatalf("mismatched Site/Host event was accepted: result=%#v err=%v", result, err)
+	}
+}
+
+func TestReviewScheduledSiteRemovalInvalidatesOwningAgent(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "remove-owner", Address: "203.0.113.91", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "remove-site", PublicHost: "remove.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,config_hash='applied' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT config_dirty FROM control_nodes WHERE id=?", node.ID).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.removeSiteNodeSchedule(context.Background(), site.ID); err != nil {
+		t.Fatal(err)
+	}
+	var dirty int
+	var desiredHash string
+	if err := app.db.db.QueryRow("SELECT config_dirty,desired_config_hash FROM control_nodes WHERE id=?", node.ID).Scan(&dirty, &desiredHash); err != nil {
+		t.Fatal(err)
+	}
+	if dirty != 1 || desiredHash != "" {
+		t.Fatalf("owning Agent was not invalidated on site removal: dirty=%d hash=%q", dirty, desiredHash)
+	}
+	var enabled int
+	if err := app.db.db.QueryRow("SELECT enabled FROM site_node_schedules WHERE site_id=?", site.ID).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 0 {
+		t.Fatalf("site schedule remained enabled after removal: %d", enabled)
 	}
 }
 

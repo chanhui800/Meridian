@@ -290,7 +290,9 @@ func runIssueEdgeCertificateCommand(output io.Writer) error {
 			continue
 		}
 		nodeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		changed, ensureErr := ensureEdgeCertificateForNode(nodeCtx, settings, token, manager, node)
+		changed, ensureErr := ensureEdgeCertificateForNodeGuarded(nodeCtx, settings, token, manager, node, &db.nodeTLSMutationMu, func() error {
+			return verifyEdgeCertificateNodeStillEnrolled(db, node)
+		})
 		cancel()
 		if ensureErr != nil {
 			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, ensureErr))

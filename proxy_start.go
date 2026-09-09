@@ -116,6 +116,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		trustedProxies: append([]*net.IPNet(nil), pm.trustedProxies...),
 		dynamicState:   dynamicState,
 		failoverState:  newUpstreamFailoverState(),
+		trafficCounter: site.runtimeTrafficCounter,
 	}
 	installed := false
 	defer func() {
@@ -361,8 +362,8 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			requestCancel()
 		}()
 		r = r.WithContext(requestCtx)
-		inst.reqCount.Add(1)
-		inst.pendingRequests.Add(1)
+		inst.trafficRequests().Add(1)
+		inst.trafficPendingRequests().Add(1)
 
 		// The Controller can refresh quota usage on an already running Agent
 		// without rebuilding the proxy bundle. Read the live quota baseline from
@@ -387,13 +388,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				rw = &rateLimitedWriter{
 					ResponseWriter: w,
 					bytesPerSec:    speedLimitBytes,
-					written:        &inst.bytesOut,
-					cumulative:     &inst.cumulativeBytesOut,
+					written:        inst.trafficBytesOut(),
+					cumulative:     inst.trafficCumulativeOut(),
 					start:          time.Now(),
 					ctx:            r.Context(),
 				}
 			} else {
-				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
+				rw = &meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
 			}
 			if dynamicIssuer == nil {
 				writeDynamicCapabilityUnavailable(rw)
@@ -438,9 +439,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
 				var cacheWriter http.ResponseWriter
 				if speedLimitBytes > 0 {
-					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, start: time.Now(), ctx: r.Context()}
+					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut(), start: time.Now(), ctx: r.Context()}
 				} else {
-					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
+					cacheWriter = &meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
 				}
 				serveAssetCacheHit(cacheWriter, r, hit)
 				return
@@ -449,7 +450,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 
 		if r.Body != nil {
-			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn}
+			r.Body = &meteredReader{ReadCloser: r.Body, read: inst.trafficBytesIn(), cumulative: inst.trafficCumulativeIn()}
 		}
 		if len(failoverTargets) > 1 {
 			if err := prepareFailoverPlaybackInfoBody(r, redirectPolicy.limits.MaxBodyBytes); err != nil {
@@ -477,13 +478,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			rw = &rateLimitedWriter{
 				ResponseWriter: w,
 				bytesPerSec:    speedLimitBytes,
-				written:        &inst.bytesOut,
-				cumulative:     &inst.cumulativeBytesOut,
+				written:        inst.trafficBytesOut(),
+				cumulative:     inst.trafficCumulativeOut(),
 				start:          time.Now(),
 				ctx:            r.Context(),
 			}
 		} else {
-			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
+			rw = &meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
 		}
 		proxy.ServeHTTP(rw, r) // #nosec G704 -- forwarding to the administrator-configured, validated upstream is the product's purpose.
 	})

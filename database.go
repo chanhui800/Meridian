@@ -38,6 +38,7 @@ type DB struct {
 	agentSecurityMu             sync.Mutex
 	agentSecurityLastLog        map[string]time.Time
 	systemSettings              atomic.Pointer[SystemSettings]
+	nodeTLSMutationMu           sync.Mutex
 	watchHistoryMetadataMu      sync.Mutex
 	watchHistoryMetadata        map[watchHistoryMetadataKey]watchHistoryMetadataEntry
 }

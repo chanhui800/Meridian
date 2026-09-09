@@ -77,6 +77,94 @@ func TestAgentConfigIdentityRequiresRevisionAndHash(t *testing.T) {
 	}
 }
 
+func TestEdgeTrafficCounterSurvivesHotApply(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	first := runtime.trafficCounterFor(42)
+	if first == nil {
+		t.Fatal("missing stable traffic counter")
+	}
+	first.cumulativeOut.Store(100)
+	second := runtime.trafficCounterFor(42)
+	if second != first {
+		t.Fatal("hot apply created a new counter for the same site")
+	}
+	if got := second.cumulativeOut.Load(); got != 100 {
+		t.Fatalf("stable counter cumulative bytes = %d, want 100", got)
+	}
+}
+
+func TestCommitSiteStatsRebasesAuthoritativeQuotaImmediately(t *testing.T) {
+	counter := &edgeSiteTrafficCounter{}
+	inst := &ProxyInstance{
+		Site:                      Site{ID: 1},
+		trafficCounter:            counter,
+		trafficCycleAuthoritative: true,
+		trafficCycleMode:          trafficBillingModeOutbound,
+		trafficCycleUsage:         100,
+	}
+	bundle := &edgeProxyBundle{
+		manager:    &ProxyManager{proxies: map[int64]*ProxyInstance{1: inst}},
+		localSites: map[int64]edgeSiteIdentity{1: {centralID: 42}},
+	}
+	runtime := &edgeAgentRuntime{
+		bundle:       bundle,
+		siteReported: make(map[int64]ProxyRuntimeStat),
+	}
+	counter.cumulativeOut.Store(10)
+	runtime.commitSiteStats(edgeSiteStatsPending{current: map[int64]ProxyRuntimeStat{
+		42: {SiteID: 42, CumulativeBytesOut: 10},
+	}})
+	if got := inst.trafficCycleUsage; got != 110 {
+		t.Fatalf("quota baseline after report ACK = %d, want 110", got)
+	}
+	if got := inst.trafficAckedCumulativeOut; got != 10 {
+		t.Fatalf("ACK watermark = %d, want 10", got)
+	}
+	usage, err := (&ProxyManager{}).currentTrafficCycleUsage(inst, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage != 110 {
+		t.Fatalf("effective quota usage after report ACK = %d, want 110", usage)
+	}
+}
+
+func TestEdgeAPIRequestSurfacesRevokedAgentState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Meridian-Agent-State", "revoked")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"invalid agent token","agent_state":"revoked"}`)
+	}))
+	defer server.Close()
+	err := edgeAPIRequest(context.Background(), server.Client(), http.MethodGet, server.URL, "stale-token", nil, nil)
+	if !isEdgeAgentRevoked(err) {
+		t.Fatalf("revoked response error = %v, want revoked agent state", err)
+	}
+}
+
+func TestEdgeEnrollmentTokenAvailabilityUsesFileContents(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing-token")
+	if edgeEnrollmentTokenAvailable(missing) {
+		t.Fatal("missing enrollment token was treated as available")
+	}
+	empty := filepath.Join(dir, "empty-token")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if edgeEnrollmentTokenAvailable(empty) {
+		t.Fatal("empty enrollment token was treated as available")
+	}
+	valid := filepath.Join(dir, "valid-token")
+	if err := os.WriteFile(valid, []byte("one-time-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !edgeEnrollmentTokenAvailable(valid) {
+		t.Fatal("non-empty enrollment token was not detected")
+	}
+}
+
 func TestBuildEdgeProxyIgnoresControllerOnlySiteIconMetadata(t *testing.T) {
 	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
 	config := AgentRuntimeConfig{
