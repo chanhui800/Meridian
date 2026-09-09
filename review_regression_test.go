@@ -583,13 +583,99 @@ func TestReviewCompletedDNSMoveKeepsTailTrafficAuthorizedOnlyDuringDrain(t *test
 	if activeDrains != 1 {
 		t.Fatalf("Final SiteStat retired drain before tail queues were flushed: %d", activeDrains)
 	}
-	if _, err := app.db.db.Exec(`UPDATE site_node_drains SET expires_at_ms=? WHERE site_id=?`, now.Add(-time.Second).UnixMilli(), site.ID); err != nil {
+	if _, err := app.db.db.Exec(`UPDATE site_node_drains SET acked_at_ms=?,finalization_expires_at_ms=? WHERE site_id=?`, now.UnixMilli(), now.Add(-time.Second).UnixMilli(), site.ID); err != nil {
 		t.Fatal(err)
 	}
 	report.Sequence = 2
 	result, err = app.db.RecordNodeReportResult(oldToken, report, now.Add(time.Second))
 	if err != nil || len(result.DiscardedSiteIDs) != 1 || result.DiscardedSiteIDs[0] != site.ID {
 		t.Fatalf("expired drain report=%#v err=%v, want discarded", result, err)
+	}
+}
+
+func TestReviewRevocationAndDrainExpiryStartAfterAgentAck(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "ack-lifecycle", Address: "203.0.113.240", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "ack-lifecycle-site", PublicHost: "ack-lifecycle.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE sites SET enabled=0 WHERE id=?`, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-48 * time.Hour).UnixMilli()
+	if _, err := app.db.db.Exec(`INSERT INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms) VALUES(?,?,?,?)`, node.ID, site.ID, site.PublicHost, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`INSERT INTO site_node_drains(site_id,node_id,public_host,expires_at_ms,created_at_ms) VALUES(?,?,?,?,?)`, site.ID, node.ID, site.PublicHost, old, old); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(at time.Time) map[int64]authorizedNodeSite {
+		t.Helper()
+		tx, txErr := app.db.db.Begin()
+		if txErr != nil {
+			t.Fatal(txErr)
+		}
+		defer tx.Rollback()
+		allowed, lookupErr := authorizedNodeSitesTx(tx, node.ID, at.UnixMilli())
+		if lookupErr != nil {
+			t.Fatal(lookupErr)
+		}
+		return allowed
+	}
+	if _, ok := lookup(now)[site.ID]; !ok {
+		t.Fatal("unacknowledged revocation/drain was lost based on its old creation time")
+	}
+	ack := now.UnixMilli()
+	finalize := now.Add(siteNodeDrainWindow).UnixMilli()
+	if _, err := app.db.db.Exec(`UPDATE agent_route_revocations SET acked_at_ms=?,finalization_expires_at_ms=? WHERE node_id=? AND site_id=?`, ack, finalize, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_drains SET acked_at_ms=?,finalization_expires_at_ms=? WHERE node_id=? AND site_id=?`, ack, finalize, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lookup(now.Add(23 * time.Hour))[site.ID]; !ok {
+		t.Fatal("acked revocation/drain disappeared before finalization window")
+	}
+	if _, ok := lookup(now.Add(25 * time.Hour))[site.ID]; ok {
+		t.Fatal("acked revocation/drain remained after finalization window")
+	}
+}
+
+func TestReviewLegacyForceStopFallbackRevokesOldCredential(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "legacy-force-stop", Address: "203.0.113.241", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "legacy-force-stop-site", PublicHost: "legacy-force-stop.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET agent_version=? WHERE id=?`, "v1.9.64", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	created := now.Add(-legacyForceStopGrace - time.Second).UnixMilli()
+	if _, err := app.db.db.Exec(`INSERT INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms) VALUES(?,?,?,?)`, node.ID, site.ID, site.PublicHost, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.revokeLegacyAgentsWithPendingForceStops(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.nodeByAgentToken(token, now); !errors.Is(err, errInvalidAgentToken) {
+		t.Fatalf("legacy Agent credential remained valid after fallback: %v", err)
 	}
 }
 
