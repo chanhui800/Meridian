@@ -815,6 +815,25 @@ test('dashboard consumes one Controller realtime window for every browser', () =
   assert.equal(result.site[0].bytes_out, 24);
 });
 
+test('dashboard keeps the selected site chart live from the Controller SSE point', () => {
+  const h = makeTrafficHarness();
+  const now = Date.now();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: '7', range: 'realtime' };
+    dashboardControllerRealtimeEnabled = true;
+    dashboardAppendServerRealtimeTrendSample({
+      timestamp_ms: ${now},
+      site_contributions: {
+        '7': { timestamp_ms: ${now}, download_bps: 42, bytes_out: 84 },
+      },
+    });
+    return dashboardRealtimeTrendSamples.get('7');
+  })()`, h.sandbox);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].download_bps, 42);
+  assert.equal(result[0].bytes_out, 84);
+});
+
 test('dashboard stops generating browser-specific trend points after Controller data arrives', async () => {
   const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
   const sandbox = {

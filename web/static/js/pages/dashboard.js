@@ -650,6 +650,19 @@ function dashboardAppendServerRealtimeTrendSample(value) {
       dashboardRealtimeTrendSiteSamples.set(siteID, samples);
     });
   }
+  // When a site is selected, its chart reads the site-keyed map. Keep that
+  // view on the same SSE tick so it remains live between 15-second trend
+  // endpoint refreshes.
+  if (dashboardTrendState.siteId !== 'all' && point.site_contributions && typeof point.site_contributions === 'object') {
+    const siteID = String(dashboardTrendState.siteId);
+    const contribution = point.site_contributions[siteID];
+    if (contribution) {
+      const selected = dashboardRealtimeTrendSamples.get(siteID) || [];
+      upsertDashboardRealtimeSample(selected, dashboardNormalizeRealtimePoint({ ...contribution, timestamp_ms: point.timestamp_ms }));
+      pruneDashboardRealtimeSamples(selected);
+      dashboardRealtimeTrendSamples.set(siteID, selected);
+    }
+  }
   persistDashboardRealtimeSamples();
   return true;
 }
