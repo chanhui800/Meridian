@@ -269,6 +269,7 @@ func main() {
 	mux.HandleFunc("/api/agent/install.sh", app.handleAgentInstallScript)
 	mux.HandleFunc("/api/agent/enroll", app.withAgentPreAuth(app.handleAgentEnroll))
 	mux.HandleFunc("/api/agent/report", app.withAgentPreAuth(app.handleAgentReport))
+	mux.HandleFunc("/api/agent/live", app.withAgentPreAuth(app.handleAgentLive))
 	mux.HandleFunc("/api/agent/config", app.withAgentPreAuth(app.handleAgentConfig))
 	mux.Handle("/api/agent/ws", websocket.Server{
 		Handshake: func(config *websocket.Config, request *http.Request) error {

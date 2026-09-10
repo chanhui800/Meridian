@@ -92,6 +92,7 @@ function makeTrafficHarness(options) {
     window: {
       addEventListener(name) { if (name === 'resize') resizeListeners++; },
       devicePixelRatio: 1,
+      localStorage: options.localStorage,
     },
     document: makeDocument(elements),
     Toast: { error() {}, success() {}, info() {} },
@@ -472,8 +473,9 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   assert.equal(billedSample, 2 * (2048 + 1048576), 'bidirectional realtime traffic must count both VPS network legs');
 
   const trendLength = vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox);
-  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, requests:0}], 3000, 'bidirectional')", sandbox);
-  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox), trendLength, 'an unchanged Agent sample must not append a synthetic trend point');
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, requests:0}], 4000, 'bidirectional')", sandbox);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox), trendLength + 1, 'an unchanged Agent sample must still append the fixed-cadence realtime point');
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1).download_bps", sandbox), 512 * 1024, 'an unchanged Agent sample must retain the latest valid rate');
 
   await vm.runInContext('loadDashboardTable()', sandbox);
   const refreshedHTML = elements['dash-table'].innerHTML;
@@ -639,11 +641,11 @@ test('dashboard realtime trend keeps a rolling timestamp window and replaces dup
     upsertDashboardRealtimeSample(samples, { timestamp_ms: ${now - 1000}, download_bps: 9 });
   })()`, h.sandbox);
   const samples = vm.runInContext("dashboardRealtimeTrendSamples.get('all')", h.sandbox);
-  assert.deepEqual(Array.from(samples, point => point.timestamp_ms), [1, 1_799_000]);
+  assert.deepEqual(Array.from(samples, point => point.timestamp_ms), [1_799_000]);
   assert.equal(samples.at(-1).download_bps, 9, 'a newer sample at the same timestamp must replace the previous value');
 });
 
-test('dashboard realtime trend uses real timestamps for fixed-window positions', () => {
+test('dashboard realtime trend uses real timestamps for pointer positions', () => {
   const h = makeTrafficHarness();
   h.sandbox.Date = { now: () => 1_800_000 };
   const points = vm.runInContext(`(() => {
@@ -668,6 +670,57 @@ test('dashboard realtime trend uses real timestamps for fixed-window positions',
   const right = vm.runInContext('dashboardTrendPointerState({ left: 0, top: 0, width: 320, height: 200 }, ' + JSON.stringify(geometry) + ', { clientX: 300, clientY: 10 }, [{ timestamp_ms: 0 }, { timestamp_ms: 600000 }, { timestamp_ms: 1700000 }], 0, 1800000)', h.sandbox);
   assert.equal(left.index, 0);
   assert.equal(right.index, 2, 'hover selection must follow timestamp position rather than sample index spacing');
+});
+
+test('dashboard realtime chart uses a fixed five-minute window and sparse boundary labels', () => {
+  const h = makeTrafficHarness();
+  h.sandbox.Date = { now: () => 180000 };
+  const bounds = vm.runInContext(`dashboardRealtimeChartBounds([
+    { timestamp_ms: 1000 },
+    { timestamp_ms: 61000 },
+    { timestamp_ms: 121000 },
+  ])`, h.sandbox);
+  assert.equal(bounds.start, -120000);
+  assert.equal(bounds.end, 180000);
+  const labels = Array.from(vm.runInContext('dashboardTimeLabelIndexes(150, 800, "realtime")', h.sandbox));
+  assert.deepEqual(labels, [0, 149]);
+  assert.equal(vm.runInContext('dashboardTrendAxisLabel(0, [{ timestamp_ms: 179000 } , { timestamp_ms: 180000 }], "realtime", -120000, 180000)', h.sandbox), -120000);
+  assert.equal(vm.runInContext('dashboardTrendAxisLabel(1, [{ timestamp_ms: 179000 } , { timestamp_ms: 180000 }], "realtime", -120000, 180000)', h.sandbox), 180000);
+});
+
+test('dashboard realtime trend persists recent points across a page refresh', () => {
+  let stored = null;
+  const storage = {
+    getItem() { return stored; },
+    setItem(_key, value) { stored = value; },
+    removeItem() { stored = null; },
+  };
+  const h = makeTrafficHarness({ localStorage: storage });
+  const now = 10 * 60 * 1000;
+  h.sandbox.Date = { now: () => now };
+  vm.runInContext(`(() => {
+    dashboardBillingMode = 'bidirectional';
+    dashboardRealtimeTrendSamples = new Map([['all', [
+      { timestamp_ms: ${now - 4000}, download_bps: 120, upload_bps: 30, bytes_in: 4, bytes_out: 8, requests: 1, traffic_bytes: 24,
+        site_contributions: { '7': { timestamp_ms: ${now - 4000}, download_bps: 120, upload_bps: 30, bytes_in: 4, bytes_out: 8, requests: 1, traffic_bytes: 24 } } },
+      { timestamp_ms: ${now - 10 * 60 * 1000}, download_bps: 999 },
+    ]]]);
+    dashboardRealtimeTrendSiteSamples = new Map([['7', [
+      { timestamp_ms: ${now - 4000}, download_bps: 120, upload_bps: 30, bytes_in: 4, bytes_out: 8, requests: 1, traffic_bytes: 24 },
+    ]]]);
+    persistDashboardRealtimeSamples();
+    dashboardRealtimeTrendSamples = new Map();
+    dashboardRealtimeTrendSiteSamples = new Map();
+    dashboardBillingMode = null;
+    dashboardRealtimePersistedBillingMode = null;
+    restoreDashboardRealtimeSamples(${now});
+  })()`, h.sandbox);
+  assert.equal(stored !== null, true, 'live trend samples should be written to browser storage');
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", h.sandbox), 1, 'stale points must be pruned before restore');
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all')[0].download_bps", h.sandbox), 120);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all')[0].site_contributions['7'].bytes_out", h.sandbox), 8);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSiteSamples.get('7').length", h.sandbox), 1);
+  assert.equal(vm.runInContext('dashboardRealtimePersistedBillingMode', h.sandbox), 'bidirectional');
 });
 
 test('dashboard trend pointer coordinates use the plot bounds and keep the crosshair on the pointer', () => {

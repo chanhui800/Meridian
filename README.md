@@ -145,7 +145,7 @@ sudo journalctl -u meridian -f
 
 自动模式会排除未启用、心跳超时、配置未应用或已达到流量额度的节点，再按优先级和周期用量选择节点。手动模式只使用管理员指定的节点；指定节点不可用时会保持等待，不会偷偷切到其他节点。停用或删除调度时，只删除 Meridian 自己保存的 DNS 记录 ID，不触碰用户手动创建的同名记录。
 
-Agent 每 15 秒上报一次心跳、网卡累计收发字节、配置版本和监听错误。Controller 会在报告写入前验证 Node → Site 授权，并对 HTTP 和 WebSocket 报告使用同一套每节点速率与并发限制。一个被攻陷的 Agent 只能影响当前 `desired_node_id` 或 `applied_node_id` 范围内的站点。
+Agent 每 5 秒上报一次完整心跳、网卡累计收发字节、配置版本和监听错误；面板实时流量使用独立的 2 秒轻量采样。媒体库、观察记录、事件和完整站点状态仍随完整报告上报。Controller 会在报告写入前验证 Node → Site 授权，并对 HTTP、WebSocket 和实时采样使用同一套每节点速率与并发限制。一个被攻陷的 Agent 只能影响当前 `desired_node_id` 或 `applied_node_id` 范围内的站点。
 
 主控配置 Cloudflare ACME 凭据后，可以执行：
 
