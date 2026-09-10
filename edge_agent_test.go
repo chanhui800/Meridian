@@ -108,6 +108,39 @@ func TestEdgeTrafficCounterEpochAdvancesAfterRetirement(t *testing.T) {
 	}
 }
 
+func TestAgentTelemetrySequenceIsBoundToSnapshotOrder(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan int64, 1)
+	go func() {
+		sequence, _ := runtime.sampleTelemetry(func() {
+			close(firstEntered)
+			<-releaseFirst
+		})
+		firstDone <- sequence
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan int64, 1)
+	go func() {
+		sequence, _ := runtime.sampleTelemetry(func() { close(secondEntered) })
+		secondDone <- sequence
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second telemetry snapshot ran before the first snapshot released its sampler lock")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	firstSequence := <-firstDone
+	secondSequence := <-secondDone
+	if firstSequence <= 0 || secondSequence != firstSequence+1 {
+		t.Fatalf("telemetry sequence order=%d,%d, want consecutive snapshot order", firstSequence, secondSequence)
+	}
+}
+
 func TestEdgeSiteStatsRetainRemovedRouteUntilControllerAcknowledgesIt(t *testing.T) {
 	runtime := &edgeAgentRuntime{}
 	counter := runtime.trafficCounterFor(42, "tail.example.test")

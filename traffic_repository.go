@@ -366,11 +366,11 @@ func (d *DB) GetTrafficTrendLogs(siteID *int64, start, end time.Time) ([]Traffic
 	return d.GetTrafficTrendLogsGrouped(siteID, start, end, time.Minute)
 }
 
-// GetTrafficTrendLogsGrouped aggregates both controller and node traffic at
-// the requested bucket in SQLite, keeping long dashboard ranges out of the Go
-// heap. The returned rows are already ordered and can be fed directly to the
-// dashboard bucket merger.
-func (d *DB) GetTrafficTrendLogsGrouped(siteID *int64, start, end time.Time, bucket time.Duration) ([]TrafficLog, error) {
+type trafficTrendRowsQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func queryTrafficTrendLogsGrouped(queryer trafficTrendRowsQueryer, siteID *int64, start, end time.Time, bucket time.Duration) ([]TrafficLog, error) {
 	bucketMS := bucket.Milliseconds()
 	if bucketMS < 1 {
 		bucketMS = time.Minute.Milliseconds()
@@ -393,7 +393,7 @@ func (d *DB) GetTrafficTrendLogsGrouped(siteID *int64, start, end time.Time, buc
 		args = append(args, *siteID)
 	}
 	query += " GROUP BY site_id, bucket_ms ORDER BY bucket_ms, site_id"
-	rows, err := d.db.Query(query, args...)
+	rows, err := queryer.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -411,4 +411,63 @@ func (d *DB) GetTrafficTrendLogsGrouped(siteID *int64, start, end time.Time, buc
 		return nil, err
 	}
 	return logs, nil
+}
+
+// GetTrafficTrendLogsGrouped aggregates both controller and node traffic at
+// the requested bucket in SQLite, keeping long dashboard ranges out of the Go
+// heap. The returned rows are already ordered and can be fed directly to the
+// dashboard bucket merger.
+func (d *DB) GetTrafficTrendLogsGrouped(siteID *int64, start, end time.Time, bucket time.Duration) ([]TrafficLog, error) {
+	return queryTrafficTrendLogsGrouped(d.db, siteID, start, end, bucket)
+}
+
+// GetTrafficTrendLogsGroupedSnapshot reads trend rows and the Agent counter
+// baselines from one SQLite read transaction. The baseline timestamp is the
+// exact moment the last full report was committed, rather than the HTTP
+// request wall clock, so the dashboard can merge the live tail without a gap.
+func (d *DB) GetTrafficTrendLogsGroupedSnapshot(siteID *int64, start, end time.Time, bucket time.Duration) ([]TrafficLog, map[int64]dashboardTrendBaseline, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	logs, err := queryTrafficTrendLogsGrouped(tx, siteID, start, end, bucket)
+	if err != nil {
+		return nil, nil, err
+	}
+	query := `SELECT c.site_id, c.last_bytes_in, c.last_bytes_out, c.last_request_count, c.updated_at_ms
+		FROM node_site_counters c
+		JOIN site_node_schedules sch ON sch.site_id=c.site_id AND sch.applied_node_id=c.node_id
+		JOIN sites s ON s.id=c.site_id
+		WHERE sch.enabled=1 AND s.enabled=1 AND c.updated_at_ms>0`
+	args := make([]any, 0, 1)
+	if siteID != nil {
+		query += " AND c.site_id=?"
+		args = append(args, *siteID)
+	}
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	baselines := make(map[int64]dashboardTrendBaseline)
+	for rows.Next() {
+		var siteIDValue int64
+		var baseline dashboardTrendBaseline
+		if err := rows.Scan(&siteIDValue, &baseline.BytesIn, &baseline.BytesOut, &baseline.Requests, &baseline.SampledAtMS); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		baselines[siteIDValue] = baseline
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return logs, baselines, nil
 }

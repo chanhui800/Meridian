@@ -531,12 +531,17 @@ type edgeAgentRuntime struct {
 	eventSpoolError      string
 	events               edgeEventStore
 	stats                edgeSiteStats
-	telemetryMu          sync.Mutex
-	mediaCounts          map[int64]NodeMediaCount
-	retention            map[int64]NodeRetentionStatus
-	observations         []NodeDynamicObservation
-	siteReported         map[int64]ProxyRuntimeStat
-	trafficCounters      map[int64]*edgeSiteTrafficCounter
+	// telemetrySampleMu serializes the complete snapshot operation shared by
+	// the full and lightweight report loops. TelemetrySequence is allocated
+	// only after the snapshot is captured while this lock is held, so a larger
+	// sequence can never refer to an older counter snapshot.
+	telemetrySampleMu sync.Mutex
+	telemetryMu       sync.Mutex
+	mediaCounts       map[int64]NodeMediaCount
+	retention         map[int64]NodeRetentionStatus
+	observations      []NodeDynamicObservation
+	siteReported      map[int64]ProxyRuntimeStat
+	trafficCounters   map[int64]*edgeSiteTrafficCounter
 	// trafficHosts keeps the Controller host alongside the process-stable
 	// counter. A route can disappear from the current bundle while an admitted
 	// stream is still draining; its counter must remain reportable.
@@ -1060,6 +1065,43 @@ func (runtime *edgeAgentRuntime) liveSiteTrafficSnapshot() []NodeLiveSiteTraffic
 	}
 	runtime.mu.RUnlock()
 	return result
+}
+
+// sampleTelemetry runs one complete telemetry capture under the shared
+// sampler lock and allocates the ordering sequence afterwards. The callback
+// must capture all data represented by the sequence before returning.
+func (runtime *edgeAgentRuntime) sampleTelemetry(capture func()) (sequence, sampledAtMS int64) {
+	if runtime == nil {
+		return 0, 0
+	}
+	runtime.telemetrySampleMu.Lock()
+	defer runtime.telemetrySampleMu.Unlock()
+	if capture != nil {
+		capture()
+	}
+	sequence = runtime.nextTelemetrySequence()
+	sampledAtMS = time.Now().UnixMilli()
+	return sequence, sampledAtMS
+}
+
+func (runtime *edgeAgentRuntime) captureFullTelemetry(bootID string, sequence int64) (NodeReport, edgeSiteStatsPending, edgeTelemetryPending, error) {
+	if runtime == nil {
+		return NodeReport{}, edgeSiteStatsPending{}, edgeTelemetryPending{}, errors.New("nil Agent runtime")
+	}
+	runtime.telemetrySampleMu.Lock()
+	defer runtime.telemetrySampleMu.Unlock()
+	report, err := edgeCollect(bootID, sequence)
+	if err != nil {
+		return NodeReport{}, edgeSiteStatsPending{}, edgeTelemetryPending{}, err
+	}
+	pendingStats := runtime.prepareSiteStats()
+	pendingTelemetry := runtime.prepareTelemetry()
+	report.TelemetrySequence = runtime.nextTelemetrySequence()
+	report.SiteStats = pendingStats.stats
+	report.MediaCounts = pendingTelemetry.media
+	report.Retention = pendingTelemetry.retention
+	report.Observations = pendingTelemetry.observations
+	return report, pendingStats, pendingTelemetry, nil
 }
 
 func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPending, acknowledged map[int64]bool) {
@@ -2249,13 +2291,17 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 	sequence := int64(0)
 	send := func() error {
 		sequence++
+		var stats []NodeLiveSiteTraffic
+		telemetrySequence, sampledAtMS := runtime.sampleTelemetry(func() {
+			stats = runtime.liveSiteTrafficSnapshot()
+		})
 		report := NodeLiveReport{
 			ReportSessionID:   sessionID,
 			CounterEpoch:      edgeCounterEpoch(edgeDefaultInterface()),
 			Sequence:          sequence,
-			TelemetrySequence: runtime.nextTelemetrySequence(),
-			SampledAtMS:       time.Now().UnixMilli(),
-			SiteStats:         runtime.liveSiteTrafficSnapshot(),
+			TelemetrySequence: telemetrySequence,
+			SampledAtMS:       sampledAtMS,
+			SiteStats:         stats,
 		}
 		var ack struct{}
 		return edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
@@ -2649,7 +2695,7 @@ func runEdgeAgent() error {
 		}
 		refreshImmediately := false
 		sequence++
-		report, collectErr := edgeCollect(bootID, sequence)
+		report, pendingStats, pendingTelemetry, collectErr := runtime.captureFullTelemetry(bootID, sequence)
 		if collectErr != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
@@ -2658,13 +2704,8 @@ func runEdgeAgent() error {
 			report.CacheClearGeneration = runtime.cacheClearGeneration
 			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)
 			runtime.mu.RUnlock()
-			report.TelemetrySequence = runtime.nextTelemetrySequence()
 			report.EventSpoolError, report.EventQueueDepth = runtime.eventSpoolStatus()
 			report.EventDropped = runtime.events.droppedCount()
-			pendingStats := runtime.prepareSiteStats()
-			pendingTelemetry := runtime.prepareTelemetry()
-			report.SiteStats = pendingStats.stats
-			report.MediaCounts, report.Retention, report.Observations = pendingTelemetry.media, pendingTelemetry.retention, pendingTelemetry.observations
 			report.Events = edgeReportEventsByBudget(report, runtime.events.snapshot())
 			ack, wsErr := wsReporter.report(ctx, report)
 			if wsErr != nil {
