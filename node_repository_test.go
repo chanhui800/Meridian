@@ -1392,6 +1392,45 @@ func TestSiteNodeSchedulingCanBeDisabledWithoutFixedNode(t *testing.T) {
 	}
 }
 
+func TestDisabledSiteKeepsNodeSchedulingPreference(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 8, 30, 14, 30, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "preferred", Address: "203.0.113.80", Port: 19080}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "disabled-site", ListenPort: freePort(t), PublicHost: "disabled.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: passthroughUAMode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,dns_status='active',config_hash='old-hash' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE sites SET enabled=0 WHERE id=?", site.ID); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.reconcileOneSiteSchedule(context.Background(), schedule, now); err != nil {
+		t.Fatalf("reconcile disabled site: %v", err)
+	}
+	updated, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Enabled || updated.Mode != "fixed" || updated.FixedNodeID != node.ID {
+		t.Fatalf("scheduling preference was cleared: %#v", updated)
+	}
+	if updated.DesiredNodeID != 0 || updated.AppliedNodeID != 0 || updated.DNSStatus != "disabled" {
+		t.Fatalf("disabled site runtime was not cleared: %#v", updated)
+	}
+}
+
 func TestControlNodeAutoSchedulerSkipsDepletedAndOffline(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)

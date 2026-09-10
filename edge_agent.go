@@ -517,6 +517,7 @@ type edgeAgentRuntime struct {
 	drainingBundles      map[*edgeProxyBundle]struct{}
 	appliedHash          string
 	appliedRevision      int64
+	telemetrySequence    int64
 	siteCounterEpoch     uint64
 	siteCounterEpochs    map[int64]uint64
 	siteStatsCursor      int64
@@ -1830,6 +1831,22 @@ func (runtime *edgeAgentRuntime) status() (string, int64, string, string, int64,
 	return runtime.appliedHash, runtime.appliedRevision, runtime.listenerError, runtime.applyError, runtime.applyErrorAtMS, runtime.applyFailures
 }
 
+// nextTelemetrySequence is shared by the full and lightweight report loops.
+// Their channel-local sequences intentionally remain independent, while this
+// monotonic value provides the Controller with one ordering boundary.
+func (runtime *edgeAgentRuntime) nextTelemetrySequence() int64 {
+	if runtime == nil {
+		return 0
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.telemetrySequence++
+	if runtime.telemetrySequence <= 0 {
+		runtime.telemetrySequence = 1
+	}
+	return runtime.telemetrySequence
+}
+
 func (runtime *edgeAgentRuntime) close() {
 	runtime.stopServer()
 	runtime.mu.Lock()
@@ -2233,11 +2250,12 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 	send := func() error {
 		sequence++
 		report := NodeLiveReport{
-			ReportSessionID: sessionID,
-			CounterEpoch:    edgeCounterEpoch(edgeDefaultInterface()),
-			Sequence:        sequence,
-			SampledAtMS:     time.Now().UnixMilli(),
-			SiteStats:       runtime.liveSiteTrafficSnapshot(),
+			ReportSessionID:   sessionID,
+			CounterEpoch:      edgeCounterEpoch(edgeDefaultInterface()),
+			Sequence:          sequence,
+			TelemetrySequence: runtime.nextTelemetrySequence(),
+			SampledAtMS:       time.Now().UnixMilli(),
+			SiteStats:         runtime.liveSiteTrafficSnapshot(),
 		}
 		var ack struct{}
 		return edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
@@ -2640,6 +2658,7 @@ func runEdgeAgent() error {
 			report.CacheClearGeneration = runtime.cacheClearGeneration
 			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)
 			runtime.mu.RUnlock()
+			report.TelemetrySequence = runtime.nextTelemetrySequence()
 			report.EventSpoolError, report.EventQueueDepth = runtime.eventSpoolStatus()
 			report.EventDropped = runtime.events.droppedCount()
 			pendingStats := runtime.prepareSiteStats()

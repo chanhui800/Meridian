@@ -672,6 +672,29 @@ test('dashboard realtime trend uses real timestamps for pointer positions', () =
   assert.equal(right.index, 2, 'hover selection must follow timestamp position rather than sample index spacing');
 });
 
+test('dashboard realtime trend merges history at the server snapshot cutoff', () => {
+  const h = makeTrafficHarness();
+  h.sandbox.Date = { now: () => 60000 };
+  const points = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = {
+      range: 'realtime', as_of_ms: 45000, start_ms: 0, end_ms: 120000,
+      points: [
+        { timestamp_ms: 0, traffic_bytes: 100, requests: 1 },
+        { timestamp_ms: 60000, traffic_bytes: 999, requests: 9 },
+      ],
+    };
+    dashboardRealtimeTrendSamples = new Map([['all', [
+      { timestamp_ms: 40000, traffic_bytes: 50, requests: 1 },
+      { timestamp_ms: 50000, traffic_bytes: 25, requests: 1 },
+    ]]]);
+    return dashboardTrendPoints();
+  })()`, h.sandbox);
+  assert.deepEqual(Array.from(points, point => point.timestamp_ms), [0, 50000]);
+  assert.deepEqual(Array.from(points, point => point.traffic_bytes), [100, 25]);
+  assert.deepEqual(Array.from(points, point => point.requests), [1, 1]);
+});
+
 test('dashboard realtime chart uses a fixed five-minute window and sparse boundary labels', () => {
   const h = makeTrafficHarness();
   h.sandbox.Date = { now: () => 180000 };

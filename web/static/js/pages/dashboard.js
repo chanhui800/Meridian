@@ -594,7 +594,13 @@ function upsertDashboardRealtimeSample(samples, point) {
 
 function dashboardRealtimeTrendPoints() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
-  return dashboardRealtimeTrendSamples.get(key) || [];
+  const points = dashboardRealtimeTrendSamples.get(key) || [];
+  // The history response carries the exact server-side snapshot cutoff. Keep
+  // only live samples strictly newer than it so the current minute bucket is
+  // represented once when the two sources are merged.
+  const anchor = Number(dashboardTrendData?.as_of_ms || 0);
+  if (!Number.isFinite(anchor) || anchor <= 0) return points;
+  return points.filter(point => Number(point?.timestamp_ms || 0) > anchor);
 }
 
 function dashboardRealtimeHistoricalPoints() {
@@ -603,10 +609,13 @@ function dashboardRealtimeHistoricalPoints() {
   const { start, end } = dashboardRealtimeWindowBounds();
   const windowed = historical.filter(point => {
     const timestamp = Number(point?.timestamp_ms || 0);
-    return timestamp >= start && timestamp <= end;
+    const anchor = Number(dashboardTrendData?.as_of_ms || 0);
+    return timestamp >= start && timestamp <= end && (!anchor || timestamp <= anchor);
   });
   const realtime = dashboardRealtimeTrendPoints();
   if (!realtime.length) return windowed;
+  const anchor = Number(dashboardTrendData?.as_of_ms || 0);
+  if (Number.isFinite(anchor) && anchor > 0) return windowed;
   const firstRealtime = Number(realtime[0]?.timestamp_ms || 0);
   return windowed.filter(point => Number(point?.timestamp_ms || 0) < firstRealtime);
 }

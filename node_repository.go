@@ -125,11 +125,14 @@ type NodeCreateInput struct {
 }
 
 type NodeReport struct {
-	BootID                string                   `json:"boot_id"`
-	ReportSessionID       string                   `json:"report_session_id,omitempty"`
-	CounterEpoch          string                   `json:"counter_epoch,omitempty"`
-	SiteCounterEpoch      string                   `json:"site_counter_epoch,omitempty"`
-	Sequence              int64                    `json:"sequence"`
+	BootID           string `json:"boot_id"`
+	ReportSessionID  string `json:"report_session_id,omitempty"`
+	CounterEpoch     string `json:"counter_epoch,omitempty"`
+	SiteCounterEpoch string `json:"site_counter_epoch,omitempty"`
+	Sequence         int64  `json:"sequence"`
+	// TelemetrySequence is shared by the full and lightweight report channels.
+	// It lets the Controller reject a delayed sample from either channel.
+	TelemetrySequence     int64                    `json:"telemetry_sequence,omitempty"`
 	InterfaceName         string                   `json:"interface_name"`
 	RXBytes               int64                    `json:"rx_bytes"`
 	TXBytes               int64                    `json:"tx_bytes"`
@@ -155,11 +158,12 @@ type NodeReport struct {
 // It carries only process-stable per-site counters; the full NodeReport remains
 // responsible for site state, media, observations, events, and persistence.
 type NodeLiveReport struct {
-	ReportSessionID string                `json:"report_session_id"`
-	CounterEpoch    string                `json:"counter_epoch,omitempty"`
-	Sequence        int64                 `json:"sequence"`
-	SampledAtMS     int64                 `json:"sampled_at_ms"`
-	SiteStats       []NodeLiveSiteTraffic `json:"site_stats,omitempty"`
+	ReportSessionID   string                `json:"report_session_id"`
+	CounterEpoch      string                `json:"counter_epoch,omitempty"`
+	Sequence          int64                 `json:"sequence"`
+	TelemetrySequence int64                 `json:"telemetry_sequence,omitempty"`
+	SampledAtMS       int64                 `json:"sampled_at_ms"`
+	SiteStats         []NodeLiveSiteTraffic `json:"site_stats,omitempty"`
 }
 
 type NodeLiveSiteTraffic struct {
@@ -1028,7 +1032,7 @@ func validateNodeReport(report NodeReport) error {
 	if report.BootID == "" || len(report.BootID) > 128 || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 || len(report.SiteCounterEpoch) > 128 {
 		return errors.New("invalid boot_id")
 	}
-	if report.Sequence <= 0 || report.RXBytes < 0 || report.TXBytes < 0 || report.CacheClearGeneration < 0 {
+	if report.Sequence <= 0 || report.TelemetrySequence < 0 || report.RXBytes < 0 || report.TXBytes < 0 || report.CacheClearGeneration < 0 {
 		return errors.New("invalid traffic counters")
 	}
 	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ApplyError) > 1024 || len(report.ListenerError) > 1024 || len(report.EventSpoolError) > 1024 || report.EventQueueDepth < 0 || report.EventQueueDepth > edgeEventQueueLimit || report.EventDropped < 0 {
@@ -1845,6 +1849,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if err := tx.Commit(); err != nil {
 		return nodeReportCommitResult{}, err
 	}
+	// Publish the committed full-report sample to the dashboard overlay only
+	// after the transaction succeeds. The shared telemetry sequence keeps this
+	// overlay ordered with the lightweight live-report channel.
+	d.recordNodeFullTelemetry(id, report, result.acceptedSiteIDs, now)
 	result.node, err = d.controlNodeByID(id, now)
 	if err != nil {
 		return nodeReportCommitResult{}, err
