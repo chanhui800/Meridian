@@ -667,18 +667,20 @@ func (runtime *edgeAgentRuntime) trafficCounterFor(siteID int64, hosts ...string
 	return counter
 }
 
-func (runtime *edgeAgentRuntime) queueEvent(event NodeRequestEvent) {
+func (runtime *edgeAgentRuntime) queueEvent(event NodeRequestEvent) bool {
 	if runtime == nil {
-		return
+		return false
 	}
 	if err := runtime.events.add(event); err != nil {
 		runtime.mu.Lock()
 		runtime.eventSpoolError = err.Error()
 		runtime.mu.Unlock()
+		return false
 	} else {
 		runtime.mu.Lock()
 		runtime.eventSpoolError = ""
 		runtime.mu.Unlock()
+		return true
 	}
 }
 
@@ -1017,6 +1019,46 @@ func (runtime *edgeAgentRuntime) prepareSiteStats() edgeSiteStatsPending {
 		pending.nextCursor = pending.order[len(pending.order)-1] + 1
 	}
 	return pending
+}
+
+// liveSiteTrafficSnapshot copies only the counters needed by the dashboard.
+// It avoids cache sizing, request metadata, telemetry queues, and event
+// spooling so a 2-second sample remains cheap and never consumes full-report
+// state.
+func (runtime *edgeAgentRuntime) liveSiteTrafficSnapshot() []NodeLiveSiteTraffic {
+	if runtime == nil {
+		return nil
+	}
+	runtime.mu.RLock()
+	ids := make([]int64, 0, len(runtime.trafficCounters))
+	for siteID := range runtime.trafficCounters {
+		if runtime.bundle != nil && runtime.bundle.centralSites != nil {
+			if _, ok := runtime.bundle.centralSites[siteID]; !ok {
+				continue
+			}
+		}
+		ids = append(ids, siteID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) > maxNodeLiveSitesPerReport {
+		ids = ids[:maxNodeLiveSitesPerReport]
+	}
+	result := make([]NodeLiveSiteTraffic, 0, len(ids))
+	for _, siteID := range ids {
+		counter := runtime.trafficCounters[siteID]
+		host := requestPublicHost(runtime.trafficHosts[siteID])
+		if counter == nil || host == "" {
+			continue
+		}
+		result = append(result, NodeLiveSiteTraffic{
+			SiteID: siteID, Host: host,
+			CumulativeBytesIn:  counter.cumulativeIn.Load(),
+			CumulativeBytesOut: counter.cumulativeOut.Load(),
+			Requests:           counter.requests.Load(),
+		})
+	}
+	runtime.mu.RUnlock()
+	return result
 }
 
 func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPending, acknowledged map[int64]bool) {
@@ -1454,6 +1496,24 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 			RecordedAtMS: time.Now().UnixMilli(), ResourceCategory: event.ResourceCategory,
 			UpstreamUserAgent: event.UpstreamUserAgent, BackendAddress: event.BackendAddress,
 			InboundColo: event.InboundColo, OutboundColo: event.OutboundColo,
+		})
+	}
+	database.edgeWatchHistorySink = func(event watchHistoryEvent) bool {
+		identity, ok := localSites[event.SiteID]
+		if !ok || identity.centralID <= 0 {
+			return false
+		}
+		// The Agent's JWT secret is intentionally process-local and is not the
+		// Controller secret. Do not forward an unusable token ciphertext; the
+		// parsed playback identity and media fields are sufficient for history.
+		mapped := event
+		mapped.SiteID = identity.centralID
+		mapped.TokenCiphertext = ""
+		return runtime.queueEvent(NodeRequestEvent{
+			SiteID: identity.centralID, Host: identity.host, Method: http.MethodPost,
+			Path: "/Sessions/Playing/Progress", StatusCode: http.StatusNoContent,
+			RecordedAtMS: mapped.ObservedAtMS, ResourceCategory: requestLogCategoryPlaybackSync,
+			Priority: nodeEventPriorityCritical, SkipRequestLog: true, WatchHistory: &mapped,
 		})
 	}
 	manager := NewProxyManager(database, nil)
@@ -2165,6 +2225,49 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
 }
 
+func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, runtime *edgeAgentRuntime) error {
+	if runtime == nil {
+		return nil
+	}
+	sequence := int64(0)
+	send := func() error {
+		sequence++
+		report := NodeLiveReport{
+			ReportSessionID: sessionID,
+			CounterEpoch:    edgeCounterEpoch(edgeDefaultInterface()),
+			Sequence:        sequence,
+			SampledAtMS:     time.Now().UnixMilli(),
+			SiteStats:       runtime.liveSiteTrafficSnapshot(),
+		}
+		var ack struct{}
+		return edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
+	}
+	// Send one sample immediately so a freshly applied route does not wait for
+	// the first ticker boundary.
+	if err := send(); err != nil && isEdgeAgentRevoked(err) {
+		return err
+	}
+	ticker := time.NewTicker(agentLiveReportInterval)
+	defer ticker.Stop()
+	var lastLog time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := send(); err != nil {
+				if isEdgeAgentRevoked(err) {
+					return err
+				}
+				if lastLog.IsZero() || time.Since(lastLog) >= 30*time.Second {
+					fmt.Fprintf(os.Stderr, "Meridian Agent live report failed: %v\n", err)
+					lastLog = time.Now()
+				}
+			}
+		}
+	}
+}
+
 // edgeReportEventsByBudget takes both the protocol item limit and the encoded
 // JSON budget into account. Without the byte budget a queue containing large
 // metadata responses can exceed the Controller limit forever: the same head
@@ -2411,6 +2514,28 @@ func runEdgeAgent() error {
 	wsReporter := newEdgeWSReportClient(controller, state.Token)
 	defer wsReporter.close()
 	bootID := edgeBootID()
+	liveErrCh := make(chan error, 1)
+	liveCancel := func() {}
+	liveDone := make(chan struct{})
+	close(liveDone)
+	if !*once {
+		liveCtx, cancelLive := context.WithCancel(ctx)
+		liveCancel = cancelLive
+		liveDone = make(chan struct{})
+		go func() {
+			defer close(liveDone)
+			if err := edgeLiveReportLoop(liveCtx, client, controller, state.Token, bootID, runtime); err != nil {
+				select {
+				case liveErrCh <- err:
+				default:
+				}
+			}
+		}()
+	}
+	defer func() {
+		liveCancel()
+		<-liveDone
+	}()
 	sequence := int64(0)
 	const configRefreshInterval = 60 * time.Second
 	const agentUpdateRetryInterval = 5 * time.Minute
@@ -2422,6 +2547,13 @@ func runEdgeAgent() error {
 	applyFailures := 0
 	var pendingConfig *AgentRuntimeConfig
 	for {
+		select {
+		case liveErr := <-liveErrCh:
+			if isEdgeAgentRevoked(liveErr) {
+				return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+			}
+		default:
+		}
 		now := time.Now()
 		if lastConfigAt.IsZero() || now.Sub(lastConfigAt) >= configRefreshInterval {
 			// Record the attempt even when the Controller is temporarily
@@ -2574,7 +2706,7 @@ func runEdgeAgent() error {
 		}
 		if refreshImmediately {
 			// The controller has explicitly invalidated this Agent's runtime
-			// snapshot. Skip the normal 15-second heartbeat sleep and fetch the
+			// snapshot. Skip the normal full-report sleep and fetch the
 			// replacement configuration immediately.
 			continue
 		}
@@ -2582,7 +2714,7 @@ func runEdgeAgent() error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(func() time.Duration {
-			wait := 15 * time.Second
+			wait := agentFullReportInterval
 			if pendingConfig != nil && !nextApplyAttempt.IsZero() {
 				if until := time.Until(nextApplyAttempt); until < wait {
 					wait = until

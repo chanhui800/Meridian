@@ -151,6 +151,26 @@ type NodeReport struct {
 	Events                []NodeRequestEvent       `json:"events,omitempty"`
 }
 
+// NodeLiveReport is the lightweight runtime sample used by the dashboard.
+// It carries only process-stable per-site counters; the full NodeReport remains
+// responsible for site state, media, observations, events, and persistence.
+type NodeLiveReport struct {
+	ReportSessionID string                `json:"report_session_id"`
+	CounterEpoch    string                `json:"counter_epoch,omitempty"`
+	Sequence        int64                 `json:"sequence"`
+	SampledAtMS     int64                 `json:"sampled_at_ms"`
+	SiteStats       []NodeLiveSiteTraffic `json:"site_stats,omitempty"`
+}
+
+type NodeLiveSiteTraffic struct {
+	SiteID             int64  `json:"site_id"`
+	Host               string `json:"host"`
+	CumulativeBytesIn  int64  `json:"cumulative_bytes_in"`
+	CumulativeBytesOut int64  `json:"cumulative_bytes_out"`
+	Requests           int64  `json:"requests"`
+	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
+}
+
 // NodeReportResult keeps the protocol acknowledgement tied to the exact
 // validation/commit decision made by the controller. Handlers must not infer
 // ACKs from their original request slice after invalid events are filtered.
@@ -246,6 +266,10 @@ type NodeRequestEvent struct {
 	OutboundColo            string `json:"outbound_colo,omitempty"`
 	SkipRequestLog          bool   `json:"skip_request_log,omitempty"`
 	Priority                string `json:"priority,omitempty"`
+	// WatchHistory carries a fully parsed playback event from an Agent.  It is
+	// used when the Agent has no durable Controller database to run the normal
+	// request-body parser against.
+	WatchHistory *watchHistoryEvent `json:"watch_history,omitempty"`
 }
 
 const (
@@ -259,6 +283,7 @@ const (
 const maxNodeRequestEventBodyBytes = 8 << 10
 const maxNodeRequestEventResponseBodyBytes = 64 << 10
 const maxAgentReportBodyBytes = 2 << 20
+const maxAgentLiveReportBodyBytes = 256 << 10
 
 // Leave headroom below the Controller's hard 2 MiB limit so an event batch is
 // accepted consistently by both the JSON HTTP fallback and WebSocket path.
@@ -1049,6 +1074,11 @@ func validateNodeReport(report NodeReport) error {
 func validateNodeRequestEvent(event NodeRequestEvent) error {
 	if event.EventID <= 0 || (event.EventUID != "" && (len(event.EventUID) != 32 || !isHexString(event.EventUID))) || event.SiteID <= 0 || len(event.Host) > 255 || len(event.Method) > 16 || len(event.Path) > 2048 || len(event.Query) > 4096 || event.StatusCode < 0 || event.StatusCode > 999 || len(event.ClientIP) > 64 || len(event.UserAgent) > 512 || len(event.Authorization) > 8192 || len(event.Body) > maxNodeRequestEventBodyBytes || len(event.ContentType) > 128 || len(event.ContentEncoding) > 64 || len(event.ResponseBody) > maxNodeRequestEventResponseBodyBytes || len(event.ResponseContentType) > 128 || len(event.ResponseContentEncoding) > 64 || len(event.ResourceCategory) > 32 || len(event.UpstreamUserAgent) > 512 || len(event.BackendAddress) > 2048 || len(event.InboundColo) > 64 || len(event.OutboundColo) > 64 || event.RecordedAtMS <= 0 || (event.Priority != "" && event.Priority != nodeEventPriorityCritical && event.Priority != nodeEventPriorityBestEffort) {
 		return errors.New("invalid request event")
+	}
+	if event.WatchHistory != nil {
+		if event.WatchHistory.SiteID != event.SiteID || !validWatchHistoryEvent(*event.WatchHistory) {
+			return errors.New("invalid watch history event")
+		}
 	}
 	return nil
 }
@@ -1962,6 +1992,24 @@ func (d *DB) processNodeEvent(event NodeRequestEvent) error {
 		if err := d.recordNodeMetadataEvent(event); err != nil {
 			return err
 		}
+	}
+	if event.WatchHistory != nil {
+		if event.WatchHistory.SiteID != event.SiteID || !validWatchHistoryEvent(*event.WatchHistory) {
+			return errors.New("watch history event site/host mismatch")
+		}
+		site, err := d.GetSite(event.SiteID)
+		if err != nil || !site.WatchHistoryEnabled {
+			return nil
+		}
+		// Token ciphertext is encrypted with the Controller's private JWT key
+		// for direct requests. An Agent cannot legitimately produce that value,
+		// so never persist attacker-supplied ciphertext from the wire event.
+		history := *event.WatchHistory
+		history.TokenCiphertext = ""
+		if _, err := d.writeWatchHistoryBatch([]watchHistoryEvent{history}); err != nil {
+			return fmt.Errorf("persist watch history: %w", err)
+		}
+		return nil
 	}
 	return d.recordNodeWatchHistoryEvent(event)
 }
