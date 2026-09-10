@@ -201,11 +201,33 @@ function dashboardRequestScale(maxValue) {
   return { max: step * ticks, step, ticks };
 }
 
-function dashboardTimeLabelIndexes(pointCount, plotWidth, range) {
+function dashboardTimeLabelIndexes(pointCount, plotWidth, range, points = null, startMS = 0, endMS = 0) {
   if (pointCount <= 1) return [0];
   const minimumGap = range === 'realtime' ? 70 : 76;
   if (plotWidth < minimumGap * 1.7) return [0];
   const maxLabels = Math.max(2, Math.min(pointCount, Math.floor(plotWidth / minimumGap) + 1));
+  if (Array.isArray(points) && points.length > 1 && Number(endMS) > Number(startMS)) {
+    const indexes = [];
+    const used = new Set();
+    for (let label = 0; label < maxLabels; label += 1) {
+      const target = Number(startMS) + (Number(endMS) - Number(startMS)) * label / Math.max(1, maxLabels - 1);
+      let nearest = 0;
+      let distance = Infinity;
+      points.forEach((point, index) => {
+        const timestamp = Number(point?.timestamp_ms || 0);
+        const candidateDistance = Math.abs(timestamp - target);
+        if (candidateDistance < distance) {
+          distance = candidateDistance;
+          nearest = index;
+        }
+      });
+      if (!used.has(nearest)) {
+        used.add(nearest);
+        indexes.push(nearest);
+      }
+    }
+    return indexes.sort((a, b) => a - b);
+  }
   const step = Math.max(1, Math.ceil((pointCount - 1) / Math.max(1, maxLabels - 1)));
   const indexes = [0];
   for (let index = step; index < pointCount - 1; index += step) indexes.push(index);
@@ -226,7 +248,7 @@ function dashboardTrendValueLabel(value, metric) {
   return formatNumber(Math.round(value));
 }
 
-function dashboardTrendPointerState(rect, geometry, event, pointCount) {
+function dashboardTrendPointerState(rect, geometry, event, pointsOrCount, chartStartMS = 0, chartEndMS = 0) {
   const width = Math.max(1, Number(rect?.width) || 1);
   const height = Math.max(1, Number(rect?.height) || 1);
   const scaleX = Math.max(1, Number(geometry?.width) || width) / width;
@@ -239,7 +261,23 @@ function dashboardTrendPointerState(rect, geometry, event, pointCount) {
   const plotH = Math.max(1, Number(geometry?.plotH) || 1);
   const x = Math.max(left, Math.min(left + plotW, Number.isFinite(rawX) ? rawX : left));
   const y = Math.max(top, Math.min(top + plotH, Number.isFinite(rawY) ? rawY : top));
-  const index = Math.max(0, Math.min(Math.max(0, pointCount - 1), Math.round(((x - left) / plotW) * Math.max(0, pointCount - 1))));
+  const points = Array.isArray(pointsOrCount) ? pointsOrCount : null;
+  const pointCount = points ? points.length : Math.max(0, Number(pointsOrCount) || 0);
+  let index = Math.max(0, Math.min(Math.max(0, pointCount - 1), Math.round(((x - left) / plotW) * Math.max(0, pointCount - 1))));
+  const start = Number(chartStartMS || geometry?.chartStartMS || points?.[0]?.timestamp_ms || 0);
+  const end = Number(chartEndMS || geometry?.chartEndMS || points?.[points.length - 1]?.timestamp_ms || start);
+  if (points && points.length > 1 && end > start) {
+    const target = start + ((x - left) / plotW) * (end - start);
+    let bestDistance = Infinity;
+    points.forEach((point, candidate) => {
+      const timestamp = Number(point?.timestamp_ms || 0);
+      const distance = Math.abs(timestamp - target);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        index = candidate;
+      }
+    });
+  }
   return { x, y, index };
 }
 
@@ -372,21 +410,74 @@ function dashboardRealtimeSiteSampleAt(siteID, timestampMS) {
   return latest;
 }
 
+const dashboardRealtimeWindowDurationMS = 30 * 60 * 1000;
+
+function dashboardRealtimeWindowBounds(now = Date.now()) {
+  const current = Number(now) > 0 ? Number(now) : Date.now();
+  const configuredEnd = Number(dashboardTrendData?.range === 'realtime' ? dashboardTrendData?.end_ms : 0);
+  const end = Math.max(current, Number.isFinite(configuredEnd) ? configuredEnd : 0);
+  return { start: end - dashboardRealtimeWindowDurationMS, end };
+}
+
+function pruneDashboardRealtimeSamples(samples, now = Date.now()) {
+  if (!Array.isArray(samples) || !samples.length) return samples;
+  const { start, end } = dashboardRealtimeWindowBounds(now);
+  const kept = samples
+    .filter(point => {
+      const timestamp = Number(point?.timestamp_ms || 0);
+      return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end + 5000;
+    })
+    .sort((a, b) => Number(a.timestamp_ms || 0) - Number(b.timestamp_ms || 0));
+  if (kept.length > 2000) kept.splice(0, kept.length - 2000);
+  samples.splice(0, samples.length, ...kept);
+  return samples;
+}
+
+function upsertDashboardRealtimeSample(samples, point) {
+  if (!Array.isArray(samples) || !point) return samples;
+  const timestamp = Number(point.timestamp_ms || 0);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return samples;
+  let low = 0;
+  let high = samples.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const candidate = Number(samples[middle]?.timestamp_ms || 0);
+    if (candidate === timestamp) {
+      samples[middle] = point;
+      return samples;
+    }
+    if (candidate < timestamp) low = middle + 1;
+    else high = middle - 1;
+  }
+  samples.splice(low, 0, point);
+  return samples;
+}
+
 function dashboardRealtimeTrendPoints() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   return dashboardRealtimeTrendSamples.get(key) || [];
 }
 
-function dashboardTrendRealtimeOffset() {
+function dashboardRealtimeHistoricalPoints() {
   const historical = dashboardTrendData?.points || [];
+  if (dashboardTrendState.range !== 'realtime') return historical;
+  const { start, end } = dashboardRealtimeWindowBounds();
+  const windowed = historical.filter(point => {
+    const timestamp = Number(point?.timestamp_ms || 0);
+    return timestamp >= start && timestamp <= end;
+  });
   const realtime = dashboardRealtimeTrendPoints();
-  if (dashboardTrendState.range !== 'realtime' || !historical.length || !realtime.length) return historical.length;
+  if (!realtime.length) return windowed;
   const firstRealtime = Number(realtime[0]?.timestamp_ms || 0);
-  return historical.filter(point => Number(point.timestamp_ms || 0) < firstRealtime).length;
+  return windowed.filter(point => Number(point?.timestamp_ms || 0) < firstRealtime);
+}
+
+function dashboardTrendRealtimeOffset() {
+  return dashboardRealtimeHistoricalPoints().length;
 }
 
 function dashboardTrendPoints() {
-  const historicalPoints = dashboardTrendData?.points || [];
+  const historicalPoints = dashboardRealtimeHistoricalPoints();
   if (dashboardTrendState.range !== 'realtime') return historicalPoints;
   const realtimePoints = dashboardRealtimeTrendPoints();
   if (!realtimePoints.length || !historicalPoints.length) return realtimePoints.length ? realtimePoints : historicalPoints;
@@ -464,7 +555,16 @@ function drawDashboardTrendChart(metric) {
   const left = Math.min(Math.max(50, Math.ceil(yLabelWidth) + 16), Math.floor(width * .36));
   const right = 12, top = 14, bottom = 30;
   const plotW = Math.max(1, width - left - right), plotH = Math.max(1, height - top - bottom);
-  chart.geometry = { width, height, left, right, top, bottom, plotW, plotH };
+  const chartStartMS = dashboardTrendState.range === 'realtime'
+    ? dashboardRealtimeWindowBounds().start
+    : Number(dashboardTrendData?.start_ms || points[0]?.timestamp_ms || 0);
+  const chartEndMS = dashboardTrendState.range === 'realtime'
+    ? dashboardRealtimeWindowBounds().end
+    : Math.max(chartStartMS, Number(dashboardTrendData?.end_ms || points[points.length - 1]?.timestamp_ms || chartStartMS));
+  const xForTimestamp = timestamp => chartEndMS > chartStartMS
+    ? left + plotW * Math.max(0, Math.min(1, (Number(timestamp || chartStartMS) - chartStartMS) / (chartEndMS - chartStartMS)))
+    : left + plotW / 2;
+  chart.geometry = { width, height, left, right, top, bottom, plotW, plotH, chartStartMS, chartEndMS };
   ctx.textBaseline = 'middle';
   ctx.fillStyle = 'var(--white-60)';
   if (ctx.setLineDash) ctx.setLineDash([4, 4]);
@@ -478,7 +578,7 @@ function drawDashboardTrendChart(metric) {
   }
   if (ctx.setLineDash) ctx.setLineDash([]);
   const canvasSeries = series.map(item => ({ ...item, points: item.values.map((value, index) => ({
-    x: left + plotW * index / Math.max(1, points.length - 1),
+    x: xForTimestamp(points[index]?.timestamp_ms),
     y: top + plotH * (1 - (value / (scale.max || 1))),
   })) }));
   canvasSeries.forEach(item => {
@@ -499,7 +599,7 @@ function drawDashboardTrendChart(metric) {
     ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = canvasSeries[0].color; ctx.lineWidth = 2; ctx.stroke();
   }
   ctx.fillStyle = '#64748b'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
-  dashboardTimeLabelIndexes(points.length, plotW, dashboardTrendState.range).forEach(index => {
+  dashboardTimeLabelIndexes(points.length, plotW, dashboardTrendState.range, points, chartStartMS, chartEndMS).forEach(index => {
     const label = dashboardTrendTimeLabel(points[index].timestamp_ms, dashboardTrendState.range);
     const labelWidth = typeof ctx.measureText === 'function' ? ctx.measureText(label).width : label.length * 7;
     const x = Math.max(left + labelWidth / 2, Math.min(width - right - labelWidth / 2, pointsOnCanvas[index].x));
@@ -651,7 +751,7 @@ function setupDashboardTrendControls() {
         return;
       }
       const geometry = chart.geometry || { width: rect.width, height: rect.height, left: 0, top: 0, plotW: rect.width, plotH: rect.height };
-      const pointer = dashboardTrendPointerState(rect, geometry, event, points.length);
+      const pointer = dashboardTrendPointerState(rect, geometry, event, points, geometry.chartStartMS, geometry.chartEndMS);
       chart.hoverIndex = pointer.index;
       chart.hoverX = pointer.x;
       chart.hoverY = pointer.y;
@@ -720,6 +820,8 @@ async function loadDashboardTrends() {
       if (endInput) endInput.value = customDefault.end;
     }
     dashboardTrendData = data;
+    for (const samples of dashboardRealtimeTrendSamples.values()) pruneDashboardRealtimeSamples(samples);
+    for (const samples of dashboardRealtimeTrendSiteSamples.values()) pruneDashboardRealtimeSamples(samples);
     reconcileDashboardTrendSiteSelection();
     dashboardTrendSummary(data);
     renderDashboardTrendCharts();
@@ -1019,10 +1121,8 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     };
     if (billingKnown) point.traffic_bytes = billingMode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut);
     if (contributions && Object.keys(contributions).length) point.site_contributions = contributions;
-    samples.push(point);
-    // Keep the active dashboard session responsive without imposing a time
-    // window; the X axis adapts to however many samples are available.
-    if (samples.length > 1800) samples.splice(0, samples.length - 1800);
+    upsertDashboardRealtimeSample(samples, point);
+    pruneDashboardRealtimeSamples(samples);
     dashboardRealtimeTrendSamples.set(key, samples);
   };
   if (changedSiteIDs.size > 0) {
@@ -1060,8 +1160,8 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     // Keep the site series timestamp aligned with the Agent sample. The
     // aggregate series still uses the controller snapshot timestamp.
     appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, siteSampledAt);
-    siteSamples.push(siteSample);
-    if (siteSamples.length > 1800) siteSamples.splice(0, siteSamples.length - 1800);
+    upsertDashboardRealtimeSample(siteSamples, siteSample);
+    pruneDashboardRealtimeSamples(siteSamples);
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples);
   }
   dashboardSites = dashboardSites.map(site => {
