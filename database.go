@@ -18,6 +18,10 @@ type DB struct {
 	edgeEphemeral      bool
 	edgeRequestLogSink func(requestLogEvent)
 	edgeTelemetrySink  func(edgeTelemetryEvent)
+	// edgeWatchHistorySink forwards watch-history events from an Agent's
+	// ephemeral proxy database into the durable Agent event spool.  Controller
+	// databases leave this nil and use the normal asynchronous writer below.
+	edgeWatchHistorySink func(watchHistoryEvent) bool
 
 	dynamicObservationQueue     chan dynamicObservationCommand
 	dynamicObservationDone      chan struct{}
@@ -41,6 +45,8 @@ type DB struct {
 	nodeTLSMutationMu           sync.Mutex
 	watchHistoryMetadataMu      sync.Mutex
 	watchHistoryMetadata        map[watchHistoryMetadataKey]watchHistoryMetadataEntry
+	agentLiveMu                 sync.RWMutex
+	agentLive                   map[nodeLiveTrafficKey]nodeLiveTrafficState
 }
 
 func openDB(path string) (*DB, error) {
@@ -50,7 +56,7 @@ func openDB(path string) (*DB, error) {
 		return nil, err
 	}
 	sqlDB.SetMaxOpenConns(1)
-	d := &DB{db: sqlDB, dbPath: path, agentSecurityLastLog: make(map[string]time.Time)}
+	d := &DB{db: sqlDB, dbPath: path, agentSecurityLastLog: make(map[string]time.Time), agentLive: make(map[nodeLiveTrafficKey]nodeLiveTrafficState)}
 	if err := d.migrate(); err != nil {
 		sqlDB.Close()
 		return nil, err
@@ -107,6 +113,9 @@ func (d *DB) Close() {
 		return
 	}
 	d.dynamicObservationCloseOnce.Do(func() {
+		d.agentLiveMu.Lock()
+		d.agentLive = nil
+		d.agentLiveMu.Unlock()
 		if d.dynamicObservationQueue != nil {
 			result := make(chan error, 1)
 			d.dynamicObservationGate.Lock()

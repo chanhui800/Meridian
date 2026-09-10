@@ -1142,11 +1142,17 @@ func validWatchHistoryEvent(event watchHistoryEvent) bool {
 		len(event.UpstreamItemID) <= watchHistoryMaxIDBytes && event.ObservedAtMS > 0 && event.PositionTicks >= 0 && event.RunTimeTicks >= 0 &&
 		len(event.Title) <= watchHistoryMaxTitleBytes && len(event.OriginalTitle) <= watchHistoryMaxTitleBytes &&
 		len(event.SeriesName) <= watchHistoryMaxTitleBytes && len(event.IMDBID) <= watchHistoryMaxIDBytes && len(event.TVDBID) <= watchHistoryMaxIDBytes &&
-		len(event.UserName) <= watchHistoryMaxIdentityBytes && len(event.UserID) <= watchHistoryMaxIdentityBytes && len(event.DeviceID) <= watchHistoryMaxIdentityBytes && len(event.DeviceName) <= watchHistoryMaxIdentityBytes && len(event.PlaySessionID) <= watchHistoryMaxIdentityBytes
+		len(event.UserName) <= watchHistoryMaxIdentityBytes && len(event.UserID) <= watchHistoryMaxIdentityBytes && len(event.DeviceID) <= watchHistoryMaxIdentityBytes && len(event.DeviceName) <= watchHistoryMaxIdentityBytes && len(event.PlaySessionID) <= watchHistoryMaxIdentityBytes && len(event.TokenCiphertext) <= watchHistoryMaxTokenBytes
 }
 
 func (d *DB) EnqueueWatchHistory(event watchHistoryEvent) bool {
-	if d == nil || d.edgeEphemeral || !validWatchHistoryEvent(event) {
+	if d == nil || !validWatchHistoryEvent(event) {
+		return false
+	}
+	if d.edgeEphemeral {
+		if d.edgeWatchHistorySink != nil {
+			return d.edgeWatchHistorySink(event)
+		}
 		return false
 	}
 	command := dynamicObservationCommand{kind: dynamicObservationCommandWatchHistoryWrite, watchHistory: event}

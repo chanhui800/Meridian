@@ -335,6 +335,7 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 	}
 	defer rows.Close()
 	result := make(map[int64]NodeSiteLiveTraffic)
+	liveOverlay := d.nodeLiveTrafficOverlay(now)
 	for rows.Next() {
 		var value NodeSiteLiveTraffic
 		var nodeLastSeenMS int64
@@ -342,6 +343,13 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 		var listenerError, dnsStatus string
 		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.CacheSizeBytes, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus); err != nil {
 			return nil, err
+		}
+		liveKey := nodeLiveTrafficKey{nodeID: value.NodeID, siteID: value.SiteID}
+		if live, ok := liveOverlay[liveKey]; ok && live.SampledAtMS >= value.SampledAtMS {
+			value.CumulativeBytesIn = live.CumulativeBytesIn
+			value.CumulativeBytesOut = live.CumulativeBytesOut
+			value.Requests = live.Requests
+			value.SampledAtMS = live.SampledAtMS
 		}
 		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow
 		siteFresh := value.SampledAtMS > 0 && now.Sub(time.UnixMilli(value.SampledAtMS)) <= nodeOnlineWindow

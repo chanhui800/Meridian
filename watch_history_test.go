@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"io"
@@ -60,6 +61,32 @@ func openWatchHistoryTestDB(t *testing.T) *DB {
 	}
 	t.Cleanup(database.Close)
 	return database
+}
+
+func TestEdgeEphemeralWatchHistoryUsesEventSink(t *testing.T) {
+	database := openWatchHistoryTestDB(t)
+	database.edgeEphemeral = true
+	called := make(chan watchHistoryEvent, 1)
+	database.edgeWatchHistorySink = func(event watchHistoryEvent) bool {
+		called <- event
+		return true
+	}
+	event := watchHistoryEvent{
+		SiteID: 1, SessionHash: strings.Repeat("a", sha256.Size*2),
+		UpstreamItemID: "item-1", EventType: "progress", ObservedAtMS: 1,
+		PositionTicks: 10, RunTimeTicks: 100, SeasonNumber: -1, EpisodeNumber: -1,
+	}
+	if !database.EnqueueWatchHistory(event) {
+		t.Fatal("ephemeral watch history was not forwarded to the Agent event sink")
+	}
+	select {
+	case got := <-called:
+		if got.SiteID != event.SiteID || got.UpstreamItemID != event.UpstreamItemID {
+			t.Fatalf("forwarded event = %#v, want %#v", got, event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watch history sink was not called")
+	}
 }
 
 func createWatchHistoryTestSite(t *testing.T, database *DB, enabled bool) *Site {

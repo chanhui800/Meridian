@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -87,6 +89,76 @@ func TestControlNodeEnrollmentTrafficAndDelete(t *testing.T) {
 	afterDelete, err := app.db.NodeControlSnapshot(now.Add(7 * time.Second))
 	if err != nil || len(afterDelete.Nodes) != 0 || afterDelete.Scheduler.ManualNodeID != 0 || afterDelete.Scheduler.ActiveNodeID != 0 {
 		t.Fatalf("snapshot after delete = %#v, %v", afterDelete, err)
+	}
+}
+
+func TestNodeReportPersistsAgentWatchHistoryEvent(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "watch-agent", Address: "203.0.113.44", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "watch-agent-site", PublicHost: "watch-agent.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096", WatchHistoryEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET desired_node_id=? WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	history := &watchHistoryEvent{SiteID: site.ID, SessionHash: strings.Repeat("b", sha256.Size*2), UpstreamItemID: "item-1", EventType: "progress", ObservedAtMS: now.UnixMilli(), PositionTicks: 10, RunTimeTicks: 100, SeasonNumber: -1, EpisodeNumber: -1}
+	event := NodeRequestEvent{EventID: 1, EventUID: strings.Repeat("c", 32), SiteID: site.ID, Host: site.PublicHost, Method: http.MethodPost, Path: "/Sessions/Playing/Progress", StatusCode: http.StatusNoContent, RecordedAtMS: now.UnixMilli(), Priority: nodeEventPriorityCritical, SkipRequestLog: true, WatchHistory: history}
+	if _, err := app.db.RecordNodeReportResult(token, NodeReport{BootID: "watch-session", ReportSessionID: "watch-session", CounterEpoch: "kernel:eth0", Sequence: 1, InterfaceName: "eth0", Events: []NodeRequestEvent{event}}, now); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM watch_sessions WHERE site_id=? AND session_hash=?", site.ID, history.SessionHash).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("watch session count=%d, want 1", count)
+	}
+}
+
+func TestDisabledScheduleCleanupClearsStaleAssignments(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "stale-node", Address: "203.0.113.45", Port: 9090}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "stale-site", PublicHost: "stale.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,desired_node_id=?,applied_node_id=?,cf_zone_id='',cf_record_id='',cf_record_type='A',applied_address='203.0.113.45',dns_status='active' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.deleteTrackedSiteDNS(context.Background(), schedule); err != nil {
+		t.Fatal(err)
+	}
+	var enabled int
+	var fixed, desired, applied sql.NullInt64
+	var zone, record, recordType, address, status string
+	if err := app.db.db.QueryRow(`SELECT enabled,fixed_node_id,desired_node_id,applied_node_id,cf_zone_id,cf_record_id,cf_record_type,applied_address,dns_status FROM site_node_schedules WHERE site_id=?`, site.ID).Scan(&enabled, &fixed, &desired, &applied, &zone, &record, &recordType, &address, &status); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 0 || fixed.Valid || desired.Valid || applied.Valid || zone != "" || record != "" || recordType != "" || address != "" || status != "disabled" {
+		t.Fatalf("stale schedule was not cleared: enabled=%d fixed=%v desired=%v applied=%v zone=%q record=%q type=%q address=%q status=%q", enabled, fixed, desired, applied, zone, record, recordType, address, status)
 	}
 }
 
@@ -1477,6 +1549,12 @@ func TestAgentConfigHashSeparatesReleaseMetadata(t *testing.T) {
 	}
 	if !agentUsesRuntimeConfigHash("v1.9.30") || agentUsesRuntimeConfigHash("v1.9.29") {
 		t.Fatal("runtime config hash compatibility gate is incorrect")
+	}
+	if !agentUsesRuntimeConfigHash("v1.9.74-pre.6") || !agentSupportsProbeSecret("v1.9.74-pre.6") || !agentSupportsTrafficBaseline("v1.9.74-pre.6") {
+		t.Fatal("prerelease build must use the current Agent compatibility contract")
+	}
+	if preHash, err := agentConfigHashForVersion(config, "v1.9.74-pre.6"); err != nil || preHash != runtimeHash {
+		t.Fatalf("prerelease hash differs from runtime hash: got=%q want=%q err=%v", preHash, runtimeHash, err)
 	}
 	if agentSupportsProbeSecret("v1.9.42") || !agentSupportsProbeSecret("v1.9.43") {
 		t.Fatal("probe secret compatibility gate is incorrect")

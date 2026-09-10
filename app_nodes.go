@@ -654,7 +654,7 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 			}
 		}(node)
 	}
-	a.jsonOK(w, map[string]interface{}{"node_guid": node.GUID, "agent_token": agentToken, "report_interval_seconds": 15})
+	a.jsonOK(w, map[string]interface{}{"node_guid": node.GUID, "agent_token": agentToken, "report_interval_seconds": int(agentFullReportInterval / time.Second)})
 }
 
 func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
@@ -699,7 +699,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 	}
 	configChanged := nodeReportConfigChanged(result.Node, report.AppliedConfigHash, report.AppliedConfigRevision)
 	a.jsonOK(w, map[string]interface{}{
-		"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
+		"accepted": true, "node_id": result.Node.ID, "next_report_seconds": int(agentFullReportInterval / time.Second),
 		"accepted_site_ids": result.AcceptedSiteIDs, "discarded_site_ids": result.DiscardedSiteIDs,
 		"accepted_media_site_ids": result.AcceptedMediaSiteIDs, "discarded_media_site_ids": result.DiscardedMediaSiteIDs,
 		"accepted_retention_site_ids": result.AcceptedRetentionSiteIDs, "discarded_retention_site_ids": result.DiscardedRetentionSiteIDs,
@@ -708,6 +708,65 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		"discarded_event_ids": result.DiscardedEventIDs, "discarded_event_uids": result.DiscardedEventUIDs,
 		"config_hash":    result.Node.DesiredConfigHash,
 		"config_changed": configChanged,
+	})
+}
+
+// handleAgentLive accepts the small, high-frequency traffic sample used by
+// the dashboard. It shares the per-node report admission gate with the full
+// HTTP/WebSocket report paths, but performs no SQLite writes.
+func (a *App) handleAgentLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	identity, authErr := agentNodeIdentityForRequest(a, r)
+	if authErr != nil {
+		writeAgentAuthenticationError(a, w, r, authErr)
+		return
+	}
+	release, retryAfter, admitted := a.agentReports().admit(identity.Node.ID, time.Now())
+	if !admitted {
+		seconds := int(retryAfter.Seconds())
+		if retryAfter-time.Duration(seconds)*time.Second > 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		a.jsonErr(w, http.StatusTooManyRequests, "agent report rate or concurrency limit exceeded")
+		return
+	}
+	defer release()
+	var report NodeLiveReport
+	if err := decodeJSONBodyWithLimit(w, r, &report, maxAgentLiveReportBodyBytes); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	now := time.Now()
+	if err := validateNodeLiveReport(report, now); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	accepted, discarded, err := a.db.recordNodeLiveReport(identity.Node.ID, report, now)
+	if errors.Is(err, errInvalidAgentToken) {
+		writeAgentAuthFailure(a, w, r)
+		return
+	}
+	if err != nil {
+		a.jsonErr(w, http.StatusServiceUnavailable, "live report temporarily unavailable")
+		return
+	}
+	for _, siteID := range discarded {
+		a.db.recordAgentSecurityRejection(identity.Node.ID, siteID, "site-stats")
+	}
+	a.jsonOK(w, map[string]interface{}{
+		"accepted":            true,
+		"node_id":             identity.Node.ID,
+		"next_report_seconds": int(agentLiveReportInterval / time.Second),
+		"accepted_site_ids":   accepted,
+		"discarded_site_ids":  discarded,
 	})
 }
 
@@ -758,24 +817,22 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		if err := ws.SetReadDeadline(time.Now().Add(nodeOnlineWindow)); err != nil {
 			return
 		}
+		// Read only the bounded WebSocket frame before admission. The frame is
+		// capped by MaxPayloadBytes; admitting after receive prevents an idle
+		// WebSocket connection from monopolizing the node's slot and blocking the
+		// independent 2-second live traffic channel.
+		var payload []byte
+		if err := websocket.Message.Receive(ws, &payload); err != nil {
+			return
+		}
 		release, retryAfter, admitted := a.agentReports().admit(node.ID, time.Now())
 		if !admitted {
-			// Do not receive or decode another frame after admission is denied.
-			// Closing prevents an over-limit peer from keeping the connection in
-			// a tight error loop while it continues sending large frames.
 			_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_ = websocket.JSON.Send(ws, map[string]interface{}{
 				"accepted":            false,
 				"error":               "agent report rate or concurrency limit exceeded",
 				"retry_after_seconds": max(1, int(retryAfter.Seconds()+0.5)),
 			})
-			return
-		}
-		// Read only the bounded WebSocket frame after admission. MaxPayloadBytes
-		// bounds the frame allocation before JSON decoding.
-		var payload []byte
-		if err := websocket.Message.Receive(ws, &payload); err != nil {
-			release()
 			return
 		}
 		var report NodeReport
@@ -794,7 +851,7 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 			return
 		}
 		ack := map[string]interface{}{
-			"accepted": true, "node_id": result.Node.ID, "next_report_seconds": 15,
+			"accepted": true, "node_id": result.Node.ID, "next_report_seconds": int(agentFullReportInterval / time.Second),
 			"accepted_site_ids": result.AcceptedSiteIDs, "discarded_site_ids": result.DiscardedSiteIDs,
 			"accepted_media_site_ids": result.AcceptedMediaSiteIDs, "discarded_media_site_ids": result.DiscardedMediaSiteIDs,
 			"accepted_retention_site_ids": result.AcceptedRetentionSiteIDs, "discarded_retention_site_ids": result.DiscardedRetentionSiteIDs,

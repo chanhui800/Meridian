@@ -19,6 +19,8 @@ let dashboardRealtimeTrendSamples = new Map();
 let dashboardRealtimeTrendSiteSamples = new Map();
 let dashboardLatestRatesBySite = new Map();
 let dashboardBillingMode = null;
+let dashboardRealtimePersistedBillingMode = null;
+const dashboardRealtimeStorageKey = 'meridian.dashboard.realtime-trends.v1';
 let dashboardLastSnapshotMS = 0;
 let dashboardLastObservedSiteCount = -1;
 
@@ -116,6 +118,7 @@ function renderDashboard() {
   `;
 
   startDashSSE();
+  restoreDashboardRealtimeSamples();
   setupDashboardTrendControls();
   observeDashboardTrendResize();
   void loadDashboardBootstrap();
@@ -203,6 +206,9 @@ function dashboardRequestScale(maxValue) {
 
 function dashboardTimeLabelIndexes(pointCount, plotWidth, range, points = null, startMS = 0, endMS = 0) {
   if (pointCount <= 1) return [0];
+  // Realtime charts follow Komari's sparse boundary labels. Historical views
+  // keep the denser adaptive labels because their buckets cover longer spans.
+  if (range === 'realtime') return [0, pointCount - 1];
   const minimumGap = range === 'realtime' ? 70 : 76;
   if (plotWidth < minimumGap * 1.7) return [0];
   const maxLabels = Math.max(2, Math.min(pointCount, Math.floor(plotWidth / minimumGap) + 1));
@@ -235,6 +241,13 @@ function dashboardTimeLabelIndexes(pointCount, plotWidth, range, points = null, 
   const lastLabelPixelGap = (lastIndex - indexes[indexes.length - 1]) * plotWidth / Math.max(1, lastIndex);
   if (lastLabelPixelGap >= minimumGap || indexes.length === 1) indexes.push(lastIndex);
   return indexes;
+}
+
+function dashboardTrendAxisLabel(index, points, range, startMS, endMS) {
+  if (range === 'realtime' && Array.isArray(points) && points.length > 1) {
+    return index === 0 ? Number(startMS) : Number(endMS);
+  }
+  return Number(points?.[index]?.timestamp_ms || (index === 0 ? startMS : endMS));
 }
 
 function dashboardTrendMetricValue(point, metric) {
@@ -352,8 +365,7 @@ function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
   const realtimeSeries = dashboardRealtimeTrendSiteSamples;
   const siteRows = [];
   if (selectedSiteID === null) {
-    const realtimeOffset = dashboardTrendRealtimeOffset();
-    const realtimeIndex = pointIndex - realtimeOffset;
+    const realtimeIndex = pointIndex;
     if (range === 'realtime' && realtimeSeries.size && realtimeIndex >= 0) {
       const knownSites = dashboardSites.length ? dashboardSites : allSeries.map(series => ({ id: series.site_id, name: series.site_name }));
       knownSites.forEach(site => {
@@ -410,13 +422,19 @@ function dashboardRealtimeSiteSampleAt(siteID, timestampMS) {
   return latest;
 }
 
-const dashboardRealtimeWindowDurationMS = 30 * 60 * 1000;
+// Match Komari's realtime view: a fixed five-minute window sampled from the
+// two-second SSE cadence. The window must stay fixed even when a site has no
+// traffic, otherwise sparse site reports make the x-axis expand over time.
+const dashboardRealtimeWindowDurationMS = 5 * 60 * 1000;
+const dashboardRealtimeSampleIntervalMS = 2 * 1000;
+// Keep a bounded FIFO as a second guard for duplicated or unusually frequent
+// events. At the normal two-second cadence this is exactly one five-minute
+// window.
+const dashboardRealtimeMaxPoints = Math.ceil(dashboardRealtimeWindowDurationMS / dashboardRealtimeSampleIntervalMS);
 
 function dashboardRealtimeWindowBounds(now = Date.now()) {
   const current = Number(now) > 0 ? Number(now) : Date.now();
-  const configuredEnd = Number(dashboardTrendData?.range === 'realtime' ? dashboardTrendData?.end_ms : 0);
-  const end = Math.max(current, Number.isFinite(configuredEnd) ? configuredEnd : 0);
-  return { start: end - dashboardRealtimeWindowDurationMS, end };
+  return { start: current - dashboardRealtimeWindowDurationMS, end: current };
 }
 
 function pruneDashboardRealtimeSamples(samples, now = Date.now()) {
@@ -428,9 +446,130 @@ function pruneDashboardRealtimeSamples(samples, now = Date.now()) {
       return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end + 5000;
     })
     .sort((a, b) => Number(a.timestamp_ms || 0) - Number(b.timestamp_ms || 0));
-  if (kept.length > 2000) kept.splice(0, kept.length - 2000);
+  if (kept.length > dashboardRealtimeMaxPoints) {
+    kept.splice(0, kept.length - dashboardRealtimeMaxPoints);
+  }
   samples.splice(0, samples.length, ...kept);
   return samples;
+}
+
+function dashboardRealtimeStorage() {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    return window.localStorage;
+  } catch (_) {
+    // Private browsing modes and restrictive storage policies can throw even
+    // when localStorage is exposed. Trend persistence is only an enhancement,
+    // so the live SSE path must continue without it.
+    return null;
+  }
+}
+
+function dashboardNormalizeRealtimePoint(value) {
+  if (!value || typeof value !== 'object') return null;
+  const timestamp = Number(value.timestamp_ms);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+  const numberOrZero = candidate => {
+    const number = Number(candidate);
+    return Number.isFinite(number) && number >= 0 ? number : 0;
+  };
+  const point = {
+    timestamp_ms: timestamp,
+    download_bps: numberOrZero(value.download_bps),
+    upload_bps: numberOrZero(value.upload_bps),
+    bytes_in: numberOrZero(value.bytes_in),
+    bytes_out: numberOrZero(value.bytes_out),
+    requests: numberOrZero(value.requests),
+  };
+  if (value.traffic_bytes !== undefined) point.traffic_bytes = numberOrZero(value.traffic_bytes);
+  if (value.site_contributions && typeof value.site_contributions === 'object' && !Array.isArray(value.site_contributions)) {
+    const contributions = {};
+    Object.keys(value.site_contributions).slice(0, 512).forEach(siteID => {
+      if (!/^\d+$/.test(siteID)) return;
+      const source = value.site_contributions[siteID];
+      const contribution = dashboardNormalizeRealtimePoint({ ...source, timestamp_ms: timestamp });
+      if (!contribution) return;
+      delete contribution.site_contributions;
+      contributions[siteID] = contribution;
+    });
+    if (Object.keys(contributions).length) point.site_contributions = contributions;
+  }
+  return point;
+}
+
+function dashboardNormalizeRealtimeSamples(values, now = Date.now()) {
+  if (!Array.isArray(values)) return [];
+  const samples = [];
+  values.forEach(value => {
+    const point = dashboardNormalizeRealtimePoint(value);
+    if (point) upsertDashboardRealtimeSample(samples, point);
+  });
+  return pruneDashboardRealtimeSamples(samples, now);
+}
+
+function dashboardPersistableRealtimeSamples(samples) {
+  if (!Array.isArray(samples)) return [];
+  return samples.map(dashboardNormalizeRealtimePoint).filter(Boolean);
+}
+
+function persistDashboardRealtimeSamples() {
+  const storage = dashboardRealtimeStorage();
+  if (!storage) return;
+  try {
+    const sites = {};
+    dashboardRealtimeTrendSiteSamples.forEach((samples, siteID) => {
+      const persistable = dashboardPersistableRealtimeSamples(samples);
+      if (persistable.length) sites[String(siteID)] = persistable;
+    });
+    storage.setItem(dashboardRealtimeStorageKey, JSON.stringify({
+      version: 1,
+      saved_at_ms: Date.now(),
+      billing_mode: dashboardBillingMode || dashboardRealtimePersistedBillingMode || null,
+      all: dashboardPersistableRealtimeSamples(dashboardRealtimeTrendSamples.get('all') || []),
+      sites,
+    }));
+  } catch (_) {
+    // Quota errors and disabled storage must never interrupt live updates.
+  }
+}
+
+function clearDashboardRealtimeSamplesStorage() {
+  const storage = dashboardRealtimeStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(dashboardRealtimeStorageKey);
+  } catch (_) {
+    // Ignore storage policy failures; the in-memory sequence is still reset.
+  }
+}
+
+function restoreDashboardRealtimeSamples(now = Date.now()) {
+  const storage = dashboardRealtimeStorage();
+  if (!storage) return false;
+  let payload;
+  try {
+    const raw = storage.getItem(dashboardRealtimeStorageKey);
+    if (!raw) return false;
+    payload = JSON.parse(raw);
+  } catch (_) {
+    return false;
+  }
+  if (!payload || typeof payload !== 'object' || Number(payload.version || 1) !== 1) return false;
+  const all = dashboardNormalizeRealtimeSamples(payload.all, now);
+  const sites = new Map();
+  if (payload.sites && typeof payload.sites === 'object' && !Array.isArray(payload.sites)) {
+    Object.keys(payload.sites).forEach(siteID => {
+      if (!/^\d+$/.test(siteID)) return;
+      const samples = dashboardNormalizeRealtimeSamples(payload.sites[siteID], now);
+      if (samples.length) sites.set(siteID, samples);
+    });
+  }
+  dashboardRealtimeTrendSamples = new Map();
+  dashboardRealtimeTrendSiteSamples = sites;
+  if (all.length) dashboardRealtimeTrendSamples.set('all', all);
+  const billingMode = String(payload.billing_mode || '').toLowerCase();
+  dashboardRealtimePersistedBillingMode = billingMode === 'outbound' || billingMode === 'bidirectional' ? billingMode : null;
+  return all.length > 0 || sites.size > 0;
 }
 
 function upsertDashboardRealtimeSample(samples, point) {
@@ -480,9 +619,27 @@ function dashboardTrendPoints() {
   const historicalPoints = dashboardRealtimeHistoricalPoints();
   if (dashboardTrendState.range !== 'realtime') return historicalPoints;
   const realtimePoints = dashboardRealtimeTrendPoints();
-  if (!realtimePoints.length || !historicalPoints.length) return realtimePoints.length ? realtimePoints : historicalPoints;
+  if (!realtimePoints.length || !historicalPoints.length) {
+    return realtimePoints.length ? realtimePoints : historicalPoints;
+  }
   const offset = dashboardTrendRealtimeOffset();
   return historicalPoints.slice(0, offset).concat(realtimePoints);
+}
+
+function dashboardTrendChartPoints() {
+  if (dashboardTrendState.range === 'realtime') {
+    const realtimePoints = dashboardRealtimeTrendPoints();
+    if (realtimePoints.length) return realtimePoints;
+  }
+  return dashboardTrendPoints();
+}
+
+function dashboardRealtimeChartBounds(points) {
+  // Keep the realtime x-axis anchored to the moving five-minute window. Do
+  // not derive it from the first/last point: unchanged sites intentionally
+  // still receive a sample every SSE tick, and sparse data must not stretch
+  // the visible time range.
+  return dashboardRealtimeWindowBounds();
 }
 
 function dashboardTrendSummary(data) {
@@ -534,7 +691,7 @@ function dashboardRoundRect(ctx, x, y, width, height, radius) {
 
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
-  const points = dashboardTrendPoints();
+  const points = dashboardTrendChartPoints();
   if (!chart || !chart.canvas || !chart.canvas.getContext || !points.length) return;
   const canvas = chart.canvas;
   const wrap = canvas.parentElement;
@@ -555,11 +712,14 @@ function drawDashboardTrendChart(metric) {
   const left = Math.min(Math.max(50, Math.ceil(yLabelWidth) + 16), Math.floor(width * .36));
   const right = 12, top = 14, bottom = 30;
   const plotW = Math.max(1, width - left - right), plotH = Math.max(1, height - top - bottom);
+  const realtimeBounds = dashboardTrendState.range === 'realtime'
+    ? dashboardRealtimeChartBounds(points)
+    : null;
   const chartStartMS = dashboardTrendState.range === 'realtime'
-    ? dashboardRealtimeWindowBounds().start
+    ? realtimeBounds.start
     : Number(dashboardTrendData?.start_ms || points[0]?.timestamp_ms || 0);
   const chartEndMS = dashboardTrendState.range === 'realtime'
-    ? dashboardRealtimeWindowBounds().end
+    ? realtimeBounds.end
     : Math.max(chartStartMS, Number(dashboardTrendData?.end_ms || points[points.length - 1]?.timestamp_ms || chartStartMS));
   const xForTimestamp = timestamp => chartEndMS > chartStartMS
     ? left + plotW * Math.max(0, Math.min(1, (Number(timestamp || chartStartMS) - chartStartMS) / (chartEndMS - chartStartMS)))
@@ -600,9 +760,12 @@ function drawDashboardTrendChart(metric) {
   }
   ctx.fillStyle = '#64748b'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
   dashboardTimeLabelIndexes(points.length, plotW, dashboardTrendState.range, points, chartStartMS, chartEndMS).forEach(index => {
-    const label = dashboardTrendTimeLabel(points[index].timestamp_ms, dashboardTrendState.range);
+    const labelTimestamp = dashboardTrendAxisLabel(index, points, dashboardTrendState.range, chartStartMS, chartEndMS);
+    const label = dashboardTrendTimeLabel(labelTimestamp, dashboardTrendState.range);
     const labelWidth = typeof ctx.measureText === 'function' ? ctx.measureText(label).width : label.length * 7;
-    const x = Math.max(left + labelWidth / 2, Math.min(width - right - labelWidth / 2, pointsOnCanvas[index].x));
+    const x = dashboardTrendState.range === 'realtime' && points.length > 1
+      ? (index === 0 ? left + labelWidth / 2 : width - right - labelWidth / 2)
+      : Math.max(left + labelWidth / 2, Math.min(width - right - labelWidth / 2, pointsOnCanvas[index].x));
     ctx.fillText(label, x, height - 7);
   });
   if (chart.hoverIndex >= 0 && pointsOnCanvas[chart.hoverIndex]) {
@@ -740,7 +903,7 @@ function setupDashboardTrendControls() {
       drawDashboardTrendChart(metric);
     };
     const updateHover = event => {
-      const points = dashboardTrendPoints();
+      const points = dashboardTrendChartPoints();
       if (!points.length) return;
       const rect = canvas.getBoundingClientRect();
       // Touch pointer capture continues delivering pointermove events after
@@ -934,14 +1097,17 @@ function updateDashboardLive(stats) {
 	if (generatedAt > 0) dashboardLastSnapshotMS = generatedAt;
 	const incomingBillingMode = String(stats?.billing_mode || '').toLowerCase();
 	if (incomingBillingMode === 'outbound' || incomingBillingMode === 'bidirectional') {
-	  if (dashboardBillingMode && dashboardBillingMode !== incomingBillingMode) {
+	  const previousBillingMode = dashboardBillingMode || dashboardRealtimePersistedBillingMode;
+	  if (previousBillingMode && previousBillingMode !== incomingBillingMode) {
 	    // Existing realtime traffic was calculated under the old policy. Drop
 	    // only that derived sequence; counter baselines and live rates remain
 	    // valid and will continue on the next sample.
 	    dashboardRealtimeTrendSamples = new Map();
 	    dashboardRealtimeTrendSiteSamples = new Map();
+	    clearDashboardRealtimeSamplesStorage();
 	  }
 	  dashboardBillingMode = incomingBillingMode;
+	  dashboardRealtimePersistedBillingMode = incomingBillingMode;
 	}
 	const panelDomainEl = document.getElementById('s-panel-domain');
 	const currentPanelURL = dashboardCurrentPanelURL(stats.panel_access_url);
@@ -977,7 +1143,6 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
   const liveMap = new Map();
   const trendDeltas = new Map();
   const rateSamples = new Map();
-  const changedSiteTimestamps = new Map();
   const changedSiteIDs = new Set();
   let totalDeltaIn = 0;
   let totalDeltaOut = 0;
@@ -1013,7 +1178,6 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     if (!previous) {
       dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
       changedSiteIDs.add(siteID);
-      changedSiteTimestamps.set(siteID, current.timestamp);
       rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
       trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
     } else if (!fresh) {
@@ -1022,14 +1186,12 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       // counters as the recovery baseline.
       if (previous.running || previous.fresh || (dashboardLiveSpeeds.get(siteID)?.down || 0) !== 0 || (dashboardLiveSpeeds.get(siteID)?.up || 0) !== 0) {
         changedSiteIDs.add(siteID);
-        changedSiteTimestamps.set(siteID, current.timestamp);
         rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
         trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
       }
       dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
     } else if (current.timestamp > previous.timestamp) {
       changedSiteIDs.add(siteID);
-      changedSiteTimestamps.set(siteID, current.timestamp);
       // After an offline interval, establish a fresh baseline rather than
       // charging the whole outage as a single speed sample.
       const recovering = previous.running !== true || previous.fresh !== true;
@@ -1096,7 +1258,6 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       if (wasActive || existingSpeed.down !== 0 || existingSpeed.up !== 0) {
         dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
         changedSiteIDs.add(siteID);
-        changedSiteTimestamps.set(siteID, latest.sampledAt);
         rateSamples.set(String(siteID), { download_bps: 0, upload_bps: 0 });
         trendDeltas.set(siteID, { bytesIn: 0, bytesOut: 0, requests: 0 });
       }
@@ -1125,41 +1286,48 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     pruneDashboardRealtimeSamples(samples);
     dashboardRealtimeTrendSamples.set(key, samples);
   };
-  if (changedSiteIDs.size > 0) {
-    const contributions = {};
-    for (const siteID of changedSiteIDs) {
-      const delta = trendDeltas.get(siteID) || {};
-      const rate = rateSamples.get(String(siteID)) || {};
-      contributions[String(siteID)] = {
-        download_bps: Math.max(0, Number(rate.download_bps || 0)),
-        upload_bps: Math.max(0, Number(rate.upload_bps || 0)),
-        bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
-        bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
-        requests: Math.max(0, Number(delta.requests || 0)),
-      };
-      if (billingKnown) contributions[String(siteID)].traffic_bytes = billingMode === 'outbound'
-        ? contributions[String(siteID)].bytes_out
-        : 2 * (contributions[String(siteID)].bytes_in + contributions[String(siteID)].bytes_out);
-    }
-    appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests }, sampledAt, contributions);
-  }
+  // Append one aggregate point on every SSE tick, even if no site's counter
+  // changed. This keeps the realtime chart on a fixed two-second cadence;
+  // unchanged sites retain their latest valid rate while their byte/request
+  // deltas remain zero for this interval.
+  const contributions = {};
   for (const siteID of changedSiteIDs) {
-    const rate = rateSamples.get(String(siteID)) || {};
     const delta = trendDeltas.get(siteID) || {};
-    const siteSampledAt = changedSiteTimestamps.get(siteID) || sampledAt;
-    const siteSamples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
-    const siteSample = {
-      timestamp_ms: siteSampledAt,
+    const rate = rateSamples.get(String(siteID)) || {};
+    contributions[String(siteID)] = {
       download_bps: Math.max(0, Number(rate.download_bps || 0)),
       upload_bps: Math.max(0, Number(rate.upload_bps || 0)),
       bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
       bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
       requests: Math.max(0, Number(delta.requests || 0)),
     };
+    if (billingKnown) contributions[String(siteID)].traffic_bytes = billingMode === 'outbound'
+      ? contributions[String(siteID)].bytes_out
+      : 2 * (contributions[String(siteID)].bytes_in + contributions[String(siteID)].bytes_out);
+  }
+  appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests }, sampledAt, contributions);
+
+  // Site charts use the same controller snapshot timestamp rather than the
+  // Agent's last site sample timestamp. Otherwise a site that reports less
+  // often would overwrite the same point repeatedly and its 150-point FIFO
+  // would span an ever-growing period.
+  for (const [siteID, latest] of dashboardLatestRatesBySite) {
+    const rate = {
+      download_bps: Math.max(0, Number(latest?.down || 0)),
+      upload_bps: Math.max(0, Number(latest?.up || 0)),
+    };
+    const delta = trendDeltas.get(siteID) || {};
+    const siteSamples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
+    const siteSample = {
+      timestamp_ms: sampledAt,
+      download_bps: rate.download_bps,
+      upload_bps: rate.upload_bps,
+      bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
+      bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
+      requests: Math.max(0, Number(delta.requests || 0)),
+    };
     if (billingKnown) siteSample.traffic_bytes = billingMode === 'outbound' ? siteSample.bytes_out : 2 * (siteSample.bytes_in + siteSample.bytes_out);
-    // Keep the site series timestamp aligned with the Agent sample. The
-    // aggregate series still uses the controller snapshot timestamp.
-    appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, siteSampledAt);
+    appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, sampledAt);
     upsertDashboardRealtimeSample(siteSamples, siteSample);
     pruneDashboardRealtimeSamples(siteSamples);
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples);
@@ -1176,6 +1344,7 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     return { ...site, ...live, _liveSpeed: speed };
   });
   renderDashboardTableRows();
+  persistDashboardRealtimeSamples();
 }
 
 function dashboardCurrentPanelURL(fallback) {
@@ -1212,6 +1381,7 @@ function stopDashSSE() {
   dashboardLiveSpeeds = new Map();
   dashboardLatestRatesBySite = new Map();
   dashboardBillingMode = null;
+  dashboardRealtimePersistedBillingMode = null;
   dashboardRealtimeTrendSamples = new Map();
   dashboardRealtimeTrendSiteSamples = new Map();
   dashboardLastSnapshotMS = 0;

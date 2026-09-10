@@ -32,10 +32,27 @@ test('dashboard trend tooltip lists all site names or only the selected site', (
   assert.match(dashboardSource, /selectedOption\?\.textContent/);
 });
 
-test('dashboard realtime trend keeps historical points after a page refresh', () => {
-  assert.match(dashboardSource, /function dashboardTrendRealtimeOffset\(\)/);
-  assert.match(dashboardSource, /historicalPoints\.slice\(0, offset\)\.concat\(realtimePoints\)/);
-  assert.match(dashboardSource, /if \(!realtimePoints\.length \|\| !historicalPoints\.length\) return realtimePoints\.length \? realtimePoints : historicalPoints/);
+test('dashboard realtime trend uses a bounded fixed five-minute FIFO', () => {
+  assert.match(dashboardSource, /dashboardRealtimeWindowDurationMS = 5 \* 60 \* 1000/);
+  assert.match(dashboardSource, /dashboardRealtimeSampleIntervalMS = 2 \* 1000/);
+  assert.match(dashboardSource, /Math\.ceil\(dashboardRealtimeWindowDurationMS \/ dashboardRealtimeSampleIntervalMS\)/);
+  assert.match(dashboardSource, /kept\.length > dashboardRealtimeMaxPoints/);
+  assert.match(dashboardSource, /function dashboardTrendChartPoints\(\)/);
+  assert.match(dashboardSource, /if \(realtimePoints\.length\) return realtimePoints/);
+  assert.match(dashboardSource, /function dashboardRealtimeChartBounds\(points\)/);
+  assert.match(dashboardSource, /return dashboardRealtimeWindowBounds\(\)/);
+  assert.match(dashboardSource, /function dashboardTrendAxisLabel\(index, points, range, startMS, endMS\)/);
+  assert.match(dashboardSource, /dashboardTrendAxisLabel\(index, points, dashboardTrendState\.range, chartStartMS, chartEndMS\)/);
+  assert.match(dashboardSource, /if \(range === 'realtime'\) return \[0, pointCount - 1\]/);
+});
+
+test('dashboard realtime trend survives page refresh through bounded local storage', () => {
+  assert.match(dashboardSource, /meridian\.dashboard\.realtime-trends\.v1/);
+  assert.match(dashboardSource, /function persistDashboardRealtimeSamples\(\)/);
+  assert.match(dashboardSource, /function restoreDashboardRealtimeSamples\(now = Date\.now\(\)\)/);
+  assert.match(dashboardSource, /dashboardNormalizeRealtimeSamples\(payload\.all, now\)/);
+  assert.match(dashboardSource, /restoreDashboardRealtimeSamples\(\)/);
+  assert.match(dashboardSource, /persistDashboardRealtimeSamples\(\);/);
 });
 
 test('dashboard loads one bootstrap snapshot before relying on SSE', () => {

@@ -664,15 +664,8 @@ func agentConfigLegacyHash(config AgentRuntimeConfig) (string, error) {
 }
 
 func agentUsesRuntimeConfigHash(version string) bool {
-	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	major, errMajor := strconv.Atoi(parts[0])
-	minor, errMinor := strconv.Atoi(parts[1])
-	patch, errPatch := strconv.Atoi(parts[2])
-	if errMajor != nil || errMinor != nil || errPatch != nil {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
 		return false
 	}
 	if major != 1 {
@@ -691,15 +684,8 @@ func agentUsesRuntimeConfigHash(version string) bool {
 // during the rolling upgrade window so they can validate and apply the config
 // before downloading the current Agent binary.
 func agentSupportsProbeSecret(version string) bool {
-	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	major, errMajor := strconv.Atoi(parts[0])
-	minor, errMinor := strconv.Atoi(parts[1])
-	patch, errPatch := strconv.Atoi(parts[2])
-	if errMajor != nil || errMinor != nil || errPatch != nil {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
 		return false
 	}
 	if major != 1 {
@@ -717,15 +703,8 @@ func agentSupportsProbeSecret(version string) bool {
 // Agents ignore the JSON field, so the controller must calculate the hash over
 // the shape they actually know until they upgrade.
 func agentSupportsCacheClear(version string) bool {
-	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	major, errMajor := strconv.Atoi(parts[0])
-	minor, errMinor := strconv.Atoi(parts[1])
-	patch, errPatch := strconv.Atoi(parts[2])
-	if errMajor != nil || errMinor != nil || errPatch != nil {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
 		return false
 	}
 	if major != 1 {
@@ -743,15 +722,8 @@ func agentSupportsCacheClear(version string) bool {
 // they have upgraded; otherwise they reject an otherwise valid configuration
 // because their locally computed hash has no such field.
 func agentSupportsForceStop(version string) bool {
-	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	major, errMajor := strconv.Atoi(parts[0])
-	minor, errMinor := strconv.Atoi(parts[1])
-	patch, errPatch := strconv.Atoi(parts[2])
-	if errMajor != nil || errMinor != nil || errPatch != nil {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
 		return false
 	}
 	if major != 1 {
@@ -776,20 +748,33 @@ func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (strin
 	return hashAgentConfigPayloadForVersion(config, true, agentSupportsTrafficBaseline(version))
 }
 
+// parseAgentVersion accepts the build metadata used by AWS test deployments
+// (for example v1.9.74-pre.6) while comparing only the stable numeric release
+// portion for wire compatibility decisions. Prerelease builds must not fall
+// through to the legacy hash contract merely because of their suffix.
+func parseAgentVersion(version string) (major, minor, patch int, ok bool) {
+	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
+	version = strings.SplitN(version, "-", 2)[0]
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return 0, 0, 0, false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil || major < 0 || minor < 0 || patch < 0 {
+		return 0, 0, 0, false
+	}
+	return major, minor, patch, true
+}
+
 // agentSupportsTrafficBaseline reports whether the Agent understands the
 // Controller's separated traffic-cycle state introduced in v1.9.61. Before
 // that release TrafficUsed was part of the route hash and must remain in the
 // compatibility hash during a rolling upgrade.
 func agentSupportsTrafficBaseline(version string) bool {
-	version = strings.TrimSpace(strings.TrimPrefix(version, "v"))
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	major, errMajor := strconv.Atoi(parts[0])
-	minor, errMinor := strconv.Atoi(parts[1])
-	patch, errPatch := strconv.Atoi(parts[2])
-	if errMajor != nil || errMinor != nil || errPatch != nil {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
 		return false
 	}
 	if major != 1 {
@@ -1166,9 +1151,13 @@ func (a *App) handleSiteNodeScheduleByID(w http.ResponseWriter, r *http.Request)
 		writeNodeAPIError(a, w, err)
 		return
 	}
-	if !input.Enabled && previous.cfRecordID != "" {
+	if !input.Enabled {
 		if err := a.deleteTrackedSiteDNS(r.Context(), previous); err != nil {
-			_, _ = a.db.SaveSiteNodeSchedule(id, true, previous.Mode, previous.FixedNodeID, time.Now())
+			// Keep the schedule disabled while the remote cleanup is retried by
+			// the scheduler. Re-enabling it here can recreate DNS on the next
+			// tick and is especially surprising when Cloudflare already removed
+			// the record (or is temporarily unavailable).
+			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), id)
 			a.jsonErr(w, http.StatusBadGateway, "DNS cleanup failed: "+err.Error())
 			return
 		}
@@ -1237,19 +1226,61 @@ func (c *cloudflareClient) writeAddressRecord(ctx context.Context, zoneID, recor
 }
 
 func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedule) error {
-	if schedule.cfRecordID == "" {
+	if schedule.cfRecordID != "" {
+		cf, err := a.cloudflareForScheduling()
+		if err != nil {
+			return err
+		}
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
+			return err
+		}
+	}
+	return a.finalizeDisabledSiteNodeSchedule(schedule)
+}
+
+// finalizeDisabledSiteNodeSchedule clears every assignment and remote DNS
+// handle after the external delete has completed. It is deliberately safe to
+// call for already-disabled rows left by older releases, so the scheduler can
+// repair stale state without requiring an operator to toggle the site again.
+func (a *App) finalizeDisabledSiteNodeSchedule(schedule SiteNodeSchedule) error {
+	if a == nil || a.db == nil || schedule.SiteID <= 0 {
 		return nil
 	}
-	cf, err := a.cloudflareForScheduling()
+	tx, err := a.db.db.Begin()
 	if err != nil {
 		return err
 	}
-	if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
+	defer tx.Rollback()
+	ids, err := siteNodeRevocationIDsTx(tx, schedule.SiteID, schedule.FixedNodeID, schedule.DesiredNodeID, schedule.AppliedNodeID)
+	if err != nil {
 		return err
 	}
-	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET cf_zone_id='',cf_record_id='',cf_record_type='',applied_node_id=NULL,
-		applied_address='',dns_status='disabled',last_error='',updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), schedule.SiteID)
-	return err
+	for _, nodeID := range ids {
+		if nodeID <= 0 {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms)
+			VALUES(?,?,?,?)`, nodeID, schedule.SiteID, strings.ToLower(strings.TrimSpace(schedule.PublicHost)), time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	}
+	if err := markAgentConfigsDirtyForNodeIDsTx(tx, ids...); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
+		applied_node_id=NULL,cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',
+		dns_status='disabled',last_error='',config_pending_since_ms=0,updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), schedule.SiteID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func siteNodeScheduleNeedsCleanup(value SiteNodeSchedule) bool {
+	return !value.Enabled && (value.FixedNodeID > 0 || value.DesiredNodeID > 0 || value.AppliedNodeID > 0 ||
+		strings.TrimSpace(value.cfZoneID) != "" || strings.TrimSpace(value.cfRecordID) != "" ||
+		strings.TrimSpace(value.cfRecordType) != "" || strings.TrimSpace(value.AppliedAddress) != "" ||
+		value.DNSStatus != "disabled" || strings.TrimSpace(value.LastError) != "" || value.ConfigPendingSinceMS != 0)
 }
 
 func deleteTrackedSiteDNSRemote(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule) error {
@@ -1516,6 +1547,16 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 		return
 	}
 	for _, value := range values {
+		if !value.Enabled && siteNodeScheduleNeedsCleanup(value) {
+			cleanupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			cleanupErr := a.deleteTrackedSiteDNS(cleanupCtx, value)
+			cancel()
+			if cleanupErr != nil {
+				log.Printf("[node-scheduler] cleanup disabled site %d: %v", value.SiteID, cleanupErr)
+				_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", cleanupErr.Error(), now.UnixMilli(), value.SiteID)
+			}
+			continue
+		}
 		if !value.Enabled {
 			continue
 		}
