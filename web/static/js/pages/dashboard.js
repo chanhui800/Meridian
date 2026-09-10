@@ -20,6 +20,10 @@ let dashboardRealtimeTrendSiteSamples = new Map();
 let dashboardLatestRatesBySite = new Map();
 let dashboardBillingMode = null;
 let dashboardRealtimePersistedBillingMode = null;
+// Once the Controller exposes its authoritative realtime sequence, the
+// browser only renders/merges those points. The local path remains as a
+// compatibility fallback for older Controllers and unit harnesses.
+let dashboardControllerRealtimeEnabled = false;
 const dashboardRealtimeStorageKey = 'meridian.dashboard.realtime-trends.v1';
 let dashboardLastSnapshotMS = 0;
 let dashboardLastObservedSiteCount = -1;
@@ -578,6 +582,91 @@ function restoreDashboardRealtimeSamples(now = Date.now()) {
   return all.length > 0 || sites.size > 0;
 }
 
+function dashboardMergeServerRealtimePoints(data) {
+  if (!data || !Object.prototype.hasOwnProperty.call(data, 'realtime_points')) return;
+  dashboardControllerRealtimeEnabled = true;
+  const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
+  const normalized = dashboardNormalizeRealtimeSamples(data.realtime_points, Date.now());
+  const mergeAuthoritative = (existing, serverPoints) => {
+    if (!serverPoints.length) return [];
+    const latestServer = Number(serverPoints[serverPoints.length - 1]?.timestamp_ms || 0);
+    // Keep only points that could have arrived through the in-flight SSE
+    // stream after this HTTP response. Older persisted points and points from
+    // a previous Controller process must never outrank the server window.
+    const tailLimit = latestServer + (dashboardRealtimeSampleIntervalMS * 3);
+    const tail = (existing || []).filter(point => {
+      const timestamp = Number(point?.timestamp_ms || 0);
+      return timestamp > latestServer && timestamp <= tailLimit;
+    });
+    const merged = serverPoints.slice();
+    tail.forEach(point => upsertDashboardRealtimeSample(merged, point));
+    pruneDashboardRealtimeSamples(merged);
+    return merged;
+  };
+  const existing = dashboardRealtimeTrendSamples.get(key) || [];
+  const merged = mergeAuthoritative(existing, normalized);
+  if (merged.length) dashboardRealtimeTrendSamples.set(key, merged);
+  else dashboardRealtimeTrendSamples.delete(key);
+
+  if (key === 'all') {
+    // The aggregate server point carries each site's contribution. Rebuild
+    // the per-site view from the same authoritative window so selecting a
+    // site in another browser produces the same line.
+    const existingSites = dashboardRealtimeTrendSiteSamples;
+    dashboardRealtimeTrendSiteSamples = new Map();
+    const serverSites = new Map();
+    normalized.forEach(point => {
+      if (!point.site_contributions || typeof point.site_contributions !== 'object') return;
+      Object.keys(point.site_contributions).forEach(siteID => {
+        const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms });
+        if (!contribution) return;
+        const samples = serverSites.get(siteID) || [];
+        upsertDashboardRealtimeSample(samples, contribution);
+        serverSites.set(siteID, samples);
+      });
+    });
+    serverSites.forEach((serverPoints, siteID) => {
+      const mergedSite = mergeAuthoritative(existingSites.get(siteID) || [], serverPoints);
+      if (mergedSite.length) dashboardRealtimeTrendSiteSamples.set(siteID, mergedSite);
+    });
+  }
+  persistDashboardRealtimeSamples();
+}
+
+function dashboardAppendServerRealtimeTrendSample(value) {
+  const point = dashboardNormalizeRealtimePoint(value);
+  if (!point) return false;
+  const all = dashboardRealtimeTrendSamples.get('all') || [];
+  upsertDashboardRealtimeSample(all, point);
+  pruneDashboardRealtimeSamples(all);
+  dashboardRealtimeTrendSamples.set('all', all);
+  if (point.site_contributions && typeof point.site_contributions === 'object') {
+    Object.keys(point.site_contributions).forEach(siteID => {
+      const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms });
+      if (!contribution) return;
+      const samples = dashboardRealtimeTrendSiteSamples.get(siteID) || [];
+      upsertDashboardRealtimeSample(samples, contribution);
+      pruneDashboardRealtimeSamples(samples);
+      dashboardRealtimeTrendSiteSamples.set(siteID, samples);
+    });
+  }
+  // When a site is selected, its chart reads the site-keyed map. Keep that
+  // view on the same SSE tick so it remains live between 15-second trend
+  // endpoint refreshes.
+  if (dashboardTrendState.siteId !== 'all' && point.site_contributions && typeof point.site_contributions === 'object') {
+    const siteID = String(dashboardTrendState.siteId);
+    const contribution = point.site_contributions[siteID];
+    if (contribution) {
+      const selected = dashboardRealtimeTrendSamples.get(siteID) || [];
+      upsertDashboardRealtimeSample(selected, dashboardNormalizeRealtimePoint({ ...contribution, timestamp_ms: point.timestamp_ms }));
+      pruneDashboardRealtimeSamples(selected);
+      dashboardRealtimeTrendSamples.set(siteID, selected);
+    }
+  }
+  persistDashboardRealtimeSamples();
+  return true;
+}
+
 function upsertDashboardRealtimeSample(samples, point) {
   if (!Array.isArray(samples) || !point) return samples;
   const timestamp = Number(point.timestamp_ms || 0);
@@ -602,7 +691,7 @@ function dashboardRealtimeTrendPoints() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   const points = dashboardRealtimeTrendSamples.get(key) || [];
   const baseline = dashboardRealtimeBaselineForKey(key);
-  const anchor = Number(baseline?.sampled_at_ms || dashboardTrendData?.as_of_ms || 0);
+  const anchor = dashboardRealtimeHistoryCutoffMS(baseline);
   const newer = !Number.isFinite(anchor) || anchor <= 0
     ? points
     : points.filter(point => Number(point?.timestamp_ms || 0) > anchor);
@@ -662,10 +751,23 @@ function dashboardRealtimeBaselineForKey(key) {
   return aggregate.sampled_at_ms > 0 ? aggregate : null;
 }
 
+function dashboardRealtimeHistoryCutoffMS(baseline = null) {
+  const persisted = Number(baseline?.sampled_at_ms || 0);
+  if (Number.isFinite(persisted) && persisted > 0) return persisted;
+  // Current responses include live_baselines even when a mixed local/Agent
+  // selection cannot produce one complete watermark. In that case `as_of_ms`
+  // is only a request-time fallback and must not erase browser-restored live
+  // samples after a refresh. Older responses without live_baselines retain
+  // the legacy as_of_ms cutoff for compatibility.
+  if (dashboardTrendData?.live_baselines && typeof dashboardTrendData.live_baselines === 'object') return 0;
+  const fallback = Number(dashboardTrendData?.as_of_ms || 0);
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+}
+
 function dashboardTrendCutoffMS() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   const baseline = dashboardRealtimeBaselineForKey(key);
-  const value = Number(baseline?.sampled_at_ms || dashboardTrendData?.as_of_ms || 0);
+  const value = dashboardRealtimeHistoryCutoffMS(baseline);
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
@@ -703,10 +805,66 @@ function dashboardTrendPoints() {
 
 function dashboardTrendChartPoints() {
   if (dashboardTrendState.range === 'realtime') {
-    const realtimePoints = dashboardRealtimeTrendPoints();
+    // Keep the complete five-minute client-side tail for drawing. The
+    // history merge below intentionally returns only samples newer than the
+    // persisted watermark, but dropping older live samples here made every
+    // 15-second trend refresh (and every page reload) collapse the chart to a
+    // nearly empty or all-zero tail.
+    const realtimePoints = dashboardRealtimeChartTrendPoints();
     if (realtimePoints.length) return realtimePoints;
   }
   return dashboardTrendPoints();
+}
+
+function dashboardRealtimeChartTrendPoints() {
+  const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
+  const points = dashboardRealtimeTrendSamples.get(key) || [];
+  if (!points.length) return [];
+  const baseline = dashboardRealtimeBaselineForKey(key);
+  const anchor = dashboardRealtimeHistoryCutoffMS(baseline);
+  if (!baseline || !Number.isFinite(anchor) || anchor <= 0) return points;
+
+  let previous = {
+    bytesIn: Math.max(0, Number(baseline.bytes_in || 0)),
+    bytesOut: Math.max(0, Number(baseline.bytes_out || 0)),
+    requests: Math.max(0, Number(baseline.requests || 0)),
+    timestamp: anchor,
+  };
+  return points.map(point => {
+    const timestamp = Number(point?.timestamp_ms || 0);
+    // Samples at or before the durable watermark already contain the deltas
+    // captured during their original live interval. Keep them as-is so a
+    // trend API refresh cannot erase the visible history.
+    if (!Number.isFinite(timestamp) || timestamp <= anchor) return point;
+    const hasCumulative = point.cumulative_bytes_in !== undefined
+      || point.cumulative_bytes_out !== undefined
+      || point.cumulative_requests !== undefined;
+    if (!hasCumulative) return point;
+    const current = {
+      bytesIn: Math.max(0, Number(point.cumulative_bytes_in || 0)),
+      bytesOut: Math.max(0, Number(point.cumulative_bytes_out || 0)),
+      requests: Math.max(0, Number(point.cumulative_requests || 0)),
+      timestamp,
+    };
+    const deltaIn = current.bytesIn >= previous.bytesIn ? current.bytesIn - previous.bytesIn : current.bytesIn;
+    const deltaOut = current.bytesOut >= previous.bytesOut ? current.bytesOut - previous.bytesOut : current.bytesOut;
+    const deltaRequests = current.requests >= previous.requests ? current.requests - previous.requests : current.requests;
+    const seconds = Math.max(0, (current.timestamp - previous.timestamp) / 1000);
+    const next = {
+      ...point,
+      bytes_in: deltaIn,
+      bytes_out: deltaOut,
+      requests: deltaRequests,
+      download_bps: seconds > 0 ? deltaOut / seconds : 0,
+      upload_bps: seconds > 0 ? deltaIn / seconds : 0,
+    };
+    if (point.traffic_bytes !== undefined) {
+      const mode = dashboardTrendData?.billing_mode;
+      next.traffic_bytes = mode === 'outbound' ? deltaOut : 2 * (deltaIn + deltaOut);
+    }
+    previous = current;
+    return next;
+  });
 }
 
 function dashboardRealtimeChartBounds(points) {
@@ -1076,6 +1234,7 @@ async function loadDashboardTrends() {
       if (endInput) endInput.value = customDefault.end;
     }
     dashboardTrendData = data;
+    dashboardMergeServerRealtimePoints(data);
     for (const samples of dashboardRealtimeTrendSamples.values()) pruneDashboardRealtimeSamples(samples);
     for (const samples of dashboardRealtimeTrendSiteSamples.values()) pruneDashboardRealtimeSamples(samples);
     reconcileDashboardTrendSiteSelection();
@@ -1225,9 +1384,11 @@ function updateDashboardLive(stats) {
   const uptimeEl = document.getElementById('s-uptime');
   if (uptimeEl) uptimeEl.textContent = formatUptime(stats.uptime_seconds || 0);
 
-  const requestsEl = document.getElementById('s-requests');
-  if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
-  updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
+	const requestsEl = document.getElementById('s-requests');
+	if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
+  if (stats?.realtime_trend) dashboardControllerRealtimeEnabled = true;
+	updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
+  if (stats?.realtime_trend) dashboardAppendServerRealtimeTrendSample(stats.realtime_trend);
   updateDashboardTrendRealtime();
 }
 
@@ -1369,6 +1530,22 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     totalCumulativeRequests += Math.max(0, Number(sample?.requests || 0));
   });
   const sampledAt = Number(snapshotMS || Date.now());
+  if (dashboardControllerRealtimeEnabled) {
+    dashboardSites = dashboardSites.map(site => {
+      const siteID = Number(site.id);
+      const live = liveMap.get(siteID);
+      if (!live) return site;
+      const speed = dashboardLiveSpeeds.get(siteID);
+      if (!speed) {
+        const { _liveSpeed, ...siteWithoutSpeed } = site;
+        return { ...siteWithoutSpeed, ...live };
+      }
+      return { ...site, ...live, _liveSpeed: speed };
+    });
+    renderDashboardTableRows();
+    persistDashboardRealtimeSamples();
+    return;
+  }
   const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt, contributions = null) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
     const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));

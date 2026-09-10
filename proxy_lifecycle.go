@@ -481,6 +481,7 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 	if snap.UptimeSeconds < 0 {
 		snap.UptimeSeconds = 0
 	}
+	snap.RealtimeTrend = pm.dashboardRealtimeTrendLatest()
 	return snap
 }
 

@@ -126,30 +126,36 @@ func (inst *ProxyInstance) trafficPendingRequests() *atomic.Int64 {
 }
 
 type ProxyManager struct {
-	mu                      sync.RWMutex
-	lifecycleMu             sync.Mutex
-	proxies                 map[int64]*ProxyInstance
-	publicHosts             map[string]int64
-	publicHostModes         map[string]string
-	pathPrefixes            map[string]int64
-	upstreamHeaderKey       []byte
-	trustedProxies          []*net.IPNet
-	hostOnlyIngressSafe     bool
-	shutdownStarted         atomic.Bool
-	database                *DB
-	dynamicRuntime          *dynamicRuntime
-	dynamicRouteKey         []byte
-	dynamicTransportFactory dynamicTransportFactory
-	dynamicAvailable        bool
-	dynamicPanelHost        string
-	dynamicPanelPort        int
-	dynamicInterfaceAddrs   dynamicInterfaceAddrsFunc
-	assetCache              *assetCache
-	siteTLSConfig           *tls.Config
-	accountRetention        *accountRetentionTracker
-	trendCacheMu            sync.Mutex
-	trendCache              map[string]dashboardTrendCacheEntry
-	dashboardTrendGroup     singleflight.Group
+	mu                           sync.RWMutex
+	lifecycleMu                  sync.Mutex
+	proxies                      map[int64]*ProxyInstance
+	publicHosts                  map[string]int64
+	publicHostModes              map[string]string
+	pathPrefixes                 map[string]int64
+	upstreamHeaderKey            []byte
+	trustedProxies               []*net.IPNet
+	hostOnlyIngressSafe          bool
+	shutdownStarted              atomic.Bool
+	database                     *DB
+	dynamicRuntime               *dynamicRuntime
+	dynamicRouteKey              []byte
+	dynamicTransportFactory      dynamicTransportFactory
+	dynamicAvailable             bool
+	dynamicPanelHost             string
+	dynamicPanelPort             int
+	dynamicInterfaceAddrs        dynamicInterfaceAddrsFunc
+	assetCache                   *assetCache
+	siteTLSConfig                *tls.Config
+	accountRetention             *accountRetentionTracker
+	trendCacheMu                 sync.Mutex
+	trendCache                   map[string]dashboardTrendCacheEntry
+	dashboardTrendGroup          singleflight.Group
+	dashboardRealtimeMu          sync.RWMutex
+	dashboardRealtimePoints      []dashboardTrendPoint
+	dashboardRealtimePrev        map[int64]dashboardRealtimeCounter
+	dashboardRealtimeLastMS      int64
+	dashboardRealtimeBillingMode string
+	dashboardRealtimeStarted     atomic.Bool
 }
 
 // ProxyRuntimeStat is a non-persistent edge snapshot. Node scheduling quotas
