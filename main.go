@@ -211,6 +211,7 @@ func main() {
 	// Traffic flush goroutine with context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	pm.startDashboardRealtimeSampler(ctx)
 	assetCache.startReconcile(ctx)
 
 	go func() {

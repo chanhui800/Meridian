@@ -47,19 +47,20 @@ type SiteTraffic struct {
 // TrafficSnapshot is the single authoritative global traffic payload shared by
 // /api/dashboard, /api/traffic/overview and SSE events.
 type TrafficSnapshot struct {
-	TotalSites      int           `json:"total_sites"`
-	OnlineSites     int           `json:"online_sites"`
-	RunningSites    int           `json:"running_sites"`
-	TotalTraffic    int64         `json:"total_traffic"`
-	MonthlyTraffic  int64         `json:"monthly_traffic"`
-	BillingMode     string        `json:"billing_mode"`
-	TrafficResetDay int           `json:"traffic_reset_day"`
-	TotalRequests   int64         `json:"total_requests"`
-	UptimeSeconds   int64         `json:"uptime_seconds"`
-	PanelDomain     string        `json:"panel_domain,omitempty"`
-	PanelAccessURL  string        `json:"panel_access_url,omitempty"`
-	GeneratedAtMS   int64         `json:"generated_at_ms"`
-	LiveSites       []SiteTraffic `json:"live_sites"`
+	TotalSites      int                  `json:"total_sites"`
+	OnlineSites     int                  `json:"online_sites"`
+	RunningSites    int                  `json:"running_sites"`
+	TotalTraffic    int64                `json:"total_traffic"`
+	MonthlyTraffic  int64                `json:"monthly_traffic"`
+	BillingMode     string               `json:"billing_mode"`
+	TrafficResetDay int                  `json:"traffic_reset_day"`
+	TotalRequests   int64                `json:"total_requests"`
+	UptimeSeconds   int64                `json:"uptime_seconds"`
+	PanelDomain     string               `json:"panel_domain,omitempty"`
+	PanelAccessURL  string               `json:"panel_access_url,omitempty"`
+	GeneratedAtMS   int64                `json:"generated_at_ms"`
+	LiveSites       []SiteTraffic        `json:"live_sites"`
+	RealtimeTrend   *dashboardTrendPoint `json:"realtime_trend,omitempty"`
 }
 
 // NodeSiteLiveTraffic is the last persisted runtime sample from an applied

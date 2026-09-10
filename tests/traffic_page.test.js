@@ -779,6 +779,61 @@ test('dashboard realtime trend persists recent points across a page refresh', ()
   assert.equal(vm.runInContext('dashboardRealtimePersistedBillingMode', h.sandbox), 'bidirectional');
 });
 
+test('dashboard consumes one Controller realtime window for every browser', () => {
+  const h = makeTrafficHarness();
+  const now = Date.now();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardRealtimeTrendSamples = new Map([['all', [
+      { timestamp_ms: ${now - 5000}, download_bps: 999 },
+    ]]]);
+    dashboardRealtimeTrendSiteSamples = new Map();
+    dashboardMergeServerRealtimePoints({
+      realtime_points: [{
+        timestamp_ms: ${now - 2000},
+        download_bps: 120,
+        upload_bps: 4,
+        bytes_in: 8,
+        bytes_out: 24,
+        requests: 2,
+        traffic_bytes: 64,
+        site_contributions: {
+          '7': { timestamp_ms: ${now - 2000}, download_bps: 120, bytes_in: 8, bytes_out: 24, requests: 2, traffic_bytes: 64 },
+        },
+      }],
+    });
+    return {
+      enabled: dashboardControllerRealtimeEnabled,
+      all: dashboardRealtimeTrendSamples.get('all'),
+      site: dashboardRealtimeTrendSiteSamples.get('7'),
+    };
+  })()`, h.sandbox);
+  assert.equal(result.enabled, true);
+  assert.deepEqual(Array.from(result.all, point => point.timestamp_ms), [now - 2000]);
+  assert.equal(result.all[0].download_bps, 120);
+  assert.equal(result.site.length, 1);
+  assert.equal(result.site[0].bytes_out, 24);
+});
+
+test('dashboard stops generating browser-specific trend points after Controller data arrives', async () => {
+  const elements = { 'dash-table': makeElement('dash-table'), 's-cache': makeElement('s-cache') };
+  const sandbox = {
+    window: {}, document: makeDocument(elements), console,
+    Date: { now: () => 3000 },
+    Toast: { error() {}, success() {}, info() {} },
+    fetch: async () => okJson([{ id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 0, cache_size_bytes: 0 }]),
+    Router: { current: 'dashboard' },
+    setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 0; }, clearTimeout() {},
+  };
+  vm.createContext(sandbox);
+  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+  await vm.runInContext('loadDashboardTable()', sandbox);
+  vm.runInContext(`dashboardMergeServerRealtimePoints({ realtime_points: [{ timestamp_ms: 2000, download_bps: 25, site_contributions: {} }] })`, sandbox);
+  vm.runInContext("updateDashboardSiteSpeeds([{id:1, sampled_at_ms:3000, cumulative_bytes_in:0, cumulative_bytes_out:1000, running:true}], 3000, 'outbound')", sandbox);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all').length", sandbox), 1, 'SSE live speed refresh must not add a browser-only timestamp');
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all')[0].timestamp_ms", sandbox), 2000);
+});
+
 test('dashboard realtime refresh keeps persisted points when mixed-site history has a request-time cutoff', () => {
   const h = makeTrafficHarness();
   const now = Date.now();

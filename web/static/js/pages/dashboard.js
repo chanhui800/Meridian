@@ -20,6 +20,10 @@ let dashboardRealtimeTrendSiteSamples = new Map();
 let dashboardLatestRatesBySite = new Map();
 let dashboardBillingMode = null;
 let dashboardRealtimePersistedBillingMode = null;
+// Once the Controller exposes its authoritative realtime sequence, the
+// browser only renders/merges those points. The local path remains as a
+// compatibility fallback for older Controllers and unit harnesses.
+let dashboardControllerRealtimeEnabled = false;
 const dashboardRealtimeStorageKey = 'meridian.dashboard.realtime-trends.v1';
 let dashboardLastSnapshotMS = 0;
 let dashboardLastObservedSiteCount = -1;
@@ -576,6 +580,78 @@ function restoreDashboardRealtimeSamples(now = Date.now()) {
   const billingMode = String(payload.billing_mode || '').toLowerCase();
   dashboardRealtimePersistedBillingMode = billingMode === 'outbound' || billingMode === 'bidirectional' ? billingMode : null;
   return all.length > 0 || sites.size > 0;
+}
+
+function dashboardMergeServerRealtimePoints(data) {
+  if (!data || !Object.prototype.hasOwnProperty.call(data, 'realtime_points')) return;
+  dashboardControllerRealtimeEnabled = true;
+  const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
+  const normalized = dashboardNormalizeRealtimeSamples(data.realtime_points, Date.now());
+  const mergeAuthoritative = (existing, serverPoints) => {
+    if (!serverPoints.length) return [];
+    const latestServer = Number(serverPoints[serverPoints.length - 1]?.timestamp_ms || 0);
+    // Keep only points that could have arrived through the in-flight SSE
+    // stream after this HTTP response. Older persisted points and points from
+    // a previous Controller process must never outrank the server window.
+    const tailLimit = latestServer + (dashboardRealtimeSampleIntervalMS * 3);
+    const tail = (existing || []).filter(point => {
+      const timestamp = Number(point?.timestamp_ms || 0);
+      return timestamp > latestServer && timestamp <= tailLimit;
+    });
+    const merged = serverPoints.slice();
+    tail.forEach(point => upsertDashboardRealtimeSample(merged, point));
+    pruneDashboardRealtimeSamples(merged);
+    return merged;
+  };
+  const existing = dashboardRealtimeTrendSamples.get(key) || [];
+  const merged = mergeAuthoritative(existing, normalized);
+  if (merged.length) dashboardRealtimeTrendSamples.set(key, merged);
+  else dashboardRealtimeTrendSamples.delete(key);
+
+  if (key === 'all') {
+    // The aggregate server point carries each site's contribution. Rebuild
+    // the per-site view from the same authoritative window so selecting a
+    // site in another browser produces the same line.
+    const existingSites = dashboardRealtimeTrendSiteSamples;
+    dashboardRealtimeTrendSiteSamples = new Map();
+    const serverSites = new Map();
+    normalized.forEach(point => {
+      if (!point.site_contributions || typeof point.site_contributions !== 'object') return;
+      Object.keys(point.site_contributions).forEach(siteID => {
+        const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms });
+        if (!contribution) return;
+        const samples = serverSites.get(siteID) || [];
+        upsertDashboardRealtimeSample(samples, contribution);
+        serverSites.set(siteID, samples);
+      });
+    });
+    serverSites.forEach((serverPoints, siteID) => {
+      const mergedSite = mergeAuthoritative(existingSites.get(siteID) || [], serverPoints);
+      if (mergedSite.length) dashboardRealtimeTrendSiteSamples.set(siteID, mergedSite);
+    });
+  }
+  persistDashboardRealtimeSamples();
+}
+
+function dashboardAppendServerRealtimeTrendSample(value) {
+  const point = dashboardNormalizeRealtimePoint(value);
+  if (!point) return false;
+  const all = dashboardRealtimeTrendSamples.get('all') || [];
+  upsertDashboardRealtimeSample(all, point);
+  pruneDashboardRealtimeSamples(all);
+  dashboardRealtimeTrendSamples.set('all', all);
+  if (point.site_contributions && typeof point.site_contributions === 'object') {
+    Object.keys(point.site_contributions).forEach(siteID => {
+      const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms });
+      if (!contribution) return;
+      const samples = dashboardRealtimeTrendSiteSamples.get(siteID) || [];
+      upsertDashboardRealtimeSample(samples, contribution);
+      pruneDashboardRealtimeSamples(samples);
+      dashboardRealtimeTrendSiteSamples.set(siteID, samples);
+    });
+  }
+  persistDashboardRealtimeSamples();
+  return true;
 }
 
 function upsertDashboardRealtimeSample(samples, point) {
@@ -1145,6 +1221,7 @@ async function loadDashboardTrends() {
       if (endInput) endInput.value = customDefault.end;
     }
     dashboardTrendData = data;
+    dashboardMergeServerRealtimePoints(data);
     for (const samples of dashboardRealtimeTrendSamples.values()) pruneDashboardRealtimeSamples(samples);
     for (const samples of dashboardRealtimeTrendSiteSamples.values()) pruneDashboardRealtimeSamples(samples);
     reconcileDashboardTrendSiteSelection();
@@ -1294,9 +1371,11 @@ function updateDashboardLive(stats) {
   const uptimeEl = document.getElementById('s-uptime');
   if (uptimeEl) uptimeEl.textContent = formatUptime(stats.uptime_seconds || 0);
 
-  const requestsEl = document.getElementById('s-requests');
-  if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
-  updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
+	const requestsEl = document.getElementById('s-requests');
+	if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
+  if (stats?.realtime_trend) dashboardControllerRealtimeEnabled = true;
+	updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
+  if (stats?.realtime_trend) dashboardAppendServerRealtimeTrendSample(stats.realtime_trend);
   updateDashboardTrendRealtime();
 }
 
@@ -1438,6 +1517,22 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
     totalCumulativeRequests += Math.max(0, Number(sample?.requests || 0));
   });
   const sampledAt = Number(snapshotMS || Date.now());
+  if (dashboardControllerRealtimeEnabled) {
+    dashboardSites = dashboardSites.map(site => {
+      const siteID = Number(site.id);
+      const live = liveMap.get(siteID);
+      if (!live) return site;
+      const speed = dashboardLiveSpeeds.get(siteID);
+      if (!speed) {
+        const { _liveSpeed, ...siteWithoutSpeed } = site;
+        return { ...siteWithoutSpeed, ...live };
+      }
+      return { ...site, ...live, _liveSpeed: speed };
+    });
+    renderDashboardTableRows();
+    persistDashboardRealtimeSamples();
+    return;
+  }
   const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt, contributions = null) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
     const bytesIn = Math.max(0, Number(sample?.bytesIn || 0));

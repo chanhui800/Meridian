@@ -58,13 +58,14 @@ func (pm *ProxyManager) cacheDashboardTrend(key string, response *dashboardTrend
 }
 
 type dashboardTrendPoint struct {
-	TimestampMS int64   `json:"timestamp_ms"`
-	Traffic     int64   `json:"traffic_bytes"`
-	BytesIn     int64   `json:"bytes_in"`
-	BytesOut    int64   `json:"bytes_out"`
-	Requests    int64   `json:"requests"`
-	DownloadBPS float64 `json:"download_bps"`
-	UploadBPS   float64 `json:"upload_bps"`
+	TimestampMS       int64                         `json:"timestamp_ms"`
+	Traffic           int64                         `json:"traffic_bytes"`
+	BytesIn           int64                         `json:"bytes_in"`
+	BytesOut          int64                         `json:"bytes_out"`
+	Requests          int64                         `json:"requests"`
+	DownloadBPS       float64                       `json:"download_bps"`
+	UploadBPS         float64                       `json:"upload_bps"`
+	SiteContributions map[int64]dashboardTrendPoint `json:"site_contributions,omitempty"`
 }
 
 // dashboardTrendBaseline is the last cumulative Agent counter that is
@@ -91,10 +92,11 @@ type dashboardTrendsResponse struct {
 	// Keep this field in every response, including an empty object. The
 	// dashboard uses its presence to distinguish a request-time as_of_ms
 	// fallback from a durable live baseline when merging the client tail.
-	LiveBaselines map[int64]dashboardTrendBaseline `json:"live_baselines"`
-	BucketSeconds int64                            `json:"bucket_seconds"`
-	Points        []dashboardTrendPoint            `json:"points"`
-	SiteSeries    []dashboardTrendSite             `json:"site_series"`
+	LiveBaselines  map[int64]dashboardTrendBaseline `json:"live_baselines"`
+	BucketSeconds  int64                            `json:"bucket_seconds"`
+	Points         []dashboardTrendPoint            `json:"points"`
+	SiteSeries     []dashboardTrendSite             `json:"site_series"`
+	RealtimePoints []dashboardTrendPoint            `json:"realtime_points"`
 }
 
 // dashboardTrendSite carries the same time buckets as the aggregate chart,
@@ -459,6 +461,7 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 		BucketSeconds:  int64(bucket / time.Second),
 		Points:         points,
 		SiteSeries:     siteSeries,
+		RealtimePoints: pm.dashboardRealtimeTrendPoints(siteID),
 	}
 	pm.cacheDashboardTrend(cacheKey, response, now.Add(cacheTTL))
 	return response, nil
