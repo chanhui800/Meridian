@@ -616,10 +616,58 @@ test('dashboard trends use pointer interaction and dashed crosshairs', () => {
   assert.match(source, /const ticks = 6/);
   assert.match(source, /dashboardRoundRect/);
   assert.match(source, /dashboardRealtimeTrendSamples/);
-  assert.match(source, /dashboardTimeLabelIndexes\(points\.length, plotW, dashboardTrendState\.range\)/);
+  assert.match(source, /dashboardTimeLabelIndexes\(points\.length, plotW, dashboardTrendState\.range, points, chartStartMS, chartEndMS\)/);
   assert.doesNotMatch(source, /实时（请求采样）/);
   assert.match(css, /touch-action:\s*none/);
   assert.match(css, /cursor:\s*default/);
+});
+
+test('dashboard realtime trend keeps a rolling timestamp window and replaces duplicate samples', () => {
+  let now = 30 * 60 * 1000;
+  const h = makeTrafficHarness();
+  h.sandbox.Date = { now: () => now };
+  vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = { range: 'realtime', end_ms: ${now} };
+    const samples = [
+      { timestamp_ms: -1, download_bps: 1 },
+      { timestamp_ms: ${now - 30 * 60 * 1000 + 1}, download_bps: 2 },
+      { timestamp_ms: ${now - 1000}, download_bps: 3 },
+    ];
+    pruneDashboardRealtimeSamples(samples);
+    dashboardRealtimeTrendSamples = new Map([['all', samples]]);
+    upsertDashboardRealtimeSample(samples, { timestamp_ms: ${now - 1000}, download_bps: 9 });
+  })()`, h.sandbox);
+  const samples = vm.runInContext("dashboardRealtimeTrendSamples.get('all')", h.sandbox);
+  assert.deepEqual(Array.from(samples, point => point.timestamp_ms), [1, 1_799_000]);
+  assert.equal(samples.at(-1).download_bps, 9, 'a newer sample at the same timestamp must replace the previous value');
+});
+
+test('dashboard realtime trend uses real timestamps for fixed-window positions', () => {
+  const h = makeTrafficHarness();
+  h.sandbox.Date = { now: () => 1_800_000 };
+  const points = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = {
+      range: 'realtime',
+      start_ms: 0,
+      end_ms: 1800000,
+      points: [
+        { timestamp_ms: 0, requests: 1 },
+        { timestamp_ms: 600000, requests: 2 },
+      ],
+    };
+    dashboardRealtimeTrendSamples = new Map([['all', [
+      { timestamp_ms: 1700000, requests: 3 },
+    ]]]);
+    return dashboardTrendPoints();
+  })()`, h.sandbox);
+  assert.equal(points.at(-1).timestamp_ms, 1_700_000);
+  const geometry = { width: 320, height: 200, left: 40, top: 10, plotW: 260, plotH: 150, chartStartMS: 0, chartEndMS: 1_800_000 };
+  const left = vm.runInContext('dashboardTrendPointerState({ left: 0, top: 0, width: 320, height: 200 }, ' + JSON.stringify(geometry) + ', { clientX: 40, clientY: 10 }, [{ timestamp_ms: 0 }, { timestamp_ms: 600000 }, { timestamp_ms: 1700000 }], 0, 1800000)', h.sandbox);
+  const right = vm.runInContext('dashboardTrendPointerState({ left: 0, top: 0, width: 320, height: 200 }, ' + JSON.stringify(geometry) + ', { clientX: 300, clientY: 10 }, [{ timestamp_ms: 0 }, { timestamp_ms: 600000 }, { timestamp_ms: 1700000 }], 0, 1800000)', h.sandbox);
+  assert.equal(left.index, 0);
+  assert.equal(right.index, 2, 'hover selection must follow timestamp position rather than sample index spacing');
 });
 
 test('dashboard trend pointer coordinates use the plot bounds and keep the crosshair on the pointer', () => {
