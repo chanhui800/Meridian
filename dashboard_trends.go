@@ -87,8 +87,11 @@ type dashboardTrendsResponse struct {
 	EndMS          int64  `json:"end_ms"`
 	// AsOfMS is the history snapshot cutoff. Realtime points newer than this
 	// instant can be merged without double-counting the current bucket.
-	AsOfMS        int64                            `json:"as_of_ms"`
-	LiveBaselines map[int64]dashboardTrendBaseline `json:"live_baselines,omitempty"`
+	AsOfMS int64 `json:"as_of_ms"`
+	// Keep this field in every response, including an empty object. The
+	// dashboard uses its presence to distinguish a request-time as_of_ms
+	// fallback from a durable live baseline when merging the client tail.
+	LiveBaselines map[int64]dashboardTrendBaseline `json:"live_baselines"`
 	BucketSeconds int64                            `json:"bucket_seconds"`
 	Points        []dashboardTrendPoint            `json:"points"`
 	SiteSeries    []dashboardTrendSite             `json:"site_series"`

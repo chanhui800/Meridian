@@ -779,6 +779,56 @@ test('dashboard realtime trend persists recent points across a page refresh', ()
   assert.equal(vm.runInContext('dashboardRealtimePersistedBillingMode', h.sandbox), 'bidirectional');
 });
 
+test('dashboard realtime refresh keeps persisted points when mixed-site history has a request-time cutoff', () => {
+  const h = makeTrafficHarness();
+  const now = Date.now();
+  const points = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = {
+      range: 'realtime',
+      as_of_ms: ${now},
+      points: [],
+      // A mixed local/Agent view intentionally has no single aggregate
+      // persisted watermark. The request-time as_of_ms must not erase the
+      // browser-restored live point that arrived just before refresh.
+      site_series: [{ site_id: 1, site_name: 'Agent' }, { site_id: 2, site_name: 'Local' }],
+      live_baselines: { '1': { sampled_at_ms: ${now - 5000}, bytes_in: 10, bytes_out: 20, requests: 1 } },
+    };
+    dashboardRealtimeTrendSamples = new Map([['all', [
+      { timestamp_ms: ${now - 1000}, download_bps: 123, upload_bps: 4, bytes_in: 1, bytes_out: 2, requests: 1 },
+    ]]]);
+    dashboardRealtimeTrendSiteSamples = new Map();
+    return dashboardRealtimeTrendPoints();
+  })()`, h.sandbox);
+  assert.equal(points.length, 1, 'request-time as_of_ms must not discard a restored realtime point');
+  assert.equal(points[0].download_bps, 123);
+});
+
+test('dashboard realtime chart keeps the full live tail across a moving baseline', () => {
+  const h = makeTrafficHarness();
+  const now = Date.now();
+  const points = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = {
+      range: 'realtime',
+      billing_mode: 'outbound',
+      live_baselines: { '1': { sampled_at_ms: ${now - 2000}, bytes_in: 0, bytes_out: 100, requests: 1 } },
+      site_series: [{ site_id: 1, site_name: 'Agent' }],
+    };
+    dashboardRealtimeTrendSamples = new Map([['all', [
+      // This point is already represented by the moving baseline, but it is
+      // still part of the visible five-minute chart tail.
+      { timestamp_ms: ${now - 10000}, download_bps: 50, upload_bps: 0, bytes_in: 0, bytes_out: 50, requests: 1, cumulative_bytes_out: 50 },
+      // Only points newer than the baseline are recalculated from counters.
+      { timestamp_ms: ${now - 1000}, download_bps: 999, upload_bps: 0, bytes_in: 0, bytes_out: 20, requests: 1, cumulative_bytes_out: 120 },
+    ]]]);
+    return dashboardTrendChartPoints();
+  })()`, h.sandbox);
+  assert.deepEqual(Array.from(points, point => point.timestamp_ms), [now - 10000, now - 1000]);
+  assert.equal(points[0].download_bps, 50);
+  assert.equal(points[1].download_bps, 20, 'new samples should still use the latest persisted baseline');
+});
+
 test('dashboard trend pointer coordinates use the plot bounds and keep the crosshair on the pointer', () => {
   const { sandbox } = makeTrafficHarness();
   const state = vm.runInContext(`dashboardTrendPointerState(

@@ -602,7 +602,7 @@ function dashboardRealtimeTrendPoints() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   const points = dashboardRealtimeTrendSamples.get(key) || [];
   const baseline = dashboardRealtimeBaselineForKey(key);
-  const anchor = Number(baseline?.sampled_at_ms || dashboardTrendData?.as_of_ms || 0);
+  const anchor = dashboardRealtimeHistoryCutoffMS(baseline);
   const newer = !Number.isFinite(anchor) || anchor <= 0
     ? points
     : points.filter(point => Number(point?.timestamp_ms || 0) > anchor);
@@ -662,10 +662,23 @@ function dashboardRealtimeBaselineForKey(key) {
   return aggregate.sampled_at_ms > 0 ? aggregate : null;
 }
 
+function dashboardRealtimeHistoryCutoffMS(baseline = null) {
+  const persisted = Number(baseline?.sampled_at_ms || 0);
+  if (Number.isFinite(persisted) && persisted > 0) return persisted;
+  // Current responses include live_baselines even when a mixed local/Agent
+  // selection cannot produce one complete watermark. In that case `as_of_ms`
+  // is only a request-time fallback and must not erase browser-restored live
+  // samples after a refresh. Older responses without live_baselines retain
+  // the legacy as_of_ms cutoff for compatibility.
+  if (dashboardTrendData?.live_baselines && typeof dashboardTrendData.live_baselines === 'object') return 0;
+  const fallback = Number(dashboardTrendData?.as_of_ms || 0);
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+}
+
 function dashboardTrendCutoffMS() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   const baseline = dashboardRealtimeBaselineForKey(key);
-  const value = Number(baseline?.sampled_at_ms || dashboardTrendData?.as_of_ms || 0);
+  const value = dashboardRealtimeHistoryCutoffMS(baseline);
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
@@ -703,10 +716,66 @@ function dashboardTrendPoints() {
 
 function dashboardTrendChartPoints() {
   if (dashboardTrendState.range === 'realtime') {
-    const realtimePoints = dashboardRealtimeTrendPoints();
+    // Keep the complete five-minute client-side tail for drawing. The
+    // history merge below intentionally returns only samples newer than the
+    // persisted watermark, but dropping older live samples here made every
+    // 15-second trend refresh (and every page reload) collapse the chart to a
+    // nearly empty or all-zero tail.
+    const realtimePoints = dashboardRealtimeChartTrendPoints();
     if (realtimePoints.length) return realtimePoints;
   }
   return dashboardTrendPoints();
+}
+
+function dashboardRealtimeChartTrendPoints() {
+  const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
+  const points = dashboardRealtimeTrendSamples.get(key) || [];
+  if (!points.length) return [];
+  const baseline = dashboardRealtimeBaselineForKey(key);
+  const anchor = dashboardRealtimeHistoryCutoffMS(baseline);
+  if (!baseline || !Number.isFinite(anchor) || anchor <= 0) return points;
+
+  let previous = {
+    bytesIn: Math.max(0, Number(baseline.bytes_in || 0)),
+    bytesOut: Math.max(0, Number(baseline.bytes_out || 0)),
+    requests: Math.max(0, Number(baseline.requests || 0)),
+    timestamp: anchor,
+  };
+  return points.map(point => {
+    const timestamp = Number(point?.timestamp_ms || 0);
+    // Samples at or before the durable watermark already contain the deltas
+    // captured during their original live interval. Keep them as-is so a
+    // trend API refresh cannot erase the visible history.
+    if (!Number.isFinite(timestamp) || timestamp <= anchor) return point;
+    const hasCumulative = point.cumulative_bytes_in !== undefined
+      || point.cumulative_bytes_out !== undefined
+      || point.cumulative_requests !== undefined;
+    if (!hasCumulative) return point;
+    const current = {
+      bytesIn: Math.max(0, Number(point.cumulative_bytes_in || 0)),
+      bytesOut: Math.max(0, Number(point.cumulative_bytes_out || 0)),
+      requests: Math.max(0, Number(point.cumulative_requests || 0)),
+      timestamp,
+    };
+    const deltaIn = current.bytesIn >= previous.bytesIn ? current.bytesIn - previous.bytesIn : current.bytesIn;
+    const deltaOut = current.bytesOut >= previous.bytesOut ? current.bytesOut - previous.bytesOut : current.bytesOut;
+    const deltaRequests = current.requests >= previous.requests ? current.requests - previous.requests : current.requests;
+    const seconds = Math.max(0, (current.timestamp - previous.timestamp) / 1000);
+    const next = {
+      ...point,
+      bytes_in: deltaIn,
+      bytes_out: deltaOut,
+      requests: deltaRequests,
+      download_bps: seconds > 0 ? deltaOut / seconds : 0,
+      upload_bps: seconds > 0 ? deltaIn / seconds : 0,
+    };
+    if (point.traffic_bytes !== undefined) {
+      const mode = dashboardTrendData?.billing_mode;
+      next.traffic_bytes = mode === 'outbound' ? deltaOut : 2 * (deltaIn + deltaOut);
+    }
+    previous = current;
+    return next;
+  });
 }
 
 function dashboardRealtimeChartBounds(points) {
