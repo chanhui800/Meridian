@@ -414,6 +414,9 @@ func TestBuildEdgeProxyIgnoresControllerOnlySiteIconMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build edge proxy with UI icon metadata: %v", err)
 	}
+	if !runtime.structuredPlaybackEvents.Load() {
+		t.Fatal("production Agent proxy did not enable structured playback events")
+	}
 	bundle.close()
 }
 
@@ -590,6 +593,42 @@ func TestEdgeObserverMarksReplayEventsCritical(t *testing.T) {
 	events := runtime.events.snapshot()
 	if len(events) != 1 || events[0].Priority != nodeEventPriorityCritical {
 		t.Fatalf("observer event priority = %#v, want critical", events)
+	}
+}
+
+func TestEdgeObserverDoesNotReplayStructuredPlaybackSync(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &edgeAgentRuntime{}
+	if err := runtime.events.initWithRawKey(dir, key, nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.structuredPlaybackEvents.Store(true)
+	const body = `{"ItemId":"item-1","PlaySessionId":"session-1"}`
+	var upstreamBody string
+	handler := runtime.observe(map[string]int64{"media.example.test": 7}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		upstreamBody = string(data)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "https://media.example.test/Sessions/Playing/Progress", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("observer response status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	if upstreamBody != body {
+		t.Fatalf("upstream body = %q, want %q", upstreamBody, body)
+	}
+	if events := runtime.events.snapshot(); len(events) != 0 {
+		t.Fatalf("structured playback request generated replay events: %#v", events)
 	}
 }
 

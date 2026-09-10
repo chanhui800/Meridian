@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -530,7 +531,12 @@ type edgeAgentRuntime struct {
 	applyFailures        int64
 	eventSpoolError      string
 	events               edgeEventStore
-	stats                edgeSiteStats
+	// structuredPlaybackEvents is enabled for the production Agent proxy. Its
+	// ephemeral database parses playback-sync requests and forwards the
+	// resulting WatchHistory event directly, so observe must not enqueue the
+	// same request body a second time as a replay event.
+	structuredPlaybackEvents atomic.Bool
+	stats                    edgeSiteStats
 	// telemetrySampleMu serializes the complete snapshot operation shared by
 	// the full and lightweight report loops. TelemetrySequence is allocated
 	// only after the snapshot is captured while this lock is held, so a larger
@@ -1352,6 +1358,8 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 			http.Error(w, "site not assigned", http.StatusMisdirectedRequest)
 			return
 		}
+		playbackSync := edgePlaybackSyncPath(r.URL.Path)
+		structuredPlayback := playbackSync && runtime.structuredPlaybackEvents.Load()
 		var responseCapture bytes.Buffer
 		writer := &edgeStatusWriter{ResponseWriter: w}
 		if edgeMetadataPath(r.Method, r.URL.Path) {
@@ -1360,7 +1368,7 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 			writer.captureLimit = edgeEventResponseLimit
 		}
 		var requestBody string
-		if edgePlaybackSyncPath(r.URL.Path) && r.Body != nil && (r.ContentLength < 0 || r.ContentLength <= edgeEventBodyLimit) {
+		if playbackSync && !structuredPlayback && r.Body != nil && (r.ContentLength < 0 || r.ContentLength <= edgeEventBodyLimit) {
 			originalBody := r.Body
 			body, err := io.ReadAll(io.LimitReader(originalBody, edgeEventBodyLimit+1))
 			// Sampling must never consume bytes that the upstream proxy needs. If
@@ -1382,8 +1390,16 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 		if status >= http.StatusOK && status < http.StatusMultipleChoices && strings.Contains(strings.ToLower(w.Header().Get("Content-Type")), "json") {
 			responseBody = responseCapture.String()
 		}
+		if structuredPlayback {
+			// The in-process proxy already forwarded one canonical, parsed
+			// WatchHistory event through edgeWatchHistorySink. Replaying the raw
+			// body here would create a second event with a different fallback
+			// identity (the replay has no original RemoteAddr/X-Emby headers),
+			// which can result in duplicate active sessions in the Controller.
+			return
+		}
 		authorization := ""
-		if edgePlaybackSyncPath(r.URL.Path) {
+		if playbackSync {
 			authorization = r.Header.Get("Authorization")
 		}
 		if requestBody == "" && responseBody == "" {
@@ -1559,6 +1575,10 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 			Priority: nodeEventPriorityCritical, SkipRequestLog: true, WatchHistory: &mapped,
 		})
 	}
+	// Playback sync is parsed by the ephemeral proxy database above and sent
+	// through the structured sink. Mark the runtime before exposing the bundle
+	// so observe never emits a second raw-body event for the same request.
+	runtime.structuredPlaybackEvents.Store(true)
 	manager := NewProxyManager(database, nil)
 	bundle.manager = manager
 	if runtime.resolver != nil {
