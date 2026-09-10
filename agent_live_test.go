@@ -64,6 +64,80 @@ func TestNodeLiveReportOverlaysDashboardWithoutPersistingTraffic(t *testing.T) {
 	}
 }
 
+func TestNodeTelemetrySequenceOrdersFullAndLiveChannels(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "ordered-live", Address: "203.0.113.73", Port: 19073}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "ordered-site", ListenPort: freePort(t), PublicHost: "ordered.example", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:1", PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET applied_node_id=?, dns_status='active' WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	fullReport := func(sequence, telemetry int64, in, out, requests int64, at time.Time) {
+		t.Helper()
+		if _, err := app.db.RecordNodeReport(token, NodeReport{
+			BootID: "ordered-boot", ReportSessionID: "ordered-session", CounterEpoch: "kernel:eth0",
+			Sequence: sequence, TelemetrySequence: telemetry, InterfaceName: "eth0",
+			SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: in, CumulativeBytesOut: out, RequestCount: requests}},
+		}, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fullReport(1, 100, 100, 200, 3, now)
+	accepted, _, err := app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
+		ReportSessionID: "ordered-session", CounterEpoch: "kernel:eth0", Sequence: 1, TelemetrySequence: 101,
+		SampledAtMS: now.Add(time.Second).UnixMilli(),
+		SiteStats:   []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 900, CumulativeBytesOut: 1200, Requests: 17}},
+	}, now.Add(time.Second))
+	if err != nil || len(accepted) != 1 {
+		t.Fatalf("live report accepted=%v err=%v", accepted, err)
+	}
+	fullReport(2, 102, 950, 1250, 19, now.Add(2*time.Second))
+	// A delayed live request with an older shared sequence must not overlay
+	// the newer committed full report.
+	accepted, _, err = app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
+		ReportSessionID: "ordered-session", CounterEpoch: "kernel:eth0", Sequence: 2, TelemetrySequence: 101,
+		SampledAtMS: now.Add(3 * time.Second).UnixMilli(),
+		SiteStats:   []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 910, CumulativeBytesOut: 1210, Requests: 18}},
+	}, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 0 {
+		t.Fatalf("delayed live report was accepted: %v", accepted)
+	}
+	snapshot, err := app.db.NodeSiteLiveTrafficSnapshot(now.Add(4 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, ok := snapshot[site.ID]
+	if !ok || value.CumulativeBytesIn != 950 || value.CumulativeBytesOut != 1250 || value.Requests != 19 {
+		t.Fatalf("newer full report was overwritten: %#v", snapshot)
+	}
+	// A restarted Agent begins a fresh telemetry sequence and must not be
+	// blocked by the previous process's watermark.
+	accepted, _, err = app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
+		ReportSessionID: "restarted-session", CounterEpoch: "kernel:eth0", Sequence: 1, TelemetrySequence: 1,
+		SampledAtMS: now.Add(5 * time.Second).UnixMilli(),
+		SiteStats:   []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 1000, CumulativeBytesOut: 1300, Requests: 20}},
+	}, now.Add(5*time.Second))
+	if err != nil || len(accepted) != 1 {
+		t.Fatalf("restarted live report accepted=%v err=%v", accepted, err)
+	}
+}
+
 func TestNodeLiveReportRejectsUnauthorizedSite(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()

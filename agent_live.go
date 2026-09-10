@@ -19,10 +19,11 @@ type nodeLiveTrafficKey struct {
 
 type nodeLiveTrafficState struct {
 	NodeLiveSiteTraffic
-	reportSessionID string
-	counterEpoch    string
-	sequence        int64
-	updatedAt       time.Time
+	reportSessionID   string
+	counterEpoch      string
+	sequence          int64
+	telemetrySequence int64
+	updatedAt         time.Time
 }
 
 func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
@@ -31,7 +32,7 @@ func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
 	if report.ReportSessionID == "" || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 {
 		return errors.New("invalid live report session")
 	}
-	if report.Sequence <= 0 || report.SampledAtMS <= 0 || len(report.SiteStats) > maxNodeLiveSitesPerReport {
+	if report.Sequence <= 0 || report.TelemetrySequence < 0 || report.SampledAtMS <= 0 || len(report.SiteStats) > maxNodeLiveSitesPerReport {
 		return errors.New("invalid live report metadata")
 	}
 	// The timestamp is only a diagnostic hint. The server receive time is used
@@ -46,6 +47,16 @@ func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
 		}
 	}
 	return nil
+}
+
+func telemetrySequenceIsStale(previous nodeLiveTrafficState, sessionID, counterEpoch string, sequence int64) bool {
+	if sequence <= 0 || previous.telemetrySequence <= 0 {
+		return false
+	}
+	// The shared sequence restarts with a new Agent process. Only compare it
+	// inside the same report session/counter epoch; a new session is a fresh
+	// ordering domain and may legitimately begin at sequence 1.
+	return previous.reportSessionID == sessionID && previous.counterEpoch == counterEpoch && sequence <= previous.telemetrySequence
 }
 
 // recordNodeLiveReport validates site ownership in a read transaction and
@@ -90,6 +101,12 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 		}
 		key := nodeLiveTrafficKey{nodeID: nodeID, siteID: site.ID}
 		previous, exists := d.agentLive[key]
+		// Full and lightweight reports share TelemetrySequence. A delayed
+		// lightweight report must never overwrite a newer full report (or the
+		// reverse), even though their channel-local sequences are independent.
+		if exists && telemetrySequenceIsStale(previous, report.ReportSessionID, report.CounterEpoch, report.TelemetrySequence) {
+			continue
+		}
 		if exists && previous.reportSessionID == report.ReportSessionID && report.Sequence <= previous.sequence {
 			continue
 		}
@@ -101,15 +118,79 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 				Requests:           stat.Requests,
 				SampledAtMS:        serverSampledAt,
 			},
-			reportSessionID: report.ReportSessionID,
-			counterEpoch:    report.CounterEpoch,
-			sequence:        report.Sequence,
-			updatedAt:       now,
+			reportSessionID:   report.ReportSessionID,
+			counterEpoch:      report.CounterEpoch,
+			sequence:          report.Sequence,
+			telemetrySequence: report.TelemetrySequence,
+			updatedAt:         now,
 		}
 		accepted = appendUniqueInt64(accepted, stat.SiteID)
 	}
 	d.agentLiveMu.Unlock()
 	return accepted, discarded, nil
+}
+
+// recordNodeFullTelemetry publishes accepted full-report site counters into
+// the same in-memory overlay used by /api/agent/live. The shared telemetry
+// watermark prevents a delayed report from either channel from replacing a
+// newer sample.
+func (d *DB) recordNodeFullTelemetry(nodeID int64, report NodeReport, acceptedSiteIDs []int64, now time.Time) {
+	if d == nil || nodeID <= 0 || report.TelemetrySequence <= 0 || len(acceptedSiteIDs) == 0 {
+		return
+	}
+	allowed := make(map[int64]struct{}, len(acceptedSiteIDs))
+	for _, siteID := range acceptedSiteIDs {
+		if siteID > 0 {
+			allowed[siteID] = struct{}{}
+		}
+	}
+	d.agentLiveMu.Lock()
+	defer d.agentLiveMu.Unlock()
+	if d.agentLive == nil {
+		d.agentLive = make(map[nodeLiveTrafficKey]nodeLiveTrafficState)
+	}
+	sessionID := strings.TrimSpace(report.ReportSessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(report.BootID)
+	}
+	counterEpoch := strings.TrimSpace(report.CounterEpoch)
+	for _, stat := range report.SiteStats {
+		if _, ok := allowed[stat.SiteID]; !ok {
+			continue
+		}
+		host := requestPublicHost(stat.Host)
+		if host == "" {
+			continue
+		}
+		currentIn, currentOut := stat.CumulativeBytesIn, stat.CumulativeBytesOut
+		if currentIn == 0 && stat.BytesIn > 0 {
+			currentIn = stat.BytesIn
+		}
+		if currentOut == 0 && stat.BytesOut > 0 {
+			currentOut = stat.BytesOut
+		}
+		key := nodeLiveTrafficKey{nodeID: nodeID, siteID: stat.SiteID}
+		previous, exists := d.agentLive[key]
+		if exists && telemetrySequenceIsStale(previous, sessionID, counterEpoch, report.TelemetrySequence) {
+			continue
+		}
+		liveSequence := int64(0)
+		if exists {
+			liveSequence = previous.sequence
+		}
+		d.agentLive[key] = nodeLiveTrafficState{
+			NodeLiveSiteTraffic: NodeLiveSiteTraffic{
+				SiteID: stat.SiteID, Host: host,
+				CumulativeBytesIn: currentIn, CumulativeBytesOut: currentOut,
+				Requests: stat.RequestCount, SampledAtMS: now.UnixMilli(),
+			},
+			reportSessionID:   sessionID,
+			counterEpoch:      counterEpoch,
+			sequence:          liveSequence,
+			telemetrySequence: report.TelemetrySequence,
+			updatedAt:         now,
+		}
+	}
 }
 
 func appendUniqueInt64(values []int64, value int64) []int64 {

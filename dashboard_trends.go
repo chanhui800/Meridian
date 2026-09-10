@@ -14,6 +14,8 @@ type dashboardTrendCacheEntry struct {
 	Response  *dashboardTrendsResponse
 }
 
+const maxDashboardTrendCacheEntries = 128
+
 func (pm *ProxyManager) dashboardTrendCached(key string, now time.Time) *dashboardTrendsResponse {
 	pm.trendCacheMu.Lock()
 	defer pm.trendCacheMu.Unlock()
@@ -33,11 +35,22 @@ func (pm *ProxyManager) cacheDashboardTrend(key string, response *dashboardTrend
 	if pm.trendCache == nil {
 		pm.trendCache = make(map[string]dashboardTrendCacheEntry)
 	}
-	if len(pm.trendCache) > 128 {
+	now := time.Now()
+	for cacheKey, entry := range pm.trendCache {
+		if !now.Before(entry.ExpiresAt) {
+			delete(pm.trendCache, cacheKey)
+		}
+	}
+	if len(pm.trendCache) >= maxDashboardTrendCacheEntries {
+		oldestKey := ""
+		var oldestExpiry time.Time
 		for cacheKey, entry := range pm.trendCache {
-			if !time.Now().Before(entry.ExpiresAt) {
-				delete(pm.trendCache, cacheKey)
+			if oldestKey == "" || entry.ExpiresAt.Before(oldestExpiry) {
+				oldestKey, oldestExpiry = cacheKey, entry.ExpiresAt
 			}
+		}
+		if oldestKey != "" {
+			delete(pm.trendCache, oldestKey)
 		}
 	}
 	pm.trendCache[key] = dashboardTrendCacheEntry{ExpiresAt: expiresAt, Response: response}
@@ -54,15 +67,18 @@ type dashboardTrendPoint struct {
 }
 
 type dashboardTrendsResponse struct {
-	SiteID         string                `json:"site_id"`
-	Range          string                `json:"range"`
-	BillingMode    string                `json:"billing_mode"`
-	TimezoneOffset int                   `json:"timezone_offset_minutes"`
-	StartMS        int64                 `json:"start_ms"`
-	EndMS          int64                 `json:"end_ms"`
-	BucketSeconds  int64                 `json:"bucket_seconds"`
-	Points         []dashboardTrendPoint `json:"points"`
-	SiteSeries     []dashboardTrendSite  `json:"site_series"`
+	SiteID         string `json:"site_id"`
+	Range          string `json:"range"`
+	BillingMode    string `json:"billing_mode"`
+	TimezoneOffset int    `json:"timezone_offset_minutes"`
+	StartMS        int64  `json:"start_ms"`
+	EndMS          int64  `json:"end_ms"`
+	// AsOfMS is the history snapshot cutoff. Realtime points newer than this
+	// instant can be merged without double-counting the current bucket.
+	AsOfMS        int64                 `json:"as_of_ms"`
+	BucketSeconds int64                 `json:"bucket_seconds"`
+	Points        []dashboardTrendPoint `json:"points"`
+	SiteSeries    []dashboardTrendSite  `json:"site_series"`
 }
 
 // dashboardTrendSite carries the same time buckets as the aggregate chart,
@@ -335,6 +351,7 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 		TimezoneOffset: settings.ScheduleTimezone,
 		StartMS:        start.UnixMilli(),
 		EndMS:          end.UnixMilli(),
+		AsOfMS:         now.UnixMilli(),
 		BucketSeconds:  int64(bucket / time.Second),
 		Points:         points,
 		SiteSeries:     siteSeries,

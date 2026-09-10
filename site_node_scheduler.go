@@ -1238,6 +1238,60 @@ func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedul
 	return a.finalizeDisabledSiteNodeSchedule(schedule)
 }
 
+// deleteTrackedSiteDNSForSiteDisable removes the active DNS/runtime
+// assignment when the site itself is disabled, while preserving the
+// operator's scheduling preference (enabled, mode and fixed_node_id). A site
+// can therefore be re-enabled without silently losing its selected node.
+func (a *App) deleteTrackedSiteDNSForSiteDisable(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
+	if schedule.cfRecordID != "" {
+		cf, err := a.cloudflareForScheduling()
+		if err != nil {
+			return err
+		}
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
+			return err
+		}
+	}
+	return a.finalizeDisabledSiteNodeRuntime(schedule, now)
+}
+
+// finalizeDisabledSiteNodeRuntime clears assignments and revokes old routes
+// without changing the site's scheduling preference. This is intentionally
+// separate from finalizeDisabledSiteNodeSchedule, which is used when an
+// operator explicitly disables scheduling and must clear that preference.
+func (a *App) finalizeDisabledSiteNodeRuntime(schedule SiteNodeSchedule, now time.Time) error {
+	if a == nil || a.db == nil || schedule.SiteID <= 0 {
+		return nil
+	}
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	ids, err := siteNodeRevocationIDsTx(tx, schedule.SiteID, schedule.FixedNodeID, schedule.DesiredNodeID, schedule.AppliedNodeID)
+	if err != nil {
+		return err
+	}
+	for _, nodeID := range ids {
+		if nodeID <= 0 {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO agent_route_revocations(node_id,site_id,public_host,created_at_ms)
+			VALUES(?,?,?,?)`, nodeID, schedule.SiteID, strings.ToLower(strings.TrimSpace(schedule.PublicHost)), now.UnixMilli()); err != nil {
+			return err
+		}
+	}
+	if err := markAgentConfigsDirtyForNodeIDsTx(tx, ids...); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE site_node_schedules SET desired_node_id=NULL,applied_node_id=NULL,
+		cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',dns_status='disabled',
+		last_error='',config_hash='',config_pending_since_ms=0,updated_at_ms=? WHERE site_id=?`, now.UnixMilli(), schedule.SiteID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // finalizeDisabledSiteNodeSchedule clears every assignment and remote DNS
 // handle after the external delete has completed. It is deliberately safe to
 // call for already-disabled rows left by older releases, so the scheduler can
@@ -1358,10 +1412,9 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	}
 	if !site.Enabled {
 		if schedule.cfRecordID != "" {
-			return a.deleteTrackedSiteDNS(ctx, schedule)
+			return a.deleteTrackedSiteDNSForSiteDisable(ctx, schedule, now)
 		}
-		_, err := a.db.db.Exec("UPDATE site_node_schedules SET dns_status='disabled',last_error='',updated_at_ms=? WHERE site_id=?", now.UnixMilli(), schedule.SiteID)
-		return err
+		return a.finalizeDisabledSiteNodeRuntime(schedule, now)
 	}
 	if schedule.DesiredNodeID <= 0 {
 		return errors.New("no eligible node is available")

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -43,6 +44,9 @@ func TestDashboardTrendsAggregateAllAndSingleSite(t *testing.T) {
 	if all.SiteID != "all" || all.Range != "hour" || all.BucketSeconds != 60 || len(all.Points) != 60 {
 		t.Fatalf("all metadata = %+v", all)
 	}
+	if all.AsOfMS <= 0 {
+		t.Fatalf("dashboard trend is missing its history snapshot cutoff: %+v", all)
+	}
 	traffic, requests := sumDashboardTrend(all.Points)
 	if traffic != 860 || requests != 6 {
 		t.Fatalf("all totals = traffic %d requests %d, want 860/6", traffic, requests)
@@ -70,6 +74,24 @@ func TestDashboardTrendsAggregateAllAndSingleSite(t *testing.T) {
 	}
 	if len(single.SiteSeries) != 1 || single.SiteSeries[0].SiteID != first.ID || single.SiteSeries[0].SiteName != "first" {
 		t.Fatalf("single site series = %+v, want first only", single.SiteSeries)
+	}
+}
+
+func TestDashboardTrendCacheHasHardEntryLimit(t *testing.T) {
+	pm := &ProxyManager{trendCache: make(map[string]dashboardTrendCacheEntry)}
+	expires := time.Now().Add(time.Hour)
+	for i := 0; i < maxDashboardTrendCacheEntries; i++ {
+		pm.cacheDashboardTrend(fmt.Sprintf("trend-%d", i), &dashboardTrendsResponse{}, expires.Add(time.Duration(i)*time.Second))
+	}
+	pm.cacheDashboardTrend("trend-new", &dashboardTrendsResponse{}, expires.Add(2*time.Hour))
+	if len(pm.trendCache) != maxDashboardTrendCacheEntries {
+		t.Fatalf("trend cache size=%d, want=%d", len(pm.trendCache), maxDashboardTrendCacheEntries)
+	}
+	if pm.dashboardTrendCached("trend-0", time.Now()) != nil {
+		t.Fatal("oldest trend cache entry was not evicted at the hard limit")
+	}
+	if pm.dashboardTrendCached("trend-new", time.Now()) == nil {
+		t.Fatal("newest trend cache entry was evicted")
 	}
 }
 
