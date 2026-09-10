@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,6 +67,17 @@ type dashboardTrendPoint struct {
 	UploadBPS   float64 `json:"upload_bps"`
 }
 
+// dashboardTrendBaseline is the last cumulative Agent counter that is
+// durably represented by node_site_traffic_logs. Realtime samples after this
+// watermark can be converted to deltas without using the Controller wall
+// clock as a proxy for persisted history.
+type dashboardTrendBaseline struct {
+	BytesIn     int64 `json:"bytes_in"`
+	BytesOut    int64 `json:"bytes_out"`
+	Requests    int64 `json:"requests"`
+	SampledAtMS int64 `json:"sampled_at_ms"`
+}
+
 type dashboardTrendsResponse struct {
 	SiteID         string `json:"site_id"`
 	Range          string `json:"range"`
@@ -75,10 +87,11 @@ type dashboardTrendsResponse struct {
 	EndMS          int64  `json:"end_ms"`
 	// AsOfMS is the history snapshot cutoff. Realtime points newer than this
 	// instant can be merged without double-counting the current bucket.
-	AsOfMS        int64                 `json:"as_of_ms"`
-	BucketSeconds int64                 `json:"bucket_seconds"`
-	Points        []dashboardTrendPoint `json:"points"`
-	SiteSeries    []dashboardTrendSite  `json:"site_series"`
+	AsOfMS        int64                            `json:"as_of_ms"`
+	LiveBaselines map[int64]dashboardTrendBaseline `json:"live_baselines,omitempty"`
+	BucketSeconds int64                            `json:"bucket_seconds"`
+	Points        []dashboardTrendPoint            `json:"points"`
+	SiteSeries    []dashboardTrendSite             `json:"site_series"`
 }
 
 // dashboardTrendSite carries the same time buckets as the aggregate chart,
@@ -179,22 +192,76 @@ func dashboardTrendWindowWithLocation(name string, now, customStart, customEnd t
 }
 
 func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboardPendingTraffic {
-	result := make(map[int64]dashboardPendingTraffic)
+	result, _, unlock := pm.lockLocalDashboardTrendSnapshot(siteID, time.Now())
+	unlock()
+	return result
+}
+
+// lockLocalDashboardTrendSnapshot pins every selected local proxy while the
+// caller takes the SQLite history snapshot. Holding trafficMu across that
+// read makes the in-memory cumulative/pending split and traffic_logs observe
+// one consistent point in time; the returned unlock function must be called
+// on every path.
+func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt time.Time) (map[int64]dashboardPendingTraffic, map[int64]dashboardTrendBaseline, func()) {
+	pendingResult := make(map[int64]dashboardPendingTraffic)
+	baselineResult := make(map[int64]dashboardTrendBaseline)
+	if pm == nil {
+		return pendingResult, baselineResult, func() {}
+	}
 	pm.mu.RLock()
-	defer pm.mu.RUnlock()
+	ids := make([]int64, 0, len(pm.proxies))
+	instances := make(map[int64]*ProxyInstance)
 	for id, inst := range pm.proxies {
 		if siteID != nil && *siteID != id {
 			continue
 		}
-		inst.trafficMu.Lock()
-		result[id] = dashboardPendingTraffic{
-			BytesIn:  inst.trafficBytesIn().Load(),
-			BytesOut: inst.trafficBytesOut().Load(),
-			Requests: inst.trafficPendingRequests().Load(),
-		}
-		inst.trafficMu.Unlock()
+		ids = append(ids, id)
+		instances[id] = inst
 	}
-	return result
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		inst := instances[id]
+		inst.trafficMu.Lock()
+		pendingIn := inst.trafficBytesIn().Load()
+		pendingOut := inst.trafficBytesOut().Load()
+		pendingRequests := inst.trafficPendingRequests().Load()
+		baselineIn := inst.trafficCumulativeIn().Load() - pendingIn
+		baselineOut := inst.trafficCumulativeOut().Load() - pendingOut
+		baselineRequests := inst.trafficRequests().Load() - pendingRequests
+		if baselineIn < 0 {
+			baselineIn = 0
+		}
+		if baselineOut < 0 {
+			baselineOut = 0
+		}
+		if baselineRequests < 0 {
+			baselineRequests = 0
+		}
+		pendingResult[id] = dashboardPendingTraffic{
+			BytesIn: pendingIn, BytesOut: pendingOut, Requests: pendingRequests,
+		}
+		baselineResult[id] = dashboardTrendBaseline{
+			BytesIn: baselineIn, BytesOut: baselineOut, Requests: baselineRequests,
+			SampledAtMS: sampledAt.UnixMilli(),
+		}
+	}
+	return pendingResult, baselineResult, func() {
+		for index := len(ids) - 1; index >= 0; index-- {
+			instances[ids[index]].trafficMu.Unlock()
+		}
+		pm.mu.RUnlock()
+	}
+}
+
+// localDashboardTrendBaselines returns the controller-local cumulative
+// counters that are already represented by traffic_logs at the same snapshot
+// as pendingDashboardTraffic. Agent baselines come from SQLite; local proxy
+// baselines are derived by subtracting the unflushed counters from the
+// process-stable cumulative counters.
+func (pm *ProxyManager) localDashboardTrendBaselines(siteID *int64, sampledAt time.Time) map[int64]dashboardTrendBaseline {
+	_, baselines, unlock := pm.lockLocalDashboardTrendSnapshot(siteID, sampledAt)
+	unlock()
+	return baselines
 }
 
 func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName string, billingMode string, logs []TrafficLog, pending dashboardPendingTraffic, now ...time.Time) []dashboardTrendPoint {
@@ -305,7 +372,9 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 	if cached := pm.dashboardTrendCached(cacheKey, now); cached != nil {
 		return cached, nil
 	}
-	logs, err := pm.database.GetTrafficTrendLogsGrouped(siteID, start, end, bucket)
+	pendingBySite, localBaselines, unlockLocal := pm.lockLocalDashboardTrendSnapshot(siteID, now)
+	defer unlockLocal()
+	logs, liveBaselines, err := pm.database.GetTrafficTrendLogsGroupedSnapshot(siteID, start, end, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +392,11 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 	for _, logRow := range logs {
 		logsBySite[logRow.SiteID] = append(logsBySite[logRow.SiteID], logRow)
 	}
-	pendingBySite := pm.pendingDashboardTraffic(siteID)
+	for localSiteID, baseline := range localBaselines {
+		if _, exists := liveBaselines[localSiteID]; !exists {
+			liveBaselines[localSiteID] = baseline
+		}
+	}
 	var aggregatePending dashboardPendingTraffic
 	for _, value := range pendingBySite {
 		aggregatePending.BytesIn += value.BytesIn
@@ -339,6 +412,33 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 			Points:   dashboardTrendPoints(start, end, bucket, name, billingMode, logsBySite[site.ID], pendingBySite[site.ID], now),
 		})
 	}
+	// AsOfMS is a real persisted-history watermark whenever every selected
+	// site is backed by an Agent counter baseline. Mixed local/Agent views keep
+	// the request-time fallback because no single timestamp can describe both
+	// sources; their per-site baselines are still returned for exact merges.
+	asOfMS := now.UnixMilli()
+	if len(selectedSites) > 0 {
+		complete := true
+		earliest := int64(0)
+		for _, site := range selectedSites {
+			baseline, ok := liveBaselines[site.ID]
+			if !ok || baseline.SampledAtMS <= 0 {
+				complete = false
+				break
+			}
+			if earliest == 0 || baseline.SampledAtMS < earliest {
+				earliest = baseline.SampledAtMS
+			}
+		}
+		if complete && earliest > 0 {
+			asOfMS = earliest
+		}
+	}
+	if siteID != nil {
+		if baseline, ok := liveBaselines[*siteID]; ok && baseline.SampledAtMS > 0 {
+			asOfMS = baseline.SampledAtMS
+		}
+	}
 	response := &dashboardTrendsResponse{
 		SiteID: func() string {
 			if siteID == nil {
@@ -351,7 +451,8 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 		TimezoneOffset: settings.ScheduleTimezone,
 		StartMS:        start.UnixMilli(),
 		EndMS:          end.UnixMilli(),
-		AsOfMS:         now.UnixMilli(),
+		AsOfMS:         asOfMS,
+		LiveBaselines:  liveBaselines,
 		BucketSeconds:  int64(bucket / time.Second),
 		Points:         points,
 		SiteSeries:     siteSeries,

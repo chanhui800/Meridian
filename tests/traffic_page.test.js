@@ -711,6 +711,39 @@ test('dashboard realtime chart uses a fixed five-minute window and sparse bounda
   assert.equal(vm.runInContext('dashboardTrendAxisLabel(1, [{ timestamp_ms: 179000 } , { timestamp_ms: 180000 }], "realtime", -120000, 180000)', h.sandbox), 180000);
 });
 
+test('dashboard realtime paths stay anchored to both chart boundaries', () => {
+  const h = makeTrafficHarness();
+  const padded = vm.runInContext(`dashboardTrendPaddedPathPoints(
+    [{ x: 120, y: 80 }, { x: 180, y: 80 }], 20, 280, 180, true
+  )`, h.sandbox);
+  assert.equal(padded[0].x, 20);
+  assert.equal(padded.at(-1).x, 280);
+  assert.equal(padded[0].y, 180);
+  assert.equal(padded.at(-1).y, 180);
+  assert.equal(padded.length, 4);
+});
+
+test('dashboard realtime Agent baseline converts cumulative samples into a lossless tail', () => {
+  const h = makeTrafficHarness();
+  const points = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: '7', range: 'realtime' };
+    dashboardTrendData = {
+      range: 'realtime', as_of_ms: 4000, billing_mode: 'outbound',
+      live_baselines: { '7': { bytes_in: 100, bytes_out: 200, requests: 10, sampled_at_ms: 4000 } },
+      points: [{ timestamp_ms: 0, traffic_bytes: 100, requests: 1 }],
+    };
+    dashboardRealtimeTrendSamples = new Map([['7', [
+      { timestamp_ms: 3000, cumulative_bytes_in: 110, cumulative_bytes_out: 220, cumulative_requests: 11, traffic_bytes: 0 },
+      { timestamp_ms: 6000, cumulative_bytes_in: 130, cumulative_bytes_out: 260, cumulative_requests: 13, traffic_bytes: 0 },
+      { timestamp_ms: 8000, cumulative_bytes_in: 135, cumulative_bytes_out: 270, cumulative_requests: 14, traffic_bytes: 0 },
+    ]]]);
+    return dashboardRealtimeTrendPoints();
+  })()`, h.sandbox);
+  assert.deepEqual(Array.from(points, point => point.timestamp_ms), [6000, 8000]);
+  assert.deepEqual(Array.from(points, point => [point.bytes_out, point.requests]), [[60, 3], [10, 1]]);
+  assert.deepEqual(Array.from(points, point => point.download_bps), [30, 5]);
+});
+
 test('dashboard realtime trend persists recent points across a page refresh', () => {
   let stored = null;
   const storage = {

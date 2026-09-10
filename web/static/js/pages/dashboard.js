@@ -481,6 +481,12 @@ function dashboardNormalizeRealtimePoint(value) {
     bytes_out: numberOrZero(value.bytes_out),
     requests: numberOrZero(value.requests),
   };
+  // Cumulative counters let the realtime tail start from the exact
+  // persisted Agent baseline returned by the Controller. Older localStorage
+  // entries may omit them and continue through the legacy timestamp merge.
+  if (value.cumulative_bytes_in !== undefined) point.cumulative_bytes_in = numberOrZero(value.cumulative_bytes_in);
+  if (value.cumulative_bytes_out !== undefined) point.cumulative_bytes_out = numberOrZero(value.cumulative_bytes_out);
+  if (value.cumulative_requests !== undefined) point.cumulative_requests = numberOrZero(value.cumulative_requests);
   if (value.traffic_bytes !== undefined) point.traffic_bytes = numberOrZero(value.traffic_bytes);
   if (value.site_contributions && typeof value.site_contributions === 'object' && !Array.isArray(value.site_contributions)) {
     const contributions = {};
@@ -595,12 +601,72 @@ function upsertDashboardRealtimeSample(samples, point) {
 function dashboardRealtimeTrendPoints() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   const points = dashboardRealtimeTrendSamples.get(key) || [];
-  // The history response carries the exact server-side snapshot cutoff. Keep
-  // only live samples strictly newer than it so the current minute bucket is
-  // represented once when the two sources are merged.
-  const anchor = Number(dashboardTrendData?.as_of_ms || 0);
-  if (!Number.isFinite(anchor) || anchor <= 0) return points;
-  return points.filter(point => Number(point?.timestamp_ms || 0) > anchor);
+  const baseline = dashboardRealtimeBaselineForKey(key);
+  const anchor = Number(baseline?.sampled_at_ms || dashboardTrendData?.as_of_ms || 0);
+  const newer = !Number.isFinite(anchor) || anchor <= 0
+    ? points
+    : points.filter(point => Number(point?.timestamp_ms || 0) > anchor);
+  if (!baseline || !newer.length || !Number.isFinite(Number(baseline.sampled_at_ms)) || Number(baseline.sampled_at_ms) <= 0) return newer;
+  let previous = {
+    bytesIn: Math.max(0, Number(baseline.bytes_in || 0)),
+    bytesOut: Math.max(0, Number(baseline.bytes_out || 0)),
+    requests: Math.max(0, Number(baseline.requests || 0)),
+    timestamp: Number(baseline.sampled_at_ms),
+  };
+  return newer.map(point => {
+    const hasCumulative = point.cumulative_bytes_in !== undefined || point.cumulative_bytes_out !== undefined || point.cumulative_requests !== undefined;
+    if (!hasCumulative) return point;
+    const current = {
+      bytesIn: Math.max(0, Number(point.cumulative_bytes_in || 0)),
+      bytesOut: Math.max(0, Number(point.cumulative_bytes_out || 0)),
+      requests: Math.max(0, Number(point.cumulative_requests || 0)),
+      timestamp: Number(point.timestamp_ms || previous.timestamp),
+    };
+    const deltaIn = current.bytesIn >= previous.bytesIn ? current.bytesIn - previous.bytesIn : current.bytesIn;
+    const deltaOut = current.bytesOut >= previous.bytesOut ? current.bytesOut - previous.bytesOut : current.bytesOut;
+    const deltaRequests = current.requests >= previous.requests ? current.requests - previous.requests : current.requests;
+    const seconds = Math.max(0, (current.timestamp - previous.timestamp) / 1000);
+    const next = {
+      ...point,
+      bytes_in: deltaIn,
+      bytes_out: deltaOut,
+      requests: deltaRequests,
+      download_bps: seconds > 0 ? deltaOut / seconds : 0,
+      upload_bps: seconds > 0 ? deltaIn / seconds : 0,
+    };
+    if (point.traffic_bytes !== undefined) {
+      const mode = dashboardTrendData?.billing_mode;
+      next.traffic_bytes = mode === 'outbound' ? deltaOut : 2 * (deltaIn + deltaOut);
+    }
+    previous = current;
+    return next;
+  });
+}
+
+function dashboardRealtimeBaselineForKey(key) {
+  const raw = dashboardTrendData?.live_baselines;
+  if (!raw || typeof raw !== 'object') return null;
+  if (key !== 'all') return raw[key] || raw[String(key)] || null;
+  const series = Array.isArray(dashboardTrendData?.site_series) ? dashboardTrendData.site_series : [];
+  if (!series.length) return null;
+  const aggregate = { bytes_in: 0, bytes_out: 0, requests: 0, sampled_at_ms: 0 };
+  for (const site of series) {
+    const baseline = raw[String(site.site_id)] || raw[site.site_id];
+    if (!baseline || Number(baseline.sampled_at_ms || 0) <= 0) return null;
+    aggregate.bytes_in += Math.max(0, Number(baseline.bytes_in || 0));
+    aggregate.bytes_out += Math.max(0, Number(baseline.bytes_out || 0));
+    aggregate.requests += Math.max(0, Number(baseline.requests || 0));
+    const sampledAt = Number(baseline.sampled_at_ms);
+    if (!aggregate.sampled_at_ms || sampledAt < aggregate.sampled_at_ms) aggregate.sampled_at_ms = sampledAt;
+  }
+  return aggregate.sampled_at_ms > 0 ? aggregate : null;
+}
+
+function dashboardTrendCutoffMS() {
+  const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
+  const baseline = dashboardRealtimeBaselineForKey(key);
+  const value = Number(baseline?.sampled_at_ms || dashboardTrendData?.as_of_ms || 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 function dashboardRealtimeHistoricalPoints() {
@@ -609,12 +675,12 @@ function dashboardRealtimeHistoricalPoints() {
   const { start, end } = dashboardRealtimeWindowBounds();
   const windowed = historical.filter(point => {
     const timestamp = Number(point?.timestamp_ms || 0);
-    const anchor = Number(dashboardTrendData?.as_of_ms || 0);
+    const anchor = dashboardTrendCutoffMS();
     return timestamp >= start && timestamp <= end && (!anchor || timestamp <= anchor);
   });
   const realtime = dashboardRealtimeTrendPoints();
   if (!realtime.length) return windowed;
-  const anchor = Number(dashboardTrendData?.as_of_ms || 0);
+  const anchor = dashboardTrendCutoffMS();
   if (Number.isFinite(anchor) && anchor > 0) return windowed;
   const firstRealtime = Number(realtime[0]?.timestamp_ms || 0);
   return windowed.filter(point => Number(point?.timestamp_ms || 0) < firstRealtime);
@@ -698,6 +764,15 @@ function dashboardRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
+function dashboardTrendPaddedPathPoints(points, left, right, baselineY, realtime) {
+  if (!realtime || !Array.isArray(points) || !points.length) return points || [];
+  const padded = points.slice();
+  const epsilon = 0.5;
+  if (padded[0].x > left + epsilon) padded.unshift({ x: left, y: baselineY, synthetic: true });
+  if (padded[padded.length - 1].x < right - epsilon) padded.push({ x: right, y: baselineY, synthetic: true });
+  return padded;
+}
+
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
   const points = dashboardTrendChartPoints();
@@ -749,9 +824,18 @@ function drawDashboardTrendChart(metric) {
   const canvasSeries = series.map(item => ({ ...item, points: item.values.map((value, index) => ({
     x: xForTimestamp(points[index]?.timestamp_ms),
     y: top + plotH * (1 - (value / (scale.max || 1))),
-  })) }));
+  })), pathPoints: [] }));
   canvasSeries.forEach(item => {
-    const pointsOnCanvas = item.points;
+    item.pathPoints = dashboardTrendPaddedPathPoints(
+      item.points,
+      left,
+      width - right,
+      top + plotH,
+      dashboardTrendState.range === 'realtime',
+    );
+  });
+  canvasSeries.forEach(item => {
+    const pointsOnCanvas = item.pathPoints;
     ctx.beginPath();
     pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
     if (metric !== 'speed') {
@@ -1276,6 +1360,14 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       totalRateIn += Math.max(0, Number(latest.up || 0));
     }
   }
+  let totalCumulativeIn = 0;
+  let totalCumulativeOut = 0;
+  let totalCumulativeRequests = 0;
+  dashboardSpeedSamples.forEach(sample => {
+    totalCumulativeIn += Math.max(0, Number(sample?.bytesIn || 0));
+    totalCumulativeOut += Math.max(0, Number(sample?.bytesOut || 0));
+    totalCumulativeRequests += Math.max(0, Number(sample?.requests || 0));
+  });
   const sampledAt = Number(snapshotMS || Date.now());
   const appendRealtimeTrendSample = (key, sample, sampleTimestamp = sampledAt, contributions = null) => {
     const samples = dashboardRealtimeTrendSamples.get(key) || [];
@@ -1289,6 +1381,9 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       bytes_out: bytesOut,
       requests: Math.max(0, Number(sample?.requests || 0)),
     };
+    if (sample?.cumulativeBytesIn !== undefined) point.cumulative_bytes_in = Math.max(0, Number(sample.cumulativeBytesIn || 0));
+    if (sample?.cumulativeBytesOut !== undefined) point.cumulative_bytes_out = Math.max(0, Number(sample.cumulativeBytesOut || 0));
+    if (sample?.cumulativeRequests !== undefined) point.cumulative_requests = Math.max(0, Number(sample.cumulativeRequests || 0));
     if (billingKnown) point.traffic_bytes = billingMode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut);
     if (contributions && Object.keys(contributions).length) point.site_contributions = contributions;
     upsertDashboardRealtimeSample(samples, point);
@@ -1310,11 +1405,26 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
       requests: Math.max(0, Number(delta.requests || 0)),
     };
+    const cumulative = dashboardSpeedSamples.get(siteID);
+    if (cumulative) {
+      contributions[String(siteID)].cumulative_bytes_in = Math.max(0, Number(cumulative.bytesIn || 0));
+      contributions[String(siteID)].cumulative_bytes_out = Math.max(0, Number(cumulative.bytesOut || 0));
+      contributions[String(siteID)].cumulative_requests = Math.max(0, Number(cumulative.requests || 0));
+    }
     if (billingKnown) contributions[String(siteID)].traffic_bytes = billingMode === 'outbound'
       ? contributions[String(siteID)].bytes_out
       : 2 * (contributions[String(siteID)].bytes_in + contributions[String(siteID)].bytes_out);
   }
-  appendRealtimeTrendSample('all', { download_bps: totalRateOut, upload_bps: totalRateIn, bytesIn: totalDeltaIn, bytesOut: totalDeltaOut, requests: totalDeltaRequests }, sampledAt, contributions);
+  appendRealtimeTrendSample('all', {
+    download_bps: totalRateOut,
+    upload_bps: totalRateIn,
+    bytesIn: totalDeltaIn,
+    bytesOut: totalDeltaOut,
+    requests: totalDeltaRequests,
+    cumulativeBytesIn: totalCumulativeIn,
+    cumulativeBytesOut: totalCumulativeOut,
+    cumulativeRequests: totalCumulativeRequests,
+  }, sampledAt, contributions);
 
   // Site charts use the same controller snapshot timestamp rather than the
   // Agent's last site sample timestamp. Otherwise a site that reports less
@@ -1326,6 +1436,7 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       upload_bps: Math.max(0, Number(latest?.up || 0)),
     };
     const delta = trendDeltas.get(siteID) || {};
+    const currentSample = dashboardSpeedSamples.get(siteID);
     const siteSamples = dashboardRealtimeTrendSiteSamples.get(String(siteID)) || [];
     const siteSample = {
       timestamp_ms: sampledAt,
@@ -1334,9 +1445,18 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       bytes_in: Math.max(0, Number(delta.bytesIn || 0)),
       bytes_out: Math.max(0, Number(delta.bytesOut || 0)),
       requests: Math.max(0, Number(delta.requests || 0)),
+      cumulative_bytes_in: Math.max(0, Number(currentSample?.bytesIn || 0)),
+      cumulative_bytes_out: Math.max(0, Number(currentSample?.bytesOut || 0)),
+      cumulative_requests: Math.max(0, Number(currentSample?.requests || 0)),
     };
     if (billingKnown) siteSample.traffic_bytes = billingMode === 'outbound' ? siteSample.bytes_out : 2 * (siteSample.bytes_in + siteSample.bytes_out);
-    appendRealtimeTrendSample(String(siteID), { ...rate, ...delta }, sampledAt);
+    appendRealtimeTrendSample(String(siteID), {
+      ...rate,
+      ...delta,
+      cumulativeBytesIn: Math.max(0, Number(currentSample?.bytesIn || 0)),
+      cumulativeBytesOut: Math.max(0, Number(currentSample?.bytesOut || 0)),
+      cumulativeRequests: Math.max(0, Number(currentSample?.requests || 0)),
+    }, sampledAt);
     upsertDashboardRealtimeSample(siteSamples, siteSample);
     pruneDashboardRealtimeSamples(siteSamples);
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples);

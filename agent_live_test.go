@@ -64,6 +64,56 @@ func TestNodeLiveReportOverlaysDashboardWithoutPersistingTraffic(t *testing.T) {
 	}
 }
 
+func TestDashboardTrendSnapshotReturnsPersistedAgentBaseline(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "trend-baseline-node", Address: "203.0.113.74", Port: 19074}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "trend-baseline-site", ListenPort: freePort(t), PublicHost: "trend-baseline.example", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:1", PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET applied_node_id=?, dns_status='active' WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{
+		BootID: "trend-baseline-boot", ReportSessionID: "trend-baseline-session", CounterEpoch: "kernel:eth0", SiteCounterEpoch: "1",
+		Sequence: 1, TelemetrySequence: 1, InterfaceName: "eth0", SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, BytesIn: 10, BytesOut: 20, CumulativeBytesIn: 110, CumulativeBytesOut: 220, RequestCount: 11, CounterEpoch: 1}},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	_, baselines, err := app.db.GetTrafficTrendLogsGroupedSnapshot(&site.ID, now.Add(-time.Minute), now.Add(time.Minute), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, ok := baselines[site.ID]
+	if !ok {
+		t.Fatalf("missing Agent trend baseline: %#v", baselines)
+	}
+	if baseline.BytesIn != 110 || baseline.BytesOut != 220 || baseline.Requests != 11 || baseline.SampledAtMS != now.UnixMilli() {
+		t.Fatalf("baseline=%+v, want counters 110/220/11 at %d", baseline, now.UnixMilli())
+	}
+	trend, err := app.pm.dashboardTrends(&site.ID, "realtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trend.AsOfMS != now.UnixMilli() {
+		t.Fatalf("dashboard AsOfMS=%d, want persisted Agent watermark %d", trend.AsOfMS, now.UnixMilli())
+	}
+	if got := trend.LiveBaselines[site.ID]; got != baseline {
+		t.Fatalf("dashboard live baseline=%+v, want %+v", got, baseline)
+	}
+}
+
 func TestNodeTelemetrySequenceOrdersFullAndLiveChannels(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()
