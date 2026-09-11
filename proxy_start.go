@@ -323,6 +323,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 		defer inst.endHTTPRequest(requestController)
 		normalizeEmbeddedDynamicCapabilityRequestPath(r.URL)
+		if site.PathPrefix != "" && !isReservedDynamicRoute(r.URL.Path) {
+			stripIngressPathPrefix(r.URL, site.PathPrefix)
+		}
 		requestStartedAt := time.Now()
 		clientRequestContext := r.Context()
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}

@@ -298,21 +298,26 @@ func isKnownMediaApplicationRoute(pathValue string) bool {
 }
 
 func stripIngressPathPrefix(requestURL *url.URL, prefix string) {
-	if requestURL == nil || !ingressPathMatches(requestURL.Path, prefix) {
+	if requestURL == nil || prefix == "" || !ingressPathMatches(requestURL.Path, prefix) {
 		return
 	}
-	path := strings.TrimPrefix(requestURL.Path, prefix)
-	if path == "" {
-		path = "/"
-	}
-	requestURL.Path = path
-	if requestURL.RawPath != "" {
-		rawPrefix := (&url.URL{Path: prefix}).EscapedPath()
-		rawPath := strings.TrimPrefix(requestURL.RawPath, rawPrefix)
-		if rawPath == "" {
-			rawPath = "/"
+	rawPrefix := (&url.URL{Path: prefix}).EscapedPath()
+	for ingressPathMatches(requestURL.Path, prefix) {
+		path := strings.TrimPrefix(requestURL.Path, prefix)
+		if path == "" {
+			path = "/"
 		}
-		requestURL.RawPath = rawPath
+		requestURL.Path = path
+		if requestURL.RawPath != "" {
+			rawPath := strings.TrimPrefix(requestURL.RawPath, rawPrefix)
+			if rawPath == "" {
+				rawPath = "/"
+			}
+			requestURL.RawPath = rawPath
+		}
+		if path == "/" {
+			break
+		}
 	}
 }
 
@@ -712,7 +717,8 @@ func isPlaybackRequest(path string) bool {
 
 func isPlaybackRedirectEndpoint(pathValue string) bool {
 	pathValue = strings.ToLower(pathValue)
-	return pathValue == "/emya/video" || pathValue == "/emby/emya/video"
+	return pathValue == "/emya/video" || pathValue == "/emby/emya/video" ||
+		pathValue == "/emya/subtitle" || pathValue == "/emby/emya/subtitle"
 }
 
 func isPlaybackInfoRequest(path string) bool {

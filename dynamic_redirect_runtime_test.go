@@ -184,6 +184,8 @@ func TestDynamicRedirectRuntimeEligibilityIsNarrow(t *testing.T) {
 		{name: "item download", method: http.MethodGet, path: "/Items/42/Download", want: true},
 		{name: "Emya video GET", method: http.MethodGet, path: "/emby/emya/video?server=emos", want: true},
 		{name: "Emya video HEAD", method: http.MethodHead, path: "/emya/video", want: true},
+		{name: "Emya subtitle GET", method: http.MethodGet, path: "/emby/emya/subtitle?server=emos&media_id=evn6y0q52p53&subtitle_id=11575", want: true},
+		{name: "Emya subtitle HEAD", method: http.MethodHead, path: "/emya/subtitle", want: true},
 		{name: "exact PlaybackInfo", method: http.MethodGet, path: "/Items/42/PlaybackInfo?UserId=7", want: true},
 		{name: "exact emby PlaybackInfo", method: http.MethodHead, path: "/emby/Items/42/PlaybackInfo", want: true},
 		{name: "HLS manifest", method: http.MethodGet, path: "/custom/live.m3u8", want: true},
