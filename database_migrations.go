@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 48
+	databaseSchemaVersion = 49
 )
 
 func (d *DB) migrate() error {
@@ -537,6 +537,7 @@ func (d *DB) migrateOnce() error {
 		{"agent_apply_error_at_ms", "ALTER TABLE control_nodes ADD COLUMN agent_apply_error_at_ms INTEGER NOT NULL DEFAULT 0"},
 		{"agent_apply_failures", "ALTER TABLE control_nodes ADD COLUMN agent_apply_failures BIGINT NOT NULL DEFAULT 0"},
 		{"agent_listener_error", "ALTER TABLE control_nodes ADD COLUMN agent_listener_error TEXT NOT NULL DEFAULT ''"},
+		{"agent_lease_expires_at_ms", "ALTER TABLE control_nodes ADD COLUMN agent_lease_expires_at_ms INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('control_nodes') WHERE name=?", migration.column).Scan(&found); err != nil {
