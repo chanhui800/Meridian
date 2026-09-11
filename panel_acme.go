@@ -428,6 +428,12 @@ type cloudflareResponse struct {
 	Result json.RawMessage `json:"result"`
 }
 
+const (
+	cloudflareRequestMaxAttempts = 3
+	cloudflareRequestRetryBase   = 250 * time.Millisecond
+	cloudflareRequestBodyLimit   = 1 << 20
+)
+
 // cleanConfiguredTLSPath normalizes valid administrator paths for consistent
 // comparisons. Validation is performed by validateTLSPathConfiguration before
 // the server starts; retaining the cleaned raw value here keeps legacy callers
@@ -1721,34 +1727,118 @@ func waitForTXTRecord(ctx context.Context, name, value string) error {
 	}
 }
 
+func cloudflareRequestRetryableMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		// Retrying POST could create duplicate DNS records when the first
+		// request succeeded but its response was lost.
+		return false
+	}
+}
+
+func cloudflareRequestRetryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
+}
+
+func waitCloudflareRequestRetry(ctx context.Context, attempt int) error {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := cloudflareRequestRetryBase * time.Duration(1<<(attempt-1))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// request retries only idempotent DNS operations. This covers transient
+// Cloudflare/API gateway failures without risking duplicate records from a
+// retried POST. The caller's context remains the overall retry budget.
 func (c *cloudflareClient) request(ctx context.Context, method, requestPath string, body io.Reader) (json.RawMessage, error) {
-	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.apiBase, "/")+requestPath, body)
-	if err != nil {
-		return nil, err
+	if c == nil {
+		return nil, errors.New("Cloudflare DNS client is unavailable")
 	}
-	request.Header.Set("Authorization", "Bearer "+c.token)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("cloudflare DNS request failed: %w", err)
-	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read Cloudflare DNS response: %w", err)
-	}
-	var envelope cloudflareResponse
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return nil, errors.New("cloudflare DNS returned an invalid response")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
-		message := "cloudflare DNS request was rejected"
-		if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
-			message += ": " + strings.TrimSpace(envelope.Errors[0].Message)
+	var bodyBytes []byte
+	if body != nil {
+		data, err := io.ReadAll(io.LimitReader(body, cloudflareRequestBodyLimit+1))
+		if err != nil {
+			return nil, fmt.Errorf("read Cloudflare DNS request: %w", err)
 		}
-		return nil, errors.New(message)
+		if len(data) > cloudflareRequestBodyLimit {
+			return nil, errors.New("Cloudflare DNS request body is too large")
+		}
+		bodyBytes = data
 	}
-	return envelope.Result, nil
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	maxAttempts := 1
+	if cloudflareRequestRetryableMethod(method) {
+		maxAttempts = cloudflareRequestMaxAttempts
+	}
+	endpoint := strings.TrimRight(c.apiBase, "/") + requestPath
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var requestBody io.Reader
+		if bodyBytes != nil {
+			requestBody = bytes.NewReader(bodyBytes)
+		}
+		request, err := http.NewRequestWithContext(ctx, method, endpoint, requestBody)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Authorization", "Bearer "+c.token)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			if attempt < maxAttempts && ctx.Err() == nil {
+				if retryErr := waitCloudflareRequestRetry(ctx, attempt); retryErr == nil {
+					continue
+				}
+			}
+			return nil, fmt.Errorf("cloudflare DNS request failed: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, cloudflareRequestBodyLimit))
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			if attempt < maxAttempts && ctx.Err() == nil {
+				if retryErr := waitCloudflareRequestRetry(ctx, attempt); retryErr == nil {
+					continue
+				}
+			}
+			return nil, fmt.Errorf("read Cloudflare DNS response: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close Cloudflare DNS response: %w", closeErr)
+		}
+		// Gate retries on the HTTP status before decoding the body. Gateways
+		// often return HTML or an empty body for 429/5xx responses, and those
+		// responses are still safely retryable for idempotent operations.
+		if attempt < maxAttempts && cloudflareRequestRetryableStatus(response.StatusCode) && ctx.Err() == nil {
+			if retryErr := waitCloudflareRequestRetry(ctx, attempt); retryErr == nil {
+				continue
+			}
+		}
+		var envelope cloudflareResponse
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return nil, errors.New("cloudflare DNS returned an invalid response")
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
+			message := "cloudflare DNS request was rejected"
+			if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
+				message += ": " + strings.TrimSpace(envelope.Errors[0].Message)
+			}
+			return nil, errors.New(message)
+		}
+		return envelope.Result, nil
+	}
+	return nil, errors.New("cloudflare DNS request failed after retries")
 }
 
 func (c *cloudflareClient) findZone(ctx context.Context, zoneName string) (string, error) {

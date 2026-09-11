@@ -712,8 +712,8 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAgentLive accepts the small, high-frequency traffic sample used by
-// the dashboard. It shares the per-node report admission gate with the full
-// HTTP/WebSocket report paths, but performs no SQLite writes.
+// the dashboard. It has an independent per-node admission gate from the full
+// HTTP/WebSocket report paths, and performs no SQLite writes.
 func (a *App) handleAgentLive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -725,7 +725,7 @@ func (a *App) handleAgentLive(w http.ResponseWriter, r *http.Request) {
 		writeAgentAuthenticationError(a, w, r, authErr)
 		return
 	}
-	release, retryAfter, admitted := a.agentReports().admit(identity.Node.ID, time.Now())
+	release, retryAfter, admitted := a.agentLiveReports().admit(identity.Node.ID, time.Now())
 	if !admitted {
 		seconds := int(retryAfter.Seconds())
 		if retryAfter-time.Duration(seconds)*time.Second > 0 {

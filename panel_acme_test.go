@@ -443,6 +443,52 @@ func TestCloudflareDeleteRecordIsIdempotentWhenRecordIsMissing(t *testing.T) {
 	}
 }
 
+func TestCloudflareRequestRetriesTransientIdempotentOperation(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s, want PUT", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"success":false,"errors":[{"message":"temporary gateway failure"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result":{"id":"record"}}`))
+	}))
+	defer server.Close()
+
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	result, err := client.request(context.Background(), http.MethodPut, "/zones/zone/dns_records/record", strings.NewReader(`{"content":"203.0.113.10"}`))
+	if err != nil {
+		t.Fatalf("transient PUT failed: %v", err)
+	}
+	if string(result) != `{"id":"record"}` || attempts != 2 {
+		t.Fatalf("result=%s attempts=%d, want record and two attempts", result, attempts)
+	}
+}
+
+func TestCloudflareRequestDoesNotRetryCreatePOST(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"message":"temporary gateway failure"}]}`))
+	}))
+	defer server.Close()
+
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	if _, err := client.request(context.Background(), http.MethodPost, "/zones/zone/dns_records", strings.NewReader(`{"type":"TXT"}`)); err == nil {
+		t.Fatal("create POST unexpectedly succeeded")
+	}
+	if attempts != 1 {
+		t.Fatalf("create POST attempts=%d, want one attempt", attempts)
+	}
+}
+
 func TestDNSPropagationResolversIncludeUDPAndTCP(t *testing.T) {
 	t.Setenv("DNS_PROPAGATION_RESOLVERS", "1.1.1.1")
 	resolvers := dnsPropagationResolvers()

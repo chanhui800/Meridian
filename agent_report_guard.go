@@ -298,6 +298,22 @@ func (a *App) agentReports() *nodeReportAdmission {
 	return a.agentReportLimiter
 }
 
+// agentLiveReports has a separate per-node admission budget from the full
+// report path. Live samples are lightweight and in-memory, while full reports
+// may hold the SQLite-backed admission slot for longer. Keeping their slots
+// independent prevents a slow full report from dropping live trend samples.
+func (a *App) agentLiveReports() *nodeReportAdmission {
+	if a == nil {
+		return newNodeReportAdmission()
+	}
+	a.agentLiveReportMu.Lock()
+	defer a.agentLiveReportMu.Unlock()
+	if a.agentLiveLimiter == nil {
+		a.agentLiveLimiter = newNodeReportAdmission()
+	}
+	return a.agentLiveLimiter
+}
+
 func (a *App) agentPreAuthAdmission() *agentPreAuthAdmission {
 	if a == nil {
 		return newAgentPreAuthAdmission()
