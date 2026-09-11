@@ -156,6 +156,11 @@ type ProxyManager struct {
 	dashboardRealtimeLastMS      int64
 	dashboardRealtimeBillingMode string
 	dashboardRealtimeStarted     atomic.Bool
+	// dashboardSnapshot is the last process-wide traffic snapshot captured by
+	// the realtime sampler. SSE clients read this immutable copy instead of
+	// rerunning the full SQLite-backed aggregation for every connection.
+	dashboardSnapshotMu sync.RWMutex
+	dashboardSnapshot   *TrafficSnapshot
 }
 
 // ProxyRuntimeStat is a non-persistent edge snapshot. Node scheduling quotas

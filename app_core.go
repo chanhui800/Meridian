@@ -40,6 +40,7 @@ type App struct {
 	agentLiveLimiter   *nodeReportAdmission
 	agentPreAuthMu     sync.Mutex
 	agentPreAuth       *agentPreAuthAdmission
+	nodeSchedulerMu    sync.Mutex
 }
 
 func (a *App) tmdbService() *tmdbService {

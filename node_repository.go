@@ -27,6 +27,7 @@ var (
 	errNodeNameConflict      = errors.New("node name already exists")
 	errInvalidNodeToken      = errors.New("invalid or expired node token")
 	errInvalidAgentToken     = errors.New("invalid agent token")
+	errStaleAgentSession     = errors.New("stale agent session; fetch a fresh agent configuration")
 	errManualNodeUnavailable = errors.New("manual node is unavailable")
 	errPersistentJWTRequired = errors.New("Agent nodes require a persistent JWT_SECRET")
 )
@@ -80,6 +81,9 @@ type ControlNode struct {
 	lastRawTXBytes        int64
 	lastBootID            string // counter epoch (kernel boot + interface)
 	lastReportSessionID   string
+	activeAgentSessionID  string
+	agentSessionEpoch     int64
+	agentLeaseID          string
 	lastSequence          int64
 	enrollmentTokenHash   string
 	agentTokenHash        string
@@ -127,6 +131,8 @@ type NodeCreateInput struct {
 type NodeReport struct {
 	BootID           string `json:"boot_id"`
 	ReportSessionID  string `json:"report_session_id,omitempty"`
+	SessionEpoch     int64  `json:"session_epoch,omitempty"`
+	AgentLeaseID     string `json:"agent_lease_id,omitempty"`
 	CounterEpoch     string `json:"counter_epoch,omitempty"`
 	SiteCounterEpoch string `json:"site_counter_epoch,omitempty"`
 	Sequence         int64  `json:"sequence"`
@@ -159,6 +165,8 @@ type NodeReport struct {
 // responsible for site state, media, observations, events, and persistence.
 type NodeLiveReport struct {
 	ReportSessionID   string                `json:"report_session_id"`
+	SessionEpoch      int64                 `json:"session_epoch,omitempty"`
+	AgentLeaseID      string                `json:"agent_lease_id,omitempty"`
 	CounterEpoch      string                `json:"counter_epoch,omitempty"`
 	Sequence          int64                 `json:"sequence"`
 	TelemetrySequence int64                 `json:"telemetry_sequence,omitempty"`
@@ -459,7 +467,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 
 const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
-	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
+	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
 	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
 	FROM control_nodes`
@@ -469,7 +477,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var enabled, configDirty int
 	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
-		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID,
+		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
 		&node.ConfigRevision, &node.DesiredConfigRevision, &node.AppliedConfigRevision,
 		&node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
@@ -1029,7 +1037,7 @@ func validateNodeReport(report NodeReport) error {
 	report.ReportSessionID = strings.TrimSpace(report.ReportSessionID)
 	report.CounterEpoch = strings.TrimSpace(report.CounterEpoch)
 	report.InterfaceName = strings.TrimSpace(report.InterfaceName)
-	if report.BootID == "" || len(report.BootID) > 128 || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 || len(report.SiteCounterEpoch) > 128 {
+	if report.BootID == "" || len(report.BootID) > 128 || len(report.ReportSessionID) > 128 || len(report.AgentLeaseID) > 128 || report.SessionEpoch < 0 || len(report.CounterEpoch) > 128 || len(report.SiteCounterEpoch) > 128 {
 		return errors.New("invalid boot_id")
 	}
 	if report.Sequence <= 0 || report.TelemetrySequence < 0 || report.RXBytes < 0 || report.TXBytes < 0 || report.CacheClearGeneration < 0 {
@@ -1533,6 +1541,41 @@ func appendNodeEventIdentity(ids *[]int64, uids *[]string, event NodeRequestEven
 	}
 }
 
+// claimAgentLeaseTx binds a process session to the node before the first
+// report is accepted. A newer session epoch rotates the lease; an older
+// session can no longer overwrite state after a restart or failover.
+func claimAgentLeaseTx(tx *sql.Tx, nodeID int64, sessionID string, sessionEpoch int64) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || sessionEpoch <= 0 {
+		var lease string
+		if err := tx.QueryRow("SELECT agent_lease_id FROM control_nodes WHERE id=?", nodeID).Scan(&lease); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(lease), nil
+	}
+	var activeSession, lease string
+	var activeEpoch int64
+	if err := tx.QueryRow("SELECT active_agent_session_id,agent_session_epoch,agent_lease_id FROM control_nodes WHERE id=?", nodeID).Scan(&activeSession, &activeEpoch, &lease); err != nil {
+		return "", err
+	}
+	activeSession = strings.TrimSpace(activeSession)
+	lease = strings.TrimSpace(lease)
+	if activeSession == sessionID && activeEpoch == sessionEpoch && lease != "" {
+		return lease, nil
+	}
+	if activeSession != "" && sessionEpoch <= activeEpoch {
+		return "", errStaleAgentSession
+	}
+	newLease, err := newNodeToken()
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec("UPDATE control_nodes SET active_agent_session_id=?,agent_session_epoch=?,agent_lease_id=?,updated_at_ms=? WHERE id=?", sessionID, sessionEpoch, newLease, time.Now().UnixMilli(), nodeID); err != nil {
+		return "", err
+	}
+	return newLease, nil
+}
+
 func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now time.Time) (nodeReportCommitResult, error) {
 	result := nodeReportCommitResult{}
 	validEvents := make([]NodeRequestEvent, 0, len(report.Events))
@@ -1559,15 +1602,24 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var id, lastSequence, lastRX, lastTX int64
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID, desiredConfigHash, previousApplyError, previousAgentVersion string
+	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID string
+	var activeSessionEpoch int64
 	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
 	if err != nil {
 		return nodeReportCommitResult{}, err
+	}
+	if activeSessionID != "" && strings.TrimSpace(report.AgentLeaseID) == "" && report.SessionEpoch == 0 {
+		return nodeReportCommitResult{}, errStaleAgentSession
+	}
+	if strings.TrimSpace(report.AgentLeaseID) != "" || report.SessionEpoch > 0 {
+		if strings.TrimSpace(report.AgentLeaseID) == "" || report.SessionEpoch <= 0 || strings.TrimSpace(report.ReportSessionID) != strings.TrimSpace(activeSessionID) || report.SessionEpoch != activeSessionEpoch || strings.TrimSpace(report.AgentLeaseID) != strings.TrimSpace(agentLeaseID) {
+			return nodeReportCommitResult{}, errStaleAgentSession
+		}
 	}
 
 	// Authorization and every report mutation use one transaction. A scheduler

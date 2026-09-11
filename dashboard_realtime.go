@@ -58,8 +58,8 @@ func (pm *ProxyManager) captureDashboardRealtimeSample() {
 	}
 
 	pm.dashboardRealtimeMu.Lock()
-	defer pm.dashboardRealtimeMu.Unlock()
 	if sampledAtMS <= pm.dashboardRealtimeLastMS {
+		pm.dashboardRealtimeMu.Unlock()
 		return
 	}
 	if pm.dashboardRealtimePrev == nil {
@@ -76,6 +76,39 @@ func (pm *ProxyManager) captureDashboardRealtimeSample() {
 	pm.dashboardRealtimePrev = next
 	pm.dashboardRealtimeLastMS = sampledAtMS
 	pm.dashboardRealtimePoints = appendDashboardRealtimePoint(pm.dashboardRealtimePoints, point)
+	latest := cloneDashboardTrendPoint(point)
+	pm.dashboardRealtimeMu.Unlock()
+
+	// Publish one immutable snapshot after the trend point has been appended so
+	// SSE, dashboard and trend consumers observe the same sample sequence.
+	snapshot.RealtimeTrend = &latest
+	pm.dashboardSnapshotMu.Lock()
+	pm.dashboardSnapshot = cloneTrafficSnapshot(snapshot)
+	pm.dashboardSnapshotMu.Unlock()
+}
+
+func cloneTrafficSnapshot(snapshot *TrafficSnapshot) *TrafficSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	cloned := *snapshot
+	if snapshot.LiveSites != nil {
+		cloned.LiveSites = append([]SiteTraffic(nil), snapshot.LiveSites...)
+	}
+	if snapshot.RealtimeTrend != nil {
+		trend := cloneDashboardTrendPoint(*snapshot.RealtimeTrend)
+		cloned.RealtimeTrend = &trend
+	}
+	return &cloned
+}
+
+func (pm *ProxyManager) latestDashboardSnapshot() *TrafficSnapshot {
+	if pm == nil {
+		return nil
+	}
+	pm.dashboardSnapshotMu.RLock()
+	defer pm.dashboardSnapshotMu.RUnlock()
+	return cloneTrafficSnapshot(pm.dashboardSnapshot)
 }
 
 func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[int64]dashboardRealtimeCounter, sampledAtMS int64) (dashboardTrendPoint, map[int64]dashboardRealtimeCounter) {

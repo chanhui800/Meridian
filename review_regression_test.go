@@ -106,6 +106,21 @@ func TestReviewCacheMultiValueHeaders(t *testing.T) {
 	}
 }
 
+func TestOwnedAddressRecordAdoptionRequiresUniqueMeridianMarker(t *testing.T) {
+	records := []cloudflareAddressRecord{{ID: "r1", Type: "A", Name: "site.example", Content: "203.0.113.7", Comment: "Meridian site=7"}}
+	owned, ok, ambiguous := ownedAddressRecord(records, "A", "site.example", "203.0.113.7", "Meridian site=7")
+	if !ok || ambiguous || owned.ID != "r1" {
+		t.Fatalf("owned record match = %#v, ok=%v ambiguous=%v", owned, ok, ambiguous)
+	}
+	records = append(records, records[0])
+	if _, ok, ambiguous = ownedAddressRecord(records, "A", "site.example", "203.0.113.7", "Meridian site=7"); ok || !ambiguous {
+		t.Fatalf("duplicate marker was not treated as ambiguous: ok=%v ambiguous=%v", ok, ambiguous)
+	}
+	if _, ok, _ = ownedAddressRecord([]cloudflareAddressRecord{{ID: "operator", Type: "A", Name: "site.example", Content: "203.0.113.7", Comment: ""}}, "A", "site.example", "203.0.113.7", "Meridian site=7"); ok {
+		t.Fatal("unmarked operator record was adopted")
+	}
+}
+
 func TestReviewCacheSiteIdentityAcrossRebuild(t *testing.T) {
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

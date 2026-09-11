@@ -57,7 +57,28 @@ func configuredAgentBinaryPath() string {
 const (
 	agentPlatformHeader = "X-Meridian-Agent-Platform"
 	agentVersionHeader  = "X-Meridian-Agent-Version"
+	agentSessionHeader  = "X-Meridian-Agent-Session"
+	agentEpochHeader    = "X-Meridian-Agent-Session-Epoch"
 )
+
+func requestedAgentSession(r *http.Request) (agentSessionRequest, error) {
+	if r == nil {
+		return agentSessionRequest{}, nil
+	}
+	id := strings.TrimSpace(r.Header.Get(agentSessionHeader))
+	epochText := strings.TrimSpace(r.Header.Get(agentEpochHeader))
+	if id == "" && epochText == "" {
+		return agentSessionRequest{}, nil
+	}
+	if id == "" || len(id) > 128 {
+		return agentSessionRequest{}, errors.New("invalid agent session")
+	}
+	epoch, err := strconv.ParseInt(epochText, 10, 64)
+	if err != nil || epoch <= 0 {
+		return agentSessionRequest{}, errors.New("invalid agent session epoch")
+	}
+	return agentSessionRequest{ID: id, Epoch: epoch}, nil
+}
 
 func normalizeAgentPlatform(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -693,6 +714,11 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		writeAgentAuthFailure(a, w, r)
 		return
 	}
+	if errors.Is(err, errStaleAgentSession) {
+		w.Header().Set("X-Meridian-Agent-State", "stale")
+		a.jsonErr(w, http.StatusConflict, "stale agent session; retry configuration fetch")
+		return
+	}
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -752,6 +778,11 @@ func (a *App) handleAgentLive(w http.ResponseWriter, r *http.Request) {
 	accepted, discarded, err := a.db.recordNodeLiveReport(identity.Node.ID, report, now)
 	if errors.Is(err, errInvalidAgentToken) {
 		writeAgentAuthFailure(a, w, r)
+		return
+	}
+	if errors.Is(err, errStaleAgentSession) {
+		w.Header().Set("X-Meridian-Agent-State", "stale")
+		a.jsonErr(w, http.StatusConflict, "stale agent session; retry configuration fetch")
 		return
 	}
 	if err != nil {
@@ -848,6 +879,10 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		result, err := a.db.RecordNodeReportResult(token, report, time.Now())
 		release()
 		if err != nil {
+			if errors.Is(err, errStaleAgentSession) {
+				_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				_ = websocket.JSON.Send(ws, map[string]interface{}{"accepted": false, "agent_state": "stale", "error": "stale agent session; retry configuration fetch"})
+			}
 			return
 		}
 		ack := map[string]interface{}{

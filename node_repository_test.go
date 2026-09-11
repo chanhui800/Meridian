@@ -1814,3 +1814,50 @@ func TestNormalizeControllerURLRejectsBasePaths(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentSessionLeaseRejectsStaleReports(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "lease-node", Address: "203.0.113.210"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := app.buildAgentConfigForRequest(context.Background(), token, now, "", "", agentSessionRequest{ID: "session-a", Epoch: 100})
+	if err != nil {
+		t.Fatalf("claim first session: %v", err)
+	}
+	if first.AgentLeaseID == "" {
+		t.Fatal("first config did not issue an Agent lease")
+	}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "session-a", ReportSessionID: "session-a", SessionEpoch: 100, AgentLeaseID: first.AgentLeaseID, CounterEpoch: "kernel-a", Sequence: 1, InterfaceName: "eth0", RXBytes: 100, TXBytes: 200, AgentVersion: "test"}, now.Add(time.Second)); err != nil {
+		t.Fatalf("first session report: %v", err)
+	}
+	second, err := app.buildAgentConfigForRequest(context.Background(), token, now.Add(2*time.Second), "", "", agentSessionRequest{ID: "session-b", Epoch: 200})
+	if err != nil {
+		t.Fatalf("claim second session: %v", err)
+	}
+	if second.AgentLeaseID == first.AgentLeaseID {
+		t.Fatal("new session reused the previous Agent lease")
+	}
+	before, err := app.db.controlNodeByID(node.ID, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "session-a", ReportSessionID: "session-a", SessionEpoch: 100, AgentLeaseID: first.AgentLeaseID, CounterEpoch: "kernel-a", Sequence: 2, InterfaceName: "eth0", RXBytes: 999999, TXBytes: 999999, AgentVersion: "stale"}, now.Add(3*time.Second)); !errors.Is(err, errStaleAgentSession) {
+		t.Fatalf("stale report error=%v, want errStaleAgentSession", err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LastSeenAtMS != before.LastSeenAtMS || after.lastRawRXBytes != before.lastRawRXBytes || after.lastRawTXBytes != before.lastRawTXBytes {
+		t.Fatalf("stale report changed node state: before=%#v after=%#v", before, after)
+	}
+	if _, err := app.db.RecordNodeReport(token, NodeReport{BootID: "session-b", ReportSessionID: "session-b", SessionEpoch: 200, AgentLeaseID: second.AgentLeaseID, CounterEpoch: "kernel-b", Sequence: 1, InterfaceName: "eth0", RXBytes: 300, TXBytes: 400, AgentVersion: "current"}, now.Add(4*time.Second)); err != nil {
+		t.Fatalf("current session report: %v", err)
+	}
+}

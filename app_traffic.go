@@ -204,9 +204,17 @@ func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
-	snap, err := a.pm.TrafficSnapshot()
-	if err != nil {
-		return err
+	// The process-wide sampler owns the SQLite-backed aggregation. Reuse its
+	// immutable snapshot for every SSE client so opening more dashboards does
+	// not multiply database work. Keep a fallback for startup and lightweight
+	// embedders whose sampler has not started yet.
+	snap := a.pm.latestDashboardSnapshot()
+	if snap == nil {
+		var err error
+		snap, err = a.pm.TrafficSnapshot()
+		if err != nil {
+			return err
+		}
 	}
 	snap.PanelDomain = a.panelHost
 	snap.PanelAccessURL = a.panelAccessURL()
