@@ -76,6 +76,10 @@ type edgeSiteTrafficCounter struct {
 	cumulativeOut  atomic.Int64
 	requests       atomic.Int64
 	pendingRequest atomic.Int64
+	// flushGeneration advances after a successful persistence transaction. A
+	// dashboard trend snapshot uses it to detect a flush that raced its SQLite
+	// history read and retries without double-counting the same bytes.
+	flushGeneration atomic.Uint64
 	// activeRequests tracks handlers admitted to this site generation. It is
 	// deliberately separate from pendingRequest, which counts traffic waiting
 	// for persistence and may remain non-zero after a request has completed.
@@ -123,6 +127,13 @@ func (inst *ProxyInstance) trafficPendingRequests() *atomic.Int64 {
 		return &inst.trafficCounter.pendingRequest
 	}
 	return &inst.pendingRequests
+}
+
+func (inst *ProxyInstance) trafficFlushGeneration() *atomic.Uint64 {
+	if inst != nil && inst.trafficCounter != nil {
+		return &inst.trafficCounter.flushGeneration
+	}
+	return nil
 }
 
 type ProxyManager struct {

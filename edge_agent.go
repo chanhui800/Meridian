@@ -47,9 +47,10 @@ const (
 var errEdgeAgentUpdated = errors.New("Agent binary updated; restarting")
 
 type edgeAgentState struct {
-	NodeGUID string `json:"node_guid"`
-	Token    string `json:"agent_token"`
-	LeaseID  string `json:"agent_lease_id,omitempty"`
+	NodeGUID     string `json:"node_guid"`
+	Token        string `json:"agent_token"`
+	LeaseID      string `json:"agent_lease_id,omitempty"`
+	SessionEpoch int64  `json:"session_epoch,omitempty"`
 }
 
 type edgeSiteIdentity struct {
@@ -511,6 +512,7 @@ type edgeAgentRuntime struct {
 	nodeGUID             string
 	sessionEpoch         int64
 	leaseID              string
+	quiesced             atomic.Bool
 	port                 int
 	handler              http.Handler
 	certificate          *tls.Certificate
@@ -1842,6 +1844,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	runtime.listenerError = ""
 	runtime.mu.Unlock()
+	runtime.quiesced.Store(false)
 	if len(config.ForceStopSiteIDs) > 0 {
 		forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		runtime.forceStopCentralSites(forceCtx, config.ForceStopSiteIDs, oldState.bundle)
@@ -1931,6 +1934,7 @@ func (runtime *edgeAgentRuntime) nextTelemetrySequence() int64 {
 }
 
 func (runtime *edgeAgentRuntime) close() {
+	runtime.quiesced.Store(true)
 	runtime.stopServer()
 	runtime.mu.Lock()
 	bundle := runtime.bundle
@@ -1942,7 +1946,22 @@ func (runtime *edgeAgentRuntime) close() {
 	if cancel != nil {
 		cancel()
 	}
-	bundle.close()
+	if bundle != nil {
+		bundle.close()
+	}
+}
+
+func (runtime *edgeAgentRuntime) setSessionEpoch(epoch int64) {
+	if runtime == nil || epoch <= 0 {
+		return
+	}
+	runtime.mu.Lock()
+	runtime.sessionEpoch = epoch
+	runtime.mu.Unlock()
+}
+
+func (runtime *edgeAgentRuntime) isQuiesced() bool {
+	return runtime == nil || runtime.quiesced.Load()
 }
 
 func edgeNormalizeController(value string) (string, error) {
@@ -2038,6 +2057,33 @@ func edgeQuiesceRevoked(ctx context.Context, runtime *edgeAgentRuntime, marker s
 		return nil
 	}
 	return nil
+}
+
+func nextEdgeSessionEpoch(saved int64) (int64, error) {
+	now := time.Now().UnixNano()
+	if now <= 0 {
+		now = 1
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if saved > 0 && saved >= now {
+		if saved == maxInt64 {
+			return 0, errors.New("Agent session epoch exhausted")
+		}
+		return saved + 1, nil
+	}
+	return now, nil
+}
+
+// edgeQuiesceStale removes the data-plane ownership of a session that lost its
+// Controller lease. A stale process must not keep serving old routes or spin on
+// immediate config/report retries. The caller can resume probing after the
+// bounded recovery delay once it has advanced the persisted session epoch.
+func edgeQuiesceStale(runtime *edgeAgentRuntime) {
+	if runtime == nil {
+		return
+	}
+	runtime.close()
+	runtime.setLeaseID("")
 }
 
 func edgeEnrollmentTokenAvailable(path string) bool {
@@ -2337,20 +2383,24 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
 }
 
-func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, sessionEpoch int64, runtime *edgeAgentRuntime) error {
+func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, _ int64, runtime *edgeAgentRuntime) error {
 	if runtime == nil {
 		return nil
 	}
 	sequence := int64(0)
 	send := func() error {
+		if runtime.isQuiesced() {
+			return nil
+		}
 		sequence++
 		var stats []NodeLiveSiteTraffic
 		telemetrySequence, sampledAtMS := runtime.sampleTelemetry(func() {
 			stats = runtime.liveSiteTrafficSnapshot()
 		})
+		_, currentEpoch := runtime.reportIdentity()
 		report := NodeLiveReport{
 			ReportSessionID:   sessionID,
-			SessionEpoch:      sessionEpoch,
+			SessionEpoch:      currentEpoch,
 			CounterEpoch:      edgeCounterEpoch(edgeDefaultInterface()),
 			Sequence:          sequence,
 			TelemetrySequence: telemetrySequence,
@@ -2363,7 +2413,7 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 	}
 	// Send one sample immediately so a freshly applied route does not wait for
 	// the first ticker boundary.
-	if err := send(); err != nil && isEdgeAgentRevoked(err) {
+	if err := send(); err != nil && (isEdgeAgentRevoked(err) || isEdgeAgentStale(err)) {
 		return err
 	}
 	ticker := time.NewTicker(agentLiveReportInterval)
@@ -2375,7 +2425,7 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 			return nil
 		case <-ticker.C:
 			if err := send(); err != nil {
-				if isEdgeAgentRevoked(err) {
+				if isEdgeAgentRevoked(err) || isEdgeAgentStale(err) {
 					return err
 				}
 				if lastLog.IsZero() || time.Since(lastLog) >= 30*time.Second {
@@ -2572,6 +2622,11 @@ func runEdgeAgent() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	client := &http.Client{Timeout: 2 * time.Minute, Transport: edgeHTTPTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	instanceUnlock, err := acquireAgentInstanceLock(*statePath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer instanceUnlock()
 	revokedMarker := *statePath + ".revoked"
 	if _, statErr := os.Stat(revokedMarker); statErr == nil {
 		if !edgeEnrollmentTokenAvailable(*tokenFile) {
@@ -2605,9 +2660,13 @@ func runEdgeAgent() error {
 			return err
 		}
 	}
-	sessionEpoch := time.Now().UnixNano()
-	if sessionEpoch <= 0 {
-		sessionEpoch = 1
+	sessionEpoch, err := nextEdgeSessionEpoch(state.SessionEpoch)
+	if err != nil {
+		return err
+	}
+	state.SessionEpoch = sessionEpoch
+	if err := edgeSaveState(*statePath, state); err != nil {
+		return fmt.Errorf("persist Agent session epoch: %w", err)
 	}
 	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID, sessionEpoch: sessionEpoch, leaseID: state.LeaseID}
 	spoolDir := filepath.Join(runtime.stateDir, "events")
@@ -2664,20 +2723,65 @@ func runEdgeAgent() error {
 	const agentUpdateRetryInterval = 5 * time.Minute
 	const agentApplyRetryBase = 5 * time.Second
 	const agentApplyRetryMax = 60 * time.Second
+	const agentStaleRecoveryBase = 30 * time.Second
+	const agentStaleRecoveryMax = 5 * time.Minute
 	lastConfigAt := time.Time{}
 	lastUpdateAttempt := time.Time{}
 	nextApplyAttempt := time.Time{}
 	applyFailures := 0
 	var pendingConfig *AgentRuntimeConfig
+	staleRecoveryAt := time.Time{}
+	staleRecoveryDelay := agentStaleRecoveryBase
+	handleStale := func() {
+		edgeQuiesceStale(runtime)
+		pendingConfig = nil
+		applyFailures = 0
+		nextApplyAttempt = time.Time{}
+		state.LeaseID = ""
+		nextEpoch, epochErr := nextEdgeSessionEpoch(state.SessionEpoch)
+		if epochErr == nil {
+			state.SessionEpoch = nextEpoch
+			sessionEpoch = nextEpoch
+			runtime.setSessionEpoch(nextEpoch)
+			if saveErr := edgeSaveState(*statePath, state); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "Meridian Agent stale-session state save failed: %v\n", saveErr)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "Meridian Agent stale-session epoch advance failed: %v\n", epochErr)
+		}
+		lastConfigAt = time.Now()
+		staleRecoveryAt = time.Now().Add(staleRecoveryDelay)
+		staleRecoveryDelay *= 2
+		if staleRecoveryDelay > agentStaleRecoveryMax {
+			staleRecoveryDelay = agentStaleRecoveryMax
+		}
+	}
 	for {
 		select {
 		case liveErr := <-liveErrCh:
 			if isEdgeAgentRevoked(liveErr) {
 				return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 			}
+			if isEdgeAgentStale(liveErr) {
+				handleStale()
+			}
 		default:
 		}
 		now := time.Now()
+		if !staleRecoveryAt.IsZero() {
+			if now.Before(staleRecoveryAt) {
+				timer := time.NewTimer(time.Until(staleRecoveryAt))
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				case <-timer.C:
+				}
+				continue
+			}
+			staleRecoveryAt = time.Time{}
+			lastConfigAt = time.Time{}
+		}
 		if lastConfigAt.IsZero() || now.Sub(lastConfigAt) >= configRefreshInterval {
 			// Record the attempt even when the Controller is temporarily
 			// unavailable, otherwise a network outage would create a tight fetch
@@ -2694,7 +2798,8 @@ func runEdgeAgent() error {
 					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 				}
 				if isEdgeAgentStale(err) {
-					lastConfigAt = time.Time{}
+					handleStale()
+					continue
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
@@ -2710,7 +2815,7 @@ func runEdgeAgent() error {
 				// the still-serving configuration. Hash-stable refreshes are the
 				// only path allowed to mutate the live baseline in place.
 				appliedHash, appliedRevision, _, _, _, _ := runtime.status()
-				if agentConfigIdentityEqual(config, AgentRuntimeConfig{ConfigHash: appliedHash, ConfigRevision: appliedRevision}) {
+				if !runtime.isQuiesced() && agentConfigIdentityEqual(config, AgentRuntimeConfig{ConfigHash: appliedHash, ConfigRevision: appliedRevision}) {
 					runtime.syncSiteTrafficLimits(config)
 				}
 				// Refresh the pending payload when the Controller sends a newer
@@ -2740,7 +2845,7 @@ func runEdgeAgent() error {
 		}
 		if pendingConfig != nil && (nextApplyAttempt.IsZero() || !now.Before(nextApplyAttempt)) {
 			applied, appliedRevision, _, _, _, _ := runtime.status()
-			if agentConfigIdentityEqual(*pendingConfig, AgentRuntimeConfig{ConfigHash: applied, ConfigRevision: appliedRevision}) {
+			if !runtime.isQuiesced() && agentConfigIdentityEqual(*pendingConfig, AgentRuntimeConfig{ConfigHash: applied, ConfigRevision: appliedRevision}) {
 				pendingConfig = nil
 				applyFailures = 0
 				nextApplyAttempt = time.Time{}
@@ -2760,7 +2865,11 @@ func runEdgeAgent() error {
 				pendingConfig = nil
 				applyFailures = 0
 				nextApplyAttempt = time.Time{}
+				staleRecoveryDelay = agentStaleRecoveryBase
 			}
+		}
+		if runtime.isQuiesced() {
+			continue
 		}
 		refreshImmediately := false
 		sequence++
@@ -2786,8 +2895,8 @@ func runEdgeAgent() error {
 					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 				}
 				if isEdgeAgentStale(wsErr) {
-					lastConfigAt = time.Time{}
-					refreshImmediately = true
+					handleStale()
+					continue
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", wsErr)
 			} else {

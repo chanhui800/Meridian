@@ -197,7 +197,7 @@ func dashboardTrendWindowWithLocation(name string, now, customStart, customEnd t
 }
 
 func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboardPendingTraffic {
-	result, _, unlock := pm.lockLocalDashboardTrendSnapshot(siteID, time.Now())
+	result, _, _, unlock := pm.lockLocalDashboardTrendSnapshot(siteID, time.Now())
 	unlock()
 	return result
 }
@@ -207,11 +207,12 @@ func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboa
 // function is retained for source compatibility with older callers, but is a
 // no-op. In particular, callers must be able to perform SQLite history reads
 // without holding all local traffic locks.
-func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt time.Time) (map[int64]dashboardPendingTraffic, map[int64]dashboardTrendBaseline, func()) {
+func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt time.Time) (map[int64]dashboardPendingTraffic, map[int64]dashboardTrendBaseline, map[int64]uint64, func()) {
 	pendingResult := make(map[int64]dashboardPendingTraffic)
 	baselineResult := make(map[int64]dashboardTrendBaseline)
+	generationResult := make(map[int64]uint64)
 	if pm == nil {
-		return pendingResult, baselineResult, func() {}
+		return pendingResult, baselineResult, generationResult, func() {}
 	}
 	pm.mu.RLock()
 	ids := make([]int64, 0, len(pm.proxies))
@@ -249,10 +250,45 @@ func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt
 			BytesIn: baselineIn, BytesOut: baselineOut, Requests: baselineRequests,
 			SampledAtMS: sampledAt.UnixMilli(),
 		}
+		if generation := inst.trafficFlushGeneration(); generation != nil {
+			generationResult[id] = generation.Load()
+		}
 		inst.trafficMu.Unlock()
 	}
 	pm.mu.RUnlock()
-	return pendingResult, baselineResult, func() {}
+	return pendingResult, baselineResult, generationResult, func() {}
+}
+
+// dashboardTrendGenerationsMatch reports whether every local instance still
+// has the same flush generation captured before the SQLite history read. A
+// successful flush advances that generation after its transaction commits;
+// retrying when it changes prevents a snapshot from adding both the persisted
+// row and the pre-flush pending counters.
+func (pm *ProxyManager) dashboardTrendGenerationsMatch(siteID *int64, expected map[int64]uint64) bool {
+	if pm == nil {
+		return true
+	}
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for id, generation := range expected {
+		if siteID != nil && *siteID != id {
+			continue
+		}
+		inst, ok := pm.proxies[id]
+		if !ok || inst == nil {
+			return false
+		}
+		inst.trafficMu.Lock()
+		current := uint64(0)
+		if value := inst.trafficFlushGeneration(); value != nil {
+			current = value.Load()
+		}
+		inst.trafficMu.Unlock()
+		if current != generation {
+			return false
+		}
+	}
+	return true
 }
 
 // localDashboardTrendBaselines returns the controller-local cumulative
@@ -261,7 +297,7 @@ func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt
 // baselines are derived by subtracting the unflushed counters from the
 // process-stable cumulative counters.
 func (pm *ProxyManager) localDashboardTrendBaselines(siteID *int64, sampledAt time.Time) map[int64]dashboardTrendBaseline {
-	_, baselines, unlock := pm.lockLocalDashboardTrendSnapshot(siteID, sampledAt)
+	_, baselines, _, unlock := pm.lockLocalDashboardTrendSnapshot(siteID, sampledAt)
 	unlock()
 	return baselines
 }
@@ -374,11 +410,20 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 	if cached := pm.dashboardTrendCached(cacheKey, now); cached != nil {
 		return cached, nil
 	}
-	pendingBySite, localBaselines, unlockLocal := pm.lockLocalDashboardTrendSnapshot(siteID, now)
-	defer unlockLocal()
-	logs, liveBaselines, err := pm.database.GetTrafficTrendLogsGroupedSnapshot(siteID, start, end, bucket)
-	if err != nil {
-		return nil, err
+	var pendingBySite map[int64]dashboardPendingTraffic
+	var localBaselines map[int64]dashboardTrendBaseline
+	var logs []TrafficLog
+	var liveBaselines map[int64]dashboardTrendBaseline
+	var generations map[int64]uint64
+	for attempt := 0; attempt < 3; attempt++ {
+		pendingBySite, localBaselines, generations, _ = pm.lockLocalDashboardTrendSnapshot(siteID, now)
+		logs, liveBaselines, err = pm.database.GetTrafficTrendLogsGroupedSnapshot(siteID, start, end, bucket)
+		if err != nil {
+			return nil, err
+		}
+		if attempt == 2 || pm.dashboardTrendGenerationsMatch(siteID, generations) {
+			break
+		}
 	}
 	sites, err := pm.database.ListSites()
 	if err != nil {

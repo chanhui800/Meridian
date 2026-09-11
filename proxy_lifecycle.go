@@ -190,6 +190,9 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	if !inst.trafficCycleAuthoritative && inst.trafficCycleMode == cycleMode && inst.trafficCycleStart.Equal(cycleStart) {
 		inst.trafficCycleUsage += trafficBillableBytes(cycleMode, in, out)
 	}
+	if generation := inst.trafficFlushGeneration(); generation != nil {
+		generation.Add(1)
+	}
 	return nil
 }
 

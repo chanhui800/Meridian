@@ -832,6 +832,7 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_hash='',
 			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
+			schedule_revision=schedule_revision+1,
 			updated_at_ms=?
 			WHERE desired_node_id=?`, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 			return ControlNode{}, err
@@ -900,7 +901,7 @@ func (d *DB) DeleteControlNode(id int64) error {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,applied_node_id=NULL,
-		dns_status='disabled',last_error='' WHERE fixed_node_id=? OR desired_node_id=? OR applied_node_id=?`, id, id, id); err != nil {
+		dns_status='disabled',last_error='',schedule_revision=schedule_revision+1 WHERE fixed_node_id=? OR desired_node_id=? OR applied_node_id=?`, id, id, id); err != nil {
 		return err
 	}
 	result, err := tx.Exec("DELETE FROM control_nodes WHERE id=?", id)
@@ -1741,6 +1742,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if desiredHash != "" && appliedHash != desiredHash {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_pending_since_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE config_pending_since_ms END,
+			schedule_revision=CASE WHEN config_pending_since_ms=0 THEN schedule_revision+1 ELSE schedule_revision END,
 			updated_at_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE updated_at_ms END
 			WHERE enabled=1 AND desired_node_id=? AND config_hash=?`, now.UnixMilli(), now.UnixMilli(), id, desiredHash); err != nil {
 			return nodeReportCommitResult{}, err
