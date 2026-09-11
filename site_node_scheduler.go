@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,88 @@ const (
 	legacyForceStopGrace = 10 * time.Minute
 	nodeSchedulerWorkers = 4
 )
+
+type nodeSchedulerJob struct {
+	value   SiteNodeSchedule
+	cleanup bool
+	now     time.Time
+}
+
+// nodeSchedulerQueue keeps remote probes/DNS operations out of the 15-second
+// scheduler tick. Each site has at most one in-flight job; a slow site cannot
+// hold up discovery and enqueueing for every other site.
+type nodeSchedulerQueue struct {
+	jobs     chan nodeSchedulerJob
+	mu       sync.Mutex
+	inFlight map[int64]struct{}
+}
+
+func (a *App) ensureNodeSchedulerQueue(ctx context.Context) *nodeSchedulerQueue {
+	if a == nil {
+		return nil
+	}
+	a.nodeSchedulerQueueMu.Lock()
+	defer a.nodeSchedulerQueueMu.Unlock()
+	if a.nodeSchedulerQueue != nil {
+		return a.nodeSchedulerQueue
+	}
+	queue := &nodeSchedulerQueue{
+		jobs:     make(chan nodeSchedulerJob, 256),
+		inFlight: make(map[int64]struct{}),
+	}
+	a.nodeSchedulerQueue = queue
+	for i := 0; i < nodeSchedulerWorkers; i++ {
+		go a.runNodeSchedulerWorker(ctx, queue)
+	}
+	return queue
+}
+
+func (a *App) runNodeSchedulerWorker(ctx context.Context, queue *nodeSchedulerQueue) {
+	if a == nil || queue == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-queue.jobs:
+			workCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			var err error
+			if job.cleanup {
+				err = a.deleteTrackedSiteDNS(workCtx, job.value)
+			} else {
+				err = a.reconcileOneSiteSchedule(workCtx, job.value, job.now)
+			}
+			cancel()
+			a.processNodeSchedulerOutcome(job, err)
+			queue.mu.Lock()
+			delete(queue.inFlight, job.value.SiteID)
+			queue.mu.Unlock()
+		}
+	}
+}
+
+func (a *App) enqueueNodeSchedulerJob(queue *nodeSchedulerQueue, job nodeSchedulerJob) bool {
+	if queue == nil || job.value.SiteID <= 0 {
+		return false
+	}
+	queue.mu.Lock()
+	if _, exists := queue.inFlight[job.value.SiteID]; exists {
+		queue.mu.Unlock()
+		return false
+	}
+	queue.inFlight[job.value.SiteID] = struct{}{}
+	queue.mu.Unlock()
+	select {
+	case queue.jobs <- job:
+		return true
+	default:
+		queue.mu.Lock()
+		delete(queue.inFlight, job.value.SiteID)
+		queue.mu.Unlock()
+		return false
+	}
+}
 
 type SiteNodeSchedule struct {
 	SiteID               int64  `json:"site_id"`
@@ -483,6 +566,19 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	if len(updates) == 0 {
 		return nil
 	}
+	// Hold each affected site's lock while publishing the assignment snapshot.
+	// Acquire in stable order so a multi-site refresh cannot deadlock with
+	// another caller that is updating a different subset of sites.
+	sort.Slice(updates, func(i, j int) bool { return updates[i].siteID < updates[j].siteID })
+	unlockSites := make([]func(), 0, len(updates))
+	for _, update := range updates {
+		unlockSites = append(unlockSites, a.lockSiteSchedule(update.siteID))
+	}
+	defer func() {
+		for i := len(unlockSites) - 1; i >= 0; i-- {
+			unlockSites[i]()
+		}
+	}()
 	tx, err := a.db.db.Begin()
 	if err != nil {
 		return err
@@ -1056,8 +1152,8 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	if _, err := tx.Exec(`UPDATE site_node_schedules SET
 		config_pending_since_ms=CASE WHEN config_hash<>? THEN ? ELSE config_pending_since_ms END,
-		config_hash=?,schedule_revision=CASE WHEN config_hash<>? THEN schedule_revision+1 ELSE schedule_revision END,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?`,
-		config.ConfigHash, now.UnixMilli(), config.ConfigHash, config.ConfigHash, now.UnixMilli(), node.ID); err != nil {
+		config_hash=?,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?`,
+		config.ConfigHash, now.UnixMilli(), config.ConfigHash, now.UnixMilli(), node.ID); err != nil {
 		return AgentRuntimeConfig{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1187,6 +1283,10 @@ func (a *App) handleSiteNodeScheduleByID(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
+	// Serialize the complete local mutation and any Cloudflare cleanup with a
+	// scheduler worker operating on this site.
+	unlockSite := a.lockSiteSchedule(id)
+	defer unlockSite()
 	value, err := a.db.SaveSiteNodeSchedule(id, input.Enabled, input.Mode, input.FixedNodeID, time.Now())
 	if err != nil {
 		writeNodeAPIError(a, w, err)
@@ -1202,12 +1302,12 @@ func (a *App) handleSiteNodeScheduleByID(w http.ResponseWriter, r *http.Request)
 			writeNodeAPIError(a, w, currentErr)
 			return
 		}
-		if err := a.deleteTrackedSiteDNS(r.Context(), current); err != nil {
+		if err := a.deleteTrackedSiteDNSLocked(r.Context(), current); err != nil {
 			// Keep the schedule disabled while the remote cleanup is retried by
 			// the scheduler. Re-enabling it here can recreate DNS on the next
 			// tick and is especially surprising when Cloudflare already removed
 			// the record (or is temporarily unavailable).
-			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), id)
+			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=0 AND schedule_revision=?`, err.Error(), time.Now().UnixMilli(), id, current.ScheduleRevision)
 			a.jsonErr(w, http.StatusBadGateway, "DNS cleanup failed: "+err.Error())
 			return
 		}
@@ -1316,6 +1416,12 @@ func classifyOwnedAddressRecords(records []cloudflareAddressRecord, name, marker
 }
 
 func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedule) error {
+	unlockSite := a.lockSiteSchedule(schedule.SiteID)
+	defer unlockSite()
+	return a.deleteTrackedSiteDNSLocked(ctx, schedule)
+}
+
+func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeSchedule) error {
 	if schedule.cfRecordID != "" {
 		cf, err := a.cloudflareForScheduling()
 		if err != nil {
@@ -1362,6 +1468,23 @@ func (a *App) finalizeDisabledSiteNodeRuntime(schedule SiteNodeSchedule, now tim
 	if err != nil {
 		return err
 	}
+	// Claim this exact disabled generation before publishing ForceStop
+	// revocations or dirtying Agent configs. A zero-row CAS means an
+	// administrator or newer scheduler generation already changed the site;
+	// stale cleanup must become a no-op.
+	result, err := tx.Exec(`UPDATE site_node_schedules SET desired_node_id=NULL,applied_node_id=NULL,
+		cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',dns_status='disabled',
+		last_error='',config_hash='',config_pending_since_ms=0,schedule_revision=schedule_revision+1,updated_at_ms=? WHERE site_id=? AND enabled=1 AND schedule_revision=? AND EXISTS (SELECT 1 FROM sites WHERE sites.id=site_node_schedules.site_id AND sites.enabled=0)`, now.UnixMilli(), schedule.SiteID, schedule.ScheduleRevision)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return nil
+	}
 	for _, nodeID := range ids {
 		if nodeID <= 0 {
 			continue
@@ -1372,11 +1495,6 @@ func (a *App) finalizeDisabledSiteNodeRuntime(schedule SiteNodeSchedule, now tim
 		}
 	}
 	if err := markAgentConfigsDirtyForNodeIDsTx(tx, ids...); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE site_node_schedules SET desired_node_id=NULL,applied_node_id=NULL,
-		cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',dns_status='disabled',
-		last_error='',config_hash='',config_pending_since_ms=0,schedule_revision=schedule_revision+1,updated_at_ms=? WHERE site_id=? AND enabled=1 AND schedule_revision=? AND EXISTS (SELECT 1 FROM sites WHERE sites.id=site_node_schedules.site_id AND sites.enabled=0)`, now.UnixMilli(), schedule.SiteID, schedule.ScheduleRevision); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1399,6 +1517,22 @@ func (a *App) finalizeDisabledSiteNodeSchedule(schedule SiteNodeSchedule) error 
 	if err != nil {
 		return err
 	}
+	// Claim the disabled generation before creating revocations. If it has
+	// already advanced, this stale cleanup must not affect the replacement
+	// schedule.
+	result, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
+		applied_node_id=NULL,cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',
+		dns_status='disabled',last_error='',config_pending_since_ms=0,schedule_revision=schedule_revision+1,updated_at_ms=? WHERE site_id=? AND enabled=0 AND schedule_revision=?`, time.Now().UnixMilli(), schedule.SiteID, schedule.ScheduleRevision)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return nil
+	}
 	for _, nodeID := range ids {
 		if nodeID <= 0 {
 			continue
@@ -1409,15 +1543,6 @@ func (a *App) finalizeDisabledSiteNodeSchedule(schedule SiteNodeSchedule) error 
 		}
 	}
 	if err := markAgentConfigsDirtyForNodeIDsTx(tx, ids...); err != nil {
-		return err
-	}
-	result, err := tx.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
-		applied_node_id=NULL,cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',
-		dns_status='disabled',last_error='',config_pending_since_ms=0,schedule_revision=schedule_revision+1,updated_at_ms=? WHERE site_id=? AND enabled=0 AND schedule_revision=?`, time.Now().UnixMilli(), schedule.SiteID, schedule.ScheduleRevision)
-	if err != nil {
-		return err
-	}
-	if _, err := result.RowsAffected(); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1457,6 +1582,53 @@ func deleteDNSRecordBestEffort(ctx context.Context, cf *cloudflareClient, zoneID
 		return err
 	}
 	return nil
+}
+
+// restoreDNSRecordBestEffort compensates an existing-record PUT when the
+// local schedule CAS fails. The scheduler serializes normal writers per site,
+// but the read-before-restore guard also avoids overwriting an unrelated
+// operator change made while the Controller was committing its transaction.
+func restoreDNSRecordBestEffort(ctx context.Context, cf *cloudflareClient, zoneID, name, expectedContent, marker string, previous *cloudflareAddressRecord) error {
+	if cf == nil || previous == nil || strings.TrimSpace(previous.ID) == "" {
+		return nil
+	}
+	records, err := cf.exactAddressRecords(ctx, zoneID, name)
+	if err != nil {
+		return err
+	}
+	for _, current := range records {
+		if current.ID != previous.ID {
+			continue
+		}
+		if current.Content != expectedContent || strings.TrimSpace(current.Comment) != marker {
+			// Another writer changed the record after our PUT. Preserve that
+			// newer value instead of blindly rolling it back.
+			return nil
+		}
+		_, err = cf.writeAddressRecord(ctx, zoneID, previous.ID, previous.Type, name, previous.Content, previous.Comment)
+		return err
+	}
+	return nil
+}
+
+func compensateDNSRecordBestEffort(ctx context.Context, cf *cloudflareClient, zoneID, name, expectedContent, marker, recordID string, created bool, previous *cloudflareAddressRecord) error {
+	if created {
+		deleteErr := deleteDNSRecordBestEffort(ctx, cf, zoneID, recordID)
+		if previous == nil {
+			return deleteErr
+		}
+		// A wrong-family Meridian record may have been replaced by a newly
+		// created record. Recreate the original record after removing the
+		// candidate so a failed generation does not erase operator-visible DNS.
+		if _, createErr := cf.writeAddressRecord(ctx, zoneID, "", previous.Type, name, previous.Content, previous.Comment); createErr != nil {
+			if deleteErr != nil {
+				return errors.Join(deleteErr, createErr)
+			}
+			return createErr
+		}
+		return deleteErr
+	}
+	return restoreDNSRecordBestEffort(ctx, cf, zoneID, name, expectedContent, marker, previous)
 }
 
 func nodeDialAddress(address string, port int) (string, error) {
@@ -1512,6 +1684,12 @@ func probeScheduledNodeWithRoots(ctx context.Context, node ControlNode, host str
 }
 
 func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
+	unlockSite := a.lockSiteSchedule(schedule.SiteID)
+	defer unlockSite()
+	return a.reconcileOneSiteScheduleLocked(ctx, schedule, now)
+}
+
+func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
 	if !schedule.Enabled {
 		return nil
 	}
@@ -1588,6 +1766,20 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	trackedRecordID := strings.TrimSpace(schedule.cfRecordID)
 	recordID := trackedRecordID
 	dnsRecordCreated := false
+	var previousRecord *cloudflareAddressRecord
+	if recordID != "" {
+		// Keep a preimage for a possible PUT compensation if the schedule
+		// generation changes before the local transaction commits.
+		if records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost); getErr == nil {
+			for i := range records {
+				if records[i].ID == recordID {
+					copy := records[i]
+					previousRecord = &copy
+					break
+				}
+			}
+		}
+	}
 	if recordID == "" {
 		records, err := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
 		if err != nil {
@@ -1612,6 +1804,8 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 				} else {
 					recordID = owned.ID
 				}
+				copy := owned
+				previousRecord = &copy
 			}
 		}
 	}
@@ -1678,20 +1872,16 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	// final counter; it is not left to the next sixty-second config poll.
 	tx, beginErr := a.db.db.BeginTx(ctx, nil)
 	if beginErr != nil {
-		if dnsRecordCreated {
-			if cleanupErr := deleteDNSRecordBestEffort(ctx, cf, zoneID, recordID); cleanupErr != nil {
-				return errors.Join(beginErr, cleanupErr)
-			}
+		if cleanupErr := compensateDNSRecordBestEffort(ctx, cf, zoneID, schedule.PublicHost, ip.String(), marker, recordID, dnsRecordCreated, previousRecord); cleanupErr != nil {
+			return errors.Join(beginErr, cleanupErr)
 		}
 		return beginErr
 	}
 	defer tx.Rollback()
 	cleanupTransaction := func(cause error) error {
 		_ = tx.Rollback()
-		if dnsRecordCreated && strings.TrimSpace(recordID) != "" {
-			if cleanupErr := deleteDNSRecordBestEffort(ctx, cf, zoneID, recordID); cleanupErr != nil {
-				return errors.Join(cause, cleanupErr)
-			}
+		if cleanupErr := compensateDNSRecordBestEffort(ctx, cf, zoneID, schedule.PublicHost, ip.String(), marker, recordID, dnsRecordCreated, previousRecord); cleanupErr != nil {
+			return errors.Join(cause, cleanupErr)
 		}
 		return cause
 	}
@@ -1717,12 +1907,11 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	}
 	if rowsAffected != 1 {
 		_ = tx.Rollback()
-		if dnsRecordCreated && strings.TrimSpace(recordID) != "" {
-			if cleanupErr := deleteDNSRecordBestEffort(ctx, cf, zoneID, recordID); cleanupErr != nil {
-				return errors.Join(errors.New("site schedule changed during DNS reconciliation"), cleanupErr)
-			}
+		cause := errors.New("site schedule changed during DNS reconciliation")
+		if cleanupErr := compensateDNSRecordBestEffort(ctx, cf, zoneID, schedule.PublicHost, ip.String(), marker, recordID, dnsRecordCreated, previousRecord); cleanupErr != nil {
+			return errors.Join(cause, cleanupErr)
 		}
-		return errors.New("site schedule changed during DNS reconciliation")
+		return cause
 	}
 	if err = tx.Commit(); err != nil {
 		return cleanupTransaction(err)
@@ -1765,15 +1954,42 @@ func upsertSiteNodeDrainTx(tx *sql.Tx, siteID, nodeID int64, publicHost string, 
 	return err
 }
 
+func (a *App) processNodeSchedulerOutcome(job nodeSchedulerJob, err error) {
+	if a == nil || err == nil {
+		return
+	}
+	value := job.value
+	now := time.Now()
+	if job.cleanup {
+		log.Printf("[node-scheduler] cleanup disabled site %d: %v", value.SiteID, err)
+		_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=0 AND schedule_revision=?", err.Error(), now.UnixMilli(), value.SiteID, value.ScheduleRevision)
+		return
+	}
+	log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
+	var readiness *nodeReadinessError
+	if value.Mode == "global" && value.DesiredNodeID > 0 && errors.As(err, &readiness) {
+		var schedulerMode string
+		if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
+			shouldCooldown := readiness.Kind == readinessCertificate || readiness.Kind == readinessListener || readiness.Kind == readinessProbe
+			if readiness.Kind == readinessConfig && value.ConfigPendingSinceMS > 0 {
+				shouldCooldown = now.Sub(time.UnixMilli(value.ConfigPendingSinceMS)) >= 90*time.Second
+			}
+			if shouldCooldown {
+				if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
+					log.Printf("[node-scheduler] record site %d node %d cooldown failed: %v", value.SiteID, value.DesiredNodeID, cooldownErr)
+				}
+			}
+		}
+	}
+	if value.DNSStatus != "waiting" || value.LastError != err.Error() {
+		_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=1 AND desired_node_id=? AND schedule_revision=?", err.Error(), now.UnixMilli(), value.SiteID, value.DesiredNodeID, value.ScheduleRevision)
+	}
+}
+
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	if a == nil {
 		return
 	}
-	// A scheduler round is single-flight. This keeps the bounded worker pool
-	// from ever reconciling the same site in two overlapping rounds when an
-	// embedder invokes the scheduler manually while the ticker is active.
-	a.nodeSchedulerMu.Lock()
-	defer a.nodeSchedulerMu.Unlock()
 	now := time.Now()
 	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE acked_at_ms>0 AND finalization_expires_at_ms>0 AND finalization_expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire node drains: %v", err)
@@ -1803,97 +2019,25 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 		log.Printf("[node-scheduler] list site schedules failed: %v", err)
 		return
 	}
-	type job struct {
-		value   SiteNodeSchedule
-		cleanup bool
-	}
-	type outcome struct {
-		job job
-		err error
-	}
-	jobs := make([]job, 0, len(values))
+	queue := a.ensureNodeSchedulerQueue(ctx)
+	jobs := make([]nodeSchedulerJob, 0, len(values))
 	for _, value := range values {
 		if !value.Enabled && siteNodeScheduleNeedsCleanup(value) {
-			jobs = append(jobs, job{value: value, cleanup: true})
+			jobs = append(jobs, nodeSchedulerJob{value: value, cleanup: true, now: now})
 		} else if value.Enabled {
-			jobs = append(jobs, job{value: value})
+			jobs = append(jobs, nodeSchedulerJob{value: value, now: now})
 		}
 	}
-	if len(jobs) == 0 {
-		return
-	}
-	workerCount := nodeSchedulerWorkers
-	if workerCount < 1 {
-		workerCount = 1
-	}
-	if workerCount > len(jobs) {
-		workerCount = len(jobs)
-	}
-	jobCh := make(chan job)
-	outCh := make(chan outcome, len(jobs))
-	var workers sync.WaitGroup
-	workers.Add(workerCount)
-	for i := 0; i < workerCount; i++ {
-		go func() {
-			defer workers.Done()
-			for current := range jobCh {
-				workCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-				var workErr error
-				if current.cleanup {
-					workErr = a.deleteTrackedSiteDNS(workCtx, current.value)
-				} else {
-					workErr = a.reconcileOneSiteSchedule(workCtx, current.value, now)
-				}
-				cancel()
-				outCh <- outcome{job: current, err: workErr}
+	for _, job := range jobs {
+		if !a.enqueueNodeSchedulerJob(queue, job) {
+			// A site already in-flight is expected; a full queue is surfaced so a
+			// later tick can retry it after workers drain.
+			queue.mu.Lock()
+			_, inFlight := queue.inFlight[job.value.SiteID]
+			queue.mu.Unlock()
+			if !inFlight {
+				log.Printf("[node-scheduler] scheduler queue full; site %d will retry", job.value.SiteID)
 			}
-		}()
-	}
-	go func() {
-		defer close(jobCh)
-		for _, current := range jobs {
-			select {
-			case jobCh <- current:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		workers.Wait()
-		close(outCh)
-	}()
-	for result := range outCh {
-		value := result.job.value
-		err := result.err
-		if result.job.cleanup {
-			if err != nil {
-				log.Printf("[node-scheduler] cleanup disabled site %d: %v", value.SiteID, err)
-				_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=0 AND schedule_revision=?", err.Error(), now.UnixMilli(), value.SiteID, value.ScheduleRevision)
-			}
-			continue
-		}
-		if err == nil {
-			continue
-		}
-		log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
-		var readiness *nodeReadinessError
-		if value.Mode == "global" && value.DesiredNodeID > 0 && errors.As(err, &readiness) {
-			var schedulerMode string
-			if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
-				shouldCooldown := readiness.Kind == readinessCertificate || readiness.Kind == readinessListener || readiness.Kind == readinessProbe
-				if readiness.Kind == readinessConfig && value.ConfigPendingSinceMS > 0 {
-					shouldCooldown = now.Sub(time.UnixMilli(value.ConfigPendingSinceMS)) >= 90*time.Second
-				}
-				if shouldCooldown {
-					if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
-						log.Printf("[node-scheduler] record site %d node %d cooldown failed: %v", value.SiteID, value.DesiredNodeID, cooldownErr)
-					}
-				}
-			}
-		}
-		if value.DNSStatus != "waiting" || value.LastError != err.Error() {
-			_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=1 AND desired_node_id=? AND schedule_revision=?", err.Error(), now.UnixMilli(), value.SiteID, value.DesiredNodeID, value.ScheduleRevision)
 		}
 	}
 }
@@ -2016,6 +2160,8 @@ func siteNodeRevocationIDsTx(tx *sql.Tx, siteID int64, nodeIDs ...int64) ([]int6
 }
 
 func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
+	unlockSite := a.lockSiteSchedule(siteID)
+	defer unlockSite()
 	var exists int
 	if err := a.db.db.QueryRow("SELECT COUNT(*) FROM site_node_schedules WHERE site_id=?", siteID).Scan(&exists); err != nil {
 		return err
@@ -2098,6 +2244,16 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 	if len(affected) == 0 {
 		return nil
 	}
+	sort.Slice(affected, func(i, j int) bool { return affected[i].SiteID < affected[j].SiteID })
+	unlockSites := make([]func(), 0, len(affected))
+	for _, value := range affected {
+		unlockSites = append(unlockSites, a.lockSiteSchedule(value.SiteID))
+	}
+	defer func() {
+		for i := len(unlockSites) - 1; i >= 0; i-- {
+			unlockSites[i]()
+		}
+	}()
 	needsCloudflare := false
 	for _, value := range affected {
 		if strings.TrimSpace(value.cfRecordID) != "" {

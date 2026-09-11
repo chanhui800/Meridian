@@ -49,7 +49,6 @@ var errEdgeAgentUpdated = errors.New("Agent binary updated; restarting")
 type edgeAgentState struct {
 	NodeGUID     string `json:"node_guid"`
 	Token        string `json:"agent_token"`
-	LeaseID      string `json:"agent_lease_id,omitempty"`
 	SessionEpoch int64  `json:"session_epoch,omitempty"`
 }
 
@@ -2076,8 +2075,8 @@ func nextEdgeSessionEpoch(saved int64) (int64, error) {
 
 // edgeQuiesceStale removes the data-plane ownership of a session that lost its
 // Controller lease. A stale process must not keep serving old routes or spin on
-// immediate config/report retries. The caller can resume probing after the
-// bounded recovery delay once it has advanced the persisted session epoch.
+// immediate config/report retries. Its fixed process epoch is retained so a
+// cloned loser cannot repeatedly outbid the active Agent.
 func edgeQuiesceStale(runtime *edgeAgentRuntime) {
 	if runtime == nil {
 		return
@@ -2668,7 +2667,16 @@ func runEdgeAgent() error {
 	if err := edgeSaveState(*statePath, state); err != nil {
 		return fmt.Errorf("persist Agent session epoch: %w", err)
 	}
-	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID, sessionEpoch: sessionEpoch, leaseID: state.LeaseID}
+	// A lease is issued for this process session by the first successful config
+	// request. Never reuse the lease persisted by a previous process: doing so
+	// lets the live reporter race that claim with a new session/epoch pair.
+	if err := edgeSaveState(*statePath, state); err != nil {
+		return fmt.Errorf("persist Agent session state: %w", err)
+	}
+	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID, sessionEpoch: sessionEpoch, leaseID: ""}
+	// No data-plane or live telemetry is exposed until this process has claimed
+	// a fresh Controller lease and successfully applied its first config.
+	runtime.quiesced.Store(true)
 	spoolDir := filepath.Join(runtime.stateDir, "events")
 	spoolKey, spoolKeyErr := loadOrCreateSpoolKey(filepath.Join(runtime.stateDir, "spool.key"))
 	if spoolKeyErr != nil {
@@ -2697,15 +2705,24 @@ func runEdgeAgent() error {
 	defer wsReporter.close()
 	bootID := edgeBootID()
 	liveErrCh := make(chan error, 1)
-	liveCancel := func() {}
-	liveDone := make(chan struct{})
-	close(liveDone)
-	if !*once {
-		liveCtx, cancelLive := context.WithCancel(ctx)
+	var liveMu sync.Mutex
+	var liveCancel context.CancelFunc
+	var liveDone chan struct{}
+	startLiveReporter := func() {
+		if *once {
+			return
+		}
+		liveMu.Lock()
+		defer liveMu.Unlock()
+		if liveCancel != nil {
+			return
+		}
+		liveCtx, cancelLive := context.WithCancel(ctx) // #nosec G118 -- the supervisor invokes cancelLive in stopLiveReporter.
+		done := make(chan struct{})
 		liveCancel = cancelLive
-		liveDone = make(chan struct{})
+		liveDone = done
 		go func() {
-			defer close(liveDone)
+			defer close(done)
 			if err := edgeLiveReportLoop(liveCtx, client, controller, state.Token, bootID, sessionEpoch, runtime); err != nil {
 				select {
 				case liveErrCh <- err:
@@ -2714,10 +2731,17 @@ func runEdgeAgent() error {
 			}
 		}()
 	}
-	defer func() {
-		liveCancel()
-		<-liveDone
-	}()
+	stopLiveReporter := func() {
+		liveMu.Lock()
+		cancelLive, done := liveCancel, liveDone
+		liveCancel, liveDone = nil, nil
+		liveMu.Unlock()
+		if cancelLive != nil {
+			cancelLive()
+			<-done
+		}
+	}
+	defer stopLiveReporter()
 	sequence := int64(0)
 	const configRefreshInterval = 60 * time.Second
 	const agentUpdateRetryInterval = 5 * time.Minute
@@ -2733,21 +2757,13 @@ func runEdgeAgent() error {
 	staleRecoveryAt := time.Time{}
 	staleRecoveryDelay := agentStaleRecoveryBase
 	handleStale := func() {
+		stopLiveReporter()
 		edgeQuiesceStale(runtime)
 		pendingConfig = nil
 		applyFailures = 0
 		nextApplyAttempt = time.Time{}
-		state.LeaseID = ""
-		nextEpoch, epochErr := nextEdgeSessionEpoch(state.SessionEpoch)
-		if epochErr == nil {
-			state.SessionEpoch = nextEpoch
-			sessionEpoch = nextEpoch
-			runtime.setSessionEpoch(nextEpoch)
-			if saveErr := edgeSaveState(*statePath, state); saveErr != nil {
-				fmt.Fprintf(os.Stderr, "Meridian Agent stale-session state save failed: %v\n", saveErr)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "Meridian Agent stale-session epoch advance failed: %v\n", epochErr)
+		if saveErr := edgeSaveState(*statePath, state); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "Meridian Agent stale-session state save failed: %v\n", saveErr)
 		}
 		lastConfigAt = time.Now()
 		staleRecoveryAt = time.Now().Add(staleRecoveryDelay)
@@ -2806,10 +2822,6 @@ func runEdgeAgent() error {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else {
 				runtime.setLeaseID(config.AgentLeaseID)
-				state.LeaseID = config.AgentLeaseID
-				if saveErr := edgeSaveState(*statePath, state); saveErr != nil {
-					fmt.Fprintf(os.Stderr, "Meridian Agent state save failed: %v\n", saveErr)
-				}
 				// A new identity must be applied atomically. Updating the old
 				// bundle before apply would leak a failed candidate's quota into
 				// the still-serving configuration. Hash-stable refreshes are the
@@ -2866,6 +2878,7 @@ func runEdgeAgent() error {
 				applyFailures = 0
 				nextApplyAttempt = time.Time{}
 				staleRecoveryDelay = agentStaleRecoveryBase
+				startLiveReporter()
 			}
 		}
 		if runtime.isQuiesced() {
