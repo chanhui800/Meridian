@@ -49,6 +49,7 @@ var errEdgeAgentUpdated = errors.New("Agent binary updated; restarting")
 type edgeAgentState struct {
 	NodeGUID string `json:"node_guid"`
 	Token    string `json:"agent_token"`
+	LeaseID  string `json:"agent_lease_id,omitempty"`
 }
 
 type edgeSiteIdentity struct {
@@ -508,6 +509,8 @@ type edgeAgentRuntime struct {
 	mu                   sync.RWMutex
 	stateDir             string
 	nodeGUID             string
+	sessionEpoch         int64
+	leaseID              string
 	port                 int
 	handler              http.Handler
 	certificate          *tls.Certificate
@@ -1893,6 +1896,24 @@ func (runtime *edgeAgentRuntime) status() (string, int64, string, string, int64,
 	return runtime.appliedHash, runtime.appliedRevision, runtime.listenerError, runtime.applyError, runtime.applyErrorAtMS, runtime.applyFailures
 }
 
+func (runtime *edgeAgentRuntime) reportIdentity() (string, int64) {
+	if runtime == nil {
+		return "", 0
+	}
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	return strings.TrimSpace(runtime.leaseID), runtime.sessionEpoch
+}
+
+func (runtime *edgeAgentRuntime) setLeaseID(leaseID string) {
+	if runtime == nil {
+		return
+	}
+	runtime.mu.Lock()
+	runtime.leaseID = strings.TrimSpace(leaseID)
+	runtime.mu.Unlock()
+}
+
 // nextTelemetrySequence is shared by the full and lightweight report loops.
 // Their channel-local sequences intentionally remain independent, while this
 // monotonic value provides the Controller with one ordering boundary.
@@ -1998,6 +2019,11 @@ func isEdgeAgentRevoked(err error) bool {
 	return errors.As(err, &apiErr) && strings.EqualFold(strings.TrimSpace(apiErr.AgentState), "revoked")
 }
 
+func isEdgeAgentStale(err error) bool {
+	var apiErr *edgeAPIError
+	return errors.As(err, &apiErr) && strings.EqualFold(strings.TrimSpace(apiErr.AgentState), "stale")
+}
+
 // edgeQuiesceRevoked closes the data plane before recording the durable
 // marker. If the disk is unavailable, returning would let systemd restart the
 // same revoked credential forever; stay inert until an operator stops or
@@ -2092,6 +2118,9 @@ func edgeAPIRequestWithHeaders(ctx context.Context, client *http.Client, method,
 }
 
 type edgeReportAck struct {
+	Accepted                    bool     `json:"accepted"`
+	AgentState                  string   `json:"agent_state,omitempty"`
+	Error                       string   `json:"error,omitempty"`
 	AcceptedSiteIDs             []int64  `json:"accepted_site_ids"`
 	DiscardedSiteIDs            []int64  `json:"discarded_site_ids"`
 	AcceptedMediaSiteIDs        []int64  `json:"accepted_media_site_ids"`
@@ -2200,6 +2229,10 @@ func (c *edgeWSReportClient) report(ctx context.Context, payload NodeReport) (ed
 		c.nextTry = time.Now().Add(30 * time.Second)
 		return edgeReportAck{}, err
 	}
+	if !ack.Accepted && strings.EqualFold(strings.TrimSpace(ack.AgentState), "stale") {
+		c.closeLocked()
+		return edgeReportAck{}, &edgeAPIError{StatusCode: http.StatusConflict, AgentState: "stale", Message: ack.Error}
+	}
 	return ack, nil
 }
 
@@ -2304,7 +2337,7 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
 }
 
-func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, runtime *edgeAgentRuntime) error {
+func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, sessionEpoch int64, runtime *edgeAgentRuntime) error {
 	if runtime == nil {
 		return nil
 	}
@@ -2317,12 +2350,14 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 		})
 		report := NodeLiveReport{
 			ReportSessionID:   sessionID,
+			SessionEpoch:      sessionEpoch,
 			CounterEpoch:      edgeCounterEpoch(edgeDefaultInterface()),
 			Sequence:          sequence,
 			TelemetrySequence: telemetrySequence,
 			SampledAtMS:       sampledAtMS,
 			SiteStats:         stats,
 		}
+		report.AgentLeaseID, _ = runtime.reportIdentity()
 		var ack struct{}
 		return edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
 	}
@@ -2570,7 +2605,11 @@ func runEdgeAgent() error {
 			return err
 		}
 	}
-	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID}
+	sessionEpoch := time.Now().UnixNano()
+	if sessionEpoch <= 0 {
+		sessionEpoch = 1
+	}
+	runtime := &edgeAgentRuntime{stateDir: filepath.Dir(*statePath), nodeGUID: state.NodeGUID, sessionEpoch: sessionEpoch, leaseID: state.LeaseID}
 	spoolDir := filepath.Join(runtime.stateDir, "events")
 	spoolKey, spoolKeyErr := loadOrCreateSpoolKey(filepath.Join(runtime.stateDir, "spool.key"))
 	if spoolKeyErr != nil {
@@ -2608,7 +2647,7 @@ func runEdgeAgent() error {
 		liveDone = make(chan struct{})
 		go func() {
 			defer close(liveDone)
-			if err := edgeLiveReportLoop(liveCtx, client, controller, state.Token, bootID, runtime); err != nil {
+			if err := edgeLiveReportLoop(liveCtx, client, controller, state.Token, bootID, sessionEpoch, runtime); err != nil {
 				select {
 				case liveErrCh <- err:
 				default:
@@ -2648,14 +2687,24 @@ func runEdgeAgent() error {
 			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, http.Header{
 				agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
 				agentVersionHeader:  []string{appVersion},
+				agentSessionHeader:  []string{bootID},
+				agentEpochHeader:    []string{strconv.FormatInt(sessionEpoch, 10)},
 			}); err != nil {
 				if isEdgeAgentRevoked(err) {
 					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+				}
+				if isEdgeAgentStale(err) {
+					lastConfigAt = time.Time{}
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else {
+				runtime.setLeaseID(config.AgentLeaseID)
+				state.LeaseID = config.AgentLeaseID
+				if saveErr := edgeSaveState(*statePath, state); saveErr != nil {
+					fmt.Fprintf(os.Stderr, "Meridian Agent state save failed: %v\n", saveErr)
+				}
 				// A new identity must be applied atomically. Updating the old
 				// bundle before apply would leak a failed candidate's quota into
 				// the still-serving configuration. Hash-stable refreshes are the
@@ -2720,6 +2769,7 @@ func runEdgeAgent() error {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
 			report.AppliedConfigHash, report.AppliedConfigRevision, report.ListenerError, report.ApplyError, report.ApplyErrorAtMS, report.ApplyFailures = runtime.status()
+			report.AgentLeaseID, report.SessionEpoch = runtime.reportIdentity()
 			runtime.mu.RLock()
 			report.CacheClearGeneration = runtime.cacheClearGeneration
 			report.SiteCounterEpoch = strconv.FormatUint(runtime.siteCounterEpoch, 10)
@@ -2734,6 +2784,10 @@ func runEdgeAgent() error {
 			if wsErr != nil {
 				if isEdgeAgentRevoked(wsErr) {
 					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+				}
+				if isEdgeAgentStale(wsErr) {
+					lastConfigAt = time.Time{}
+					refreshImmediately = true
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent report failed: %v\n", wsErr)
 			} else {

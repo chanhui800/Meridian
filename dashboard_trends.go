@@ -202,11 +202,11 @@ func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboa
 	return result
 }
 
-// lockLocalDashboardTrendSnapshot pins every selected local proxy while the
-// caller takes the SQLite history snapshot. Holding trafficMu across that
-// read makes the in-memory cumulative/pending split and traffic_logs observe
-// one consistent point in time; the returned unlock function must be called
-// on every path.
+// lockLocalDashboardTrendSnapshot copies the selected local counters under
+// trafficMu and releases every mutex before returning. The returned unlock
+// function is retained for source compatibility with older callers, but is a
+// no-op. In particular, callers must be able to perform SQLite history reads
+// without holding all local traffic locks.
 func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt time.Time) (map[int64]dashboardPendingTraffic, map[int64]dashboardTrendBaseline, func()) {
 	pendingResult := make(map[int64]dashboardPendingTraffic)
 	baselineResult := make(map[int64]dashboardTrendBaseline)
@@ -249,13 +249,10 @@ func (pm *ProxyManager) lockLocalDashboardTrendSnapshot(siteID *int64, sampledAt
 			BytesIn: baselineIn, BytesOut: baselineOut, Requests: baselineRequests,
 			SampledAtMS: sampledAt.UnixMilli(),
 		}
+		inst.trafficMu.Unlock()
 	}
-	return pendingResult, baselineResult, func() {
-		for index := len(ids) - 1; index >= 0; index-- {
-			instances[ids[index]].trafficMu.Unlock()
-		}
-		pm.mu.RUnlock()
-	}
+	pm.mu.RUnlock()
+	return pendingResult, baselineResult, func() {}
 }
 
 // localDashboardTrendBaselines returns the controller-local cumulative

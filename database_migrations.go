@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 46
+	databaseSchemaVersion = 47
 )
 
 func (d *DB) migrate() error {
@@ -377,6 +377,9 @@ func (d *DB) migrateOnce() error {
 		last_raw_tx_bytes BIGINT NOT NULL DEFAULT 0,
 		last_boot_id TEXT NOT NULL DEFAULT '',
 		last_report_session_id TEXT NOT NULL DEFAULT '',
+		active_agent_session_id TEXT NOT NULL DEFAULT '',
+		agent_session_epoch BIGINT NOT NULL DEFAULT 0,
+		agent_lease_id TEXT NOT NULL DEFAULT '',
 		last_sequence BIGINT NOT NULL DEFAULT 0,
 		interface_name TEXT NOT NULL DEFAULT '',
 		agent_version TEXT NOT NULL DEFAULT '',
@@ -775,6 +778,9 @@ func (d *DB) migrateOnce() error {
 	for _, migration := range []struct{ table, column, sql string }{
 		{"control_nodes", "traffic_manual_offset_bytes", "ALTER TABLE control_nodes ADD COLUMN traffic_manual_offset_bytes BIGINT NOT NULL DEFAULT 0"},
 		{"control_nodes", "last_report_session_id", "ALTER TABLE control_nodes ADD COLUMN last_report_session_id TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "active_agent_session_id", "ALTER TABLE control_nodes ADD COLUMN active_agent_session_id TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "agent_session_epoch", "ALTER TABLE control_nodes ADD COLUMN agent_session_epoch BIGINT NOT NULL DEFAULT 0"},
+		{"control_nodes", "agent_lease_id", "ALTER TABLE control_nodes ADD COLUMN agent_lease_id TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "event_spool_error", "ALTER TABLE control_nodes ADD COLUMN event_spool_error TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "event_queue_depth", "ALTER TABLE control_nodes ADD COLUMN event_queue_depth INTEGER NOT NULL DEFAULT 0"},
 		{"control_nodes", "event_dropped", "ALTER TABLE control_nodes ADD COLUMN event_dropped BIGINT NOT NULL DEFAULT 0"},

@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,7 @@ const (
 	// unknown) version while a revocation is pending, the whole Agent
 	// credential is revoked so the old data-plane listener cannot drain forever.
 	legacyForceStopGrace = 10 * time.Minute
+	nodeSchedulerWorkers = 4
 )
 
 type SiteNodeSchedule struct {
@@ -102,6 +104,7 @@ type AgentRuntimeConfig struct {
 	PrivateKeyPEM        string           `json:"private_key_pem,omitempty"`
 	DynamicKey           string           `json:"dynamic_key,omitempty"`
 	ProbeSecret          string           `json:"probe_secret,omitempty"`
+	AgentLeaseID         string           `json:"agent_lease_id,omitempty"`
 	AgentVersion         string           `json:"agent_version,omitempty"`
 	AgentSHA256          string           `json:"agent_sha256,omitempty"`
 	AgentDownloadURL     string           `json:"agent_download_url,omitempty"`
@@ -839,7 +842,12 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 	return a.buildAgentConfigForRequest(context.Background(), token, now, platform, "")
 }
 
-func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now time.Time, platform, clientVersion string) (AgentRuntimeConfig, error) {
+type agentSessionRequest struct {
+	ID    string
+	Epoch int64
+}
+
+func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now time.Time, platform, clientVersion string, requestedSession ...agentSessionRequest) (AgentRuntimeConfig, error) {
 	var node ControlNode
 	var err error
 	if identity, ok := agentCredentialFromContext(ctx); ok && identity.HasNode && identity.Token == token {
@@ -884,6 +892,14 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	defer tx.Rollback()
 	node, err = scanControlNode(tx.QueryRow(controlNodeSelect+" WHERE id=?", node.ID), now)
+	if err != nil {
+		return AgentRuntimeConfig{}, err
+	}
+	var session agentSessionRequest
+	if len(requestedSession) > 0 {
+		session = requestedSession[0]
+	}
+	leaseID, err := claimAgentLeaseTx(tx, node.ID, session.ID, session.Epoch)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
@@ -976,7 +992,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	// Keep the legacy field names in the Agent wire contract during rolling
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigRevision: node.ConfigRevision, NodeGUID: node.GUID, EntryMode: "direct",
-		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText,
+		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText, AgentLeaseID: leaseID,
 		CacheClearGeneration: node.CacheClearGeneration, Routes: routes}
 	forceRows, forceErr := tx.Query("SELECT site_id FROM agent_route_revocations WHERE node_id=? ORDER BY site_id", node.ID)
 	if forceErr != nil {
@@ -1055,9 +1071,19 @@ func (a *App) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, platformErr.Error())
 		return
 	}
-	config, err := a.buildAgentConfigForRequest(r.Context(), requestBearerToken(r), time.Now(), platform, r.Header.Get(agentVersionHeader))
+	session, sessionErr := requestedAgentSession(r)
+	if sessionErr != nil {
+		a.jsonErr(w, http.StatusBadRequest, sessionErr.Error())
+		return
+	}
+	config, err := a.buildAgentConfigForRequest(r.Context(), requestBearerToken(r), time.Now(), platform, r.Header.Get(agentVersionHeader), session)
 	if errors.Is(err, errInvalidAgentToken) {
 		writeAgentAuthFailure(a, w, r)
+		return
+	}
+	if errors.Is(err, errStaleAgentSession) {
+		w.Header().Set("X-Meridian-Agent-State", "stale")
+		a.jsonErr(w, http.StatusConflict, "stale agent session; retry configuration fetch")
 		return
 	}
 	if err != nil {
@@ -1181,7 +1207,7 @@ func (a *App) cloudflareForScheduling() (*cloudflareClient, error) {
 	return &cloudflareClient{token: token, httpClient: &http.Client{Timeout: 15 * time.Second}, apiBase: "https://api.cloudflare.com/client/v4"}, nil
 }
 
-type cloudflareAddressRecord struct{ ID, Type, Name, Content string }
+type cloudflareAddressRecord struct{ ID, Type, Name, Content, Comment string }
 
 func (c *cloudflareClient) exactAddressRecords(ctx context.Context, zoneID, name string) ([]cloudflareAddressRecord, error) {
 	result, err := c.request(ctx, http.MethodGet, "/zones/"+url.PathEscape(zoneID)+"/dns_records?name="+url.QueryEscape(name)+"&per_page=100", nil)
@@ -1193,6 +1219,7 @@ func (c *cloudflareClient) exactAddressRecords(ctx context.Context, zoneID, name
 		Type    string `json:"type"`
 		Name    string `json:"name"`
 		Content string `json:"content"`
+		Comment string `json:"comment"`
 	}
 	if err := json.Unmarshal(result, &raw); err != nil {
 		return nil, errors.New("Cloudflare DNS returned invalid records")
@@ -1200,14 +1227,18 @@ func (c *cloudflareClient) exactAddressRecords(ctx context.Context, zoneID, name
 	values := make([]cloudflareAddressRecord, 0, len(raw))
 	for _, item := range raw {
 		if (item.Type == "A" || item.Type == "AAAA") && strings.EqualFold(item.Name, name) {
-			values = append(values, cloudflareAddressRecord{ID: item.ID, Type: item.Type, Name: item.Name, Content: item.Content})
+			values = append(values, cloudflareAddressRecord{ID: item.ID, Type: item.Type, Name: item.Name, Content: item.Content, Comment: item.Comment})
 		}
 	}
 	return values, nil
 }
 
-func (c *cloudflareClient) writeAddressRecord(ctx context.Context, zoneID, recordID, recordType, name, address string) (string, error) {
-	body, _ := json.Marshal(map[string]any{"type": recordType, "name": name, "content": address, "ttl": 60, "proxied": false})
+func (c *cloudflareClient) writeAddressRecord(ctx context.Context, zoneID, recordID, recordType, name, address string, comments ...string) (string, error) {
+	payload := map[string]any{"type": recordType, "name": name, "content": address, "ttl": 60, "proxied": false}
+	if len(comments) > 0 && strings.TrimSpace(comments[0]) != "" {
+		payload["comment"] = strings.TrimSpace(comments[0])
+	}
+	body, _ := json.Marshal(payload)
 	method, path := http.MethodPost, "/zones/"+url.PathEscape(zoneID)+"/dns_records"
 	if recordID != "" {
 		method, path = http.MethodPut, path+"/"+url.PathEscape(recordID)
@@ -1223,6 +1254,18 @@ func (c *cloudflareClient) writeAddressRecord(ctx context.Context, zoneID, recor
 		return "", errors.New("Cloudflare DNS did not return a record ID")
 	}
 	return record.ID, nil
+}
+
+func ownedAddressRecord(records []cloudflareAddressRecord, recordType, name, address, marker string) (cloudflareAddressRecord, bool, bool) {
+	var match cloudflareAddressRecord
+	count := 0
+	for _, record := range records {
+		if record.Type == recordType && strings.EqualFold(record.Name, name) && record.Content == address && strings.TrimSpace(record.Comment) == marker {
+			match = record
+			count++
+		}
+	}
+	return match, count == 1, count > 1
 }
 
 func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedule) error {
@@ -1481,10 +1524,34 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 			return err
 		}
 		if len(records) > 0 {
-			return errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
+			marker := fmt.Sprintf("Meridian site=%d", schedule.SiteID)
+			if owned, ok, ambiguous := ownedAddressRecord(records, recordType, schedule.PublicHost, ip.String(), marker); ambiguous {
+				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
+			} else if ok {
+				// A previous POST may have succeeded while its response or local
+				// transaction was lost. Adopt the uniquely marked record instead of
+				// creating another record or reporting a permanent untracked error.
+				schedule.cfZoneID, schedule.cfRecordID = zoneID, owned.ID
+			}
+			if schedule.cfRecordID == "" {
+				return errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
+			}
 		}
 	}
-	recordID, err := cf.writeAddressRecord(ctx, zoneID, schedule.cfRecordID, recordType, schedule.PublicHost, ip.String())
+	marker := fmt.Sprintf("Meridian site=%d", schedule.SiteID)
+	recordID, err := cf.writeAddressRecord(ctx, zoneID, schedule.cfRecordID, recordType, schedule.PublicHost, ip.String(), marker)
+	if err != nil && schedule.cfRecordID == "" {
+		// POST is not safely retryable: the remote side may have created the
+		// record even when the response was lost. Re-read exact records and
+		// adopt only a uniquely matching Meridian marker.
+		if records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost); getErr == nil {
+			if owned, ok, ambiguous := ownedAddressRecord(records, recordType, schedule.PublicHost, ip.String(), marker); ambiguous {
+				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
+			} else if ok {
+				recordID, err = owned.ID, nil
+			}
+		}
+	}
 	if err != nil && schedule.cfRecordID != "" && isCloudflareRecordNotFoundError(err) {
 		// A tracked record may have been removed outside Meridian. Re-resolve
 		// the zone and recreate only when the exact name is still unoccupied;
@@ -1498,7 +1565,7 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 			}
 		}
 		if err == nil {
-			recordID, err = cf.writeAddressRecord(ctx, zoneID, "", recordType, schedule.PublicHost, ip.String())
+			recordID, err = cf.writeAddressRecord(ctx, zoneID, "", recordType, schedule.PublicHost, ip.String(), marker)
 		}
 	}
 	if err != nil {
@@ -1570,6 +1637,14 @@ func upsertSiteNodeDrainTx(tx *sql.Tx, siteID, nodeID int64, publicHost string, 
 }
 
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
+	if a == nil {
+		return
+	}
+	// A scheduler round is single-flight. This keeps the bounded worker pool
+	// from ever reconciling the same site in two overlapping rounds when an
+	// embedder invokes the scheduler manually while the ticker is active.
+	a.nodeSchedulerMu.Lock()
+	defer a.nodeSchedulerMu.Unlock()
 	now := time.Now()
 	if _, err := a.db.db.Exec("DELETE FROM site_node_drains WHERE acked_at_ms>0 AND finalization_expires_at_ms>0 AND finalization_expires_at_ms<=?", now.UnixMilli()); err != nil {
 		log.Printf("[node-scheduler] expire node drains: %v", err)
@@ -1599,43 +1674,95 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 		log.Printf("[node-scheduler] list site schedules failed: %v", err)
 		return
 	}
+	type job struct {
+		value   SiteNodeSchedule
+		cleanup bool
+	}
+	type outcome struct {
+		job job
+		err error
+	}
+	jobs := make([]job, 0, len(values))
 	for _, value := range values {
 		if !value.Enabled && siteNodeScheduleNeedsCleanup(value) {
-			cleanupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			cleanupErr := a.deleteTrackedSiteDNS(cleanupCtx, value)
-			cancel()
-			if cleanupErr != nil {
-				log.Printf("[node-scheduler] cleanup disabled site %d: %v", value.SiteID, cleanupErr)
-				_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", cleanupErr.Error(), now.UnixMilli(), value.SiteID)
+			jobs = append(jobs, job{value: value, cleanup: true})
+		} else if value.Enabled {
+			jobs = append(jobs, job{value: value})
+		}
+	}
+	if len(jobs) == 0 {
+		return
+	}
+	workerCount := nodeSchedulerWorkers
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > len(jobs) {
+		workerCount = len(jobs)
+	}
+	jobCh := make(chan job)
+	outCh := make(chan outcome, len(jobs))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workers.Done()
+			for current := range jobCh {
+				workCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				var workErr error
+				if current.cleanup {
+					workErr = a.deleteTrackedSiteDNS(workCtx, current.value)
+				} else {
+					workErr = a.reconcileOneSiteSchedule(workCtx, current.value, now)
+				}
+				cancel()
+				outCh <- outcome{job: current, err: workErr}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobCh)
+		for _, current := range jobs {
+			select {
+			case jobCh <- current:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	workers.Wait()
+	close(outCh)
+	for result := range outCh {
+		value := result.job.value
+		err := result.err
+		if result.job.cleanup {
+			if err != nil {
+				log.Printf("[node-scheduler] cleanup disabled site %d: %v", value.SiteID, err)
+				_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
 			}
 			continue
 		}
-		if !value.Enabled {
+		if err == nil {
 			continue
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		err := a.reconcileOneSiteSchedule(probeCtx, value, now)
-		cancel()
-		if err != nil {
-			log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
-			var readiness *nodeReadinessError
-			if value.Mode == "global" && value.DesiredNodeID > 0 && errors.As(err, &readiness) {
-				var schedulerMode string
-				if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
-					shouldCooldown := readiness.Kind == readinessCertificate || readiness.Kind == readinessListener || readiness.Kind == readinessProbe
-					if readiness.Kind == readinessConfig && value.ConfigPendingSinceMS > 0 {
-						shouldCooldown = now.Sub(time.UnixMilli(value.ConfigPendingSinceMS)) >= 90*time.Second
-					}
-					if shouldCooldown {
-						if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
-							log.Printf("[node-scheduler] record site %d node %d cooldown failed: %v", value.SiteID, value.DesiredNodeID, cooldownErr)
-						}
+		log.Printf("[node-scheduler] site %d waiting: %v", value.SiteID, err)
+		var readiness *nodeReadinessError
+		if value.Mode == "global" && value.DesiredNodeID > 0 && errors.As(err, &readiness) {
+			var schedulerMode string
+			if modeErr := a.db.db.QueryRow("SELECT mode FROM node_scheduler_settings WHERE id=1").Scan(&schedulerMode); modeErr == nil && schedulerMode == "auto" {
+				shouldCooldown := readiness.Kind == readinessCertificate || readiness.Kind == readinessListener || readiness.Kind == readinessProbe
+				if readiness.Kind == readinessConfig && value.ConfigPendingSinceMS > 0 {
+					shouldCooldown = now.Sub(time.UnixMilli(value.ConfigPendingSinceMS)) >= 90*time.Second
+				}
+				if shouldCooldown {
+					if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
+						log.Printf("[node-scheduler] record site %d node %d cooldown failed: %v", value.SiteID, value.DesiredNodeID, cooldownErr)
 					}
 				}
 			}
-			if value.DNSStatus != "waiting" || value.LastError != err.Error() {
-				_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
-			}
+		}
+		if value.DNSStatus != "waiting" || value.LastError != err.Error() {
+			_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?", err.Error(), now.UnixMilli(), value.SiteID)
 		}
 	}
 }

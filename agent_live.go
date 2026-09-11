@@ -32,6 +32,9 @@ func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
 	if report.ReportSessionID == "" || len(report.ReportSessionID) > 128 || len(report.CounterEpoch) > 128 {
 		return errors.New("invalid live report session")
 	}
+	if report.AgentLeaseID != "" && (report.SessionEpoch <= 0 || len(report.AgentLeaseID) > 128) {
+		return errors.New("invalid live report lease")
+	}
 	if report.Sequence <= 0 || report.TelemetrySequence < 0 || report.SampledAtMS <= 0 || len(report.SiteStats) > maxNodeLiveSitesPerReport {
 		return errors.New("invalid live report metadata")
 	}
@@ -75,6 +78,19 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 	allowed, err := authorizedNodeSitesTx(tx, nodeID, now.UnixMilli())
 	if err != nil {
 		return nil, nil, err
+	}
+	var activeSession, lease string
+	var activeEpoch int64
+	if err := tx.QueryRow("SELECT active_agent_session_id,agent_session_epoch,agent_lease_id FROM control_nodes WHERE id=?", nodeID).Scan(&activeSession, &activeEpoch, &lease); err != nil {
+		return nil, nil, err
+	}
+	if strings.TrimSpace(activeSession) != "" && report.AgentLeaseID == "" && report.SessionEpoch == 0 {
+		return nil, nil, errStaleAgentSession
+	}
+	if report.AgentLeaseID != "" || report.SessionEpoch > 0 {
+		if report.AgentLeaseID == "" || report.SessionEpoch <= 0 || strings.TrimSpace(report.ReportSessionID) != strings.TrimSpace(activeSession) || report.SessionEpoch != activeEpoch || strings.TrimSpace(report.AgentLeaseID) != strings.TrimSpace(lease) {
+			return nil, nil, errStaleAgentSession
+		}
 	}
 
 	accepted = make([]int64, 0, len(report.SiteStats))
