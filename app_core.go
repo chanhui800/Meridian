@@ -11,36 +11,75 @@ import (
 )
 
 type App struct {
-	db                 *DB
-	dbPath             string
-	pm                 *ProxyManager
-	backupMu           sync.Mutex
-	siteLifecycleMu    sync.Mutex
-	setupTokenMu       sync.Mutex
-	setupToken         string
-	loginLimiter       *loginRateLimiter
-	loginLimiterOnce   sync.Once
-	trustedProxies     []*net.IPNet
-	clientIPRegions    *clientIPRegionResolver
-	panelHost          string
-	routeDomain        string
-	panelTLSEnabled    bool
-	panelCertificates  *panelCertificateManager
-	certificateWorker  *certificateWorker
-	panelBindLoopback  bool
-	panelListenPort    int
-	dynamicRouteKey    []byte
-	restartCh          chan struct{}
-	restartOnce        sync.Once
-	tmdb               *tmdbService
-	tmdbOnce           sync.Once
-	agentReportMu      sync.Mutex
-	agentReportLimiter *nodeReportAdmission
-	agentLiveReportMu  sync.Mutex
-	agentLiveLimiter   *nodeReportAdmission
-	agentPreAuthMu     sync.Mutex
-	agentPreAuth       *agentPreAuthAdmission
-	nodeSchedulerMu    sync.Mutex
+	db                   *DB
+	dbPath               string
+	pm                   *ProxyManager
+	backupMu             sync.Mutex
+	siteLifecycleMu      sync.Mutex
+	setupTokenMu         sync.Mutex
+	setupToken           string
+	loginLimiter         *loginRateLimiter
+	loginLimiterOnce     sync.Once
+	trustedProxies       []*net.IPNet
+	clientIPRegions      *clientIPRegionResolver
+	panelHost            string
+	routeDomain          string
+	panelTLSEnabled      bool
+	panelCertificates    *panelCertificateManager
+	certificateWorker    *certificateWorker
+	panelBindLoopback    bool
+	panelListenPort      int
+	dynamicRouteKey      []byte
+	restartCh            chan struct{}
+	restartOnce          sync.Once
+	tmdb                 *tmdbService
+	tmdbOnce             sync.Once
+	agentReportMu        sync.Mutex
+	agentReportLimiter   *nodeReportAdmission
+	agentLiveReportMu    sync.Mutex
+	agentLiveLimiter     *nodeReportAdmission
+	agentPreAuthMu       sync.Mutex
+	agentPreAuth         *agentPreAuthAdmission
+	siteScheduleLocksMu  sync.Mutex
+	siteScheduleLocks    map[int64]*siteScheduleLock
+	nodeSchedulerQueueMu sync.Mutex
+	nodeSchedulerQueue   *nodeSchedulerQueue
+}
+
+// siteScheduleLock serializes every local/remote mutation for one site. A
+// scheduler worker must not PUT or DELETE a Cloudflare record while an admin
+// request is changing the same schedule, otherwise the remote side effect can
+// outlive the generation that authorized it.
+type siteScheduleLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (a *App) lockSiteSchedule(siteID int64) func() {
+	if a == nil || siteID <= 0 {
+		return func() {}
+	}
+	a.siteScheduleLocksMu.Lock()
+	if a.siteScheduleLocks == nil {
+		a.siteScheduleLocks = make(map[int64]*siteScheduleLock)
+	}
+	lock := a.siteScheduleLocks[siteID]
+	if lock == nil {
+		lock = &siteScheduleLock{}
+		a.siteScheduleLocks[siteID] = lock
+	}
+	lock.refs++
+	a.siteScheduleLocksMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		a.siteScheduleLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(a.siteScheduleLocks, siteID)
+		}
+		a.siteScheduleLocksMu.Unlock()
+	}
 }
 
 func (a *App) tmdbService() *tmdbService {

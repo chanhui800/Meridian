@@ -1742,7 +1742,6 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if desiredHash != "" && appliedHash != desiredHash {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_pending_since_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE config_pending_since_ms END,
-			schedule_revision=CASE WHEN config_pending_since_ms=0 THEN schedule_revision+1 ELSE schedule_revision END,
 			updated_at_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE updated_at_ms END
 			WHERE enabled=1 AND desired_node_id=? AND config_hash=?`, now.UnixMilli(), now.UnixMilli(), id, desiredHash); err != nil {
 			return nodeReportCommitResult{}, err

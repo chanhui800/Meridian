@@ -90,3 +90,42 @@ func TestSiteScheduleRevisionAdvancesOnEveryAdministrativeMutation(t *testing.T)
 		t.Fatalf("revisions did not advance: first=%d second=%d", first.ScheduleRevision, second.ScheduleRevision)
 	}
 }
+
+func TestStaleDisabledCleanupCannotPublishRevocation(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "cleanup-node", Address: "203.0.113.90", Port: 9090}, now)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "cleanup-site", PublicHost: "cleanup.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatalf("create site: %v", err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, false, "fixed", 0, now); err != nil {
+		t.Fatalf("create disabled schedule: %v", err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,dns_status='waiting' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatalf("seed disabled assignment: %v", err)
+	}
+	stale, err := app.db.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatalf("load stale schedule: %v", err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now.Add(time.Second)); err != nil {
+		t.Fatalf("re-enable schedule: %v", err)
+	}
+	if err := app.finalizeDisabledSiteNodeSchedule(stale); err != nil {
+		t.Fatalf("stale cleanup: %v", err)
+	}
+	var revocations, enabled int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM agent_route_revocations WHERE site_id=?", site.ID).Scan(&revocations); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT enabled FROM site_node_schedules WHERE site_id=?", site.ID).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if revocations != 0 || enabled != 1 {
+		t.Fatalf("stale cleanup changed replacement generation: revocations=%d enabled=%d", revocations, enabled)
+	}
+}
