@@ -725,6 +725,7 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 	if _, err := tx.Exec(`UPDATE site_node_schedules
 		SET config_hash='',
 			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
+			schedule_revision=schedule_revision+1,
 			updated_at_ms=?
 		WHERE site_id=?`, nowMS, nowMS, site.ID); err != nil {
 		return err
@@ -825,6 +826,7 @@ func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
 	if _, err := tx.Exec(`UPDATE site_node_schedules
 		SET config_hash='',
 			config_pending_since_ms=CASE WHEN enabled=1 AND ?=1 THEN ? ELSE 0 END,
+			schedule_revision=schedule_revision+1,
 			updated_at_ms=?
 		WHERE site_id=?`, value, nowMS, nowMS, id); err != nil {
 		return err

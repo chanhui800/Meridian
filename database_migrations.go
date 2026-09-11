@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 47
+	databaseSchemaVersion = 48
 )
 
 func (d *DB) migrate() error {
@@ -432,6 +432,7 @@ func (d *DB) migrateOnce() error {
 		dns_status TEXT NOT NULL DEFAULT 'disabled',
 		config_hash TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
+		schedule_revision BIGINT NOT NULL DEFAULT 1,
 		config_pending_since_ms INTEGER NOT NULL DEFAULT 0,
 		created_at_ms INTEGER NOT NULL DEFAULT 0,
 		updated_at_ms INTEGER NOT NULL DEFAULT 0
@@ -789,6 +790,7 @@ func (d *DB) migrateOnce() error {
 		{"site_node_schedules", "agent_last_request_at_ms", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_request_at_ms INTEGER NOT NULL DEFAULT 0"},
 		{"site_node_schedules", "agent_last_status", "ALTER TABLE site_node_schedules ADD COLUMN agent_last_status INTEGER NOT NULL DEFAULT 0"},
 		{"site_node_schedules", "config_pending_since_ms", "ALTER TABLE site_node_schedules ADD COLUMN config_pending_since_ms INTEGER NOT NULL DEFAULT 0"},
+		{"site_node_schedules", "schedule_revision", "ALTER TABLE site_node_schedules ADD COLUMN schedule_revision BIGINT NOT NULL DEFAULT 1"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", migration.table, migration.column).Scan(&exists); err != nil {
@@ -799,6 +801,9 @@ func (d *DB) migrateOnce() error {
 				return err
 			}
 		}
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE site_node_schedules SET schedule_revision=1 WHERE schedule_revision<=0"); err != nil {
+		return err
 	}
 	if previousSchemaVersion < 34 {
 		// A pre-34 database had no durable invalidation bit. Preserve ready
