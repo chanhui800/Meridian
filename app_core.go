@@ -36,6 +36,8 @@ type App struct {
 	tmdbOnce           sync.Once
 	agentReportMu      sync.Mutex
 	agentReportLimiter *nodeReportAdmission
+	agentLiveReportMu  sync.Mutex
+	agentLiveLimiter   *nodeReportAdmission
 	agentPreAuthMu     sync.Mutex
 	agentPreAuth       *agentPreAuthAdmission
 }

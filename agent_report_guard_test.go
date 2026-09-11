@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,6 +175,51 @@ func TestNodeReportAdmissionReclaimsIdleEntries(t *testing.T) {
 	admission.mu.Unlock()
 	if exists {
 		t.Fatal("idle node report limiter entry was not reclaimed")
+	}
+}
+
+func TestAgentLiveReportAdmissionIsIndependentFromFullReports(t *testing.T) {
+	app := &App{}
+	now := time.Now()
+	fullRelease, _, ok := app.agentReports().admit(42, now)
+	if !ok {
+		t.Fatal("full report was rejected")
+	}
+	defer fullRelease()
+
+	liveRelease, _, ok := app.agentLiveReports().admit(42, now)
+	if !ok {
+		t.Fatal("live report was blocked by an in-flight full report")
+	}
+	liveRelease()
+	if app.agentReports() == app.agentLiveReports() {
+		t.Fatal("live and full reports unexpectedly share an admission limiter")
+	}
+}
+
+func TestAgentLiveHandlerIsNotBlockedByFullReport(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "live-admission", Address: "203.0.113.42"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := app.db.EnrollControlNode(enrollment, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullRelease, _, ok := app.agentReports().admit(node.ID, now)
+	if !ok {
+		t.Fatal("full report was rejected")
+	}
+	defer fullRelease()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/live", strings.NewReader(`{"report_session_id":"live-test","counter_epoch":"kernel:eth0","sequence":1,"telemetry_sequence":1,"sampled_at_ms":1}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	app.handleAgentLive(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("live report status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
 }
 
