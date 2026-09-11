@@ -2312,41 +2312,8 @@ func edgeEnroll(ctx context.Context, client *http.Client, controller, tokenFile,
 	return state, nil
 }
 
-func edgeDefaultInterface() string {
-	file, err := os.Open("/proc/net/route")
-	if err == nil {
-		defer file.Close()
-		scanner := bufio.NewScanner(file)
-		_ = scanner.Scan()
-		for scanner.Scan() {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) >= 4 && fields[1] == "00000000" {
-				flags, parseErr := strconv.ParseUint(fields[3], 16, 32)
-				if parseErr == nil && flags&2 != 0 {
-					return fields[0]
-				}
-			}
-		}
-	}
-	interfaces, _ := net.Interfaces()
-	for _, candidate := range interfaces {
-		if candidate.Flags&net.FlagUp != 0 && candidate.Flags&net.FlagLoopback == 0 {
-			return candidate.Name
-		}
-	}
-	return ""
-}
-
-func edgeCounter(interfaceName, name string) (int64, error) {
-	if name != "rx_bytes" && name != "tx_bytes" {
-		return 0, errors.New("invalid counter")
-	}
-	data, err := os.ReadFile(filepath.Join("/sys/class/net", interfaceName, "statistics", name)) // #nosec G304 -- interface is discovered from the kernel route table.
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-}
+// edgeDefaultInterface, edgeCounter and edgeCounterEpoch are platform-specific
+// and live in edge_agent_counters_unix.go / edge_agent_counters_windows.go.
 
 func edgeBootID() string {
 	random := make([]byte, 8)
@@ -2356,14 +2323,6 @@ func edgeBootID() string {
 		prefix = strings.TrimSpace(string(data)) + ":"
 	}
 	return prefix + hex.EncodeToString(random)
-}
-
-func edgeCounterEpoch(interfaceName string) string {
-	kernelBootID := "unknown"
-	if data, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
-		kernelBootID = strings.TrimSpace(string(data))
-	}
-	return kernelBootID + ":" + interfaceName
 }
 
 func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
@@ -2749,6 +2708,9 @@ func runEdgeAgent() error {
 	const agentApplyRetryMax = 60 * time.Second
 	const agentStaleRecoveryBase = 30 * time.Second
 	const agentStaleRecoveryMax = 5 * time.Minute
+	// agentQuiescedPollInterval bounds the supervisor loop's sleep while the
+	// runtime is quiesced, keeping the CPU idle between retry attempts.
+	const agentQuiescedPollInterval = 2 * time.Second
 	lastConfigAt := time.Time{}
 	lastUpdateAttempt := time.Time{}
 	nextApplyAttempt := time.Time{}
@@ -2882,6 +2844,21 @@ func runEdgeAgent() error {
 			}
 		}
 		if runtime.isQuiesced() {
+			if *once {
+				return nil
+			}
+			// A quiesced runtime has nothing to report or apply. Sleep instead
+			// of spinning: the next fetch/apply attempt is gated by
+			// lastConfigAt/nextApplyAttempt and stale recovery waits on
+			// staleRecoveryAt, so a failing controller or a failing apply must
+			// not burn a CPU core while those timers run out.
+			timer := time.NewTimer(agentQuiescedPollInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-timer.C:
+			}
 			continue
 		}
 		refreshImmediately := false

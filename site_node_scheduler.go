@@ -86,20 +86,55 @@ func (a *App) runNodeSchedulerWorker(ctx context.Context, queue *nodeSchedulerQu
 		case <-ctx.Done():
 			return
 		case job := <-queue.jobs:
-			workCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			var err error
-			if job.cleanup {
-				err = a.deleteTrackedSiteDNS(workCtx, job.value)
-			} else {
-				err = a.reconcileOneSiteSchedule(workCtx, job.value, job.now)
-			}
-			cancel()
-			a.processNodeSchedulerOutcome(job, err)
-			queue.mu.Lock()
-			delete(queue.inFlight, job.value.SiteID)
-			queue.mu.Unlock()
+			a.runNodeSchedulerJob(ctx, queue, job)
 		}
 	}
+}
+
+// runNodeSchedulerJob executes one dequeued job. The schedule is re-read under
+// the site lock so a queued job can never act on a superseded generation: any
+// Cloudflare side effect must be validated against the current revision before
+// it happens. A panic in one job is contained to that job and reported as a
+// failure outcome instead of taking down the whole controller.
+func (a *App) runNodeSchedulerJob(ctx context.Context, queue *nodeSchedulerQueue, job nodeSchedulerJob) {
+	workCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	err := func() (jobErr error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				jobErr = fmt.Errorf("scheduler job panicked: %v", recovered)
+			}
+		}()
+		unlockSite := a.lockSiteSchedule(job.value.SiteID)
+		defer unlockSite()
+		current, loadErr := a.db.siteNodeSchedule(job.value.SiteID)
+		if errors.Is(loadErr, errNodeNotFound) {
+			// The site is gone; there is nothing left to reconcile or clean up.
+			return nil
+		}
+		if loadErr != nil {
+			return loadErr
+		}
+		if current.ScheduleRevision != job.value.ScheduleRevision {
+			// A newer generation replaced this queued job; the next tick
+			// schedules work for the current revision.
+			return nil
+		}
+		if job.cleanup {
+			if current.Enabled || !siteNodeScheduleNeedsCleanup(current) {
+				return nil
+			}
+			return a.deleteTrackedSiteDNSLocked(workCtx, current)
+		}
+		if !current.Enabled {
+			return nil
+		}
+		return a.reconcileOneSiteScheduleLocked(workCtx, current, time.Now())
+	}()
+	cancel()
+	a.processNodeSchedulerOutcome(job, err)
+	queue.mu.Lock()
+	delete(queue.inFlight, job.value.SiteID)
+	queue.mu.Unlock()
 }
 
 func (a *App) enqueueNodeSchedulerJob(queue *nodeSchedulerQueue, job nodeSchedulerJob) bool {
@@ -1011,7 +1046,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if len(requestedSession) > 0 {
 		session = requestedSession[0]
 	}
-	leaseID, err := claimAgentLeaseTx(tx, node.ID, session.ID, session.Epoch)
+	leaseID, err := claimAgentLeaseTx(tx, node.ID, session.ID, session.Epoch, now)
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
@@ -1333,6 +1368,24 @@ func (a *App) cloudflareForScheduling() (*cloudflareClient, error) {
 
 type cloudflareAddressRecord struct{ ID, Type, Name, Content, Comment string }
 
+func (c *cloudflareClient) dnsRecordByID(ctx context.Context, zoneID, recordID string) (cloudflareAddressRecord, error) {
+	result, err := c.request(ctx, http.MethodGet, "/zones/"+url.PathEscape(zoneID)+"/dns_records/"+url.PathEscape(recordID), nil)
+	if err != nil {
+		return cloudflareAddressRecord{}, err
+	}
+	var raw struct {
+		ID      string `json:"id"`
+		Type    string `json:"type"`
+		Name    string `json:"name"`
+		Content string `json:"content"`
+		Comment string `json:"comment"`
+	}
+	if err := json.Unmarshal(result, &raw); err != nil {
+		return cloudflareAddressRecord{}, errors.New("Cloudflare DNS returned an invalid record")
+	}
+	return cloudflareAddressRecord{ID: raw.ID, Type: raw.Type, Name: raw.Name, Content: raw.Content, Comment: raw.Comment}, nil
+}
+
 func (c *cloudflareClient) exactAddressRecords(ctx context.Context, zoneID, name string) ([]cloudflareAddressRecord, error) {
 	result, err := c.request(ctx, http.MethodGet, "/zones/"+url.PathEscape(zoneID)+"/dns_records?name="+url.QueryEscape(name)+"&per_page=100", nil)
 	if err != nil {
@@ -1397,6 +1450,13 @@ func ownedAddressRecord(records []cloudflareAddressRecord, recordType, name, add
 // content may legitimately differ after a node move and is reconciled by the
 // caller. Any unowned exact record is a hard conflict because Cloudflare would
 // otherwise round-robin traffic between an operator record and Meridian's.
+// siteDNSOwnershipMarker is the Cloudflare comment that marks an address
+// record as owned by this Meridian instance for one site. Create, adopt,
+// update and delete paths must all verify against this exact value.
+func siteDNSOwnershipMarker(siteID int64) string {
+	return fmt.Sprintf("Meridian site=%d", siteID)
+}
+
 func classifyOwnedAddressRecords(records []cloudflareAddressRecord, name, marker string) (cloudflareAddressRecord, bool, int, bool) {
 	var owned cloudflareAddressRecord
 	ownedCount := 0
@@ -1565,8 +1625,33 @@ func deleteTrackedSiteDNSRemote(ctx context.Context, cf *cloudflareClient, sched
 	if schedule.cfZoneID == "" {
 		return errors.New("tracked DNS zone is missing")
 	}
+	if err := verifyTrackedSiteDNSOwnership(ctx, cf, schedule); err != nil {
+		return err
+	}
 	if err := cf.deleteRecord(ctx, schedule.cfZoneID, schedule.cfRecordID); err != nil && !isCloudflareRecordNotFoundError(err) {
 		return err
+	}
+	return nil
+}
+
+// verifyTrackedSiteDNSOwnership re-reads the tracked record before the
+// destructive delete. Only a record that still carries the exact Meridian
+// ownership marker for this site may be removed; an operator edit (cleared
+// comment, changed type or renamed host) is treated as a conflict and left in
+// place for the operator to resolve. A record that no longer exists remains an
+// idempotent success so the local cleanup can complete.
+func verifyTrackedSiteDNSOwnership(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule) error {
+	record, err := cf.dnsRecordByID(ctx, schedule.cfZoneID, schedule.cfRecordID)
+	if err != nil {
+		if isCloudflareRecordNotFoundError(err) {
+			return nil
+		}
+		return err
+	}
+	if (record.Type != "A" && record.Type != "AAAA") ||
+		!strings.EqualFold(strings.TrimSpace(record.Name), strings.TrimSpace(schedule.PublicHost)) ||
+		strings.TrimSpace(record.Comment) != siteDNSOwnershipMarker(schedule.SiteID) {
+		return errors.New("tracked DNS record no longer carries the Meridian ownership marker; refusing to delete")
 	}
 	return nil
 }
@@ -1609,6 +1694,17 @@ func restoreDNSRecordBestEffort(ctx context.Context, cf *cloudflareClient, zoneI
 		return err
 	}
 	return nil
+}
+
+// recreateReplacedDNSRecordBestEffort recreates a record that a family switch
+// (A↔AAAA) deleted after its replacement create failed. Best effort: if the
+// restore also fails, the next reconcile retries the complete switch.
+func recreateReplacedDNSRecordBestEffort(ctx context.Context, cf *cloudflareClient, zoneID string, previous cloudflareAddressRecord) error {
+	if cf == nil || strings.TrimSpace(previous.ID) == "" {
+		return nil
+	}
+	_, err := cf.writeAddressRecord(ctx, zoneID, "", previous.Type, previous.Name, previous.Content, previous.Comment)
+	return err
 }
 
 func compensateDNSRecordBestEffort(ctx context.Context, cf *cloudflareClient, zoneID, name, expectedContent, marker, recordID string, created bool, previous *cloudflareAddressRecord) error {
@@ -1762,21 +1858,27 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 			return err
 		}
 	}
-	marker := fmt.Sprintf("Meridian site=%d", schedule.SiteID)
+	marker := siteDNSOwnershipMarker(schedule.SiteID)
 	trackedRecordID := strings.TrimSpace(schedule.cfRecordID)
 	recordID := trackedRecordID
 	dnsRecordCreated := false
 	var previousRecord *cloudflareAddressRecord
+	var replacedRecord *cloudflareAddressRecord
 	if recordID != "" {
 		// Keep a preimage for a possible PUT compensation if the schedule
 		// generation changes before the local transaction commits.
-		if records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost); getErr == nil {
-			for i := range records {
-				if records[i].ID == recordID {
-					copy := records[i]
-					previousRecord = &copy
-					break
-				}
+		records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
+		if getErr != nil {
+			// Without the preimage a compensating PUT could not restore the
+			// previous address if the schedule changes mid-update. Refuse the
+			// blind write; the next tick retries with a fresh snapshot.
+			return fmt.Errorf("read current DNS record before update: %w", getErr)
+		}
+		for i := range records {
+			if records[i].ID == recordID {
+				copy := records[i]
+				previousRecord = &copy
+				break
 			}
 		}
 	}
@@ -1801,6 +1903,8 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 					if err := cf.deleteRecord(ctx, zoneID, owned.ID); err != nil && !isCloudflareRecordNotFoundError(err) {
 						return err
 					}
+					replaced := owned
+					replacedRecord = &replaced
 				} else {
 					recordID = owned.ID
 				}
@@ -1826,6 +1930,10 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 				return errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
 			} else if ok && owned.Type == recordType {
 				recordID, err = owned.ID, nil
+				// The adopted record was created by this attempt's lost POST, so
+				// compensation must delete it if the schedule generation no
+				// longer matches; otherwise it would leak an untracked record.
+				dnsRecordCreated = creatingRecord
 			}
 		}
 	}
@@ -1847,9 +1955,16 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 					err = errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
 				case ok && owned.Type == recordType:
 					recordID, err, recoveredRecord = owned.ID, nil, true
+					// The adopted marker record is untracked in this schedule
+					// generation, so compensation must remove it if the local
+					// transaction still fails; otherwise it would leak.
+					dnsRecordCreated = true
 				case ok:
 					if deleteErr := cf.deleteRecord(ctx, zoneID, owned.ID); deleteErr != nil && !isCloudflareRecordNotFoundError(deleteErr) {
 						err = deleteErr
+					} else {
+						replaced := owned
+						replacedRecord = &replaced
 					}
 				default:
 					err = errors.New("tracked Meridian DNS record is missing")
@@ -1864,6 +1979,14 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 		}
 	}
 	if err != nil {
+		if replacedRecord != nil {
+			// A family switch (A↔AAAA) deleted the previous record before its
+			// replacement create failed. Restore the old record so a transient
+			// Cloudflare error cannot leave the hostname without any address.
+			if restoreErr := recreateReplacedDNSRecordBestEffort(ctx, cf, zoneID, *replacedRecord); restoreErr != nil {
+				return errors.Join(err, restoreErr)
+			}
+		}
 		return err
 	}
 	// DNS is an external side effect and is complete at this point. Publish the
@@ -1975,7 +2098,7 @@ func (a *App) processNodeSchedulerOutcome(job nodeSchedulerJob, err error) {
 				shouldCooldown = now.Sub(time.UnixMilli(value.ConfigPendingSinceMS)) >= 90*time.Second
 			}
 			if shouldCooldown {
-				if cooldownErr := a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, err, now); cooldownErr != nil {
+				if cooldownErr := a.recordSiteNodeProbeFailureForJob(value, err, now); cooldownErr != nil {
 					log.Printf("[node-scheduler] record site %d node %d cooldown failed: %v", value.SiteID, value.DesiredNodeID, cooldownErr)
 				}
 			}
@@ -1984,6 +2107,20 @@ func (a *App) processNodeSchedulerOutcome(job nodeSchedulerJob, err error) {
 	if value.DNSStatus != "waiting" || value.LastError != err.Error() {
 		_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=1 AND desired_node_id=? AND schedule_revision=?", err.Error(), now.UnixMilli(), value.SiteID, value.DesiredNodeID, value.ScheduleRevision)
 	}
+}
+
+// recordSiteNodeProbeFailureForJob records the health-check cooldown only when
+// the schedule generation that produced the failure is still current. The
+// outcome runs after the job released the site lock, so a superseded job's
+// failure must not penalize the node for the replacement generation.
+func (a *App) recordSiteNodeProbeFailureForJob(value SiteNodeSchedule, jobErr error, now time.Time) error {
+	unlockSite := a.lockSiteSchedule(value.SiteID)
+	defer unlockSite()
+	current, err := a.db.siteNodeSchedule(value.SiteID)
+	if err != nil || current.ScheduleRevision != value.ScheduleRevision || current.DesiredNodeID != value.DesiredNodeID {
+		return nil
+	}
+	return a.db.recordSiteNodeProbeFailure(value.SiteID, value.DesiredNodeID, jobErr, now)
 }
 
 func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {

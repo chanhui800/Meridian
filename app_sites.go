@@ -487,6 +487,12 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	case action == "toggle" && r.Method == "POST":
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
+		// Site lifecycle mutations bump schedule_revision and race the
+		// scheduler's Cloudflare side effects; serialize them with the same
+		// per-site lock the scheduler workers use (lock order:
+		// siteLifecycleMu -> siteScheduleLock).
+		unlockSchedule := a.lockSiteSchedule(id)
+		defer unlockSchedule()
 		site, err := a.db.GetSite(id)
 		if err != nil {
 			a.jsonErr(w, 500, err.Error())
@@ -562,6 +568,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	case action == "" && r.Method == "PUT":
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
+		// Serialize with scheduler workers: the update bumps schedule_revision
+		// and may replace the public host the scheduler manages DNS for
+		// (lock order: siteLifecycleMu -> siteScheduleLock).
+		unlockSchedule := a.lockSiteSchedule(id)
+		defer unlockSchedule()
 		oldSite, err := a.db.GetSite(id)
 		if err != nil {
 			a.jsonErr(w, 404, "site not found")
@@ -1036,6 +1047,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	case action == "" && r.Method == "DELETE":
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
+		// removeSiteNodeSchedule serializes the schedule/remote-DNS cleanup
+		// with scheduler workers through its own per-site lock; DeleteSite and
+		// the disable fallback bump schedule_revision so any queued worker job
+		// fails its CAS. Do not take lockSiteSchedule here: the mutex is not
+		// re-entrant and removeSiteNodeSchedule would deadlock.
 		// Only delete after a clean stop. If ingress already closed but drain or
 		// final persistence failed, retain a disabled row as the retry handle.
 		if stopErr := a.pm.StopSite(id); stopErr != nil {

@@ -1542,10 +1542,20 @@ func appendNodeEventIdentity(ids *[]int64, uids *[]string, event NodeRequestEven
 	}
 }
 
+// agentLeaseTTL is how long a claimed Agent lease stays valid without a
+// renewal. Agents report every five seconds and renew on every accepted report
+// and config fetch, so a healthy lease never lapses; a lapsed lease means the
+// owning Agent stopped reporting and may be taken over by another session.
+const agentLeaseTTL = 90 * time.Second
+
 // claimAgentLeaseTx binds a process session to the node before the first
 // report is accepted. A newer session epoch rotates the lease; an older
-// session can no longer overwrite state after a restart or failover.
-func claimAgentLeaseTx(tx *sql.Tx, nodeID int64, sessionID string, sessionEpoch int64) (string, error) {
+// session can no longer overwrite state after a restart or failover. A lease
+// whose TTL lapsed proves the owning Agent stopped reporting, so another
+// enrolled session may take the node over: the takeover rotates the lease and
+// stamps a fresh expiry, and the superseded session can only reclaim after the
+// new lease itself expires.
+func claimAgentLeaseTx(tx *sql.Tx, nodeID int64, sessionID string, sessionEpoch int64, now time.Time) (string, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" || sessionEpoch <= 0 {
 		var lease string
@@ -1555,23 +1565,34 @@ func claimAgentLeaseTx(tx *sql.Tx, nodeID int64, sessionID string, sessionEpoch 
 		return strings.TrimSpace(lease), nil
 	}
 	var activeSession, lease string
-	var activeEpoch int64
-	if err := tx.QueryRow("SELECT active_agent_session_id,agent_session_epoch,agent_lease_id FROM control_nodes WHERE id=?", nodeID).Scan(&activeSession, &activeEpoch, &lease); err != nil {
+	var activeEpoch, activeExpiryMS int64
+	if err := tx.QueryRow("SELECT active_agent_session_id,agent_session_epoch,agent_lease_id,agent_lease_expires_at_ms FROM control_nodes WHERE id=?", nodeID).Scan(&activeSession, &activeEpoch, &lease, &activeExpiryMS); err != nil {
 		return "", err
 	}
 	activeSession = strings.TrimSpace(activeSession)
 	lease = strings.TrimSpace(lease)
+	nowMS := now.UnixMilli()
+	expiresMS := now.Add(agentLeaseTTL).UnixMilli()
 	if activeSession == sessionID && activeEpoch == sessionEpoch && lease != "" {
+		// Same session reclaiming through the config path: renew the window.
+		if _, err := tx.Exec("UPDATE control_nodes SET agent_lease_expires_at_ms=?,updated_at_ms=? WHERE id=?", expiresMS, nowMS, nodeID); err != nil {
+			return "", err
+		}
 		return lease, nil
 	}
-	if activeSession != "" && sessionEpoch <= activeEpoch {
+	leaseExpired := activeSession != "" && activeExpiryMS > 0 && nowMS > activeExpiryMS
+	if activeSession != "" && !leaseExpired && sessionEpoch <= activeEpoch {
 		return "", errStaleAgentSession
 	}
 	newLease, err := newNodeToken()
 	if err != nil {
 		return "", err
 	}
-	if _, err := tx.Exec("UPDATE control_nodes SET active_agent_session_id=?,agent_session_epoch=?,agent_lease_id=?,updated_at_ms=? WHERE id=?", sessionID, sessionEpoch, newLease, time.Now().UnixMilli(), nodeID); err != nil {
+	// The claiming session keeps its own epoch so its subsequent reports keep
+	// matching the stored (session, epoch, lease) triple. Fencing against the
+	// superseded owner is preserved by the rotated lease ID: the old lease can
+	// never validate again, and reclaiming it requires the new lease to expire.
+	if _, err := tx.Exec("UPDATE control_nodes SET active_agent_session_id=?,agent_session_epoch=?,agent_lease_id=?,agent_lease_expires_at_ms=?,updated_at_ms=? WHERE id=?", sessionID, sessionEpoch, newLease, expiresMS, nowMS, nodeID); err != nil {
 		return "", err
 	}
 	return newLease, nil
@@ -1725,12 +1746,12 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 			lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,agent_lease_expires_at_ms=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
 		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), appliedHash, report.AppliedConfigRevision, applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
 		clearAppliedConfig,
 		report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration,
-		now.UnixMilli(), now.UnixMilli(), id); err != nil {
+		now.Add(agentLeaseTTL).UnixMilli(), now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
 	}
 	// A cold-started Agent may report before it has successfully applied the

@@ -49,6 +49,10 @@ type ProxyInstance struct {
 	reqCount                  atomic.Int64
 	pendingRequests           atomic.Int64
 	persistedTraffic          atomic.Int64
+	// trafficGeneration backs the flush-generation fallback for controller
+	// local instances (no Agent runtime counter). The dashboard trend snapshot
+	// uses it to detect a flush that raced its SQLite history read.
+	trafficGeneration         atomic.Uint64
 	trafficCycleStart         time.Time
 	trafficCycleMode          string
 	trafficCycleUsage         int64
@@ -130,10 +134,16 @@ func (inst *ProxyInstance) trafficPendingRequests() *atomic.Int64 {
 }
 
 func (inst *ProxyInstance) trafficFlushGeneration() *atomic.Uint64 {
-	if inst != nil && inst.trafficCounter != nil {
+	if inst == nil {
+		return nil
+	}
+	if inst.trafficCounter != nil {
 		return &inst.trafficCounter.flushGeneration
 	}
-	return nil
+	// Controller-local instances track the flush generation inline so the
+	// trend snapshot's retry logic also covers sites without an Agent
+	// runtime counter.
+	return &inst.trafficGeneration
 }
 
 type ProxyManager struct {
