@@ -223,6 +223,7 @@ func TestRequestLogClassificationAndSanitization(t *testing.T) {
 		{path: "/Items?Recursive=true", want: requestLogCategoryMetadata},
 		{path: "/Shows/NextUp", want: requestLogCategoryMetadata},
 		{path: "/Videos/abc/Subtitles/0/Stream.vtt", want: requestLogCategorySubtitle},
+		{path: "/emby/emya/subtitle", want: requestLogCategorySubtitle},
 		{path: "/web/app.js", want: requestLogCategoryAsset},
 		{path: "/socket", want: requestLogCategoryWebSocket, upgrade: true},
 		{path: "/Users/AuthenticateByName", want: requestLogCategoryAuth},

@@ -808,6 +808,7 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 						// Some Emby-compatible servers mark relative subtitle DeliveryUrl
 						// values as external. Resolve them against the real upstream
 						// PlaybackInfo URL so the optional subtitle cannot reject the video.
+						session.rememberRelativePlaybackPath(deliveryText)
 						rewritten, err := session.rewriteAgainstSourceKindWithRequiredHeaders(deliveryText, session.base, capabilitySource, kind, requiredHeaders)
 						if err != nil {
 							return nil, err

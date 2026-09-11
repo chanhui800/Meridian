@@ -6470,6 +6470,14 @@ func TestPathIngressNormalizationAndPrefixHelpers(t *testing.T) {
 	if u.Path != "/Videos/1" {
 		t.Fatalf("stripped path=%q", u.Path)
 	}
+	uRepeated, err := url.Parse("https://panel.example/emos/emos/_meridian/d/token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripIngressPathPrefix(uRepeated, "/emos")
+	if uRepeated.Path != "/_meridian/d/token" {
+		t.Fatalf("repeated stripped path=%q, want /_meridian/d/token", uRepeated.Path)
+	}
 	if got := addIngressPathPrefix("/Videos/1", "/emby"); got != "/emby/Videos/1" {
 		t.Fatalf("prefixed path=%q", got)
 	}

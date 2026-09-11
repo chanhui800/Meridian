@@ -505,7 +505,7 @@ func classifyRequestLogResource(r *http.Request) string {
 		return requestLogCategoryManifest
 	case requestLogPathHasSuffix(path, ".ts", ".m4s"):
 		return requestLogCategorySegment
-	case strings.Contains(path, "/subtitles/"), strings.HasSuffix(path, "/subtitles"), strings.Contains(path, "/captions/"), requestLogPathHasSuffix(path, ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup"):
+	case strings.Contains(path, "/subtitles/"), strings.HasSuffix(path, "/subtitles"), strings.Contains(path, "/captions/"), strings.Contains(path, "/emya/subtitle"), requestLogPathHasSuffix(path, ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup"):
 		return requestLogCategorySubtitle
 	case strings.Contains(path, "/images/"), strings.HasSuffix(path, "/images"), strings.Contains(path, "/image/"), strings.Contains(path, "/icons/"), strings.Contains(path, "/branding/"), strings.Contains(path, "/covers/"), requestLogPathHasSuffix(path, ".jpg", ".jpeg", ".gif", ".png", ".svg", ".ico", ".webp", ".avif"):
 		return requestLogCategoryImage
