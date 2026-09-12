@@ -579,10 +579,17 @@ func installDynamicStructuredBody(resp *http.Response, payload []byte, rewritten
 	resp.ContentLength = int64(len(payload))
 	resp.Uncompressed = true
 	resp.Trailer = nil
+	// The installed body is always the decoded payload, so wire-representation
+	// headers (Content-Encoding from a gunzipped original, and checksums
+	// computed over those wire bytes) are stale in every mode and must go.
+	for _, name := range []string{
+		"Content-Encoding", "Content-MD5", "Digest",
+	} {
+		resp.Header.Del(name)
+	}
 	if rewritten {
 		for _, name := range []string{
-			"Accept-Ranges", "Content-Encoding", "Content-MD5", "Content-Range", "Digest",
-			"ETag", "Last-Modified", "Vary",
+			"Accept-Ranges", "Content-Range", "ETag", "Last-Modified", "Vary",
 		} {
 			resp.Header.Del(name)
 		}
@@ -817,10 +824,10 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		// for the whole site. PlaybackInfo keeps its own stricter chain: its
 		// denials (for example required headers on a relative URL that no
 		// capability could carry) must stay hard errors.
-		issuer.observe(source, dynamicObservationDecisionDenied, dynamicStructuredRewriteDeniedReason(source), authority)
 		if resp != nil && resp.Body != nil && resp.StatusCode < http.StatusBadRequest &&
 			(source == dynamicDiscoverySourceHLS || source == dynamicDiscoverySourceDASH) {
 			log.Printf("[%s] %s rewrite rejected; preserving upstream response: %v", issuer.site.Name, source, err)
+			issuer.observe(source, dynamicObservationDecisionDenied, dynamicStructuredRewriteDeniedReason(source), authority)
 			installDynamicStructuredBody(resp, payload, false)
 			return nil
 		}

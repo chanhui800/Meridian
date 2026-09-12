@@ -443,7 +443,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
 				var cacheWriter http.ResponseWriter
 				if speedLimitBytes > 0 {
-					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut(), start: time.Now(), ctx: r.Context()}
+					limited := &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut(), start: time.Now(), ctx: r.Context()}
+					if trafficQuota > 0 {
+						cacheWriter = &quotaLimitedWriter{meteredWriter: meteredWriter{ResponseWriter: limited}, pm: pm, inst: inst, quota: trafficQuota}
+					} else {
+						cacheWriter = limited
+					}
 				} else {
 					cacheWriter = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
 				}

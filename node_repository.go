@@ -920,6 +920,9 @@ func (d *DB) DeleteControlNode(id int64) error {
 	if _, err := tx.Exec("DELETE FROM node_site_counters WHERE node_id=?", id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM node_site_traffic_logs WHERE node_id=?", id); err != nil {
+		return err
+	}
 	result, err := tx.Exec("DELETE FROM control_nodes WHERE id=?", id)
 	if err != nil {
 		return err

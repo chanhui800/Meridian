@@ -339,6 +339,7 @@ func (s *edgeEventStore) add(event NodeRequestEvent) error {
 			}
 		} else {
 			s.dropped++
+			s.lastPersist = time.Now()
 			return s.persistLocked()
 		}
 	}
@@ -360,6 +361,15 @@ func (s *edgeEventStore) persistDebouncedLocked() error {
 		return nil
 	}
 	s.lastPersist = now
+	return s.persistLocked()
+}
+
+// flush performs a synchronous persist for shutdown paths where the
+// debounce window may still hold unpersisted, unacknowledged events.
+func (s *edgeEventStore) flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastPersist = time.Now()
 	return s.persistLocked()
 }
 
@@ -1969,6 +1979,9 @@ func (runtime *edgeAgentRuntime) close() {
 	if bundle != nil {
 		bundle.close()
 	}
+	// The debounced spool may still hold <2s of unpersisted events; a
+	// graceful stop (self-update, systemd) must not lose them.
+	_ = runtime.events.flush()
 }
 
 func (runtime *edgeAgentRuntime) setSessionEpoch(epoch int64) {

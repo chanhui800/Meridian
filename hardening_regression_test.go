@@ -619,3 +619,57 @@ func TestAgentConfigHashKeepsPreV1986SiteWireCompatibility(t *testing.T) {
 		t.Fatalf("legacy site conversion = %#v", legacy)
 	}
 }
+
+func TestQuotaLimitedWriterAbortsPastQuota(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSiteRecord(Site{Name: "quota-writer", ListenPort: 19861, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "passthrough"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE sites SET traffic_quota=? WHERE id=?", 1024, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	inst := &ProxyInstance{Site: *site}
+	pm := NewProxyManager(app.db, nil)
+	// Seed the cached cycle usage above the quota so the first 16 MiB probe
+	// aborts; the cycle boundary matches the current settings so the cache is
+	// used instead of a fresh DB sum.
+	inst.trafficCycleStart = time.Now().Add(-time.Hour)
+	inst.trafficCycleMode = trafficBillingModeBidirectional
+	inst.trafficCycleUsage = 4096
+	recorder := httptest.NewRecorder()
+	writer := &quotaLimitedWriter{
+		meteredWriter: meteredWriter{ResponseWriter: recorder, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()},
+		pm:    pm,
+		inst:  inst,
+		quota: 1024,
+	}
+	payload := make([]byte, quotaCheckBytes+1)
+	_, err = writer.Write(payload)
+	if !errors.Is(err, http.ErrAbortHandler) {
+		t.Fatalf("write err=%v, want http.ErrAbortHandler", err)
+	}
+	if inst.trafficBytesOut().Load() != int64(len(payload)) {
+		t.Fatalf("metered=%d, want %d", inst.trafficBytesOut().Load(), len(payload))
+	}
+}
+
+func TestDynamicPreserveStripsStaleContentEncoding(t *testing.T) {
+	resp := &http.Response{
+		Header:     http.Header{},
+		StatusCode: http.StatusOK,
+	}
+	resp.Header.Set("Content-Encoding", "gzip")
+	resp.Header.Set("ETag", "\"v1\"")
+	installDynamicStructuredBody(resp, []byte("#EXTM3U\n"), false)
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Fatalf("preserved response still carries Content-Encoding=%q", got)
+	}
+	if got := resp.Header.Get("ETag"); got == "" {
+		t.Fatal("no-op preserve lost the ETag validator")
+	}
+	installDynamicStructuredBody(resp, []byte("#EXTM3U\n#rewritten\n"), true)
+	if got := resp.Header.Get("ETag"); got != "" {
+		t.Fatal("rewritten response kept a stale ETag validator")
+	}
+}
