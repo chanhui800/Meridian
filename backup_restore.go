@@ -2455,8 +2455,14 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 		if err := rollbackRestoreFiles(dbPath, rollback); err != nil {
 			return nil, fmt.Errorf("回滚上次未完成的恢复: %w", err)
 		}
-		_ = os.Remove(appliedMarker) // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
-		_ = os.RemoveAll(rollback)   // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
+		// Invariant: as long as the applied marker exists, the complete
+		// rollback snapshot must still exist. Remove the marker first and
+		// propagate its error; only then may the snapshot be discarded. A
+		// stale marker with a deleted snapshot would brick every later boot.
+		if err := os.Remove(appliedMarker); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
+			return nil, fmt.Errorf("移除恢复标记失败，保留回滚快照: %w", err)
+		}
+		_ = os.RemoveAll(rollback) // #nosec G703 G304 -- fixed suffix path derived from the configured database path.
 		// A crash after the staged database was moved leaves an incomplete
 		// pending directory. The old installation is authoritative after the
 		// rollback; discard that stage instead of trying to apply it again.

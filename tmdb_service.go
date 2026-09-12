@@ -160,8 +160,8 @@ func (s *tmdbService) runOne(ctx context.Context, now time.Time) (bool, error) {
 	token, err := decryptTMDBReadToken(stored.TokenCiphertext)
 	if err != nil {
 		if markErr := s.db.markTMDBCredentialResult(tmdbCredentialInvalid, "decrypt", now.UnixMilli()); markErr != nil {
-		log.Printf("[tmdb] persist credential-invalid state failed: %v", markErr)
-	}
+			log.Printf("[tmdb] persist credential-invalid state failed: %v", markErr)
+		}
 		return false, err
 	}
 	job, found, err := s.db.claimTMDBJob(now.UnixMilli())

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"math"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"

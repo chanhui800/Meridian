@@ -377,8 +377,11 @@ func (s *edgeEventStore) persistDebouncedLocked() error {
 func (s *edgeEventStore) flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
 	s.lastPersist = time.Now()
-	return s.persistLocked()
+	return nil
 }
 
 func (s *edgeEventStore) snapshot() []NodeRequestEvent {
@@ -420,8 +423,11 @@ func (s *edgeEventStore) ack(events []NodeRequestEvent) error {
 		}
 	}
 	s.items = kept
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
 	s.lastPersist = time.Now()
-	return s.persistLocked()
+	return nil
 }
 
 type edgeSiteStats struct {

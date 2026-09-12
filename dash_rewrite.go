@@ -35,7 +35,7 @@ func dashFixedTemplateClaimMarker(index int) string {
 func sanitizeDASHTemplate(value string) (string, []dashTemplateMarker, error) {
 	const markerPrefix = dashTemplateMarkerPrefix
 	if value == "" || len(value) > maxDynamicTargetURLBytes || strings.Contains(value, markerPrefix) || strings.Contains(strings.ToLower(value), dashFixedTemplateClaimMarkerPrefix) || containsDynamicUnsafeRune(value) {
-		return "", nil, fmt.Errorf("invalid DASH URL template")
+		return "", nil, newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL template"))
 	}
 	markers := make([]dashTemplateMarker, 0, 4)
 	var output strings.Builder
@@ -112,7 +112,7 @@ func formatDASHFixedTemplateValue(expression string, bindings dashTemplateBindin
 func prepareDASHTemplateReferences(sanitized string, markers []dashTemplateMarker, bindings dashTemplateBindings) (string, string, []string, error) {
 	reference, err := url.Parse(sanitized)
 	if err != nil || reference.User != nil || reference.Fragment != "" || reference.RawFragment != "" || reference.Opaque != "" {
-		return "", "", nil, fmt.Errorf("invalid DASH URL template")
+		return "", "", nil, newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL template"))
 	}
 	validationText := sanitized
 	claimText := sanitized
@@ -216,7 +216,7 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	validationReference, validationErr := url.Parse(validationText)
 	claimReference, claimErr := url.Parse(claimText)
 	if validationErr != nil || claimErr != nil || validationReference.User != nil || claimReference.User != nil || validationReference.Fragment != "" || claimReference.Fragment != "" || validationReference.RawFragment != "" || claimReference.RawFragment != "" || validationReference.Opaque != "" || claimReference.Opaque != "" {
-		return "", fmt.Errorf("invalid DASH URL template")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL template"))
 	}
 	resolvedValidation := base.ResolveReference(validationReference)
 	resolvedClaim := base.ResolveReference(claimReference)
@@ -231,7 +231,7 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 		claimURL, claimErr = normalizeDynamicURL(resolvedClaim.String())
 	}
 	if validationErr != nil || claimErr != nil {
-		return "", fmt.Errorf("invalid DASH URL template")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL template"))
 	}
 	claimTarget, expressions, err := restoreDASHTemplateClaimMarkers(claimURL.String(), markers)
 	if err != nil {
@@ -243,7 +243,7 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	}
 	session.urlCount++
 	if session.urlCount > session.issuer.policy.limits.MaxURLsPerResponse {
-		return "", fmt.Errorf("discovered URL count exceeds its limit")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("discovered URL count exceeds its limit"))
 	}
 	seenKey := "dash-template\x00" + strconv.FormatBool(configured) + "\x00" + claimTarget + "\x00" + strings.Join(expressions, "\x1f") + "\x00" + strings.Join(fixedValues, "\x1f")
 	if route, exists := session.seen[seenKey]; exists {
@@ -457,9 +457,9 @@ func rewriteDASHNode(node *dashXMLNode, inheritedBase *url.URL, inheritedAddress
 				return 0, err
 			}
 			reloadDepth := max(1, session.depth)
-			rewritten, err := session.rewriteAgainstSourceKindDepth(value, session.base, dynamicDiscoverySourceDASH, dynamicCapabilityKindManifest, reloadDepth)
+			rewritten, err := session.rewriteAgainstSourceKindDepthWithRequiredHeaders(value, session.base, dynamicDiscoverySourceDASH, dynamicCapabilityKindManifest, reloadDepth, nil)
 			if err != nil {
-				return 0, err
+				return 0, newDynamicPolicyDenialError(err)
 			}
 			setDASHNodeText(node, rewritten)
 		}
