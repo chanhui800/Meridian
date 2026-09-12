@@ -564,11 +564,18 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			closeNewListener()
 			return fmt.Errorf("final traffic flush of the instance being replaced: %w", err)
 		}
-		if flushed := existing.Site.TrafficUsed; flushed > inst.persistedTraffic.Load() {
-			inst.persistedTraffic.Store(flushed)
-			inst.persistedBytesIn.Store(existing.Site.TrafficUsedIn)
-			inst.persistedBytesOut.Store(existing.Site.TrafficUsedOut)
-			inst.Site.TrafficUsed = flushed
+		// The 60s flusher mutates these Site fields under trafficMu; take the
+		// same lock so a concurrent flush cannot hand us a torn baseline.
+		existing.trafficMu.Lock()
+		flushedTraffic := existing.Site.TrafficUsed
+		flushedIn := existing.Site.TrafficUsedIn
+		flushedOut := existing.Site.TrafficUsedOut
+		existing.trafficMu.Unlock()
+		if flushedTraffic > inst.persistedTraffic.Load() {
+			inst.persistedTraffic.Store(flushedTraffic)
+			inst.persistedBytesIn.Store(flushedIn)
+			inst.persistedBytesOut.Store(flushedOut)
+			inst.Site.TrafficUsed = flushedTraffic
 		}
 	}
 

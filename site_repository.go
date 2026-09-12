@@ -752,6 +752,11 @@ func (d *DB) DeleteSite(id int64) error {
 	if _, err := tx.Exec("DELETE FROM traffic_logs WHERE site_id=?", id); err != nil {
 		return err
 	}
+	// Foreign keys are not enforced by the SQLite DSN, so the node traffic
+	// ledger needs the same explicit cascade as traffic_logs above.
+	if _, err := tx.Exec("DELETE FROM node_site_traffic_logs WHERE site_id=?", id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM dynamic_observations WHERE site_id=?", id); err != nil {
 		return err
 	}

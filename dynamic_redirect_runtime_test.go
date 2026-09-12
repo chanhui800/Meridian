@@ -2019,7 +2019,9 @@ func TestDynamicRedirectRuntimeProfileOperationalBoundaries(t *testing.T) {
 			state := newDynamicSiteState(runtime, limits)
 			for index := range limits.MaxAuthorities - 1 {
 				authority := fmt.Sprintf("https://seed-%d.example.com:443", index)
-				state.authorities[authority] = &dynamicAuthorityEntry{committed: true}
+				// Seed through the same fields reserveAuthority populates so
+				// the idle-eviction sweep treats these as freshly used.
+				state.authorities[authority] = &dynamicAuthorityEntry{committed: true, lastUsed: now.UnixNano()}
 				runtime.authorities[authority] = 1
 			}
 			if len(state.authorities) != limits.MaxAuthorities-1 {

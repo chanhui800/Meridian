@@ -2502,7 +2502,15 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 	defer os.Remove(temporaryName)
 	digest := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(response.Body, 128<<20))
-	if copyErr != nil || written <= 0 || !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), config.AgentSHA256) {
+	if copyErr != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("Agent update download failed: %w", copyErr)
+	}
+	if written <= 0 {
+		_ = temporary.Close()
+		return errors.New("Agent update download was empty")
+	}
+	if !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), config.AgentSHA256) {
 		_ = temporary.Close()
 		return errors.New("Agent update checksum mismatch")
 	}

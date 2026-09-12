@@ -1386,25 +1386,35 @@ func (c *cloudflareClient) dnsRecordByID(ctx context.Context, zoneID, recordID s
 	return cloudflareAddressRecord{ID: raw.ID, Type: raw.Type, Name: raw.Name, Content: raw.Content, Comment: raw.Comment}, nil
 }
 
+// maxCloudflareRecordPages bounds pagination of same-name record listings at
+// 20 pages x 100 records; beyond that the conflict scan degrades gracefully.
+const maxCloudflareRecordPages = 20
+
 func (c *cloudflareClient) exactAddressRecords(ctx context.Context, zoneID, name string) ([]cloudflareAddressRecord, error) {
-	result, err := c.request(ctx, http.MethodGet, "/zones/"+url.PathEscape(zoneID)+"/dns_records?name="+url.QueryEscape(name)+"&per_page=100", nil)
-	if err != nil {
-		return nil, err
-	}
-	var raw []struct {
-		ID      string `json:"id"`
-		Type    string `json:"type"`
-		Name    string `json:"name"`
-		Content string `json:"content"`
-		Comment string `json:"comment"`
-	}
-	if err := json.Unmarshal(result, &raw); err != nil {
-		return nil, errors.New("Cloudflare DNS returned invalid records")
-	}
-	values := make([]cloudflareAddressRecord, 0, len(raw))
-	for _, item := range raw {
-		if (item.Type == "A" || item.Type == "AAAA") && strings.EqualFold(item.Name, name) {
-			values = append(values, cloudflareAddressRecord{ID: item.ID, Type: item.Type, Name: item.Name, Content: item.Content, Comment: item.Comment})
+	query := "/zones/" + url.PathEscape(zoneID) + "/dns_records?name=" + url.QueryEscape(name) + "&per_page=100"
+	values := make([]cloudflareAddressRecord, 0, 8)
+	for page := 1; page <= maxCloudflareRecordPages; page++ {
+		result, info, err := c.requestWithInfo(ctx, http.MethodGet, query+"&page="+strconv.Itoa(page), nil)
+		if err != nil {
+			return nil, err
+		}
+		var raw []struct {
+			ID      string `json:"id"`
+			Type    string `json:"type"`
+			Name    string `json:"name"`
+			Content string `json:"content"`
+			Comment string `json:"comment"`
+		}
+		if err := json.Unmarshal(result, &raw); err != nil {
+			return nil, errors.New("Cloudflare DNS returned invalid records")
+		}
+		for _, item := range raw {
+			if (item.Type == "A" || item.Type == "AAAA") && strings.EqualFold(item.Name, name) {
+				values = append(values, cloudflareAddressRecord{ID: item.ID, Type: item.Type, Name: item.Name, Content: item.Content, Comment: item.Comment})
+			}
+		}
+		if len(raw) == 0 || info.TotalPages <= page {
+			break
 		}
 	}
 	return values, nil

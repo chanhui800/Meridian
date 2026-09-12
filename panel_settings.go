@@ -229,6 +229,17 @@ func (d *DB) SaveManagedPanelSettings(panelDomain, routeDomain string, listenPor
 	if err := validatePanelListenPort(listenPort); err != nil {
 		return PanelSettings{}, 0, err
 	}
+	// The panel listener binds after the site listeners at startup. A port
+	// collision with a dedicated-port site would fatal the next boot and turn
+	// into a restart crash loop, so reject it up front.
+	var portConflicts int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM sites WHERE listen_port=? AND ingress_mode IN (?,?)`,
+		listenPort, ingressModePort, ingressModeBoth).Scan(&portConflicts); err != nil {
+		return PanelSettings{}, 0, err
+	}
+	if portConflicts > 0 {
+		return PanelSettings{}, 0, fmt.Errorf("面板端口 %d 与站点专用端口冲突，请更换端口或调整站点入口", listenPort)
+	}
 	candidate, err := normalizeManagedPanelSettings(panelDomain, routeDomain)
 	if err != nil {
 		return PanelSettings{}, 0, err

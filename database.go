@@ -41,6 +41,7 @@ type DB struct {
 	agentSecurityLastRejectedMS atomic.Int64
 	agentSecurityMu             sync.Mutex
 	agentSecurityLastLog        map[string]time.Time
+	lastTrafficPruneMS          atomic.Int64
 	systemSettings              atomic.Pointer[SystemSettings]
 	nodeTLSMutationMu           sync.Mutex
 	watchHistoryMetadataMu      sync.Mutex

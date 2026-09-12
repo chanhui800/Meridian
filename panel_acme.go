@@ -425,7 +425,15 @@ type cloudflareResponse struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"errors"`
-	Result json.RawMessage `json:"result"`
+	Result     json.RawMessage      `json:"result"`
+	ResultInfo cloudflareResultInfo `json:"result_info"`
+}
+
+// cloudflareResultInfo carries Cloudflare list pagination metadata so list
+// helpers can follow every page instead of silently truncating at per_page.
+type cloudflareResultInfo struct {
+	Page       int `json:"page"`
+	TotalPages int `json:"total_pages"`
 }
 
 const (
@@ -927,10 +935,15 @@ func (m *panelCertificateManager) status(settings PanelSettings, activePanelDoma
 	if m == nil {
 		return status
 	}
+	// Only the in-memory issuing flag and the pair paths need the manager
+	// mutex. File reads, parsing and chain verification run outside it: they
+	// touch disk and the system trust store, and GetCertificate for every TLS
+	// handshake shares this mutex, so holding it across that I/O would stall
+	// panel handshakes whenever a status poll hit a slow disk.
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	status.Issuing = m.issuing
 	certFile, _ := m.panelPairPaths()
+	m.mu.Unlock()
 	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
 	if err != nil {
 		return status
@@ -1227,6 +1240,59 @@ func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, to
 	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.RouteDomain, identifiers, staging)
 }
 
+// reusableCertificateForIdentifiers returns the currently installed panel
+// certificate pair when it is time-valid with more than the renewal window
+// remaining and covers every requested identifier (exact SANs or the route
+// wildcard). Callers invoke it after the shared issuance locks are held so a
+// concurrent issuer's fresh certificate is reused instead of re-issued.
+func (m *panelCertificateManager) reusableCertificateForIdentifiers(identifiers []string) *issuedPanelCertificate {
+	if m == nil || m.certFile == "" || m.keyFile == "" || len(identifiers) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	certFile, keyFile := m.certFile, m.keyFile
+	m.mu.Unlock()
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- certFile is the manager-owned TLS path captured at construction.
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	if now.Before(certificate.NotBefore) || !now.Before(certificate.NotAfter) {
+		return nil
+	}
+	if time.Until(certificate.NotAfter) <= panelCertificateRenewalWindow {
+		return nil
+	}
+	for _, identifier := range identifiers {
+		if strings.HasPrefix(identifier, "*.") {
+			if !certificateHasExactDNSName(certificate, identifier) {
+				return nil
+			}
+			continue
+		}
+		if certificate.VerifyHostname(identifier) != nil {
+			return nil
+		}
+	}
+	keyPEM, err := os.ReadFile(keyFile) // #nosec G304 G703 -- keyFile is the manager-owned TLS path captured at construction.
+	if err != nil {
+		return nil
+	}
+	pair, err := tls.X509KeyPair(data, keyPEM)
+	if err != nil {
+		return nil
+	}
+	return &issuedPanelCertificate{certPEM: data, keyPEM: keyPEM, certificate: pair}
+}
+
 func panelCertificateIdentifiers(settings PanelSettings) []string {
 	wildcard := wildcardDomainForSettings(settings)
 	if wildcard == "" {
@@ -1294,6 +1360,18 @@ func (m *panelCertificateManager) issueCloudflareForIdentifiers(ctx context.Cont
 				log.Printf("[acme] release shared issuance lock failed: %v", err)
 			}
 		}()
+	}
+
+	// Another issuer (web request, renewal scheduler, or CLI) may have finished
+	// while this request waited for the shared issuance lock. If the currently
+	// installed certificate already covers every requested identifier and is
+	// well inside its renewal window, reuse it instead of burning a duplicate
+	// against the CA's per-week duplicate-certificate quota. Staging requests
+	// are explicit test issuances and always proceed.
+	if !staging {
+		if reused := m.reusableCertificateForIdentifiers(cleanIdentifiers); reused != nil {
+			return reused, nil
+		}
 	}
 
 	if err := os.MkdirAll(m.accountDir, 0o700); err != nil { // #nosec G703 -- accountDir is captured from administrator-configured TLS paths.
@@ -1761,17 +1839,24 @@ func waitCloudflareRequestRetry(ctx context.Context, attempt int) error {
 // Cloudflare/API gateway failures without risking duplicate records from a
 // retried POST. The caller's context remains the overall retry budget.
 func (c *cloudflareClient) request(ctx context.Context, method, requestPath string, body io.Reader) (json.RawMessage, error) {
+	result, _, err := c.requestWithInfo(ctx, method, requestPath, body)
+	return result, err
+}
+
+// requestWithInfo behaves like request but also returns Cloudflare's
+// result_info block for paginated list endpoints.
+func (c *cloudflareClient) requestWithInfo(ctx context.Context, method, requestPath string, body io.Reader) (json.RawMessage, cloudflareResultInfo, error) {
 	if c == nil {
-		return nil, errors.New("Cloudflare DNS client is unavailable")
+		return nil, cloudflareResultInfo{}, errors.New("Cloudflare DNS client is unavailable")
 	}
 	var bodyBytes []byte
 	if body != nil {
 		data, err := io.ReadAll(io.LimitReader(body, cloudflareRequestBodyLimit+1))
 		if err != nil {
-			return nil, fmt.Errorf("read Cloudflare DNS request: %w", err)
+			return nil, cloudflareResultInfo{}, fmt.Errorf("read Cloudflare DNS request: %w", err)
 		}
 		if len(data) > cloudflareRequestBodyLimit {
-			return nil, errors.New("Cloudflare DNS request body is too large")
+			return nil, cloudflareResultInfo{}, errors.New("Cloudflare DNS request body is too large")
 		}
 		bodyBytes = data
 	}
@@ -1791,7 +1876,7 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 		}
 		request, err := http.NewRequestWithContext(ctx, method, endpoint, requestBody)
 		if err != nil {
-			return nil, err
+			return nil, cloudflareResultInfo{}, err
 		}
 		request.Header.Set("Authorization", "Bearer "+c.token)
 		request.Header.Set("Content-Type", "application/json")
@@ -1802,7 +1887,7 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 					continue
 				}
 			}
-			return nil, fmt.Errorf("cloudflare DNS request failed: %w", err)
+			return nil, cloudflareResultInfo{}, fmt.Errorf("cloudflare DNS request failed: %w", err)
 		}
 		data, readErr := io.ReadAll(io.LimitReader(response.Body, cloudflareRequestBodyLimit))
 		closeErr := response.Body.Close()
@@ -1812,10 +1897,10 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 					continue
 				}
 			}
-			return nil, fmt.Errorf("read Cloudflare DNS response: %w", readErr)
+			return nil, cloudflareResultInfo{}, fmt.Errorf("read Cloudflare DNS response: %w", readErr)
 		}
 		if closeErr != nil {
-			return nil, fmt.Errorf("close Cloudflare DNS response: %w", closeErr)
+			return nil, cloudflareResultInfo{}, fmt.Errorf("close Cloudflare DNS response: %w", closeErr)
 		}
 		// Gate retries on the HTTP status before decoding the body. Gateways
 		// often return HTML or an empty body for 429/5xx responses, and those
@@ -1827,18 +1912,18 @@ func (c *cloudflareClient) request(ctx context.Context, method, requestPath stri
 		}
 		var envelope cloudflareResponse
 		if err := json.Unmarshal(data, &envelope); err != nil {
-			return nil, errors.New("cloudflare DNS returned an invalid response")
+			return nil, cloudflareResultInfo{}, errors.New("cloudflare DNS returned an invalid response")
 		}
 		if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
 			message := "cloudflare DNS request was rejected"
 			if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
 				message += ": " + strings.TrimSpace(envelope.Errors[0].Message)
 			}
-			return nil, errors.New(message)
+			return nil, cloudflareResultInfo{}, errors.New(message)
 		}
-		return envelope.Result, nil
+		return envelope.Result, envelope.ResultInfo, nil
 	}
-	return nil, errors.New("cloudflare DNS request failed after retries")
+	return nil, cloudflareResultInfo{}, errors.New("cloudflare DNS request failed after retries")
 }
 
 func (c *cloudflareClient) findZone(ctx context.Context, zoneName string) (string, error) {

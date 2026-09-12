@@ -431,6 +431,10 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 	return skipped, nil
 }
 
+// nodeRequestEventPendingLimit bounds unprocessed agent-event ledger rows;
+// it matches the Agent's own event spool capacity.
+const nodeRequestEventPendingLimit = 8192
+
 func pruneRequestLogsTx(tx *sql.Tx, now time.Time, retention time.Duration) error {
 	cutoffMS := now.Add(-retention).UnixMilli()
 	if _, err := tx.Exec("DELETE FROM request_logs WHERE recorded_at_ms<?", cutoffMS); err != nil {
@@ -439,11 +443,21 @@ func pruneRequestLogsTx(tx *sql.Tx, now time.Time, retention time.Duration) erro
 	if retention < 24*time.Hour {
 		retention = 24 * time.Hour
 	}
-	// The event ledger is only a replay/deduplication window. Keep pending
-	// (processed_at_ms=0) rows forever, but retire acknowledged identities after
-	// the request-log retention plus one extra day so an offline Agent can replay
-	// safely without allowing the table to grow without bound.
+	// The event ledger is only a replay/deduplication window. Retire
+	// acknowledged identities after the request-log retention plus one extra
+	// day so an offline Agent can replay safely without allowing the table to
+	// grow without bound.
 	if _, err := tx.Exec(`DELETE FROM node_request_events WHERE processed_at_ms>0 AND received_at_ms<?`, now.Add(-retention-24*time.Hour).UnixMilli()); err != nil {
+		return err
+	}
+	// Pending rows were previously kept forever. An event whose derived effect
+	// keeps failing would pin its row indefinitely, so cap the unprocessed
+	// ledger (the Agent spool is the authoritative redelivery source) and
+	// drop the oldest pending rows beyond the cap.
+	if _, err := tx.Exec(`DELETE FROM node_request_events WHERE processed_at_ms=0 AND (node_id, agent_boot_id, event_id) IN (
+		SELECT node_id, agent_boot_id, event_id FROM node_request_events WHERE processed_at_ms=0
+		ORDER BY received_at_ms ASC, node_id, agent_boot_id, event_id LIMIT -1 OFFSET ?
+	)`, nodeRequestEventPendingLimit); err != nil {
 		return err
 	}
 	_, err := tx.Exec(`

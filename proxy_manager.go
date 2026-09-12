@@ -711,17 +711,42 @@ func (pm *ProxyManager) PublicHostSiteID(host string) (int64, bool) {
 func (pm *ProxyManager) PathRoute(requestPath string) (http.Handler, string, bool) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
+	// Selection must be deterministic: Go randomizes map iteration, so with a
+	// site registered under an app base (e.g. /emby) plus other path-ingress
+	// sites, one request path can match several prefixes via the direct and
+	// the /emby- or /jellyfin-embedded forms. The longest effective prefix
+	// wins, with the site id as a stable tie-breaker.
+	bestPrefix := ""
+	bestID := int64(0)
+	bestLength := -1
 	for prefix, id := range pm.pathPrefixes {
-		if !ingressPathMatches(requestPath, prefix) && !embeddedIngressPathMatches(requestPath, prefix) {
+		if ingressPathMatches(requestPath, prefix) {
+			if length := len(prefix); length > bestLength || (length == bestLength && (bestID == 0 || id < bestID)) {
+				bestPrefix, bestID, bestLength = prefix, id, length
+			}
 			continue
 		}
-		inst := pm.proxies[id]
-		if inst == nil {
-			return nil, prefix, true
+		if !embeddedIngressPathMatches(requestPath, prefix) {
+			continue
 		}
-		return inst.handler, prefix, true
+		for _, appBase := range []string{"/emby", "/jellyfin"} {
+			embedded := appBase + prefix
+			if len(requestPath) >= len(embedded) && strings.EqualFold(requestPath[:len(embedded)], embedded) {
+				if length := len(embedded); length > bestLength || (length == bestLength && (bestID == 0 || id < bestID)) {
+					bestPrefix, bestID, bestLength = prefix, id, length
+				}
+				break
+			}
+		}
 	}
-	return nil, "", false
+	if bestLength < 0 {
+		return nil, "", false
+	}
+	inst := pm.proxies[bestID]
+	if inst == nil {
+		return nil, bestPrefix, true
+	}
+	return inst.handler, bestPrefix, true
 }
 
 func embeddedIngressPathMatches(requestPath, prefix string) bool {
