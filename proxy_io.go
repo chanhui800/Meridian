@@ -111,15 +111,15 @@ type quotaLimitedReader struct {
 
 func (q *quotaLimitedReader) Read(p []byte) (int, error) {
 	n, err := q.meteredReader.Read(p)
-	if err != nil {
-		return n, err
-	}
-	if quotaProbeShared(q.inst, int64(n)) {
+	// Readers may legally return data together with io.EOF. Account and probe
+	// that final chunk before propagating the underlying error so a checkpoint
+	// cannot be skipped at end of stream.
+	if n > 0 && quotaProbeShared(q.inst, int64(n)) {
 		if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
 			return n, errTrafficQuotaExceeded
 		}
 	}
-	return n, nil
+	return n, err
 }
 
 // Flush support for streaming

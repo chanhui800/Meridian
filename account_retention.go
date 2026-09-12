@@ -158,9 +158,9 @@ func newAccountRetentionTracker(database *DB) *accountRetentionTracker {
 	}
 }
 
-// sweepLocked expires stale sessions and enforces the session cap. It runs at
-// most once per sweep interval (or immediately when the cap is reached) —
-// never on every observation.
+// sweepLocked expires stale sessions. It runs at most once per sweep interval;
+// capacity eviction is handled separately on the new-session path so a full
+// tracker never turns the observation hot path into a full-map scan.
 func (tracker *accountRetentionTracker) sweepLocked(now time.Time) {
 	tracker.lastSweep = now
 	for key, session := range tracker.sessions {
@@ -168,24 +168,32 @@ func (tracker *accountRetentionTracker) sweepLocked(now time.Time) {
 			delete(tracker.sessions, key)
 		}
 	}
-	if len(tracker.sessions) < accountRetentionSessionLimit {
-		return
+}
+
+// evictOldestLocked keeps the bounded tracker at its limit when a new
+// identity arrives. Expired entries are preferred, otherwise the least
+// recently observed identity is removed. This scan only runs when creating a
+// session at capacity, never for observations that reuse an existing key.
+func (tracker *accountRetentionTracker) evictOldestLocked(now time.Time) {
+	var oldestKey string
+	var oldestSeen time.Time
+	found := false
+	for key, session := range tracker.sessions {
+		if session == nil {
+			delete(tracker.sessions, key)
+			return
+		}
+		seen := session.LastObservedAt
+		if now.Sub(seen) > accountRetentionSessionTTL {
+			delete(tracker.sessions, key)
+			return
+		}
+		if !found || seen.Before(oldestSeen) {
+			oldestKey, oldestSeen, found = key, seen, true
+		}
 	}
-	overflow := len(tracker.sessions) - accountRetentionSessionLimit
-	for overflow > 0 && len(tracker.sessions) > 0 {
-		var oldestKey string
-		var oldestSeen time.Time
-		found := false
-		for key, session := range tracker.sessions {
-			if !found || session.LastObservedAt.Before(oldestSeen) {
-				oldestKey, oldestSeen, found = key, session.LastObservedAt, true
-			}
-		}
-		if !found {
-			break
-		}
+	if found {
 		delete(tracker.sessions, oldestKey)
-		overflow--
 	}
 }
 
@@ -290,7 +298,7 @@ func (tracker *accountRetentionTracker) Observe(site Site, request *http.Request
 
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	if len(tracker.sessions) >= accountRetentionSessionLimit || endedAt.Sub(tracker.lastSweep) >= accountRetentionSweepInterval {
+	if tracker.lastSweep.IsZero() || endedAt.Sub(tracker.lastSweep) >= accountRetentionSweepInterval {
 		tracker.sweepLocked(endedAt)
 	}
 	cycleStartedAtMS := site.AccountRetentionStartedMS
@@ -301,6 +309,14 @@ func (tracker *accountRetentionTracker) Observe(site Site, request *http.Request
 	}
 	session := tracker.sessions[key]
 	if session == nil || session.SiteID != site.ID || session.CycleStartedAtMS != cycleStartedAtMS {
+		if session == nil {
+			for len(tracker.sessions) >= accountRetentionSessionLimit {
+				tracker.evictOldestLocked(endedAt)
+				if len(tracker.sessions) >= accountRetentionSessionLimit {
+					break
+				}
+			}
+		}
 		session = &accountRetentionSession{SiteID: site.ID, CycleStartedAtMS: cycleStartedAtMS}
 		tracker.sessions[key] = session
 	}
