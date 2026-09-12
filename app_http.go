@@ -54,10 +54,16 @@ func (l *loginRateLimiter) pruneExpired(now time.Time) {
 	}
 }
 
-func (l *loginRateLimiter) evictLeastRecentlySeen() {
+func (l *loginRateLimiter) evictLeastRecentlySeen(now time.Time) bool {
 	var oldestClient string
 	var oldestSeen time.Time
 	for client, attempt := range l.attempts {
+		// Never evict an active lockout: an attacker flooding distinct client
+		// keys must not be able to squeeze out an entry that is currently
+		// blocking them.
+		if now.Before(attempt.blockedUntil) {
+			continue
+		}
 		seen := attempt.lastSeen
 		if seen.IsZero() {
 			seen = attempt.firstFailure
@@ -67,9 +73,13 @@ func (l *loginRateLimiter) evictLeastRecentlySeen() {
 			oldestSeen = seen
 		}
 	}
-	if oldestClient != "" {
-		delete(l.attempts, oldestClient)
+	if oldestClient == "" {
+		// Every entry is an active lockout: refuse to track a new key rather
+		// than discard someone's lockout.
+		return false
 	}
+	delete(l.attempts, oldestClient)
+	return true
 }
 
 func (l *loginRateLimiter) allow(client string, now time.Time) (bool, time.Duration) {
@@ -94,8 +104,10 @@ func (l *loginRateLimiter) recordFailure(client string, now time.Time) {
 	defer l.mu.Unlock()
 	l.pruneExpired(now)
 	attempt, exists := l.attempts[client]
-	if !exists && len(l.attempts) >= l.maxEntries {
-		l.evictLeastRecentlySeen()
+	if !exists && len(l.attempts) >= l.maxEntries && !l.evictLeastRecentlySeen(now) {
+		// The table is full of active lockouts; drop tracking for this new
+		// key instead of evicting a lockout.
+		return
 	}
 	if attempt.firstFailure.IsZero() || now.Sub(attempt.firstFailure) >= loginFailureWindow {
 		attempt = loginAttempt{firstFailure: now}
@@ -578,6 +590,13 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if userID, _, err := a.authenticatedSessionIdentity(r); err == nil {
 		if revokeErr := a.db.RevokeUserSessions(userID); revokeErr != nil {
 			log.Printf("[auth] logout session revocation failed: %v", revokeErr)
+			// The browser cookie is cleared either way, but the server-side
+			// session is still alive; reporting success here would hide a
+			// still-valid copied token from an operator who logged out
+			// precisely because they suspected one.
+			a.clearSessionCookie(w, r)
+			a.jsonErr(w, http.StatusInternalServerError, "logout failed: server session could not be revoked; the session token may still be valid")
+			return
 		}
 	}
 	a.clearSessionCookie(w, r)

@@ -145,12 +145,23 @@ func (a *App) handleUAProfiles(w http.ResponseWriter, r *http.Request) {
 	a.jsonOK(w, profiles)
 }
 
+// maxSSEConnections bounds concurrent dashboard event streams. Each stream
+// holds a connection, a ticker and its own loop; the snapshots are shared, so
+// the cap exists purely to bound connection and goroutine fan-out.
+const maxSSEConnections = 16
+
 func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		a.jsonErr(w, 500, "SSE not supported")
 		return
 	}
+	if a.sseConnections.Add(1) > maxSSEConnections {
+		a.sseConnections.Add(-1)
+		a.jsonErr(w, http.StatusServiceUnavailable, "too many dashboard event streams; close other dashboard tabs and retry")
+		return
+	}
+	defer a.sseConnections.Add(-1)
 
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")

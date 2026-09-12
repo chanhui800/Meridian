@@ -431,7 +431,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if isRedirectMode {
 				wsTarget = target
 			}
-			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, configuredHeaders)
+			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, pm, trafficQuota, configuredHeaders)
 			return
 		}
 
@@ -459,7 +459,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 
 		if r.Body != nil {
-			r.Body = &meteredReader{ReadCloser: r.Body, read: inst.trafficBytesIn(), cumulative: inst.trafficCumulativeIn()}
+			if trafficQuota > 0 {
+				r.Body = &quotaLimitedReader{meteredReader: meteredReader{ReadCloser: r.Body, read: inst.trafficBytesIn(), cumulative: inst.trafficCumulativeIn()}, pm: pm, inst: inst, quota: trafficQuota}
+			} else {
+				r.Body = &meteredReader{ReadCloser: r.Body, read: inst.trafficBytesIn(), cumulative: inst.trafficCumulativeIn()}
+			}
 		}
 		if len(failoverTargets) > 1 {
 			if err := prepareFailoverPlaybackInfoBody(r, redirectPolicy.limits.MaxBodyBytes); err != nil {

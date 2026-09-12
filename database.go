@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -42,6 +44,7 @@ type DB struct {
 	agentSecurityMu             sync.Mutex
 	agentSecurityLastLog        map[string]time.Time
 	lastTrafficPruneMS          atomic.Int64
+	installUUID                 string
 	systemSettings              atomic.Pointer[SystemSettings]
 	nodeTLSMutationMu           sync.Mutex
 	watchHistoryMetadataMu      sync.Mutex
@@ -59,6 +62,10 @@ func openDB(path string) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 	d := &DB{db: sqlDB, dbPath: path, agentSecurityLastLog: make(map[string]time.Time), agentLive: make(map[nodeLiveTrafficKey]nodeLiveTrafficState)}
 	if err := d.migrate(); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	if err := d.ensureInstallationUUID(); err != nil {
 		sqlDB.Close()
 		return nil, err
 	}
@@ -131,4 +138,36 @@ func sqliteBool(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ensureInstallationUUID loads or creates the random identity that scopes
+// Cloudflare DNS ownership markers to this Meridian installation, so two
+// controllers sharing one zone can never treat each other's records as their
+// own.
+func (d *DB) ensureInstallationUUID() error {
+	if d == nil || d.db == nil {
+		return errors.New("database is unavailable")
+	}
+	var value string
+	err := d.db.QueryRow("SELECT install_uuid FROM installation_meta WHERE id=1").Scan(&value)
+	if err == nil && strings.TrimSpace(value) != "" {
+		d.installUUID = strings.TrimSpace(value)
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return err
+	}
+	value = hex.EncodeToString(raw)
+	if _, err := d.db.Exec("INSERT OR IGNORE INTO installation_meta(id, install_uuid) VALUES(1,?)", value); err != nil {
+		return err
+	}
+	if err := d.db.QueryRow("SELECT install_uuid FROM installation_meta WHERE id=1").Scan(&value); err != nil {
+		return err
+	}
+	d.installUUID = strings.TrimSpace(value)
+	return nil
 }

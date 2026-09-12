@@ -58,33 +58,68 @@ func (m *meteredWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// quotaLimitedWriter aborts a streaming response once the site's billing-cycle
-// usage crosses its quota. The admission check only guards request start; a
-// single long-lived stream admitted just under the quota could otherwise
-// transfer unboundedly past it. The usage probe runs at most once per
-// quotaCheckBytes to bound its cost, and never while the handler holds the
-// instance traffic lock.
-type quotaLimitedWriter struct {
-	meteredWriter
-	pm         *ProxyManager
-	inst       *ProxyInstance
-	quota      int64
-	sinceCheck int64
+// quotaCheckBytes bounds how often the site-wide mid-stream quota probe runs.
+const quotaCheckBytes = 16 << 20
+
+// errTrafficQuotaExceeded aborts request bodies and tunnel transfers whose
+// site has crossed its billing quota; it is not exposed to clients.
+var errTrafficQuotaExceeded = errors.New("traffic quota exceeded")
+
+// quotaProbeShared records bytes against the instance-wide probe accumulator
+// and reports whether the caller must run the quota check now. The first
+// stream to cross the threshold claims the check.
+func quotaProbeShared(inst *ProxyInstance, n int64) bool {
+	if inst == nil || n <= 0 {
+		return false
+	}
+	return inst.quotaCheckSince.Add(n) >= quotaCheckBytes && inst.quotaCheckSince.Swap(0) >= 0
 }
 
-const quotaCheckBytes = 16 << 20
+// quotaLimitedWriter aborts a streaming response once the site's billing-cycle
+// usage crosses its quota. The probe uses the instance-wide byte accumulator
+// shared by every concurrent stream, request body and tunnel, so the
+// undetected overshoot is bounded by ~quotaCheckBytes of aggregate traffic
+// rather than per-stream windows.
+type quotaLimitedWriter struct {
+	meteredWriter
+	pm    *ProxyManager
+	inst  *ProxyInstance
+	quota int64
+}
 
 func (q *quotaLimitedWriter) Write(b []byte) (int, error) {
 	n, err := q.meteredWriter.Write(b)
-	q.sinceCheck += int64(n)
-	if q.sinceCheck < quotaCheckBytes {
+	if err != nil {
 		return n, err
 	}
-	q.sinceCheck = 0
-	if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
-		return n, http.ErrAbortHandler
+	if quotaProbeShared(q.inst, int64(n)) {
+		if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
+			return n, http.ErrAbortHandler
+		}
 	}
 	return n, err
+}
+
+// quotaLimitedReader aborts an upload body once the site crosses its quota;
+// bidirectional billing must not admit an unbounded POST after admission.
+type quotaLimitedReader struct {
+	meteredReader
+	pm    *ProxyManager
+	inst  *ProxyInstance
+	quota int64
+}
+
+func (q *quotaLimitedReader) Read(p []byte) (int, error) {
+	n, err := q.meteredReader.Read(p)
+	if err != nil {
+		return n, err
+	}
+	if quotaProbeShared(q.inst, int64(n)) {
+		if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
+			return n, errTrafficQuotaExceeded
+		}
+	}
+	return n, nil
 }
 
 // Flush support for streaming
@@ -193,12 +228,27 @@ type tunnelWriter struct {
 	bytesPerSec int64
 	written     int64
 	start       time.Time
+	quota       *quotaTunnelProbe
+}
+
+// quotaTunnelProbe lets a WebSocket tunnel share the site-wide quota
+// checkpoint: a long-lived connection must stop transferring once its site
+// is over quota, exactly like the HTTP response path.
+type quotaTunnelProbe struct {
+	pm    *ProxyManager
+	inst  *ProxyInstance
+	limit int64
 }
 
 func (t *tunnelWriter) Write(b []byte) (int, error) {
 	if t.bytesPerSec <= 0 {
 		n, err := t.dst.Write(b)
 		addMeteredBytes(t.counter, t.cumulative, n)
+		if err == nil && n > 0 && t.quota != nil && quotaProbeShared(t.quota.inst, int64(n)) {
+			if usage, usageErr := t.quota.pm.currentTrafficCycleUsage(t.quota.inst, time.Now()); usageErr == nil && usage >= t.quota.limit {
+				return n, errTrafficQuotaExceeded
+			}
+		}
 		return n, err
 	}
 	total := 0
@@ -226,6 +276,11 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 		}
 		if n == 0 {
 			return total, io.ErrNoProgress
+		}
+		if t.quota != nil && quotaProbeShared(t.quota.inst, int64(n)) {
+			if usage, usageErr := t.quota.pm.currentTrafficCycleUsage(t.quota.inst, time.Now()); usageErr == nil && usage >= t.quota.limit {
+				return total, errTrafficQuotaExceeded
+			}
 		}
 	}
 	return total, nil

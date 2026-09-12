@@ -188,12 +188,14 @@ func accountRetentionViewerKey(siteID int64, request *http.Request, trustedProxi
 	if identity == "" {
 		identity = "anonymous"
 	}
-	raw := strings.Join([]string{
-		strconv.FormatInt(siteID, 10),
-		identity,
-		requestClientKey(request, trustedProxies),
-		request.Header.Get("User-Agent"),
-	}, "\x00")
+	parts := []string{strconv.FormatInt(siteID, 10), identity}
+	if identity == "anonymous" {
+		// Only the anonymous fallback needs volatile client markers: a viewer
+		// holding a token or device identity must not fork retention sessions
+		// by rotating User-Agent or roaming between IPs.
+		parts = append(parts, requestClientKey(request, trustedProxies), request.Header.Get("User-Agent"))
+	}
+	raw := strings.Join(parts, "\x00")
 	digest := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("%x", digest[:])
 }

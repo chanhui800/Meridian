@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -175,13 +176,17 @@ func (a *App) handleTMDBTest(w http.ResponseWriter, r *http.Request) {
 	nowMS := time.Now().UnixMilli()
 	if err := service.client.testCredentials(r.Context(), token); err != nil {
 		if usingStored {
-			_ = a.db.markTMDBCredentialResult(tmdbCredentialInvalid, tmdbSafeErrorCode(err), nowMS)
+			if markErr := a.db.markTMDBCredentialResult(tmdbCredentialInvalid, tmdbSafeErrorCode(err), nowMS); markErr != nil {
+				log.Printf("[tmdb] persist credential-invalid state failed: %v", markErr)
+			}
 		}
 		a.jsonErr(w, http.StatusBadGateway, tmdbChineseError(err))
 		return
 	}
 	if usingStored {
-		_ = a.db.markTMDBCredentialResult(tmdbCredentialReady, "", nowMS)
+		if markErr := a.db.markTMDBCredentialResult(tmdbCredentialReady, "", nowMS); markErr != nil {
+			log.Printf("[tmdb] persist credential-ready state failed: %v", markErr)
+		}
 		service.Wake()
 	}
 	settings, _ := a.db.tmdbPublicSettings()

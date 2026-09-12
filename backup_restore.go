@@ -2496,9 +2496,14 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 				log.Printf("恢复回滚失败，保留回滚目录与标记等待下次启动重试: %v", rollbackErr)
 				return
 			}
-			_ = os.Remove(dbPath + backupAppliedSuffix) // #nosec G703 G304 -- fixed restore marker suffix.
-			_ = os.RemoveAll(rollback)                  // #nosec G703 G304 -- fixed rollback suffix path.
-			_ = os.RemoveAll(pending)                   // #nosec G703 G304 -- fixed pending suffix path.
+			if markerErr := os.Remove(dbPath + backupAppliedSuffix); markerErr != nil && !errors.Is(markerErr, os.ErrNotExist) { // #nosec G703 G304 -- fixed restore marker suffix.
+				// Marker still present: keep the snapshot so the next startup
+				// retries with a complete rollback directory.
+				log.Printf("移除恢复标记失败，保留回滚目录等待下次启动重试: %v", markerErr)
+				return
+			}
+			_ = os.RemoveAll(rollback) // #nosec G703 G304 -- fixed rollback suffix path.
+			_ = os.RemoveAll(pending)  // #nosec G703 G304 -- fixed pending suffix path.
 		}
 	}()
 	for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -2578,19 +2583,24 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 	if rollback == "" {
 		return errors.New("恢复回滚目录为空")
 	}
+	// Copy-based restore: os.Rename would consume the only rollback snapshot,
+	// so a failure after the first rename would leave the deployment with a
+	// half-moved database and no recovery copy. The rollback directory stays
+	// complete until the caller removes the applied marker; copyPrivateFile
+	// writes durably (temp file + fsync + rename + directory sync).
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		_ = os.Remove(dbPath + suffix) // #nosec G703 G304 -- fixed SQLite sidecar suffix.
 		source := filepath.Join(rollback, backupDatabaseEntry+suffix)
 		if _, err := os.Stat(source); err == nil { // #nosec G703 G304 -- source is the fixed rollback database entry.
-			if err := os.Rename(source, dbPath+suffix); err != nil {
-				return err
-			}
-			if err := syncDirectory(filepath.Dir(dbPath)); err != nil {
+			if err := copyPrivateFile(source, dbPath+suffix); err != nil {
 				return err
 			}
 		} else if suffix == "" {
 			return errors.New("恢复回滚副本缺少数据库")
 		}
+	}
+	if err := syncDirectory(filepath.Dir(dbPath)); err != nil {
+		return err
 	}
 	if restoreDirectoryIncludesTLS(rollback) {
 		if _, err := os.Stat(filepath.Join(rollback, "tls-namespace.json")); err == nil { // #nosec G703 -- rollback is the private fixed restore directory.
@@ -2629,8 +2639,13 @@ func rollbackAppliedRestore(dbPath string, state *restoreAppliedState) error {
 	if err := rollbackRestoreFiles(dbPath, state.RollbackDir); err != nil {
 		return err
 	}
-	_ = os.Remove(dbPath + backupAppliedSuffix) // #nosec G703 G304 -- fixed restore marker suffix.
-	return os.RemoveAll(state.RollbackDir)      // #nosec G703 G304 -- rollback directory was created by Meridian.
+	// Invariant: as long as the applied marker exists, the complete rollback
+	// snapshot must still exist. Remove the marker first and propagate its
+	// error; only then is it safe to discard the snapshot.
+	if err := os.Remove(dbPath + backupAppliedSuffix); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- fixed restore marker suffix.
+		return fmt.Errorf("移除恢复标记失败，保留回滚快照: %w", err)
+	}
+	return os.RemoveAll(state.RollbackDir) // #nosec G703 G304 -- rollback directory was created by Meridian.
 }
 
 func finalizeAppliedRestore(dbPath string) error {

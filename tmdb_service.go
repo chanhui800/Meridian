@@ -159,7 +159,9 @@ func (s *tmdbService) runOne(ctx context.Context, now time.Time) (bool, error) {
 	}
 	token, err := decryptTMDBReadToken(stored.TokenCiphertext)
 	if err != nil {
-		_ = s.db.markTMDBCredentialResult(tmdbCredentialInvalid, "decrypt", now.UnixMilli())
+		if markErr := s.db.markTMDBCredentialResult(tmdbCredentialInvalid, "decrypt", now.UnixMilli()); markErr != nil {
+		log.Printf("[tmdb] persist credential-invalid state failed: %v", markErr)
+	}
 		return false, err
 	}
 	job, found, err := s.db.claimTMDBJob(now.UnixMilli())
@@ -176,7 +178,9 @@ func (s *tmdbService) runOne(ctx context.Context, now time.Time) (bool, error) {
 	if lookupErr == nil {
 		completeErr := s.db.completeTMDBJob(job.ID, job.JobRevision, metadata, stored.Language, now.UnixMilli())
 		if completeErr == nil {
-			_ = s.db.markTMDBCredentialResult(tmdbCredentialReady, "", now.UnixMilli())
+			if markErr := s.db.markTMDBCredentialResult(tmdbCredentialReady, "", now.UnixMilli()); markErr != nil {
+				log.Printf("[tmdb] persist credential-ready state failed: %v", markErr)
+			}
 			return true, nil
 		}
 		return true, completeErr

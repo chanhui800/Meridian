@@ -338,9 +338,12 @@ func (s *edgeEventStore) add(event NodeRequestEvent) error {
 				s.dropped++
 			}
 		} else {
+			// A dropped event does not change the queue contents, so it must
+			// not pay a synchronous whole-file rewrite: persisting the counter
+			// on the same debounce cadence keeps a full queue from degrading
+			// into per-event fsyncs under controller-outage load.
 			s.dropped++
-			s.lastPersist = time.Now()
-			return s.persistLocked()
+			return s.persistDebouncedLocked()
 		}
 	}
 	s.items = append(s.items, event)
@@ -360,8 +363,13 @@ func (s *edgeEventStore) persistDebouncedLocked() error {
 	if !s.lastPersist.IsZero() && now.Sub(s.lastPersist) < edgeEventPersistInterval {
 		return nil
 	}
+	// Stamp only after a successful write: a failed persist must not push the
+	// next retry two seconds out, and the error stays visible to add/ack.
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
 	s.lastPersist = now
-	return s.persistLocked()
+	return nil
 }
 
 // flush performs a synchronous persist for shutdown paths where the
@@ -2562,8 +2570,14 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 	if err := os.Rename(temporaryName, executable); err != nil {
 		return err
 	}
+	// The rename already committed the replacement: from here the on-disk
+	// binary is the new one, so a failed durability sync must NOT turn into a
+	// plain update error — the process would keep running the old code while
+	// the next digest check reads the new binary from disk and concludes no
+	// restart is needed. Surface the sync failure as a warning and still
+	// demand the restart.
 	if err := syncDirectory(filepath.Dir(executable)); err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "Meridian Agent update directory sync failed (replacement already applied): %v\n", err)
 	}
 	return errEdgeAgentUpdated
 }

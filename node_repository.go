@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -496,7 +497,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 		node.Status = "pending"
 	}
 	if node.BillingMode == "bidirectional" {
-		node.TrafficUsed = node.PeriodRXBytes + node.PeriodTXBytes
+		node.TrafficUsed = saturatingAddInt64(node.PeriodRXBytes, node.PeriodTXBytes)
 	} else {
 		node.TrafficUsed = node.PeriodTXBytes
 	}
@@ -1627,6 +1628,19 @@ func claimAgentLeaseTx(tx *sql.Tx, nodeID int64, sessionID string, sessionEpoch 
 		return "", err
 	}
 	return newLease, nil
+}
+
+// saturatingAddInt64 adds two byte counters without wrapping: a counter that
+// reaches the int64 ceiling must read as the ceiling, not wrap negative and
+// get zeroed by downstream clamp-to-zero logic.
+func saturatingAddInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
 }
 
 func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now time.Time) (nodeReportCommitResult, error) {

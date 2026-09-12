@@ -165,7 +165,7 @@ func validateHLSURIAttributes(tag, value string, attributes []hlsAttributeSpan) 
 		}
 		reference, err := url.Parse(uri)
 		if err != nil || reference.IsAbs() || reference.Host != "" {
-			return fmt.Errorf("HLS rendition report URI must be relative")
+			return newDynamicPolicyDenialError(fmt.Errorf("HLS rendition report URI must be relative"))
 		}
 		return nil
 	case "#EXT-X-DATERANGE":
@@ -177,17 +177,17 @@ func validateHLSURIAttributes(tag, value string, attributes []hlsAttributeSpan) 
 
 func rewriteHLSURIKind(value string, session *dynamicRewriteSession, kind string) (string, error) {
 	if value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) {
-		return "", fmt.Errorf("invalid HLS URI")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("invalid HLS URI"))
 	}
 	if strings.Contains(value, "{$") {
-		return "", fmt.Errorf("HLS variable substitution is unsupported")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("HLS variable substitution is unsupported"))
 	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Fragment != "" || parsed.RawFragment != "" {
-		return "", fmt.Errorf("invalid HLS URI")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("invalid HLS URI"))
 	}
 	if parsed.Scheme != "" && !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
-		return "", fmt.Errorf("unsupported HLS URI scheme")
+		return "", newDynamicPolicyDenialError(fmt.Errorf("unsupported HLS URI scheme"))
 	}
 	return session.rewriteAgainstKind(value, session.base, kind)
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,7 @@ type App struct {
 	dbPath               string
 	pm                   *ProxyManager
 	backupMu             sync.Mutex
+	sseConnections       atomic.Int64
 	siteLifecycleMu      sync.Mutex
 	setupTokenMu         sync.Mutex
 	setupToken           string
