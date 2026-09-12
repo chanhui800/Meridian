@@ -58,6 +58,16 @@ jobs:
           bash -n install.sh
           bash -n scripts/agent-install.sh
           bash -n docker-entrypoint.sh
+
+      # The installer runs under `set -euo pipefail`; a reference to an unset
+      # environment variable in the defaults block breaks every default
+      # install at load time, and bash -n cannot catch it. Execute just the
+      # defaults block in a shell that matches the script's flags.
+      - name: Installer defaults survive unset environment variables
+        run: |
+          sed -n '1,31p' install.sh > /tmp/install-defaults.sh
+          echo 'echo "defaults-ok"' >> /tmp/install-defaults.sh
+          env -u MERIDIAN_DATA_DIR -u MERIDIAN_INSTALL_DIR -u MERIDIAN_BACKUP_DIR -u MERIDIAN_SERVICE_NAME -u MERIDIAN_ROOT_GROUP bash /tmp/install-defaults.sh | grep -q 'defaults-ok'
           bash -n tests/install_test.sh
           bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh

@@ -1575,7 +1575,7 @@ func (a *App) cloudflareForScheduling() (*cloudflareClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &cloudflareClient{token: token, httpClient: &http.Client{Timeout: 15 * time.Second}, apiBase: "https://api.cloudflare.com/client/v4"}, nil
+	return &cloudflareClient{token: token, httpClient: &http.Client{Timeout: 15 * time.Second}, apiBase: "https://api.cloudflare.com/client/v4", installUUID: a.db.installUUID}, nil
 }
 
 type cloudflareAddressRecord struct{ ID, Type, Name, Content, Comment string }
@@ -1628,6 +1628,12 @@ func (c *cloudflareClient) exactAddressRecords(ctx context.Context, zoneID, name
 		if len(raw) == 0 || info.TotalPages <= page {
 			break
 		}
+		if info.TotalPages > maxCloudflareRecordPages {
+			// A truncated listing must never feed ownership or conflict
+			// decisions: refuse the whole scan instead of judging a partial
+			// set.
+			return nil, fmt.Errorf("Cloudflare returned %d pages of DNS records; ownership scan supports at most %d", info.TotalPages, maxCloudflareRecordPages)
+		}
 	}
 	return values, nil
 }
@@ -1673,13 +1679,29 @@ func ownedAddressRecord(records []cloudflareAddressRecord, recordType, name, add
 // caller. Any unowned exact record is a hard conflict because Cloudflare would
 // otherwise round-robin traffic between an operator record and Meridian's.
 // siteDNSOwnershipMarker is the Cloudflare comment that marks an address
-// record as owned by this Meridian instance for one site. Create, adopt,
-// update and delete paths must all verify against this exact value.
-func siteDNSOwnershipMarker(siteID int64) string {
+// record as owned by this Meridian installation for one site. The
+// installation UUID keeps two controllers sharing one zone from treating
+// each other's records as their own. Create, adopt, update and delete paths
+// must all verify against this exact value.
+func siteDNSOwnershipMarker(siteID int64, installUUID string) string {
+	return fmt.Sprintf("Meridian controller=%s site=%d", installUUID, siteID)
+}
+
+// legacySiteDNSOwnershipMarker is the pre-installation-UUID marker. Records
+// carrying it are still accepted as owned during the transition; the next
+// reconcile PUT rewrites the comment to the scoped marker.
+func legacySiteDNSOwnershipMarker(siteID int64) string {
 	return fmt.Sprintf("Meridian site=%d", siteID)
 }
 
-func classifyOwnedAddressRecords(records []cloudflareAddressRecord, name, marker string) (cloudflareAddressRecord, bool, int, bool) {
+// siteDNSMarkerOwned reports whether a record comment proves ownership by
+// this installation for the given site.
+func siteDNSMarkerOwned(comment string, siteID int64, installUUID string) bool {
+	trimmed := strings.TrimSpace(comment)
+	return trimmed == siteDNSOwnershipMarker(siteID, installUUID) || trimmed == legacySiteDNSOwnershipMarker(siteID)
+}
+
+func classifyOwnedAddressRecords(records []cloudflareAddressRecord, name string, marker func(string) bool) (cloudflareAddressRecord, bool, int, bool) {
 	var owned cloudflareAddressRecord
 	ownedCount := 0
 	unownedCount := 0
@@ -1687,7 +1709,7 @@ func classifyOwnedAddressRecords(records []cloudflareAddressRecord, name, marker
 		if (record.Type != "A" && record.Type != "AAAA") || !strings.EqualFold(record.Name, name) {
 			continue
 		}
-		if strings.TrimSpace(record.Comment) == marker {
+		if marker(strings.TrimSpace(record.Comment)) {
 			owned = record
 			ownedCount++
 		} else {
@@ -1875,7 +1897,7 @@ func verifyTrackedSiteDNSOwnership(ctx context.Context, cf *cloudflareClient, sc
 	// renamed after the record was created, and refusing the delete then would
 	// wedge cleanup and site deletion forever on a record Meridian still owns.
 	if (record.Type != "A" && record.Type != "AAAA") ||
-		strings.TrimSpace(record.Comment) != siteDNSOwnershipMarker(schedule.SiteID) {
+		!siteDNSMarkerOwned(record.Comment, schedule.SiteID, cf.installUUID) {
 		return errors.New("tracked DNS record no longer carries the Meridian ownership marker; refusing to delete")
 	}
 	return nil
@@ -2083,7 +2105,10 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 			return err
 		}
 	}
-	marker := siteDNSOwnershipMarker(schedule.SiteID)
+	marker := siteDNSOwnershipMarker(schedule.SiteID, a.db.installUUID)
+	isOwnedComment := func(comment string) bool {
+		return siteDNSMarkerOwned(comment, schedule.SiteID, a.db.installUUID)
+	}
 	trackedRecordID := strings.TrimSpace(schedule.cfRecordID)
 	recordID := trackedRecordID
 	dnsRecordCreated := false
@@ -2113,7 +2138,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 			return err
 		}
 		if len(records) > 0 {
-			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, marker)
+			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, isOwnedComment)
 			if ambiguous {
 				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
 			}
@@ -2148,7 +2173,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 		// record even when the response was lost. Re-read exact records and
 		// adopt only a uniquely matching Meridian marker.
 		if records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost); getErr == nil {
-			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, marker)
+			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, isOwnedComment)
 			if ambiguous {
 				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
 			} else if unowned > 0 {
@@ -2172,7 +2197,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 			var records []cloudflareAddressRecord
 			records, err = cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
 			if err == nil && len(records) > 0 {
-				owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, marker)
+				owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, isOwnedComment)
 				switch {
 				case ambiguous:
 					err = errors.New("multiple Meridian DNS records match this site; manual cleanup required")

@@ -417,6 +417,9 @@ type cloudflareClient struct {
 	token      string
 	httpClient *http.Client
 	apiBase    string
+	// installUUID scopes DNS ownership markers to one Meridian installation;
+	// empty means the pre-scoped legacy marker.
+	installUUID string
 }
 
 type cloudflareResponse struct {

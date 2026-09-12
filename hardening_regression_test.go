@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -41,22 +43,35 @@ func TestAgentInstanceLockRejectsSecondOwner(t *testing.T) {
 }
 
 func TestClassifyOwnedAddressRecordsDetectsContentChangesAndConflicts(t *testing.T) {
+	isOwned := func(comment string) bool { return siteDNSMarkerOwned(comment, 7, "test-install-uuid") }
 	owned, ok, unowned, ambiguous := classifyOwnedAddressRecords([]cloudflareAddressRecord{{
-		ID: "owned", Type: "A", Name: "site.example", Content: "198.51.100.2", Comment: "Meridian site=7",
-	}}, "site.example", "Meridian site=7")
+		ID: "owned", Type: "A", Name: "site.example", Content: "198.51.100.2", Comment: siteDNSOwnershipMarker(7, "test-install-uuid"),
+	}}, "site.example", isOwned)
 	if !ok || ambiguous || unowned != 0 || owned.ID != "owned" {
 		t.Fatalf("owned classification=%#v,%v,%d,%v", owned, ok, unowned, ambiguous)
 	}
+	// The legacy pre-UUID marker stays owned during the migration window.
+	if owned, ok, _, _ := classifyOwnedAddressRecords([]cloudflareAddressRecord{{
+		ID: "legacy", Type: "A", Name: "site.example", Content: "198.51.100.2", Comment: legacySiteDNSOwnershipMarker(7),
+	}}, "site.example", isOwned); !ok || owned.ID != "legacy" {
+		t.Fatalf("legacy marker not classified as owned: ok=%v owned=%#v", ok, owned)
+	}
+	// A different installation's scoped marker is NOT ours.
+	if _, ok, unowned, _ := classifyOwnedAddressRecords([]cloudflareAddressRecord{{
+		ID: "other", Type: "A", Name: "site.example", Content: "198.51.100.2", Comment: siteDNSOwnershipMarker(7, "another-install"),
+	}}, "site.example", isOwned); ok || unowned != 1 {
+		t.Fatalf("foreign controller marker classified as owned: ok=%v unowned=%d", ok, unowned)
+	}
 	_, ok, unowned, ambiguous = classifyOwnedAddressRecords([]cloudflareAddressRecord{{
 		ID: "operator", Type: "A", Name: "site.example", Content: "198.51.100.2",
-	}}, "site.example", "Meridian site=7")
+	}}, "site.example", isOwned)
 	if ok || ambiguous || unowned != 1 {
 		t.Fatalf("unowned classification ok=%v unowned=%d ambiguous=%v", ok, unowned, ambiguous)
 	}
 	_, ok, unowned, ambiguous = classifyOwnedAddressRecords([]cloudflareAddressRecord{
-		{ID: "one", Type: "A", Name: "site.example", Comment: "Meridian site=7"},
-		{ID: "two", Type: "A", Name: "site.example", Comment: "Meridian site=7"},
-	}, "site.example", "Meridian site=7")
+		{ID: "one", Type: "A", Name: "site.example", Comment: siteDNSOwnershipMarker(7, "test-install-uuid")},
+		{ID: "two", Type: "A", Name: "site.example", Comment: legacySiteDNSOwnershipMarker(7)},
+	}, "site.example", isOwned)
 	if ok || !ambiguous || unowned != 0 {
 		t.Fatalf("ambiguous classification ok=%v unowned=%d ambiguous=%v", ok, unowned, ambiguous)
 	}
@@ -253,6 +268,7 @@ func TestDeleteTrackedSiteDNSRemoteVerifiesOwnership(t *testing.T) {
 		return `{"success":true,"result":{"id":"` + id + `","type":"` + recordType + `","name":"` + name + `","content":"` + content + `","comment":"` + comment + `"}}`
 	}
 	schedule := SiteNodeSchedule{SiteID: 7, PublicHost: "site.example", cfZoneID: "zone-1", cfRecordID: "rec-1"}
+	marker := siteDNSOwnershipMarker(7, "test-install-uuid")
 	cases := []struct {
 		name       string
 		body       string
@@ -260,7 +276,9 @@ func TestDeleteTrackedSiteDNSRemoteVerifiesOwnership(t *testing.T) {
 		wantErr    string
 		wantDelete bool
 	}{
-		{name: "owned record is deleted", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", "Meridian site=7"), status: http.StatusOK, wantDelete: true},
+		{name: "owned record is deleted", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", marker), status: http.StatusOK, wantDelete: true},
+		{name: "legacy marker is deleted", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", legacySiteDNSOwnershipMarker(7)), status: http.StatusOK, wantDelete: true},
+		{name: "foreign controller marker refuses delete", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", siteDNSOwnershipMarker(7, "another-install")), status: http.StatusOK, wantErr: "refusing to delete"},
 		{name: "operator-edited comment refuses delete", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", ""), status: http.StatusOK, wantErr: "refusing to delete"},
 		// A record whose host no longer matches the site still carries the
 		// ownership marker and record ID, so cleanup may proceed: refusing it
@@ -281,7 +299,7 @@ func TestDeleteTrackedSiteDNSRemoteVerifiesOwnership(t *testing.T) {
 				_, _ = w.Write([]byte(testCase.body))
 			}))
 			defer server.Close()
-			cf := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+			cf := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL, installUUID: "test-install-uuid"}
 			err := deleteTrackedSiteDNSRemote(context.Background(), cf, schedule)
 			if testCase.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
@@ -323,11 +341,11 @@ func TestRecreateReplacedDNSRecordRestoresPreimage(t *testing.T) {
 	}))
 	defer server.Close()
 	cf := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
-	previous := cloudflareAddressRecord{ID: "old", Type: "A", Name: "site.example", Content: "203.0.113.5", Comment: "Meridian site=7"}
+	previous := cloudflareAddressRecord{ID: "old", Type: "A", Name: "site.example", Content: "203.0.113.5", Comment: siteDNSOwnershipMarker(7, "test-install-uuid")}
 	if err := recreateReplacedDNSRecordBestEffort(context.Background(), cf, "zone-1", previous); err != nil {
 		t.Fatalf("recreate: %v", err)
 	}
-	if payload.Type != "A" || payload.Name != "site.example" || payload.Content != "203.0.113.5" || payload.Comment != "Meridian site=7" {
+	if payload.Type != "A" || payload.Name != "site.example" || payload.Content != "203.0.113.5" || payload.Comment != siteDNSOwnershipMarker(7, "test-install-uuid") {
 		t.Fatalf("restore payload=%+v, want the deleted record preimage", payload)
 	}
 }
@@ -566,7 +584,6 @@ func TestNodeRequestEventPendingLedgerIsCapped(t *testing.T) {
 	}
 }
 
-
 func TestAgentConfigHashKeepsPreV1986SiteWireCompatibility(t *testing.T) {
 	config := AgentRuntimeConfig{
 		SchemaVersion: agentConfigSchemaVersion,
@@ -640,9 +657,9 @@ func TestQuotaLimitedWriterAbortsPastQuota(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writer := &quotaLimitedWriter{
 		meteredWriter: meteredWriter{ResponseWriter: recorder, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()},
-		pm:    pm,
-		inst:  inst,
-		quota: 1024,
+		pm:            pm,
+		inst:          inst,
+		quota:         1024,
 	}
 	payload := make([]byte, quotaCheckBytes+1)
 	_, err = writer.Write(payload)
@@ -671,5 +688,65 @@ func TestDynamicPreserveStripsStaleContentEncoding(t *testing.T) {
 	installDynamicStructuredBody(resp, []byte("#EXTM3U\n#rewritten\n"), true)
 	if got := resp.Header.Get("ETag"); got != "" {
 		t.Fatal("rewritten response kept a stale ETag validator")
+	}
+}
+
+func TestHLSRewriteDenialsFailClosedUnderPreserveFallback(t *testing.T) {
+	// Policy denials (userinfo, scheme, fragment) must remain hard errors even
+	// though format-compatibility failures now preserve the upstream manifest.
+	if newDynamicPolicyDenialError(fmt.Errorf("x")) == nil {
+		t.Fatal("denial constructor returned nil")
+	}
+	wrapped := newDynamicPolicyDenialError(fmt.Errorf("discovered URL: userinfo"))
+	var decoded *dynamicPolicyDenialError
+	if !errors.As(error(wrapped), &decoded) {
+		t.Fatal("errors.As does not unwrap the denial")
+	}
+	session := &dynamicRewriteSession{ctx: context.Background(), base: mustStructuredURL(t, "https://api.example.com/live/master.m3u8"), source: dynamicDiscoverySourceHLS}
+	issuer := &dynamicCapabilityIssuer{key: make([]byte, 32), siteID: 1, policyRevision: 1, policy: dynamicRedirectPolicy{limits: dynamicDefaultProfileLimits()}, state: newDynamicSiteState(newDynamicRuntime(), dynamicDefaultProfileLimits())}
+	session.issuer = issuer
+	if _, err := rewriteHLSURIKind("http://user:pass@cdn.example.com/video.ts", session, dynamicCapabilityKindResource); err == nil {
+		t.Fatal("userinfo URI was accepted")
+	} else if !errors.As(err, &decoded) {
+		t.Fatalf("userinfo denial not typed: %v", err)
+	}
+	if _, err := rewriteHLSURIKind("ftp://cdn.example.com/video.ts", session, dynamicCapabilityKindResource); err == nil || !errors.As(err, &decoded) {
+		t.Fatalf("scheme denial not typed: %v", err)
+	}
+	if _, err := rewriteHLSURIKind("https://cdn.example.com/video.ts#frag", session, dynamicCapabilityKindResource); err == nil || !errors.As(err, &decoded) {
+		t.Fatalf("fragment denial not typed: %v", err)
+	}
+}
+
+func TestSaturatingAddInt64DoesNotWrap(t *testing.T) {
+	if got := saturatingAddInt64(math.MaxInt64, 1); got != math.MaxInt64 {
+		t.Fatalf("overflow wrapped: %d", got)
+	}
+	if got := saturatingAddInt64(math.MaxInt64-5, 10); got != math.MaxInt64 {
+		t.Fatalf("partial overflow wrapped: %d", got)
+	}
+	if got := saturatingAddInt64(100, 200); got != 300 {
+		t.Fatalf("normal add broken: %d", got)
+	}
+	if got := saturatingAddInt64(math.MinInt64, -1); got != math.MinInt64 {
+		t.Fatalf("underflow wrapped: %d", got)
+	}
+}
+
+func TestQuotaProbeSharedBoundedToOneCheck(t *testing.T) {
+	inst := &ProxyInstance{}
+	if quotaProbeShared(nil, 100) {
+		t.Fatal("nil instance must not probe")
+	}
+	first := inst.quotaCheckSince.Add(quotaCheckBytes - 1)
+	_ = first
+	if !quotaProbeShared(inst, 1) {
+		t.Fatal("crossing the threshold must claim the probe")
+	}
+	if inst.quotaCheckSince.Load() != 0 {
+		t.Fatalf("probe did not reset the accumulator: %d", inst.quotaCheckSince.Load())
+	}
+	if quotaProbeShared(inst, 10) {
+		t.Fatal("small follow-up must not probe")
 	}
 }

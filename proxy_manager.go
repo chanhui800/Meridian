@@ -53,6 +53,11 @@ type ProxyInstance struct {
 	// local instances (no Agent runtime counter). The dashboard trend snapshot
 	// uses it to detect a flush that raced its SQLite history read.
 	trafficGeneration         atomic.Uint64
+	// quotaCheckSince is the site-wide byte accumulator for mid-stream quota
+	// probes: writers and readers across all concurrent streams share it, so
+	// the first stream to push it past quotaCheckBytes performs one shared
+	// check instead of each stream maintaining its own 16 MiB blind spot.
+	quotaCheckSince           atomic.Int64
 	trafficCycleStart         time.Time
 	trafficCycleMode          string
 	trafficCycleUsage         int64

@@ -216,8 +216,28 @@ func normalizeTrustedCapabilityURL(value string) (*url.URL, error) {
 	return target, nil
 }
 
+// dynamicPolicyDenialError marks a rewrite failure as a security or policy
+// refusal (unsafe URL, userinfo, scheme, fragment, count/depth limits, mint
+// denial) rather than a format-compatibility problem. The upstream-preserve
+// fallback must fail closed on these: relaying the original payload would
+// hand the client raw absolute URLs the dynamic boundary refused to proxy.
+type dynamicPolicyDenialError struct{ reason string }
+
+func newDynamicPolicyDenialError(err error) *dynamicPolicyDenialError {
+	if err == nil {
+		return nil
+	}
+	return &dynamicPolicyDenialError{reason: err.Error()}
+}
+
+func (e *dynamicPolicyDenialError) Error() string { return e.reason }
+
 func (s *dynamicRewriteSession) rewriteAgainstKind(raw string, base *url.URL, kind string) (string, error) {
-	return s.rewriteAgainstSourceKind(raw, base, s.source, kind)
+	route, err := s.rewriteAgainstSourceKind(raw, base, s.source, kind)
+	if err != nil {
+		return route, newDynamicPolicyDenialError(err)
+	}
+	return route, nil
 }
 
 func (s *dynamicRewriteSession) rewriteAgainstSourceKind(raw string, base *url.URL, source, kind string) (string, error) {
@@ -824,8 +844,10 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		// for the whole site. PlaybackInfo keeps its own stricter chain: its
 		// denials (for example required headers on a relative URL that no
 		// capability could carry) must stay hard errors.
+		var denial *dynamicPolicyDenialError
 		if resp != nil && resp.Body != nil && resp.StatusCode < http.StatusBadRequest &&
-			(source == dynamicDiscoverySourceHLS || source == dynamicDiscoverySourceDASH) {
+			(source == dynamicDiscoverySourceHLS || source == dynamicDiscoverySourceDASH) &&
+			!errors.As(err, &denial) {
 			log.Printf("[%s] %s rewrite rejected; preserving upstream response: %v", issuer.site.Name, source, err)
 			issuer.observe(source, dynamicObservationDecisionDenied, dynamicStructuredRewriteDeniedReason(source), authority)
 			installDynamicStructuredBody(resp, payload, false)

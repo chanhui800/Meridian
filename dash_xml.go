@@ -209,16 +209,16 @@ func dashAttributeIndex(node *dashXMLNode, local string, extremeCompatibility bo
 
 func resolveDASHReference(base *url.URL, value string) (*url.URL, error) {
 	if base == nil || value == "" || value != strings.TrimSpace(value) || containsDynamicUnsafeRune(value) || strings.Contains(value, `\`) {
-		return nil, fmt.Errorf("invalid DASH URL")
+		return nil, newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL"))
 	}
 	reference, err := url.Parse(value)
 	if err != nil || reference.User != nil || reference.Fragment != "" || reference.RawFragment != "" {
-		return nil, fmt.Errorf("invalid DASH URL")
+		return nil, newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL"))
 	}
 	resolved := base.ResolveReference(reference)
 	resolved.Scheme = strings.ToLower(resolved.Scheme)
 	if resolved.Scheme != "http" && resolved.Scheme != "https" || resolved.Host == "" || resolved.User != nil {
-		return nil, fmt.Errorf("unsupported DASH URL")
+		return nil, newDynamicPolicyDenialError(fmt.Errorf("unsupported DASH URL"))
 	}
 	return resolved, nil
 }

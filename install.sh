@@ -21,7 +21,7 @@ SYSTEMD_RESTRICT_ADDRESS_FAMILIES="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 # A data directory under /home cannot coexist with ProtectHome=true: systemd
 # would hide it from the sandboxed service and the install would fail its
 # health check with a misleading error. Allow read-only protection instead.
-case "$MERIDIAN_DATA_DIR" in
+case "$DATA_DIR" in
     /home/*) SYSTEMD_PROTECT_HOME="read-only" ;;
     *) SYSTEMD_PROTECT_HOME="true" ;;
 esac

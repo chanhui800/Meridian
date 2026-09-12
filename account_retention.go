@@ -138,13 +138,54 @@ type accountRetentionTracker struct {
 	database       *DB
 	sessions       map[string]*accountRetentionSession
 	cycleOverrides map[int64]int64
+	lastSweep      time.Time
 }
+
+// accountRetentionSessionLimit bounds the tracker's memory; identities
+// beyond the cap evict by oldest observation after expiry has been applied.
+const accountRetentionSessionLimit = 8192
+
+// accountRetentionSweepInterval throttles the expiry sweep: the hot path used
+// to scan every session on every playback-sync observation, which made the
+// aggregate O(N^2) under load.
+const accountRetentionSweepInterval = time.Minute
 
 func newAccountRetentionTracker(database *DB) *accountRetentionTracker {
 	return &accountRetentionTracker{
 		database:       database,
 		sessions:       make(map[string]*accountRetentionSession),
 		cycleOverrides: make(map[int64]int64),
+	}
+}
+
+// sweepLocked expires stale sessions and enforces the session cap. It runs at
+// most once per sweep interval (or immediately when the cap is reached) —
+// never on every observation.
+func (tracker *accountRetentionTracker) sweepLocked(now time.Time) {
+	tracker.lastSweep = now
+	for key, session := range tracker.sessions {
+		if now.Sub(session.LastObservedAt) > accountRetentionSessionTTL {
+			delete(tracker.sessions, key)
+		}
+	}
+	if len(tracker.sessions) < accountRetentionSessionLimit {
+		return
+	}
+	overflow := len(tracker.sessions) - accountRetentionSessionLimit
+	for overflow > 0 && len(tracker.sessions) > 0 {
+		var oldestKey string
+		var oldestSeen time.Time
+		found := false
+		for key, session := range tracker.sessions {
+			if !found || session.LastObservedAt.Before(oldestSeen) {
+				oldestKey, oldestSeen, found = key, session.LastObservedAt, true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(tracker.sessions, oldestKey)
+		overflow--
 	}
 }
 
@@ -188,12 +229,14 @@ func accountRetentionViewerKey(siteID int64, request *http.Request, trustedProxi
 	if identity == "" {
 		identity = "anonymous"
 	}
-	raw := strings.Join([]string{
-		strconv.FormatInt(siteID, 10),
-		identity,
-		requestClientKey(request, trustedProxies),
-		request.Header.Get("User-Agent"),
-	}, "\x00")
+	parts := []string{strconv.FormatInt(siteID, 10), identity}
+	if identity == "anonymous" {
+		// Only the anonymous fallback needs volatile client markers: a viewer
+		// holding a token or device identity must not fork retention sessions
+		// by rotating User-Agent or roaming between IPs.
+		parts = append(parts, requestClientKey(request, trustedProxies), request.Header.Get("User-Agent"))
+	}
+	raw := strings.Join(parts, "\x00")
 	digest := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("%x", digest[:])
 }
@@ -247,10 +290,8 @@ func (tracker *accountRetentionTracker) Observe(site Site, request *http.Request
 
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	for sessionKey, session := range tracker.sessions {
-		if endedAt.Sub(session.LastObservedAt) > accountRetentionSessionTTL {
-			delete(tracker.sessions, sessionKey)
-		}
+	if len(tracker.sessions) >= accountRetentionSessionLimit || endedAt.Sub(tracker.lastSweep) >= accountRetentionSweepInterval {
+		tracker.sweepLocked(endedAt)
 	}
 	cycleStartedAtMS := site.AccountRetentionStartedMS
 	if override := tracker.cycleOverrides[site.ID]; override > cycleStartedAtMS {
