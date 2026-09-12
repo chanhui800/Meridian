@@ -71,7 +71,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return fmt.Errorf("invalid upstream headers: %w", err)
 		}
 	}
-	redirectPolicy, err := newDynamicRedirectPolicy(site, pm.DynamicDiscoveryAvailable())
+	redirectPolicy, err := newDynamicRedirectPolicy(pm.DynamicDiscoveryAvailable())
 	if err != nil {
 		return err
 	}
@@ -161,11 +161,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		Rewrite: func(proxyReq *httputil.ProxyRequest) {
 			ingressPrefix, _ := proxyReq.In.Context().Value(pathIngressContextKey{}).(string)
 			if redirectPolicy.configured {
-				eligible := isDynamicRedirectEligibleRequestForState(proxyReq.In, dynamicState)
-				if redirectPolicy.profile == dynamicProfileExtreme {
-					eligible = isExtremeDynamicRedirectEligibleRequest(proxyReq.In)
-				}
-				if eligible {
+				if eligible := isDynamicRedirectEligibleRequestForState(proxyReq.In, dynamicState); eligible {
 					ctx := context.WithValue(proxyReq.Out.Context(), dynamicRequestEligibleContextKey{}, true)
 					proxyReq.Out = proxyReq.Out.WithContext(ctx)
 				}
@@ -388,7 +384,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		if isReservedDynamicRoute(r.URL.Path) {
 			var rw http.ResponseWriter
 			if speedLimitBytes > 0 {
-				rw = &rateLimitedWriter{
+				limited := &rateLimitedWriter{
 					ResponseWriter: w,
 					bytesPerSec:    speedLimitBytes,
 					written:        inst.trafficBytesOut(),
@@ -396,8 +392,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					start:          time.Now(),
 					ctx:            r.Context(),
 				}
+				if trafficQuota > 0 {
+					rw = &quotaLimitedWriter{meteredWriter: meteredWriter{ResponseWriter: limited}, pm: pm, inst: inst, quota: trafficQuota}
+				} else {
+					rw = limited
+				}
 			} else {
-				rw = &meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
+				rw = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
 			}
 			if dynamicIssuer == nil {
 				writeDynamicCapabilityUnavailable(rw)
@@ -444,7 +445,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				if speedLimitBytes > 0 {
 					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut(), start: time.Now(), ctx: r.Context()}
 				} else {
-					cacheWriter = &meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
+					cacheWriter = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
 				}
 				serveAssetCacheHit(cacheWriter, r, hit)
 				return
@@ -463,22 +464,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return
 			}
 		}
-		if redirectPolicy.profile == dynamicProfileExtreme && isExtremeDynamicRedirectEligibleRequest(r) {
-			releaseReplayBody, err := prepareExtremeRedirectReplayBody(r, dynamicState, redirectPolicy.limits.MaxBodyBytes)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"error":"invalid request body"}`))
-				return
-			}
-			if releaseReplayBody != nil {
-				defer releaseReplayBody()
-			}
-		}
 
 		var rw http.ResponseWriter
 		if speedLimitBytes > 0 {
-			rw = &rateLimitedWriter{
+			limited := &rateLimitedWriter{
 				ResponseWriter: w,
 				bytesPerSec:    speedLimitBytes,
 				written:        inst.trafficBytesOut(),
@@ -486,8 +475,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				start:          time.Now(),
 				ctx:            r.Context(),
 			}
+			// The inner writer already meters; pass nil counters so wrapping
+			// does not double-count the same bytes.
+			if trafficQuota > 0 {
+				rw = &quotaLimitedWriter{meteredWriter: meteredWriter{ResponseWriter: limited}, pm: pm, inst: inst, quota: trafficQuota}
+			} else {
+				rw = limited
+			}
 		} else {
-			rw = &meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
+			rw = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
 		}
 		proxy.ServeHTTP(rw, r) // #nosec G704 -- forwarding to the administrator-configured, validated upstream is the product's purpose.
 	})
@@ -638,4 +634,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	}()
 
 	return nil
+}
+
+
+// meteredOrQuotaWriter returns the response writer that meters site traffic,
+// wrapped with mid-stream quota enforcement when the site has a quota.
+func (pm *ProxyManager) meteredOrQuotaWriter(w http.ResponseWriter, inst *ProxyInstance, trafficQuota int64) http.ResponseWriter {
+	metered := meteredWriter{ResponseWriter: w, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut()}
+	if trafficQuota > 0 {
+		return &quotaLimitedWriter{meteredWriter: metered, pm: pm, inst: inst, quota: trafficQuota}
+	}
+	return &metered
 }

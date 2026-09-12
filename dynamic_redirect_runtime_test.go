@@ -75,20 +75,13 @@ func (w *redirectRuntimeSignalWriter) Write(payload []byte) (int, error) {
 	return len(payload), nil
 }
 
-func redirectRuntimePolicy(profile string, available bool) dynamicRedirectPolicy {
-	limits, ok := dynamicLimitsForProfile(profile)
-	if !ok {
-		panic("unknown test dynamic profile")
-	}
+func redirectRuntimePolicy(available bool) dynamicRedirectPolicy {
 	return dynamicRedirectPolicy{
 		configured: true,
-		available:  available,
-		profile:    profile,
-		limits:     limits,
-		sources:    []string{dynamicDiscoverySourceRedirect},
-		domainRules: []DynamicDomainRule{
-			{Type: "suffix", Value: "example.com"},
-		},
+		available:   available,
+		profile:     dynamicProfileCompatible,
+		limits:      dynamicDefaultProfileLimits(),
+		sources:     []string{dynamicDiscoverySourceRedirect},
 	}
 }
 
@@ -219,10 +212,7 @@ func TestDynamicRedirectRuntimeEligibilityIsNarrow(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeUsesOnlyLiveLearnedPlaybackPaths(t *testing.T) {
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible limits are unavailable")
-	}
+	limits := dynamicDefaultProfileLimits()
 	_, state := redirectRuntimeState(t, limits, nil)
 	defer state.close()
 	now := time.Now()
@@ -268,48 +258,6 @@ func TestDynamicRedirectRuntimeUsesOnlyLiveLearnedPlaybackPaths(t *testing.T) {
 	bounded.mu.Unlock()
 	if entryCount != dynamicLearnedPlaybackPathLimit || bounded.hasLearnedPlaybackPath("/vendor/entry-000", now.Add(time.Second)) || !bounded.hasLearnedPlaybackPath(fmt.Sprintf("/vendor/entry-%03d", dynamicLearnedPlaybackPathLimit), now.Add(time.Second)) {
 		t.Fatalf("learned path capacity state count=%d", entryCount)
-	}
-}
-
-func TestDynamicRedirectRuntimeExtremeEligibilityIsBroadButReserved(t *testing.T) {
-	tests := []struct {
-		name        string
-		method      string
-		path        string
-		upgrade     bool
-		wantExtreme bool
-		wantStrict  bool
-	}{
-		{name: "ordinary API GET", method: http.MethodGet, path: "/Users/AuthenticateByName", wantExtreme: true},
-		{name: "ordinary API POST", method: http.MethodPost, path: "/Sessions/Playing", wantExtreme: true},
-		{name: "arbitrary PATCH path", method: http.MethodPatch, path: "/plugins/custom/action", wantExtreme: true},
-		{name: "arbitrary PUT path", method: http.MethodPut, path: "/plugins/custom/action", wantExtreme: true},
-		{name: "arbitrary DELETE path", method: http.MethodDelete, path: "/plugins/custom/action", wantExtreme: true},
-		{name: "CONNECT tunnel", method: http.MethodConnect, path: "/proxy"},
-		{name: "existing video GET", method: http.MethodGet, path: "/Videos/42/stream.mkv", wantExtreme: true, wantStrict: true},
-		{name: "existing PlaybackInfo HEAD", method: http.MethodHead, path: "/Items/42/PlaybackInfo", wantExtreme: true, wantStrict: true},
-		{name: "existing media POST remains strict-ineligible", method: http.MethodPost, path: "/Videos/42/stream", wantExtreme: true},
-		{name: "upgrade intent", method: http.MethodGet, path: "/Videos/42/stream", upgrade: true},
-		{name: "reserved capability root", method: http.MethodGet, path: strings.TrimSuffix(dynamicRoutePrefix, "/")},
-		{name: "reserved capability token", method: http.MethodGet, path: dynamicRoutePrefix + "opaque-token"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			req := httptest.NewRequest(test.method, "https://origin.example.com"+test.path, nil)
-			if test.upgrade {
-				req.Header.Set("Connection", "keep-alive, Upgrade")
-				req.Header.Set("Upgrade", "websocket")
-			}
-			if got := isExtremeDynamicRedirectEligibleRequest(req); got != test.wantExtreme {
-				t.Fatalf("Extreme eligibility for %s %s = %t, want %t", test.method, test.path, got, test.wantExtreme)
-			}
-			if got := isDynamicRedirectEligibleRequest(req); got != test.wantStrict {
-				t.Fatalf("strict eligibility for %s %s = %t, want %t", test.method, test.path, got, test.wantStrict)
-			}
-		})
-	}
-	if isExtremeDynamicRedirectEligibleRequest(nil) || isDynamicRedirectEligibleRequest(nil) {
-		t.Fatal("nil request was eligible")
 	}
 }
 
@@ -374,7 +322,7 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 	t.Run("configured manual authority does not require dynamic key or DNS", func(t *testing.T) {
 		calls := 0
 		factoryCalls := 0
-		policy := redirectRuntimePolicy(dynamicProfileCompatible, false)
+		policy := redirectRuntimePolicy(false)
 		transport := &redirectFollowTransport{
 			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
@@ -409,7 +357,7 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 				return redirectRuntimeResponse(req, http.StatusMovedPermanently, []string{manualTarget}, nil), nil
 			}),
 			playbackHosts: map[string]bool{manualAuthority: true},
-			dynamicPolicy: redirectRuntimePolicy(dynamicProfileSafe, true),
+			dynamicPolicy: redirectRuntimePolicy(true),
 		}
 		resp, err := transport.RoundTrip(httptest.NewRequest(http.MethodGet, "https://origin.example.com/Users/42", nil))
 		if err != nil {
@@ -423,7 +371,7 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 
 	t.Run("configured dynamic policy leaves source-disabled redirect untouched", func(t *testing.T) {
 		calls := 0
-		policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+		policy := redirectRuntimePolicy(true)
 		policy.sources = []string{dynamicDiscoverySourceHLS}
 		transport := &redirectFollowTransport{
 			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -444,7 +392,7 @@ func TestDynamicRedirectRuntimePreservesDisabledAndManualRedirects(t *testing.T)
 	})
 
 	t.Run("direct capability follower rejects source-disabled unknown authority", func(t *testing.T) {
-		policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+		policy := redirectRuntimePolicy(true)
 		policy.sources = []string{dynamicDiscoverySourceHLS}
 		var resolverCalls atomic.Int32
 		_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
@@ -479,7 +427,7 @@ func TestDynamicRedirectRuntimeFollowsAllAllowedUnknownStatuses(t *testing.T) {
 			if status == http.StatusPermanentRedirect {
 				method = http.MethodHead
 			}
-			policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+			policy := redirectRuntimePolicy(true)
 			var resolverCalls atomic.Int32
 			resolver := dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
 				resolverCalls.Add(1)
@@ -535,7 +483,7 @@ func TestDynamicRedirectRuntimeFollowsAllAllowedUnknownStatuses(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeAcceptsPercentEncodedSpaces(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileExtreme, true)
+	policy := redirectRuntimePolicy(true)
 	var resolverCalls atomic.Int32
 	resolver := dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
 		resolverCalls.Add(1)
@@ -573,7 +521,7 @@ func TestDynamicRedirectRuntimeAcceptsPercentEncodedSpaces(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	runtime, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
 		if host != "cdn.example.com" {
 			return nil, fmt.Errorf("unexpected DNS host %q", host)
@@ -631,7 +579,7 @@ func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) 
 }
 
 func TestDynamicRedirectRuntimeDirectModeExposesValidatedMainVideoTarget(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
 		if host != "cdn.example.com" {
 			return nil, fmt.Errorf("unexpected DNS host %q", host)
@@ -667,7 +615,7 @@ func TestDynamicRedirectRuntimeDirectModeExposesValidatedMainVideoTarget(t *test
 }
 
 func TestDynamicRedirectRuntimeDirectModeDoesNotExposeRedirectUserInfo(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	_, state := redirectRuntimeState(t, policy.limits, nil)
 	transport := &redirectFollowTransport{
 		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -689,7 +637,7 @@ func TestDynamicRedirectRuntimeDirectModeDoesNotExposeRedirectUserInfo(t *testin
 }
 
 func TestDynamicRedirectRuntimeInternallyFollowsMediaRedirects(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
 		if host != "cdn.example.com" {
 			return nil, fmt.Errorf("unexpected DNS host %q", host)
@@ -733,414 +681,8 @@ func TestDynamicRedirectRuntimeInternallyFollowsMediaRedirects(t *testing.T) {
 	}
 }
 
-func TestDynamicRedirectRuntimeSeeOtherIsExtremeOnly(t *testing.T) {
-	for _, test := range []struct {
-		profile     string
-		wantHandled bool
-	}{
-		{profile: dynamicProfileSafe},
-		{profile: dynamicProfileCompatible},
-		{profile: dynamicProfileExtreme, wantHandled: true},
-	} {
-		t.Run(test.profile, func(t *testing.T) {
-			calls := 0
-			redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
-			transport := &redirectFollowTransport{
-				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					calls++
-					if calls == 1 {
-						return redirectRuntimeResponse(req, http.StatusSeeOther, []string{"/Videos/42/next"}, redirectBody), nil
-					}
-					return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("ok"))), nil
-				}),
-				dynamicPolicy: redirectRuntimePolicy(test.profile, true),
-			}
-			resp, err := transport.RoundTrip(redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.com/Videos/42/stream"))
-			if test.wantHandled {
-				if err != nil {
-					t.Fatalf("Extreme 303 RoundTrip: %v", err)
-				}
-				if resp == nil || resp.StatusCode != http.StatusOK || calls != 2 {
-					t.Fatalf("Extreme 303 response=%#v calls=%d, want 200 after two calls", resp, calls)
-				}
-				_ = resp.Body.Close()
-			} else {
-				if resp != nil || calls != 1 {
-					t.Fatalf("%s 303 response=%#v calls=%d, want rejection after one call", test.profile, resp, calls)
-				}
-				redirectRuntimeAssertError(t, err, dynamicObservationReasonUnsupportedStatus)
-			}
-			if !redirectBody.closed.Load() {
-				t.Fatal("303 response body was not closed")
-			}
-		})
-	}
-}
-
-func TestDynamicRedirectRuntimeExtremeMethodAndBodySemantics(t *testing.T) {
-	const payload = `{"operation":"transcode"}`
-	tests := []struct {
-		name       string
-		status     int
-		method     string
-		wantMethod string
-		keepBody   bool
-	}{
-		{name: "301 GET", status: http.StatusMovedPermanently, method: http.MethodGet, wantMethod: http.MethodGet},
-		{name: "301 HEAD", status: http.StatusMovedPermanently, method: http.MethodHead, wantMethod: http.MethodHead},
-		{name: "301 POST", status: http.StatusMovedPermanently, method: http.MethodPost, wantMethod: http.MethodGet},
-		{name: "301 PATCH", status: http.StatusMovedPermanently, method: http.MethodPatch, wantMethod: http.MethodPatch, keepBody: true},
-		{name: "302 GET", status: http.StatusFound, method: http.MethodGet, wantMethod: http.MethodGet},
-		{name: "302 HEAD", status: http.StatusFound, method: http.MethodHead, wantMethod: http.MethodHead},
-		{name: "302 POST", status: http.StatusFound, method: http.MethodPost, wantMethod: http.MethodGet},
-		{name: "302 PATCH", status: http.StatusFound, method: http.MethodPatch, wantMethod: http.MethodPatch, keepBody: true},
-		{name: "303 GET", status: http.StatusSeeOther, method: http.MethodGet, wantMethod: http.MethodGet},
-		{name: "303 HEAD", status: http.StatusSeeOther, method: http.MethodHead, wantMethod: http.MethodHead},
-		{name: "303 POST", status: http.StatusSeeOther, method: http.MethodPost, wantMethod: http.MethodGet},
-		{name: "303 PATCH", status: http.StatusSeeOther, method: http.MethodPatch, wantMethod: http.MethodGet},
-		{name: "307 GET", status: http.StatusTemporaryRedirect, method: http.MethodGet, wantMethod: http.MethodGet, keepBody: true},
-		{name: "307 HEAD", status: http.StatusTemporaryRedirect, method: http.MethodHead, wantMethod: http.MethodHead, keepBody: true},
-		{name: "307 POST", status: http.StatusTemporaryRedirect, method: http.MethodPost, wantMethod: http.MethodPost, keepBody: true},
-		{name: "307 PATCH", status: http.StatusTemporaryRedirect, method: http.MethodPatch, wantMethod: http.MethodPatch, keepBody: true},
-		{name: "308 GET", status: http.StatusPermanentRedirect, method: http.MethodGet, wantMethod: http.MethodGet, keepBody: true},
-		{name: "308 HEAD", status: http.StatusPermanentRedirect, method: http.MethodHead, wantMethod: http.MethodHead, keepBody: true},
-		{name: "308 POST", status: http.StatusPermanentRedirect, method: http.MethodPost, wantMethod: http.MethodPost, keepBody: true},
-		{name: "308 PATCH", status: http.StatusPermanentRedirect, method: http.MethodPatch, wantMethod: http.MethodPatch, keepBody: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			calls := 0
-			redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
-			var followedMethod, followedBody, replayedBody, followedContentType, followedContentEncoding string
-			var followedLength int64
-			var followedHadBody, followedHadGetBody bool
-			transport := &redirectFollowTransport{
-				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					calls++
-					if calls == 1 {
-						return redirectRuntimeResponse(req, test.status, []string{"/redirected"}, redirectBody), nil
-					}
-					followedMethod = req.Method
-					followedLength = req.ContentLength
-					followedContentType = req.Header.Get("Content-Type")
-					followedContentEncoding = req.Header.Get("Content-Encoding")
-					followedHadBody = req.Body != nil && req.Body != http.NoBody
-					if followedHadBody {
-						body, readErr := io.ReadAll(req.Body)
-						if readErr != nil {
-							t.Fatalf("read followed body: %v", readErr)
-						}
-						followedBody = string(body)
-					}
-					followedHadGetBody = req.GetBody != nil
-					if followedHadGetBody {
-						replay, replayErr := req.GetBody()
-						if replayErr != nil {
-							t.Fatalf("GetBody after redirect: %v", replayErr)
-						}
-						body, readErr := io.ReadAll(replay)
-						_ = replay.Close()
-						if readErr != nil {
-							t.Fatalf("read GetBody after redirect: %v", readErr)
-						}
-						replayedBody = string(body)
-					}
-					return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("ok"))), nil
-				}),
-				dynamicPolicy: redirectRuntimePolicy(dynamicProfileExtreme, true),
-			}
-			request := redirectRuntimeEligibleRequest(test.method, "https://origin.example.com/original")
-			request.Body = io.NopCloser(strings.NewReader(payload))
-			request.ContentLength = int64(len(payload))
-			if test.keepBody {
-				request.GetBody = func() (io.ReadCloser, error) {
-					return io.NopCloser(strings.NewReader(payload)), nil
-				}
-			}
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Content-Encoding", "identity")
-
-			resp, err := transport.RoundTrip(request)
-			if err != nil {
-				t.Fatalf("Extreme redirect: %v", err)
-			}
-			if resp == nil || resp.StatusCode != http.StatusOK || calls != 2 {
-				t.Fatalf("response=%#v calls=%d, want 200 after two calls", resp, calls)
-			}
-			_ = resp.Body.Close()
-			_ = request.Body.Close()
-			if !redirectBody.closed.Load() {
-				t.Fatal("redirect response body was not closed")
-			}
-			if followedMethod != test.wantMethod {
-				t.Fatalf("followed method=%q, want %q", followedMethod, test.wantMethod)
-			}
-			if test.keepBody {
-				if !followedHadBody || followedBody != payload || !followedHadGetBody || replayedBody != payload {
-					t.Fatalf("preserved body present=%t body=%q GetBody=%t replay=%q", followedHadBody, followedBody, followedHadGetBody, replayedBody)
-				}
-				if followedLength != int64(len(payload)) || followedContentType != "application/json" || followedContentEncoding != "identity" {
-					t.Fatalf("preserved body metadata length=%d type=%q encoding=%q", followedLength, followedContentType, followedContentEncoding)
-				}
-			} else {
-				if followedHadBody || followedBody != "" || followedHadGetBody || replayedBody != "" || followedLength != 0 {
-					t.Fatalf("dropped body present=%t body=%q GetBody=%t replay=%q length=%d", followedHadBody, followedBody, followedHadGetBody, replayedBody, followedLength)
-				}
-				if followedContentType != "" || followedContentEncoding != "" {
-					t.Fatalf("dropped body leaked metadata type=%q encoding=%q", followedContentType, followedContentEncoding)
-				}
-			}
-		})
-	}
-}
-
-func TestDynamicRedirectRuntimeExtremeReplayDenials(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileExtreme, true)
-	tests := []struct {
-		name      string
-		configure func(*http.Request, int64)
-	}{
-		{
-			name: "missing GetBody",
-			configure: func(req *http.Request, _ int64) {
-				req.GetBody = nil
-			},
-		},
-		{
-			name: "unknown length",
-			configure: func(req *http.Request, _ int64) {
-				req.ContentLength = -1
-			},
-		},
-		{
-			name: "over profile body limit",
-			configure: func(req *http.Request, maxBodyBytes int64) {
-				req.ContentLength = maxBodyBytes + 1
-			},
-		},
-		{
-			name: "transfer encoding",
-			configure: func(req *http.Request, _ int64) {
-				req.TransferEncoding = []string{"chunked"}
-			},
-		},
-		{
-			name: "trailers",
-			configure: func(req *http.Request, _ int64) {
-				req.Trailer = http.Header{"X-Body-Digest": []string{"secret"}}
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			const payload = "request-body"
-			calls := 0
-			redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
-			transport := &redirectFollowTransport{
-				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					calls++
-					if calls == 1 {
-						return redirectRuntimeResponse(req, http.StatusTemporaryRedirect, []string{"/redirected"}, redirectBody), nil
-					}
-					return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("unexpected"))), nil
-				}),
-				dynamicPolicy: policy,
-			}
-			request := redirectRuntimeEligibleRequest(http.MethodPatch, "https://origin.example.com/original")
-			request.Body = io.NopCloser(strings.NewReader(payload))
-			request.ContentLength = int64(len(payload))
-			request.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(strings.NewReader(payload)), nil
-			}
-			test.configure(request, policy.limits.MaxBodyBytes)
-
-			resp, err := transport.RoundTrip(request)
-			if resp != nil {
-				_ = resp.Body.Close()
-				t.Fatalf("response=%#v, want nil", resp)
-			}
-			redirectRuntimeAssertError(t, err, dynamicObservationReasonRedirectBodyReplayDenied)
-			if calls != 1 {
-				t.Fatalf("upstream calls=%d, want one before replay denial", calls)
-			}
-			if !redirectBody.closed.Load() {
-				t.Fatal("denied redirect response body was not closed")
-			}
-			_ = request.Body.Close()
-		})
-	}
-}
-
-func TestDynamicRedirectRuntimePreparesRepeatableExtremeBody(t *testing.T) {
-	const payload = `{"MediaSourceId":"source-1"}`
-	limits, ok := dynamicLimitsForProfile(dynamicProfileExtreme)
-	if !ok {
-		t.Fatal("Extreme profile limits missing")
-	}
-	_, state := redirectRuntimeState(t, limits, nil)
-	t.Cleanup(state.close)
-	request := httptest.NewRequest(http.MethodPatch, "https://origin.example.com/original", strings.NewReader(payload))
-	request.ContentLength = int64(len(payload))
-	request.GetBody = nil
-	release, err := prepareExtremeRedirectReplayBody(request, state, int64(len(payload)))
-	if err != nil {
-		t.Fatalf("prepare bounded replay body: %v", err)
-	}
-	if release == nil || request.GetBody == nil {
-		t.Fatalf("release_non_nil=%t GetBody_non_nil=%t, want both true", release != nil, request.GetBody != nil)
-	}
-	t.Cleanup(release)
-
-	initialBody, err := io.ReadAll(request.Body)
-	if err != nil {
-		t.Fatalf("read prepared initial body: %v", err)
-	}
-	_ = request.Body.Close()
-	if string(initialBody) != payload {
-		t.Fatalf("prepared initial body=%q, want %q", initialBody, payload)
-	}
-
-	transport := &redirectFollowTransport{dynamicPolicy: redirectRuntimePolicy(dynamicProfileExtreme, true)}
-	current := request
-	for index, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
-		target := redirectRuntimeMustParseURL(t, fmt.Sprintf("https://origin.example.com/hop-%d", index+1))
-		next, stripBodyHeaders, reasonCode := transport.newExtremeCompatibleDynamicRedirectRequest(current.Context(), current, status, target)
-		if reasonCode != "" || next == nil || stripBodyHeaders {
-			t.Fatalf("hop %d request=%#v strip=%t reason=%q", index+1, next, stripBodyHeaders, reasonCode)
-		}
-		body, readErr := io.ReadAll(next.Body)
-		if readErr != nil {
-			t.Fatalf("read hop %d body: %v", index+1, readErr)
-		}
-		_ = next.Body.Close()
-		if string(body) != payload || next.Method != http.MethodPatch || next.ContentLength != int64(len(payload)) || next.GetBody == nil {
-			t.Fatalf("hop %d method=%q length=%d GetBody=%t body=%q", index+1, next.Method, next.ContentLength, next.GetBody != nil, body)
-		}
-		extra, replayErr := next.GetBody()
-		if replayErr != nil {
-			t.Fatalf("hop %d GetBody: %v", index+1, replayErr)
-		}
-		replayed, readErr := io.ReadAll(extra)
-		_ = extra.Close()
-		if readErr != nil || string(replayed) != payload {
-			t.Fatalf("hop %d repeated body=%q err=%v", index+1, replayed, readErr)
-		}
-		current = next
-	}
-	release()
-}
-
-func TestDynamicRedirectRuntimeExtremeCrossAuthorityBodyHeaders(t *testing.T) {
-	const payload = `{"operation":"probe"}`
-	target := redirectRuntimeMustParseURL(t, "https://cdn.example.com/jobs/42")
-	targetAuthority := redirectHostKey(target)
-	redirectBody := &redirectRuntimeCloseSpy{Reader: strings.NewReader("redirect")}
-	var followed *http.Request
-	var followedBody string
-	calls := 0
-	transport := &redirectFollowTransport{
-		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			calls++
-			if calls == 1 {
-				return redirectRuntimeResponse(req, http.StatusTemporaryRedirect, []string{target.String()}, redirectBody), nil
-			}
-			followed = req
-			body, err := io.ReadAll(req.Body)
-			if err != nil {
-				t.Fatalf("read cross-authority body: %v", err)
-			}
-			followedBody = string(body)
-			return redirectRuntimeResponse(req, http.StatusOK, nil, io.NopCloser(strings.NewReader("ok"))), nil
-		}),
-		playbackHosts:         map[string]bool{targetAuthority: true},
-		configuredAuthorities: map[string]bool{targetAuthority: true},
-		dynamicPolicy:         redirectRuntimePolicy(dynamicProfileExtreme, true),
-	}
-	request := redirectRuntimeEligibleRequest(http.MethodPatch, "https://origin.example.com/jobs/42")
-	request.Body = io.NopCloser(strings.NewReader(payload))
-	request.ContentLength = int64(len(payload))
-	request.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader(payload)), nil
-	}
-	wantHeaders := map[string]string{
-		"Accept":           "application/json",
-		"Accept-Encoding":  "identity",
-		"Range":            "bytes=0-4095",
-		"If-Range":         `"safe-etag"`,
-		"User-Agent":       "safe-client/1",
-		"Content-Type":     "application/json",
-		"Content-Encoding": "gzip",
-		"Content-Language": "en-US",
-		"Content-MD5":      "safe-content-md5",
-		"Digest":           "sha-256=safe-digest",
-	}
-	for name, value := range wantHeaders {
-		request.Header.Set(name, value)
-	}
-	for name, value := range map[string]string{
-		"Authorization":        "Bearer origin-secret",
-		"Cookie":               "session=origin-secret",
-		"Proxy-Authorization":  "Basic proxy-secret",
-		"X-Emby-Authorization": `MediaBrowser Client="client", Token="emby-secret"`,
-		"X-Emby-Token":         "emby-secret",
-		"X-MediaBrowser-Token": "media-secret",
-		"Forwarded":            "for=203.0.113.9;proto=https",
-		"X-Forwarded-For":      "203.0.113.9",
-		"X-Forwarded-Host":     "private.example.net",
-		"X-Forwarded-Proto":    "https",
-		"X-Real-IP":            "203.0.113.9",
-		"Connection":           "keep-alive, X-Hop-Secret",
-		"X-Hop-Secret":         "hop-secret",
-		"Keep-Alive":           "timeout=5",
-		"Proxy-Connection":     "keep-alive",
-		"TE":                   "trailers",
-		"Trailer":              "X-Trailer-Secret",
-		"Transfer-Encoding":    "chunked",
-		"Upgrade":              "websocket",
-		"Expect":               "100-continue",
-		"Content-Length":       "999999",
-		"X-Arbitrary-Secret":   "unknown-secret",
-	} {
-		request.Header.Set(name, value)
-	}
-
-	resp, err := transport.RoundTrip(request)
-	if err != nil {
-		t.Fatalf("cross-authority replay: %v", err)
-	}
-	if resp == nil || resp.StatusCode != http.StatusOK || calls != 2 || followed == nil {
-		t.Fatalf("response=%#v calls=%d followed_non_nil=%t", resp, calls, followed != nil)
-	}
-	_ = resp.Body.Close()
-	_ = request.Body.Close()
-	if !redirectBody.closed.Load() {
-		t.Fatal("cross-authority redirect body was not closed")
-	}
-	if followed.Method != http.MethodPatch || followedBody != payload || followed.ContentLength != int64(len(payload)) || followed.GetBody == nil {
-		t.Fatalf("followed method=%q body=%q length=%d GetBody=%t", followed.Method, followedBody, followed.ContentLength, followed.GetBody != nil)
-	}
-	for name, want := range wantHeaders {
-		if got := followed.Header.Get(name); got != want {
-			t.Errorf("safe replay header %s=%q, want %q", name, got, want)
-		}
-	}
-	for _, name := range []string{
-		"Authorization", "Cookie", "Proxy-Authorization", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token",
-		"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
-		"Connection", "X-Hop-Secret", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "Upgrade", "Expect",
-		"Content-Length", "X-Arbitrary-Secret",
-	} {
-		if values := followed.Header.Values(name); len(values) != 0 {
-			t.Errorf("cross-authority replay leaked %s=%q", name, values)
-		}
-	}
-	if len(followed.Header) != len(wantHeaders) {
-		t.Errorf("cross-authority replay headers=%v, want only %v", followed.Header, wantHeaders)
-	}
-}
-
 func TestDynamicRedirectRuntimeReusesCallerStreamLease(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+	policy := redirectRuntimePolicy(true)
 	policy.limits.MaxStreams = 1
 	runtime, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
@@ -1185,7 +727,7 @@ func TestDynamicRedirectRuntimeReusesCallerStreamLease(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeRetainsAuthorityThroughStructuredRewrite(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	policy.sources = []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS}
 	runtime, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
@@ -1228,7 +770,7 @@ func TestDynamicRedirectRuntimeRetainsAuthorityThroughStructuredRewrite(t *testi
 }
 
 func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	policy.sources = []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo, dynamicDiscoverySourceHLS}
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
@@ -1289,7 +831,7 @@ func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *t
 }
 
 func TestDynamicRedirectRuntimeCarriesDisabledPlaybackIdentityAndFailsClosed(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	policy.sources = []string{dynamicDiscoverySourceRedirect}
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
@@ -1344,7 +886,7 @@ func TestDynamicRedirectRuntimeRebuildsHeadersAndCleansResponse(t *testing.T) {
 	t.Setenv("ALL_PROXY", "http://proxy.invalid:65535")
 	t.Setenv("NO_PROXY", "")
 
-	policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+	policy := redirectRuntimePolicy(true)
 	var resolverHost string
 	resolver := dynamicIPResolverFunc(func(_ context.Context, host string) ([]net.IPAddr, error) {
 		resolverHost = host
@@ -1522,7 +1064,7 @@ func TestDynamicRedirectRuntimeRebuildsHeadersAndCleansResponse(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeBlocksInformationalAndTrailerHeaders(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	resolver := dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
 	})
@@ -1601,7 +1143,7 @@ func TestDynamicRedirectRuntimeBlocksInformationalAndTrailerHeaders(t *testing.T
 }
 
 func TestDynamicRedirectRuntimePreservesNotModified(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	body := &redirectRuntimeCloseSpy{Reader: strings.NewReader("unexpected")}
 	calls := 0
 	transport := &redirectFollowTransport{
@@ -1628,7 +1170,7 @@ func TestDynamicRedirectRuntimePreservesNotModified(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeRejectsMalformedRedirectChains(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	for _, test := range []struct {
 		name      string
 		status    int
@@ -1719,27 +1261,6 @@ func TestDynamicRedirectRuntimeRefusesUnsafeUnknownTargets(t *testing.T) {
 		denyTargetHost bool
 	}{
 		{
-			name:       "safe profile scheme",
-			profile:    dynamicProfileSafe,
-			origin:     "https://origin.example.net/Videos/42/stream",
-			location:   "http://cdn.example.com/media",
-			wantReason: dynamicObservationReasonSchemeDenied,
-		},
-		{
-			name:       "safe profile port",
-			profile:    dynamicProfileSafe,
-			origin:     "https://origin.example.net/Videos/42/stream",
-			location:   "https://cdn.example.com:444/media",
-			wantReason: dynamicObservationReasonPortDenied,
-		},
-		{
-			name:       "safe profile domain",
-			profile:    dynamicProfileSafe,
-			origin:     "https://origin.example.net/Videos/42/stream",
-			location:   "https://cdn.example.net/media",
-			wantReason: dynamicObservationReasonDomainDenied,
-		},
-		{
 			name:       "HTTPS downgrade",
 			profile:    dynamicProfileCompatible,
 			origin:     "https://origin.example.net/Videos/42/stream",
@@ -1776,7 +1297,7 @@ func TestDynamicRedirectRuntimeRefusesUnsafeUnknownTargets(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			policy := redirectRuntimePolicy(test.profile, true)
+			policy := redirectRuntimePolicy(true)
 			var resolverCalls atomic.Int32
 			resolver := dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 				resolverCalls.Add(1)
@@ -1829,7 +1350,7 @@ func redirectRuntimeMustParseURL(t *testing.T, raw string) *url.URL {
 }
 
 func TestDynamicRedirectRuntimeMissingKeyFailsClosedAndSanitizesHTTPError(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileSafe, false)
+	policy := redirectRuntimePolicy(false)
 	var resolverCalls atomic.Int32
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		resolverCalls.Add(1)
@@ -1914,10 +1435,7 @@ func TestDynamicRedirectRuntimeHTTPErrorClassification(t *testing.T) {
 
 func TestDynamicRedirectRuntimeAuthorityAndRateBudgets(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	baseLimits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible profile missing")
-	}
+	baseLimits := dynamicDefaultProfileLimits()
 
 	t.Run("per-site authority capacity", func(t *testing.T) {
 		limits := baseLimits
@@ -2009,11 +1527,8 @@ func TestDynamicRedirectRuntimeAuthorityAndRateBudgets(t *testing.T) {
 
 func TestDynamicRedirectRuntimeProfileOperationalBoundaries(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible, dynamicProfileExtreme} {
-		limits, ok := dynamicLimitsForProfile(profile)
-		if !ok {
-			t.Fatalf("profile %q missing", profile)
-		}
+	for _, profile := range []string{dynamicProfileCompatible} {
+		limits := dynamicDefaultProfileLimits()
 		t.Run(profile+" authority limit", func(t *testing.T) {
 			runtime := newDynamicRuntime()
 			state := newDynamicSiteState(runtime, limits)
@@ -2101,10 +1616,7 @@ func TestDynamicRedirectRuntimeProfileOperationalBoundaries(t *testing.T) {
 
 func TestDynamicRedirectRuntimeDeduplicatesConcurrentAuthorityResolution(t *testing.T) {
 	const concurrentDiscoveries = 200
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible profile missing")
-	}
+	limits := dynamicDefaultProfileLimits()
 	target, err := normalizeDynamicURL("https://cdn.example.com/media")
 	if err != nil {
 		t.Fatal(err)
@@ -2224,7 +1736,7 @@ func TestDynamicRedirectRuntimeDeduplicatesConcurrentAuthorityResolution(t *test
 }
 
 func TestDynamicRedirectRuntimeDNSWorkerAndAnswerBudgets(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+	policy := redirectRuntimePolicy(true)
 	target, err := normalizeDynamicURL("http://cdn.example.com/media")
 	if err != nil {
 		t.Fatal(err)
@@ -2299,10 +1811,7 @@ func TestDynamicRedirectRuntimeDNSWorkerAndAnswerBudgets(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimePerSiteAndGlobalStreamPermits(t *testing.T) {
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible profile missing")
-	}
+	limits := dynamicDefaultProfileLimits()
 	limits.MaxStreams = 1
 
 	t.Run("per-site limit", func(t *testing.T) {
@@ -2357,7 +1866,7 @@ func TestDynamicRedirectRuntimePerSiteAndGlobalStreamPermits(t *testing.T) {
 }
 
 func TestDynamicRedirectRuntimeRequestCancellationReleasesStream(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+	policy := redirectRuntimePolicy(true)
 	policy.limits.MaxStreams = 1
 	runtime, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil

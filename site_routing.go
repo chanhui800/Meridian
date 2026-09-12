@@ -795,10 +795,6 @@ func isDynamicRedirectEligibleRequestForState(r *http.Request, state *dynamicSit
 	return r != nil && r.URL != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && !hasUpgradeIntent(r) && state != nil && state.hasLearnedPlaybackPath(r.URL.Path, time.Now())
 }
 
-func isExtremeDynamicRedirectEligibleRequest(r *http.Request) bool {
-	return r != nil && r.URL != nil && r.Method != http.MethodConnect && !hasUpgradeIntent(r) && !isReservedDynamicRoute(r.URL.Path)
-}
-
 func upstreamTargetForRequest(r *http.Request, apiTarget, playbackTarget *url.URL) *url.URL {
 	if playbackTarget != nil && isPlaybackRequest(r.URL.Path) {
 		return playbackTarget

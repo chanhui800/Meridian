@@ -58,6 +58,35 @@ func (m *meteredWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// quotaLimitedWriter aborts a streaming response once the site's billing-cycle
+// usage crosses its quota. The admission check only guards request start; a
+// single long-lived stream admitted just under the quota could otherwise
+// transfer unboundedly past it. The usage probe runs at most once per
+// quotaCheckBytes to bound its cost, and never while the handler holds the
+// instance traffic lock.
+type quotaLimitedWriter struct {
+	meteredWriter
+	pm         *ProxyManager
+	inst       *ProxyInstance
+	quota      int64
+	sinceCheck int64
+}
+
+const quotaCheckBytes = 16 << 20
+
+func (q *quotaLimitedWriter) Write(b []byte) (int, error) {
+	n, err := q.meteredWriter.Write(b)
+	q.sinceCheck += int64(n)
+	if q.sinceCheck < quotaCheckBytes {
+		return n, err
+	}
+	q.sinceCheck = 0
+	if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
+		return n, http.ErrAbortHandler
+	}
+	return n, err
+}
+
 // Flush support for streaming
 func (m *meteredWriter) Flush() {
 	if f, ok := m.ResponseWriter.(http.Flusher); ok {

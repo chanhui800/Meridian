@@ -139,7 +139,7 @@ func (i *dynamicCapabilityIssuer) mintValidatedResourceWithRequiredHeadersTracke
 	if !validDynamicCapabilityResource(source, kind, depth) {
 		return "", false, newDynamicProxyError(dynamicObservationReasonInvalidLocation)
 	}
-	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 && (i.policy.profile != dynamicProfileExtreme || dynamicRequiredHeadersConflictWithFixedPolicy(requiredHeaders, i.upstreamHeaderPolicy)) {
+	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 {
 		return "", false, newDynamicProxyError(dynamicObservationReasonInvalidLocation)
 	}
 	selfTargets := i.state.runtime.selfTargets.Load()
@@ -217,7 +217,7 @@ func (i *dynamicCapabilityIssuer) mintTrustedValidatedWithRequiredHeadersTracked
 	if i == nil || !i.policy.available || !i.policy.sourceEnabled(source) || i.state == nil || len(i.key) != sha256.Size || i.configuredTransport == nil || !validDynamicCapabilityResource(source, kind, depth) {
 		return "", false, newDynamicProxyError(dynamicObservationReasonRuntimeUnavailable)
 	}
-	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 && (i.policy.profile != dynamicProfileExtreme || dynamicRequiredHeadersConflictWithFixedPolicy(requiredHeaders, i.upstreamHeaderPolicy)) {
+	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 {
 		return "", false, newDynamicProxyError(dynamicObservationReasonInvalidLocation)
 	}
 	normalized, err := normalizeTrustedCapabilityURL(validationTarget.String())

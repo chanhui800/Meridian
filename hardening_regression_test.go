@@ -262,7 +262,10 @@ func TestDeleteTrackedSiteDNSRemoteVerifiesOwnership(t *testing.T) {
 	}{
 		{name: "owned record is deleted", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", "Meridian site=7"), status: http.StatusOK, wantDelete: true},
 		{name: "operator-edited comment refuses delete", body: recordJSON("rec-1", "A", "site.example", "203.0.113.5", ""), status: http.StatusOK, wantErr: "refusing to delete"},
-		{name: "renamed record refuses delete", body: recordJSON("rec-1", "A", "other.example", "203.0.113.5", "Meridian site=7"), status: http.StatusOK, wantErr: "refusing to delete"},
+		// A record whose host no longer matches the site still carries the
+		// ownership marker and record ID, so cleanup may proceed: refusing it
+		// would wedge site deletion forever after a site rename.
+		{name: "renamed host with marker is deleted", body: recordJSON("rec-1", "A", "other.example", "203.0.113.5", "Meridian site=7"), status: http.StatusOK, wantDelete: true},
 		{name: "wrong family refuses delete", body: recordJSON("rec-1", "CNAME", "site.example", "target.example", "Meridian site=7"), status: http.StatusOK, wantErr: "refusing to delete"},
 		{name: "missing record stays idempotent", body: `{"success":false,"errors":[{"code":81044,"message":"record does not exist"}]}`, status: http.StatusNotFound, wantDelete: true},
 	}
@@ -560,5 +563,59 @@ func TestNodeRequestEventPendingLedgerIsCapped(t *testing.T) {
 	}
 	if pending > nodeRequestEventPendingLimit {
 		t.Fatalf("pending ledger rows=%d, want <= %d", pending, nodeRequestEventPendingLimit)
+	}
+}
+
+
+func TestAgentConfigHashKeepsPreV1986SiteWireCompatibility(t *testing.T) {
+	config := AgentRuntimeConfig{
+		SchemaVersion: agentConfigSchemaVersion,
+		NodeGUID:      "compat-node",
+		HTTPSPort:     9090,
+		DynamicKey:    testEdgeRuntimeKey(t),
+		Routes: []AgentSiteRoute{{
+			SiteID: 9, Host: "media.example.test", TargetURL: "https://origin.example.test",
+			Site: Site{ID: 9, Name: "compat", PublicHost: "media.example.test", IngressMode: ingressModeHost},
+		}},
+	}
+	if agentSupportsDynamicPolicyRemoval("v1.9.85") {
+		t.Fatal("v1.9.85 must be treated as pre-removal")
+	}
+	if !agentSupportsDynamicPolicyRemoval("v1.9.86") || !agentSupportsDynamicPolicyRemoval("v2.0.0") {
+		t.Fatal("removal gate must accept v1.9.86 and later")
+	}
+	legacyHash, err := agentConfigHashForVersion(config, "v1.9.85")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modernHash, err := agentConfigHashForVersion(config, "v1.9.86")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyHash == modernHash {
+		t.Fatal("legacy and modern site wire hashes must differ after field removal")
+	}
+	// The legacy payload must serialize the removed fields with zero values in
+	// their original positions — that is what a v1.9.85 agent re-marshals.
+	payload, err := json.Marshal(agentRuntimeConfigHashLegacy{Routes: []agentSiteRouteHashLegacy{{Site: agentSiteHashLegacy{}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"dynamic_discovery_enabled", "dynamic_profile",
+		"dynamic_discovery_sources", "dynamic_domain_rules",
+		"dynamic_allow_https_downgrade",
+	} {
+		if !strings.Contains(string(payload), key) {
+			t.Fatalf("legacy hash payload lost key %q", key)
+		}
+	}
+	// Round-trip conversion must not lose current fields.
+	legacy, err := legacyAgentSiteHash(Site{ID: 9, Name: "compat", TrafficQuota: 123})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.ID != 9 || legacy.Name != "compat" || legacy.TrafficQuota != 123 || legacy.DynamicDiscoveryEnabled || legacy.DynamicProfile != "" {
+		t.Fatalf("legacy site conversion = %#v", legacy)
 	}
 }

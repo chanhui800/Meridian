@@ -407,7 +407,7 @@ func TestBuildEdgeProxyIgnoresControllerOnlySiteIconMetadata(t *testing.T) {
 				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
 				IconName: "Emby", IconURL: "https://icons.example.test/emby.png",
 			},
-			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: "[]", DynamicRules: "[]",
+			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
 	bundle, err := buildEdgeProxy(config, runtime)
@@ -440,7 +440,7 @@ func TestEdgeProxyReportsMediaCountsWithCentralSiteID(t *testing.T) {
 				TargetURL: upstream.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy",
 				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
 			},
-			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: "[]", DynamicRules: "[]",
+			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
 	bundle, err := buildEdgeProxy(config, runtime)
@@ -481,7 +481,7 @@ func TestEdgeProxyEnforcesControllerTrafficQuotaAfterConfigRefresh(t *testing.T)
 				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
 				TrafficQuota: 100, TrafficUsed: 100,
 			},
-			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: "[]", DynamicRules: "[]",
+			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
 	bundle, err := buildEdgeProxy(config, runtime)
@@ -784,9 +784,8 @@ func TestEdgeProxyRewritesAndServesDynamicPlaybackBackend(t *testing.T) {
 			SiteID: 51, Host: "dynamic.example.test", TargetURL: upstream.URL, PlaybackMode: "direct",
 			Site: Site{Name: "dynamic", PublicHost: "dynamic.example.test", IngressMode: ingressModeHost,
 				TargetURL: upstream.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]",
-				UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth, DynamicDiscoveryEnabled: true,
-				DynamicProfile: dynamicProfileCompatible, DynamicDiscoverySources: allDynamicDiscoverySources()},
-			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: `["redirect","playback_info","hls","dash"]`, DynamicRules: "[]",
+				UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth},
+			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
 	bundle, err := buildEdgeProxy(config, runtime)
@@ -846,9 +845,8 @@ func TestEdgeProxyReusesPrimaryPlaybackAndHeaderPolicies(t *testing.T) {
 			Headers: map[string][]string{"X-Origin-Secret": {"configured"}},
 			Site: Site{Name: "edge", PublicHost: "edge.example.test", IngressMode: ingressModeHost,
 				TargetURL: api.URL, PlaybackTargetURL: playback.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy",
-				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,
-				DynamicProfile: dynamicProfileSafe, DynamicDiscoverySources: defaultDynamicDiscoverySources(), DynamicDomainRules: []DynamicDomainRule{}},
-			FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: `["redirect","playback_info","hls","dash"]`, DynamicRules: "[]",
+				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,},
+			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
 	bundle, err := buildEdgeProxy(config, runtime)
@@ -934,8 +932,7 @@ func TestBuildAgentConfigCarriesCompleteDynamicSiteWithoutNestedQueryDeadlock(t 
 	site, err := app.db.CreateSiteRecord(Site{
 		Name: "dynamic", PublicHost: "dynamic.example.test", IngressMode: ingressModeHost, TargetURL: "https://origin.example.test",
 		PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode,
-		DynamicDiscoveryEnabled: true, DynamicProfile: dynamicProfileCompatible,
-		DynamicDiscoverySources: allDynamicDiscoverySources(), DynamicDomainRules: []DynamicDomainRule{},
+
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -957,7 +954,7 @@ func TestBuildAgentConfigCarriesCompleteDynamicSiteWithoutNestedQueryDeadlock(t 
 	case err := <-errorsCh:
 		t.Fatal(err)
 	case config := <-result:
-		if len(config.Routes) != 1 || !config.Routes[0].Site.DynamicDiscoveryEnabled || config.DynamicKey == "" {
+		if len(config.Routes) != 1 || config.DynamicKey == "" {
 			t.Fatalf("incomplete runtime config: %#v", config)
 		}
 		decodedProbe, decodeErr := edgeDecodeKey(config.ProbeSecret)

@@ -3788,7 +3788,7 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	}
 	defer occupied.Close()
 
-	body := strings.NewReader(`{"name":"stable","listen_port":` + jsonNumber(conflictPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse","dynamic_profile":"compatible","dynamic_domain_rules":[{"type":"exact","value":"8.8.8.8"}],"dynamic_allow_https_downgrade":true}`)
+	body := strings.NewReader(`{"name":"stable","listen_port":` + jsonNumber(conflictPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
 	rr := httptest.NewRecorder()
 
@@ -3804,8 +3804,8 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	if reloaded.ListenPort != initialPort {
 		t.Fatalf("listen_port = %d, want %d", reloaded.ListenPort, initialPort)
 	}
-	if reloaded.DynamicDiscoveryEnabled != site.DynamicDiscoveryEnabled || reloaded.DynamicProfile != site.DynamicProfile || reloaded.StoredDynamicDomainRules != site.StoredDynamicDomainRules || reloaded.DynamicAllowHTTPSDowngrade != site.DynamicAllowHTTPSDowngrade || reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
-		t.Fatalf("rolled-back dynamic policy = %#v, want original %#v", reloaded, site)
+	if reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
+		t.Fatalf("rolled-back dynamic policy revision = %d, want original %d", reloaded.DynamicPolicyRevision, site.DynamicPolicyRevision)
 	}
 	if !app.pm.IsRunning(site.ID) {
 		t.Fatalf("expected original site to keep running")
@@ -5108,9 +5108,6 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"custom_version": true, "client_ip_mode": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
 		"updated_at": true, "running": true,
-		"dynamic_discovery_enabled": true, "dynamic_profile": true,
-		"dynamic_discovery_sources": true,
-		"dynamic_domain_rules":      true, "dynamic_allow_https_downgrade": true,
 		"dynamic_policy_revision": true,
 		"asset_cache_enabled":     true, "asset_cache_ttl_sec": true,
 		"asset_cache_max_bytes": true, "asset_cache_rules": true, "cache_size_bytes": true,

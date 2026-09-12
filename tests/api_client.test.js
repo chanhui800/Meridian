@@ -81,12 +81,10 @@ test('dynamic discovery API calls use the exact authenticated paths and verbs', 
     };
   };
 
-  await vm.runInContext('API.getDynamicProfiles()', sandbox);
   await vm.runInContext('API.getDynamicObservations("site/42 ?")', sandbox);
   await vm.runInContext('API.deleteDynamicObservations("site/42 ?")', sandbox);
 
   assert.deepEqual(requests.map(request => [request.options.method, request.url]), [
-    ['GET', '/api/dynamic-profiles'],
     ['GET', '/api/sites/site%2F42%20%3F/dynamic-observations'],
     ['DELETE', '/api/sites/site%2F42%20%3F/dynamic-observations'],
   ]);

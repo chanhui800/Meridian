@@ -1250,7 +1250,7 @@ func (m *panelCertificateManager) reusableCertificateForIdentifiers(identifiers 
 		return nil
 	}
 	m.mu.Lock()
-	certFile, keyFile := m.certFile, m.keyFile
+	certFile, keyFile := m.panelPairPaths()
 	m.mu.Unlock()
 	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- certFile is the manager-owned TLS path captured at construction.
 	if err != nil {

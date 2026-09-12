@@ -250,12 +250,12 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 	case strings.Contains(raw, `\`):
 		return "", fmt.Errorf("invalid discovered URL: backslash")
 	}
-	if source == dynamicDiscoverySourcePlaybackInfo && (s.issuer.policy.profile == dynamicProfileCompatible || s.issuer.policy.profile == dynamicProfileExtreme) {
+	if source == dynamicDiscoverySourcePlaybackInfo {
 		if normalized, ok := normalizePlaybackInfoSchemelessURL(raw, base); ok {
 			raw = normalized
 		}
 	}
-	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 && (s.issuer.policy.profile != dynamicProfileExtreme || dynamicRequiredHeadersConflictWithFixedPolicy(requiredHeaders, s.issuer.upstreamHeaderPolicy)) {
+	if err := validateDynamicCapabilityRequiredHeaderClaims(requiredHeaders); err != nil || len(requiredHeaders) > 0 {
 		return "", fmt.Errorf("invalid discovered URL required headers")
 	}
 	if source == dynamicDiscoverySourceDASH && strings.Contains(raw, dashLiteralDollarClaimMarker) {
@@ -569,19 +569,28 @@ func readDynamicStructuredBody(resp *http.Response, limit int64) ([]byte, error)
 	return payload, nil
 }
 
-func installDynamicStructuredBody(resp *http.Response, payload []byte) {
+// installDynamicStructuredBody installs a (re-)encoded structured body. When
+// the rewrite changed nothing, the body's bytes still match the stored payload
+// but the stored validators describe them exactly, so the cache headers are
+// preserved for conditional revalidation; they are stripped only when the
+// content was actually rewritten, where they would be lies.
+func installDynamicStructuredBody(resp *http.Response, payload []byte, rewritten bool) {
 	resp.Body = io.NopCloser(bytes.NewReader(payload))
 	resp.ContentLength = int64(len(payload))
 	resp.Uncompressed = true
 	resp.Trailer = nil
-	for _, name := range []string{
-		"Accept-Ranges", "Content-Encoding", "Content-MD5", "Content-Range", "Digest",
-		"ETag", "Last-Modified", "Vary",
-	} {
-		resp.Header.Del(name)
+	if rewritten {
+		for _, name := range []string{
+			"Accept-Ranges", "Content-Encoding", "Content-MD5", "Content-Range", "Digest",
+			"ETag", "Last-Modified", "Vary",
+		} {
+			resp.Header.Del(name)
+		}
 	}
 	resp.Header.Set("Content-Length", strconv.Itoa(len(payload)))
-	resp.Header.Set("Cache-Control", "private, no-store")
+	if rewritten {
+		resp.Header.Set("Cache-Control", "private, no-store")
+	}
 	resp.Header.Set("Referrer-Policy", "no-referrer")
 	resp.Header.Set("X-Content-Type-Options", "nosniff")
 }
@@ -791,7 +800,7 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 				return errDynamicCapabilityExpiredDuringUse
 			}
 			log.Printf("[%s] PlaybackInfo automatic URL proxy fallback preserved the upstream response", issuer.site.Name)
-			installDynamicStructuredBody(resp, payload)
+			installDynamicStructuredBody(resp, payload, false)
 			return nil
 		}
 	}
@@ -799,6 +808,21 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		session.rollback()
 		if source == dynamicDiscoverySourcePlaybackInfo {
 			log.Printf("[%s] PlaybackInfo rewrite rejected: diagnostic=%s fingerprint=%s profile=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err), playbackInfoRewriteDiagnosticFingerprint(err), issuer.policy.profile)
+		}
+		// A manifest the strict rewriter cannot parse is not a client error:
+		// real-world playlists routinely carry vendor tags, BOMs, DRM
+		// descriptors, or foreign XML namespaces that the strict parser
+		// deliberately rejects. Relay the upstream response verbatim instead
+		// of replacing a working 200 with a hard 502 that would break playback
+		// for the whole site. PlaybackInfo keeps its own stricter chain: its
+		// denials (for example required headers on a relative URL that no
+		// capability could carry) must stay hard errors.
+		issuer.observe(source, dynamicObservationDecisionDenied, dynamicStructuredRewriteDeniedReason(source), authority)
+		if resp != nil && resp.Body != nil && resp.StatusCode < http.StatusBadRequest &&
+			(source == dynamicDiscoverySourceHLS || source == dynamicDiscoverySourceDASH) {
+			log.Printf("[%s] %s rewrite rejected; preserving upstream response: %v", issuer.site.Name, source, err)
+			installDynamicStructuredBody(resp, payload, false)
+			return nil
 		}
 		return recordFailure(dynamicStructuredRewriteDeniedReason(source))
 	}
@@ -815,7 +839,7 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		return newDynamicProxyError(dynamicObservationReasonCapacityLimit)
 	}
 	session.publishLearnedPlaybackPaths()
-	installDynamicStructuredBody(resp, rewritten)
+	installDynamicStructuredBody(resp, rewritten, !bytes.Equal(payload, rewritten))
 	return nil
 }
 

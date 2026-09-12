@@ -25,10 +25,10 @@ func newStructuredDiscoveryTestIssuer(t *testing.T) *dynamicCapabilityIssuer {
 
 func newStructuredDiscoveryTestIssuerForProfile(t *testing.T, profile string) *dynamicCapabilityIssuer {
 	t.Helper()
-	limits, ok := dynamicLimitsForProfile(profile)
-	if !ok {
+	if profile != dynamicProfileCompatible {
 		t.Fatalf("dynamic profile %q is unavailable", profile)
 	}
+	limits := dynamicDefaultProfileLimits()
 	resolver := dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
 	})
@@ -238,58 +238,6 @@ func TestPlaybackInfoRelativeExternalDeliveryURLWithRequiredHeadersFailsClosed(t
 	}
 }
 
-func TestCompatibleAndExtremePlaybackInfoAcceptSchemelessHostPortURLs(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		input  string
-		target string
-	}{
-		{name: "bare authority", input: "cflocal.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://cflocal.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
-		{name: "http missing slashes", input: "http:gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
-		{name: "http single slash", input: "http:/gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret", target: "http://gfplay.xxlb.net:80/Videos/1/stream.mp4?token=origin-secret"},
-	} {
-		for _, profile := range []string{dynamicProfileCompatible, dynamicProfileExtreme} {
-			t.Run(test.name+"/"+profile, func(t *testing.T) {
-				issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
-				base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
-				session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-				payload, err := json.Marshal(map[string]any{"MediaSources": []any{map[string]any{"DirectStreamUrl": test.input}}})
-				if err != nil {
-					t.Fatalf("marshal PlaybackInfo: %v", err)
-				}
-				rewritten, err := rewritePlaybackInfoResponse(payload, session)
-				if err != nil {
-					t.Fatalf("rewrite %s PlaybackInfo URL: %v", profile, err)
-				}
-				routes := structuredCapabilityRoutes(string(rewritten))
-				if len(routes) != 1 || strings.Contains(string(rewritten), "xxlb.net") || strings.Contains(string(rewritten), "origin-secret") {
-					t.Fatalf("URL was not protected by one capability route: %s", rewritten)
-				}
-				claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-				if err != nil {
-					t.Fatalf("open URL capability: %v", err)
-				}
-				if claims.Target != test.target {
-					t.Fatalf("capability target = %q, want %q", claims.Target, test.target)
-				}
-			})
-		}
-
-		t.Run(test.name+"/safe", func(t *testing.T) {
-			issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileSafe)
-			base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
-			session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-			payload, err := json.Marshal(map[string]any{"MediaSources": []any{map[string]any{"DirectStreamUrl": test.input}}})
-			if err != nil {
-				t.Fatalf("marshal PlaybackInfo: %v", err)
-			}
-			if _, err := rewritePlaybackInfoResponse(payload, session); err == nil {
-				t.Fatal("Safe unexpectedly accepted a malformed host:port URL")
-			}
-		})
-	}
-}
-
 func TestAutomaticPlaybackInfoFallbackRewritesValidURLsAndPreservesInvalidOnes(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
@@ -364,13 +312,7 @@ func TestPlaybackInfoRelativeManifestDoesNotRequireAdvancedSource(t *testing.T) 
 }
 
 func TestAutomaticProxyPolicyIgnoresLegacyPerSiteDiscoverySettings(t *testing.T) {
-	policy, err := newDynamicRedirectPolicy(Site{
-		DynamicDiscoveryEnabled:    false,
-		DynamicProfile:             dynamicProfileSafe,
-		DynamicDiscoverySources:    []string{},
-		DynamicDomainRules:         []DynamicDomainRule{},
-		DynamicAllowHTTPSDowngrade: false,
-	}, true)
+	policy, err := newDynamicRedirectPolicy(true)
 	if err != nil {
 		t.Fatalf("automatic proxy policy: %v", err)
 	}
@@ -711,10 +653,7 @@ func TestStructuredResponsePipelineBoundsGzipAndInvalidatesValidators(t *testing
 }
 func TestDynamicParseBudgetEnforcesPerSiteConcurrency(t *testing.T) {
 	runtime := newDynamicRuntime()
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible profile is unavailable")
-	}
+	limits := dynamicDefaultProfileLimits()
 	state := newDynamicSiteState(runtime, limits)
 	releaseFirst, ok := state.acquireParse(1)
 	if !ok {
@@ -843,9 +782,6 @@ func TestStructuredDiscoveryProxyLifecycleEndToEnd(t *testing.T) {
 		PlaybackMode:            "direct",
 		StreamHosts:             "[]",
 		UAMode:                  "infuse",
-		DynamicDiscoveryEnabled: true,
-		DynamicProfile:          dynamicProfileCompatible,
-		DynamicDiscoverySources: allDynamicDiscoverySources(),
 	})
 	if err != nil {
 		t.Fatalf("create e2e site: %v", err)
@@ -966,9 +902,6 @@ func TestRelativePlaybackInfoVendorRedirectStaysOnProxyEndToEnd(t *testing.T) {
 		PlaybackMode:            "direct",
 		StreamHosts:             "[]",
 		UAMode:                  "infuse",
-		DynamicDiscoveryEnabled: true,
-		DynamicProfile:          dynamicProfileCompatible,
-		DynamicDiscoverySources: allDynamicDiscoverySources(),
 	})
 	if err != nil {
 		t.Fatalf("create relative vendor redirect site: %v", err)
@@ -1082,9 +1015,6 @@ func TestFailedDynamicSiteStartClosesRuntimeState(t *testing.T) {
 		PlaybackMode:            "direct",
 		StreamHosts:             "[]",
 		UAMode:                  "infuse",
-		DynamicDiscoveryEnabled: true,
-		DynamicProfile:          dynamicProfileCompatible,
-		DynamicDiscoverySources: allDynamicDiscoverySources(),
 	})
 	if err != nil {
 		t.Fatalf("create failed-start site: %v", err)
@@ -1865,10 +1795,7 @@ func TestStructuredManifestParsingHonorsCancellation(t *testing.T) {
 }
 
 func TestCapabilityRegistryGloballyPrunesAndAccountsMemory(t *testing.T) {
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible profile is unavailable")
-	}
+	limits := dynamicDefaultProfileLimits()
 	runtime := newDynamicRuntime()
 	stale := newDynamicSiteState(runtime, limits)
 	active := newDynamicSiteState(runtime, limits)
@@ -1966,36 +1893,6 @@ func TestStructuredWorkingSetAccountsForRetainedAllocations(t *testing.T) {
 	}
 }
 
-func TestExtremePlaybackInfoUnknownLengthSharesReplayParseBudget(t *testing.T) {
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	const replayBytes = int64(1668)
-	releaseReplay, acquired := issuer.state.acquireParse(replayBytes)
-	if !acquired {
-		t.Fatal("reserve replay body memory")
-	}
-	defer releaseReplay()
-
-	payload := `{"MediaSources":[]}`
-	request := httptest.NewRequest(http.MethodPost, "https://api.example.com/Items/1/PlaybackInfo", nil)
-	response := &http.Response{
-		StatusCode:    http.StatusOK,
-		Header:        http.Header{"Content-Type": {"application/json"}},
-		Body:          io.NopCloser(strings.NewReader(payload)),
-		ContentLength: -1,
-		Request:       request,
-	}
-	if err := rewriteDynamicStructuredResponse(response, issuer, false); err != nil {
-		t.Fatalf("rewrite response while replay memory is retained: %v", err)
-	}
-	if issuer.state.parseMemory != replayBytes || issuer.state.runtime.parseMemory != replayBytes {
-		t.Fatalf("parse memory after response rewrite site/global=%d/%d, want retained replay %d", issuer.state.parseMemory, issuer.state.runtime.parseMemory, replayBytes)
-	}
-	rewritten, err := io.ReadAll(response.Body)
-	if err != nil || string(rewritten) != payload {
-		t.Fatalf("rewritten PlaybackInfo=%q err=%v", rewritten, err)
-	}
-}
-
 func TestDynamicRedirectFailsClosedForDisabledStructuredSource(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	issuer.policy.sources = []string{dynamicDiscoverySourceRedirect}
@@ -2089,10 +1986,7 @@ func TestConcurrentRewriteSessionsReferenceCountProvisionalCapability(t *testing
 }
 
 func TestCapabilityLookupsEnforceExactAbsoluteAndIdleExpiry(t *testing.T) {
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		t.Fatal("compatible profile is unavailable")
-	}
+	limits := dynamicDefaultProfileLimits()
 	now := time.Unix(1_700_000_000, 0)
 	for _, test := range []struct {
 		name      string
@@ -2164,634 +2058,12 @@ func assertStructuredRewriteFailsAtomically(t *testing.T, profile, source, reque
 	}
 }
 
-func TestExtremePlaybackInfoAcceptsStringifiedCollectionsAndWholeStringURLs(t *testing.T) {
-	for _, shape := range []string{"object", "array"} {
-		t.Run(shape, func(t *testing.T) {
-			issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-			stream := map[string]any{
-				"IsExternalUrl": true,
-				"DeliveryUrl":   "https://captions.example.com/subtitle.vtt?token=caption-secret",
-			}
-			attachment := map[string]any{
-				"AttachmentUrl": "https://attachments.example.com/font.bin?token=attachment-secret",
-			}
-			source := map[string]any{
-				"DirectStreamUrl": "https://media.example.com/video.mp4?token=direct-secret",
-				"Nested": map[string]any{
-					"Artwork": "https://art.example.com/poster.jpg?token=art-secret",
-				},
-				"Description": "watch https://prose.example.com/help without treating prose as a URL",
-				"RequiredHttpHeaders": map[string]any{
-					"Origin": "https://headers.example.com",
-				},
-			}
-			if shape == "object" {
-				source["MediaStreams"] = structuredTestStringifiedJSON(t, stream)
-				source["MediaAttachments"] = structuredTestStringifiedJSON(t, attachment)
-			} else {
-				source["MediaStreams"] = structuredTestStringifiedJSON(t, []any{stream})
-				source["MediaAttachments"] = structuredTestStringifiedJSON(t, []any{attachment})
-			}
-			var mediaSources any = []any{source}
-			if shape == "object" {
-				mediaSources = source
-			}
-			payload := structuredTestJSON(t, map[string]any{
-				"MediaSources": structuredTestStringifiedJSON(t, mediaSources),
-				"RootAsset":    "https://root-assets.example.com/catalog.json?token=root-secret",
-				"Summary":      "root prose includes https://root-prose.example.com/help and stays literal",
-				"RequiredHttpHeaders": map[string]any{
-					"Referer": "https://root-header.example.com/context",
-				},
-			})
-			session := &dynamicRewriteSession{
-				ctx:    context.Background(),
-				issuer: issuer,
-				base:   mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo"),
-				source: dynamicDiscoverySourcePlaybackInfo,
-			}
-			rewritten, err := rewritePlaybackInfoResponse(payload, session)
-			if err != nil {
-				session.rollback()
-				t.Fatalf("rewrite Extreme stringified PlaybackInfo: %v", err)
-			}
-			defer session.rollback()
-
-			var decoded map[string]any
-			if err := json.Unmarshal(rewritten, &decoded); err != nil {
-				t.Fatalf("decode Extreme PlaybackInfo: %v\n%s", err, rewritten)
-			}
-			media, ok := decoded["MediaSources"].([]any)
-			if !ok || len(media) != 1 {
-				t.Fatalf("normalized MediaSources = %#v", decoded["MediaSources"])
-			}
-			mediaSource, ok := media[0].(map[string]any)
-			if !ok {
-				t.Fatalf("normalized MediaSource = %#v", media[0])
-			}
-			if streams, ok := mediaSource["MediaStreams"].([]any); !ok || len(streams) != 1 {
-				t.Fatalf("normalized MediaStreams = %#v", mediaSource["MediaStreams"])
-			}
-			if attachments, ok := mediaSource["MediaAttachments"].([]any); !ok || len(attachments) != 1 {
-				t.Fatalf("normalized MediaAttachments = %#v", mediaSource["MediaAttachments"])
-			}
-			if mediaSource["Description"] != "watch https://prose.example.com/help without treating prose as a URL" ||
-				decoded["Summary"] != "root prose includes https://root-prose.example.com/help and stays literal" {
-				t.Fatalf("prose strings were rewritten: %#v", decoded)
-			}
-			sourceHeaders, ok := mediaSource["RequiredHttpHeaders"].(map[string]any)
-			if !ok || sourceHeaders["Origin"] != "https://headers.example.com" {
-				t.Fatalf("MediaSource RequiredHttpHeaders were scanned: %#v", mediaSource["RequiredHttpHeaders"])
-			}
-			rootHeaders, ok := decoded["RequiredHttpHeaders"].(map[string]any)
-			if !ok || rootHeaders["Referer"] != "https://root-header.example.com/context" {
-				t.Fatalf("root RequiredHttpHeaders were scanned: %#v", decoded["RequiredHttpHeaders"])
-			}
-
-			expectedTargets := map[string]bool{
-				"https://media.example.com:443/video.mp4?token=direct-secret":          true,
-				"https://captions.example.com:443/subtitle.vtt?token=caption-secret":   true,
-				"https://attachments.example.com:443/font.bin?token=attachment-secret": true,
-				"https://art.example.com:443/poster.jpg?token=art-secret":              true,
-				"https://root-assets.example.com:443/catalog.json?token=root-secret":   false,
-			}
-			routes := structuredCapabilityRoutes(string(rewritten))
-			if len(routes) != len(expectedTargets) {
-				t.Fatalf("Extreme PlaybackInfo routes = %v\n%s", routes, rewritten)
-			}
-			seen := make(map[string]bool, len(routes))
-			for _, route := range routes {
-				claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, route))
-				if err != nil {
-					t.Fatalf("open Extreme PlaybackInfo capability: %v", err)
-				}
-				wantHeaders, exists := expectedTargets[claims.Target]
-				if !exists {
-					t.Fatalf("unexpected Extreme PlaybackInfo claims = %#v", claims)
-				}
-				seen[claims.Target] = true
-				if wantHeaders {
-					if len(claims.RequiredHeaders) != 1 || claims.RequiredHeaders[0] != (dynamicCapabilityHeaderClaim{Name: "Origin", Value: "https://headers.example.com"}) {
-						t.Fatalf("subtree capability headers = %#v", claims)
-					}
-				} else if len(claims.RequiredHeaders) != 0 {
-					t.Fatalf("root capability inherited MediaSource headers = %#v", claims)
-				}
-			}
-			if len(seen) != len(expectedTargets) {
-				t.Fatalf("Extreme PlaybackInfo targets = %v", seen)
-			}
-			text := string(rewritten)
-			for _, leaked := range []string{
-				"media.example.com", "captions.example.com", "attachments.example.com", "art.example.com", "root-assets.example.com",
-				"direct-secret", "caption-secret", "attachment-secret", "art-secret", "root-secret",
-			} {
-				if strings.Contains(text, leaked) {
-					t.Fatalf("Extreme PlaybackInfo leaked %q: %s", leaked, text)
-				}
-			}
-		})
-	}
-}
-
-func TestExtremePlaybackInfoAbsoluteHTTPPathOverridesProtocol(t *testing.T) {
-	cases := []struct {
-		name     string
-		protocol any
-	}{
-		{name: "file", protocol: "File"},
-		{name: "conflicting remote protocol", protocol: "Rtsp"},
-		{name: "conflicting type", protocol: map[string]any{"name": "File"}},
-	}
-	for _, test := range cases {
-		t.Run("extreme/"+test.name, func(t *testing.T) {
-			issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-			payload := structuredTestJSON(t, map[string]any{
-				"MediaSources": []any{map[string]any{
-					"Protocol": test.protocol,
-					"Path":     "https://path.example.com/live/manifest.mpd?token=path-secret",
-				}},
-			})
-			session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo"), source: dynamicDiscoverySourcePlaybackInfo}
-			rewritten, err := rewritePlaybackInfoResponse(payload, session)
-			if err != nil {
-				session.rollback()
-				t.Fatalf("rewrite absolute Extreme Path: %v", err)
-			}
-			defer session.rollback()
-			routes := structuredCapabilityRoutes(string(rewritten))
-			if len(routes) != 1 || strings.Contains(string(rewritten), "path.example.com") || strings.Contains(string(rewritten), "path-secret") {
-				t.Fatalf("absolute Extreme Path was not capability-bound: %s", rewritten)
-			}
-			claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-			if err != nil || claims.Target != "https://path.example.com:443/live/manifest.mpd?token=path-secret" || claims.Source != dynamicDiscoverySourceDASH || claims.Kind != dynamicCapabilityKindManifest {
-				t.Fatalf("absolute Extreme Path claims = %#v err=%v", claims, err)
-			}
-		})
-	}
-
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
-		for _, test := range cases {
-			t.Run(profile+"/"+test.name, func(t *testing.T) {
-				issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
-				payload := structuredTestJSON(t, map[string]any{
-					"MediaSources": []any{map[string]any{
-						"Protocol": test.protocol,
-						"Path":     "https://path.example.com/live/manifest.mpd?token=path-secret",
-					}},
-				})
-				session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo"), source: dynamicDiscoverySourcePlaybackInfo}
-				rewritten, err := rewritePlaybackInfoResponse(payload, session)
-				defer session.rollback()
-				if test.name == "file" {
-					if err != nil || !strings.Contains(string(rewritten), "https://path.example.com/live/manifest.mpd?token=path-secret") || strings.Contains(string(rewritten), dynamicRoutePrefix) {
-						t.Fatalf("%s File Path strict behavior output=%s err=%v", profile, rewritten, err)
-					}
-				} else if err == nil {
-					t.Fatalf("%s accepted conflicting Protocol %#v", profile, test.protocol)
-				}
-			})
-		}
-	}
-}
-
-func TestSafeAndCompatiblePlaybackInfoKeepStrictCollectionAndSchemaBehavior(t *testing.T) {
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
-		t.Run(profile, func(t *testing.T) {
-			issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
-			base := mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo")
-			stringified := structuredTestJSON(t, map[string]any{
-				"MediaSources": structuredTestStringifiedJSON(t, map[string]any{"Protocol": "File", "Path": "/srv/movie.mkv"}),
-			})
-			stringifiedSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-			if _, err := rewritePlaybackInfoResponse(stringified, stringifiedSession); err == nil {
-				stringifiedSession.rollback()
-				t.Fatal("stringified MediaSources was accepted outside Extreme")
-			}
-			stringifiedSession.rollback()
-
-			strict := structuredTestJSON(t, map[string]any{
-				"MediaSources": []any{map[string]any{
-					"Protocol": "File",
-					"Path":     "/srv/movie.mkv",
-					"Vendor": map[string]any{
-						"Artwork": "https://vendor-assets.example.com/poster.jpg?token=vendor-secret",
-					},
-				}},
-				"RootAsset": "https://root-assets.example.com/catalog.json?token=root-secret",
-			})
-			strictSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-			rewritten, err := rewritePlaybackInfoResponse(strict, strictSession)
-			defer strictSession.rollback()
-			if err != nil || !strings.Contains(string(rewritten), "vendor-assets.example.com") || !strings.Contains(string(rewritten), "root-assets.example.com") || strings.Contains(string(rewritten), dynamicRoutePrefix) {
-				t.Fatalf("%s schema-only behavior output=%s err=%v", profile, rewritten, err)
-			}
-		})
-	}
-}
-
-func TestExtremeRequiredHeadersAreAEADBoundExactAndNotPropagatedAcrossRedirect(t *testing.T) {
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	target := mustStructuredURL(t, "https://origin.example.com/initial.m3u8?sig=parent-secret")
-	authority := redirectHostKey(target)
-	issuer.configuredAuthorities = map[string]bool{authority: true}
-	issuer.primaryAuthority = authority
-	var captures []*http.Request
-	issuer.configuredTransport = structuredRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
-		captured := request.Clone(request.Context())
-		captured.Header = request.Header.Clone()
-		captures = append(captures, captured)
-		if len(captures) == 1 {
-			header := make(http.Header)
-			header.Set("Location", "/final.m3u8")
-			return &http.Response{StatusCode: http.StatusFound, Header: header, Body: http.NoBody, ContentLength: 0, Request: request}, nil
-		}
-		if len(captures) == 2 {
-			body := "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nchild.ts?sig=child-secret\n#EXT-X-ENDLIST\n"
-			header := make(http.Header)
-			header.Set("Content-Type", "application/vnd.apple.mpegurl")
-			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: request}, nil
-		}
-		return nil, fmt.Errorf("unexpected configured transport request %d", len(captures))
-	})
-
-	requiredInput := map[string]any{
-		"accept":          " application/vnd.apple.mpegurl ",
-		"ACCEPT-language": " en-US ",
-		"origin":          " https://player.example.com ",
-		"referer":         " https://player.example.com/watch ",
-		"user-agent":      " Extreme Player/1.0 ",
-	}
-	payload := structuredTestJSON(t, map[string]any{
-		"MediaSources": []any{map[string]any{
-			"TranscodingUrl":      target.String(),
-			"RequiredHttpHeaders": requiredInput,
-		}},
-	})
-	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo"), source: dynamicDiscoverySourcePlaybackInfo}
-	rewritten, err := rewritePlaybackInfoResponse(payload, session)
-	if err != nil || !session.commit() {
-		session.rollback()
-		t.Fatalf("mint RequiredHeaders manifest capability: output=%s err=%v", rewritten, err)
-	}
-	routes := structuredCapabilityRoutes(string(rewritten))
-	if len(routes) != 1 || strings.Contains(string(rewritten), "origin.example.com") || strings.Contains(string(rewritten), "parent-secret") {
-		t.Fatalf("RequiredHeaders target was not hidden: %s", rewritten)
-	}
-	parentRoute := routes[0]
-	parentToken := capabilityTokenFromRoute(t, parentRoute)
-	claims, err := openDynamicCapability(issuer.key, parentToken)
-	if err != nil {
-		t.Fatalf("open RequiredHeaders capability: %v", err)
-	}
-	expectedHeaders := map[string]string{
-		"Accept":          "application/vnd.apple.mpegurl",
-		"Accept-Language": "en-US",
-		"Origin":          "https://player.example.com",
-		"Referer":         "https://player.example.com/watch",
-		"User-Agent":      "Extreme Player/1.0",
-	}
-	if !claims.Trusted || claims.Target != "https://origin.example.com:443/initial.m3u8?sig=parent-secret" || claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || claims.Depth != 1 || len(claims.RequiredHeaders) != len(expectedHeaders) {
-		t.Fatalf("RequiredHeaders parent claims = %#v", claims)
-	}
-	for _, header := range claims.RequiredHeaders {
-		if expectedHeaders[header.Name] != header.Value {
-			t.Fatalf("RequiredHeaders claim = %#v, want %v", claims.RequiredHeaders, expectedHeaders)
-		}
-	}
-
-	tamperedIndex := len(parentToken) / 2
-	tamperedByte := byte('A')
-	if parentToken[tamperedIndex] == tamperedByte {
-		tamperedByte = 'B'
-	}
-	tampered := parentToken[:tamperedIndex] + string(tamperedByte) + parentToken[tamperedIndex+1:]
-	if _, err := openDynamicCapability(issuer.key, tampered); err == nil {
-		t.Fatal("tampered RequiredHeaders AEAD capability was accepted")
-	}
-	templated := claims
-	templated.Template = []string{"Number"}
-	if _, err := sealDynamicCapability(issuer.key, templated); err == nil {
-		t.Fatal("RequiredHeaders were accepted on a suffix/template capability")
-	}
-
-	for _, suffix := range []string{"/v0-1", "?_HLS_msn=1"} {
-		recorder := httptest.NewRecorder()
-		issuer.serve(recorder, httptest.NewRequest(http.MethodGet, "https://site.example"+parentRoute+suffix, nil))
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("inexact RequiredHeaders capability %q returned %d", suffix, recorder.Code)
-		}
-	}
-	if len(captures) != 0 {
-		t.Fatalf("inexact RequiredHeaders requests reached upstream: %d", len(captures))
-	}
-
-	request := httptest.NewRequest(http.MethodGet, "https://site.example"+parentRoute, nil)
-	for name := range expectedHeaders {
-		request.Header.Set(name, "client-value")
-	}
-	recorder := httptest.NewRecorder()
-	issuer.serve(recorder, request)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("redirected RequiredHeaders manifest response = %d %q", recorder.Code, recorder.Body.String())
-	}
-	if len(captures) != 2 || captures[0].URL.String() != "https://origin.example.com:443/initial.m3u8?sig=parent-secret" || captures[1].URL.String() != "https://origin.example.com:443/final.m3u8" {
-		t.Fatalf("RequiredHeaders redirect captures = %#v", captures)
-	}
-	for name, value := range expectedHeaders {
-		if got := captures[0].Header.Get(name); got != value {
-			t.Fatalf("initial capability header %s = %q, want %q", name, got, value)
-		}
-		if got := captures[1].Header.Get(name); got == value {
-			t.Fatalf("RequiredHeaders propagated across redirect: %s=%q", name, got)
-		}
-	}
-	childRoutes := structuredCapabilityRoutes(recorder.Body.String())
-	if len(childRoutes) != 1 || strings.Contains(recorder.Body.String(), "child-secret") {
-		t.Fatalf("redirected manifest child was not capability-bound: %s", recorder.Body.String())
-	}
-	childClaims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, childRoutes[0]))
-	if err != nil || childClaims.Target != "https://origin.example.com:443/child.ts?sig=child-secret" || len(childClaims.RequiredHeaders) != 0 {
-		t.Fatalf("redirected parser inherited RequiredHeaders: claims=%#v err=%v", childClaims, err)
-	}
-}
-
-func TestExtremeRequiredHeadersInheritOnlyToSameAuthorityHLSChildren(t *testing.T) {
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	target := mustStructuredURL(t, "https://cdn.example.com/live/master.m3u8?sig=parent-secret")
-	authority := redirectHostKey(target)
-	issuer.configuredAuthorities = map[string]bool{authority: true}
-	issuer.primaryAuthority = authority
-	var captured *http.Request
-	issuer.configuredTransport = structuredRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
-		captured = request.Clone(request.Context())
-		captured.Header = request.Header.Clone()
-		body := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nchild.m3u8?sig=same-secret\n#EXT-X-STREAM-INF:BANDWIDTH=2000\nhttps://other.example.com/other.m3u8?sig=cross-secret\n"
-		header := make(http.Header)
-		header.Set("Content-Type", "application/vnd.apple.mpegurl")
-		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: request}, nil
-	})
-	payload := structuredTestJSON(t, map[string]any{
-		"MediaSources": []any{map[string]any{
-			"TranscodingUrl": target.String(),
-			"RequiredHttpHeaders": map[string]any{
-				"Accept-Language": "fr-CA",
-				"Referer":         "https://player.example.com/watch",
-			},
-		}},
-	})
-	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo"), source: dynamicDiscoverySourcePlaybackInfo}
-	rewritten, err := rewritePlaybackInfoResponse(payload, session)
-	if err != nil || !session.commit() {
-		session.rollback()
-		t.Fatalf("mint inheritable RequiredHeaders capability: output=%s err=%v", rewritten, err)
-	}
-	parentRoutes := structuredCapabilityRoutes(string(rewritten))
-	if len(parentRoutes) != 1 {
-		t.Fatalf("parent RequiredHeaders routes = %v", parentRoutes)
-	}
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "https://site.example"+parentRoutes[0], nil)
-	request.Header.Set("Referer", "https://attacker.example.com/")
-	issuer.serve(recorder, request)
-	if recorder.Code != http.StatusOK || captured == nil || captured.Header.Get("Accept-Language") != "fr-CA" || captured.Header.Get("Referer") != "https://player.example.com/watch" {
-		t.Fatalf("parent RequiredHeaders request status=%d captured=%#v body=%s", recorder.Code, captured, recorder.Body.String())
-	}
-	if strings.Contains(recorder.Body.String(), "other.example.com") || strings.Contains(recorder.Body.String(), "same-secret") || strings.Contains(recorder.Body.String(), "cross-secret") {
-		t.Fatalf("child manifest leaked targets: %s", recorder.Body.String())
-	}
-	childRoutes := structuredCapabilityRoutes(recorder.Body.String())
-	if len(childRoutes) != 2 {
-		t.Fatalf("child RequiredHeaders routes = %v\n%s", childRoutes, recorder.Body.String())
-	}
-	seenSame := false
-	seenCross := false
-	for _, route := range childRoutes {
-		claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, route))
-		if err != nil {
-			t.Fatalf("open child RequiredHeaders capability: %v", err)
-		}
-		switch claims.Target {
-		case "https://cdn.example.com:443/live/child.m3u8?sig=same-secret":
-			seenSame = true
-			if len(claims.RequiredHeaders) != 2 || claims.RequiredHeaders[0] != (dynamicCapabilityHeaderClaim{Name: "Accept-Language", Value: "fr-CA"}) || claims.RequiredHeaders[1] != (dynamicCapabilityHeaderClaim{Name: "Referer", Value: "https://player.example.com/watch"}) {
-				t.Fatalf("same-authority child headers = %#v", claims)
-			}
-		case "https://other.example.com:443/other.m3u8?sig=cross-secret":
-			seenCross = true
-			if len(claims.RequiredHeaders) != 0 {
-				t.Fatalf("cross-authority child inherited headers = %#v", claims)
-			}
-		default:
-			t.Fatalf("unexpected child RequiredHeaders claims = %#v", claims)
-		}
-	}
-	if !seenSame || !seenCross {
-		t.Fatalf("child capability coverage same=%t cross=%t", seenSame, seenCross)
-	}
-}
-
-func TestExtremeRequiredHeadersRejectUnsafeAndOversizedClaimsAtomically(t *testing.T) {
-	payloadWithHeaders := func(headers map[string]any) []byte {
-		return structuredTestJSON(t, map[string]any{
-			"MediaSources": []any{
-				map[string]any{"DirectStreamUrl": "https://rollback.example.com/first.mp4?sig=rollback-secret"},
-				map[string]any{
-					"DirectStreamUrl":     "https://headers-target.example.com/second.mp4?sig=target-secret",
-					"RequiredHttpHeaders": headers,
-				},
-			},
-		})
-	}
-	for _, name := range []string{"Authorization", "Cookie", "X-Emby-Token", "X-Forwarded-For", "Connection", "Proxy-Authorization", "Range"} {
-		t.Run("forbidden/"+name, func(t *testing.T) {
-			assertStructuredRewriteFailsAtomically(t, dynamicProfileExtreme, dynamicDiscoverySourcePlaybackInfo,
-				"https://api.example.com/Items/1/PlaybackInfo", "application/json", payloadWithHeaders(map[string]any{name: "secret"}))
-		})
-	}
-
-	tooMany := make(map[string]any)
-	for index := range maxExtremeRequiredHeaderClaims + 1 {
-		tooMany[fmt.Sprintf("X-Header-%d", index)] = "value"
-	}
-	invalid := map[string]map[string]any{
-		"entry limit":      tooMany,
-		"byte limit":       {"Referer": strings.Repeat("a", maxExtremeRequiredHeaderClaimBytes)},
-		"duplicate casing": {"Accept": "video/mp4", "accept": "application/octet-stream"},
-		"empty value":      {"Origin": "  "},
-		"control value":    {"Referer": "https://player.example.com/\nsecret"},
-		"non-string value": {"User-Agent": 7},
-	}
-	for name, headers := range invalid {
-		t.Run(name, func(t *testing.T) {
-			assertStructuredRewriteFailsAtomically(t, dynamicProfileExtreme, dynamicDiscoverySourcePlaybackInfo,
-				"https://api.example.com/Items/1/PlaybackInfo", "application/json", payloadWithHeaders(headers))
-		})
-	}
-
-	legacyPayload := structuredTestJSON(t, map[string]any{
-		"MediaSources": []any{map[string]any{
-			"DirectStreamUrl": "https://headers-target.example.com/video.mp4",
-			"RequiredHttpHeaders": map[string]any{
-				"Accept": "video/mp4",
-			},
-		}},
-	})
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
-		t.Run(profile+" strict gate", func(t *testing.T) {
-			assertStructuredRewriteFailsAtomically(t, profile, dynamicDiscoverySourcePlaybackInfo,
-				"https://api.example.com/Items/1/PlaybackInfo", "application/json", legacyPayload)
-		})
-	}
-}
-
-func TestExtremeHLSDefinesLocalVariablesAndRewritesSafeExtensionURIs(t *testing.T) {
-	manifest := []byte("#EXTM3U\n" +
-		"#EXT-X-VERSION:9\n" +
-		"#EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"https://cdn.example.com\"\n" +
-		"#EXT-X-DEFINE:NAME=\"path\",VALUE=\"video\"\n" +
-		"#EXT-X-VENDOR-METADATA:URI=\"{$cdn}/{$path}/metadata.json?sig=unknown-secret\",ALT-URI=\"https://alt.example.com/metadata.bin?sig=alternate-secret\",ID=\"offline\"\n" +
-		"#EXT-X-START:TIME-OFFSET=0,VENDOR-URI=\"https://start.example.com/start.bin?sig=start-secret\"\n" +
-		"#EXT-X-STREAM-INF:BANDWIDTH=1000\n" +
-		"{$cdn}/{$path}/child.m3u8?sig=variant-secret\n")
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/live/master.m3u8"), source: dynamicDiscoverySourceHLS}
-	rewritten, err := rewriteHLSResponse(manifest, session)
-	if err != nil {
-		session.rollback()
-		t.Fatalf("rewrite Extreme HLS extensions: %v", err)
-	}
-	defer session.rollback()
-	text := string(rewritten)
-	if strings.Contains(text, "#EXT-X-DEFINE") || strings.Contains(text, "{$") {
-		t.Fatalf("Extreme HLS retained variable machinery: %s", text)
-	}
-	for _, leaked := range []string{"cdn.example.com", "alt.example.com", "start.example.com", "unknown-secret", "alternate-secret", "start-secret", "variant-secret"} {
-		if strings.Contains(text, leaked) {
-			t.Fatalf("Extreme HLS leaked %q: %s", leaked, text)
-		}
-	}
-	expected := map[string]string{
-		"https://cdn.example.com:443/video/metadata.json?sig=unknown-secret": dynamicCapabilityKindResource,
-		"https://alt.example.com:443/metadata.bin?sig=alternate-secret":      dynamicCapabilityKindResource,
-		"https://start.example.com:443/start.bin?sig=start-secret":           dynamicCapabilityKindResource,
-		"https://cdn.example.com:443/video/child.m3u8?sig=variant-secret":    dynamicCapabilityKindManifest,
-	}
-	routes := structuredCapabilityRoutes(text)
-	if len(routes) != len(expected) {
-		t.Fatalf("Extreme HLS extension routes = %v\n%s", routes, text)
-	}
-	seen := make(map[string]bool, len(routes))
-	for _, route := range routes {
-		claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, route))
-		if err != nil {
-			t.Fatalf("open Extreme HLS extension capability: %v", err)
-		}
-		kind, exists := expected[claims.Target]
-		if !exists || claims.Source != dynamicDiscoverySourceHLS || claims.Kind != kind {
-			t.Fatalf("Extreme HLS extension claims = %#v", claims)
-		}
-		seen[claims.Target] = true
-	}
-	if len(seen) != len(expected) {
-		t.Fatalf("Extreme HLS extension targets = %v", seen)
-	}
-
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
-		t.Run(profile+" strict gate", func(t *testing.T) {
-			legacyIssuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
-			legacySession := &dynamicRewriteSession{ctx: context.Background(), issuer: legacyIssuer, base: mustStructuredURL(t, "https://api.example.com/live/master.m3u8"), source: dynamicDiscoverySourceHLS}
-			if _, err := rewriteHLSResponse(manifest, legacySession); err == nil {
-				legacySession.rollback()
-				t.Fatal("Extreme HLS extensions were accepted outside Extreme")
-			}
-			legacySession.rollback()
-			if len(legacyIssuer.state.capabilities) != 0 || len(legacyIssuer.state.authorities) != 0 {
-				t.Fatal("rejected legacy HLS extension retained provisional state")
-			}
-		})
-	}
-}
-
-func TestExtremeHLSRejectsUnresolvedSensitiveAndActiveExtensionsAtomically(t *testing.T) {
-	baseManifest := func(extension string) []byte {
-		return []byte("#EXTM3U\n" +
-			"#EXT-X-TARGETDURATION:4\n" +
-			"#EXTINF:4,\n" +
-			"https://rollback-hls.example.com/segment.ts?sig=rollback-secret\n" +
-			extension + "\n" +
-			"#EXT-X-ENDLIST\n")
-	}
-	cases := map[string]string{
-		"undefined variable": "#EXT-X-VENDOR-METADATA:URI=\"{$missing}/metadata.json\"",
-		"non-local import":   "#EXT-X-DEFINE:IMPORT=\"cdn\"",
-		"sensitive DRM URI":  "#EXT-X-VENDOR-DRM:LICENSE-URI=\"https://license.example.com/key\"",
-		"content steering":   "#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steering.example.com/config\"",
-	}
-	for name, extension := range cases {
-		t.Run(name, func(t *testing.T) {
-			assertStructuredRewriteFailsAtomically(t, dynamicProfileExtreme, dynamicDiscoverySourceHLS,
-				"https://api.example.com/live/master.m3u8", "application/vnd.apple.mpegurl", baseManifest(extension))
-		})
-	}
-}
-
-func TestExtremeDASHPreservesSafeDRMAndForeignWrappersWhileRewritingStandardURLs(t *testing.T) {
-	manifest := []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:cenc="urn:mpeg:cenc:2013" xmlns:v="urn:vendor:passive-metadata">
-  <Period>
-    <v:Wrapper v:mode="passive">
-      <v:Label>offline metadata</v:Label>
-      <AdaptationSet>
-        <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
-          <cenc:pssh>c2FmZS1kcm0tbWV0YWRhdGE=</cenc:pssh>
-          <v:Marker v:kind="offline">opaque metadata</v:Marker>
-        </ContentProtection>
-        <v:Envelope v:state="idle">
-          <Representation id="video-main"><BaseURL>https://cdn.example.com/video/main.mp4?sig=dash-secret</BaseURL></Representation>
-        </v:Envelope>
-      </AdaptationSet>
-    </v:Wrapper>
-  </Period>
-</MPD>`)
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/live/manifest.mpd"), source: dynamicDiscoverySourceDASH}
-	rewritten, err := rewriteDASHResponse(manifest, session)
-	if err != nil {
-		session.rollback()
-		t.Fatalf("rewrite Extreme DASH compatibility metadata: %v", err)
-	}
-	defer session.rollback()
-	text := string(rewritten)
-	for _, preserved := range []string{"ContentProtection", "pssh", "c2FmZS1kcm0tbWV0YWRhdGE=", "Wrapper", "Envelope", "offline metadata", "opaque metadata", "urn:vendor:passive-metadata"} {
-		if !strings.Contains(text, preserved) {
-			t.Fatalf("Extreme DASH dropped %q: %s", preserved, text)
-		}
-	}
-	if strings.Contains(text, "cdn.example.com") || strings.Contains(text, "dash-secret") {
-		t.Fatalf("Extreme DASH leaked raw BaseURL: %s", text)
-	}
-	routes := structuredCapabilityRoutes(text)
-	if len(routes) != 1 {
-		t.Fatalf("Extreme DASH safe-wrapper routes = %v\n%s", routes, text)
-	}
-	claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-	if err != nil || claims.Target != "https://cdn.example.com:443/video/main.mp4?sig=dash-secret" || claims.Source != dynamicDiscoverySourceDASH || claims.Kind != dynamicCapabilityKindResource {
-		t.Fatalf("Extreme DASH safe-wrapper claims = %#v err=%v", claims, err)
-	}
-	var root struct {
-		XMLName xml.Name
-	}
-	if err := xml.Unmarshal(rewritten, &root); err != nil || root.XMLName != (xml.Name{Space: "urn:mpeg:dash:schema:mpd:2011", Local: "MPD"}) {
-		t.Fatalf("rewritten Extreme DASH XML root=%v err=%v\n%s", root.XMLName, err, text)
-	}
-}
-
 func TestSafeAndCompatibleDASHRejectExtremeDRMAndForeignWrappers(t *testing.T) {
 	features := map[string][]byte{
 		"ContentProtection": []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/><Representation id="v"><BaseURL>video.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>`),
 		"foreign wrapper":   []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:v="urn:vendor:passive"><Period><v:Wrapper><Representation id="v"><BaseURL>video.mp4</BaseURL></Representation></v:Wrapper></Period></MPD>`),
 	}
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
+	for _, profile := range []string{dynamicProfileCompatible} {
 		for feature, manifest := range features {
 			t.Run(profile+"/"+feature, func(t *testing.T) {
 				issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
@@ -2809,32 +2081,6 @@ func TestSafeAndCompatibleDASHRejectExtremeDRMAndForeignWrappers(t *testing.T) {
 	}
 }
 
-func TestExtremeDASHRejectsForeignFetchesAndActiveStructuresAtomically(t *testing.T) {
-	manifestWith := func(extension string) []byte {
-		return []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:v="urn:vendor:passive" xmlns:xlink="http://www.w3.org/1999/xlink">
-  <Period><AdaptationSet>
-    <Representation id="safe"><BaseURL>https://rollback-dash.example.com/video.mp4?sig=rollback-secret</BaseURL></Representation>` +
-			extension +
-			`</AdaptationSet></Period>
-</MPD>`)
-	}
-	cases := map[string]string{
-		"foreign URL attribute":  `<v:Metadata v:url="https://foreign.example.com/metadata"/>`,
-		"xlink fetch":            `<SupplementalProperty schemeIdUri="urn:vendor:test" xlink:href="https://xlink.example.com/document"/>`,
-		"xml base":               `<SupplementalProperty schemeIdUri="urn:vendor:test" xml:base="https://xml-base.example.com/"/>`,
-		"license URL":            `<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><v:LicenseUrl>https://license.example.com/key</v:LicenseUrl></ContentProtection>`,
-		"encoded license URL":    `<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><v:pssh>aHR0cHM6Ly9saWNlbnNlLmV4YW1wbGUuY29t</v:pssh></ContentProtection>`,
-		"content steering":       `<ContentSteering defaultServiceLocation="primary"/>`,
-		"foreign active element": `<v:SegmentTemplate media="https://segments.example.com/chunk-$Number$.m4s"/>`,
-	}
-	for name, extension := range cases {
-		t.Run(name, func(t *testing.T) {
-			assertStructuredRewriteFailsAtomically(t, dynamicProfileExtreme, dynamicDiscoverySourceDASH,
-				"https://api.example.com/live/manifest.mpd", "application/dash+xml", manifestWith(extension))
-		})
-	}
-}
-
 func TestSafeAndCompatiblePlaybackInfoKeepLegacyNestedCollectionHandling(t *testing.T) {
 	streamText := structuredTestStringifiedJSON(t, map[string]any{
 		"IsExternalUrl": true,
@@ -2843,7 +2089,7 @@ func TestSafeAndCompatiblePlaybackInfoKeepLegacyNestedCollectionHandling(t *test
 	attachmentText := structuredTestStringifiedJSON(t, []any{map[string]any{
 		"AttachmentUrl": "https://attachments.example.com/font.bin?sig=legacy-secret",
 	}})
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
+	for _, profile := range []string{dynamicProfileCompatible} {
 		t.Run(profile, func(t *testing.T) {
 			issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
 			base := mustStructuredURL(t, "https://api.example.com/Items/1/PlaybackInfo")
@@ -2875,7 +2121,7 @@ func TestSafeAndCompatibleHLSRejectExtremeFeaturesIndependently(t *testing.T) {
 		"DEFINE":                []byte("#EXTM3U\n#EXT-X-DEFINE:NAME=\"segment\",VALUE=\"video\"\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n{$segment}.ts\n#EXT-X-ENDLIST\n"),
 		"unknown URI attribute": []byte("#EXTM3U\n#EXT-X-VENDOR-METADATA:URI=\"https://metadata.example.com/value.json\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nchild.m3u8\n"),
 	}
-	for _, profile := range []string{dynamicProfileSafe, dynamicProfileCompatible} {
+	for _, profile := range []string{dynamicProfileCompatible} {
 		for feature, manifest := range features {
 			t.Run(profile+"/"+feature, func(t *testing.T) {
 				issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
@@ -2890,25 +2136,5 @@ func TestSafeAndCompatibleHLSRejectExtremeFeaturesIndependently(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-func TestExtremePlaybackInfoAbsoluteHTTPPathOverridesFileProtocol(t *testing.T) {
-	issuer := newStructuredDiscoveryTestIssuerForProfile(t, dynamicProfileExtreme)
-	payload := []byte(`{"MediaSources":[{"Protocol":"File","Path":"http://path-http.example.com:8080/live/video.mp4?token=http-secret"}]}`)
-	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "http://api.example.com:8096/Items/1/PlaybackInfo"), source: dynamicDiscoverySourcePlaybackInfo}
-	rewritten, err := rewritePlaybackInfoResponse(payload, session)
-	if err != nil {
-		session.rollback()
-		t.Fatalf("rewrite absolute HTTP PlaybackInfo Path: %v", err)
-	}
-	defer session.rollback()
-	routes := structuredCapabilityRoutes(string(rewritten))
-	if len(routes) != 1 || strings.Contains(string(rewritten), "path-http.example.com") || strings.Contains(string(rewritten), "http-secret") {
-		t.Fatalf("absolute HTTP PlaybackInfo Path was not hidden: %s", rewritten)
-	}
-	claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-	if err != nil || claims.Target != "http://path-http.example.com:8080/live/video.mp4?token=http-secret" || claims.Source != dynamicDiscoverySourcePlaybackInfo || claims.Kind != dynamicCapabilityKindResource {
-		t.Fatalf("absolute HTTP PlaybackInfo Path claims = %#v err=%v", claims, err)
 	}
 }

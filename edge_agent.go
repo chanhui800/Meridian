@@ -57,14 +57,22 @@ type edgeSiteIdentity struct {
 	host      string
 }
 
+// edgeEventPersistInterval bounds how often the encrypted event spool is
+// rewritten to disk. Persisting on every add serialized each proxied request
+// on a whole-file fsync and stalled the data plane exactly when the queue was
+// largest; a short debounce keeps at most this window of events at risk on a
+// hard crash while acks and shutdown still persist synchronously.
+const edgeEventPersistInterval = 2 * time.Second
+
 type edgeEventStore struct {
-	mu        sync.Mutex
-	next      int64
-	items     []NodeRequestEvent
-	path      string
-	key       []byte
-	legacyKey []byte
-	dropped   int64
+	mu          sync.Mutex
+	next        int64
+	items       []NodeRequestEvent
+	path        string
+	key         []byte
+	legacyKey   []byte
+	dropped     int64
+	lastPersist time.Time
 }
 
 func (s *edgeEventStore) init(dir string) error {
@@ -338,6 +346,20 @@ func (s *edgeEventStore) add(event NodeRequestEvent) error {
 	if len(s.items) > edgeEventQueueLimit {
 		s.items = append([]NodeRequestEvent(nil), s.items[len(s.items)-edgeEventQueueLimit:]...)
 	}
+	return s.persistDebouncedLocked()
+}
+
+// persistDebouncedLocked rewrites the spool at most once per
+// edgeEventPersistInterval. Requests only need the in-memory queue to make
+// progress; the durable copy exists for crash recovery and agent restarts, so
+// a short window of at-risk events is the accepted trade for not serializing
+// every proxied request behind a whole-file fsync.
+func (s *edgeEventStore) persistDebouncedLocked() error {
+	now := time.Now()
+	if !s.lastPersist.IsZero() && now.Sub(s.lastPersist) < edgeEventPersistInterval {
+		return nil
+	}
+	s.lastPersist = now
 	return s.persistLocked()
 }
 
@@ -380,6 +402,7 @@ func (s *edgeEventStore) ack(events []NodeRequestEvent) error {
 		}
 	}
 	s.items = kept
+	s.lastPersist = time.Now()
 	return s.persistLocked()
 }
 
@@ -1507,8 +1530,6 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		site.StoredFailoverLines = route.FailoverLines
 		site.StreamHosts = route.StreamHostsRaw
 		site.StoredUpstreamHeaders = route.UpstreamHeaders
-		site.StoredDynamicDiscoverySources = route.DynamicSources
-		site.StoredDynamicDomainRules = route.DynamicRules
 		site.Enabled = true
 		if route.TrafficBillingMode == trafficBillingModeOutbound || route.TrafficBillingMode == trafficBillingModeBidirectional || route.TrafficCycleStartMS != 0 {
 			site.runtimeTrafficCycleConfigured = true

@@ -73,10 +73,6 @@ func openDB(path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
-	if err := d.validateStoredDynamicPolicies(); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("validate stored dynamic policies: %w", err)
-	}
 	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity+requestLogQueueCapacity+watchHistoryQueueCapacity)
 	d.dynamicObservationDone = make(chan struct{})
 	d.watchHistoryInboxWake = make(chan struct{}, 1)

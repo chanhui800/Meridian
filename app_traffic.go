@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -144,24 +143,6 @@ func (a *App) handleUAProfiles(w http.ResponseWriter, r *http.Request) {
 		profiles = append(profiles, p)
 	}
 	a.jsonOK(w, profiles)
-}
-
-// GET /api/dynamic-profiles reports deploy-time structured discovery availability
-// without exposing dynamic route key material.
-func (a *App) handleDynamicProfiles(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	keyConfigured := len(a.dynamicRouteKey) == sha256.Size
-	a.jsonOK(w, DynamicProfilesResponse{
-		Stage:         "structured-discovery",
-		Available:     keyConfigured,
-		KeyConfigured: keyConfigured,
-		Profiles:      dynamicProfilesCatalog(),
-		GlobalLimits:  dynamicGlobalLimits(),
-	})
 }
 
 func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
