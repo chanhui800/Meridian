@@ -1322,20 +1322,27 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 			if accept != nil && !accept() {
 				return errDynamicCapabilityExpiredDuringUse
 			}
-			// The schema-free walker refused a URL it recognized but could not
-			// route. Falling back to the upstream bytes here would be worse
-			// than the failure it avoids: the client would receive the whole
-			// body with every URL unproxied, so one unroutable field would cost
-			// the capability, the traffic accounting and the quota for all of
-			// them. Fail the response instead.
-			log.Printf("[%s] PlaybackInfo rewrite and automatic fallback both rejected: diagnostic=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(fallbackErr))
-			return recordFailure(dynamicObservationReasonPlaybackInfoDenied)
+			// The walker itself failed, which for PlaybackInfo means the JSON
+			// tree could not be processed at all. Preserve the upstream body
+			// exactly as every release before v1.9.89 did. This branch is only
+			// reachable through playbackInfoAutomaticFallbackAllowed, and
+			// failing here turns a parse-level problem into a hard 502 for the
+			// whole site — the regression that broke real sites on v1.9.89.
+			log.Printf("[%s] PlaybackInfo rewrite and automatic fallback both failed; preserving the upstream response: diagnostic=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(fallbackErr))
+			installDynamicStructuredBody(resp, payload, false)
+			return nil
 		}
 	}
 	if err != nil {
 		session.rollback()
 		if source == dynamicDiscoverySourcePlaybackInfo {
-			log.Printf("[%s] PlaybackInfo rewrite rejected: diagnostic=%s fingerprint=%s profile=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err), playbackInfoRewriteDiagnosticFingerprint(err), issuer.policy.profile)
+			// The full message is logged alongside the stable diagnostic code:
+			// without it an operator sees only "playback_info_denied" in the
+			// request log and cannot tell whether the upstream sent an
+			// unroutable URL, a conflicting header claim, or an oversized body.
+			// These messages are built from field names and classification
+			// labels, never from the upstream response bytes.
+			log.Printf("[%s] PlaybackInfo rewrite rejected: diagnostic=%s detail=%q fingerprint=%s profile=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(err), err.Error(), playbackInfoRewriteDiagnosticFingerprint(err), issuer.policy.profile)
 		}
 		// A manifest the strict rewriter cannot parse is not a client error:
 		// real-world playlists routinely carry vendor tags, BOMs, DRM

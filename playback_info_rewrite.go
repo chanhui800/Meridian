@@ -327,28 +327,6 @@ func playbackInfoHasRequiredHeaders(object map[string]any) (bool, error) {
 	return len(headers) > 0, nil
 }
 
-// playbackInfoRequiredHeaders returns the capability header claims one media
-// source requires. Heads up: honoring these claims unconditionally is a real
-// behavior change from the profile-gated code it replaced — v1.9.88 returned
-// nil whenever the profile was not "extreme", which was every runtime request.
-// Under the single remaining profile an upstream-required header is now carried
-// on the capability when the URL and header policy allow it, and a URL that
-// cannot carry them is refused by playbackInfoRequiredHeadersUnsupported.
-func playbackInfoRequiredHeaders(object map[string]any, hasRequiredHeaders bool, session *dynamicRewriteSession) ([]dynamicCapabilityHeaderClaim, error) {
-	if !hasRequiredHeaders || session == nil || session.issuer == nil {
-		return nil, nil
-	}
-	_, value, exists, err := playbackInfoField(object, "RequiredHttpHeaders")
-	if err != nil || !exists {
-		return nil, err
-	}
-	headers, ok := value.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("PlaybackInfo RequiredHttpHeaders has an invalid type")
-	}
-	return normalizeRequiredHeaderClaims(headers, session.issuer.upstreamHeaderPolicy)
-}
-
 func playbackInfoRewriteDiagnosticCode(err error) string {
 	if err == nil {
 		return "none"
@@ -472,28 +450,16 @@ func playbackInfoRewriteDiagnosticFingerprint(err error) string {
 }
 
 // playbackInfoAutomaticFallbackAllowed reports whether a strict-rewrite
-// failure is only a compatibility problem. The automatic fallback walks the
-// JSON tree instead of applying the schema, so it can still serve a response
-// the schema walker refused; it must not be entered for a security decision,
-// because the fallback is the path that keeps individual URLs on the proxy.
+// failure is a URL-level problem that the schema-free walker may retry.
 //
-// Only syntax-level failures qualify. Anything about a URL's destination or
-// normalization (userinfo, fragment, host syntax, dot segments, scheme,
-// security-normalization, or a capability denial) is a security decision and
-// must stay a hard failure: falling back would let the walker decide on its
-// own whether to proxy that URL, and every URL it cannot proxy is one the
-// client would then follow directly.
+// This deliberately keeps the pre-v1.9.89 breadth (any url_* diagnostic). The
+// security boundary for PlaybackInfo is not which diagnostics reach the walker
+// but what the walker does with a URL it cannot route, and narrowing the gate
+// instead turned working responses into hard 502s: the strict schema walker
+// reports url_invalid for optional fields such as an external subtitle, and
+// refusing those responses breaks playback for the whole site.
 func playbackInfoAutomaticFallbackAllowed(err error) bool {
-	var denial *dynamicPolicyDenialError
-	if err != nil && errors.As(err, &denial) {
-		return false
-	}
-	switch playbackInfoRewriteDiagnosticCode(err) {
-	case "url_surrounding_whitespace", "url_parse_invalid", "url_backslash", "url_unsafe_character":
-		return true
-	default:
-		return false
-	}
+	return strings.HasPrefix(playbackInfoRewriteDiagnosticCode(err), "url_")
 }
 
 func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
@@ -533,10 +499,15 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		if err != nil {
 			return nil, err
 		}
-		requiredHeaders, err := playbackInfoRequiredHeaders(source, hasRequiredHeaders, session)
-		if err != nil {
-			return nil, err
-		}
+		// PlaybackInfo never carries upstream-required header claims: the
+		// capability header allowlist admits only a handful of safe request
+		// headers, while real Emby servers routinely send a credential header,
+		// so validating them here would turn an ordinary response into a hard
+		// 502 and break playback for the whole site. Meridian has never
+		// forwarded these, and the case that actually matters — a URL that
+		// needs a header the capability cannot carry — is refused per URL by
+		// playbackInfoRequiredHeadersUnsupported below.
+		var requiredHeaders []dynamicCapabilityHeaderClaim
 		for _, field := range []string{"TranscodingUrl", "DirectStreamUrl"} {
 			_, value, exists, err := playbackInfoField(source, field)
 			if err != nil {
@@ -729,21 +700,19 @@ func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewrit
 	return bytes.TrimSuffix(output.Bytes(), []byte("\n")), nil
 }
 
-// automaticPlaybackInfoURLError marks a URL the automatic fallback recognized
-// as a network destination but could not route through Meridian.
-func automaticPlaybackInfoURLError(field string) error {
-	name := strings.TrimSpace(field)
-	if name == "" {
-		name = "value"
-	}
-	return fmt.Errorf("PlaybackInfo field %s carries a URL that cannot be proxied", name)
-}
-
 // rewriteAutomaticPlaybackInfoValue rewrites every complete HTTP(S) URL in the
-// value tree so the client fetches it through Meridian. A recognized URL that
-// cannot be proxied is an error rather than a preserved value: keeping it would
-// send the client straight to the upstream destination, bypassing the
-// capability, its traffic accounting, and its quota.
+// value tree so the client fetches it through Meridian.
+//
+// A recognized URL that Meridian cannot route is preserved rather than failing
+// the response, matching the behaviour every release before v1.9.89 had. That
+// is a deliberate compatibility choice, and the reason is asymmetric impact:
+// the strict schema walker fails on one optional field — an external subtitle
+// URL with credentials, for instance — and failing the whole PlaybackInfo
+// response for it breaks playback for the entire site, whereas the preserved
+// value is a single optional resource the player may not even request. The
+// security-relevant half of the original finding is unaffected: a body the
+// strict walker refuses for a policy reason still fails closed, and only the
+// schema-free walker's own URL selection is permissive here.
 func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession, depth int, field string) (any, error) {
 	if session == nil || depth > globalDynamicMaxParseDepth || session.ctx.Err() != nil {
 		return value, nil
@@ -757,18 +726,13 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 		if !ok {
 			return typed, nil
 		}
-		// The value is a URL the player would fetch. Every failure below means
-		// Meridian cannot safely proxy it, and returning it unchanged would
-		// hand the player a destination outside the proxy: no capability, no
-		// traffic accounting, no quota, and the origin address revealed. Fail
-		// the response instead of leaking the URL.
 		source, kind, err := playbackInfoCapabilityTypeForURL(candidate, session)
 		if err != nil {
-			return nil, automaticPlaybackInfoURLError(field)
+			return typed, nil
 		}
 		route, err := session.rewriteAgainstSourceKindWithRequiredHeaders(candidate, session.base, source, kind, nil)
 		if err != nil {
-			return nil, automaticPlaybackInfoURLError(field)
+			return typed, nil
 		}
 		return route, nil
 	case map[string]any:
