@@ -214,32 +214,33 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 	if got := playbackInfoRewriteDiagnosticFingerprint(errors.New("unexpected upstream value bearer-secret")); len(got) != 8 || strings.Contains(got, "secret") {
 		t.Fatalf("diagnostic fingerprint is unsafe: %q", got)
 	}
-	// A URL whose destination cannot be proven safe must not enter the
-	// schema-free walker: that walker is the path that keeps individual URLs on
-	// the proxy, so re-deciding a security failure there would route around the
-	// strict rules. Only genuinely compatibility-level syntax failures qualify.
-	if playbackInfoAutomaticFallbackAllowed(errors.New("invalid discovered URL: target normalization host")) {
-		t.Fatal("a URL normalization decision must not allow automatic proxy fallback")
-	}
+	// The automatic fallback must stay available for every url_* diagnostic.
+	// Narrowing it to a "compatibility only" subset turned ordinary upstream
+	// responses into hard 502s in v1.9.89 — the strict walker reports
+	// url_target_host for a stream host containing an underscore, among others —
+	// so this gate is deliberately broad again. The security decision lives in
+	// what the walker does with a URL, not in which diagnostics reach it.
 	for _, err := range []error{
+		errors.New("invalid discovered URL: target normalization host"),
 		errors.New("invalid discovered URL: userinfo"),
 		errors.New("invalid discovered URL: fragment"),
 		errors.New("invalid discovered URL: target normalization scheme"),
 		errors.New("invalid discovered URL: target normalization dot_segments"),
+		errors.New("invalid discovered URL: surrounding whitespace"),
+		errors.New("invalid discovered URL: parse"),
+	} {
+		if !playbackInfoAutomaticFallbackAllowed(err) {
+			t.Fatalf("url-level error must keep the automatic fallback available: %v", err)
+		}
+	}
+	// Non-URL failures stay hard errors: the walker cannot help there.
+	for _, err := range []error{
 		errors.New("external subtitle URL requires unsupported origin headers"),
 		errors.New("PlaybackInfo RequiredHttpHeaders has an invalid value"),
 		errors.New("invalid PlaybackInfo JSON"),
 	} {
 		if playbackInfoAutomaticFallbackAllowed(err) {
-			t.Fatalf("security or structure error unexpectedly allowed fallback: %v", err)
-		}
-	}
-	for _, err := range []error{
-		errors.New("invalid discovered URL: surrounding whitespace"),
-		errors.New("invalid discovered URL: parse"),
-	} {
-		if !playbackInfoAutomaticFallbackAllowed(err) {
-			t.Fatalf("compatibility-only error must allow fallback: %v", err)
+			t.Fatalf("non-URL error unexpectedly allowed fallback: %v", err)
 		}
 	}
 }
@@ -254,12 +255,14 @@ func TestPlaybackInfoRelativeExternalDeliveryURLWithRequiredHeadersFailsClosed(t
 	}
 }
 
-// TestAutomaticPlaybackInfoFallbackRefusesURLsItCannotProxy replaces the
-// earlier preservation contract. Keeping an absolute URL the walker could not
-// route handed the player the upstream destination directly: no capability, no
-// traffic accounting, no quota, and the origin address revealed. A relative
+// TestAutomaticPlaybackInfoFallbackPreservesURLsItCannotProxy pins the
+// v1.9.89 hotfix contract. The walker preserves an absolute URL it cannot route
+// instead of failing the response: the strict schema walker refuses whole
+// documents over one optional field, and turning that into a 502 breaks
+// playback for the entire site. The strict walker's own policy decisions still
+// fail closed; only this walker's URL selection is permissive. A relative
 // same-origin playback path is not a network destination and is still kept.
-func TestAutomaticPlaybackInfoFallbackRefusesURLsItCannotProxy(t *testing.T) {
+func TestAutomaticPlaybackInfoFallbackPreservesURLsItCannotProxy(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
 	payload := []byte(`{"MediaSources":[{"DirectStreamUrl":"http://line.example.com/Videos/1/original.mkv?token=origin-secret","MediaStreams":[{"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt","IsExternalUrl":true}]}]}`)
@@ -271,15 +274,23 @@ func TestAutomaticPlaybackInfoFallbackRefusesURLsItCannotProxy(t *testing.T) {
 	strictSession.rollback()
 
 	fallbackSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	if _, err := rewriteAutomaticPlaybackInfoResponse(payload, fallbackSession); err == nil {
-		t.Fatal("the automatic fallback must not preserve a URL it cannot proxy")
+	rewritten, err := rewriteAutomaticPlaybackInfoResponse(payload, fallbackSession)
+	if err != nil {
+		t.Fatalf("the automatic fallback must serve the response: %v", err)
 	}
 	fallbackSession.rollback()
+	text := string(rewritten)
+	if !strings.Contains(text, `"DirectStreamUrl":"/Videos/1/original.mkv?token=origin-secret"`) {
+		t.Fatalf("same-authority playback URL was not kept on the proxy: %s", text)
+	}
+	if !strings.Contains(text, `"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt"`) {
+		t.Fatalf("unroutable optional URL was not preserved: %s", text)
+	}
 
 	// The same walker keeps a relative same-origin playback URL on the proxy.
 	relativePayload := []byte(`{"MediaSources":[{"DirectStreamUrl":"/Videos/1/original.mkv?token=local-token"}]}`)
 	relativeSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	rewritten, err := rewriteAutomaticPlaybackInfoResponse(relativePayload, relativeSession)
+	rewritten, err = rewriteAutomaticPlaybackInfoResponse(relativePayload, relativeSession)
 	if err != nil {
 		t.Fatalf("automatic PlaybackInfo fallback on a relative path: %v", err)
 	}

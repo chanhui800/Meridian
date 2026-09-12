@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -450,124 +449,107 @@ func TestScanHostNonPublicShorthandRecognizesResolverSpellings(t *testing.T) {
 	}
 }
 
-// TestPlaybackInfoFallbackFailureIsHard drives the whole response path. It has
-// to enter the automatic fallback for real, which requires the strict walker to
-// fail with one of the compatibility-only diagnostics: a backslash inside a
-// subtitle URL is the reachable case (delivery percent-escapes and Protocol
-// mismatches produce other codes). The payload then also carries a stream URL
-// the walker cannot route, so the fallback's own failure is what the response
-// disposition must reflect. Preserving the upstream body there would hand the
-// client every URL in it unproxied, so one unroutable field would cost the
-// capability, the accounting and the quota for all of them.
-func TestPlaybackInfoFallbackFailureIsHard(t *testing.T) {
-	issuer := newStructuredDiscoveryTestIssuer(t)
-	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
-
-	// The strict walker must really hand over to the fallback for this payload;
-	// otherwise the assertion below would be satisfied by an earlier failure and
-	// would keep passing with the fallback's fix reverted.
-	strict := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	_, strictErr := rewritePlaybackInfoResponse([]byte(fallbackFailureProbePayload), strict)
-	strict.rollback()
-	if strictErr == nil || !playbackInfoAutomaticFallbackAllowed(strictErr) {
-		t.Fatalf("payload does not enter the automatic fallback: err=%v code=%s", strictErr, playbackInfoRewriteDiagnosticCode(strictErr))
-	}
-	// And the walker must really be the thing that refuses it.
-	fallback := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	if _, fallbackErr := rewriteAutomaticPlaybackInfoResponse([]byte(fallbackFailureProbePayload), fallback); fallbackErr == nil {
-		t.Fatal("the automatic walker unexpectedly proxied every URL in the payload")
-	}
-	fallback.rollback()
-
-	response := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(fallbackFailureProbePayload)),
-		Request:    &http.Request{Method: http.MethodGet, URL: base},
-	}
-	err := rewriteDynamicStructuredResponseExpected(response, issuer, false, dynamicDiscoverySourcePlaybackInfo, 0, false)
-	if err == nil {
-		t.Fatal("a payload the fallback cannot proxy must fail the response")
-	}
-	// The failure must be a dynamic proxy error (which the proxy turns into a
-	// 502), not a silently installed body.
-	var discoveryErr *dynamicProxyError
-	if !errors.As(err, &discoveryErr) {
-		t.Fatalf("failure = %v, want a dynamic proxy error", err)
-	}
-}
-
-// fallbackFailureProbePayload fails the strict walker with the reachable
-// compatibility-only url_backslash diagnostic, and fails the automatic walker
-// on the unroutable subtitle URL.
+// TestPlaybackInfoFallbackStaysAvailableForURLLevelFailures pins the
+// compatibility contract that the first attempt at this fix broke.
 //
-// Field order matters: the strict walker validates DirectStreamUrl before the
-// MediaStreams entries, so the backslash URL has to be the DirectStreamUrl for
-// the compatibility-only diagnostic to be the one that surfaces.
-const fallbackFailureProbePayload = `{"MediaSources":[{"DirectStreamUrl":"http://line.example.com/a\\b","MediaStreams":[{"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt","IsExternalUrl":true}]}]}`
-
-// TestPlaybackInfoAutomaticFallbackIsNotEnteredForSecurityFailures tightens the
-// gate that decides whether the schema-free walker may take over. That walker
-// is the path that keeps individual URLs on the proxy, so entering it after a
-// security decision would let a URL the strict walker refused be re-decided
-// without the same rules.
-func TestPlaybackInfoAutomaticFallbackIsNotEnteredForSecurityFailures(t *testing.T) {
-	allowed := []error{
+// The strict schema walker reports url_target_host — and other url_* codes — for
+// ordinary upstream URLs; a hostname containing an underscore is one real
+// example, and a stream host that only the fallback can route is another.
+// Narrowing this gate therefore turns a working PlaybackInfo response into a
+// hard 502 and breaks playback for the whole site, which is exactly the
+// regression that reached v1.9.89 and had to be reverted.
+func TestPlaybackInfoFallbackStaysAvailableForURLLevelFailures(t *testing.T) {
+	for _, err := range []error{
 		errorsNew("invalid discovered URL: surrounding whitespace"),
-		errorsNew("invalid discovered URL: parse"),
-		errorsNew("invalid discovered URL: backslash"),
-		errorsNew("invalid discovered URL: unsafe character"),
-	}
-	for _, err := range allowed {
-		if !playbackInfoAutomaticFallbackAllowed(err) {
-			t.Fatalf("compatibility-only failure must allow fallback: %v", err)
-		}
-	}
-	// No error at all is not a fallback decision.
-	if playbackInfoAutomaticFallbackAllowed(nil) {
-		t.Fatal("a nil error must not request a fallback")
-	}
-	blocked := []error{
 		errorsNew("invalid discovered URL: userinfo"),
 		errorsNew("invalid discovered URL: fragment"),
 		errorsNew("invalid discovered URL: target normalization host"),
 		errorsNew("invalid discovered URL: target normalization dot_segments"),
-		errorsNew("invalid discovered URL: target normalization scheme"),
-		errorsNew("invalid discovered URL: target normalization port"),
-		errorsNew("invalid discovered URL: target normalization escaped_component"),
-		errorsNew("invalid trusted capability URL"),
 		errorsNew("discovered URL count exceeds its limit"),
-		errorsNew("structured response output exceeds its limit"),
-		newDynamicPolicyDenialError(errorsNew("capability denied")),
+	} {
+		if !playbackInfoAutomaticFallbackAllowed(err) {
+			t.Fatalf("url-level failure must keep the automatic fallback available: %v", err)
+		}
 	}
-	for _, err := range blocked {
+	// Non-URL failures stay hard errors: the walker cannot help there.
+	for _, err := range []error{
+		nil,
+		errorsNew("external subtitle URL requires unsupported origin headers"),
+		errorsNew("PlaybackInfo RequiredHttpHeaders has an invalid value"),
+		errorsNew("invalid PlaybackInfo JSON"),
+	} {
 		if playbackInfoAutomaticFallbackAllowed(err) {
-			t.Fatalf("security decision must not allow fallback: %v", err)
+			t.Fatalf("non-URL failure must not allow fallback: %v", err)
 		}
 	}
 }
 
-// TestPlaybackInfoAutomaticFallbackRefusesUnproxyableURL proves the walker
-// itself no longer preserves a URL it cannot route. Preserving it would hand
-// the player the upstream destination, bypassing the capability, its traffic
-// accounting and its quota.
-func TestPlaybackInfoAutomaticFallbackRefusesUnproxyableURL(t *testing.T) {
+// TestPlaybackInfoUnderscoreHostStillServes is the concrete end-to-end shape
+// behind the regression: an upstream stream host containing an underscore fails
+// the strict walker's host normalization, so the response is only served if the
+// automatic fallback is still available.
+func TestPlaybackInfoUnderscoreHostStillServes(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	base := mustStructuredURL(t, "http://1111.86518000.xyz/emby/Items/627010/PlaybackInfo")
+	payload := `{"MediaSources":[{"Protocol":"Http","Path":"http://my_host.example.com/emby/videos/627010/original.mp4","DirectStreamUrl":"http://my_host.example.com/emby/videos/627010/original.mp4"}]}`
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(payload)),
+		Request:    &http.Request{Method: http.MethodPost, URL: base},
+	}
+	if err := rewriteDynamicStructuredResponseExpected(response, issuer, false, dynamicDiscoverySourcePlaybackInfo, 0, false); err != nil {
+		t.Fatalf("an underscore stream host must not fail the whole PlaybackInfo response: %v", err)
+	}
+}
+
+// TestPlaybackInfoRequiredHeadersNeverFailTheResponse guards the second half of
+// the same regression. Real Emby servers put a credential header in
+// RequiredHttpHeaders, and the capability header allowlist admits only a handful
+// of safe request headers — so validating those claims here rejected ordinary
+// responses outright. Meridian has never forwarded them; the response must be
+// served and the URL-level check makes the security decision instead.
+func TestPlaybackInfoRequiredHeadersNeverFailTheResponse(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	base := mustStructuredURL(t, "http://line.example.com/emby/Items/1/PlaybackInfo")
+	payload := `{"MediaSources":[{"Protocol":"Http","RequiredHttpHeaders":{"X-Emby-Token":"abc123","Range":"bytes=0-","Host":"cdn.example.com"},"Path":"http://line.example.com/emby/videos/1/original.mp4","DirectStreamUrl":"http://line.example.com/emby/videos/1/original.mp4"}]}`
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(payload)),
+		Request:    &http.Request{Method: http.MethodPost, URL: base},
+	}
+	if err := rewriteDynamicStructuredResponseExpected(response, issuer, false, dynamicDiscoverySourcePlaybackInfo, 0, false); err != nil {
+		t.Fatalf("upstream RequiredHttpHeaders must not fail the PlaybackInfo response: %v", err)
+	}
+}
+
+// TestPlaybackInfoAutomaticWalkerPreservesUnroutableURL pins the deliberate
+// compatibility choice: a URL the schema-free walker cannot route is preserved
+// rather than fatal. The strict walker's policy decisions still fail closed;
+// only this walker's own URL selection is permissive, because failing the whole
+// response for one optional resource breaks playback for the entire site.
+func TestPlaybackInfoAutomaticWalkerPreservesUnroutableURL(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
 	session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
 	root := map[string]any{"DirectStreamUrl": "http://backend.invalidtld/stream.mkv"}
-	if _, err := rewriteAutomaticPlaybackInfoValue(root, session, 0, ""); err == nil {
-		t.Fatal("an unproxyable URL must fail the response instead of being preserved")
+	rewritten, err := rewriteAutomaticPlaybackInfoValue(root, session, 0, "")
+	if err != nil {
+		t.Fatalf("the walker must not fail the response: %v", err)
+	}
+	object, ok := rewritten.(map[string]any)
+	if !ok || object["DirectStreamUrl"] != "http://backend.invalidtld/stream.mkv" {
+		t.Fatalf("unroutable URL handling changed: %#v", rewritten)
 	}
 
-	// A relative playback path is not a network destination, so it is kept and
-	// learned exactly as before.
+	// A relative playback path is not a network destination and is learned.
 	relative := map[string]any{"DirectStreamUrl": "/Videos/1/original.mkv"}
-	rewritten, err := rewriteAutomaticPlaybackInfoValue(relative, session, 0, "")
+	rewritten, err = rewriteAutomaticPlaybackInfoValue(relative, session, 0, "")
 	if err != nil {
 		t.Fatalf("relative playback path must be preserved: %v", err)
 	}
-	object, ok := rewritten.(map[string]any)
+	object, ok = rewritten.(map[string]any)
 	if !ok || object["DirectStreamUrl"] != "/Videos/1/original.mkv" {
 		t.Fatalf("relative playback path changed: %#v", rewritten)
 	}
