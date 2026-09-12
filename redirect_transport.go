@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,19 +32,17 @@ func dynamicTransportFailureReason(err error) string {
 	return dynamicObservationReasonResponseFailure
 }
 
-func dynamicHandledRedirectStatus(status int, profile string) bool {
+func dynamicHandledRedirectStatus(status int) bool {
 	switch status {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 		return true
-	case http.StatusSeeOther:
-		return profile == dynamicProfileExtreme
 	default:
 		return false
 	}
 }
 
-func dynamicRejectedRedirectStatus(status int, profile string) bool {
-	return status >= 300 && status < 400 && status != http.StatusNotModified && !dynamicHandledRedirectStatus(status, profile)
+func dynamicRejectedRedirectStatus(status int) bool {
+	return status >= 300 && status < 400 && status != http.StatusNotModified && !dynamicHandledRedirectStatus(status)
 }
 
 func singleDynamicLocation(resp *http.Response) (string, bool) {
@@ -167,128 +162,24 @@ func (t *redirectFollowTransport) newDynamicTransport(target *url.URL, pinnedIPs
 	return newDynamicTransport(target, pinnedIPs, selfTargets)
 }
 
-func extremeDynamicRedirectBehavior(status int, method string) (redirectMethod string, replayBody bool) {
-	switch status {
-	case http.StatusSeeOther:
-		if method == http.MethodHead {
-			return http.MethodHead, false
-		}
-		return http.MethodGet, false
-	case http.StatusMovedPermanently, http.StatusFound:
-		switch method {
-		case http.MethodPost:
-			return http.MethodGet, false
-		case http.MethodGet, http.MethodHead:
-			return method, false
-		default:
-			return method, true
-		}
-	case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-		return method, true
-	default:
-		return method, false
-	}
-}
-
-func stripExtremeDynamicRedirectBodyHeaders(header http.Header) {
-	for _, name := range []string{
-		"Content-Disposition", "Content-Encoding", "Content-Language", "Content-Length",
-		"Content-Location", "Content-MD5", "Content-Range", "Content-Type", "Digest",
-		"Expect", "Trailer", "Transfer-Encoding",
-	} {
-		header.Del(name)
-	}
-}
-
-func (t *redirectFollowTransport) newExtremeCompatibleDynamicRedirectRequest(ctx context.Context, previous *http.Request, status int, target *url.URL) (*http.Request, bool, string) {
+// newDynamicRedirectRequest builds the follow-up request for an internally
+// followed redirect. The redirect method is preserved and the body is never
+// replayed: dynamic follows only admit bodyless GET/HEAD/PlaybackInfo
+// requests, and a 307/308 that would require body replay fails closed
+// upstream of this builder.
+func (t *redirectFollowTransport) newDynamicRedirectRequest(ctx context.Context, previous *http.Request, target *url.URL) (*http.Request, string) {
 	if previous == nil || target == nil {
-		return nil, false, dynamicObservationReasonInvalidLocation
-	}
-	method := previous.Method
-	replayBody := false
-	stripBodyHeaders := false
-	var body io.ReadCloser
-	if t.dynamicPolicy.profile == dynamicProfileExtreme {
-		method, replayBody = extremeDynamicRedirectBehavior(status, method)
-		stripBodyHeaders = !replayBody
-		requestHasBody := previous.Body != nil && previous.Body != http.NoBody ||
-			previous.ContentLength != 0 || len(previous.TransferEncoding) != 0 || len(previous.Trailer) != 0
-		if replayBody && requestHasBody {
-			// GetBody is Go's explicit replay contract. Requiring a positive,
-			// profile-bounded length and rejecting transfer/trailer framing keeps
-			// an unavailable replay from reaching any follow-up authority.
-			if previous.Body == nil || previous.Body == http.NoBody || previous.GetBody == nil ||
-				previous.ContentLength <= 0 || previous.ContentLength > t.dynamicPolicy.limits.MaxBodyBytes ||
-				len(previous.TransferEncoding) != 0 || len(previous.Trailer) != 0 {
-				return nil, false, dynamicObservationReasonRedirectBodyReplayDenied
-			}
-			var err error
-			body, err = previous.GetBody()
-			if err != nil || body == nil || body == http.NoBody {
-				if body != nil {
-					_ = body.Close()
-				}
-				return nil, false, dynamicObservationReasonRedirectBodyReplayDenied
-			}
-		}
+		return nil, dynamicObservationReasonInvalidLocation
 	}
 	// #nosec G704 -- callers restrict target to an administrator-configured authority or a normalized, policy-checked, DNS-pinned dynamic URL before this request is sent.
-	newRequest, err := http.NewRequestWithContext(ctx, method, target.String(), body)
+	newRequest, err := http.NewRequestWithContext(ctx, previous.Method, target.String(), nil)
 	if err != nil {
-		if body != nil {
-			_ = body.Close()
-		}
-		return nil, false, dynamicObservationReasonInvalidLocation
+		return nil, dynamicObservationReasonInvalidLocation
 	}
 	newRequest.Host = target.Host
-	if replayBody && body != nil {
-		newRequest.GetBody = previous.GetBody
-		newRequest.ContentLength = previous.ContentLength
-	}
-	return newRequest, stripBodyHeaders, ""
+	return newRequest, ""
 }
 
-func prepareExtremeRedirectReplayBody(r *http.Request, state *dynamicSiteState, maxBodyBytes int64) (func(), error) {
-	if r == nil || state == nil || r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 || r.GetBody != nil {
-		return nil, nil
-	}
-	// A server request has no GetBody by default. Buffer only a declared,
-	// profile-bounded body under the existing global/per-site parse-memory and
-	// concurrency budgets; unknown/chunked bodies still reach the configured
-	// upstream, but a later body-preserving redirect fails closed.
-	if r.ContentLength < 0 || r.ContentLength > maxBodyBytes || len(r.TransferEncoding) != 0 || len(r.Trailer) != 0 {
-		return nil, nil
-	}
-	release, acquired := state.acquireParse(r.ContentLength)
-	if !acquired {
-		return nil, nil
-	}
-	fail := func(err error) (func(), error) {
-		_ = r.Body.Close()
-		release()
-		return nil, err
-	}
-	body := make([]byte, int(r.ContentLength))
-	if _, err := io.ReadFull(r.Body, body); err != nil {
-		return fail(fmt.Errorf("read replayable request body: %w", err))
-	}
-	var extra [1]byte
-	if count, err := r.Body.Read(extra[:]); count != 0 || !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = fmt.Errorf("request body exceeds its declared length")
-		}
-		return fail(fmt.Errorf("validate replayable request body: %w", err))
-	}
-	if err := r.Body.Close(); err != nil {
-		release()
-		return nil, fmt.Errorf("close replayable request body: %w", err)
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	}
-	return release, nil
-}
 
 func crossAuthorityHeaders(source http.Header, additionalAllowed ...string) http.Header {
 	// Cross-authority requests enter a distinct trust domain. Rebuild only the
@@ -331,40 +222,6 @@ func copyNormalizedClientIPHeaders(destination, source http.Header, mode string)
 func crossAuthorityRedirectHeadersWithClientIPMode(source http.Header, mode string) http.Header {
 	header := crossAuthorityRedirectHeaders(source)
 	copyNormalizedClientIPHeaders(header, source, mode)
-	return header
-}
-
-var dynamicReplayBodyHeaderNames = [...]string{
-	"Content-Encoding",
-	"Content-Language",
-	"Content-MD5",
-	"Content-Type",
-	"Digest",
-}
-
-func copyDynamicReplayBodyHeaders(destination, source http.Header) {
-	for _, name := range dynamicReplayBodyHeaderNames {
-		if values := source.Values(name); len(values) > 0 {
-			destination[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
-		}
-	}
-}
-
-func crossAuthorityRedirectBodyHeaders(source http.Header) http.Header {
-	header := crossAuthorityRedirectHeaders(source)
-	copyDynamicReplayBodyHeaders(header, source)
-	return header
-}
-
-func crossAuthorityRedirectBodyHeadersWithClientIPMode(source http.Header, mode string) http.Header {
-	header := crossAuthorityRedirectBodyHeaders(source)
-	copyNormalizedClientIPHeaders(header, source, mode)
-	return header
-}
-
-func dynamicRedirectBodyHeaders(source http.Header) http.Header {
-	header := dynamicRedirectHeaders(source)
-	copyDynamicReplayBodyHeaders(header, source)
 	return header
 }
 
@@ -515,10 +372,10 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		if resp == nil {
 			return fail(dynamicObservationReasonResponseFailure, dynamicCanonicalAuthority(req.URL))
 		}
-		if dynamicRejectedRedirectStatus(resp.StatusCode, t.dynamicPolicy.profile) {
+		if dynamicRejectedRedirectStatus(resp.StatusCode) {
 			return fail(dynamicObservationReasonUnsupportedStatus, dynamicCanonicalAuthority(req.URL))
 		}
-		if !dynamicHandledRedirectStatus(resp.StatusCode, t.dynamicPolicy.profile) {
+		if !dynamicHandledRedirectStatus(resp.StatusCode) {
 			if !dynamicActive {
 				return resp, nil
 			}
@@ -585,16 +442,13 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			if redirectsFollowed >= t.dynamicPolicy.limits.MaxRedirects {
 				return fail(dynamicObservationReasonHopLimit, observationAuthority)
 			}
-			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, resp.StatusCode, locationURL)
+			newReq, reasonCode := t.newDynamicRedirectRequest(req.Context(), req, locationURL)
 			if reasonCode != "" {
 				return fail(reasonCode, observationAuthority)
 			}
 			newReq.Header = req.Header.Clone()
 			applyUAHeaderPolicy(newReq.Header, t.policy)
 			t.upstreamHeaderPolicy.apply(newReq.Header, locationURL)
-			if stripBodyHeaders {
-				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
-			}
 			if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
 				tracker.SetURL(locationURL)
 			}
@@ -616,24 +470,17 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			if t.disableLegacyRedirects || !t.playbackHosts[manualAuthority] || redirectsFollowed >= 3 {
 				return resp, nil
 			}
-			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(req.Context(), req, resp.StatusCode, locationURL)
+			newReq, reasonCode := t.newDynamicRedirectRequest(req.Context(), req, locationURL)
 			if reasonCode != "" {
 				return fail(reasonCode, dynamicCanonicalAuthority(req.URL))
 			}
 			if !sameRedirectAuthority(req.URL, locationURL) {
-				if newReq.Body != nil {
-					newReq.Header = crossAuthorityRedirectBodyHeadersWithClientIPMode(req.Header, t.clientIPMode)
-				} else {
-					newReq.Header = crossAuthorityRedirectHeadersWithClientIPMode(req.Header, t.clientIPMode)
-				}
+				newReq.Header = crossAuthorityRedirectHeadersWithClientIPMode(req.Header, t.clientIPMode)
 			} else {
 				newReq.Header = req.Header.Clone()
 			}
 			applyUAHeaderPolicy(newReq.Header, t.policy)
 			t.upstreamHeaderPolicy.apply(newReq.Header, locationURL)
-			if stripBodyHeaders {
-				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
-			}
 			if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
 				tracker.SetURL(locationURL)
 			}
@@ -720,21 +567,14 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 				}
 				streamLeaseHeld = true
 			}
-			newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, resp.StatusCode, normalized)
+			newReq, reasonCode := t.newDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, normalized)
 			if reasonCode != "" {
 				transport.CloseIdleConnections()
 				reservation.rollback()
 				return fail(reasonCode, authority)
 			}
 			newReq.Close = true
-			if newReq.Body != nil {
-				newReq.Header = dynamicRedirectBodyHeaders(req.Header)
-			} else {
-				newReq.Header = dynamicRedirectHeaders(req.Header)
-			}
-			if stripBodyHeaders {
-				stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
-			}
+			newReq.Header = dynamicRedirectHeaders(req.Header)
 			if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
 				tracker.SetURL(normalized)
 			}
@@ -819,21 +659,14 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 
 		// #nosec G704 -- target is normalized, policy-checked, DNS-pinned, and sent through a dedicated proxy-free transport.
-		newReq, stripBodyHeaders, reasonCode := t.newExtremeCompatibleDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, resp.StatusCode, normalized)
+		newReq, reasonCode := t.newDynamicRedirectRequest(isolateDynamicOutboundContext(req.Context()), req, normalized)
 		if reasonCode != "" {
 			transport.CloseIdleConnections()
 			reservation.rollback()
 			return fail(reasonCode, authority)
 		}
 		newReq.Close = true
-		if newReq.Body != nil {
-			newReq.Header = dynamicRedirectBodyHeaders(req.Header)
-		} else {
-			newReq.Header = dynamicRedirectHeaders(req.Header)
-		}
-		if stripBodyHeaders {
-			stripExtremeDynamicRedirectBodyHeaders(newReq.Header)
-		}
+		newReq.Header = dynamicRedirectHeaders(req.Header)
 		if tracker := backendAddressTrackerFromContext(newReq.Context()); tracker != nil {
 			tracker.SetURL(normalized)
 		}

@@ -101,29 +101,24 @@ func (e *dynamicProxyError) writeResponse(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(`{"error":"dynamic discovery unavailable"}`))
 }
 
+// dynamicRedirectPolicy is the single fixed runtime policy shared by every
+// site; see dynamic_policy.go for its contents and history.
 type dynamicRedirectPolicy struct {
 	configured          bool
 	available           bool
 	profile             string
 	limits              DynamicProfileLimits
 	sources             []string
-	domainRules         []DynamicDomainRule
 	allowHTTPSDowngrade bool
 }
 
-func newDynamicRedirectPolicy(site Site, available bool) (dynamicRedirectPolicy, error) {
-	_ = site
-	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)
-	if !ok {
-		return dynamicRedirectPolicy{}, fmt.Errorf("automatic proxy policy is unavailable")
-	}
+func newDynamicRedirectPolicy(available bool) (dynamicRedirectPolicy, error) {
 	return dynamicRedirectPolicy{
 		configured:          true,
 		available:           available,
 		profile:             dynamicProfileCompatible,
-		limits:              limits,
+		limits:              dynamicDefaultProfileLimits(),
 		sources:             allDynamicDiscoverySources(),
-		domainRules:         nil,
 		allowHTTPSDowngrade: true,
 	}, nil
 }
@@ -157,9 +152,6 @@ func (p dynamicRedirectPolicy) validateTarget(previous, target *url.URL, selfTar
 		if !allowedPort {
 			return dynamicObservationReasonPortDenied
 		}
-	}
-	if p.profile == dynamicProfileSafe && !dynamicDomainRuleMatches(target.Hostname(), p.domainRules) {
-		return dynamicObservationReasonDomainDenied
 	}
 	if previous != nil && strings.EqualFold(previous.Scheme, "https") && target.Scheme == "http" && !p.allowHTTPSDowngrade {
 		return dynamicObservationReasonHTTPSDowngradeDenied

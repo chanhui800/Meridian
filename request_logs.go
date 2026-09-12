@@ -456,7 +456,7 @@ func pruneRequestLogsTx(tx *sql.Tx, now time.Time, retention time.Duration) erro
 	// drop the oldest pending rows beyond the cap.
 	if _, err := tx.Exec(`DELETE FROM node_request_events WHERE processed_at_ms=0 AND (node_id, agent_boot_id, event_id) IN (
 		SELECT node_id, agent_boot_id, event_id FROM node_request_events WHERE processed_at_ms=0
-		ORDER BY received_at_ms ASC, node_id, agent_boot_id, event_id LIMIT -1 OFFSET ?
+		ORDER BY received_at_ms DESC, node_id, agent_boot_id, event_id LIMIT -1 OFFSET ?
 	)`, nodeRequestEventPendingLimit); err != nil {
 		return err
 	}

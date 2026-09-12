@@ -904,6 +904,25 @@ func (d *DB) DeleteControlNode(id int64) error {
 		dns_status='disabled',last_error='',schedule_revision=schedule_revision+1 WHERE fixed_node_id=? OR desired_node_id=? OR applied_node_id=?`, id, id, id); err != nil {
 		return err
 	}
+	// The SQLite DSN does not enforce foreign keys, so the node's child rows
+	// need explicit cleanup; without it, drains/revocations/probe failures for
+	// the deleted node accumulate forever (their finalization can never be
+	// ACKed once the node row is gone).
+	if _, err := tx.Exec("DELETE FROM site_node_drains WHERE node_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM agent_route_revocations WHERE node_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM site_node_probe_failures WHERE node_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM node_site_counters WHERE node_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM node_site_traffic_logs WHERE node_id=?", id); err != nil {
+		return err
+	}
 	result, err := tx.Exec("DELETE FROM control_nodes WHERE id=?", id)
 	if err != nil {
 		return err
@@ -1402,8 +1421,20 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 	if backendAddress == "" {
 		backendAddress = fmt.Sprintf("node:%d", nodeID)
 	}
+	// Agent-reported events must honor the same operator privacy switches as
+	// locally captured logs: the ledger identity is still recorded so replay
+	// dedup and ACKs keep working, but the log row is suppressed or has its
+	// client IP blanked per the settings.
+	settings := d.currentSystemSettings()
+	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode < 400) {
+		return nil
+	}
+	clientIP := event.ClientIP
+	if !settings.LogWriteClientIP {
+		clientIP = ""
+	}
 	_, err := tx.Exec(`INSERT INTO request_logs(site_id,site_name,final_node,resource_category,status_code,client_ip,user_agent,upstream_user_agent,backend_address,inbound_colo,outbound_colo,method,path,recorded_at_ms,timeline_at_ms)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, event.SiteID, siteName, finalNode, category, event.StatusCode, event.ClientIP, event.UserAgent, event.UpstreamUserAgent, backendAddress, event.InboundColo, event.OutboundColo, event.Method, requestLogSafeText(event.Path, requestLogMaxPathBytes), event.RecordedAtMS, event.RecordedAtMS)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, event.SiteID, siteName, finalNode, category, event.StatusCode, clientIP, event.UserAgent, event.UpstreamUserAgent, backendAddress, event.InboundColo, event.OutboundColo, event.Method, requestLogSafeText(event.Path, requestLogMaxPathBytes), event.RecordedAtMS, event.RecordedAtMS)
 	return err
 }
 

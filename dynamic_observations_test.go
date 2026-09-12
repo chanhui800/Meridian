@@ -337,7 +337,7 @@ func TestDynamicObservationMigrationEmptyAndV17IsIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read migrated v1.7 site: %v", err)
 		}
-		if site.Name != "v1.7-site" || site.DynamicDiscoveryEnabled || site.DynamicProfile != dynamicProfileSafe || site.DynamicAllowHTTPSDowngrade || site.DynamicPolicyRevision != 1 || len(site.DynamicDomainRules) != 0 {
+		if site.Name != "v1.7-site" || site.DynamicPolicyRevision != 1 {
 			t.Fatalf("migrated v1.7 site=%#v", site)
 		}
 		var trafficRows, bytes int64

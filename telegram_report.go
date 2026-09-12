@@ -328,8 +328,15 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 		return stats, err
 	}
 	trafficSum := func(start time.Time) (int64, error) {
+		// Agent-served sites account through node_site_traffic_logs; summing
+		// only traffic_logs made the report show ~0 traffic on agent
+		// deployments while the dashboard showed the real usage.
 		var bytesIn, bytesOut sql.NullInt64
-		err := d.db.QueryRow(`SELECT SUM(bytes_in), SUM(bytes_out) FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?`, trafficMinuteBucket(start), trafficMinuteBucket(tomorrow)).Scan(&bytesIn, &bytesOut)
+		err := d.db.QueryRow(`SELECT SUM(bytes_in), SUM(bytes_out) FROM (
+				SELECT bytes_in, bytes_out FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?
+				UNION ALL
+				SELECT bytes_in, bytes_out FROM node_site_traffic_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?
+			)`, trafficMinuteBucket(start), trafficMinuteBucket(tomorrow), start.UnixMilli(), tomorrow.UnixMilli()).Scan(&bytesIn, &bytesOut)
 		if err != nil || !bytesIn.Valid || !bytesOut.Valid {
 			return 0, err
 		}
@@ -346,7 +353,11 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 		return stats, err
 	}
 	var historyIn, historyOut int64
-	if err := d.db.QueryRow(`SELECT COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM traffic_logs`).Scan(&historyIn, &historyOut); err != nil {
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM (
+			SELECT bytes_in, bytes_out FROM traffic_logs
+			UNION ALL
+			SELECT bytes_in, bytes_out FROM node_site_traffic_logs
+		)`).Scan(&historyIn, &historyOut); err != nil {
 		return stats, err
 	}
 	stats.HistoryTraffic = trafficBillableBytes(billingMode, historyIn, historyOut)
@@ -376,7 +387,11 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 		return stats, err
 	}
 	requestRows.Close()
-	trafficRows, err := d.db.Query(`SELECT traffic_logs.site_id, COALESCE(NULLIF(sites.name,''), '站点 ' || traffic_logs.site_id), COALESCE(SUM(traffic_logs.bytes_in),0), COALESCE(SUM(traffic_logs.bytes_out),0) FROM traffic_logs LEFT JOIN sites ON sites.id=traffic_logs.site_id WHERE traffic_logs.recorded_at>=? AND traffic_logs.recorded_at<? GROUP BY traffic_logs.site_id, sites.name`, trafficMinuteBucket(todayStart), trafficMinuteBucket(tomorrow))
+	trafficRows, err := d.db.Query(`SELECT source.site_id, COALESCE(NULLIF(sites.name,''), '站点 ' || source.site_id), COALESCE(SUM(source.bytes_in),0), COALESCE(SUM(source.bytes_out),0) FROM (
+			SELECT site_id, bytes_in, bytes_out FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?
+			UNION ALL
+			SELECT site_id, bytes_in, bytes_out FROM node_site_traffic_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?
+		) AS source LEFT JOIN sites ON sites.id=source.site_id GROUP BY source.site_id, sites.name`, trafficMinuteBucket(todayStart), trafficMinuteBucket(tomorrow), todayStart.UnixMilli(), tomorrow.UnixMilli())
 	if err != nil {
 		return stats, err
 	}
@@ -578,6 +593,13 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// url.Error prints the full request URL, which embeds the bot token
+		// in the path; strip it so logs and API error responses never leak the
+		// credential on DNS/timeout/TLS failures.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return fmt.Errorf("telegram request to api.telegram.org failed: %w", urlErr.Err)
+		}
 		return fmt.Errorf("telegram request failed: %w", err)
 	}
 	defer resp.Body.Close()

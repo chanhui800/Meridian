@@ -18,8 +18,8 @@ import (
 
 func reviewRoute(id int64, host, target string) AgentSiteRoute {
 	return AgentSiteRoute{SiteID: id, Host: host, TargetURL: target, PlaybackMode: "direct",
-		Site:            Site{Name: host, PublicHost: host, IngressMode: ingressModeHost, TargetURL: target, PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth, DynamicProfile: dynamicProfileSafe},
-		FailoverTargets: "[]", StreamHostsRaw: "[]", DynamicSources: `["redirect","playback_info"]`, DynamicRules: "[]"}
+		Site:            Site{Name: host, PublicHost: host, IngressMode: ingressModeHost, TargetURL: target, PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth},
+		FailoverTargets: "[]", StreamHostsRaw: "[]"}
 }
 
 func installReviewCertificate(t *testing.T, app *App) {
@@ -1321,6 +1321,11 @@ func TestReviewEventSpoolEncryptsAndReportsPersistenceFailure(t *testing.T) {
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
+	// Persistence is debounced on the hot path; age the debounce window out
+	// so this add reaches the disk write and must surface its failure.
+	store.mu.Lock()
+	store.lastPersist = time.Now().Add(-edgeEventPersistInterval - time.Second)
+	store.mu.Unlock()
 	if err := store.add(event); err == nil {
 		t.Fatal("event spool persistence failure was silently ignored")
 	}

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -112,11 +111,6 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomVersion              string                `json:"custom_version"`
 			ClientIPMode               string                `json:"client_ip_mode"`
 			UpstreamHeaders            []UpstreamHeaderInput `json:"upstream_headers"`
-			DynamicDiscoveryEnabled    bool                  `json:"dynamic_discovery_enabled"`
-			DynamicProfile             string                `json:"dynamic_profile"`
-			DynamicDiscoverySources    json.RawMessage       `json:"dynamic_discovery_sources"`
-			DynamicDomainRules         []DynamicDomainRule   `json:"dynamic_domain_rules"`
-			DynamicAllowHTTPSDowngrade bool                  `json:"dynamic_allow_https_downgrade"`
 			AssetCacheEnabled          bool                  `json:"asset_cache_enabled"`
 			AssetCacheTTLSec           int                   `json:"asset_cache_ttl_sec"`
 			AssetCacheMaxBytes         int64                 `json:"asset_cache_max_bytes"`
@@ -130,28 +124,8 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
-		dynamicSources, _, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
-		if err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		if req.Name == "" || req.TargetURL == "" {
 			a.jsonErr(w, 400, "name and target_url are required")
-			return
-		}
-		dynamicPolicy := Site{
-			DynamicDiscoveryEnabled:    req.DynamicDiscoveryEnabled,
-			DynamicProfile:             req.DynamicProfile,
-			DynamicDiscoverySources:    dynamicSources,
-			DynamicDomainRules:         req.DynamicDomainRules,
-			DynamicAllowHTTPSDowngrade: req.DynamicAllowHTTPSDowngrade,
-		}
-		if err := normalizeDynamicSitePolicy(&dynamicPolicy); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := validateDynamicDiscoveryAPIEnablement(dynamicPolicy, len(a.dynamicRouteKey) == sha256.Size, false); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if req.UAMode == "" {
@@ -345,13 +319,6 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomVersion:                 req.CustomVersion,
 			ClientIPMode:                  req.ClientIPMode,
 			StoredUpstreamHeaders:         storedHeaders,
-			DynamicDiscoveryEnabled:       dynamicPolicy.DynamicDiscoveryEnabled,
-			DynamicProfile:                dynamicPolicy.DynamicProfile,
-			StoredDynamicDiscoverySources: dynamicPolicy.StoredDynamicDiscoverySources,
-			DynamicDiscoverySources:       dynamicPolicy.DynamicDiscoverySources,
-			StoredDynamicDomainRules:      dynamicPolicy.StoredDynamicDomainRules,
-			DynamicDomainRules:            dynamicPolicy.DynamicDomainRules,
-			DynamicAllowHTTPSDowngrade:    dynamicPolicy.DynamicAllowHTTPSDowngrade,
 			AssetCacheEnabled:             assetCacheConfig.AssetCacheEnabled,
 			AssetCacheTTLSec:              assetCacheConfig.AssetCacheTTLSec,
 			AssetCacheMaxBytes:            assetCacheConfig.AssetCacheMaxBytes,
@@ -606,11 +573,6 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			CustomVersion              *string                `json:"custom_version"`
 			ClientIPMode               *string                `json:"client_ip_mode"`
 			UpstreamHeaders            *[]UpstreamHeaderInput `json:"upstream_headers"`
-			DynamicDiscoveryEnabled    *bool                  `json:"dynamic_discovery_enabled"`
-			DynamicProfile             *string                `json:"dynamic_profile"`
-			DynamicDiscoverySources    json.RawMessage        `json:"dynamic_discovery_sources"`
-			DynamicDomainRules         *[]DynamicDomainRule   `json:"dynamic_domain_rules"`
-			DynamicAllowHTTPSDowngrade *bool                  `json:"dynamic_allow_https_downgrade"`
 			AssetCacheEnabled          *bool                  `json:"asset_cache_enabled"`
 			AssetCacheTTLSec           *int                   `json:"asset_cache_ttl_sec"`
 			AssetCacheMaxBytes         *int64                 `json:"asset_cache_max_bytes"`
@@ -622,11 +584,6 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
-			return
-		}
-		requestedDynamicSources, dynamicSourcesProvided, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
-		if err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		playbackTargetURL := oldSite.PlaybackTargetURL
@@ -882,21 +839,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		candidate.StoredUpstreamHeaders = storedHeaders
-		if req.DynamicDiscoveryEnabled != nil {
-			candidate.DynamicDiscoveryEnabled = *req.DynamicDiscoveryEnabled
-		}
-		if req.DynamicProfile != nil {
-			candidate.DynamicProfile = *req.DynamicProfile
-		}
-		if dynamicSourcesProvided {
-			candidate.DynamicDiscoverySources = requestedDynamicSources
-		}
-		if req.DynamicDomainRules != nil {
-			candidate.DynamicDomainRules = *req.DynamicDomainRules
-		}
-		if req.DynamicAllowHTTPSDowngrade != nil {
-			candidate.DynamicAllowHTTPSDowngrade = *req.DynamicAllowHTTPSDowngrade
-		}
+
+
+
+
+
 		if req.AssetCacheEnabled != nil {
 			candidate.AssetCacheEnabled = *req.AssetCacheEnabled
 		}
@@ -920,14 +867,6 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := normalizeAssetCacheConfig(&candidate); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := normalizeDynamicSitePolicy(&candidate); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := validateDynamicDiscoveryAPIEnablement(candidate, len(a.dynamicRouteKey) == sha256.Size, oldSite.DynamicDiscoveryEnabled); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}

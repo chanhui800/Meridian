@@ -136,7 +136,7 @@ func TestMainVideoDirectTransportFallsBackWithoutProxyingOriginBody(t *testing.T
 					return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Header: make(http.Header), Body: body, Request: req}, nil
 				}),
 				mainVideoDirect: true,
-				dynamicPolicy:   redirectRuntimePolicy(dynamicProfileCompatible, true),
+				dynamicPolicy:   redirectRuntimePolicy(true),
 			}
 			req := httptest.NewRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream.mkv", nil)
 			req = req.WithContext(context.WithValue(req.Context(), mainVideoDirectFallbackContextKey{}, fallback))

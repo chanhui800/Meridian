@@ -154,7 +154,13 @@ func rotateNodeProbeSecret(db *DB, node ControlNode) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	result, err := db.db.Exec("UPDATE control_nodes SET probe_secret_ciphertext=?,updated_at_ms=? WHERE id=? AND probe_secret_ciphertext=?", ciphertext, time.Now().UnixMilli(), node.ID, node.probeSecretCiphertext)
+	// Rotating the probe secret changes the runtime config payload, so the
+	// node's config revision must advance: without it, the scheduler probes
+	// with the new secret while the agent is still serving the old config
+	// until its next unconditional 60s poll.
+	result, err := db.db.Exec(`UPDATE control_nodes SET probe_secret_ciphertext=?,
+		config_revision=config_revision+1, desired_config_hash='', desired_config_revision=0, config_dirty=1, updated_at_ms=?
+		WHERE id=? AND probe_secret_ciphertext=?`, ciphertext, time.Now().UnixMilli(), node.ID, node.probeSecretCiphertext)
 	if err != nil {
 		return "", err
 	}

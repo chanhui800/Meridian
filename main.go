@@ -327,7 +327,6 @@ func main() {
 	mux.HandleFunc("/api/tmdb-settings", cors(app.authMiddleware(app.handleTMDBSettings)))
 	mux.HandleFunc("/api/telegram-report", cors(app.authMiddleware(app.handleTelegramReport)))
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
-	mux.HandleFunc("/api/dynamic-profiles", cors(app.authMiddleware(app.handleDynamicProfiles)))
 	mux.HandleFunc("/api/events", cors(app.authMiddleware(app.handleSSE)))
 	mux.HandleFunc("/api/nodes", cors(app.authMiddleware(app.handleNodes)))
 	mux.HandleFunc("/api/nodes/", cors(app.authMiddleware(app.handleNodeByID)))

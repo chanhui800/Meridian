@@ -1717,7 +1717,7 @@ func TestAgentConfigHashPreservesPreTrafficBaselineCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantLegacyHash, err := hashAgentConfigPayloadForVersion(config, false, false)
+	wantLegacyHash, err := hashAgentConfigPayloadLegacyDynamic(config, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1729,7 +1729,7 @@ func TestAgentConfigHashPreservesPreTrafficBaselineCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantModernHash, err := agentConfigHash(config)
+	wantModernHash, err := hashAgentConfigPayloadLegacyDynamic(config, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}

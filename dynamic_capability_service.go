@@ -567,7 +567,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		writeDynamicCapabilityUnavailable(w)
 		return
 	}
-	if len(claims.RequiredHeaders) > 0 && (i.policy.profile != dynamicProfileExtreme || hasSuffix || r.URL.RawQuery != "" || target.String() != claims.Target || dynamicRequiredHeadersConflictWithFixedPolicy(claims.RequiredHeaders, i.upstreamHeaderPolicy)) {
+	if len(claims.RequiredHeaders) > 0 {
 		writeDynamicCapabilityUnavailable(w)
 		return
 	}
@@ -694,7 +694,7 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		newDynamicProxyError(reasonCode).writeResponse(w)
 		return
 	}
-	if dynamicHandledRedirectStatus(resp.StatusCode, i.policy.profile) || dynamicRejectedRedirectStatus(resp.StatusCode, i.policy.profile) {
+	if dynamicHandledRedirectStatus(resp.StatusCode) || dynamicRejectedRedirectStatus(resp.StatusCode) {
 		if !claims.Trusted && !i.policy.sourceEnabled(dynamicDiscoverySourceRedirect) {
 			_ = resp.Body.Close()
 			i.observe(claims.Source, dynamicObservationDecisionDenied, dynamicObservationReasonUnsupportedStatus, authority)

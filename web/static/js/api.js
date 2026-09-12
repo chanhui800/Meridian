@@ -291,7 +291,6 @@ const API = {
   getProfiles() { return this.request('GET', '/api/ua-profiles'); },
 
   // Dynamic discovery
-  getDynamicProfiles() { return this.request('GET', '/api/dynamic-profiles'); },
   getDynamicObservations(siteId) {
     return this.request('GET', '/api/sites/' + encodeURIComponent(siteId) + '/dynamic-observations');
   },

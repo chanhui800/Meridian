@@ -181,6 +181,7 @@ type SiteNodeSchedule struct {
 	AgentLastStatus      int    `json:"agent_last_status"`
 	ConfigPendingSinceMS int64  `json:"config_pending_since_ms"`
 	ScheduleRevision     int64  `json:"schedule_revision"`
+	SiteEnabled          bool   `json:"site_enabled"`
 	UpdatedAtMS          int64  `json:"updated_at_ms"`
 	cfZoneID             string
 	cfRecordID           string
@@ -200,8 +201,6 @@ type AgentSiteRoute struct {
 	FailoverLines     string              `json:"failover_lines_raw,omitempty"`
 	StreamHostsRaw    string              `json:"stream_hosts_raw,omitempty"`
 	UpstreamHeaders   string              `json:"upstream_headers_raw,omitempty"`
-	DynamicSources    string              `json:"dynamic_sources_raw,omitempty"`
-	DynamicRules      string              `json:"dynamic_rules_raw,omitempty"`
 	// TrafficCycleUsage is the Controller's authoritative usage for the
 	// currently active billing cycle. It is intentionally excluded from the
 	// runtime config hash because it changes with telemetry, while the quota
@@ -250,13 +249,14 @@ func encodeRuntimeKey(value []byte) string {
 
 func scanSiteNodeSchedule(scanner interface{ Scan(...any) error }) (SiteNodeSchedule, error) {
 	var value SiteNodeSchedule
-	var enabled int
+	var enabled, siteEnabled int
 	var fixed, desired, applied sql.NullInt64
 	err := scanner.Scan(&value.SiteID, &value.SiteName, &value.PublicHost, &enabled, &value.Mode, &fixed, &desired, &applied,
 		&value.cfZoneID, &value.cfRecordID, &value.cfRecordType, &value.AppliedAddress, &value.DNSStatus,
 		&value.ConfigHash, &value.LastError, &value.DesiredNodeName, &value.AppliedNodeName, &value.AppliedNodePort,
-		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.ConfigPendingSinceMS, &value.ScheduleRevision, &value.UpdatedAtMS)
+		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.ConfigPendingSinceMS, &value.ScheduleRevision, &value.UpdatedAtMS, &siteEnabled)
 	value.Enabled = enabled != 0
+	value.SiteEnabled = siteEnabled != 0
 	if fixed.Valid {
 		value.FixedNodeID = fixed.Int64
 	}
@@ -273,7 +273,7 @@ const siteNodeScheduleSelect = `SELECT s.id,s.name,s.public_host,COALESCE(n.enab
 	n.fixed_node_id,n.desired_node_id,n.applied_node_id,COALESCE(n.cf_zone_id,''),COALESCE(n.cf_record_id,''),
 	COALESCE(n.cf_record_type,''),COALESCE(n.applied_address,''),COALESCE(n.dns_status,'disabled'),
 	COALESCE(n.config_hash,''),COALESCE(n.last_error,''),COALESCE(d.name,''),COALESCE(an.name,''),COALESCE(an.https_port,0),
-	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.config_pending_since_ms,0),COALESCE(n.schedule_revision,1),COALESCE(n.updated_at_ms,0)
+	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.config_pending_since_ms,0),COALESCE(n.schedule_revision,1),COALESCE(n.updated_at_ms,0),COALESCE(s.enabled,1)
 	FROM sites s LEFT JOIN site_node_schedules n ON n.site_id=s.id
 	LEFT JOIN control_nodes d ON d.id=n.desired_node_id LEFT JOIN control_nodes an ON an.id=n.applied_node_id`
 
@@ -527,7 +527,12 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	updates := make([]assignmentUpdate, 0)
 	changedNodeIDs := make([]int64, 0)
 	for _, value := range values {
-		if !value.Enabled {
+		// A schedule on a disabled site only participates until the worker
+		// has finalized its runtime assignment once (dns_status='disabled'):
+		// after that, re-writing desired_node_id every tick would only be
+		// counter-cleared by the next finalize, churning revisions and
+		// re-dirtying every agent config forever.
+		if !value.Enabled || !value.SiteEnabled && value.DNSStatus == "disabled" {
 			continue
 		}
 		desired := snapshot.Scheduler.ActiveNodeID
@@ -653,6 +658,146 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 	return tx.Commit()
 }
 
+// agentSiteHashBaseLegacy preserves the pre-v1.9.86 Site wire shape for the
+// configuration hash. Agents at v1.9.85 and older still carry the per-site
+// dynamic-policy fields in their Site struct and re-serialize them
+// (zero-valued) when validating a config from a newer Controller, so the
+// compatibility hash must emit the same keys in the same order.
+type agentSiteHashBaseLegacy struct {
+	ID                            int64                   `json:"id"`
+	SortOrder                     int64                   `json:"sort_order"`
+	Name                          string                  `json:"name"`
+	IconName                      string                  `json:"icon_name"`
+	IconURL                       string                  `json:"icon_url"`
+	ListenPort                    int                     `json:"listen_port"`
+	PublicHost                    string                  `json:"public_host"`
+	PathPrefix                    string                  `json:"path_prefix"`
+	IngressMode                   string                  `json:"ingress_mode"`
+	TargetURL                     string                  `json:"target_url"`
+	PrimaryLineName               string                  `json:"primary_line_name"`
+	PlaybackTargetURL             string                  `json:"playback_target_url"`
+	PlaybackMode                  string                  `json:"playback_mode"`
+	MainVideoStreamMode           string                  `json:"main_video_stream_mode"`
+	FailoverTargets               string                  `json:"-"`
+	FailoverTargetList            []string                `json:"failover_targets"`
+	StoredFailoverLines           string                  `json:"-"`
+	FailoverLines                 []FailoverLine          `json:"failover_lines"`
+	StreamHosts                   string                  `json:"-"`
+	StreamHostList                []string                `json:"stream_hosts"`
+	UAMode                        string                  `json:"ua_mode"`
+	CustomUserAgent               string                  `json:"custom_user_agent"`
+	CustomClient                  string                  `json:"custom_client"`
+	CustomVersion                 string                  `json:"custom_version"`
+	ClientIPMode                  string                  `json:"client_ip_mode"`
+	StoredUpstreamHeaders         string                  `json:"-"`
+	UpstreamHeaders               []UpstreamHeaderView    `json:"upstream_headers"`
+	DynamicDiscoveryEnabled       bool                    `json:"dynamic_discovery_enabled"`
+	DynamicProfile                string                  `json:"dynamic_profile"`
+	StoredDynamicDiscoverySources string                  `json:"-"`
+	DynamicDiscoverySources       []string                `json:"dynamic_discovery_sources"`
+	StoredDynamicDomainRules      string                  `json:"-"`
+	DynamicDomainRules            []legacyAgentDomainRule `json:"dynamic_domain_rules"`
+	DynamicAllowHTTPSDowngrade    bool                    `json:"dynamic_allow_https_downgrade"`
+	DynamicPolicyRevision         int64                   `json:"dynamic_policy_revision"`
+	AssetCacheEnabled             bool                    `json:"asset_cache_enabled"`
+	AssetCacheTTLSec              int                     `json:"asset_cache_ttl_sec"`
+	AssetCacheMaxBytes            int64                   `json:"asset_cache_max_bytes"`
+	AssetCacheRules               string                  `json:"asset_cache_rules"`
+	WatchHistoryEnabled           bool                    `json:"watch_history_enabled"`
+	AccountRetentionDays          int                     `json:"account_retention_days"`
+	AccountRetentionStartedMS     int64                   `json:"account_retention_started_at_ms"`
+	AccountRetentionCompletedMS   int64                   `json:"account_retention_last_completed_at_ms"`
+	MediaMovieCount               int64                   `json:"media_movie_count"`
+	MediaSeriesCount              int64                   `json:"media_series_count"`
+	MediaEpisodeCount             int64                   `json:"media_episode_count"`
+	MediaCountUpdatedMS           int64                   `json:"media_count_updated_at_ms"`
+	Enabled                       bool                    `json:"enabled"`
+	TrafficQuota                  int64                   `json:"traffic_quota"`
+	TrafficUsed                   int64                   `json:"traffic_used"`
+	TrafficUsedIn                 int64                   `json:"-"`
+	TrafficUsedOut                int64                   `json:"-"`
+	SpeedLimit                    int                     `json:"speed_limit"`
+	CreatedAt                     string                  `json:"created_at"`
+	UpdatedAt                     string                  `json:"updated_at"`
+}
+
+type legacyAgentDomainRule struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type agentSiteHashLegacy struct {
+	agentSiteHashBaseLegacy
+	IconName string `json:"icon_name,omitempty"`
+	IconURL  string `json:"icon_url,omitempty"`
+}
+
+type agentSiteRouteHashLegacy struct {
+	SiteID            int64               `json:"site_id"`
+	Host              string              `json:"host"`
+	TargetURL         string              `json:"target_url"`
+	PlaybackTargetURL string              `json:"playback_target_url,omitempty"`
+	StreamHosts       []string            `json:"stream_hosts,omitempty"`
+	PlaybackMode      string              `json:"playback_mode,omitempty"`
+	Headers           map[string][]string `json:"headers,omitempty"`
+	Site              agentSiteHashLegacy `json:"site"`
+	FailoverTargets   string              `json:"failover_targets_raw,omitempty"`
+	FailoverLines     string              `json:"failover_lines_raw,omitempty"`
+	StreamHostsRaw    string              `json:"stream_hosts_raw,omitempty"`
+	UpstreamHeaders   string              `json:"upstream_headers_raw,omitempty"`
+}
+
+type agentRuntimeConfigHashLegacy struct {
+	SchemaVersion        int                        `json:"schema_version"`
+	ConfigHash           string                     `json:"config_hash"`
+	NodeGUID             string                     `json:"node_guid"`
+	EntryMode            string                     `json:"entry_mode"`
+	HTTPPort             int                        `json:"http_port"`
+	HTTPSPort            int                        `json:"https_port"`
+	CertificatePEM       string                     `json:"certificate_pem,omitempty"`
+	PrivateKeyPEM        string                     `json:"private_key_pem,omitempty"`
+	DynamicKey           string                     `json:"dynamic_key,omitempty"`
+	ProbeSecret          string                     `json:"probe_secret,omitempty"`
+	AgentVersion         string                     `json:"agent_version,omitempty"`
+	AgentSHA256          string                     `json:"agent_sha256,omitempty"`
+	AgentDownloadURL     string                     `json:"agent_download_url,omitempty"`
+	CacheClearGeneration int64                      `json:"cache_clear_generation,omitempty"`
+	ForceStopSiteIDs     []int64                    `json:"force_stop_site_ids,omitempty"`
+	Routes               []agentSiteRouteHashLegacy `json:"routes"`
+}
+
+// legacyAgentSiteHash converts the current Site wire shape into the v1.9.85
+// shape via a JSON round trip: the controller no longer emits the dynamic
+// policy fields, so the legacy fields deserialize to their zero values —
+// exactly what an older Agent holds after parsing the same payload.
+func legacyAgentSiteHash(site Site) (agentSiteHashLegacy, error) {
+	data, err := json.Marshal(agentSiteHashBase(site))
+	if err != nil {
+		return agentSiteHashLegacy{}, err
+	}
+	var legacy agentSiteHashLegacy
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return agentSiteHashLegacy{}, err
+	}
+	return legacy, nil
+}
+
+// agentSupportsDynamicPolicyRemoval reports whether the Agent's Site wire
+// contract already predates the removal of the per-site dynamic policy fields.
+func agentSupportsDynamicPolicyRemoval(version string) bool {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 9 {
+		return minor > 9
+	}
+	return patch >= 86
+}
+
 // agentSiteHashBase lets the runtime hash use the Site wire shape without
 // making the UI-only icon fields part of the Agent contract. Older Agents
 // ignore icon_name/icon_url while decoding a route, so including those fields
@@ -678,8 +823,6 @@ type agentSiteRouteHash struct {
 	FailoverLines     string              `json:"failover_lines_raw,omitempty"`
 	StreamHostsRaw    string              `json:"stream_hosts_raw,omitempty"`
 	UpstreamHeaders   string              `json:"upstream_headers_raw,omitempty"`
-	DynamicSources    string              `json:"dynamic_sources_raw,omitempty"`
-	DynamicRules      string              `json:"dynamic_rules_raw,omitempty"`
 }
 
 type agentRuntimeConfigHash struct {
@@ -760,8 +903,6 @@ func agentConfigHashPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiv
 			FailoverLines:     route.FailoverLines,
 			StreamHostsRaw:    route.StreamHostsRaw,
 			UpstreamHeaders:   route.UpstreamHeaders,
-			DynamicSources:    route.DynamicSources,
-			DynamicRules:      route.DynamicRules,
 		}
 	}
 	return agentRuntimeConfigHash{
@@ -790,6 +931,77 @@ func hashAgentConfigPayload(config AgentRuntimeConfig, legacy bool) (string, err
 
 func hashAgentConfigPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiveTraffic bool) (string, error) {
 	data, err := json.Marshal(agentConfigHashPayloadForVersion(config, legacy, zeroLiveTraffic))
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+// hashAgentConfigPayloadLegacyDynamic computes the hash with the pre-v1.9.86
+// Site wire shape for Agents that still serialize the removed dynamic-policy
+// fields from their zero values.
+func hashAgentConfigPayloadLegacyDynamic(config AgentRuntimeConfig, legacy, zeroLiveTraffic bool) (string, error) {
+	config.ConfigHash = ""
+	if !legacy {
+		config.AgentVersion = ""
+		config.AgentSHA256 = ""
+	}
+	config.AgentDownloadURL = ""
+	config.ForceStopSiteIDs = nil
+	if legacy {
+		config.CacheClearGeneration = 0
+		config.ProbeSecret = ""
+	}
+	payload := agentRuntimeConfigHashLegacy{
+		SchemaVersion:        config.SchemaVersion,
+		ConfigHash:           config.ConfigHash,
+		NodeGUID:             config.NodeGUID,
+		EntryMode:            config.EntryMode,
+		HTTPPort:             config.HTTPPort,
+		HTTPSPort:            config.HTTPSPort,
+		CertificatePEM:       config.CertificatePEM,
+		PrivateKeyPEM:        config.PrivateKeyPEM,
+		DynamicKey:           config.DynamicKey,
+		ProbeSecret:          config.ProbeSecret,
+		AgentVersion:         config.AgentVersion,
+		AgentSHA256:          config.AgentSHA256,
+		AgentDownloadURL:     config.AgentDownloadURL,
+		CacheClearGeneration: config.CacheClearGeneration,
+		ForceStopSiteIDs:     config.ForceStopSiteIDs,
+	}
+	payload.Routes = make([]agentSiteRouteHashLegacy, len(config.Routes))
+	for i, route := range config.Routes {
+		hashSite := route.Site
+		if zeroLiveTraffic {
+			hashSite.TrafficUsed = 0
+			hashSite.TrafficUsedIn = 0
+			hashSite.TrafficUsedOut = 0
+		}
+		legacySite, convErr := legacyAgentSiteHash(hashSite)
+		if convErr != nil {
+			return "", convErr
+		}
+		payload.Routes[i] = agentSiteRouteHashLegacy{
+			SiteID:            route.SiteID,
+			Host:              route.Host,
+			TargetURL:         route.TargetURL,
+			PlaybackTargetURL: route.PlaybackTargetURL,
+			StreamHosts:       route.StreamHosts,
+			PlaybackMode:      route.PlaybackMode,
+			Headers:           route.Headers,
+			Site: agentSiteHashLegacy{
+				agentSiteHashBaseLegacy: legacySite.agentSiteHashBaseLegacy,
+				IconName:                route.Site.IconName,
+				IconURL:                 route.Site.IconURL,
+			},
+			FailoverTargets: route.FailoverTargets,
+			FailoverLines:   route.FailoverLines,
+			StreamHostsRaw:  route.StreamHostsRaw,
+			UpstreamHeaders: route.UpstreamHeaders,
+		}
+	}
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
@@ -892,10 +1104,12 @@ func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (strin
 	if !agentSupportsCacheClear(version) {
 		config.CacheClearGeneration = 0
 	}
-	if agentUsesRuntimeConfigHash(version) {
-		return hashAgentConfigPayloadForVersion(config, false, agentSupportsTrafficBaseline(version))
+	legacy := !agentUsesRuntimeConfigHash(version)
+	zeroLiveTraffic := agentSupportsTrafficBaseline(version)
+	if !agentSupportsDynamicPolicyRemoval(version) {
+		return hashAgentConfigPayloadLegacyDynamic(config, legacy, zeroLiveTraffic)
 	}
-	return hashAgentConfigPayloadForVersion(config, true, agentSupportsTrafficBaseline(version))
+	return hashAgentConfigPayloadForVersion(config, legacy, zeroLiveTraffic)
 }
 
 // parseAgentVersion accepts the build metadata used by AWS test deployments
@@ -1131,8 +1345,6 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		route.FailoverTargets = site.FailoverTargets
 		route.FailoverLines = site.StoredFailoverLines
 		route.StreamHostsRaw = site.StreamHosts
-		route.DynamicSources = site.StoredDynamicDiscoverySources
-		route.DynamicRules = site.StoredDynamicDomainRules
 		route.Host = strings.ToLower(strings.TrimSpace(route.Host))
 		routes = append(routes, route)
 	}
@@ -1658,8 +1870,11 @@ func verifyTrackedSiteDNSOwnership(ctx context.Context, cf *cloudflareClient, sc
 		}
 		return err
 	}
+	// Ownership is proven by the record ID plus the site's ownership-marker
+	// comment; the hostname is deliberately not compared because a site can be
+	// renamed after the record was created, and refusing the delete then would
+	// wedge cleanup and site deletion forever on a record Meridian still owns.
 	if (record.Type != "A" && record.Type != "AAAA") ||
-		!strings.EqualFold(strings.TrimSpace(record.Name), strings.TrimSpace(schedule.PublicHost)) ||
 		strings.TrimSpace(record.Comment) != siteDNSOwnershipMarker(schedule.SiteID) {
 		return errors.New("tracked DNS record no longer carries the Meridian ownership marker; refusing to delete")
 	}
@@ -2171,7 +2386,10 @@ func (a *App) reconcileSiteNodeScheduling(ctx context.Context) {
 	for _, value := range values {
 		if !value.Enabled && siteNodeScheduleNeedsCleanup(value) {
 			jobs = append(jobs, nodeSchedulerJob{value: value, cleanup: true, now: now})
-		} else if value.Enabled {
+		} else if value.Enabled && (value.SiteEnabled || value.DNSStatus != "disabled") {
+			// A site-disabled schedule needs exactly one finalize pass; after
+			// it, re-enqueueing would only repeat the clear and re-dirty
+			// agent configs on every tick.
 			jobs = append(jobs, nodeSchedulerJob{value: value, now: now})
 		}
 	}

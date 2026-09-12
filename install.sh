@@ -2227,9 +2227,10 @@ do_uninstall() {
             as_root userdel "$SERVICE_USER" 2>/dev/null || true
         fi
         if getent group "$SERVICE_GROUP" >/dev/null 2>&1 && command -v groupdel >/dev/null 2>&1; then
-            # Only remove the group the installer created when no other user
-            # still references it.
-            if [ -z "$(awk -F: -v g="$SERVICE_GROUP" '$4==gid {print}' /etc/passwd 2>/dev/null)" ]; then
+            # Only remove the group the installer created when no other user's
+            # primary GID still references it.
+            service_gid=$(getent group "$SERVICE_GROUP" | cut -d: -f3)
+            if [ -n "$service_gid" ] && [ -z "$(awk -F: -v gid="$service_gid" '$4==gid {print}' /etc/passwd 2>/dev/null)" ]; then
                 as_root groupdel "$SERVICE_GROUP" 2>/dev/null || true
             fi
         fi
