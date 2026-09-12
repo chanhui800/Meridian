@@ -328,3 +328,237 @@ func TestRecreateReplacedDNSRecordRestoresPreimage(t *testing.T) {
 		t.Fatalf("restore payload=%+v, want the deleted record preimage", payload)
 	}
 }
+
+func TestPathRouteSelectionIsDeterministic(t *testing.T) {
+	pm := &ProxyManager{
+		pathPrefixes: map[string]int64{"/emby": 2, "/foo": 1},
+		proxies: map[int64]*ProxyInstance{
+			1: {Site: Site{ID: 1}, handler: http.NotFoundHandler()},
+			2: {Site: Site{ID: 2}, handler: http.NotFoundHandler()},
+		},
+	}
+	// /emby/foo/x matches the direct /emby prefix and the embedded /emby/foo
+	// form; the longer effective match must win on every iteration instead of
+	// following Go's randomized map order.
+	for i := 0; i < 50; i++ {
+		_, prefix, ok := pm.PathRoute("/emby/foo/x")
+		if !ok || prefix != "/foo" {
+			t.Fatalf("iteration %d: prefix=%q ok=%v, want the deterministic /foo match", i, prefix, ok)
+		}
+	}
+	// An exact /emby request only matches the /emby site directly.
+	for i := 0; i < 50; i++ {
+		_, prefix, ok := pm.PathRoute("/emby")
+		if !ok || prefix != "/emby" {
+			t.Fatalf("iteration %d: prefix=%q ok=%v, want the deterministic /emby match", i, prefix, ok)
+		}
+	}
+	// Nested prefixes: the more specific /foo/bar wins over /foo.
+	pm.pathPrefixes["/foo/bar"] = 1
+	_, prefix, ok := pm.PathRoute("/foo/bar/baz")
+	if !ok || prefix != "/foo/bar" {
+		t.Fatalf("nested prefix=%q ok=%v, want /foo/bar", prefix, ok)
+	}
+}
+
+func TestCleanUpstreamDotSegments(t *testing.T) {
+	cases := map[string]string{
+		"/emby/../admin":    "/admin",
+		"/emby/./Items":     "/emby/Items",
+		"/emby/Items":       "/emby/Items",
+		"/emby/Items/":      "/emby/Items/",
+		"/emby/../..":       "/",
+		"/.well-known/acme": "/.well-known/acme",
+		"/a/b/../c/./d":     "/a/c/d",
+	}
+	for input, want := range cases {
+		if got := cleanUpstreamDotSegments(input); got != want {
+			t.Fatalf("cleanUpstreamDotSegments(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestPruneTrafficLogsBoundsHistoryAndDeletesOnSiteDelete(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSiteRecord(Site{Name: "traffic-prune", ListenPort: 19851, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "passthrough"})
+	if err != nil {
+		t.Fatalf("create site: %v", err)
+	}
+	now := time.Now()
+	if err := app.db.addTrafficWithRequests(site.ID, 1, 2, 3); err != nil {
+		t.Fatalf("insert current traffic: %v", err)
+	}
+	old := now.Add(-401 * 24 * time.Hour)
+	if _, err := app.db.db.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at, recorded_at_ms) VALUES (?,?,?,?,?,?)",
+		site.ID, 5, 5, 5, old, old.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("INSERT INTO node_site_traffic_logs (node_id, site_id, bytes_in, bytes_out, requests, recorded_at_ms) VALUES (1,?,?,?,?,?)",
+		site.ID, 5, 5, 5, old.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.pruneTrafficLogs(now); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	var oldRows, newRows, nodeRows int
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM traffic_logs WHERE recorded_at_ms<?", now.Add(-300*24*time.Hour).UnixMilli()).Scan(&oldRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM traffic_logs WHERE recorded_at_ms>=?", now.Add(-300*24*time.Hour).UnixMilli()).Scan(&newRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM node_site_traffic_logs").Scan(&nodeRows); err != nil {
+		t.Fatal(err)
+	}
+	if oldRows != 0 || newRows == 0 || nodeRows != 0 {
+		t.Fatalf("prune left oldRows=%d newRows=%d nodeRows=%d, want 0/>0/0", oldRows, newRows, nodeRows)
+	}
+	// The daily guard must skip an immediate second sweep.
+	if err := app.db.pruneTrafficLogs(now.Add(time.Minute)); err != nil {
+		t.Fatalf("guarded prune: %v", err)
+	}
+	// Deleting the site must also clear the node traffic ledger.
+	if _, err := app.db.db.Exec("INSERT INTO node_site_traffic_logs (node_id, site_id, bytes_in, bytes_out, requests, recorded_at_ms) VALUES (1,?,1,1,1,?)", site.ID, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.DeleteSite(site.ID); err != nil {
+		t.Fatalf("delete site: %v", err)
+	}
+	if err := app.db.db.QueryRow("SELECT COUNT(*) FROM node_site_traffic_logs WHERE site_id=?", site.ID).Scan(&nodeRows); err != nil {
+		t.Fatal(err)
+	}
+	if nodeRows != 0 {
+		t.Fatalf("node traffic rows survived site deletion: %d", nodeRows)
+	}
+}
+
+func TestExactAddressRecordsFollowsPagination(t *testing.T) {
+	var pages int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.RawQuery, "page=2") {
+			_, _ = w.Write([]byte(`{"success":true,"result_info":{"page":2,"total_pages":2},"result":[{"id":"r2","type":"A","name":"site.example","content":"203.0.113.2","comment":""}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result_info":{"page":1,"total_pages":2},"result":[{"id":"r1","type":"A","name":"site.example","content":"203.0.113.1","comment":""}]}`))
+	}))
+	defer server.Close()
+	cf := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	records, err := cf.exactAddressRecords(context.Background(), "zone-1", "site.example")
+	if err != nil {
+		t.Fatalf("exactAddressRecords: %v", err)
+	}
+	if pages != 2 || len(records) != 2 || records[0].ID != "r1" || records[1].ID != "r2" {
+		t.Fatalf("pages=%d records=%d, want both pages merged", pages, len(records))
+	}
+}
+
+func TestSaveManagedPanelSettingsRejectsSitePortConflict(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSiteRecord(Site{Name: "port-site", ListenPort: 19555, IngressMode: ingressModePort, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "passthrough"})
+	if err != nil {
+		t.Fatalf("create site: %v", err)
+	}
+	if _, _, err := app.db.SaveManagedPanelSettings("panel.admin.example.test", "example.test", site.ListenPort, false); err == nil {
+		t.Fatal("panel port collision with a dedicated-port site must be rejected")
+	}
+}
+
+func TestDynamicAuthorityIdleEvictionReleasesCapacity(t *testing.T) {
+	limits := DynamicProfileLimits{MaxAuthorities: 2, MaxNewAuthoritiesPerMinute: 100}
+	runtime := newDynamicRuntime()
+	state := newDynamicSiteState(runtime, limits)
+	commit := func(authority string, at time.Time) {
+		reservation, reason := state.reserveAuthority(authority, at)
+		if reason != "" {
+			t.Fatalf("reserve %s: %s", authority, reason)
+		}
+		reservation.commit()
+	}
+	now := time.Now()
+	commit("one.example", now)
+	commit("two.example", now)
+	// At capacity with stale entries, a new authority must be admitted after
+	// eviction instead of being permanently rejected.
+	late := now.Add(dynamicAuthorityIdleTTL + time.Minute)
+	commit("three.example", late)
+	// Freshly used committed entries are never evicted: three.example is
+	// within the TTL and must still reserve without recreating.
+	if entry, reason := state.reserveAuthority("three.example", late.Add(time.Second)); reason != "" || entry == nil {
+		t.Fatalf("fresh committed authority rejected after eviction sweep: %s", reason)
+	}
+}
+
+func TestDynamicAuthorityGlobalSweepDoesNotDeadlockOrLeak(t *testing.T) {
+	limits := DynamicProfileLimits{MaxAuthorities: 1, MaxNewAuthoritiesPerMinute: 1000}
+	runtime := newDynamicRuntime()
+	state := newDynamicSiteState(runtime, limits)
+	other := newDynamicSiteState(runtime, limits)
+	now := time.Now()
+	// Keep the busy site at capacity with a fresh committed entry.
+	reservation, reason := state.reserveAuthority("busy.example", now)
+	if reason != "" {
+		t.Fatalf("reserve busy: %s", reason)
+	}
+	reservation.commit()
+	// Plant a stale committed entry on another site for the global sweep.
+	staleAt := now.Add(-dynamicAuthorityIdleTTL - time.Minute)
+	staleReservation, reason := other.reserveAuthority("stale.example", staleAt)
+	if reason != "" {
+		t.Fatalf("reserve stale: %s", reason)
+	}
+	staleReservation.commit()
+	// Reserving a new authority on the busy site runs the global sweep while
+	// holding this state's mu: the sweep must skip the caller (no self
+	// deadlock), evict the other site's stale entry, and still deny with
+	// capacity_limit because the caller's own table stays full.
+	done := make(chan string, 1)
+	go func() {
+		_, sweepReason := state.reserveAuthority("new.example", now.Add(time.Second))
+		done <- sweepReason
+	}()
+	select {
+	case sweepReason := <-done:
+		if sweepReason != dynamicObservationReasonCapacityLimit {
+			t.Fatalf("reason=%q, want capacity_limit", sweepReason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reserveAuthority deadlocked during the global eviction sweep")
+	}
+	runtime.mu.Lock()
+	other.mu.Lock()
+	remaining := len(other.authorities)
+	other.mu.Unlock()
+	runtime.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("global sweep left %d stale entries on the other site", remaining)
+	}
+}
+
+func TestNodeRequestEventPendingLedgerIsCapped(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	total := nodeRequestEventPendingLimit + 5
+	for i := 0; i < total; i++ {
+		if _, err := app.db.db.Exec("INSERT INTO node_request_events (node_id, agent_boot_id, event_id, received_at_ms) VALUES (7, 'boot', ?, ?)",
+			int64(i), now.Add(-time.Duration(total-i)*time.Minute).UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := pruneRequestLogsTx(tx, now, 24*time.Hour); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	var pending int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM node_request_events WHERE processed_at_ms=0").Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending > nodeRequestEventPendingLimit {
+		t.Fatalf("pending ledger rows=%d, want <= %d", pending, nodeRequestEventPendingLimit)
+	}
+}

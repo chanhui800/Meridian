@@ -497,6 +497,20 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 		return nil, t.denied(reasonCode, authority)
 	}
+	// releaseDynamicHops frees every per-request resource a previous dynamic
+	// hop acquired (transport, stream slot, authority leases) on return paths
+	// that hand the redirect back to the client instead of following it
+	// internally. Without it the site stream permits and authority in-flight
+	// counters leak a little on every client-redirected hop until the site
+	// restarts.
+	releaseDynamicHops := func() {
+		closeResponse()
+		lease.rollback()
+		if streamRelease != nil {
+			streamRelease()
+			streamRelease = nil
+		}
+	}
 	for {
 		if resp == nil {
 			return fail(dynamicObservationReasonResponseFailure, dynamicCanonicalAuthority(req.URL))
@@ -553,6 +567,7 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			if tracker := backendAddressTrackerFromContext(req.Context()); tracker != nil {
 				tracker.SetURL(locationURL)
 			}
+			releaseDynamicHops()
 			return replaceResponseWithMainVideoRedirect(resp, locationURL), nil
 		}
 		if !dynamicActive && sameAuthority {
@@ -671,6 +686,7 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 				tracker.SetURL(normalized)
 			}
 			t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
+			releaseDynamicHops()
 			return replaceResponseWithMainVideoRedirect(resp, normalized), nil
 		}
 		if t.followUnknownRedirects && shouldInternallyFollowDynamicRedirect(req) {
@@ -767,6 +783,7 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			resp.Header.Set("Content-Length", "0")
 			resp.Header.Set("Location", route)
 			t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
+			releaseDynamicHops()
 			markDynamicResponse(resp, nil, expectedStructuredSource)
 			return resp, nil
 		}

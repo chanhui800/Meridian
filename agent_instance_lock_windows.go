@@ -24,7 +24,11 @@ func acquireAgentInstanceLock(path string) (func(), error) {
 	flags := uint32(windows.LOCKFILE_EXCLUSIVE_LOCK | windows.LOCKFILE_FAIL_IMMEDIATELY)
 	if err := windows.LockFileEx(windows.Handle(file.Fd()), flags, 0, 1, 0, &overlapped); err != nil {
 		_ = file.Close()
-		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) || errors.Is(err, windows.ERROR_IO_PENDING) {
+		// Only a lock violation means another agent holds the file. With
+		// LOCKFILE_FAIL_IMMEDIATELY an asynchronous completion (IO_PENDING)
+		// is not expected; reporting it as "already running" would mask the
+		// real failure.
+		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
 			return nil, errAgentAlreadyRunning
 		}
 		return nil, err

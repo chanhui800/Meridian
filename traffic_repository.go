@@ -472,3 +472,46 @@ func (d *DB) GetTrafficTrendLogsGroupedSnapshot(siteID *int64, start, end time.T
 	}
 	return logs, baselines, nil
 }
+
+// trafficLogRetention keeps minute-bucket rows for slightly longer than the
+// largest dashboard trend window (366 days) while bounding table growth.
+// Cycle and lifetime accounting live on the site/node rows and the persisted
+// baselines, not in these history tables.
+const trafficLogRetention = 400 * 24 * time.Hour
+
+// trafficLogPruneInterval throttles the retention sweep to once a day; the
+// DELETE is index-supported but still unnecessary work on every writer tick.
+const trafficLogPruneInterval = 24 * time.Hour
+
+// pruneTrafficLogs bounds traffic_logs and node_site_traffic_logs, which are
+// written once per site/node per minute and previously grew without limit —
+// eventually pushing the database past the backup size cap so exports failed
+// exactly when a backup was most needed.
+func (d *DB) pruneTrafficLogs(now time.Time) error {
+	last := d.lastTrafficPruneMS.Load()
+	if last != 0 && now.Sub(time.UnixMilli(last)) < trafficLogPruneInterval {
+		return nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	cutoffMS := now.Add(-trafficLogRetention).UnixMilli()
+	if _, err := tx.Exec("DELETE FROM traffic_logs WHERE recorded_at_ms>0 AND recorded_at_ms<?", cutoffMS); err != nil {
+		return err
+	}
+	// Legacy rows written before recorded_at_ms existed only carry the
+	// DATETIME column and would otherwise be retained forever.
+	if _, err := tx.Exec("DELETE FROM traffic_logs WHERE recorded_at_ms=0 AND recorded_at<?", now.Add(-trafficLogRetention)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM node_site_traffic_logs WHERE recorded_at_ms<?", cutoffMS); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.lastTrafficPruneMS.Store(now.UnixMilli())
+	return nil
+}

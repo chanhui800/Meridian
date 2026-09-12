@@ -17,3 +17,17 @@ meridian.exe
 *.exe
 .idea
 .vscode
+.tmp
+.ai-memory
+.planning
+.planning/*
+output
+output/*
+findings.md
+progress.md
+task_plan.md
+AGENTS.md
+docs/images
+tests
+*.log
+*.mrbak

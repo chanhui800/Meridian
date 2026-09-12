@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1654,6 +1655,31 @@ func backupHasJWTProtectedTokenFile(path string) (bool, error) {
 			return true, nil
 		}
 	}
+	// Probe secrets and watch-history tokens are also encrypted under keys
+	// derived from the JWT secret. A restore carrying any of them under an
+	// ephemeral JWT secret would be unrecoverable after the next restart
+	// rotates that secret, so they must trip the same guard.
+	for _, protected := range []struct{ table, column string }{
+		{table: "control_nodes", column: "probe_secret_ciphertext"},
+		{table: "watch_sessions", column: "token_ciphertext"},
+		{table: "watch_history_inbox", column: "payload_json"},
+	} {
+		exists, err := backupSQLiteColumnExists(db, protected.table, protected.column)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			continue
+		}
+		// #nosec G202 -- table and column are fixed literals from the list above.
+		var nonEmpty int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + protected.table + " WHERE " + protected.column + "<>''").Scan(&nonEmpty); err != nil {
+			return false, err
+		}
+		if nonEmpty > 0 {
+			return true, nil
+		}
+	}
 	hasTMDBColumn, err := backupSQLiteColumnExists(db, "tmdb_settings", "token_ciphertext")
 	if err != nil {
 		return false, err
@@ -2462,7 +2488,14 @@ func applyPendingRestore(dbPath string) (*restoreAppliedState, error) {
 	committed := false
 	defer func() {
 		if rollbackReady && !committed {
-			_ = rollbackRestoreFiles(dbPath, rollback)
+			if rollbackErr := rollbackRestoreFiles(dbPath, rollback); rollbackErr != nil {
+				// The rollback itself failed: the rollback directory and the
+				// applied marker are now the only copy of the pre-restore
+				// state. Keep both so the next startup retry can finish the
+				// rollback instead of destroying the last recovery path.
+				log.Printf("恢复回滚失败，保留回滚目录与标记等待下次启动重试: %v", rollbackErr)
+				return
+			}
 			_ = os.Remove(dbPath + backupAppliedSuffix) // #nosec G703 G304 -- fixed restore marker suffix.
 			_ = os.RemoveAll(rollback)                  // #nosec G703 G304 -- fixed rollback suffix path.
 			_ = os.RemoveAll(pending)                   // #nosec G703 G304 -- fixed pending suffix path.

@@ -18,11 +18,25 @@ AGENT_BIN_NAME="meridian-agent"
 SERVICE_USER="meridian"
 SERVICE_GROUP="meridian"
 SYSTEMD_RESTRICT_ADDRESS_FAMILIES="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+# A data directory under /home cannot coexist with ProtectHome=true: systemd
+# would hide it from the sandboxed service and the install would fail its
+# health check with a misleading error. Allow read-only protection instead.
+case "$MERIDIAN_DATA_DIR" in
+    /home/*) SYSTEMD_PROTECT_HOME="read-only" ;;
+    *) SYSTEMD_PROTECT_HOME="true" ;;
+esac
 ROOT_GROUP="${MERIDIAN_ROOT_GROUP:-$(id -gn 0 2>/dev/null || printf 'root')}"
 NGINX_MARKER="# Managed by Meridian installer - panel only"
 NGINX_REDACTION_MARKER="# Meridian redacted URI access log"
 
 while [ "$INSTALL_DIR" != "/" ] && [[ "$INSTALL_DIR" == */ ]]; do INSTALL_DIR="${INSTALL_DIR%/}"; done
+case "$INSTALL_DIR" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/bin|/usr/local|/usr/local/share|/usr/share|/var|/var/lib)
+        fail "拒绝使用不安全的安装目录: ${INSTALL_DIR:-<empty>}" ;;
+    *//*|*/../*|*/..|*/./*|*/.|*$'
+'*)
+        fail "安装目录包含不安全的路径片段: $INSTALL_DIR" ;;
+esac
 while [ "$DATA_DIR" != "/" ] && [[ "$DATA_DIR" == */ ]]; do DATA_DIR="${DATA_DIR%/}"; done
 while [ "$BACKUP_DIR" != "/" ] && [[ "$BACKUP_DIR" == */ ]]; do BACKUP_DIR="${BACKUP_DIR%/}"; done
 
@@ -862,7 +876,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=${SYSTEMD_PROTECT_HOME}
 ProtectHostname=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -2211,6 +2225,13 @@ do_uninstall() {
         as_root rm -rf -- "$DATA_DIR"
         if id "$SERVICE_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
             as_root userdel "$SERVICE_USER" 2>/dev/null || true
+        fi
+        if getent group "$SERVICE_GROUP" >/dev/null 2>&1 && command -v groupdel >/dev/null 2>&1; then
+            # Only remove the group the installer created when no other user
+            # still references it.
+            if [ -z "$(awk -F: -v g="$SERVICE_GROUP" '$4==gid {print}' /etc/passwd 2>/dev/null)" ]; then
+                as_root groupdel "$SERVICE_GROUP" 2>/dev/null || true
+            fi
         fi
         ok "数据目录已删除；备份目录仍保留: $BACKUP_DIR"
     else

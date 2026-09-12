@@ -121,6 +121,9 @@ func (d *DB) runDynamicObservationWriter() {
 				if err := d.pruneWatchHistory(); err != nil {
 					log.Printf("[watch-history] optional retention write failed: %v", err)
 				}
+				if err := d.pruneTrafficLogs(time.Now()); err != nil {
+					log.Printf("[traffic] optional retention write failed: %v", err)
+				}
 				continue
 			case <-inboxTicker.C:
 				d.drainWatchHistoryInbox(time.Now())

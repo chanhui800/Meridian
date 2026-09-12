@@ -291,10 +291,34 @@ func panelBodyReadDeadline(next http.Handler) http.Handler {
 			// Clearing it when the handler returns lets a slow client keep dripping an
 			// unread body indefinitely. The server installs the next request/idle
 			// deadline before reusing a healthy keep-alive connection.
-			_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+			_ = controller.SetReadDeadline(time.Now().Add(panelBodyReadTimeout(r)))
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// panelBodyReadTimeout scales the absolute body-read deadline with the request
+// size. A flat 30s deadline caps uploads at ~8.5 MB/s, which made 256 MiB
+// backup restores fail permanently on links slower than ~70 Mbps; the restore
+// upload is an authenticated, size-capped operation, so it gets a generous
+// window while small JSON bodies keep the anti-slow-loris deadline.
+func panelBodyReadTimeout(r *http.Request) time.Duration {
+	const base = 30 * time.Second
+	if r.URL.Path != "/api/backup/restore" {
+		return base
+	}
+	const perMiB = 2 * time.Second
+	deadline := base
+	if r.ContentLength > 0 {
+		deadline += time.Duration(r.ContentLength>>20) * perMiB
+	} else {
+		// Unknown length (chunked upload): allow the full maximum payload.
+		deadline += 256 * 2 * time.Second
+	}
+	if deadline > 20*time.Minute {
+		return 20 * time.Minute
+	}
+	return deadline
 }
 
 func staticHandler(staticFS fs.FS) http.Handler {
@@ -548,6 +572,14 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	// Revoking the server-side session makes logout effective for a stolen or
+	// shared-cookie copy too, instead of only clearing this browser's cookie
+	// while the token stays valid until its 72-hour expiry.
+	if userID, _, err := a.authenticatedSessionIdentity(r); err == nil {
+		if revokeErr := a.db.RevokeUserSessions(userID); revokeErr != nil {
+			log.Printf("[auth] logout session revocation failed: %v", revokeErr)
+		}
+	}
 	a.clearSessionCookie(w, r)
 	a.jsonOK(w, map[string]bool{"logged_out": true})
 }

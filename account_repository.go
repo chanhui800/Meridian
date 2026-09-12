@@ -248,3 +248,13 @@ func (d *DB) ResetAdminPassword(password string) error {
 	}
 	return tx.Commit()
 }
+
+// RevokeUserSessions rotates the account's session version so every issued
+// token — including the one logging out — stops validating immediately.
+func (d *DB) RevokeUserSessions(userID int64) error {
+	if d == nil || d.db == nil || userID <= 0 {
+		return nil
+	}
+	_, err := d.db.Exec("UPDATE users SET session_version=session_version+1 WHERE id=?", userID)
+	return err
+}

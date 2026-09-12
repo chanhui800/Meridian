@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -122,6 +123,15 @@ func applyUpstreamURL(requestURL, upstream *url.URL) {
 	requestURL.Scheme = upstream.Scheme
 	requestURL.Host = upstream.Host
 	requestURL.Path, requestURL.RawPath = joinURLPath(upstream, requestURL)
+	// Collapse dot segments so a request path like /prefix/../admin cannot
+	// escape the administrator-configured upstream base path on hosts that
+	// normalize before routing. Emby/Jellyfin never emit dot segments; if the
+	// join changed the path, the stale RawPath is discarded by EscapedPath's
+	// consistency check and the cleaned path is re-encoded.
+	if cleaned := cleanUpstreamDotSegments(requestURL.Path); cleaned != requestURL.Path {
+		requestURL.Path = cleaned
+		requestURL.RawPath = ""
+	}
 	switch {
 	case upstream.RawQuery == "":
 	case requestURL.RawQuery == "":
@@ -129,6 +139,23 @@ func applyUpstreamURL(requestURL, upstream *url.URL) {
 	default:
 		requestURL.RawQuery = upstream.RawQuery + "&" + requestURL.RawQuery
 	}
+}
+
+// cleanUpstreamDotSegments resolves . and .. segments in an already-rooted
+// URL path, preserving a trailing slash. Requests without dot segments are
+// returned unchanged.
+func cleanUpstreamDotSegments(p string) string {
+	if p == "" || !strings.Contains(p, "/.") {
+		return p
+	}
+	cleaned := path.Clean(p)
+	if cleaned == "." {
+		cleaned = "/"
+	}
+	if strings.HasSuffix(p, "/") && !strings.HasSuffix(cleaned, "/") {
+		cleaned += "/"
+	}
+	return cleaned
 }
 
 func normalizePublicHost(value string) (string, error) {

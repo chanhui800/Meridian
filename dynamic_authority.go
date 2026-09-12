@@ -85,6 +85,48 @@ func (l *dynamicAuthorityLease) rollback() {
 	l.finish(false)
 }
 
+// dynamicAuthorityIdleTTL bounds how long a committed, fully idle authority
+// entry stays in the per-site and global tables. Without eviction the tables
+// only ever grow, and once they reach the configured capacity every NEW
+// authority is permanently denied with capacity_limit while previously seen
+// ones keep working.
+const dynamicAuthorityIdleTTL = 15 * time.Minute
+
+// evictIdleAuthoritiesLocked drops committed entries with no in-flight
+// requests that have not been used within dynamicAuthorityIdleTTL. The caller
+// must hold runtime.mu and s.mu.
+func (s *dynamicSiteState) evictIdleAuthoritiesLocked(runtime *dynamicRuntime, now time.Time) {
+	for authority, entry := range s.authorities {
+		if !entry.committed || entry.inFlight != 0 || entry.resolution != nil {
+			continue
+		}
+		if now.Sub(time.Unix(0, entry.lastUsed)) < dynamicAuthorityIdleTTL {
+			continue
+		}
+		delete(s.authorities, authority)
+		if runtime.authorities[authority] <= 1 {
+			delete(runtime.authorities, authority)
+		} else {
+			runtime.authorities[authority]--
+		}
+	}
+}
+
+// evictIdleAuthoritiesGloballyLocked sweeps every site state for stale
+// authority entries. The caller must hold runtime.mu and the calling state's
+// mu, which must be passed as skip: state mu is not re-entrant, so the sweep
+// must never try to lock the caller's own state again.
+func (runtime *dynamicRuntime) evictIdleAuthoritiesGloballyLocked(now time.Time, skip *dynamicSiteState) {
+	for state := range runtime.states {
+		if state == nil || state == skip {
+			continue
+		}
+		state.mu.Lock()
+		state.evictIdleAuthoritiesLocked(runtime, now)
+		state.mu.Unlock()
+	}
+}
+
 func (s *dynamicSiteState) reserveAuthority(authority string, now time.Time) (*dynamicAuthorityReservation, string) {
 	if s == nil || s.runtime == nil || authority == "" {
 		return nil, dynamicObservationReasonRuntimeUnavailable
@@ -96,6 +138,7 @@ func (s *dynamicSiteState) reserveAuthority(authority string, now time.Time) (*d
 	defer s.mu.Unlock()
 	if entry := s.authorities[authority]; entry != nil {
 		entry.inFlight++
+		entry.lastUsed = now.UnixNano()
 		if entry.resolution == nil {
 			entry.resolution = newDynamicAuthorityResolution()
 		}
@@ -107,16 +150,25 @@ func (s *dynamicSiteState) reserveAuthority(authority string, now time.Time) (*d
 		}, ""
 	}
 
+	// Bound the tables before admitting a new authority so stale entries
+	// cannot permanently exhaust the capacity for new ones.
+	s.evictIdleAuthoritiesLocked(runtime, now)
+	if len(s.authorities) >= s.limits.MaxAuthorities || runtime.authorities[authority] == 0 && len(runtime.authorities) >= globalDynamicMaxAuthorities {
+		// A full global table may be caused by stale entries on other sites;
+		// sweep them once before refusing. The calling state is skipped: its
+		// mu is already held here and is not re-entrant.
+		runtime.evictIdleAuthoritiesGloballyLocked(now, s)
+		if len(s.authorities) >= s.limits.MaxAuthorities || runtime.authorities[authority] == 0 && len(runtime.authorities) >= globalDynamicMaxAuthorities {
+			return nil, dynamicObservationReasonCapacityLimit
+		}
+	}
 	s.newAuthorities = pruneDynamicRateWindow(s.newAuthorities, now)
 	runtime.newAuthorities = pruneDynamicRateWindow(runtime.newAuthorities, now)
-	if len(s.authorities) >= s.limits.MaxAuthorities || runtime.authorities[authority] == 0 && len(runtime.authorities) >= globalDynamicMaxAuthorities {
-		return nil, dynamicObservationReasonCapacityLimit
-	}
 	if len(s.newAuthorities) >= s.limits.MaxNewAuthoritiesPerMinute || runtime.authorities[authority] == 0 && len(runtime.newAuthorities) >= globalDynamicMaxNewAuthoritiesMinute {
 		return nil, dynamicObservationReasonRateLimit
 	}
 	resolution := newDynamicAuthorityResolution()
-	entry := &dynamicAuthorityEntry{inFlight: 1, resolution: resolution}
+	entry := &dynamicAuthorityEntry{inFlight: 1, resolution: resolution, lastUsed: now.UnixNano()}
 	s.authorities[authority] = entry
 	s.newAuthorities = append(s.newAuthorities, now)
 	if runtime.authorities[authority] == 0 {

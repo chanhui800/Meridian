@@ -195,6 +195,9 @@ type dynamicAuthorityEntry struct {
 	inFlight   int
 	committed  bool
 	resolution *dynamicAuthorityResolution
+	// lastUsed is a unix-nano stamp refreshed on every reservation; guarded
+	// by the owning dynamicSiteState.mu.
+	lastUsed int64
 }
 
 type dynamicCapabilityEntry struct {
