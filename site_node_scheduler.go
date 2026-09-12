@@ -1892,13 +1892,66 @@ func verifyTrackedSiteDNSOwnership(ctx context.Context, cf *cloudflareClient, sc
 		}
 		return err
 	}
-	// Ownership is proven by the record ID plus the site's ownership-marker
-	// comment; the hostname is deliberately not compared because a site can be
-	// renamed after the record was created, and refusing the delete then would
-	// wedge cleanup and site deletion forever on a record Meridian still owns.
-	if (record.Type != "A" && record.Type != "AAAA") ||
-		!siteDNSMarkerOwned(record.Comment, schedule.SiteID, cf.installUUID) {
-		return errors.New("tracked DNS record no longer carries the Meridian ownership marker; refusing to delete")
+	return verifySiteDNSRecordOwnership(record, schedule.SiteID, cf.installUUID, "refusing to delete")
+}
+
+// readOwnedTrackedSiteDNSRecord re-reads a tracked record by ID and returns it
+// only when its current state still proves Meridian ownership.
+//
+// Every destructive or mutating operation on a tracked record must pass
+// through this guard, so an administrator who clears the marker comment,
+// replaces the record, or rewrites it with another tool immediately takes
+// ownership back. Without the guard a scheduled reconcile PUT would silently
+// reassert Meridian's address and marker over an operator-managed record —
+// DELETE already refused to do that, and UPDATE must not be the way around it.
+//
+// The hostname is deliberately not compared: renaming a site is a supported
+// operation, so ownership is proven by the record ID plus the marker comment
+// scoped to this installation and site. The returned record is also the exact
+// preimage a compensating PUT must restore, which a name-scoped listing cannot
+// provide once the operator has moved the record.
+//
+// A record that no longer exists returns (record{}, nil, false) so callers can
+// fall through to the existing missing-record recovery path.
+func readOwnedTrackedSiteDNSRecord(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule) (cloudflareAddressRecord, error, bool) {
+	if cf == nil {
+		return cloudflareAddressRecord{}, errors.New("Cloudflare DNS client is unavailable"), false
+	}
+	if strings.TrimSpace(schedule.cfZoneID) == "" {
+		return cloudflareAddressRecord{}, errors.New("tracked DNS zone is missing"), false
+	}
+	if strings.TrimSpace(schedule.cfRecordID) == "" {
+		return cloudflareAddressRecord{}, errors.New("tracked DNS record is missing"), false
+	}
+	record, err := cf.dnsRecordByID(ctx, schedule.cfZoneID, schedule.cfRecordID)
+	if err != nil {
+		if isCloudflareRecordNotFoundError(err) {
+			return cloudflareAddressRecord{}, nil, false
+		}
+		return cloudflareAddressRecord{}, err, false
+	}
+	if err := verifySiteDNSRecordOwnership(record, schedule.SiteID, cf.installUUID, "refusing to overwrite it"); err != nil {
+		return cloudflareAddressRecord{}, err, false
+	}
+	return record, nil, true
+}
+
+// verifySiteDNSRecordOwnership reports whether a Cloudflare record still
+// proves ownership by this installation for one site. Ownership requires both
+// an address record type and the site's ownership-marker comment: an operator
+// who clears the comment, points the record elsewhere, or replaces it with a
+// CNAME has taken it back, and Meridian must then refuse to touch it rather
+// than silently reasserting its own marker and address.
+//
+// The hostname is deliberately not part of the decision. Renaming a site is
+// supported, so requiring the stored hostname would wedge both the update and
+// the cleanup of a record Meridian still legitimately owns.
+func verifySiteDNSRecordOwnership(record cloudflareAddressRecord, siteID int64, installUUID, refusal string) error {
+	if record.Type != "A" && record.Type != "AAAA" {
+		return fmt.Errorf("tracked DNS record is no longer an A/AAAA record; %s", refusal)
+	}
+	if !siteDNSMarkerOwned(record.Comment, siteID, installUUID) {
+		return fmt.Errorf("tracked DNS record no longer carries the Meridian ownership marker; %s", refusal)
 	}
 	return nil
 }
@@ -2115,22 +2168,31 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	var previousRecord *cloudflareAddressRecord
 	var replacedRecord *cloudflareAddressRecord
 	if recordID != "" {
-		// Keep a preimage for a possible PUT compensation if the schedule
-		// generation changes before the local transaction commits.
-		records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
-		if getErr != nil {
-			// Without the preimage a compensating PUT could not restore the
-			// previous address if the schedule changes mid-update. Refuse the
-			// blind write; the next tick retries with a fresh snapshot.
-			return fmt.Errorf("read current DNS record before update: %w", getErr)
+		// Re-read the tracked record by ID and require that it still proves
+		// Meridian ownership before any PUT. A name-scoped listing is not
+		// enough: it cannot prove the record we are about to overwrite is
+		// still ours (an operator may have cleared the marker comment), and it
+		// cannot find the record at all once the operator renames it, which
+		// would leave us blind-writing a stale ID.
+		//
+		// The fetched record doubles as the compensation preimage: a PUT that
+		// succeeds remotely while the local schedule CAS fails must restore
+		// exactly this record, including its comment and hostname.
+		record, readErr, owned := readOwnedTrackedSiteDNSRecord(ctx, cf, schedule)
+		if readErr != nil {
+			// Ownership can no longer be proven (cleared marker, foreign
+			// controller, or a record type we must not overwrite). Refuse the
+			// write instead of silently reclaiming the record; the operator
+			// resolves the conflict by deleting the marker-free record or
+			// re-tracking the correct one.
+			return readErr
 		}
-		for i := range records {
-			if records[i].ID == recordID {
-				copy := records[i]
-				previousRecord = &copy
-				break
-			}
+		if owned {
+			previousRecord = &record
 		}
+		// A missing tracked record (owned == false, no error) falls through to
+		// the create path below; the PUT that follows returns a not-found
+		// error, which the existing missing-record recovery handles.
 	}
 	if recordID == "" {
 		records, err := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)

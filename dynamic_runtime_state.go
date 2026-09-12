@@ -429,7 +429,7 @@ type dynamicCapabilityClaims struct {
 	RequiredHeaders []dynamicCapabilityHeaderClaim `json:"h,omitempty"`
 }
 
-func normalizeExtremeRequiredHeaderName(value string) (string, error) {
+func normalizeRequiredHeaderName(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || len(value) > maxUpstreamHeaderName {
 		return "", fmt.Errorf("RequiredHttpHeaders contains an invalid name")
@@ -448,7 +448,7 @@ func normalizeExtremeRequiredHeaderName(value string) (string, error) {
 	}
 }
 
-func normalizeExtremeRequiredHeaderValue(value string) (string, error) {
+func normalizeRequiredHeaderValue(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", fmt.Errorf("RequiredHttpHeaders contains an empty value")
@@ -465,22 +465,22 @@ func validateDynamicCapabilityRequiredHeaderClaims(headers []dynamicCapabilityHe
 	if headers == nil {
 		return nil
 	}
-	if len(headers) == 0 || len(headers) > maxExtremeRequiredHeaderClaims {
+	if len(headers) == 0 || len(headers) > maxRequiredHeaderClaims {
 		return fmt.Errorf("invalid capability required header count")
 	}
 	totalBytes := 0
 	previousName := ""
 	for _, header := range headers {
-		name, err := normalizeExtremeRequiredHeaderName(header.Name)
+		name, err := normalizeRequiredHeaderName(header.Name)
 		if err != nil || name != header.Name || previousName != "" && header.Name <= previousName {
 			return fmt.Errorf("invalid capability required header name")
 		}
-		value, err := normalizeExtremeRequiredHeaderValue(header.Value)
+		value, err := normalizeRequiredHeaderValue(header.Value)
 		if err != nil || value != header.Value {
 			return fmt.Errorf("invalid capability required header value")
 		}
 		totalBytes += len(header.Name) + len(header.Value)
-		if totalBytes > maxExtremeRequiredHeaderClaimBytes {
+		if totalBytes > maxRequiredHeaderClaimBytes {
 			return fmt.Errorf("capability required headers exceed their size limit")
 		}
 		previousName = header.Name
@@ -499,18 +499,18 @@ func dynamicRequiredHeadersConflictWithFixedPolicy(headers []dynamicCapabilityHe
 	return false
 }
 
-func normalizeExtremeRequiredHeaderClaims(headers map[string]any, fixedPolicy upstreamHeaderPolicy) ([]dynamicCapabilityHeaderClaim, error) {
+func normalizeRequiredHeaderClaims(headers map[string]any, fixedPolicy upstreamHeaderPolicy) ([]dynamicCapabilityHeaderClaim, error) {
 	if len(headers) == 0 {
 		return nil, nil
 	}
-	if len(headers) > maxExtremeRequiredHeaderClaims {
+	if len(headers) > maxRequiredHeaderClaims {
 		return nil, fmt.Errorf("RequiredHttpHeaders exceeds its entry limit")
 	}
 	normalized := make([]dynamicCapabilityHeaderClaim, 0, len(headers))
 	seen := make(map[string]bool, len(headers))
 	totalBytes := 0
 	for rawName, rawValue := range headers {
-		name, err := normalizeExtremeRequiredHeaderName(rawName)
+		name, err := normalizeRequiredHeaderName(rawName)
 		if err != nil {
 			return nil, err
 		}
@@ -523,12 +523,12 @@ func normalizeExtremeRequiredHeaderClaims(headers map[string]any, fixedPolicy up
 		if !ok {
 			return nil, fmt.Errorf("RequiredHttpHeaders contains a non-string value")
 		}
-		value, err = normalizeExtremeRequiredHeaderValue(value)
+		value, err = normalizeRequiredHeaderValue(value)
 		if err != nil {
 			return nil, err
 		}
 		totalBytes += len(name) + len(value)
-		if totalBytes > maxExtremeRequiredHeaderClaimBytes {
+		if totalBytes > maxRequiredHeaderClaimBytes {
 			return nil, fmt.Errorf("RequiredHttpHeaders exceeds its size limit")
 		}
 		normalized = append(normalized, dynamicCapabilityHeaderClaim{Name: name, Value: value})

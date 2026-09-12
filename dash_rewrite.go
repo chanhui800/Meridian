@@ -273,11 +273,11 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	return route, nil
 }
 func rewriteDASHUTCTiming(node *dashXMLNode, base *url.URL, session *dynamicRewriteSession) error {
-	schemeIndex, err := dashAttributeIndex(node, "schemeIdUri", dashExtremeCompatibilityEnabled(session))
+	schemeIndex, err := dashAttributeIndex(node, "schemeIdUri")
 	if err != nil || schemeIndex < 0 {
 		return fmt.Errorf("DASH UTCTiming requires one supported scheme")
 	}
-	valueIndex, err := dashAttributeIndex(node, "value", dashExtremeCompatibilityEnabled(session))
+	valueIndex, err := dashAttributeIndex(node, "value")
 	if err != nil || valueIndex < 0 {
 		return fmt.Errorf("DASH UTCTiming requires a value")
 	}
@@ -299,13 +299,12 @@ func rewriteDASHUTCTiming(node *dashXMLNode, base *url.URL, session *dynamicRewr
 }
 
 func rewriteDASHEventDescriptor(node *dashXMLNode, base *url.URL, session *dynamicRewriteSession) error {
-	extremeCompatibility := dashExtremeCompatibilityEnabled(session)
-	schemeIndex, err := dashAttributeIndex(node, "schemeIdUri", extremeCompatibility)
+	schemeIndex, err := dashAttributeIndex(node, "schemeIdUri")
 	if err != nil || schemeIndex < 0 {
 		return err
 	}
 	scheme := node.start.Attr[schemeIndex].Value
-	valueIndex, err := dashAttributeIndex(node, "value", extremeCompatibility)
+	valueIndex, err := dashAttributeIndex(node, "value")
 	if err != nil {
 		return err
 	}
@@ -330,21 +329,15 @@ func rewriteDASHEventDescriptor(node *dashXMLNode, base *url.URL, session *dynam
 		}
 		event := content.node
 		if event.start.Name.Space != "urn:mpeg:dash:schema:mpd:2011" {
-			if !extremeCompatibility {
-				return fmt.Errorf("DASH callback EventStream has an unsupported child")
-			}
-			if err := validateDASHExtremeCompatibilityInertSubtree(session.ctx, event); err != nil {
-				return err
-			}
-			continue
+			return fmt.Errorf("DASH callback EventStream has an unsupported child")
 		}
 		if event.start.Name.Local != "Event" {
 			return fmt.Errorf("DASH callback EventStream has an unsupported child")
 		}
-		if err := validateDASHLeafElement(event, session.ctx, extremeCompatibility); err != nil {
+		if err := validateDASHLeafElement(event, session.ctx); err != nil {
 			return err
 		}
-		messageIndex, err := dashAttributeIndex(event, "messageData", extremeCompatibility)
+		messageIndex, err := dashAttributeIndex(event, "messageData")
 		if err != nil || messageIndex < 0 {
 			return fmt.Errorf("DASH callback Event requires messageData")
 		}
@@ -362,8 +355,7 @@ func rewriteDASHNode(node *dashXMLNode, inheritedBase *url.URL, inheritedAddress
 	if err := session.ctx.Err(); err != nil {
 		return 0, fmt.Errorf("DASH parsing deadline exceeded")
 	}
-	extremeCompatibility := dashExtremeCompatibilityEnabled(session)
-	if err := validateDASHNodeNamespace(node, extremeCompatibility); err != nil {
+	if err := validateDASHNodeNamespace(node); err != nil {
 		return 0, err
 	}
 	standardNode := node.start.Name.Space == "urn:mpeg:dash:schema:mpd:2011"
@@ -375,13 +367,10 @@ func rewriteDASHNode(node *dashXMLNode, inheritedBase *url.URL, inheritedAddress
 		case "PatchLocation", "ContentSteering", "ImportedMPD", "Metrics", "Reporting":
 			return 0, fmt.Errorf("unsupported DASH external document or reporting")
 		case "ContentProtection":
-			if !extremeCompatibility {
-				return 0, fmt.Errorf("DASH DRM is unsupported")
-			}
-			if err := validateDASHExtremeCompatibilityContentProtection(session.ctx, node); err != nil {
-				return 0, err
-			}
-			return 0, nil
+			// DRM was accepted only under the removed permissive profile; the
+			// single remaining policy cannot rewrite license or certificate
+			// references, so DRM stays unsupported.
+			return 0, fmt.Errorf("DASH DRM is unsupported")
 		}
 	}
 	currentBase := inheritedBase
@@ -394,12 +383,12 @@ func rewriteDASHNode(node *dashXMLNode, inheritedBase *url.URL, inheritedAddress
 		}
 		switch child.node.start.Name.Local {
 		case "BaseURL":
-			if err := validateDASHNodeNamespace(child.node, extremeCompatibility); err != nil {
+			if err := validateDASHNodeNamespace(child.node); err != nil {
 				return 0, err
 			}
 			baseIndexes = append(baseIndexes, index)
 		case "SegmentTemplate", "SegmentList", "SegmentBase":
-			if err := validateDASHNodeNamespace(child.node, extremeCompatibility); err != nil {
+			if err := validateDASHNodeNamespace(child.node); err != nil {
 				return 0, err
 			}
 			if localAddressing != nil {
@@ -427,7 +416,7 @@ func rewriteDASHNode(node *dashXMLNode, inheritedBase *url.URL, inheritedAddress
 	}
 	effectiveAddressing := mergeDASHSegmentAddressing(inheritedAddressing, localAddressing)
 	if standardNode && node.start.Name.Local == "Representation" && effectiveAddressing != nil {
-		bindings, err := dashRepresentationBindings(node, extremeCompatibility)
+		bindings, err := dashRepresentationBindings(node)
 		if err != nil {
 			return 0, err
 		}
@@ -563,7 +552,7 @@ func rewriteDASHResponse(payload []byte, session *dynamicRewriteSession) ([]byte
 		return nil, err
 	}
 	encoder := xml.NewEncoder(&output)
-	if err := encodeDASHXMLNode(session.ctx, encoder, root, dashExtremeCompatibilityEnabled(session)); err != nil {
+	if err := encodeDASHXMLNode(session.ctx, encoder, root); err != nil {
 		return nil, err
 	}
 	if err := encoder.Flush(); err != nil {

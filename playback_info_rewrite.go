@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -15,82 +14,8 @@ import (
 	"strings"
 )
 
-type extremePlaybackInfoJSONBudget struct {
-	remainingTokens int
-}
-
-func playbackInfoIsExtreme(session *dynamicRewriteSession) bool {
-	return session != nil && session.issuer != nil && session.issuer.policy.profile == dynamicProfileExtreme
-}
-
-func decodeExtremePlaybackInfoCollection(ctx context.Context, value, field string, containerDepth int, budget *extremePlaybackInfoJSONBudget) ([]any, error) {
-	if budget == nil || containerDepth < 0 || containerDepth >= globalDynamicMaxParseDepth {
-		return nil, fmt.Errorf("PlaybackInfo field %s exceeds its structural limits", field)
-	}
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, fmt.Errorf("PlaybackInfo field %s contains invalid stringified JSON", field)
-	}
-	isObject := value[0] == '{'
-	isArray := value[0] == '['
-	if !isObject && !isArray {
-		return nil, fmt.Errorf("PlaybackInfo field %s must stringify an array or object", field)
-	}
-	wrapperTokens := 0
-	maxDepth := globalDynamicMaxParseDepth - containerDepth
-	if isObject {
-		wrapperTokens = 2
-		maxDepth--
-	}
-	tokenLimit := budget.remainingTokens + 1 - wrapperTokens
-	if tokenLimit <= 0 || maxDepth <= 0 {
-		return nil, fmt.Errorf("PlaybackInfo field %s exceeds its structural limits", field)
-	}
-	nestedTokens, err := validateDynamicJSONStructureWithin(ctx, []byte(value), tokenLimit, maxDepth)
-	if err != nil {
-		return nil, fmt.Errorf("PlaybackInfo field %s contains invalid stringified JSON", field)
-	}
-	additionalTokens := nestedTokens + wrapperTokens - 1
-	if additionalTokens > budget.remainingTokens {
-		return nil, fmt.Errorf("PlaybackInfo field %s exceeds its token limit", field)
-	}
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.UseNumber()
-	var decoded any
-	if err := decoder.Decode(&decoded); err != nil {
-		return nil, fmt.Errorf("PlaybackInfo field %s contains invalid stringified JSON", field)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("PlaybackInfo field %s contains invalid stringified JSON", field)
-	}
-	budget.remainingTokens -= additionalTokens
-	switch collection := decoded.(type) {
-	case []any:
-		return collection, nil
-	case map[string]any:
-		return []any{collection}, nil
-	default:
-		return nil, fmt.Errorf("PlaybackInfo field %s must stringify an array or object", field)
-	}
-}
-
-func normalizeExtremePlaybackInfoCollectionField(object map[string]any, field string, containerDepth int, budget *extremePlaybackInfoJSONBudget, session *dynamicRewriteSession) error {
-	key, value, exists, err := playbackInfoField(object, field)
-	if err != nil || !exists || value == nil {
-		return err
-	}
-	text, stringified := value.(string)
-	if !stringified {
-		return nil
-	}
-	collection, err := decodeExtremePlaybackInfoCollection(session.ctx, text, field, containerDepth, budget)
-	if err != nil {
-		return err
-	}
-	object[key] = collection
-	return nil
-}
-
+// dynamicURLNormalizationDiagnosticCode classifies a URL-normalization failure
+// into a stable, secret-free code.
 func dynamicURLNormalizationDiagnosticCode(err error) string {
 	if err == nil {
 		return "none"
@@ -178,7 +103,7 @@ func normalizePlaybackInfoSchemelessURL(value string, base *url.URL) (string, bo
 	return candidate, true
 }
 
-func playbackInfoExtremeNetworkURL(value string, session *dynamicRewriteSession) (string, bool) {
+func playbackInfoAbsoluteNetworkURL(value string, session *dynamicRewriteSession) (string, bool) {
 	if session != nil {
 		if normalized, ok := normalizePlaybackInfoSchemelessURL(value, session.base); ok {
 			value = normalized
@@ -194,8 +119,8 @@ func playbackInfoExtremeNetworkURL(value string, session *dynamicRewriteSession)
 	return value, true
 }
 
-func playbackInfoExtremeCapabilityType(value string, session *dynamicRewriteSession) (string, string, error) {
-	if normalized, ok := playbackInfoExtremeNetworkURL(value, session); ok {
+func playbackInfoCapabilityTypeForURL(value string, session *dynamicRewriteSession) (string, string, error) {
+	if normalized, ok := playbackInfoAbsoluteNetworkURL(value, session); ok {
 		value = normalized
 	}
 	parsed, err := url.Parse(value)
@@ -217,79 +142,6 @@ func playbackInfoExtremeCapabilityType(value string, session *dynamicRewriteSess
 		return "", "", fmt.Errorf("external PlaybackInfo manifest source is unavailable")
 	}
 	return manifestSource, dynamicCapabilityKindManifest, nil
-}
-
-func rewriteExtremePlaybackInfoValue(value any, session *dynamicRewriteSession, requiredHeaders []dynamicCapabilityHeaderClaim, ancestorDepth int) (any, error) {
-	if err := session.ctx.Err(); err != nil {
-		return nil, fmt.Errorf("PlaybackInfo parsing deadline exceeded")
-	}
-	switch typed := value.(type) {
-	case string:
-		normalized, ok := playbackInfoExtremeNetworkURL(typed, session)
-		if !ok {
-			return typed, nil
-		}
-		source, kind, err := playbackInfoExtremeCapabilityType(normalized, session)
-		if err != nil {
-			return nil, err
-		}
-		return session.rewriteAgainstSourceKindWithRequiredHeaders(normalized, session.base, source, kind, requiredHeaders)
-	case map[string]any:
-		depth := ancestorDepth + 1
-		if depth > globalDynamicMaxParseDepth {
-			return nil, fmt.Errorf("PlaybackInfo nesting exceeds its limit")
-		}
-		keys := make([]string, 0, len(typed))
-		for key := range typed {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			if strings.EqualFold(key, "RequiredHttpHeaders") {
-				continue
-			}
-			rewritten, err := rewriteExtremePlaybackInfoValue(typed[key], session, requiredHeaders, depth)
-			if err != nil {
-				return nil, err
-			}
-			typed[key] = rewritten
-		}
-		return typed, nil
-	case []any:
-		depth := ancestorDepth + 1
-		if depth > globalDynamicMaxParseDepth {
-			return nil, fmt.Errorf("PlaybackInfo nesting exceeds its limit")
-		}
-		for index := range typed {
-			rewritten, err := rewriteExtremePlaybackInfoValue(typed[index], session, requiredHeaders, depth)
-			if err != nil {
-				return nil, err
-			}
-			typed[index] = rewritten
-		}
-		return typed, nil
-	default:
-		return value, nil
-	}
-}
-
-func rewriteExtremePlaybackInfoRootValues(root map[string]any, mediaSourcesKey string, session *dynamicRewriteSession) error {
-	keys := make([]string, 0, len(root))
-	for key := range root {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		if key == mediaSourcesKey || strings.EqualFold(key, "RequiredHttpHeaders") {
-			continue
-		}
-		rewritten, err := rewriteExtremePlaybackInfoValue(root[key], session, nil, 1)
-		if err != nil {
-			return err
-		}
-		root[key] = rewritten
-	}
-	return nil
 }
 
 func playbackInfoURLCandidate(value string) bool {
@@ -325,9 +177,6 @@ func playbackInfoShouldRewriteURL(value string, session *dynamicRewriteSession) 
 
 func playbackInfoRequiredHeadersUnsupported(value string, hasRequiredHeaders bool, session *dynamicRewriteSession) bool {
 	if !hasRequiredHeaders || !playbackInfoShouldRewriteURL(value, session) {
-		return false
-	}
-	if playbackInfoIsExtreme(session) {
 		return false
 	}
 	if session == nil || session.rewriteRelative {
@@ -478,8 +327,15 @@ func playbackInfoHasRequiredHeaders(object map[string]any) (bool, error) {
 	return len(headers) > 0, nil
 }
 
-func playbackInfoExtremeRequiredHeaders(object map[string]any, hasRequiredHeaders bool, session *dynamicRewriteSession) ([]dynamicCapabilityHeaderClaim, error) {
-	if !hasRequiredHeaders || !playbackInfoIsExtreme(session) {
+// playbackInfoRequiredHeaders returns the capability header claims one media
+// source requires. Heads up: honoring these claims unconditionally is a real
+// behavior change from the profile-gated code it replaced — v1.9.88 returned
+// nil whenever the profile was not "extreme", which was every runtime request.
+// Under the single remaining profile an upstream-required header is now carried
+// on the capability when the URL and header policy allow it, and a URL that
+// cannot carry them is refused by playbackInfoRequiredHeadersUnsupported.
+func playbackInfoRequiredHeaders(object map[string]any, hasRequiredHeaders bool, session *dynamicRewriteSession) ([]dynamicCapabilityHeaderClaim, error) {
+	if !hasRequiredHeaders || session == nil || session.issuer == nil {
 		return nil, nil
 	}
 	_, value, exists, err := playbackInfoField(object, "RequiredHttpHeaders")
@@ -490,7 +346,7 @@ func playbackInfoExtremeRequiredHeaders(object map[string]any, hasRequiredHeader
 	if !ok {
 		return nil, fmt.Errorf("PlaybackInfo RequiredHttpHeaders has an invalid type")
 	}
-	return normalizeExtremeRequiredHeaderClaims(headers, session.issuer.upstreamHeaderPolicy)
+	return normalizeRequiredHeaderClaims(headers, session.issuer.upstreamHeaderPolicy)
 }
 
 func playbackInfoRewriteDiagnosticCode(err error) string {
@@ -615,8 +471,29 @@ func playbackInfoRewriteDiagnosticFingerprint(err error) string {
 	return fmt.Sprintf("%x", sum[:4])
 }
 
+// playbackInfoAutomaticFallbackAllowed reports whether a strict-rewrite
+// failure is only a compatibility problem. The automatic fallback walks the
+// JSON tree instead of applying the schema, so it can still serve a response
+// the schema walker refused; it must not be entered for a security decision,
+// because the fallback is the path that keeps individual URLs on the proxy.
+//
+// Only syntax-level failures qualify. Anything about a URL's destination or
+// normalization (userinfo, fragment, host syntax, dot segments, scheme,
+// security-normalization, or a capability denial) is a security decision and
+// must stay a hard failure: falling back would let the walker decide on its
+// own whether to proxy that URL, and every URL it cannot proxy is one the
+// client would then follow directly.
 func playbackInfoAutomaticFallbackAllowed(err error) bool {
-	return strings.HasPrefix(playbackInfoRewriteDiagnosticCode(err), "url_")
+	var denial *dynamicPolicyDenialError
+	if err != nil && errors.As(err, &denial) {
+		return false
+	}
+	switch playbackInfoRewriteDiagnosticCode(err) {
+	case "url_surrounding_whitespace", "url_parse_invalid", "url_backslash", "url_unsafe_character":
+		return true
+	default:
+		return false
+	}
 }
 
 func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
@@ -624,12 +501,9 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		return nil, fmt.Errorf("PlaybackInfo rewrite session is unavailable")
 	}
 	maxTokens := min(session.issuer.policy.limits.MaxURLsPerResponse*64+8192, globalDynamicMaxJSONTokens)
-	tokenCount, err := validateDynamicJSONStructureWithin(session.ctx, payload, maxTokens, globalDynamicMaxParseDepth)
-	if err != nil {
+	if _, err := validateDynamicJSONStructureWithin(session.ctx, payload, maxTokens, globalDynamicMaxParseDepth); err != nil {
 		return nil, fmt.Errorf("invalid PlaybackInfo JSON")
 	}
-	extreme := playbackInfoIsExtreme(session)
-	budget := &extremePlaybackInfoJSONBudget{remainingTokens: maxTokens - tokenCount}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	var root map[string]any
@@ -639,18 +513,11 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("invalid PlaybackInfo JSON")
 	}
-	mediaSourcesKey, mediaSourcesValue, exists, err := playbackInfoField(root, "MediaSources")
+	_, mediaSourcesValue, exists, err := playbackInfoField(root, "MediaSources")
 	if err != nil || !exists {
 		return nil, fmt.Errorf("PlaybackInfo is missing or duplicates MediaSources")
 	}
 	mediaSources, ok := mediaSourcesValue.([]any)
-	if !ok && extreme {
-		if err := normalizeExtremePlaybackInfoCollectionField(root, "MediaSources", 1, budget, session); err != nil {
-			return nil, err
-		}
-		mediaSourcesValue = root[mediaSourcesKey]
-		mediaSources, ok = mediaSourcesValue.([]any)
-	}
 	if !ok {
 		return nil, fmt.Errorf("PlaybackInfo MediaSources has an invalid type")
 	}
@@ -662,19 +529,11 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		if !ok {
 			return nil, fmt.Errorf("PlaybackInfo MediaSources contains an invalid entry")
 		}
-		if extreme {
-			if err := normalizeExtremePlaybackInfoCollectionField(source, "MediaStreams", 3, budget, session); err != nil {
-				return nil, err
-			}
-			if err := normalizeExtremePlaybackInfoCollectionField(source, "MediaAttachments", 3, budget, session); err != nil {
-				return nil, err
-			}
-		}
 		hasRequiredHeaders, err := playbackInfoHasRequiredHeaders(source)
 		if err != nil {
 			return nil, err
 		}
-		requiredHeaders, err := playbackInfoExtremeRequiredHeaders(source, hasRequiredHeaders, session)
+		requiredHeaders, err := playbackInfoRequiredHeaders(source, hasRequiredHeaders, session)
 		if err != nil {
 			return nil, err
 		}
@@ -693,7 +552,7 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 				if !playbackInfoSafeRelativeURL(text) || parseErr != nil || reference.Path == "" {
 					return nil, fmt.Errorf("PlaybackInfo field %s is not a safe relative URL", field)
 				}
-				if hasRequiredHeaders && session.rewriteRelative && !playbackInfoIsExtreme(session) {
+				if hasRequiredHeaders && session.rewriteRelative {
 					return nil, fmt.Errorf("external PlaybackInfo URL requires unsupported origin headers")
 				}
 				// Preserve the same-origin URL exactly as the server returned it. The
@@ -722,7 +581,7 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 			}
 		}
 		protocol, protocolExists, protocolErr := playbackInfoString(source, "Protocol")
-		if protocolErr != nil && !extreme {
+		if protocolErr != nil {
 			return nil, protocolErr
 		}
 		_, pathValue, pathExists, pathErr := playbackInfoField(source, "Path")
@@ -733,14 +592,20 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		if pathExists && !pathIsString && pathValue != nil {
 			return nil, fmt.Errorf("PlaybackInfo Path has an invalid type")
 		}
-		_, absoluteHTTPPath := playbackInfoExtremeNetworkURL(pathText, session)
-		absoluteHTTPPath = extreme && pathIsString && absoluteHTTPPath
+		// An absolute http(s) Path is a remote location the client would be sent
+		// to, exactly like the Http-protocol case below, so it must pass the
+		// same header check. A non-string Protocol is tolerated for this shape
+		// because the URL itself already identifies the transport.
+		_, absoluteHTTPPath := playbackInfoAbsoluteNetworkURL(pathText, session)
 		if protocolErr != nil && !absoluteHTTPPath {
 			return nil, protocolErr
 		}
 		if pathIsString && playbackInfoShouldRewriteURL(pathText, session) {
 			switch {
 			case absoluteHTTPPath:
+				if playbackInfoRequiredHeadersUnsupported(pathText, hasRequiredHeaders, session) {
+					return nil, fmt.Errorf("remote PlaybackInfo Path requires unsupported origin headers")
+				}
 				capabilitySource, kind, err := playbackInfoCapabilityType(source, "Path", pathText, session)
 				if err != nil {
 					return nil, err
@@ -797,7 +662,7 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 					return nil, fmt.Errorf("external PlaybackInfo DeliveryUrl is not a safe relative URL")
 				}
 				if deliveryIsString && (isExternalURL || shouldRewriteDelivery) {
-					if (relativeExternalDelivery && hasRequiredHeaders && !extreme) || playbackInfoRequiredHeadersUnsupported(deliveryText, hasRequiredHeaders, session) {
+					if relativeExternalDelivery && hasRequiredHeaders || playbackInfoRequiredHeadersUnsupported(deliveryText, hasRequiredHeaders, session) {
 						return nil, fmt.Errorf("external subtitle URL requires unsupported origin headers")
 					}
 					capabilitySource, kind, err := playbackInfoCapabilityType(stream, "DeliveryUrl", deliveryText, session)
@@ -819,16 +684,6 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 					}
 				}
 			}
-		}
-		if extreme {
-			if _, err := rewriteExtremePlaybackInfoValue(source, session, requiredHeaders, 2); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if extreme {
-		if err := rewriteExtremePlaybackInfoRootValues(root, mediaSourcesKey, session); err != nil {
-			return nil, err
 		}
 	}
 	output := dynamicBoundedBuffer{limit: session.structuredOutputLimit()}
@@ -861,7 +716,10 @@ func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewrit
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("invalid automatic PlaybackInfo JSON")
 	}
-	rewritten := rewriteAutomaticPlaybackInfoValue(root, session, 0, "")
+	rewritten, err := rewriteAutomaticPlaybackInfoValue(root, session, 0, "")
+	if err != nil {
+		return nil, err
+	}
 	output := dynamicBoundedBuffer{limit: session.structuredOutputLimit()}
 	encoder := json.NewEncoder(&output)
 	encoder.SetEscapeHTML(false)
@@ -871,9 +729,24 @@ func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewrit
 	return bytes.TrimSuffix(output.Bytes(), []byte("\n")), nil
 }
 
-func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession, depth int, field string) any {
+// automaticPlaybackInfoURLError marks a URL the automatic fallback recognized
+// as a network destination but could not route through Meridian.
+func automaticPlaybackInfoURLError(field string) error {
+	name := strings.TrimSpace(field)
+	if name == "" {
+		name = "value"
+	}
+	return fmt.Errorf("PlaybackInfo field %s carries a URL that cannot be proxied", name)
+}
+
+// rewriteAutomaticPlaybackInfoValue rewrites every complete HTTP(S) URL in the
+// value tree so the client fetches it through Meridian. A recognized URL that
+// cannot be proxied is an error rather than a preserved value: keeping it would
+// send the client straight to the upstream destination, bypassing the
+// capability, its traffic accounting, and its quota.
+func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession, depth int, field string) (any, error) {
 	if session == nil || depth > globalDynamicMaxParseDepth || session.ctx.Err() != nil {
-		return value
+		return value, nil
 	}
 	switch typed := value.(type) {
 	case string:
@@ -882,17 +755,22 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 			session.rememberRelativePlaybackPath(typed)
 		}
 		if !ok {
-			return typed
+			return typed, nil
 		}
-		source, kind, err := playbackInfoExtremeCapabilityType(candidate, session)
+		// The value is a URL the player would fetch. Every failure below means
+		// Meridian cannot safely proxy it, and returning it unchanged would
+		// hand the player a destination outside the proxy: no capability, no
+		// traffic accounting, no quota, and the origin address revealed. Fail
+		// the response instead of leaking the URL.
+		source, kind, err := playbackInfoCapabilityTypeForURL(candidate, session)
 		if err != nil {
-			return typed
+			return nil, automaticPlaybackInfoURLError(field)
 		}
 		route, err := session.rewriteAgainstSourceKindWithRequiredHeaders(candidate, session.base, source, kind, nil)
 		if err != nil {
-			return typed
+			return nil, automaticPlaybackInfoURLError(field)
 		}
-		return route
+		return route, nil
 	case map[string]any:
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
@@ -903,16 +781,24 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 			if strings.EqualFold(key, "RequiredHttpHeaders") {
 				continue
 			}
-			typed[key] = rewriteAutomaticPlaybackInfoValue(typed[key], session, depth+1, key)
+			rewritten, err := rewriteAutomaticPlaybackInfoValue(typed[key], session, depth+1, key)
+			if err != nil {
+				return nil, err
+			}
+			typed[key] = rewritten
 		}
-		return typed
+		return typed, nil
 	case []any:
 		for index := range typed {
-			typed[index] = rewriteAutomaticPlaybackInfoValue(typed[index], session, depth+1, field)
+			rewritten, err := rewriteAutomaticPlaybackInfoValue(typed[index], session, depth+1, field)
+			if err != nil {
+				return nil, err
+			}
+			typed[index] = rewritten
 		}
-		return typed
+		return typed, nil
 	default:
-		return value
+		return value, nil
 	}
 }
 

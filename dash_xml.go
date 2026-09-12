@@ -113,28 +113,19 @@ func parseDASHXML(ctx context.Context, payload []byte) (*dashXMLNode, error) {
 	return root, nil
 }
 
-func encodeDASHXMLNode(ctx context.Context, encoder *xml.Encoder, node *dashXMLNode, extremeCompatibility bool) error {
+func encodeDASHXMLNode(ctx context.Context, encoder *xml.Encoder, node *dashXMLNode) error {
 	if node == nil {
 		return fmt.Errorf("DASH XML node is unavailable")
 	}
 	if ctx == nil || ctx.Err() != nil {
 		return fmt.Errorf("DASH encoding deadline exceeded")
 	}
-	if extremeCompatibility {
-		attributes := node.start.Attr[:0]
-		for _, attribute := range node.start.Attr {
-			if !dashExtremeCompatibilityNamespaceDeclaration(attribute) || attribute.Name.Space == "" && attribute.Name.Local == "xmlns" && attribute.Value == "" {
-				attributes = append(attributes, attribute)
-			}
-		}
-		node.start.Attr = attributes
-	}
 	if err := encoder.EncodeToken(node.start); err != nil {
 		return err
 	}
 	for _, child := range node.content {
 		if child.node != nil {
-			if err := encodeDASHXMLNode(ctx, encoder, child.node, extremeCompatibility); err != nil {
+			if err := encodeDASHXMLNode(ctx, encoder, child.node); err != nil {
 				return err
 			}
 		} else if len(child.text) > 0 {
@@ -183,20 +174,18 @@ func setDASHNodeText(node *dashXMLNode, value string) {
 	node.content = []dashXMLContent{{text: []byte(value)}}
 }
 
-func dashExtremeCompatibilityEnabled(session *dynamicRewriteSession) bool {
-	return session != nil && session.issuer != nil && session.issuer.policy.profile == dynamicProfileExtreme
-}
-
-func dashAttributeIndex(node *dashXMLNode, local string, extremeCompatibility bool) (int, error) {
+// dashAttributeIndex resolves a DASH attribute by its local name. An attribute
+// that carries the expected local name inside a foreign namespace is rejected
+// rather than skipped: the permissive "extreme" profile that accepted those
+// wrappers was removed, so a foreign-namespace attribute is always an
+// unsupported manifest feature.
+func dashAttributeIndex(node *dashXMLNode, local string) (int, error) {
 	index := -1
 	for candidate := range node.start.Attr {
 		if node.start.Attr[candidate].Name.Local != local {
 			continue
 		}
 		if node.start.Attr[candidate].Name.Space != "" {
-			if extremeCompatibility {
-				continue
-			}
 			return -1, fmt.Errorf("DASH standard attribute uses a foreign namespace")
 		}
 		if index >= 0 {

@@ -97,7 +97,7 @@ func runHealthcheckCommand() error {
 
 func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-panel-certificate | issue-edge-certificate")
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-panel-certificate | issue-edge-certificate | rotate-installation-identity")
 	}
 	if args[0] == "issue-edge-certificate" {
 		if len(args) != 1 {
@@ -111,8 +111,14 @@ func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 		}
 		return runIssuePanelCertificateCommand(output)
 	}
+	if args[0] == "rotate-installation-identity" {
+		if len(args) != 1 {
+			return errors.New("rotate-installation-identity does not accept arguments")
+		}
+		return runRotateInstallationIdentityCommand(output)
+	}
 	if args[0] != "reset-password" {
-		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-panel-certificate | issue-edge-certificate")
+		return errors.New("usage: meridian admin reset-password --db <path> --password-stdin | issue-panel-certificate | issue-edge-certificate | rotate-installation-identity")
 	}
 	var dbPath string
 	passwordStdin := false
@@ -150,6 +156,57 @@ func runAdminCommand(args []string, input io.Reader, output io.Writer) error {
 		return fmt.Errorf("reset administrator password: %w", err)
 	}
 	_, err = fmt.Fprintln(output, "administrator password updated")
+	return err
+}
+
+// runRotateInstallationIdentityCommand gives this installation a new identity.
+// A controller cloned from another controller's backup shares its predecessor's
+// identity, which would let both installations claim the same Cloudflare DNS
+// records. Disaster-recovery takeover keeps the restored identity; a clone runs
+// this command instead. No secret material is printed.
+//
+// The target database must already exist. openDB migrates a missing file into a
+// fresh schema, so without this check a forgotten DB_PATH would rotate the
+// identity of a brand-new empty database and report success while the running
+// installation kept its old one.
+func runRotateInstallationIdentityCommand(output io.Writer) error {
+	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
+	if dbPath == "" {
+		dbPath = "/app/data/meridian.db"
+	}
+	// #nosec G703 G304 -- dbPath is the administrator-controlled local database location from the DB_PATH environment variable; this only checks that the file the command is about to open already exists.
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("database %s does not exist; set DB_PATH to the installation's database", dbPath)
+		}
+		return err
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	value, err := db.rotateInstallationUUID()
+	if err != nil {
+		return fmt.Errorf("rotate installation identity: %w", err)
+	}
+	if _, err := fmt.Fprintln(output, "installation identity rotated"); err != nil {
+		return err
+	}
+	// The running process caches the identity, so it must be restarted; the
+	// warning about existing DNS records matters because rotating the identity
+	// makes every record stamped with the previous one look foreign, and the
+	// scheduler will then refuse to touch it.
+	if _, err := fmt.Fprintln(output, "restart the panel to apply the new identity"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(output, "DNS records created under the previous identity keep their old marker and will be treated as foreign; delete them and let the scheduler re-create them"); err != nil {
+		return err
+	}
+	// Only the length is reported: the identity scopes DNS ownership and is
+	// not otherwise secret, but printing it would put an installation
+	// fingerprint into logs and screen captures.
+	_, err = fmt.Fprintf(output, "new identity length: %d\n", len(value))
 	return err
 }
 

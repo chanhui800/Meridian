@@ -65,6 +65,31 @@ const quotaCheckBytes = 16 << 20
 // site has crossed its billing quota; it is not exposed to clients.
 var errTrafficQuotaExceeded = errors.New("traffic quota exceeded")
 
+// errTrafficQuotaUnavailable aborts a transfer whose billing-cycle usage could
+// not be read. A configured quota is a hard limit, so "usage unknown" must not
+// degrade into "usage is fine": an unreadable usage baseline would otherwise
+// disable enforcement for every stream on the site while the database is
+// failing.
+var errTrafficQuotaUnavailable = errors.New("traffic quota enforcement is unavailable")
+
+// quotaUsageDecision evaluates one quota probe at a checkpoint. It returns
+// errTrafficQuotaExceeded when the site is over its limit and
+// errTrafficQuotaUnavailable when the usage baseline cannot be read; both are
+// fail-closed conditions for the caller.
+func quotaUsageDecision(pm *ProxyManager, inst *ProxyInstance, limit int64, now time.Time) error {
+	if pm == nil || inst == nil || limit <= 0 {
+		return nil
+	}
+	usage, err := pm.currentTrafficCycleUsage(inst, now)
+	if err != nil {
+		return errTrafficQuotaUnavailable
+	}
+	if usage >= limit {
+		return errTrafficQuotaExceeded
+	}
+	return nil
+}
+
 // quotaProbeShared records bytes against the instance-wide probe accumulator
 // and reports whether the caller must run the quota check now. The first
 // stream to cross the threshold claims the check.
@@ -93,7 +118,7 @@ func (q *quotaLimitedWriter) Write(b []byte) (int, error) {
 		return n, err
 	}
 	if quotaProbeShared(q.inst, int64(n)) {
-		if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
+		if decision := quotaUsageDecision(q.pm, q.inst, q.quota, time.Now()); decision != nil {
 			return n, http.ErrAbortHandler
 		}
 	}
@@ -115,8 +140,8 @@ func (q *quotaLimitedReader) Read(p []byte) (int, error) {
 	// that final chunk before propagating the underlying error so a checkpoint
 	// cannot be skipped at end of stream.
 	if n > 0 && quotaProbeShared(q.inst, int64(n)) {
-		if usage, usageErr := q.pm.currentTrafficCycleUsage(q.inst, time.Now()); usageErr == nil && usage >= q.quota {
-			return n, errTrafficQuotaExceeded
+		if decision := quotaUsageDecision(q.pm, q.inst, q.quota, time.Now()); decision != nil {
+			return n, decision
 		}
 	}
 	return n, err
@@ -245,8 +270,8 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 		n, err := t.dst.Write(b)
 		addMeteredBytes(t.counter, t.cumulative, n)
 		if err == nil && n > 0 && t.quota != nil && quotaProbeShared(t.quota.inst, int64(n)) {
-			if usage, usageErr := t.quota.pm.currentTrafficCycleUsage(t.quota.inst, time.Now()); usageErr == nil && usage >= t.quota.limit {
-				return n, errTrafficQuotaExceeded
+			if decision := quotaUsageDecision(t.quota.pm, t.quota.inst, t.quota.limit, time.Now()); decision != nil {
+				return n, decision
 			}
 		}
 		return n, err
@@ -278,8 +303,8 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 			return total, io.ErrNoProgress
 		}
 		if t.quota != nil && quotaProbeShared(t.quota.inst, int64(n)) {
-			if usage, usageErr := t.quota.pm.currentTrafficCycleUsage(t.quota.inst, time.Now()); usageErr == nil && usage >= t.quota.limit {
-				return total, errTrafficQuotaExceeded
+			if decision := quotaUsageDecision(t.quota.pm, t.quota.inst, t.quota.limit, time.Now()); decision != nil {
+				return total, decision
 			}
 		}
 	}

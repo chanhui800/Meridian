@@ -5,6 +5,22 @@ set -euo pipefail
 # Public operations are intentionally limited to install, update, password,
 # and uninstall. Backups and rollback remain internal safety mechanisms.
 
+# Output helpers are defined before every top-level validation below: the
+# INSTALL_DIR guard calls fail() during environment parsing, so defining the
+# helpers later would make an unsafe MERIDIAN_INSTALL_DIR die with
+# "fail: command not found" instead of the intended refusal message.
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info() { printf "${CYAN}[INFO]${NC} %s\n" "$*"; }
+ok() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
+fail() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; exit 1; }
+
 REPO="${MERIDIAN_REPO:-chanhui800/Meridian}"
 INSTALL_DIR="${MERIDIAN_INSTALL_DIR:-/usr/local/bin}"
 DATA_DIR="${MERIDIAN_DATA_DIR:-/opt/meridian}"
@@ -77,18 +93,6 @@ PANEL_TRANSACTION=0
 DOWNLOADED_AGENT_BINARY_AMD64=""
 DOWNLOADED_AGENT_BINARY_ARM64=""
 DOWNLOADED_CONTROLLER_SUFFIX=""
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-info() { printf "${CYAN}[INFO]${NC} %s\n" "$*"; }
-ok() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
-warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
-fail() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; exit 1; }
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "缺少必要命令: $1"

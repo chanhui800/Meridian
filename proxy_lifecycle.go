@@ -177,18 +177,21 @@ func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 		inst.trafficPendingRequests().Add(requests)
 		return err
 	}
-	delta := in + out
-	inst.persistedTraffic.Add(delta)
-	inst.persistedBytesIn.Add(in)
-	inst.persistedBytesOut.Add(out)
-	inst.Site.TrafficUsed += delta
-	inst.Site.TrafficUsedIn += in
-	inst.Site.TrafficUsedOut += out
+	// Saturating arithmetic throughout: these counters are quota inputs, and a
+	// wrapped value would read as a small positive number (or a negative one)
+	// and silently stop enforcing the limit instead of reporting overflow.
+	delta := saturatingAddInt64(in, out)
+	inst.persistedTraffic.Store(saturatingAddInt64(inst.persistedTraffic.Load(), delta))
+	inst.persistedBytesIn.Store(saturatingAddInt64(inst.persistedBytesIn.Load(), in))
+	inst.persistedBytesOut.Store(saturatingAddInt64(inst.persistedBytesOut.Load(), out))
+	inst.Site.TrafficUsed = saturatingAddInt64(inst.Site.TrafficUsed, delta)
+	inst.Site.TrafficUsedIn = saturatingAddInt64(inst.Site.TrafficUsedIn, in)
+	inst.Site.TrafficUsedOut = saturatingAddInt64(inst.Site.TrafficUsedOut, out)
 	settings := pm.database.currentSystemSettings()
 	cycleStart := trafficCycleStart(time.Now(), settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
 	cycleMode := trafficBillingModeLabel(settings.TrafficBillingMode)
 	if !inst.trafficCycleAuthoritative && inst.trafficCycleMode == cycleMode && inst.trafficCycleStart.Equal(cycleStart) {
-		inst.trafficCycleUsage += trafficBillableBytes(cycleMode, in, out)
+		inst.trafficCycleUsage = saturatingAddInt64(inst.trafficCycleUsage, trafficBillableBytes(cycleMode, in, out))
 	}
 	if generation := inst.trafficFlushGeneration(); generation != nil {
 		generation.Add(1)
@@ -215,7 +218,7 @@ func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.T
 		if localOut < 0 {
 			localOut = inst.trafficCumulativeOut().Load()
 		}
-		return inst.trafficCycleUsage + trafficBillableBytes(inst.trafficCycleMode, localIn, localOut), nil
+		return saturatingAddInt64(inst.trafficCycleUsage, trafficBillableBytes(inst.trafficCycleMode, localIn, localOut)), nil
 	}
 	settings := pm.database.currentSystemSettings()
 	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
@@ -231,7 +234,7 @@ func (pm *ProxyManager) currentTrafficCycleUsage(inst *ProxyInstance, now time.T
 		inst.trafficAckedCumulativeIn = inst.trafficCumulativeIn().Load()
 		inst.trafficAckedCumulativeOut = inst.trafficCumulativeOut().Load()
 	}
-	return inst.trafficCycleUsage + trafficBillableBytes(cycleMode, inst.trafficBytesIn().Load(), inst.trafficBytesOut().Load()), nil
+	return saturatingAddInt64(inst.trafficCycleUsage, trafficBillableBytes(cycleMode, inst.trafficBytesIn().Load(), inst.trafficBytesOut().Load())), nil
 }
 
 func (inst *ProxyInstance) persistedDirections() (int64, int64) {
@@ -469,15 +472,15 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 		} else {
 			// Controller-local pending bytes are not in the monthly query yet;
 			// merge them into the current snapshot exactly once.
-			st.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
-			snap.MonthlyTraffic += trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut)
+			st.MonthlyTraffic = saturatingAddInt64(st.MonthlyTraffic, trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut))
+			snap.MonthlyTraffic = saturatingAddInt64(snap.MonthlyTraffic, trafficBillableBytes(billingMode, st.BytesIn, st.BytesOut))
 			st.SampledAtMS = now.UnixMilli()
 		}
 		if st.Running {
 			snap.RunningSites++
 		}
-		snap.TotalTraffic += st.TrafficUsed
-		snap.TotalRequests += st.Requests
+		snap.TotalTraffic = saturatingAddInt64(snap.TotalTraffic, st.TrafficUsed)
+		snap.TotalRequests = saturatingAddInt64(snap.TotalRequests, st.Requests)
 		snap.LiveSites = append(snap.LiveSites, st)
 	}
 	snap.UptimeSeconds = int64(now.Sub(startTime).Seconds())

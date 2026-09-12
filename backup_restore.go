@@ -2013,11 +2013,147 @@ type tlsSnapshotPath struct {
 	Present bool   `json:"present"`
 }
 
+// tlsSnapshotRoot records one owned namespace root together with whether it
+// existed when the snapshot was taken. Without the presence bit a rollback
+// cannot tell "the operator had no TLS state yet" (nothing to copy, success)
+// from "the rollback copy of a root that did exist has been lost" (nothing to
+// copy, but the live TLS directory must not be destroyed).
+type tlsSnapshotRoot struct {
+	Path    string `json:"path"`
+	Present bool   `json:"present"`
+}
+
 type tlsNamespaceSnapshot struct {
 	// Roots is retained for rollback compatibility with v1.9.34 snapshots.
 	Roots []string          `json:"roots,omitempty"`
 	Scope tlsRestoreScope   `json:"scope,omitempty"`
 	Exact []tlsSnapshotPath `json:"exact,omitempty"`
+	// Owned mirrors Scope.OwnedRoots with the presence metadata described
+	// above. A legacy snapshot without it is validated against the tree
+	// contents instead.
+	Owned []tlsSnapshotRoot `json:"owned,omitempty"`
+}
+
+// maxTLSGenerationEntriesPerRoot bounds the rollback preflight's cross-check
+// of generation roots. A rollback tree that lists more entries than this is
+// corrupt rather than merely large, and walking it before every restore would
+// trade one availability risk for another.
+const maxTLSGenerationEntriesPerRoot = 4096
+
+// tlsRollbackOwnedPath returns where one owned root was copied inside the
+// rollback tree. v1.9.34 wrote it directly under tls-tree; the owned/
+// subdirectory was introduced in v1.9.35.
+func tlsRollbackOwnedPath(base string, index int, legacyLayout bool) string {
+	if legacyLayout {
+		return filepath.Join(base, fmt.Sprintf("%d", index))
+	}
+	return filepath.Join(base, "owned", fmt.Sprintf("%d", index))
+}
+
+// tlsRollbackLayout resolves which tree shape a rollback manifest describes and
+// normalizes the manifest's scope into the effective scope the rollback works
+// with. Both the preflight and the restore must use this one decision, because
+// they read the same tree: if they disagree, a complete snapshot is refused (an
+// unbootable installation) or an incomplete one is restored as empty.
+//
+// The discriminator is the manifest's own `roots` field, not the absence of
+// `owned` metadata. Only v1.9.34 wrote `roots`, and it copied each owned root
+// straight to tls-tree/<index>; every release from v1.9.35 through at least
+// v1.9.88 wrote a `scope` and copied to tls-tree/owned/<index>. Because `owned`
+// presence metadata was introduced after that range, treating "no owned field"
+// as legacy would misclassify every snapshot those versions wrote.
+func tlsRollbackLayout(dbPath string, snapshot tlsNamespaceSnapshot) (tlsRestoreScope, bool, error) {
+	scope := snapshot.Scope
+	if len(scope.OwnedRoots) == 0 && len(scope.ExactPaths) == 0 && len(scope.GenerationRoots) == 0 && len(snapshot.Roots) > 0 {
+		// v1.9.34 snapshots may only be safely replayed when their roots are
+		// the default DB-local TLS namespace. Never trust a legacy custom
+		// parent directory as an owned root.
+		defaultRoot, absErr := filepath.Abs(filepath.Join(filepath.Dir(dbPath), "tls"))
+		if absErr != nil {
+			return tlsRestoreScope{}, false, fmt.Errorf("解析旧版 TLS 回滚目录: %w", absErr)
+		}
+		for _, root := range snapshot.Roots {
+			rootAbsolute, rootErr := filepath.Abs(root)
+			if rootErr != nil || filepath.Clean(rootAbsolute) != filepath.Clean(defaultRoot) {
+				return tlsRestoreScope{}, false, errors.New("旧版 TLS 回滚清单包含不安全的自定义目录")
+			}
+		}
+		return tlsRestoreScope{OwnedRoots: append([]string(nil), snapshot.Roots...)}, true, nil
+	}
+	return scope, false, nil
+}
+
+// validateTLSRollbackSnapshot runs before anything is deleted. It proves the
+// rollback tree can actually restore every path the snapshot claims to hold,
+// including roots that existed but whose copy is missing or unreadable. A
+// snapshot that fails this check must abort the rollback while the live
+// database and live TLS namespace are still intact.
+func validateTLSRollbackSnapshot(rollback string, snapshot tlsNamespaceSnapshot, scope tlsRestoreScope, legacyLayout bool) error {
+	if len(snapshot.Owned) > 0 {
+		if len(snapshot.Owned) != len(scope.OwnedRoots) {
+			return fmt.Errorf("TLS 回滚清单的目录数量与快照不一致: %d/%d", len(snapshot.Owned), len(scope.OwnedRoots))
+		}
+	} else if len(scope.OwnedRoots) > 0 {
+		// A manifest without presence metadata still recorded which roots it
+		// copied, so every root is assumed present; the tree check below is what
+		// actually proves it.
+		assumed := make([]tlsSnapshotRoot, len(scope.OwnedRoots))
+		for index, root := range scope.OwnedRoots {
+			assumed[index] = tlsSnapshotRoot{Path: root, Present: true}
+		}
+		snapshot.Owned = assumed
+	}
+	base := filepath.Join(rollback, "tls-tree")
+	for index, entry := range snapshot.Owned {
+		if !entry.Present {
+			continue
+		}
+		copied := tlsRollbackOwnedPath(base, index, legacyLayout)
+		info, err := os.Stat(copied) // #nosec G703 -- copied is the generated rollback namespace for one owned root.
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("TLS 回滚副本缺少目录 %s", entry.Path)
+			}
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("TLS 回滚副本目录不是目录: %s", entry.Path)
+		}
+	}
+	for index, entry := range snapshot.Exact {
+		if !entry.Present {
+			continue
+		}
+		copied := filepath.Join(base, "exact", fmt.Sprintf("%d", index))
+		if _, err := os.Lstat(copied); err != nil { // #nosec G703 -- copied is the generated rollback path for one exact entry.
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("TLS 回滚副本缺少文件 %s", entry.Path)
+			}
+			return err
+		}
+	}
+	for index, root := range scope.GenerationRoots {
+		dir := filepath.Join(base, "generations", fmt.Sprintf("%d", index))
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if len(entries) > maxTLSGenerationEntriesPerRoot {
+			return fmt.Errorf("TLS 回滚副本 generation 目录条目过多: %s", root)
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "generation-") {
+				continue
+			}
+			if _, err := os.Lstat(filepath.Join(dir, entry.Name())); err != nil { // #nosec G703 -- re-checked entry beneath a generated rollback directory.
+				return fmt.Errorf("TLS 回滚副本缺少 generation 条目: %s", entry.Name())
+			}
+		}
+	}
+	return nil
 }
 
 func appendUniqueTLSPath(values []string, seen map[string]struct{}, value string) []string {
@@ -2322,7 +2458,16 @@ func snapshotTLSNamespace(dbPath, rollback string) error {
 		_, statErr := os.Lstat(path) // #nosec G703 -- path is an explicitly tracked TLS path.
 		exact[index] = tlsSnapshotPath{Path: path, Present: statErr == nil}
 	}
-	snapshot := tlsNamespaceSnapshot{Scope: scope, Exact: exact}
+	// Record root presence next to the copy attempt. copyTLSNamespaceTree
+	// succeeds for an absent source, so without this bit a rollback could not
+	// distinguish a root that never existed from one whose rollback copy was
+	// later lost and would delete the live namespace for nothing.
+	owned := make([]tlsSnapshotRoot, len(scope.OwnedRoots))
+	for index, root := range scope.OwnedRoots {
+		_, statErr := os.Lstat(root) // #nosec G703 -- root is an explicitly owned Meridian TLS namespace.
+		owned[index] = tlsSnapshotRoot{Path: root, Present: statErr == nil}
+	}
+	snapshot := tlsNamespaceSnapshot{Scope: scope, Exact: exact, Owned: owned}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -2354,22 +2499,9 @@ func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
 		return err
 	}
 	currentScope := managedTLSRestoreScope(dbPath)
-	scope := snapshot.Scope
-	if len(scope.OwnedRoots) == 0 && len(scope.ExactPaths) == 0 && len(scope.GenerationRoots) == 0 && len(snapshot.Roots) > 0 {
-		// v1.9.34 snapshots may only be safely replayed when their roots are
-		// the default DB-local TLS namespace. Never trust a legacy custom
-		// parent directory as an owned root.
-		defaultRoot, absErr := filepath.Abs(filepath.Join(filepath.Dir(dbPath), "tls"))
-		if absErr != nil {
-			return fmt.Errorf("解析旧版 TLS 回滚目录: %w", absErr)
-		}
-		for _, root := range snapshot.Roots {
-			rootAbsolute, rootErr := filepath.Abs(root)
-			if rootErr != nil || filepath.Clean(rootAbsolute) != filepath.Clean(defaultRoot) {
-				return errors.New("旧版 TLS 回滚清单包含不安全的自定义目录")
-			}
-		}
-		scope = tlsRestoreScope{OwnedRoots: append([]string(nil), snapshot.Roots...)}
+	scope, legacyLayout, err := tlsRollbackLayout(dbPath, snapshot)
+	if err != nil {
+		return err
 	}
 	if !sameTLSRestoreScope(scope, currentScope) {
 		return errors.New("TLS 回滚清单与当前配置不一致")
@@ -2377,12 +2509,20 @@ func restoreTLSNamespaceSnapshot(dbPath, rollback string) error {
 	if err := validateTLSRestoreScope(dbPath, currentScope); err != nil {
 		return err
 	}
+	// Prove the rollback tree is complete before the first destructive step.
+	// removeTLSRestoreScope below deletes the live TLS namespace, and
+	// copyTLSNamespaceTree treats a missing source as success, so an
+	// incomplete rollback copy would otherwise leave the installation with no
+	// TLS state while still reporting a successful rollback.
+	if err := validateTLSRollbackSnapshot(rollback, snapshot, scope, legacyLayout); err != nil {
+		return err
+	}
 	if err := removeTLSRestoreScope(currentScope); err != nil {
 		return err
 	}
 	base := filepath.Join(rollback, "tls-tree")
 	for index, root := range scope.OwnedRoots {
-		if err := copyTLSNamespaceTree(filepath.Join(base, "owned", fmt.Sprintf("%d", index)), root); err != nil {
+		if err := copyTLSNamespaceTree(tlsRollbackOwnedPath(base, index, legacyLayout), root); err != nil {
 			return err
 		}
 	}
@@ -2617,6 +2757,21 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 			var snapshot tlsNamespaceSnapshot
 			if err := json.Unmarshal(data, &snapshot); err != nil {
 				return fmt.Errorf("TLS 回滚清单损坏: %w", err)
+			}
+			// The manifest parsing above only proves the JSON is readable. The
+			// tree it points at must also be complete, because the rollback
+			// deletes the live database first and the live TLS namespace after
+			// that; discovering a missing rollback root at that point would
+			// destroy both copies of the state.
+			//
+			// The layout decision is shared with restoreTLSNamespaceSnapshot so
+			// the preflight probes exactly the tree the restore will read.
+			scope, legacyLayout, layoutErr := tlsRollbackLayout(dbPath, snapshot)
+			if layoutErr != nil {
+				return layoutErr
+			}
+			if err := validateTLSRollbackSnapshot(rollback, snapshot, scope, legacyLayout); err != nil {
+				return err
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err

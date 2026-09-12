@@ -371,13 +371,23 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		trafficQuota := inst.Site.TrafficQuota
 		inst.trafficMu.Unlock()
 		if trafficQuota > 0 {
-			currentUsed, usageErr := pm.currentTrafficCycleUsage(inst, time.Now())
-			if usageErr != nil {
-				log.Printf("[%s] failed to calculate current traffic cycle usage: %v", site.Name, usageErr)
-			} else if currentUsed >= trafficQuota {
+			// A configured quota is a hard limit, so an unreadable usage
+			// baseline must fail closed with "enforcement unavailable" rather
+			// than admitting traffic that the site may no longer be allowed to
+			// carry. This is deliberately not 403: the quota is not known to be
+			// exhausted, the check itself could not run.
+			switch err := quotaUsageDecision(pm, inst, trafficQuota, time.Now()); err {
+			case nil:
+			case errTrafficQuotaExceeded:
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				w.Write([]byte(`{"error":"traffic quota exceeded"}`))
+				return
+			default:
+				log.Printf("[%s] refusing request: %v", site.Name, errTrafficQuotaUnavailable)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"error":"traffic quota enforcement unavailable"}`))
 				return
 			}
 		}
