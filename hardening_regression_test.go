@@ -750,3 +750,61 @@ func TestQuotaProbeSharedBoundedToOneCheck(t *testing.T) {
 		t.Fatal("small follow-up must not probe")
 	}
 }
+
+func TestAccountRetentionEvictsAtCapacityWithoutPerRequestSweep(t *testing.T) {
+	app := newTestApp(t)
+	tracker := newAccountRetentionTracker(app.db)
+	now := time.Now()
+	// Fill the tracker beyond the cap with distinct identities; each new
+	// identity at capacity must evict exactly one entry, never grow unbounded.
+	for i := 0; i < accountRetentionSessionLimit+50; i++ {
+		key := fmt.Sprintf("identity-%d", i)
+		session := &accountRetentionSession{SiteID: 1, CycleStartedAtMS: 1, LastObservedAt: now}
+		tracker.mu.Lock()
+		if tracker.sessions[key] == nil {
+			for len(tracker.sessions) >= accountRetentionSessionLimit {
+				tracker.evictOldestLocked(now)
+				if len(tracker.sessions) >= accountRetentionSessionLimit {
+					break
+				}
+			}
+		}
+		tracker.sessions[key] = session
+		if len(tracker.sessions) > accountRetentionSessionLimit {
+			tracker.mu.Unlock()
+			t.Fatalf("tracker grew past cap: %d", len(tracker.sessions))
+		}
+		tracker.mu.Unlock()
+	}
+	if len(tracker.sessions) != accountRetentionSessionLimit {
+		t.Fatalf("tracker size=%d, want exactly the cap", len(tracker.sessions))
+	}
+}
+
+func TestLoginLimiterOverflowFailsSafeWhenTableIsAllLockouts(t *testing.T) {
+	limiter := newLoginRateLimiter()
+	now := time.Now()
+	// Fill the table with distinct clients under active lockout.
+	for i := 0; i < limiter.maxEntries; i++ {
+		client := fmt.Sprintf("blocked-%d", i)
+		for attempt := 0; attempt < maxLoginFailures; attempt++ {
+			limiter.recordFailure(client, now)
+		}
+		if ok, _ := limiter.allow(client, now); ok {
+			t.Fatalf("client %s not locked after %d failures", client, maxLoginFailures)
+		}
+	}
+	// A brand-new client while the table is full of lockouts: the coarse
+	// overflow bucket must accumulate and lock, never silently fail open.
+	for attempt := 0; attempt < maxLoginFailures; attempt++ {
+		limiter.recordFailure("newcomer", now)
+	}
+	if ok, _ := limiter.allow("another-newcomer", now); ok {
+		t.Fatal("overflow lockout did not fail safe: untracked client allowed during saturation")
+	}
+	// After the lockout lapses, untracked clients are allowed again.
+	later := now.Add(loginLockoutDuration + time.Second)
+	if ok, _ := limiter.allow("post-lockout-client", later); !ok {
+		t.Fatal("overflow lockout did not lapse")
+	}
+}

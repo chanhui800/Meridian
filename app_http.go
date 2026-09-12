@@ -27,6 +27,7 @@ type loginRateLimiter struct {
 	mu         sync.Mutex
 	attempts   map[string]loginAttempt
 	maxEntries int
+	overflow   loginAttempt
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
@@ -51,6 +52,10 @@ func (l *loginRateLimiter) pruneExpired(now time.Time) {
 		if attempt.firstFailure.IsZero() || !now.Before(attempt.firstFailure.Add(loginFailureWindow)) {
 			delete(l.attempts, client)
 		}
+	}
+	if !now.Before(l.overflow.blockedUntil) &&
+		(l.overflow.firstFailure.IsZero() || !now.Before(l.overflow.firstFailure.Add(loginFailureWindow))) {
+		l.overflow = loginAttempt{}
 	}
 }
 
@@ -88,6 +93,9 @@ func (l *loginRateLimiter) allow(client string, now time.Time) (bool, time.Durat
 	l.pruneExpired(now)
 	attempt, ok := l.attempts[client]
 	if !ok {
+		if now.Before(l.overflow.blockedUntil) {
+			return false, l.overflow.blockedUntil.Sub(now)
+		}
 		return true, 0
 	}
 	attempt.lastSeen = now
@@ -105,8 +113,19 @@ func (l *loginRateLimiter) recordFailure(client string, now time.Time) {
 	l.pruneExpired(now)
 	attempt, exists := l.attempts[client]
 	if !exists && len(l.attempts) >= l.maxEntries && !l.evictLeastRecentlySeen(now) {
-		// The table is full of active lockouts; drop tracking for this new
-		// key instead of evicting a lockout.
+		// The table is full of active lockouts. Track failures in a bounded
+		// coarse bucket so exhaustion fails safe instead of allowing an
+		// untracked client to retry indefinitely.
+		attempt = l.overflow
+		if attempt.firstFailure.IsZero() || now.Sub(attempt.firstFailure) >= loginFailureWindow {
+			attempt = loginAttempt{firstFailure: now}
+		}
+		attempt.failures++
+		attempt.lastSeen = now
+		if attempt.failures >= maxLoginFailures {
+			attempt.blockedUntil = now.Add(loginLockoutDuration)
+		}
+		l.overflow = attempt
 		return
 	}
 	if attempt.firstFailure.IsZero() || now.Sub(attempt.firstFailure) >= loginFailureWindow {

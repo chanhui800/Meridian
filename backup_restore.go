@@ -2589,6 +2589,39 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 	if rollback == "" {
 		return errors.New("恢复回滚目录为空")
 	}
+	// Preflight every rollback source before touching the live namespace. A
+	// missing snapshot must leave the currently running database intact so a
+	// recoverable deployment is not destroyed while reporting the error.
+	rollbackDB := filepath.Join(rollback, backupDatabaseEntry)
+	if info, err := os.Stat(rollbackDB); err != nil { // #nosec G304 G703 -- rollback is the fixed restore rollback suffix derived from the configured database path.
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("恢复回滚副本缺少数据库")
+		}
+		return err
+	} else if !info.Mode().IsRegular() {
+		return errors.New("恢复回滚副本数据库不是普通文件")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		source := filepath.Join(rollback, backupDatabaseEntry+suffix)
+		if info, err := os.Stat(source); err == nil { // #nosec G304 G703 -- rollback is the fixed restore rollback suffix derived from the configured database path.
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("恢复回滚副本 %s 不是普通文件", suffix)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if restoreDirectoryIncludesTLS(rollback) {
+		manifestPath := filepath.Join(rollback, "tls-namespace.json")
+		if data, err := os.ReadFile(manifestPath); err == nil { // #nosec G304 G703 -- rollback is the fixed restore rollback suffix derived from the configured database path.
+			var snapshot tlsNamespaceSnapshot
+			if err := json.Unmarshal(data, &snapshot); err != nil {
+				return fmt.Errorf("TLS 回滚清单损坏: %w", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	// Copy-based restore: os.Rename would consume the only rollback snapshot,
 	// so a failure after the first rename would leave the deployment with a
 	// half-moved database and no recovery copy. The rollback directory stays
