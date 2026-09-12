@@ -214,16 +214,32 @@ func TestPlaybackInfoRewriteDiagnosticCodeIsStableAndSecretFree(t *testing.T) {
 	if got := playbackInfoRewriteDiagnosticFingerprint(errors.New("unexpected upstream value bearer-secret")); len(got) != 8 || strings.Contains(got, "secret") {
 		t.Fatalf("diagnostic fingerprint is unsafe: %q", got)
 	}
-	if !playbackInfoAutomaticFallbackAllowed(errors.New("invalid discovered URL: target normalization host")) {
-		t.Fatal("URL normalization failure must allow automatic proxy fallback")
+	// A URL whose destination cannot be proven safe must not enter the
+	// schema-free walker: that walker is the path that keeps individual URLs on
+	// the proxy, so re-deciding a security failure there would route around the
+	// strict rules. Only genuinely compatibility-level syntax failures qualify.
+	if playbackInfoAutomaticFallbackAllowed(errors.New("invalid discovered URL: target normalization host")) {
+		t.Fatal("a URL normalization decision must not allow automatic proxy fallback")
 	}
 	for _, err := range []error{
+		errors.New("invalid discovered URL: userinfo"),
+		errors.New("invalid discovered URL: fragment"),
+		errors.New("invalid discovered URL: target normalization scheme"),
+		errors.New("invalid discovered URL: target normalization dot_segments"),
 		errors.New("external subtitle URL requires unsupported origin headers"),
 		errors.New("PlaybackInfo RequiredHttpHeaders has an invalid value"),
 		errors.New("invalid PlaybackInfo JSON"),
 	} {
 		if playbackInfoAutomaticFallbackAllowed(err) {
 			t.Fatalf("security or structure error unexpectedly allowed fallback: %v", err)
+		}
+	}
+	for _, err := range []error{
+		errors.New("invalid discovered URL: surrounding whitespace"),
+		errors.New("invalid discovered URL: parse"),
+	} {
+		if !playbackInfoAutomaticFallbackAllowed(err) {
+			t.Fatalf("compatibility-only error must allow fallback: %v", err)
 		}
 	}
 }
@@ -238,7 +254,12 @@ func TestPlaybackInfoRelativeExternalDeliveryURLWithRequiredHeadersFailsClosed(t
 	}
 }
 
-func TestAutomaticPlaybackInfoFallbackRewritesValidURLsAndPreservesInvalidOnes(t *testing.T) {
+// TestAutomaticPlaybackInfoFallbackRefusesURLsItCannotProxy replaces the
+// earlier preservation contract. Keeping an absolute URL the walker could not
+// route handed the player the upstream destination directly: no capability, no
+// traffic accounting, no quota, and the origin address revealed. A relative
+// same-origin playback path is not a network destination and is still kept.
+func TestAutomaticPlaybackInfoFallbackRefusesURLsItCannotProxy(t *testing.T) {
 	issuer := newStructuredDiscoveryTestIssuer(t)
 	base := mustStructuredURL(t, "http://line.example.com/Items/1/PlaybackInfo")
 	payload := []byte(`{"MediaSources":[{"DirectStreamUrl":"http://line.example.com/Videos/1/original.mkv?token=origin-secret","MediaStreams":[{"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt","IsExternalUrl":true}]}]}`)
@@ -250,16 +271,20 @@ func TestAutomaticPlaybackInfoFallbackRewritesValidURLsAndPreservesInvalidOnes(t
 	strictSession.rollback()
 
 	fallbackSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
-	rewritten, err := rewriteAutomaticPlaybackInfoResponse(payload, fallbackSession)
+	if _, err := rewriteAutomaticPlaybackInfoResponse(payload, fallbackSession); err == nil {
+		t.Fatal("the automatic fallback must not preserve a URL it cannot proxy")
+	}
+	fallbackSession.rollback()
+
+	// The same walker keeps a relative same-origin playback URL on the proxy.
+	relativePayload := []byte(`{"MediaSources":[{"DirectStreamUrl":"/Videos/1/original.mkv?token=local-token"}]}`)
+	relativeSession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourcePlaybackInfo}
+	rewritten, err := rewriteAutomaticPlaybackInfoResponse(relativePayload, relativeSession)
 	if err != nil {
-		t.Fatalf("automatic PlaybackInfo fallback: %v", err)
+		t.Fatalf("automatic PlaybackInfo fallback on a relative path: %v", err)
 	}
-	text := string(rewritten)
-	if !strings.Contains(text, `"DirectStreamUrl":"/Videos/1/original.mkv?token=origin-secret"`) {
-		t.Fatalf("same-authority playback URL was not kept on the proxy: %s", text)
-	}
-	if !strings.Contains(text, `"DeliveryUrl":"http://backend.invalidtld/subtitle.vtt"`) {
-		t.Fatalf("invalid optional URL was not preserved: %s", text)
+	if !strings.Contains(string(rewritten), `"/Videos/1/original.mkv?token=local-token"`) {
+		t.Fatalf("relative same-origin playback path changed: %s", rewritten)
 	}
 }
 
@@ -2058,11 +2083,13 @@ func assertStructuredRewriteFailsAtomically(t *testing.T, profile, source, reque
 	}
 }
 
-func TestSafeAndCompatibleDASHRejectExtremeDRMAndForeignWrappers(t *testing.T) {
+func TestDASHRejectsDRMAndForeignWrappersOutsideTheRemovedProfiles(t *testing.T) {
 	features := map[string][]byte{
 		"ContentProtection": []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/><Representation id="v"><BaseURL>video.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>`),
 		"foreign wrapper":   []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:v="urn:vendor:passive"><Period><v:Wrapper><Representation id="v"><BaseURL>video.mp4</BaseURL></Representation></v:Wrapper></Period></MPD>`),
 	}
+	// dynamicProfileCompatible is the only profile the runtime assigns; the
+	// loop is kept so the assertion stays bound to a named profile.
 	for _, profile := range []string{dynamicProfileCompatible} {
 		for feature, manifest := range features {
 			t.Run(profile+"/"+feature, func(t *testing.T) {
@@ -2070,7 +2097,7 @@ func TestSafeAndCompatibleDASHRejectExtremeDRMAndForeignWrappers(t *testing.T) {
 				session := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: mustStructuredURL(t, "https://api.example.com/live/manifest.mpd"), source: dynamicDiscoverySourceDASH}
 				if _, err := rewriteDASHResponse(manifest, session); err == nil {
 					session.rollback()
-					t.Fatalf("%s accepted Extreme DASH %s", profile, feature)
+					t.Fatalf("profile %s accepted legacy DASH %s", profile, feature)
 				}
 				session.rollback()
 				if len(issuer.state.capabilities) != 0 || len(issuer.state.authorities) != 0 {
@@ -2081,7 +2108,7 @@ func TestSafeAndCompatibleDASHRejectExtremeDRMAndForeignWrappers(t *testing.T) {
 	}
 }
 
-func TestSafeAndCompatiblePlaybackInfoKeepLegacyNestedCollectionHandling(t *testing.T) {
+func TestPlaybackInfoLegacyNestedCollectionHandlingOnTheOnlyProfile(t *testing.T) {
 	streamText := structuredTestStringifiedJSON(t, map[string]any{
 		"IsExternalUrl": true,
 		"DeliveryUrl":   "https://captions.example.com/subtitle.vtt?sig=legacy-secret",
@@ -2089,6 +2116,8 @@ func TestSafeAndCompatiblePlaybackInfoKeepLegacyNestedCollectionHandling(t *test
 	attachmentText := structuredTestStringifiedJSON(t, []any{map[string]any{
 		"AttachmentUrl": "https://attachments.example.com/font.bin?sig=legacy-secret",
 	}})
+	// dynamicProfileCompatible is the only profile the runtime assigns; the
+	// loop is kept so the assertion stays bound to a named profile.
 	for _, profile := range []string{dynamicProfileCompatible} {
 		t.Run(profile, func(t *testing.T) {
 			issuer := newStructuredDiscoveryTestIssuerForProfile(t, profile)
@@ -2116,11 +2145,13 @@ func TestSafeAndCompatiblePlaybackInfoKeepLegacyNestedCollectionHandling(t *test
 	}
 }
 
-func TestSafeAndCompatibleHLSRejectExtremeFeaturesIndependently(t *testing.T) {
+func TestHLSRejectsRemovedProfileFeaturesIndependently(t *testing.T) {
 	features := map[string][]byte{
 		"DEFINE":                []byte("#EXTM3U\n#EXT-X-DEFINE:NAME=\"segment\",VALUE=\"video\"\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n{$segment}.ts\n#EXT-X-ENDLIST\n"),
 		"unknown URI attribute": []byte("#EXTM3U\n#EXT-X-VENDOR-METADATA:URI=\"https://metadata.example.com/value.json\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nchild.m3u8\n"),
 	}
+	// dynamicProfileCompatible is the only profile the runtime assigns; the
+	// loop is kept so the assertion stays bound to a named profile.
 	for _, profile := range []string{dynamicProfileCompatible} {
 		for feature, manifest := range features {
 			t.Run(profile+"/"+feature, func(t *testing.T) {

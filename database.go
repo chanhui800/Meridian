@@ -171,3 +171,38 @@ func (d *DB) ensureInstallationUUID() error {
 	d.installUUID = strings.TrimSpace(value)
 	return nil
 }
+
+// rotateInstallationUUID replaces the installation identity and returns the
+// new value. It exists because restoring a backup copies installation_meta
+// along with every other table: a disaster-recovery takeover must keep the
+// original identity so it can keep managing the DNS records that controller
+// created, while a controller cloned from a backup must adopt a new one or the
+// two installations would present the same Cloudflare ownership marker and
+// each would treat the other's records as its own.
+//
+// Note that this only updates the cached value for the calling process. A
+// running panel reads installUUID once at startup, so an operator who rotates
+// the identity through the CLI must restart the service.
+func (d *DB) rotateInstallationUUID() (string, error) {
+	if d == nil || d.db == nil {
+		return "", errors.New("database is unavailable")
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	value := hex.EncodeToString(raw)
+	if _, err := d.db.Exec("INSERT INTO installation_meta(id, install_uuid) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET install_uuid=excluded.install_uuid", value); err != nil {
+		return "", err
+	}
+	var stored string
+	if err := d.db.QueryRow("SELECT install_uuid FROM installation_meta WHERE id=1").Scan(&stored); err != nil {
+		return "", err
+	}
+	stored = strings.TrimSpace(stored)
+	if stored != value {
+		return "", errors.New("installation identity was not updated")
+	}
+	d.installUUID = stored
+	return stored, nil
+}

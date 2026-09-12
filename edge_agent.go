@@ -1232,7 +1232,7 @@ func (runtime *edgeAgentRuntime) commitSiteStatsWithACK(pending edgeSiteStatsPen
 				// Rebase the Controller baseline and ACK watermark together.
 				// The just-committed report must remain billable immediately;
 				// it must not disappear until the next config refresh.
-				inst.trafficCycleUsage += trafficBillableBytes(inst.trafficCycleMode, delta.CumulativeBytesIn, delta.CumulativeBytesOut)
+				inst.trafficCycleUsage = saturatingAddInt64(inst.trafficCycleUsage, trafficBillableBytes(inst.trafficCycleMode, delta.CumulativeBytesIn, delta.CumulativeBytesOut))
 			}
 			inst.trafficAckedCumulativeIn = stat.CumulativeBytesIn
 			inst.trafficAckedCumulativeOut = stat.CumulativeBytesOut
@@ -1977,7 +1977,20 @@ func (runtime *edgeAgentRuntime) nextTelemetrySequence() int64 {
 	return runtime.telemetrySequence
 }
 
-func (runtime *edgeAgentRuntime) close() {
+// edgeEventSpoolFlushError reports that the final, shutdown-time spool
+// persistence failed. It is a named error so callers can distinguish "the
+// process is stopping but up to two seconds of unacknowledged events could not
+// be written" from an ordinary runtime failure.
+var edgeEventSpoolFlushError = errors.New("event spool persistence failed during shutdown")
+
+// close tears the runtime down. The returned error reports a failed final
+// spool flush; the caller decides whether an unusable queue warrants a failed
+// exit. Closing itself is always complete: the data plane is stopped and the
+// bundle released before the flush is attempted.
+func (runtime *edgeAgentRuntime) close() error {
+	if runtime == nil {
+		return nil
+	}
 	runtime.quiesced.Store(true)
 	runtime.stopServer()
 	runtime.mu.Lock()
@@ -1994,8 +2007,30 @@ func (runtime *edgeAgentRuntime) close() {
 		bundle.close()
 	}
 	// The debounced spool may still hold <2s of unpersisted events; a
-	// graceful stop (self-update, systemd) must not lose them.
-	_ = runtime.events.flush()
+	// graceful stop (self-update, systemd) must not lose them. Retry briefly
+	// because the usual cause is a transient write error. Each attempt is a
+	// synchronous fsync with no deadline, so a device that never returns will
+	// still block shutdown; the bounded retry limits the number of attempts,
+	// not the time a single attempt may take.
+	return flushEdgeEventStoreOnShutdown(&runtime.events)
+}
+
+// flushEdgeEventStoreOnShutdown persists the event spool with a bounded retry
+// so a transient I/O error does not silently drop the last debounce window.
+func flushEdgeEventStoreOnShutdown(store *edgeEventStore) error {
+	if store == nil {
+		return nil
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if lastErr = store.flush(); lastErr == nil {
+			return nil
+		}
+		if attempt < 2 {
+			time.Sleep(150 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("%w: %v", edgeEventSpoolFlushError, lastErr)
 }
 
 func (runtime *edgeAgentRuntime) setSessionEpoch(epoch int64) {
@@ -2096,7 +2131,9 @@ func isEdgeAgentStale(err error) bool {
 // repairs the service instead.
 func edgeQuiesceRevoked(ctx context.Context, runtime *edgeAgentRuntime, marker string) error {
 	if runtime != nil {
-		runtime.close()
+		if err := runtime.close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Meridian Agent is revoked; %v\n", err)
+		}
 	}
 	if err := os.WriteFile(marker, []byte("revoked\n"), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "Meridian Agent is revoked but cannot persist revoked state: %v; remaining offline until stopped\n", err)
@@ -2129,7 +2166,9 @@ func edgeQuiesceStale(runtime *edgeAgentRuntime) {
 	if runtime == nil {
 		return
 	}
-	runtime.close()
+	if err := runtime.close(); err != nil {
+		fmt.Fprintf(os.Stderr, "Meridian Agent lost its Controller lease; %v\n", err)
+	}
 	runtime.setLeaseID("")
 }
 
@@ -2626,7 +2665,7 @@ func edgeFetchAgentManifest(ctx context.Context, client *http.Client, controller
 	return manifest, nil
 }
 
-func runEdgeAgent() error {
+func runEdgeAgent() (runErr error) {
 	flags := flag.NewFlagSet("meridian-agent", flag.ContinueOnError)
 	controllerValue := flags.String("controller", "", "controller URL")
 	statePath := flags.String("state", "/var/lib/meridian-agent/state.json", "state path")
@@ -2721,7 +2760,14 @@ func runEdgeAgent() error {
 			return fmt.Errorf("load event spool: %w (quarantine failed: %v)", err, quarantineErr)
 		}
 	}
-	defer runtime.close()
+	defer func() {
+		// Surface a failed final spool flush as a failed exit instead of
+		// silently dropping the last debounce window. Never mask an existing
+		// error from the main loop.
+		if closeErr := runtime.close(); closeErr != nil && runErr == nil {
+			runErr = closeErr
+		}
+	}()
 	wsReporter := newEdgeWSReportClient(controller, state.Token)
 	defer wsReporter.close()
 	bootID := edgeBootID()

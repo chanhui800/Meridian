@@ -39,14 +39,16 @@ const (
 )
 
 const (
-	dynamicProfileSafe                 = "safe"
-	dynamicProfileCompatible           = "compatible"
-	dynamicCapabilityVersion           = 1
-	maxDynamicCapabilityBytes          = 16384
-	dynamicCapabilityAAD               = "meridian-dynamic-capability-v1"
-	dynamicProfileExtreme              = "extreme"
-	maxExtremeRequiredHeaderClaims     = 8
-	maxExtremeRequiredHeaderClaimBytes = 4 << 10
+	// dynamicProfileCompatible is the only profile the runtime assigns. The
+	// "safe" and "extreme" profiles are gone: per-site policy was removed in
+	// v1.9.86 and the code that branched on them was removed in v1.9.89, so a
+	// policy comparison here would always compare equal to this value.
+	dynamicProfileCompatible    = "compatible"
+	dynamicCapabilityVersion    = 1
+	maxDynamicCapabilityBytes   = 16384
+	dynamicCapabilityAAD        = "meridian-dynamic-capability-v1"
+	maxRequiredHeaderClaims     = 8
+	maxRequiredHeaderClaimBytes = 4 << 10
 
 	maxDynamicTargetURLBytes  = 4096
 	maxDynamicResolvedIPCount = 64

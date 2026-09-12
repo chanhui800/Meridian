@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -228,6 +229,501 @@ func newDynamicPolicyDenialError(err error) *dynamicPolicyDenialError {
 		return nil
 	}
 	return &dynamicPolicyDenialError{reason: err.Error()}
+}
+
+// dynamicURLScanCandidate reports whether a downstream-visible string is
+// shaped like an absolute URL a client would follow, and whether it is safe to
+// hand over unproxied. Only the destination selector is considered: a fragment
+// or userinfo cannot be carried by a Meridian capability, so a URL using either
+// would be followed by the player directly.
+//
+// A string that is not URL-shaped (a relative path, a bare filename, a DRM
+// key-format identifier) is deliberately not a candidate: it cannot reach a
+// third-party host on its own, and an unrelated string that merely parses as a
+// URL must not block a compatibility preserve.
+func dynamicURLScanCandidate(value string) (candidate, safe bool) {
+	trimmed := strings.TrimSpace(value)
+	lowered := strings.ToLower(trimmed)
+	scheme := ""
+	switch {
+	case strings.HasPrefix(lowered, "http://"):
+		scheme = "http://"
+	case strings.HasPrefix(lowered, "https://"):
+		scheme = "https://"
+	default:
+		// Non-http schemes are deliberately not candidates here. The strict
+		// parsers already refuse them as a policy denial, so those bodies are
+		// never preserved, and several of them — skd://, for instance — are DRM
+		// identifiers that a player resolves through its own licence stack
+		// rather than a URL it fetches. Treating them as unroutable would
+		// reject ordinary FairPlay manifests for no security gain.
+		//
+		// A scheme followed by an authority is the one shape that could still
+		// reach a third-party host, so it is refused unless it is known not to
+		// name one. This keeps the scan conservative if a future strict parser
+		// stops rejecting an unfamiliar scheme.
+		if marker := strings.Index(lowered, "://"); marker > 0 {
+			switch lowered[:marker] {
+			case "skd", "blob", "data":
+				return false, false
+			default:
+				return true, false
+			}
+		}
+		return false, false
+	}
+	if len(trimmed) < len("http://x") {
+		return true, false
+	}
+	// A URL-shaped string must be safe. Anything about it that cannot be
+	// proven safe stays unsafe, including a host-less or opaque remainder.
+	if trimmed != value || containsDynamicUnsafeRune(trimmed) || strings.Contains(trimmed, `\`) || strings.Contains(trimmed, "{$") {
+		return true, false
+	}
+	hostPort := trimmed[len(scheme):]
+	if cut := strings.IndexAny(hostPort, "/?#"); cut >= 0 {
+		hostPort = hostPort[:cut]
+	}
+	if strings.HasPrefix(hostPort, "[") {
+		// A bracketed host is the RFC 3986 IPv6-literal form. Accept exactly
+		// the well-formed `[address]` or `[address]:port` shapes; every other
+		// use of a bracket stays unsafe.
+		closing := strings.IndexByte(hostPort, ']')
+		if closing < 0 {
+			return true, false
+		}
+		literal := net.ParseIP(hostPort[1:closing])
+		remainder := hostPort[closing+1:]
+		if literal == nil {
+			return true, false
+		}
+		// An IPv4-mapped literal such as [::ffff:198.51.100.7] is an IPv4
+		// destination in disguise, so it is judged by the address it maps to
+		// rather than rejected for having a mapped form.
+		addr, ok := netip.AddrFromSlice(literal)
+		if !ok {
+			return true, false
+		}
+		addr = addr.Unmap()
+		if addr.Is4() {
+			return true, false
+		}
+		if !dynamicIPIsPublic(addr) {
+			return true, false
+		}
+		if remainder != "" && (remainder[0] != ':' || len(remainder) == 1) {
+			return true, false
+		}
+		hostPort = hostPort[closing+1:]
+	} else if strings.ContainsAny(hostPort, "[]") {
+		return true, false
+	}
+	if strings.ContainsAny(hostPort, " \t\"'<>(){}|^`") {
+		return true, false
+	}
+	if at := strings.LastIndexByte(hostPort, '@'); at >= 0 {
+		return true, false
+	}
+	if strings.Contains(hostPort, "#") {
+		return true, false
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
+		return true, false
+	}
+	if len(parsed.String()) > maxDynamicTargetURLBytes {
+		return true, false
+	}
+	// A fragment is carried by the client, never by the capability, so a
+	// fragment-bearing URL would be followed outside Meridian.
+	if parsed.Fragment != "" || parsed.RawFragment != "" {
+		return true, false
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return true, false
+	}
+	if !dynamicURLDecodedComponentIsSafe(parsed.EscapedPath(), false) || !dynamicURLDecodedComponentIsSafe(parsed.RawQuery, true) {
+		return true, false
+	}
+	if dynamicURLPathHasDotSegments(parsed.EscapedPath()) {
+		return true, false
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return true, false
+		}
+	}
+	// The strict rewriter refuses non-public resolved addresses, so an IP
+	// literal pointing at a private, loopback, or otherwise special range is a
+	// destination Meridian would never have proxied. Preserving the body would
+	// hand that address to the client instead. The alternative numeric IPv4
+	// spellings (127.1, 0x7f000001, 2130706433) are not parsed by net.ParseIP,
+	// so they are matched by name below.
+	host := parsed.Hostname()
+	if literal := net.ParseIP(host); literal != nil {
+		addr, ok := netip.AddrFromSlice(literal)
+		if !ok || !dynamicIPIsPublic(addr.Unmap()) {
+			return true, false
+		}
+	} else if dynamicScanHostIsNonPublicShorthand(host) {
+		return true, false
+	}
+	return true, true
+}
+
+// dynamicScanHostIsNonPublicShorthand recognizes host names that resolve
+// without DNS to a local or otherwise special address: the literal "localhost"
+// and the alternative numeric IPv4 spellings that the resolver accepts but
+// net.ParseIP does not. A strict rewrite never proxies these, so preserving a
+// body that names one would expose it to the client instead.
+func dynamicScanHostIsNonPublicShorthand(host string) bool {
+	trimmed := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if trimmed == "" {
+		return false
+	}
+	if trimmed == "localhost" || strings.HasSuffix(trimmed, ".localhost") {
+		return true
+	}
+	parts := strings.Split(trimmed, ".")
+	if len(parts) > 4 {
+		return false
+	}
+	octets := make([]int64, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		// Base 0 accepts the decimal, octal and hexadecimal spellings a
+		// resolver accepts; anything outside a 32-bit range is not an address.
+		value, err := strconv.ParseInt(part, 0, 64)
+		if err != nil || value < 0 || value > 0xffffffff {
+			return false
+		}
+		octets = append(octets, value)
+	}
+	// Every part before the last is a single octet; the last absorbs all
+	// remaining bytes, which is why "127.1" means 127.0.0.1 and "2130706433"
+	// means 127.0.0.1 as well. Every shift below operates on a value already
+	// proven to be in [0, 0xffffffff], so the additions cannot overflow.
+	address := int64(0)
+	if len(octets) == 1 {
+		address = octets[0]
+	} else {
+		for index := 0; index < len(octets)-1; index++ {
+			if octets[index] > 0xff {
+				return false
+			}
+			address |= octets[index] << (8 * (3 - index))
+		}
+		trailing := octets[len(octets)-1]
+		switch len(octets) {
+		case 2:
+			trailing <<= 16
+		case 3:
+			trailing <<= 8
+		}
+		address |= trailing
+	}
+	bytes4 := [4]byte{
+		byte((address >> 24) & 0xff),
+		byte((address >> 16) & 0xff),
+		byte((address >> 8) & 0xff),
+		byte(address & 0xff),
+	}
+	return !dynamicIPIsPublic(netip.AddrFrom4(bytes4))
+}
+
+// scanHLSManifestURLs extracts every string a strict HLS rewrite would treat
+// as a network location: media URI lines and the URL-bearing attributes of
+// known tags. It is deliberately tolerant of the syntax errors that made the
+// strict parser give up, because its only job is to prove that no URL in the
+// payload would be followed outside Meridian.
+func scanHLSManifestURLs(payload []byte) (candidate, unsafe bool) {
+	sawCandidate := false
+	for _, rawLine := range strings.Split(string(payload), "\n") {
+		line := strings.TrimSuffix(rawLine, "\r")
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			found, bad := dynamicURLScanValue(line)
+			sawCandidate = sawCandidate || found
+			if bad {
+				return true, true
+			}
+			continue
+		}
+		colon := strings.IndexByte(line, ':')
+		if colon < 0 || colon+1 >= len(line) {
+			continue
+		}
+		tag := line[:colon]
+		attributes, err := parseHLSAttributeList(line[colon+1:])
+		if err != nil {
+			// The strict parser stops at the first syntax error, which is often
+			// the only reason this body is being preserved. A malformed list
+			// must not hide a URL that appears earlier on the same line, so
+			// fall back to scanning every quoted or bare value on it.
+			for _, value := range hlsScanRawAttributeValues(line[colon+1:]) {
+				found, bad := dynamicURLScanValue(value)
+				sawCandidate = sawCandidate || found
+				if bad {
+					return true, true
+				}
+			}
+			continue
+		}
+		for _, attribute := range attributes {
+			value := line[colon+1:][attribute.valueStart:attribute.valueEnd]
+			if !hlsAttributeNameCarriesURL(tag, attribute.name) {
+				// Even an attribute that is not supposed to hold a URL must not
+				// smuggle one. #EXT-X-DEFINE VALUE is the documented case: a
+				// later {$name} reference expands it into a URI, so the URL
+				// reaches the player through a tag the strict rewriter rejected
+				// before it ever looked at the reference. Scanning every
+				// attribute value covers that case without having to enumerate
+				// which extension tags can feed a URI.
+				if found, bad := dynamicURLScanValue(value); bad {
+					return true, true
+				} else {
+					sawCandidate = sawCandidate || found
+				}
+				continue
+			}
+			found, bad := dynamicURLScanValue(value)
+			sawCandidate = sawCandidate || found
+			if bad {
+				return true, true
+			}
+		}
+	}
+	return sawCandidate, false
+}
+
+// hlsScanRawAttributeValues extracts value-shaped tokens from an attribute
+// list that failed to parse, so a syntax error cannot hide a URL on that line.
+func hlsScanRawAttributeValues(body string) []string {
+	values := make([]string, 0, 8)
+	for index := 0; index < len(body); index++ {
+		switch body[index] {
+		case '"':
+			close := strings.IndexByte(body[index+1:], '"')
+			if close < 0 {
+				values = append(values, body[index+1:])
+				return values
+			}
+			values = append(values, body[index+1:index+1+close])
+			index += close + 1
+		case '=':
+			start := index + 1
+			if start < len(body) && body[start] == '"' {
+				continue
+			}
+			end := start
+			for end < len(body) && body[end] != ',' {
+				end++
+			}
+			values = append(values, body[start:end])
+			index = end
+		}
+	}
+	return values
+}
+
+// hlsAttributeNameCarriesURL reports whether an attribute value is expected to
+// name a network location, so the scan can distinguish a missing rewrite from a
+// smuggled URL. It is intentionally broader than the strict rewriter's rewrite
+// list: a tag the strict parser refused (content steering, for example) still
+// carries an origin the player would fetch. Values of every other attribute are
+// still scanned by the caller, so an unlisted URL-bearing name is not a hole.
+func hlsAttributeNameCarriesURL(tag, name string) bool {
+	switch name {
+	case "URI", "URL", "X-URI", "X-URL", "X-ASSET-URI", "X-ASSET-LIST", "SERVER-URI", "BASE-URI":
+		return true
+	}
+	return strings.HasSuffix(name, "-URI") || strings.HasSuffix(name, "-URL")
+}
+
+// scanDASHManifestURLs extracts XML attribute values and text nodes that are
+// shaped like absolute URLs. Text nodes are included because the strict
+// rewriter rewrites recognized text content and, more importantly, because an
+// unrecognized feature inside a text node must not be handed to the player
+// with a live third-party destination.
+func scanDASHManifestURLs(payload []byte) (candidate, unsafe bool) {
+	sawCandidate := false
+	scan := func(value string) bool {
+		for _, decoded := range dashScanDecodedValues(value) {
+			found, bad := dynamicURLScanValue(decoded)
+			sawCandidate = sawCandidate || found
+			if bad {
+				return true
+			}
+		}
+		return false
+	}
+	rest := string(payload)
+	for {
+		open := strings.IndexByte(rest, '<')
+		if open < 0 {
+			break
+		}
+		rest = rest[open+1:]
+		end := strings.IndexByte(rest, '>')
+		if end < 0 {
+			break
+		}
+		tag := rest[:end]
+		rest = rest[end+1:]
+		if strings.HasPrefix(tag, "!") {
+			// CDATA carries text, not markup, so its content must be scanned as
+			// a value rather than skipped with the other declarations.
+			if body, ok := dashCDataBody(tag); ok {
+				if scan(body) {
+					return true, true
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(tag, "/") || strings.HasPrefix(tag, "?") {
+			continue
+		}
+		nameEnd := strings.IndexAny(tag, " \t\r\n/")
+		if nameEnd < 0 {
+			continue
+		}
+		for _, attribute := range dashScanAttributes(tag[nameEnd:]) {
+			if scan(attribute) {
+				return true, true
+			}
+		}
+	}
+	for _, text := range dashTextNodes(string(payload)) {
+		if scan(text) {
+			return true, true
+		}
+	}
+	return sawCandidate, false
+}
+
+// dashCDataBody returns the section content when a `<!...>` token is a CDATA
+// section.
+func dashCDataBody(tag string) (string, bool) {
+	const prefix = "![CDATA["
+	if !strings.HasPrefix(tag, prefix) {
+		return "", false
+	}
+	body := tag[len(prefix):]
+	return strings.TrimSuffix(body, "]]"), true
+}
+
+// dashScanDecodedValues returns the value together with its numeric-character-
+// reference decoding. An XML producer may legally write a scheme as entities
+// (`&#104;ttp://…`), and the parsed document would then carry a real URL even
+// though the raw bytes never contain the literal scheme.
+func dashScanDecodedValues(value string) []string {
+	values := []string{value}
+	if !strings.Contains(value, "&#") {
+		return values
+	}
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for index := 0; index < len(value); {
+		if value[index] == '&' && index+1 < len(value) && value[index+1] == '#' {
+			end := strings.IndexByte(value[index:], ';')
+			if end > 2 {
+				digits := value[index+2 : index+end]
+				base := 10
+				if digits[0] == 'x' || digits[0] == 'X' {
+					digits, base = digits[1:], 16
+				}
+				if code, err := strconv.ParseInt(digits, base, 32); err == nil && code > 0 && code <= 0x10ffff {
+					builder.WriteRune(rune(code))
+					index += end + 1
+					continue
+				}
+			}
+		}
+		builder.WriteByte(value[index])
+		index++
+	}
+	if decoded := builder.String(); decoded != value {
+		values = append(values, decoded)
+	}
+	return values
+}
+
+// dashScanAttributes returns the quoted attribute values of one XML start tag.
+func dashScanAttributes(body string) []string {
+	values := make([]string, 0, 8)
+	for index := 0; index < len(body); index++ {
+		quote := body[index]
+		if quote != '"' && quote != '\'' {
+			continue
+		}
+		close := strings.IndexByte(body[index+1:], quote)
+		if close < 0 {
+			break
+		}
+		values = append(values, body[index+1:index+1+close])
+		index += close + 1
+	}
+	return values
+}
+
+// dashTextNodes returns the character data between XML tags.
+func dashTextNodes(document string) []string {
+	nodes := make([]string, 0, 16)
+	rest := document
+	for {
+		open := strings.IndexByte(rest, '>')
+		if open < 0 {
+			break
+		}
+		rest = rest[open+1:]
+		next := strings.IndexByte(rest, '<')
+		if next < 0 {
+			if trimmed := strings.TrimSpace(rest); trimmed != "" {
+				nodes = append(nodes, trimmed)
+			}
+			break
+		}
+		if trimmed := strings.TrimSpace(rest[:next]); trimmed != "" {
+			nodes = append(nodes, trimmed)
+		}
+		rest = rest[next:]
+	}
+	return nodes
+}
+
+// dynamicURLScanValue classifies one extracted string.
+func dynamicURLScanValue(value string) (candidate, unsafe bool) {
+	candidate, safe := dynamicURLScanCandidate(value)
+	return candidate, candidate && !safe
+}
+
+// preservedStructuredBodyIsSafe proves that preserving an upstream structured
+// body verbatim will not hand the client a network destination Meridian cannot
+// represent. Every URL-shaped string the strict rewriter would have rewritten
+// must be one a capability could have carried.
+//
+// This closes the gap between "the strict parser rejected this manifest" and
+// "therefore the original bytes are safe to forward". A parser that stops
+// early on a vendor tag, an unsupported DRM descriptor, or an attribute error
+// never reaches its per-URL validation, so its failure alone proves nothing
+// about the URLs still in the payload. A relative path or a non-URL token
+// proves nothing either way and is ignored.
+func preservedStructuredBodyIsSafe(source string, payload []byte) bool {
+	switch source {
+	case dynamicDiscoverySourceHLS:
+		_, unsafe := scanHLSManifestURLs(payload)
+		return !unsafe
+	case dynamicDiscoverySourceDASH:
+		_, unsafe := scanDASHManifestURLs(payload)
+		return !unsafe
+	default:
+		return true
+	}
 }
 
 func (e *dynamicPolicyDenialError) Error() string { return e.reason }
@@ -826,9 +1322,14 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 			if accept != nil && !accept() {
 				return errDynamicCapabilityExpiredDuringUse
 			}
-			log.Printf("[%s] PlaybackInfo automatic URL proxy fallback preserved the upstream response", issuer.site.Name)
-			installDynamicStructuredBody(resp, payload, false)
-			return nil
+			// The schema-free walker refused a URL it recognized but could not
+			// route. Falling back to the upstream bytes here would be worse
+			// than the failure it avoids: the client would receive the whole
+			// body with every URL unproxied, so one unroutable field would cost
+			// the capability, the traffic accounting and the quota for all of
+			// them. Fail the response instead.
+			log.Printf("[%s] PlaybackInfo rewrite and automatic fallback both rejected: diagnostic=%s", issuer.site.Name, playbackInfoRewriteDiagnosticCode(fallbackErr))
+			return recordFailure(dynamicObservationReasonPlaybackInfoDenied)
 		}
 	}
 	if err != nil {
@@ -844,10 +1345,19 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		// for the whole site. PlaybackInfo keeps its own stricter chain: its
 		// denials (for example required headers on a relative URL that no
 		// capability could carry) must stay hard errors.
+		//
+		// Preserving is only safe once the payload has been proven to contain
+		// no network destination Meridian could not have represented: the
+		// strict parser stops at the first unsupported feature, so its failure
+		// says nothing about the URLs that follow it.
 		var denial *dynamicPolicyDenialError
 		if resp != nil && resp.Body != nil && resp.StatusCode < http.StatusBadRequest &&
 			(source == dynamicDiscoverySourceHLS || source == dynamicDiscoverySourceDASH) &&
 			!errors.As(err, &denial) {
+			if !preservedStructuredBodyIsSafe(source, payload) {
+				log.Printf("[%s] %s rewrite rejected and the body contains an unroutable URL; refusing to preserve it", issuer.site.Name, source)
+				return recordFailure(dynamicStructuredRewriteDeniedReason(source))
+			}
 			log.Printf("[%s] %s rewrite rejected; preserving upstream response: %v", issuer.site.Name, source, err)
 			issuer.observe(source, dynamicObservationDecisionDenied, dynamicStructuredRewriteDeniedReason(source), authority)
 			installDynamicStructuredBody(resp, payload, false)
