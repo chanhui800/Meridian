@@ -1,3 +1,8 @@
 install.sh text eol=lf
 docker-entrypoint.sh text eol=lf
 tests/*.sh text eol=lf
+# The Agent installer is a POSIX sh script that the panel serves byte-for-byte
+# and the node runs under /bin/sh. On Alpine that is busybox ash, which rejects
+# "set -e\r" with "illegal option -", so this file has to be LF in the working
+# tree and not only in the repository.
+scripts/*.sh text eol=lf
