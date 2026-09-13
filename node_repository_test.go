@@ -1484,9 +1484,17 @@ func TestBuildNodeInstallScriptDoesNotPersistTokenInService(t *testing.T) {
 func TestAgentInstallScriptIsTransactional(t *testing.T) {
 	script := buildNodeInstallScript("https://panel.example.com", "enrollment-secret")
 	downloadIndex := strings.Index(script, "curl --proto")
-	stopIndex := strings.Index(script, "systemctl stop meridian-agent.service")
+	// The stop must be asserted at its call site, not through the command text:
+	// that text now lives inside the cmd_service_stop helper, which is defined
+	// near the top of the script, so matching it would report the definition's
+	// position instead of the point where the service is actually stopped.
+	stopIndex := strings.Index(script, "\ncmd_service_stop\n")
 	if downloadIndex < 0 || stopIndex < 0 || stopIndex < downloadIndex {
 		t.Fatalf("Agent installer stops the service before downloading and validating: download=%d stop=%d", downloadIndex, stopIndex)
+	}
+	// Both init systems must be reachable through the helper layer.
+	if !strings.Contains(script, "rc-service meridian-agent stop") {
+		t.Fatal("Agent installer has no OpenRC stop path")
 	}
 	if !strings.Contains(script, "--reenroll") || !strings.Contains(script, "wait_for_registration") {
 		t.Fatal("Agent installer does not expose explicit re-enrollment and registration verification")

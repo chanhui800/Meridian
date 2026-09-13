@@ -49,8 +49,153 @@ case "$(uname -s):$(uname -m)" in
 esac
 
 command -v curl >/dev/null 2>&1 || { echo 'curl is required.' >&2; exit 1; }
-command -v systemctl >/dev/null 2>&1 || { echo 'systemd is required.' >&2; exit 1; }
 command -v mktemp >/dev/null 2>&1 || { echo 'mktemp is required.' >&2; exit 1; }
+
+# The Agent is supervised by the system init: it exits with a non-zero status
+# after replacing its own binary (self-update) and relies entirely on the init
+# system to start it again, so the unit written below must respawn. Both
+# supported init systems are detected explicitly, and an unsupported one is
+# reported by name instead of failing later with a misleading message.
+init_system=''
+if command -v systemctl >/dev/null 2>&1; then
+  init_system='systemd'
+elif command -v openrc >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; then
+  init_system='openrc'
+else
+  echo 'This Agent installer supports systemd and OpenRC only.' >&2
+  echo "Detected init: $(cat /proc/1/comm 2>/dev/null || echo unknown)" >&2
+  echo 'Alpine and other OpenRC systems are supported; a container without an init system is not.' >&2
+  exit 1
+fi
+service_file=
+openrc_service_file=/etc/init.d/meridian-agent
+case "$init_system" in
+  systemd) service_file=/etc/systemd/system/meridian-agent.service ;;
+esac
+
+# --- service lifecycle -------------------------------------------------------
+# One indirection layer so the install/rollback logic below is identical for
+# both init systems. Every helper tolerates "already stopped" / "already
+# running" states, because the installer re-runs over an existing install.
+cmd_service_stop() {
+  case "$init_system" in
+    systemd) systemctl stop meridian-agent.service >/dev/null 2>&1 || true ;;
+    openrc) rc-service meridian-agent stop >/dev/null 2>&1 || true ;;
+  esac
+}
+cmd_service_enable() {
+  if [ "$1" -eq 1 ]; then
+    case "$init_system" in
+      systemd) systemctl enable meridian-agent.service >/dev/null 2>&1 || true ;;
+      openrc) rc-update add meridian-agent default >/dev/null 2>&1 || true ;;
+    esac
+  else
+    case "$init_system" in
+      systemd) systemctl disable meridian-agent.service >/dev/null 2>&1 || true ;;
+      openrc) rc-update del meridian-agent default >/dev/null 2>&1 || true ;;
+    esac
+  fi
+}
+cmd_service_start() {
+  case "$init_system" in
+    systemd) systemctl start meridian-agent.service >/dev/null 2>&1 ;;
+    openrc) rc-service meridian-agent start >/dev/null 2>&1 ;;
+  esac
+}
+cmd_service_active() {
+  case "$init_system" in
+    systemd) systemctl is-active --quiet meridian-agent.service 2>/dev/null ;;
+    openrc) rc-service meridian-agent status >/dev/null 2>&1 ;;
+  esac
+}
+cmd_service_enabled() {
+  case "$init_system" in
+    systemd) systemctl is-enabled --quiet meridian-agent.service 2>/dev/null ;;
+    openrc) rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])meridian-agent([[:space:]]|$)' ;;
+  esac
+}
+cmd_service_reload() {
+  case "$init_system" in
+    systemd) systemctl daemon-reload >/dev/null 2>&1 || true ;;
+    openrc) : ;;
+  esac
+}
+cmd_service_install() {
+  # $1 = path to the freshly rendered unit/init script
+  case "$init_system" in
+    systemd)
+      install -m 0644 "$1" "$service_file.new"
+      mv -f "$service_file.new" "$service_file"
+      ;;
+    openrc)
+      install -m 0755 "$1" "$openrc_service_file.new"
+      mv -f "$openrc_service_file.new" "$openrc_service_file"
+      ;;
+  esac
+}
+write_agent_service_unit() {
+  # $1 = destination path
+  case "$init_system" in
+    systemd)
+      cat > "$1" <<EOF
+[Unit]
+Description=Meridian node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$install_dir/meridian-agent --controller $controller_url --state $state_dir/state.json --enroll-token-file $token_file
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=$state_dir $install_dir $token_dir
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      ;;
+    openrc)
+      # supervise-daemon plus respawn is the OpenRC equivalent of systemd's
+      # Restart=always: the Agent exits(1) after a self-update, so without a
+      # supervised respawn a node would stay offline after its first update.
+      cat > "$1" <<EOF
+#!/sbin/openrc-run
+# Managed by the Meridian Agent installer.
+name="meridian-agent"
+description="Meridian node agent"
+command="$install_dir/meridian-agent"
+command_args="--controller $controller_url --state $state_dir/state.json --enroll-token-file $token_file"
+command_user="root"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME:-meridian-agent}.pid"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/meridian-agent.log"
+error_log="/var/log/meridian-agent.log"
+rc_ulimit="-n 4096"
+depend() {
+  need net
+  after firewall
+}
+EOF
+      ;;
+  esac
+}
+
 install -d -m 0755 "$install_dir"
 install -d -m 0700 "$state_dir" "$token_dir"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/meridian-agent-install.XXXXXXXX")
@@ -120,35 +265,7 @@ fi
 chmod 0755 "$binary_tmp"
 printf '%s' "$enrollment_token" > "$token_tmp"
 chmod 0600 "$token_tmp"
-cat > "$service_tmp" <<EOF
-[Unit]
-Description=Meridian node agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$install_dir/meridian-agent --controller $controller_url --state $state_dir/state.json --enroll-token-file $token_file
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectHome=true
-ProtectSystem=strict
-ProtectHostname=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictRealtime=true
-ReadWritePaths=$state_dir $install_dir $token_dir
-
-[Install]
-WantedBy=multi-user.target
-EOF
+write_agent_service_unit "$service_tmp"
 
 # Snapshot the small set of files that will be replaced. A normal reinstall
 # keeps state.json; an explicit re-enrollment snapshots it so rollback can
@@ -174,15 +291,19 @@ previous_state_token=""
 if [ "$had_state" -eq 1 ]; then
   previous_state_token=$(sed -n 's/.*"agent_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)
 fi
-if [ -f "$service_file" ]; then
-  had_service=1
-  cp -p "$service_file" "$service_backup"
+managed_service_file="$service_file"
+if [ "$init_system" = 'openrc' ]; then
+  managed_service_file="$openrc_service_file"
 fi
-if systemctl is-active --quiet meridian-agent.service 2>/dev/null; then was_active=1; fi
-if systemctl is-enabled --quiet meridian-agent.service 2>/dev/null; then was_enabled=1; fi
+if [ -f "$managed_service_file" ]; then
+  had_service=1
+  cp -p "$managed_service_file" "$service_backup"
+fi
+if cmd_service_active; then was_active=1; fi
+if cmd_service_enabled; then was_enabled=1; fi
 
 rollback() {
-  systemctl stop meridian-agent.service >/dev/null 2>&1 || true
+  cmd_service_stop
   if [ "$had_binary" -eq 1 ]; then
     install -m 0755 "$binary_backup" "$install_dir/meridian-agent.rollback"
     mv -f "$install_dir/meridian-agent.rollback" "$install_dir/meridian-agent"
@@ -207,18 +328,18 @@ rollback() {
     rm -f "$state_file"
   fi
   if [ "$had_service" -eq 1 ]; then
-    install -m 0644 "$service_backup" "$service_file.rollback"
-    mv -f "$service_file.rollback" "$service_file"
+    install -m 0755 "$service_backup" "$managed_service_file.rollback"
+    mv -f "$managed_service_file.rollback" "$managed_service_file"
   else
-    rm -f "$service_file"
+    rm -f "$managed_service_file"
   fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  if [ "$was_enabled" -eq 1 ]; then systemctl enable meridian-agent.service >/dev/null 2>&1 || true; else systemctl disable meridian-agent.service >/dev/null 2>&1 || true; fi
-  if [ "$was_active" -eq 1 ]; then systemctl start meridian-agent.service >/dev/null 2>&1 || true; fi
+  cmd_service_reload
+  if [ "$was_enabled" -eq 1 ]; then cmd_service_enable 1; else cmd_service_enable 0; fi
+  if [ "$was_active" -eq 1 ]; then cmd_service_start || true; fi
 }
 trap 'if [ "$rollback_active" -eq 1 ]; then rollback; rollback_active=0; fi; exit 130' HUP INT TERM
 
-systemctl stop meridian-agent.service >/dev/null 2>&1 || true
+cmd_service_stop
 rollback_active=1
 install -m 0755 "$binary_tmp" "$install_dir/meridian-agent.new"
 mv -f "$install_dir/meridian-agent.new" "$install_dir/meridian-agent"
@@ -233,12 +354,12 @@ elif [ ! -f "$state_file" ]; then
   install -m 0600 "$token_tmp" "$token_file.new"
   mv -f "$token_file.new" "$token_file"
 fi
-install -m 0644 "$service_tmp" "$service_file.new"
-mv -f "$service_file.new" "$service_file"
+cmd_service_install "$service_tmp"
 wait_for_registration() {
-  # systemd may report active while the Agent is retrying an invalid token.
-  # Enrollment writes a new state file and removes the one-time token; wait
-  # for both signals before reporting success for a first install/re-enroll.
+  # An init system may report the service as running while the Agent is still
+  # retrying an invalid token. Enrollment writes a new state file and removes
+  # the one-time token; wait for both signals before reporting success for a
+  # first install/re-enroll.
   if [ "$reenroll" -ne 1 ] && [ "$had_state" -ne 0 ]; then
     return 0
   fi
@@ -251,8 +372,7 @@ wait_for_registration() {
       if [ "$had_state" -eq 0 ] || [ "$current_state_token" != "$previous_state_token" ]; then
         enrollment_committed=1
       fi
-      if systemctl is-active --quiet meridian-agent.service 2>/dev/null \
-        && [ ! -e "$token_file" ]; then
+      if cmd_service_active && [ ! -e "$token_file" ]; then
         return 0
       fi
     fi
@@ -261,7 +381,11 @@ wait_for_registration() {
   done
   return 1
 }
-if ! systemctl daemon-reload || ! systemctl enable --now meridian-agent.service || ! systemctl is-active --quiet meridian-agent.service || ! wait_for_registration; then
+# Enable first, then start, so a failure to register at boot is still reported
+# the same way on both init systems.
+cmd_service_reload
+cmd_service_enable 1
+if ! cmd_service_start || ! cmd_service_active || ! wait_for_registration; then
   rollback
   rollback_active=0
   if [ "$enrollment_committed" -eq 1 ]; then

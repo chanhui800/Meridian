@@ -30,9 +30,15 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
 - `-t`、`--token`：Controller 为该节点生成的一次性注册令牌，默认有效期 24 小时。
 - `--reenroll`：重新生成脚本后使用。它会清理本机旧的注册状态，等待新的注册状态写入。
 
-安装器只支持 Linux amd64 和 arm64，并要求节点能通过 HTTPS 访问 Controller。脚本会先下载并校验二进制、平台和 SHA-256，再停止现有服务。首次安装和重新注册会等待 Agent 真正完成注册，不会仅凭 systemd 的 `active` 状态报告成功。
+安装器只支持 Linux amd64 和 arm64，要求节点使用 **systemd 或 OpenRC**，并要求节点能通过 HTTPS 访问 Controller。Debian、Ubuntu 等 systemd 发行版和 Alpine 等 OpenRC 发行版都可以直接安装；脚本会先下载并校验二进制、平台和 SHA-256，再停止现有服务。首次安装和重新注册会等待 Agent 真正完成注册，不会仅凭服务管理器报告的 `active` 状态报告成功。
+
+Agent 二进制是静态链接的，不依赖 glibc，因此在 Alpine（musl libc）上无需安装兼容层。
+
+不支持既没有 systemd 也没有 OpenRC 的环境，例如没有 init 系统的容器。这种情况下安装器会在开始前退出，并打印检测到的 init。
 
 ## 安装后检查
+
+systemd 节点：
 
 ```bash
 sudo systemctl is-enabled meridian-agent
@@ -41,7 +47,18 @@ sudo journalctl -u meridian-agent -n 100 --no-pager
 sudo ss -lntp | grep ':9090'
 ```
 
+OpenRC 节点（Alpine 等）：
+
+```bash
+sudo rc-service meridian-agent status
+sudo rc-update show default | grep meridian-agent
+sudo tail -n 100 /var/log/meridian-agent.log
+sudo ss -lntp | grep ':9090'
+```
+
 如果节点使用其他端口，请替换最后一条命令中的端口号。Controller 的“节点调度”页面应显示在线、网卡名称、最近心跳和“配置已应用”。如果日志出现监听端口冲突，请先释放端口或修改节点端口。
+
+在 OpenRC 上，服务由 `supervise-daemon` 托管并配置了无限重试：Agent 自更新后会以非零状态退出，由服务管理器重新拉起。请勿手工修改 `/etc/init.d/meridian-agent` 中的 `respawn_*` 设置，否则 Agent 自更新后会停止运行。
 
 ## 升级和重新注册
 
@@ -58,12 +75,23 @@ sudo ss -lntp | grep ':9090'
 
 ## 卸载 Agent
 
-先在 Controller 中删除节点，再在目标节点执行：
+先在 Controller 中删除节点，再在目标节点执行。
+
+systemd 节点：
 
 ```bash
 sudo systemctl disable --now meridian-agent.service
 sudo rm -f /etc/systemd/system/meridian-agent.service
 sudo systemctl daemon-reload
+sudo rm -rf /opt/meridian-agent /var/lib/meridian-agent /etc/meridian-agent
+```
+
+OpenRC 节点（Alpine 等）：
+
+```bash
+sudo rc-service meridian-agent stop
+sudo rc-update del meridian-agent default
+sudo rm -f /etc/init.d/meridian-agent
 sudo rm -rf /opt/meridian-agent /var/lib/meridian-agent /etc/meridian-agent
 ```
 

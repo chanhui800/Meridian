@@ -69,16 +69,26 @@ jobs:
           echo 'echo "defaults-ok"' >> /tmp/install-defaults.sh
           env -u MERIDIAN_DATA_DIR -u MERIDIAN_INSTALL_DIR -u MERIDIAN_BACKUP_DIR -u MERIDIAN_SERVICE_NAME -u MERIDIAN_ROOT_GROUP bash /tmp/install-defaults.sh | grep -q 'defaults-ok'
           bash -n tests/install_test.sh
+          bash -n tests/agent_install_test.sh
+          bash -n tests/agent_install_container_test.sh
           bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh
           bash -n tests/dynamic_route_key_test.sh
           bash -n scripts/release-policy.sh
           bash -n tests/release_policy_test.sh
-          shellcheck install.sh scripts/agent-install.sh docker-entrypoint.sh scripts/release-policy.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh tests/release_policy_test.sh
+          shellcheck install.sh scripts/agent-install.sh docker-entrypoint.sh scripts/release-policy.sh tests/install_test.sh tests/agent_install_test.sh tests/agent_install_container_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh tests/release_policy_test.sh
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
+          bash tests/agent_install_test.sh
           bash tests/release_policy_test.sh
+
+      # Runs the real Agent installer inside a real Alpine (musl/OpenRC)
+      # container. Alpine uses OpenRC instead of systemd, which is the platform
+      # this coverage exists for; the script skips itself when no daemon is
+      # reachable.
+      - name: Agent installer works under OpenRC
+        run: bash tests/agent_install_container_test.sh
 
       - name: Test Docker entrypoint
         run: bash tests/docker_entrypoint_test.sh
