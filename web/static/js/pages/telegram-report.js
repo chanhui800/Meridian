@@ -76,7 +76,7 @@ function renderTelegramReport() {
           <div><h2>日报内容</h2><p>通知会自动包含以下统计。</p></div>
         </div>
         <div class="telegram-report-items">
-          <div><span>01</span><p><strong>今日概览</strong><small>独立访客、请求总数、视频请求、站点数量、活跃高峰与最热媒体库</small></p></div>
+          <div><span>01</span><p><strong>今日概览</strong><small>请求总数、视频请求、站点数量、活跃高峰与最热媒体库</small></p></div>
           <div><span>02</span><p><strong>服务器部署信息</strong><small>各落地节点的今日流量、当月用量与剩余额度</small></p></div>
           <div><span>03</span><p><strong>客户端分布</strong><small>访问次数最高的前 5 个客户端标识及占比</small></p></div>
           <div><span>04</span><p><strong>流量统计</strong><small>当天、七天内、30 天内与历史累计</small></p></div>

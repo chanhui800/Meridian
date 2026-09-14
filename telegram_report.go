@@ -120,26 +120,26 @@ type telegramReportTrafficWarning struct {
 }
 
 type telegramReportStats struct {
-	GeneratedAt          time.Time
-	UniqueClients        int64
-	ActivePeak           int64
-	Requests             int64
-	VideoRequests        int64
-	TodayTraffic         int64
-	SevenDayTraffic      int64
-	ThirtyDayTraffic     int64
-	HistoryTraffic       int64
-	BillingMode          string
-	SiteCount            int
-	RunningSiteCount     int
-	ControllerSiteCount  int
-	TrafficWarnPercent   int
-	TopRequests          []telegramReportSiteStat
-	TopTraffic           []telegramReportSiteStat
-	Nodes                []telegramReportNodeStat
-	TrafficWarnings      []telegramReportTrafficWarning
-	RetentionSites       []telegramReportRetentionStat
-	TopUserAgents        []struct {
+	GeneratedAt         time.Time
+	UniqueClients       int64
+	ActivePeak          int64
+	Requests            int64
+	VideoRequests       int64
+	TodayTraffic        int64
+	SevenDayTraffic     int64
+	ThirtyDayTraffic    int64
+	HistoryTraffic      int64
+	BillingMode         string
+	SiteCount           int
+	RunningSiteCount    int
+	ControllerSiteCount int
+	TrafficWarnPercent  int
+	TopRequests         []telegramReportSiteStat
+	TopTraffic          []telegramReportSiteStat
+	Nodes               []telegramReportNodeStat
+	TrafficWarnings     []telegramReportTrafficWarning
+	RetentionSites      []telegramReportRetentionStat
+	TopUserAgents       []struct {
 		Name  string
 		Count int64
 	}
@@ -747,14 +747,13 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n\n")
 	// The reader wants the moment first: a report is only actionable if the
 	// window it covers is unambiguous.
-	fmt.Fprintf(&b, "⏱ 统计时间：%s\n\n", stats.GeneratedAt.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&b, "⏱️ 统计时间：%s\n\n", stats.GeneratedAt.Format("2006-01-02 15:04"))
 
 	b.WriteString("✨ 今日概览\n")
-	fmt.Fprintf(&b, "• 👥 独立访客：%d 人\n", stats.UniqueClients)
 	fmt.Fprintf(&b, "• 📈 请求总数：%d 次\n", stats.Requests)
 	fmt.Fprintf(&b, "• 🎬 视频请求：%d 次\n", stats.VideoRequests)
 	fmt.Fprintf(&b, "• 🗂 媒体库站点：%d 个（启用 %d 个）\n", stats.SiteCount, stats.RunningSiteCount)
-	fmt.Fprintf(&b, "• ⚡ 活跃高峰：%d 人/分钟\n", stats.ActivePeak)
+	fmt.Fprintf(&b, "• ⚡️ 活跃高峰：%d 人/分钟\n", stats.ActivePeak)
 	if len(stats.TopTraffic) > 0 {
 		hottest := stats.TopTraffic[0]
 		fmt.Fprintf(&b, "• 🏆 今日最热媒体库：%s（%s）\n", truncateTelegramText(hottest.Name, 48), formatTelegramBytes(hottest.Traffic))
@@ -767,9 +766,6 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	if len(stats.Nodes) == 0 {
 		b.WriteString("• 暂无落地节点\n")
 	}
-	if len(stats.Nodes) == 1 {
-		fmt.Fprintf(&b, "• 所有站点统一通过 %s 中转\n", truncateTelegramText(stats.Nodes[0].Name, 48))
-	}
 	for _, node := range stats.Nodes {
 		remaining := "未设置额度"
 		if node.HasQuota {
@@ -777,18 +773,6 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 		}
 		fmt.Fprintf(&b, "• %s（%d 个站点）：今日 %s 丨 当月 %s 丨 剩余 %s\n",
 			truncateTelegramText(node.Name, 48), node.SiteCount, formatTelegramBytes(node.TodayTraffic), formatTelegramBytes(node.CycleTraffic), remaining)
-	}
-	if stats.ControllerSiteCount > 0 {
-		fmt.Fprintf(&b, "• 另有 %d 个站点由控制端直接承载（未走落地节点）\n", stats.ControllerSiteCount)
-	}
-	if len(stats.Nodes) > 0 {
-		online := 0
-		for _, node := range stats.Nodes {
-			if node.SiteCount > 0 {
-				online++
-			}
-		}
-		fmt.Fprintf(&b, "• 共 %d 个落地节点 · 服务中 %d 个 ✅\n", len(stats.Nodes), online)
 	}
 	b.WriteString("\n")
 
@@ -880,6 +864,10 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	return message
 }
 
+// telegramReportRankPrefix marks a rank in the daily heat list: the crown and
+// the star carry the top two, then the keycap digits. The keycap form is what
+// the operator asked for, and it is used consistently for ranks three onward so
+// the list never mixes an emoji marker with a bare digit.
 func telegramReportRankPrefix(index int) string {
 	switch index {
 	case 0:
@@ -887,7 +875,7 @@ func telegramReportRankPrefix(index int) string {
 	case 1:
 		return "🌟"
 	default:
-		return fmt.Sprintf("%d.", index+1)
+		return fmt.Sprintf("%d\ufe0f\u20e3", index+1)
 	}
 }
 

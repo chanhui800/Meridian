@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,9 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 			{Name: "最热", Traffic: 5 << 30},
 			{Name: "次热", Traffic: 3 << 30},
 			{Name: "第三", Traffic: 2 << 30},
+			{Name: "第四", Traffic: 1 << 30},
+			{Name: "第五", Traffic: 1 << 20},
+			{Name: "第六不该出现", Traffic: 1 << 10},
 		},
 		Nodes: []telegramReportNodeStat{{Name: "落地节点", TodayTraffic: 1 << 30, CycleTraffic: 10 << 30, Remaining: 90 << 30, HasQuota: true, SiteCount: 11}},
 		RetentionSites: []telegramReportRetentionStat{
@@ -43,9 +47,12 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 	message := buildTelegramReportMessage(stats)
 	for _, expected := range []string{
 		"📊 Meridian 数据日报",
-		"⏱ 统计时间：2026-09-13 20:00",
+		"⏱️ 统计时间：2026-09-13 20:00",
 		"✨ 今日概览",
-		"👥 独立访客：42 人",
+		"• 📈 请求总数：1234 次",
+		"• 🎬 视频请求：567 次",
+		"• 🗂 媒体库站点：11 个（启用 11 个）",
+		"• ⚡️ 活跃高峰：7 人/分钟",
 		"🏆 今日最热媒体库：最热",
 		"📍 服务器部署信息",
 		"🧩 客户端分布",
@@ -58,6 +65,12 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 			t.Fatalf("report is missing %q:\n%s", expected, message)
 		}
 	}
+	// Lines the operator took out of the agreed layout must stay out.
+	for _, removed := range []string{"独立访客", "所有站点统一通过", "由控制端直接承载", "个落地节点 · 服务中", "历史条数"} {
+		if strings.Contains(message, removed) {
+			t.Fatalf("report still renders the removed %q line:\n%s", removed, message)
+		}
+	}
 	// Section order is part of the contract, not just presence.
 	order := []string{"✨ 今日概览", "📍 服务器部署信息", "🧩 客户端分布", "🌐 流量统计", "🔥 今日节点热度 TOP 5", "🔔 保号提醒", "🚀 System Status"}
 	position := -1
@@ -68,26 +81,52 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 		}
 		position = index
 	}
-	// The top library is ranked by traffic, so the crown marks the heaviest site.
-	if !strings.Contains(message, "👑 最热：") || !strings.Contains(message, "🌟 次热：") || !strings.Contains(message, "3. 第三：") {
+	// The top library is ranked by traffic, so the crown marks the heaviest site
+	// and the keycap digits carry the remaining ranks.
+	if !strings.Contains(message, "👑 最热：") || !strings.Contains(message, "🌟 次热：") || !strings.Contains(message, "3\ufe0f\u20e3 第三：") {
 		t.Fatalf("ranking markers are wrong:\n%s", message)
 	}
-	if strings.Contains(message, "历史条数") {
-		t.Fatalf("report still renders the removed history-count line:\n%s", message)
+	for index := 3; index <= 5; index++ {
+		want := fmt.Sprintf("%d\ufe0f\u20e3", index)
+		if !strings.Contains(message, want) {
+			t.Fatalf("rank %d is missing its keycap marker %q:\n%s", index, want, message)
+		}
+	}
+	if strings.Contains(message, "No.3") || strings.Contains(message, "\n3. ") {
+		t.Fatalf("a bare or spelled-out rank prefix survived:\n%s", message)
+	}
+	// The list is capped at five even when more sites have traffic.
+	if strings.Contains(message, "第六不该出现") {
+		t.Fatalf("the heat list rendered more than five rows:\n%s", message)
 	}
 }
 
-func TestTelegramReportDeploymentSectionSummarisesSingleNode(t *testing.T) {
+func TestTelegramReportRankPrefixUsesAskedMarkers(t *testing.T) {
+	// The exact markers the operator asked for, byte for byte. The keycap digits
+	// are the ones that must not drift back to a bare "3.".
+	want := []string{"👑", "🌟", "3\ufe0f\u20e3", "4\ufe0f\u20e3", "5\ufe0f\u20e3"}
+	for index, expected := range want {
+		if got := telegramReportRankPrefix(index); got != expected {
+			t.Fatalf("rank %d prefix = %q, want %q", index+1, got, expected)
+		}
+	}
+	if got := telegramReportRankPrefix(0); got == telegramReportRankPrefix(2) {
+		t.Fatalf("the top rank and the third rank share the marker %q", got)
+	}
+}
+
+func TestTelegramReportDeploymentSectionListsNodes(t *testing.T) {
 	message := buildTelegramReportMessage(telegramReportStats{
 		GeneratedAt:        time.Now(),
 		TrafficWarnPercent: telegramReportTrafficWarnDisableValue,
 		Nodes:              []telegramReportNodeStat{{Name: "唯一节点", TodayTraffic: 1 << 30, CycleTraffic: 2 << 30, Remaining: 8 << 30, HasQuota: true, SiteCount: 11}},
 	})
-	if !strings.Contains(message, "所有站点统一通过 唯一节点 中转") {
-		t.Fatalf("single-node deployment summary missing:\n%s", message)
+	if !strings.Contains(message, "• 唯一节点（11 个站点）：今日 1.00 GB 丨 当月 2.00 GB 丨 剩余 8.00 GB") {
+		t.Fatalf("node line is wrong:\n%s", message)
 	}
-	if !strings.Contains(message, "共 1 个落地节点 · 服务中 1 个 ✅") {
-		t.Fatalf("node tally missing:\n%s", message)
+	// The deployment section is the node list and nothing else.
+	if strings.Contains(message, "所有站点统一通过") || strings.Contains(message, "个落地节点") {
+		t.Fatalf("deployment section carries a summary line the operator removed:\n%s", message)
 	}
 	// An unmetered node must say so instead of printing a bogus 0 B remaining.
 	unmetered := buildTelegramReportMessage(telegramReportStats{
@@ -492,9 +531,6 @@ func TestTelegramReportClientDistributionListsShares(t *testing.T) {
 	empty := buildTelegramReportMessage(telegramReportStats{GeneratedAt: time.Now()})
 	if !strings.Contains(empty, "• 暂无客户端数据") || !strings.Contains(empty, "• 暂无落地节点") {
 		t.Fatalf("empty report is missing its empty states:\n%s", empty)
-	}
-	if strings.Contains(empty, "共 0 个落地节点") {
-		t.Fatalf("empty report printed a node tally without nodes:\n%s", empty)
 	}
 	if strings.Contains(empty, "⚠️ 流量预警") {
 		t.Fatalf("empty report printed a warning section:\n%s", empty)
