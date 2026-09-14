@@ -227,6 +227,9 @@ func main() {
 		}
 	}()
 	go runTelegramReportScheduler(ctx, db)
+	// Threshold alerts run on their own cadence and are independent of the daily
+	// report: an alert goes out when a quota crosses the line, not on a schedule.
+	go runTelegramTrafficAlertScheduler(ctx, db)
 	tmdb := newTMDBService(db, nil)
 	go tmdb.Run(ctx)
 
@@ -326,6 +329,7 @@ func main() {
 	mux.HandleFunc("/api/tmdb-settings/cache/clear", cors(app.authMiddleware(app.handleTMDBCacheClear)))
 	mux.HandleFunc("/api/tmdb-settings", cors(app.authMiddleware(app.handleTMDBSettings)))
 	mux.HandleFunc("/api/telegram-report", cors(app.authMiddleware(app.handleTelegramReport)))
+	mux.HandleFunc("/api/telegram-alerts", cors(app.authMiddleware(app.handleTelegramTrafficAlerts)))
 	mux.HandleFunc("/api/ua-profiles", cors(app.authMiddleware(app.handleUAProfiles)))
 	mux.HandleFunc("/api/events", cors(app.authMiddleware(app.handleSSE)))
 	mux.HandleFunc("/api/nodes", cors(app.authMiddleware(app.handleNodes)))
