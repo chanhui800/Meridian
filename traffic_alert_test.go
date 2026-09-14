@@ -23,10 +23,14 @@ func TestTelegramAlertBucketStepsAndEscalation(t *testing.T) {
 		{500, 80, 0, "below the threshold"},
 		{799, 80, 0, "one byte below the threshold"},
 		{800, 80, 80, "exactly at the threshold"},
-		{950, 80, 80, "between the threshold and the first step"},
-		{1000, 80, 100, "a full quota is the next step"},
-		{1199, 80, 100, "past full but below the following step"},
-		{1200, 80, 120, "the step after a full quota"},
+		{840, 80, 80, "just under the next step"},
+		{850, 80, 85, "the first five-point step"},
+		{899, 80, 85, "just under the step after that"},
+		{900, 80, 90, "two steps up"},
+		{999, 80, 95, "just under a full quota"},
+		{1000, 80, 100, "a full quota"},
+		{1001, 80, 100, "one byte past a full quota"},
+		{1050, 80, 105, "past the quota, onto the next step"},
 		{2000, 80, 200, "double the quota"},
 		{2400, 80, 240, "past double"},
 		{500, 0, 0, "alerts disabled"},
@@ -36,12 +40,31 @@ func TestTelegramAlertBucketStepsAndEscalation(t *testing.T) {
 			t.Fatalf("bucket for used=%d warn=%d = %d, want %d (%s)", testCase.used, testCase.warn, got, testCase.expected, testCase.why)
 		}
 	}
-	// A tighter threshold makes its own first step.
-	if got := telegramReportAlertBucket(600, limit, 50); got != 50 {
-		t.Fatalf("bucket at 50%% threshold = %d, want 50", got)
+	// The ladder is anchored on the threshold: its first step is the threshold
+	// itself, and each further step is one more step size up.
+	if got := telegramReportAlertBucket(500, limit, 50); got != 50 {
+		t.Fatalf("bucket exactly at a 50%% threshold = %d, want 50", got)
+	}
+	if got := telegramReportAlertBucket(600, limit, 50); got != 60 {
+		t.Fatalf("bucket at 50%% threshold with 60%% used = %d, want 60", got)
 	}
 	if got := telegramReportAlertBucket(400, limit, 50); got != 0 {
 		t.Fatalf("bucket below the 50%% threshold = %d, want 0", got)
+	}
+	// A threshold that is not a multiple of the step anchors its own first step,
+	// which is how the very first alert fires at exactly the configured line
+	// rather than at the next round number.
+	if got := telegramReportAlertBucket(720, limit, 72); got != 72 {
+		t.Fatalf("bucket exactly at a 72%% threshold = %d, want 72", got)
+	}
+	if got := telegramReportAlertBucket(700, limit, 72); got != 0 {
+		t.Fatalf("bucket below a 72%% threshold = %d, want 0", got)
+	}
+	if got := telegramReportAlertBucket(760, limit, 72); got != 72 {
+		t.Fatalf("bucket between the anchoring step and the next = %d, want 72", got)
+	}
+	if got := telegramReportAlertBucket(770, limit, 72); got != 77 {
+		t.Fatalf("bucket one step above a 72%% threshold = %d, want 77", got)
 	}
 	// A quota large enough to overflow a naive ratio must still classify.
 	const huge = int64(1) << 62
@@ -50,6 +73,15 @@ func TestTelegramAlertBucketStepsAndEscalation(t *testing.T) {
 	}
 	if got := telegramReportAlertBucket(0, 0, 80); got != 0 {
 		t.Fatalf("bucket for an unmetered resource = %d, want 0", got)
+	}
+	// The ladder is anchored on the threshold, so every step is a whole multiple
+	// of the configured step size.
+	for percent := 80; percent <= 130; percent += 5 {
+		used := int64(percent * 10)
+		got := telegramReportAlertBucket(used, limit, 80)
+		if got%trafficAlertEscalationStep != 0 || got < 80 || got > percent {
+			t.Fatalf("bucket at %d%% = %d, which is not a step at or below the usage", percent, got)
+		}
 	}
 }
 
@@ -143,36 +175,49 @@ func TestTelegramAlertFiresOnceAndEscalates(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("crossing the threshold sent %d alerts, want 1", len(sent))
 	}
-	// Sitting above the line must not repeat on every tick.
+	// Sitting above the line but below the next step must not repeat.
 	for range 5 {
 		tick(0.82)
 	}
 	if len(sent) != 1 {
 		t.Fatalf("a resource parked above the threshold sent %d alerts, want 1", len(sent))
 	}
-	// Climbing into the next step is a new announcement.
-	tick(1.05)
+	// Climbing onto the next step is a new announcement.
+	tick(0.85)
 	if len(sent) != 2 {
-		t.Fatalf("crossing into the next step sent %d alerts, want 2", len(sent))
+		t.Fatalf("crossing onto the first step sent %d alerts, want 2", len(sent))
 	}
 	for range 5 {
-		tick(1.10)
+		tick(0.88)
 	}
 	if len(sent) != 2 {
-		t.Fatalf("a resource parked past the quota sent %d alerts, want 2", len(sent))
+		t.Fatalf("a resource parked on a step sent %d alerts, want 2", len(sent))
 	}
-	tick(1.25)
+	tick(0.90)
 	if len(sent) != 3 {
 		t.Fatalf("crossing the following step sent %d alerts, want 3", len(sent))
 	}
+	// The steps keep escalating past a full quota.
+	tick(1.00)
+	if len(sent) != 4 {
+		t.Fatalf("crossing a full quota sent %d alerts, want 4", len(sent))
+	}
+	tick(1.10)
+	if len(sent) != 5 {
+		t.Fatalf("crossing the step past a full quota sent %d alerts, want 5", len(sent))
+	}
+	tick(1.15)
+	if len(sent) != 6 {
+		t.Fatalf("crossing the step after that sent %d alerts, want 6", len(sent))
+	}
 	// Dropping back below the threshold does not re-arm within the same cycle.
 	tick(0.10)
-	if len(sent) != 3 {
+	if len(sent) != 6 {
 		t.Fatalf("dropping below the threshold changed the alert count to %d", len(sent))
 	}
-	tick(0.85)
-	if len(sent) != 3 {
-		t.Fatalf("re-crossing the same step re-alerted within the cycle: %d alerts", len(sent))
+	tick(0.86)
+	if len(sent) != 6 {
+		t.Fatalf("re-crossing an already announced step re-alerted within the cycle: %d alerts", len(sent))
 	}
 
 	// A new billing cycle re-arms every step. The node's own cycle boundary is
@@ -186,22 +231,23 @@ func TestTelegramAlertFiresOnceAndEscalates(t *testing.T) {
 	}
 	setUsage(0.85)
 	runTelegramTrafficAlertTick(context.Background(), app.db, nextCycle, sender)
-	if len(sent) != 4 {
-		t.Fatalf("a new cycle sent %d alerts in total, want 4", len(sent))
+	if len(sent) != 7 {
+		t.Fatalf("a new cycle sent %d alerts in total, want 7", len(sent))
 	}
 	// In the current cycle the same state must stay quiet.
 	setUsage(0.85)
 	runTelegramTrafficAlertTick(context.Background(), app.db, now, sender)
-	if len(sent) != 4 {
+	if len(sent) != 7 {
 		t.Fatalf("the original cycle re-alerted after the new cycle ran: %d alerts", len(sent))
 	}
-	// The ledger must hold one row per (resource, cycle, step).
+	// The ledger must hold one row per (resource, cycle, step): six from the first
+	// cycle and one from the second.
 	var rows int
 	if err := app.db.db.QueryRow(`SELECT COUNT(*) FROM telegram_traffic_alerts WHERE kind='node' AND resource_id=?`, node.ID).Scan(&rows); err != nil {
 		t.Fatalf("count ledger rows: %v", err)
 	}
-	if rows != 4 {
-		t.Fatalf("ledger rows = %d, want 4", rows)
+	if rows != 7 {
+		t.Fatalf("ledger rows = %d, want 7", rows)
 	}
 }
 
