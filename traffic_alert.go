@@ -20,9 +20,11 @@ const (
 	// reporting cadence that feeds it, and keeps the alert timely.
 	trafficAlertCheckInterval = time.Minute
 	// How far past the threshold a resource must climb before it is announced
-	// again. 20 points means a resource at 80% is announced again at 100% and at
-	// 120%: the escalation an operator needs, without a message per percent.
-	trafficAlertEscalationStep = 20
+	// again. Five points means a resource at 80% is announced again at 85%, 90%,
+	// 95%, 100% and so on: fine enough to track the approach to a limit step by
+	// step, coarse enough that a resource parked at one level stays quiet rather
+	// than alerting on every tick.
+	trafficAlertEscalationStep = 5
 	trafficAlertHistoryKept    = 200
 )
 
@@ -48,9 +50,9 @@ type telegramTrafficAlert struct {
 // telegramReportAlertBucket maps a used/limit state onto its escalation step.
 // The steps are multiples of trafficAlertEscalationStep starting at the first
 // multiple that is at least the configured threshold, and the result is the
-// highest step the usage has reached. With the default 80% threshold the steps
-// are 80, 100, 120, 140 and so on, so a resource is announced when it crosses
-// the line and then only when it climbs another 20 points.
+// highest step the usage has reached. With the default 80% threshold and a
+// five-point step those are 80, 85, 90, 95, 100 and so on, so a resource is
+// announced when it crosses the line and then once per further step.
 //
 // The comparisons go through telegramReportRatioAtLeastPercent rather than
 // scaling the numbers, because a quota large enough to overflow int64 would

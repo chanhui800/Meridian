@@ -56,7 +56,7 @@ function renderTelegramReport() {
           <label class="telegram-field">
             <span>流量预警阈值</span>
             <input class="form-input" type="number" id="telegram-traffic-warning" min="0" max="100" step="1" inputmode="numeric" value="80">
-            <small>节点或站点已用流量达到该百分比时，会<strong>立即单独推送一条预警</strong>；用量每再涨 20% 会再提醒一次，同一周期内不会重复。填 0 关闭预警。</small>
+            <small>节点或站点已用流量达到该百分比时，会<strong>立即单独推送一条预警</strong>；之后每再涨 5%（如 80→85→90）再提醒一次，同一档位不重复。填 0 关闭预警。</small>
           </label>
           <label class="telegram-field">
             <span>发送时间</span>
@@ -83,7 +83,7 @@ function renderTelegramReport() {
           <div><span>05</span><p><strong>今日站点热度 TOP 5</strong><small>当日流量最高的前 5 个站点及请求次数</small></p></div>
           <div><span>06</span><p><strong>流量预警</strong><small>用量触及阈值百分比的节点与站点（阈值可调）</small></p></div>
           <div><span>07</span><p><strong>保号提醒</strong><small>开启保号的站点完成状态与剩余天数</small></p></div>
-          <div><span>08</span><p><strong>阈值预警（单独推送）</strong><small>用量达到阈值时立刻单独发一条，不占用日报；每涨 20% 再提醒一次</small></p></div>
+          <div><span>08</span><p><strong>阈值预警（单独推送）</strong><small>用量达到阈值时立刻单独发一条，不占用日报；每再涨 5% 提醒一次</small></p></div>
         </div>
       </aside></div></main>
     </div>`;
