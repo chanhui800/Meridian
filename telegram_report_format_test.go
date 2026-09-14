@@ -32,12 +32,12 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 		BillingMode:        trafficBillingModeBidirectional,
 		TrafficWarnPercent: 80,
 		TopTraffic: []telegramReportSiteStat{
-			{Name: "最热", Traffic: 5 << 30},
-			{Name: "次热", Traffic: 3 << 30},
-			{Name: "第三", Traffic: 2 << 30},
-			{Name: "第四", Traffic: 1 << 30},
-			{Name: "第五", Traffic: 1 << 20},
-			{Name: "第六不该出现", Traffic: 1 << 10},
+			{Name: "最热", Traffic: 5 << 30, Requests: 900},
+			{Name: "次热", Traffic: 3 << 30, Requests: 800},
+			{Name: "第三", Traffic: 2 << 30, Requests: 700},
+			{Name: "第四", Traffic: 1 << 30, Requests: 600},
+			{Name: "第五", Traffic: 1 << 20, Requests: 500},
+			{Name: "第六不该出现", Traffic: 1 << 10, Requests: 400},
 		},
 		Nodes: []telegramReportNodeStat{{Name: "落地节点", TodayTraffic: 1 << 30, CycleTraffic: 10 << 30, Remaining: 90 << 30, HasQuota: true, SiteCount: 11}},
 		RetentionSites: []telegramReportRetentionStat{
@@ -52,7 +52,7 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 		"• 📈 请求总数：1234 次",
 		"• 🎬 视频请求：567 次",
 		"• 🗂 媒体库站点：11 个（启用 11 个）",
-		"• ⚡️ 活跃高峰：7 人/分钟",
+		"• ⚡️ 活跃高峰：7 人（最忙的 1 分钟内）",
 		"🏆 今日最热媒体库：最热",
 		"📍 服务器部署信息",
 		"🧩 客户端分布",
@@ -82,9 +82,12 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 		position = index
 	}
 	// The top library is ranked by traffic, so the crown marks the heaviest site
-	// and the keycap digits carry the remaining ranks.
-	if !strings.Contains(message, "👑 最热：") || !strings.Contains(message, "🌟 次热：") || !strings.Contains(message, "3\ufe0f\u20e3 第三：") {
-		t.Fatalf("ranking markers are wrong:\n%s", message)
+	// and the keycap digits carry the remaining ranks. Each line leads with the
+	// traffic figure and follows with the request count.
+	if !strings.Contains(message, "👑 最热：5.00 GB 丨 900 次请求") ||
+		!strings.Contains(message, "🌟 次热：3.00 GB 丨 800 次请求") ||
+		!strings.Contains(message, "3\ufe0f\u20e3 第三：2.00 GB 丨 700 次请求") {
+		t.Fatalf("ranking lines are wrong:\n%s", message)
 	}
 	for index := 3; index <= 5; index++ {
 		want := fmt.Sprintf("%d\ufe0f\u20e3", index)

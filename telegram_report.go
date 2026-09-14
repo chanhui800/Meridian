@@ -753,7 +753,10 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	fmt.Fprintf(&b, "• 📈 请求总数：%d 次\n", stats.Requests)
 	fmt.Fprintf(&b, "• 🎬 视频请求：%d 次\n", stats.VideoRequests)
 	fmt.Fprintf(&b, "• 🗂 媒体库站点：%d 个（启用 %d 个）\n", stats.SiteCount, stats.RunningSiteCount)
-	fmt.Fprintf(&b, "• ⚡️ 活跃高峰：%d 人/分钟\n", stats.ActivePeak)
+	// This figure is the busiest time window, not a head count: it is the
+	// largest number of distinct clients seen inside any single minute, so the
+	// label has to say so rather than read as concurrent viewers.
+	fmt.Fprintf(&b, "• ⚡️ 活跃高峰：%d 人（最忙的 1 分钟内）\n", stats.ActivePeak)
 	if len(stats.TopTraffic) > 0 {
 		hottest := stats.TopTraffic[0]
 		fmt.Fprintf(&b, "• 🏆 今日最热媒体库：%s（%s）\n", truncateTelegramText(hottest.Name, 48), formatTelegramBytes(hottest.Traffic))
@@ -812,7 +815,9 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 		}
 		for index := 0; index < limit; index++ {
 			item := stats.TopTraffic[index]
-			fmt.Fprintf(&b, "%s %s：%s\n", telegramReportRankPrefix(index), truncateTelegramText(item.Name, 48), formatTelegramBytes(item.Traffic))
+			// The rank is driven by traffic, so the traffic figure leads and the
+			// request count follows as the secondary number on the same line.
+			fmt.Fprintf(&b, "%s %s：%s 丨 %d 次请求\n", telegramReportRankPrefix(index), truncateTelegramText(item.Name, 48), formatTelegramBytes(item.Traffic), item.Requests)
 		}
 	}
 	b.WriteString("\n")
