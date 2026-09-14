@@ -101,7 +101,7 @@ test('telegram page previews the report sections the builder actually emits', ()
     '服务器部署信息',
     '客户端分布',
     '流量统计',
-    '今日节点热度 TOP 5',
+    '今日站点热度 TOP 5',
     '流量预警',
     '保号提醒',
   ]) {

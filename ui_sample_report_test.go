@@ -14,31 +14,42 @@ func TestUISampleReportDump(t *testing.T) {
 	if os.Getenv("UI_SAMPLE_REPORT") == "" {
 		t.Skip("set UI_SAMPLE_REPORT=1 to print a sample report")
 	}
-	const mb = int64(1) << 20
+	// formatTelegramBytes divides by 1024, so express the figures the way the
+	// panel does: 1 GB is 10^9 bytes, which is about 0.93 GiB.
+	const gb = int64(1_000_000_000)
+	const mb = int64(1_000_000)
+	peakStart := time.Date(2026, time.September, 14, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
 	stats := telegramReportStats{
-		GeneratedAt:         time.Date(2026, time.September, 14, 11, 39, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+		GeneratedAt:         time.Date(2026, time.September, 14, 12, 43, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
 		UniqueClients:       4,
 		ActivePeak:          2,
+		PeakStart:           peakStart,
+		PeakEnd:             peakStart.Add(time.Hour),
+		PeakRequests:        10,
+		HasPeakWindow:       true,
 		Requests:            115,
 		VideoRequests:       2,
 		SiteCount:           11,
 		RunningSiteCount:    11,
-		TodayTraffic:        1650 * mb,
-		SevenDayTraffic:     114130 * mb,
-		ThirtyDayTraffic:    171280 * mb,
-		HistoryTraffic:      171280 * mb,
+		TodayTraffic:        int64(1.65 * float64(gb)),
+		SevenDayTraffic:     int64(114.13 * float64(gb)),
+		CycleTraffic:        227_010_587_698,
+		CycleStart:          time.Date(2026, time.September, 15, 0, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+		LifetimeTraffic:     171_280_000_000,
 		BillingMode:         trafficBillingModeBidirectional,
 		ControllerSiteCount: 9,
 		TrafficWarnPercent:  80,
 		TopTraffic: []telegramReportSiteStat{
-			{Name: "1111", Requests: 20, Traffic: 1640 * mb},
-			{Name: "折纸", Requests: 5, Traffic: 3240000},
-			{Name: "予初", Requests: 3, Traffic: 827170},
-			{Name: "茶百道", Requests: 2, Traffic: 37440},
-			{Name: "桃子", Requests: 1, Traffic: 25470},
+			{Name: "1111", Requests: 36, Traffic: 1_640_000_000},
+			{Name: "折纸", Requests: 29, Traffic: 3_240_000},
+			{Name: "予初", Requests: 16, Traffic: 827_170},
+			{Name: "茶百道", Requests: 16, Traffic: 37_440},
+			{Name: "桃子", Requests: 16, Traffic: 25_470},
 		},
 		Nodes: []telegramReportNodeStat{
-			{Name: "9929", TodayTraffic: 1640 * mb, CycleTraffic: 342750 * mb, Remaining: 157250 * mb, HasQuota: true, SiteCount: 2},
+			// Live figures: rx + tx + the 80 GiB manual offset is 227.01 GB, the
+			// same amount the panel renders as 211.42 GiB for this node.
+			{Name: "9929", TodayTraffic: 1_640_000_000, CycleTraffic: 227_010_587_698, Remaining: 309_860_324_302, HasQuota: true, SiteCount: 2},
 		},
 		RetentionSites: []telegramReportRetentionStat{
 			{Name: "墨云阁", RemainingDays: 23},
@@ -51,11 +62,11 @@ func TestUISampleReportDump(t *testing.T) {
 		struct {
 			Name  string
 			Count int64
-		}{Name: "CapyPlayer/1.1.5", Count: 113},
+		}{Name: telegramReportClientName("CapyPlayer/1.1.5"), Count: 113},
 		struct {
 			Name  string
 			Count int64
-		}{Name: "Hills/1.9.0-beta.1 (android; 17)", Count: 2},
+		}{Name: telegramReportClientName("Hills/1.9.0-beta.1 (android; 17)"), Count: 2},
 	)
 	message := buildTelegramReportMessage(stats)
 	fmt.Printf("\n----8<---- report (%d bytes) ----8<----\n%s\n----8<---- end ----8<----\n", len(message), message)
