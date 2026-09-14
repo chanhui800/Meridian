@@ -10,6 +10,8 @@
 #   openrc  - rc-service present, no systemctl  -> /etc/init.d script
 #   systemd - systemctl present                 -> systemd unit
 #   none    - neither                           -> refuses, naming both
+#   crosscontroller - a stored credential the Controller rejects
+#                                             -> refuses, demanding --reenroll
 #
 # Requires docker. Skips (exit 0) when docker or the alpine image is unavailable,
 # so it is safe to run anywhere; CI runs it where a daemon exists.
@@ -69,9 +71,9 @@ echo "$dir"
 EOF
 cat > "$SB/bin-common/curl" <<'EOF'
 #!/bin/sh
-out=""; hdr=""; prev=""
+out=""; hdr=""; prev=""; wfmt=""
 for a in "$@"; do
-  case "$prev" in -o) out="$a" ;; -D) hdr="$a" ;; esac
+  case "$prev" in -o) out="$a" ;; -D) hdr="$a" ;; -w) wfmt="$a" ;; esac
   prev="$a"
 done
 url=""
@@ -102,7 +104,21 @@ exit 0
 AGENT
     chmod +x "$out"
     ;;
+  */api/agent/config)
+    # What the Controller answers when the stored Agent credential is probed.
+    # A marker selects the answer so the same stub can model both "this node is
+    # already enrolled here" and "this node belongs to another Controller".
+    if [ -f "$SB/config-rejects" ]; then
+      [ -n "$wfmt" ] && printf '401'
+    else
+      [ -n "$wfmt" ] && printf '200'
+      [ -n "$out" ] && printf '{}' > "$out"
+    fi
+    ;;
 esac
+# The installer reads the status code through -w '%{http_code}'; every other
+# call site relies on the real exit status, so only an unknown URL without a
+# format request falls through to the generic exit 0 below.
 exit 0
 EOF
 cat > "$SB/bin-common/sha256sum" <<'EOF'
@@ -143,6 +159,20 @@ case "$1" in
 esac
 exit 0
 EOF
+  ;;
+crosscontroller)
+  # Same init surface as the systemd scenario; the difference is the Controller's
+  # answer to the credential probe.
+  cat > "$SB/bin-init/systemctl" <<'EOF'
+#!/bin/sh
+case "$1" in
+  is-active) [ -f "$SB/service-started" ] && exit 0 || exit 3 ;;
+  start)     : > "$SB/service-started"; exit 0 ;;
+  stop)      rm -f "$SB/service-started"; exit 0 ;;
+esac
+exit 0
+EOF
+  : > "$SB/config-rejects"
   ;;
 esac
 chmod +x "$SB/bin-init/"* 2>/dev/null || true
@@ -226,6 +256,17 @@ none)
   probe "names both supported inits" grep -q 'supports systemd and OpenRC only' "$SB/install.log"
   probe_not "no misleading systemd-only message" grep -q 'systemd is required' "$SB/install.log"
   ;;
+crosscontroller)
+  # The stored credential belongs to another Controller. Skipping enrollment and
+  # printing success is the bug this scenario exists to prevent.
+  expect_rc 1 "installer refuses instead of reporting success"
+  probe "states the node belongs to a different Controller" grep -q 'already enrolled to a different Meridian Controller' "$SB/install.log"
+  probe "says the panel will keep showing it as pending" grep -q 'keep showing it as pending' "$SB/install.log"
+  probe "offers the --reenroll command" grep -q -- '--reenroll' "$SB/install.log"
+  probe "the offered command targets this Controller" grep -q 'panel.example.test:9090' "$SB/install.log"
+  probe_not "does not claim success" grep -q 'Meridian Agent installed and running' "$SB/install.log"
+  probe_not "does not leave a token for the next start" test -e "$SB/etc/meridian-agent/enrollment-token"
+  ;;
 esac
 
 echo
@@ -234,7 +275,7 @@ echo "SCENARIO $SCENARIO: PASS"
 CONTAINER
 
 OVERALL=0
-for scenario in openrc systemd none; do
+for scenario in openrc systemd none crosscontroller; do
     echo
     docker run --rm --platform linux/amd64 \
         -v "$WORK/agent-install.sh:/tmp/agent-install.sh:ro" \

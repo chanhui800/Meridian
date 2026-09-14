@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -34,10 +35,15 @@ var (
 )
 
 type ControlNode struct {
-	ID                          int64  `json:"id"`
-	GUID                        string `json:"guid"`
-	Name                        string `json:"name"`
-	Address                     string `json:"address"`
+	ID      int64  `json:"id"`
+	GUID    string `json:"guid"`
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	// AddressSource records where Address came from: "manual" when an operator
+	// entered it, "enrollment" when it was inferred from the source address of
+	// the Agent's own enrollment request. The panel surfaces the difference so
+	// an inferred address is reviewed rather than trusted silently.
+	AddressSource               string `json:"address_source"`
 	Port                        int    `json:"port"`
 	Enabled                     bool   `json:"enabled"`
 	Priority                    int    `json:"priority"`
@@ -445,6 +451,8 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	}
 	nowMS := now.UnixMilli()
 	cycleStart := nodeCycleStart(now, input.ResetDay, d.currentSystemSettings().ScheduleTimezone)
+	// address_source is left to its column default here: a row created from the
+	// panel always carries an operator-entered address.
 	result, err := d.db.Exec(`INSERT INTO control_nodes
 		(guid,name,address,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
 		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
@@ -466,7 +474,7 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
+const controlNodeSelect = `SELECT id,guid,name,address,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
@@ -476,7 +484,7 @@ const controlNodeSelect = `SELECT id,guid,name,address,https_port,enabled,priori
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
 	var enabled, configDirty int
-	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
+	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
@@ -803,14 +811,17 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 
 	portChanged := currentPort != input.Port
 	enabledChanged := currentEnabled != sqliteBool(enabled)
+	// Saving from the panel always records the address as operator-confirmed, so
+	// an address that enrollment once inferred loses its "please verify" marker
+	// the moment a human touches the form.
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
 			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
 			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
 			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
@@ -1008,7 +1019,57 @@ func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
 	return nil
 }
 
+// Address provenance values stored in control_nodes.address_source.
+const (
+	nodeAddressSourceManual     = "manual"
+	nodeAddressSourceEnrollment = "enrollment"
+)
+
+// enrollSourceAddressAnswer decides whether the source address of an enrollment
+// request may stand in for a node address the operator left empty.
+//
+// The address ends up in a site's DNS A/AAAA record, so a wrong guess publishes
+// the wrong host and breaks the site. It is therefore accepted only when the
+// controller observed it directly and it is globally routable: a private or
+// loopback address cannot serve public DNS, and an address seen through a
+// trusted proxy describes that proxy rather than the node.
+func enrollSourceAddressAnswer(sourceIP string) (string, bool) {
+	trimmed := strings.TrimSpace(sourceIP)
+	if trimmed == "" {
+		return "", false
+	}
+	// requestClientKey can fall back to a raw RemoteAddr string; only a real IP
+	// is usable here.
+	parsed := net.ParseIP(trimmed)
+	if parsed == nil || !nodeAddressIsGlobalUnicast(parsed) {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+// nodeAddressIsGlobalUnicast reports whether an address could be published as a
+// public DNS record. Link-local, loopback, private and unspecified ranges are
+// rejected, as are IPv6 addresses that are not globally routable.
+func nodeAddressIsGlobalUnicast(ip net.IP) bool {
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	// IPv4-mapped IPv6 addresses compare as IPv4 for routability, which is what
+	// the DNS record type will be derived from anyway.
+	return true
+}
+
 func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string, error) {
+	return d.EnrollControlNodeFromSource(token, now, "")
+}
+
+// EnrollControlNodeFromSource enrolls a node and, when the operator left the
+// address empty, records the address the controller observed the Agent connect
+// from. sourceIP comes from the enrollment request and is ignored when empty,
+// non-routable, or when the operator already supplied an address.
+func (d *DB) EnrollControlNodeFromSource(token string, now time.Time, sourceIP string) (ControlNode, string, error) {
 	if jwtSecretEphemeral {
 		return ControlNode{}, "", errPersistentJWTRequired
 	}
@@ -1045,6 +1106,13 @@ func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string
 	rows, err := result.RowsAffected()
 	if err != nil || rows != 1 {
 		return ControlNode{}, "", errInvalidNodeToken
+	}
+	if inferred, ok := enrollSourceAddressAnswer(sourceIP); ok {
+		// Only fills a blank: an operator-entered address is never overwritten.
+		if _, err := tx.Exec(`UPDATE control_nodes SET address=?,address_source=? WHERE id=? AND TRIM(address)=''`,
+			inferred, nodeAddressSourceEnrollment, id); err != nil {
+			return ControlNode{}, "", err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return ControlNode{}, "", err
