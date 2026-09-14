@@ -104,8 +104,12 @@ type telegramReportNodeStat struct {
 	TodayTraffic int64
 	CycleTraffic int64
 	Remaining    int64
-	HasQuota     bool
-	SiteCount    int
+	// Limit is the node's configured quota. Remaining is clamped at zero once the
+	// quota is exhausted, so the ratio must be taken against this figure rather
+	// than against used+remaining.
+	Limit     int64
+	HasQuota  bool
+	SiteCount int
 }
 
 // telegramReportTrafficWarning is one quota that has reached the configured
@@ -630,6 +634,7 @@ func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings
 		}
 		if quota > 0 {
 			node.HasQuota = true
+			node.Limit = quota
 			node.Remaining = quota - node.CycleTraffic
 			if node.Remaining < 0 {
 				node.Remaining = 0
@@ -658,7 +663,7 @@ func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings
 			if !node.HasQuota {
 				continue
 			}
-			warning, ok := telegramReportProximityWarning("node", node.Name, node.CycleTraffic, node.Remaining, stats.TrafficWarnPercent)
+			warning, ok := telegramReportProximityWarning("node", node.Name, node.CycleTraffic, node.Limit, stats.TrafficWarnPercent)
 			if ok {
 				warnings = append(warnings, warning)
 			}
@@ -696,11 +701,7 @@ func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings
 			if err != nil {
 				return err
 			}
-			remaining := site.quota - used
-			if remaining < 0 {
-				remaining = 0
-			}
-			warning, ok := telegramReportProximityWarning("site", site.name, used, remaining, stats.TrafficWarnPercent)
+			warning, ok := telegramReportProximityWarning("site", site.name, used, site.quota, stats.TrafficWarnPercent)
 			if ok {
 				warnings = append(warnings, warning)
 			}
@@ -722,16 +723,24 @@ func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings
 	return nil
 }
 
-// telegramReportProximityWarning reports whether used/limit has reached the
-// warning line, and returns the pre-charged numbers for rendering. A quota of
-// zero means unmetered on both nodes and sites, so it never warns.
-func telegramReportProximityWarning(kind, name string, used, remaining int64, warnPercent int) (telegramReportTrafficWarning, bool) {
-	limit := used + remaining
+// telegramReportProximityWarning reports whether used has reached warnPercent of
+// the configured limit. The limit is passed in rather than derived from
+// used+remaining: Remaining is clamped at zero once the quota is exhausted, so
+// deriving it there would make a spent quota look like a quota that is exactly
+// spent, and near-spent traffic would read as exactly at the line.
+//
+// A limit of zero or less means unmetered on both nodes and sites, so it never
+// warns.
+func telegramReportProximityWarning(kind, name string, used, limit int64, warnPercent int) (telegramReportTrafficWarning, bool) {
 	if warnPercent <= telegramReportTrafficWarnDisableValue || limit <= 0 {
 		return telegramReportTrafficWarning{}, false
 	}
 	if !telegramReportRatioAtLeastPercent(used, limit, warnPercent) {
 		return telegramReportTrafficWarning{}, false
+	}
+	remaining := limit - used
+	if remaining < 0 {
+		remaining = 0
 	}
 	return telegramReportTrafficWarning{Kind: kind, Name: name, Used: used, Limit: limit, Remaining: remaining}, true
 }

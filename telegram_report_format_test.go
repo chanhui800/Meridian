@@ -188,21 +188,27 @@ func TestTelegramReportProximityWarningHonoursThresholdAndDisableValue(t *testin
 
 	// The threshold comparison itself: exact equality must warn, because the
 	// operator picked that line on purpose, and everything below it must not.
-	if _, ok := telegramReportProximityWarning("node", "刚好到线", 80, 20, 80); !ok {
+	// The fourth argument is the configured limit, never the clamped remainder.
+	if _, ok := telegramReportProximityWarning("node", "刚好到线", 80, 100, 80); !ok {
 		t.Fatal("usage exactly at the threshold did not warn")
 	}
-	if _, ok := telegramReportProximityWarning("node", "差一点", 79, 21, 80); ok {
+	if _, ok := telegramReportProximityWarning("node", "差一点", 79, 100, 80); ok {
 		t.Fatal("usage below the threshold warned")
 	}
 	if _, ok := telegramReportProximityWarning("node", "零额度", 0, 0, 80); ok {
 		t.Fatal("an unmetered quota produced a warning")
 	}
-	if _, ok := telegramReportProximityWarning("node", "关闭预警", 100, 0, telegramReportTrafficWarnDisableValue); ok {
+	if _, ok := telegramReportProximityWarning("node", "关闭预警", 100, 100, telegramReportTrafficWarnDisableValue); ok {
 		t.Fatal("a disabled threshold produced a warning")
 	}
-	// A large quota must not overflow the comparison: 640 PiB at 90%.
+	// A spent quota must still report the true remaining as zero.
+	spent, ok := telegramReportProximityWarning("node", "已用满", 140, 100, 80)
+	if !ok || spent.Remaining != 0 || spent.Limit != 100 || spent.Used != 140 {
+		t.Fatalf("spent quota warning = %+v, want used 140 limit 100 remaining 0", spent)
+	}
+	// A large quota must not overflow the comparison: 640 PiB of a 704 PiB limit.
 	const pib = int64(1) << 50
-	if _, ok := telegramReportProximityWarning("node", "超大额度", 640*pib, 64*pib, 80); !ok {
+	if _, ok := telegramReportProximityWarning("node", "超大额度", 640*pib, 704*pib, 80); !ok {
 		t.Fatal("a very large quota did not warn at 90%")
 	}
 }
@@ -230,7 +236,7 @@ func TestTelegramReportProximityWarningSurvivesQuotaOverflow(t *testing.T) {
 			}
 			used := exact.Int64()
 
-			warning, ok := telegramReportProximityWarning("node", "超大额度", used, limit-used, percent)
+			warning, ok := telegramReportProximityWarning("node", "超大额度", used, limit, percent)
 			if !ok {
 				t.Fatalf("quota %d with %d%% used did not warn", limit, percent)
 			}
@@ -239,7 +245,7 @@ func TestTelegramReportProximityWarningSurvivesQuotaOverflow(t *testing.T) {
 			}
 			// One byte below the line must stay quiet, which also proves the
 			// comparison does not simply saturate to "always warn".
-			if _, ok := telegramReportProximityWarning("node", "超大额度", used-1, limit-used+1, percent); ok {
+			if _, ok := telegramReportProximityWarning("node", "超大额度", used-1, limit, percent); ok {
 				t.Fatalf("quota %d one byte below %d%% warned", limit, percent)
 			}
 
@@ -316,9 +322,95 @@ func TestTelegramReportStatsCountLandingNodeUsage(t *testing.T) {
 	if got.CycleTraffic != 1000 || got.Remaining != 0 || !got.HasQuota {
 		t.Fatalf("node cycle = %+v, want used 1000 remaining 0", got)
 	}
-	// A fully consumed quota must warn, so the double-charge cannot hide here.
+	if got.Limit != 1000 {
+		t.Fatalf("node limit = %d, want the configured quota 1000", got.Limit)
+	}
+	// A fully consumed quota must warn, and the warning must reach the message.
 	if len(stats.TrafficWarnings) != 1 || stats.TrafficWarnings[0].Kind != "node" || stats.TrafficWarnings[0].Used != 1000 {
 		t.Fatalf("warnings = %+v, want one node warning with used 1000", stats.TrafficWarnings)
+	}
+	if message := buildTelegramReportMessage(stats); !strings.Contains(message, "🔴 节点 report-node：已用 100.0%（剩余 0 B）") {
+		t.Fatalf("a full node quota did not render a warning line:\n%s", message)
+	}
+}
+
+// TestTelegramReportNodeWarningFiresAtTheThreshold pins that node usage is
+// compared against the configured quota, not against used+remaining. Because
+// Remaining is clamped at zero, deriving the limit from it makes any exhausted
+// quota compare as exactly 100% and makes near-threshold usage compare against
+// itself, which silently suppressed the node warning entirely.
+func TestTelegramReportNodeWarningFiresAtTheThreshold(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().In(time.Local)
+	const gib = int64(1) << 30
+	const quota = int64(500) * gib
+
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "threshold-node", Address: "203.0.113.98", Port: 9443,
+		TrafficQuota: quota, BillingMode: trafficBillingModeBidirectional, ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatalf("CreateControlNode: %v", err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatalf("EnrollControlNode: %v", err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "threshold-site", PublicHost: "threshold.example.test", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatalf("SaveSiteNodeSchedule: %v", err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,dns_status='active' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
+		t.Fatalf("apply schedule: %v", err)
+	}
+
+	warnedAt := func(fraction float64) (bool, string, string) {
+		t.Helper()
+		// Bidirectional counters are charged, so period_tx alone is the usage.
+		tx := int64(float64(quota) * fraction)
+		if _, err := app.db.db.Exec(`UPDATE control_nodes SET enabled=1, period_rx_bytes=0, period_tx_bytes=?, traffic_manual_offset_bytes=0 WHERE id=?`, tx, node.ID); err != nil {
+			t.Fatalf("seed usage: %v", err)
+		}
+		stats, err := app.db.buildTelegramReportStats(now)
+		if err != nil {
+			t.Fatalf("buildTelegramReportStats: %v", err)
+		}
+		message := buildTelegramReportMessage(stats)
+		line := ""
+		for _, candidate := range strings.Split(message, "\n") {
+			if strings.Contains(candidate, "•") && strings.Contains(candidate, "threshold-node：已用") {
+				line = candidate
+			}
+		}
+		return strings.Contains(message, "⚠️ 流量预警"), line, message
+	}
+
+	for _, testCase := range []struct {
+		fraction float64
+		want     bool
+	}{
+		{0.50, false},
+		{0.79, false},
+		{0.80, true},
+		{0.85, true},
+		{1.00, true},
+		{1.20, true},
+	} {
+		warned, line, message := warnedAt(testCase.fraction)
+		if warned != testCase.want {
+			t.Fatalf("at %.0f%% of quota: warning = %v, want %v\n%s", testCase.fraction*100, warned, testCase.want, message)
+		}
+		if testCase.want && !strings.Contains(line, "已用") {
+			t.Fatalf("at %.0f%%: warning section present but no node line rendered", testCase.fraction*100)
+		}
+	}
+
+	// The rendered ratio must track the quota, not the clamped remainder.
+	_, line, _ := warnedAt(1.20)
+	if !strings.Contains(line, "已用 120.0%") {
+		t.Fatalf("over-quota node line = %q, want it to report 120.0%%", line)
 	}
 }
 
