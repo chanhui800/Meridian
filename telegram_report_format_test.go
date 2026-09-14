@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"math/big"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -152,10 +153,64 @@ func TestTelegramReportProximityWarningHonoursThresholdAndDisableValue(t *testin
 	if _, ok := telegramReportProximityWarning("node", "关闭预警", 100, 0, telegramReportTrafficWarnDisableValue); ok {
 		t.Fatal("a disabled threshold produced a warning")
 	}
-	// A large quota must not overflow the integer comparison: 1 PiB used at 80%.
+	// A large quota must not overflow the comparison: 640 PiB at 90%.
 	const pib = int64(1) << 50
-	if _, ok := telegramReportProximityWarning("node", "超大额度", 90*(pib/100), 10*(pib/100), 80); !ok {
+	if _, ok := telegramReportProximityWarning("node", "超大额度", 640*pib, 64*pib, 80); !ok {
 		t.Fatal("a very large quota did not warn at 90%")
+	}
+}
+
+// TestTelegramReportProximityWarningSurvivesQuotaOverflow checks the comparison
+// against an exact big-integer oracle at quotas above the point where the
+// obvious `used*100` form wraps int64. Those wrappings produced a negative
+// product, so a nearly full quota was reported as nearly empty.
+func TestTelegramReportProximityWarningSurvivesQuotaOverflow(t *testing.T) {
+	// limit*100 exceeds MaxInt64 once the quota passes ~92 PB (2^56.4).
+	// Disagreement with the int64 form is not guaranteed on every input, because
+	// two wrapped products can still compare the same way, so it is tracked
+	// across the whole matrix and required at least once.
+	witnessedDisagreement := false
+	for _, limit := range []int64{1 << 57, 1 << 58, 1 << 62, (1 << 63) - 1, int64(1)<<60 + 7919} {
+		bigLimit := big.NewInt(limit)
+		for _, percent := range []int{1, 20, 50, 80, 99, 100} {
+			// The smallest whole number of bytes that reaches the threshold,
+			// computed without truncation: ceil(limit * percent / 100).
+			exact := new(big.Int).Mul(bigLimit, big.NewInt(int64(percent)))
+			exact.Add(exact, big.NewInt(99))
+			exact.Div(exact, big.NewInt(100))
+			if !exact.IsInt64() {
+				t.Fatalf("test setup: %d%% of %d exceeds int64", percent, limit)
+			}
+			used := exact.Int64()
+
+			warning, ok := telegramReportProximityWarning("node", "超大额度", used, limit-used, percent)
+			if !ok {
+				t.Fatalf("quota %d with %d%% used did not warn", limit, percent)
+			}
+			if warning.Limit != limit || warning.Used != used {
+				t.Fatalf("warning = %+v, want used %d limit %d", warning, used, limit)
+			}
+			// One byte below the line must stay quiet, which also proves the
+			// comparison does not simply saturate to "always warn".
+			if _, ok := telegramReportProximityWarning("node", "超大额度", used-1, limit-used+1, percent); ok {
+				t.Fatalf("quota %d one byte below %d%% warned", limit, percent)
+			}
+
+			oldForm := used*100 >= limit*int64(percent)
+			newForm := telegramReportRatioAtLeastPercent(used, limit, percent)
+			if oldForm != newForm {
+				if !newForm {
+					t.Fatalf("quota %d at %d%%: the two forms disagreed and the new one was wrong", limit, percent)
+				}
+				witnessedDisagreement = true
+			}
+		}
+	}
+	if !witnessedDisagreement {
+		t.Fatal("no input in this matrix distinguishes the 128-bit comparison from the int64 one")
+	}
+	if telegramReportRatioAtLeastPercent(0, 1<<62, 1) {
+		t.Fatal("zero usage warned at 1%")
 	}
 }
 
