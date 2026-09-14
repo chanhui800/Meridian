@@ -226,7 +226,8 @@ func TestTelegramReportTrafficUsesGlobalBillingMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build bidirectional stats: %v", err)
 	}
-	if dual.TodayTraffic != 200 || dual.HistoryTraffic != 200 || len(dual.TopTraffic) != 1 || dual.TopTraffic[0].Traffic != 200 {
+	// The global billing mode charges today's traffic and the lifetime total.
+	if dual.TodayTraffic != 200 || dual.LifetimeTraffic != 200 || len(dual.TopTraffic) != 1 || dual.TopTraffic[0].Traffic != 200 {
 		t.Fatalf("bidirectional stats = %+v, want traffic 200", dual)
 	}
 
@@ -239,7 +240,7 @@ func TestTelegramReportTrafficUsesGlobalBillingMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build outbound stats: %v", err)
 	}
-	if outbound.TodayTraffic != 90 || outbound.HistoryTraffic != 90 || len(outbound.TopTraffic) != 1 || outbound.TopTraffic[0].Traffic != 90 {
+	if outbound.TodayTraffic != 90 || outbound.LifetimeTraffic != 90 || len(outbound.TopTraffic) != 1 || outbound.TopTraffic[0].Traffic != 90 {
 		t.Fatalf("outbound stats = %+v, want traffic 90", outbound)
 	}
 }

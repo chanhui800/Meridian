@@ -27,8 +27,9 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 		RunningSiteCount:   11,
 		TodayTraffic:       3 << 30,
 		SevenDayTraffic:    21 << 30,
-		ThirtyDayTraffic:   90 << 30,
-		HistoryTraffic:     400 << 30,
+		CycleTraffic:       90 << 30,
+		CycleStart:         time.Date(2026, time.September, 15, 0, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+		LifetimeTraffic:    400 << 30,
 		BillingMode:        trafficBillingModeBidirectional,
 		TrafficWarnPercent: 80,
 		TopTraffic: []telegramReportSiteStat{
@@ -49,15 +50,14 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 		"📊 Meridian 数据日报",
 		"⏱️ 统计时间：2026-09-13 20:00",
 		"✨ 今日概览",
-		"• 📈 请求总数：1234 次",
-		"• 🎬 视频请求：567 次",
-		"• 🗂 媒体库站点：11 个（启用 11 个）",
-		"• ⚡️ 活跃高峰：7 人（最忙的 1 分钟内）",
+		"📈 请求总数：1234 次",
+		"🎬 视频请求：567 次",
+		"🗂 媒体库站点：11 个（启用 11 个）",
 		"🏆 今日最热媒体库：最热",
 		"📍 服务器部署信息",
 		"🧩 客户端分布",
 		"🌐 流量统计",
-		"🔥 今日节点热度 TOP 5",
+		"🔥 今日站点热度 TOP 5",
 		"🔔 保号提醒",
 		"🚀 System Status：Operational",
 	} {
@@ -65,14 +65,19 @@ func TestTelegramReportMessageCarriesEveryAgreedSection(t *testing.T) {
 			t.Fatalf("report is missing %q:\n%s", expected, message)
 		}
 	}
+	// 今日概览 is the headline block and carries no list bullets.
+	overview := message[strings.Index(message, "✨ 今日概览"):strings.Index(message, "📍 服务器部署信息")]
+	if strings.Contains(overview, "•") {
+		t.Fatalf("今日概览 still carries a bullet:\n%s", overview)
+	}
 	// Lines the operator took out of the agreed layout must stay out.
-	for _, removed := range []string{"独立访客", "所有站点统一通过", "由控制端直接承载", "个落地节点 · 服务中", "历史条数"} {
+	for _, removed := range []string{"独立访客", "所有站点统一通过", "由控制端直接承载", "个落地节点 · 服务中", "历史条数", "人/分钟"} {
 		if strings.Contains(message, removed) {
 			t.Fatalf("report still renders the removed %q line:\n%s", removed, message)
 		}
 	}
 	// Section order is part of the contract, not just presence.
-	order := []string{"✨ 今日概览", "📍 服务器部署信息", "🧩 客户端分布", "🌐 流量统计", "🔥 今日节点热度 TOP 5", "🔔 保号提醒", "🚀 System Status"}
+	order := []string{"✨ 今日概览", "📍 服务器部署信息", "🧩 客户端分布", "🌐 流量统计", "🔥 今日站点热度 TOP 5", "🔔 保号提醒", "🚀 System Status"}
 	position := -1
 	for _, header := range order {
 		index := strings.Index(message, header)
@@ -261,7 +266,7 @@ func TestTelegramReportStatsCountLandingNodeUsage(t *testing.T) {
 	now := time.Now().In(time.Local)
 	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{
 		Name: "report-node", Address: "203.0.113.77", Port: 9443,
-		TrafficQuota: 1000, BillingMode: trafficBillingModeOutbound, ResetDay: 1,
+		TrafficQuota: 1000, BillingMode: trafficBillingModeBidirectional, ResetDay: 1,
 	}, now)
 	if err != nil {
 		t.Fatalf("CreateControlNode: %v", err)
@@ -280,7 +285,11 @@ func TestTelegramReportStatsCountLandingNodeUsage(t *testing.T) {
 	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET desired_node_id=?,applied_node_id=?,dns_status='active' WHERE site_id=?`, node.ID, node.ID, site.ID); err != nil {
 		t.Fatalf("apply schedule: %v", err)
 	}
-	if _, err := app.db.db.Exec(`UPDATE control_nodes SET enabled=1, period_rx_bytes=?, period_tx_bytes=? WHERE id=?`, int64(500), int64(400), node.ID); err != nil {
+	// A bidirectional node's period counters already carry the Agent's charge,
+	// so the report sums them exactly as the panel does: rx + tx + offset. The
+	// panel would render 1000 here; the doubling convention would print 1900.
+	if _, err := app.db.db.Exec(`UPDATE control_nodes SET enabled=1, period_rx_bytes=?, period_tx_bytes=?, traffic_manual_offset_bytes=? WHERE id=?`,
+		int64(500), int64(400), int64(100), node.ID); err != nil {
 		t.Fatalf("seed node counters: %v", err)
 	}
 	if _, err := app.db.db.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?)`,
@@ -304,30 +313,73 @@ func TestTelegramReportStatsCountLandingNodeUsage(t *testing.T) {
 	if got.TodayTraffic != 200 {
 		t.Fatalf("node today traffic = %d, want 200", got.TodayTraffic)
 	}
-	// The node cycle uses its OWN outbound mode, so 400 out of a 1000 quota
-	// leaves 600. Reading the panel-wide bidirectional mode here would report
-	// 900 used and 100 remaining, and would trip an 80% warning wrongly.
-	if got.CycleTraffic != 400 || got.Remaining != 600 || !got.HasQuota {
-		t.Fatalf("node cycle = %+v, want used 400 remaining 600", got)
+	if got.CycleTraffic != 1000 || got.Remaining != 0 || !got.HasQuota {
+		t.Fatalf("node cycle = %+v, want used 1000 remaining 0", got)
 	}
-	if len(stats.TrafficWarnings) != 0 {
-		t.Fatalf("warnings = %+v, want none at 40%% of quota", stats.TrafficWarnings)
+	// A fully consumed quota must warn, so the double-charge cannot hide here.
+	if len(stats.TrafficWarnings) != 1 || stats.TrafficWarnings[0].Kind != "node" || stats.TrafficWarnings[0].Used != 1000 {
+		t.Fatalf("warnings = %+v, want one node warning with used 1000", stats.TrafficWarnings)
 	}
+}
 
-	// Push the node over the 80% line and confirm the warning follows the
-	// node's own mode.
-	if _, err := app.db.db.Exec(`UPDATE control_nodes SET period_tx_bytes=? WHERE id=?`, int64(850), node.ID); err != nil {
-		t.Fatalf("raise node usage: %v", err)
+// TestTelegramReportNodeCycleMatchesPanelFormula pins the node arithmetic the
+// operator compared against the panel. A node's period counters already carry
+// the Agent's own billing charge, so the report sums them the way the panel
+// does: bidirectional adds both directions, outbound takes transmit only, and
+// neither doubles them.
+//
+// This is the regression that made the report disagree with the panel: routing
+// these counters through trafficBillableBytes applied the panel-wide doubling
+// convention a second time, so a node the panel showed at 211 GiB was reported
+// at 343 GB.
+func TestTelegramReportNodeCycleMatchesPanelFormula(t *testing.T) {
+	for _, testCase := range []struct {
+		mode     string
+		rx, tx   int64
+		expected int64
+	}{
+		{trafficBillingModeBidirectional, 500, 400, 900},
+		{trafficBillingModeOutbound, 500, 400, 400},
+		{"", 500, 400, 900},
+		{trafficBillingModeBidirectional, 0, 0, 0},
+	} {
+		got := telegramReportNodeChargedBytes(testCase.mode, testCase.rx, testCase.tx)
+		if got != testCase.expected {
+			t.Fatalf("node charge for mode %q rx=%d tx=%d = %d, want %d", testCase.mode, testCase.rx, testCase.tx, got, testCase.expected)
+		}
+		// The panel-wide conversion doubles these same numbers in bidirectional
+		// mode, where the double-charge actually occurred. Outbound mode charges
+		// transmit only under both formulas, so only the summing mode can
+		// distinguish them.
+		if testCase.mode != trafficBillingModeOutbound && testCase.rx+testCase.tx > 0 {
+			doubled := trafficBillableBytes(trafficBillingModeBidirectional, testCase.rx, testCase.tx)
+			if doubled == got {
+				t.Fatalf("node charge coincides with the doubling convention for mode %q; the double-charge is back", testCase.mode)
+			}
+		}
 	}
-	stats, err = app.db.buildTelegramReportStats(now)
-	if err != nil {
-		t.Fatalf("rebuild stats: %v", err)
+}
+
+// TestTelegramReportNodeCycleMatchesALiveNode reproduces the live figures: 67.38
+// GiB in, 64.04 GiB out and an 80 GiB manual offset on a bidirectional node. The
+// panel charges rx+tx+offset = 211.42 GiB; the report must print that rather
+// than the doubled 342.84 GiB.
+func TestTelegramReportNodeCycleMatchesALiveNode(t *testing.T) {
+	const (
+		rx     = int64(72_344_430_181)
+		tx     = int64(68_766_811_597)
+		offset = int64(85_899_345_920)
+	)
+	total := saturatingAddInt64(telegramReportNodeChargedBytes(trafficBillingModeBidirectional, rx, tx), offset)
+	if total != 227_010_587_698 {
+		t.Fatalf("node cycle = %d, want 227010587698 (211.42 GiB)", total)
 	}
-	if len(stats.TrafficWarnings) != 1 || stats.TrafficWarnings[0].Kind != "node" || stats.TrafficWarnings[0].Name != "report-node" {
-		t.Fatalf("warnings = %+v, want one node warning", stats.TrafficWarnings)
+	doubled := saturatingAddInt64(trafficBillableBytes(trafficBillingModeBidirectional, rx, tx), offset)
+	if doubled == total {
+		t.Fatal("the doubling convention produced the same figure; this case no longer distinguishes them")
 	}
-	if stats.TrafficWarnings[0].Remaining != 150 {
-		t.Fatalf("warning remaining = %d, want 150", stats.TrafficWarnings[0].Remaining)
+	if doubled != 368_121_829_476 {
+		t.Fatalf("doubling convention = %d, want 368121829476; the fixture drifted", doubled)
 	}
 }
 
@@ -515,6 +567,116 @@ func TestTelegramReportThresholdMigrationBackfillsDefault(t *testing.T) {
 	// Re-running it must be a no-op rather than an error.
 	if err := ensureTelegramReportSettingsSchema(context.Background(), conn); err != nil {
 		t.Fatalf("second ensure failed: %v", err)
+	}
+}
+
+func TestTelegramReportClientNameDropsVersionAndPlatform(t *testing.T) {
+	for _, testCase := range []struct{ raw, want string }{
+		{"CapyPlayer/1.1.5", "CapyPlayer"},
+		{"Hills/1.9.0-beta.1 (android; 17)", "Hills"},
+		{"Hills/1.9", "Hills"},
+		{"Infuse/7.8.1", "Infuse"},
+		{"Emby for iOS/2.2.5", "Emby"},
+		{"VLC/3.0.20 LibVLC/3.0.20", "VLC"},
+		{"  Padded/1.0  ", "Padded"},
+		{"Bare", "Bare"},
+		{"", ""},
+		{"(anonymous)", ""},
+	} {
+		if got := telegramReportClientName(testCase.raw); got != testCase.want {
+			t.Fatalf("client name for %q = %q, want %q", testCase.raw, got, testCase.want)
+		}
+	}
+}
+
+func TestTelegramReportClientAggregationFoldsVersions(t *testing.T) {
+	rows := []struct {
+		Name  string
+		Count int64
+	}{
+		{Name: "CapyPlayer", Count: 60},
+		{Name: "CapyPlayer", Count: 40},
+		{Name: "Infuse", Count: 70},
+		{Name: "Emby", Count: 5},
+	}
+	merged := aggregateTelegramReportClients(rows, 2)
+	if len(merged) != 2 {
+		t.Fatalf("merged rows = %+v, want 2", merged)
+	}
+	// The two CapyPlayer versions must outrank the single Infuse row.
+	if merged[0].Name != "CapyPlayer" || merged[0].Count != 100 {
+		t.Fatalf("top client = %+v, want CapyPlayer with 100", merged[0])
+	}
+	if merged[1].Name != "Infuse" || merged[1].Count != 70 {
+		t.Fatalf("second client = %+v, want Infuse with 70", merged[1])
+	}
+	// Ties are ordered by name so the report is stable between runs.
+	tied := aggregateTelegramReportClients([]struct {
+		Name  string
+		Count int64
+	}{{Name: "zeta", Count: 5}, {Name: "alpha", Count: 5}}, 2)
+	if tied[0].Name != "alpha" {
+		t.Fatalf("tie order = %+v, want alpha first", tied)
+	}
+}
+
+func TestTelegramReportPeakWindowIsTheBusiestHour(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().In(time.Local)
+	settings := app.db.currentSystemSettings()
+	location := timezoneLocation(settings.ScheduleTimezone)
+	local := now.In(location)
+	todayStart := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+
+	site, err := app.db.CreateSite("peak-window", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	insert := func(at time.Time) {
+		t.Helper()
+		if _, err := app.db.db.Exec(`INSERT INTO request_logs
+			(site_id, site_name, resource_category, status_code, client_ip, user_agent, method, path, recorded_at_ms, timeline_at_ms)
+			VALUES (?, 'peak-window', 'video', 200, '127.0.0.1', 'test', 'GET', '/x', ?, ?)`,
+			site.ID, at.UnixMilli(), at.UnixMilli()); err != nil {
+			t.Fatalf("insert request log: %v", err)
+		}
+	}
+	// 09:00 gets three requests, 14:00 gets one: the window must be 09:00-10:00.
+	for range 3 {
+		insert(todayStart.Add(9*time.Hour + 5*time.Minute))
+	}
+	insert(todayStart.Add(14*time.Hour + 30*time.Minute))
+
+	start, end, requests, ok, err := app.db.telegramReportPeakWindow(todayStart, todayStart.AddDate(0, 0, 1), location)
+	if err != nil {
+		t.Fatalf("peak window: %v", err)
+	}
+	if !ok {
+		t.Fatal("peak window reported no data despite requests today")
+	}
+	if start.Hour() != 9 || end.Hour() != 10 || requests != 3 {
+		t.Fatalf("peak window = %s-%s with %d, want 09:00-10:00 with 3", start.Format("15:04"), end.Format("15:04"), requests)
+	}
+	if start.Format("15:04") != "09:00" {
+		t.Fatalf("peak window start rendered as %s", start.Format("15:04"))
+	}
+
+	// The report line prints the window and the count, never a head count.
+	stats := telegramReportStats{GeneratedAt: local, PeakStart: start, PeakEnd: end, PeakRequests: requests, HasPeakWindow: true}
+	if message := buildTelegramReportMessage(stats); !strings.Contains(message, "⏰ 活跃高峰：09:00 - 10:00（3 次）") {
+		t.Fatalf("peak line is wrong:\n%s", message)
+	}
+
+	// A day with no requests must not invent a window.
+	emptyStart, _, _, emptyOK, err := app.db.telegramReportPeakWindow(todayStart.AddDate(0, 0, -3), todayStart.AddDate(0, 0, -2), location)
+	if err != nil {
+		t.Fatalf("empty peak window: %v", err)
+	}
+	if emptyOK || !emptyStart.IsZero() {
+		t.Fatalf("empty day reported a window: ok=%v start=%s", emptyOK, emptyStart)
+	}
+	if message := buildTelegramReportMessage(telegramReportStats{GeneratedAt: local}); !strings.Contains(message, "⏰ 活跃高峰：暂无数据") {
+		t.Fatalf("empty peak line is wrong:\n%s", message)
 	}
 }
 

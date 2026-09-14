@@ -76,11 +76,11 @@ function renderTelegramReport() {
           <div><h2>日报内容</h2><p>通知会自动包含以下统计。</p></div>
         </div>
         <div class="telegram-report-items">
-          <div><span>01</span><p><strong>今日概览</strong><small>请求总数、视频请求、站点数量、活跃高峰与最热媒体库</small></p></div>
-          <div><span>02</span><p><strong>服务器部署信息</strong><small>各落地节点的今日流量、当月用量与剩余额度</small></p></div>
-          <div><span>03</span><p><strong>客户端分布</strong><small>访问次数最高的前 5 个客户端标识及占比</small></p></div>
-          <div><span>04</span><p><strong>流量统计</strong><small>当天、七天内、30 天内与历史累计</small></p></div>
-          <div><span>05</span><p><strong>今日节点热度 TOP 5</strong><small>当日流量最高的前 5 个媒体库站点</small></p></div>
+          <div><span>01</span><p><strong>今日概览</strong><small>请求总数、视频请求、站点数量、活跃时段与最热媒体库</small></p></div>
+          <div><span>02</span><p><strong>服务器部署信息</strong><small>各落地节点的今日流量、当月用量与剩余额度（与面板同口径）</small></p></div>
+          <div><span>03</span><p><strong>客户端分布</strong><small>访问次数最高的前 5 个客户端及占比（不含版本号）</small></p></div>
+          <div><span>04</span><p><strong>流量统计</strong><small>当天、七天内、当月流量（按面板流量周期）与计费口径</small></p></div>
+          <div><span>05</span><p><strong>今日站点热度 TOP 5</strong><small>当日流量最高的前 5 个站点及请求次数</small></p></div>
           <div><span>06</span><p><strong>流量预警</strong><small>用量触及阈值百分比的节点与站点（阈值可调）</small></p></div>
           <div><span>07</span><p><strong>保号提醒</strong><small>开启保号的站点完成状态与剩余天数</small></p></div>
         </div>

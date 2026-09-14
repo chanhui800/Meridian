@@ -120,15 +120,24 @@ type telegramReportTrafficWarning struct {
 }
 
 type telegramReportStats struct {
-	GeneratedAt         time.Time
-	UniqueClients       int64
-	ActivePeak          int64
-	Requests            int64
-	VideoRequests       int64
-	TodayTraffic        int64
-	SevenDayTraffic     int64
-	ThirtyDayTraffic    int64
-	HistoryTraffic      int64
+	GeneratedAt     time.Time
+	UniqueClients   int64
+	ActivePeak      int64
+	PeakStart       time.Time
+	PeakEnd         time.Time
+	PeakRequests    int64
+	HasPeakWindow   bool
+	Requests        int64
+	VideoRequests   int64
+	TodayTraffic    int64
+	SevenDayTraffic int64
+	// CycleTraffic is the global billing-cycle total, following the same reset
+	// day, timezone and billing mode as the panel. It is named apart from the
+	// per-node telegramReportNodeStat.CycleTraffic on purpose: those are two
+	// different quantities that must never be assigned to each other.
+	CycleTraffic        int64
+	CycleStart          time.Time
+	LifetimeTraffic     int64
 	BillingMode         string
 	SiteCount           int
 	RunningSiteCount    int
@@ -390,6 +399,11 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if err := d.db.QueryRow(`SELECT COALESCE(MAX(active_clients),0) FROM (SELECT COUNT(DISTINCT client_ip) AS active_clients FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? GROUP BY CAST(recorded_at_ms/60000 AS INTEGER))`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.ActivePeak); err != nil {
 		return stats, err
 	}
+	peakStart, peakEnd, peakRequests, hasPeak, peakErr := d.telegramReportPeakWindow(todayStart, tomorrow, location)
+	if peakErr != nil {
+		return stats, peakErr
+	}
+	stats.PeakStart, stats.PeakEnd, stats.PeakRequests, stats.HasPeakWindow = peakStart, peakEnd, peakRequests, hasPeak
 	trafficSum := func(start time.Time) (int64, error) {
 		// Agent-served sites account through node_site_traffic_logs; summing
 		// only traffic_logs made the report show ~0 traffic on agent
@@ -412,18 +426,25 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if stats.SevenDayTraffic, err = trafficSum(todayStart.AddDate(0, 0, -6)); err != nil {
 		return stats, err
 	}
-	if stats.ThirtyDayTraffic, err = trafficSum(todayStart.AddDate(0, 0, -29)); err != nil {
-		return stats, err
+	// The cycle figures follow the panel's own billing cycle: the configured
+	// reset day (e.g. the 15th) in the scheduling timezone, charged with the
+	// global billing mode. A rolling 30-day window would disagree with the panel.
+	cycleStart := trafficCycleStart(localNow, settings.TrafficResetDay, location)
+	if !cycleStart.IsZero() {
+		if stats.CycleTraffic, err = trafficSum(cycleStart); err != nil {
+			return stats, err
+		}
+		stats.CycleStart = cycleStart
 	}
-	var historyIn, historyOut int64
+	var lifetimeIn, lifetimeOut int64
 	if err := d.db.QueryRow(`SELECT COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM (
 			SELECT bytes_in, bytes_out FROM traffic_logs
 			UNION ALL
 			SELECT bytes_in, bytes_out FROM node_site_traffic_logs
-		)`).Scan(&historyIn, &historyOut); err != nil {
+		)`).Scan(&lifetimeIn, &lifetimeOut); err != nil {
 		return stats, err
 	}
-	stats.HistoryTraffic = trafficBillableBytes(billingMode, historyIn, historyOut)
+	stats.LifetimeTraffic = trafficBillableBytes(billingMode, lifetimeIn, lifetimeOut)
 
 	requestRows, err := d.db.Query(`SELECT request_logs.site_id,
 		COALESCE(NULLIF(sites.name,''), NULLIF(MAX(request_logs.site_name),''), '站点 ' || request_logs.site_id),
@@ -489,7 +510,10 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if len(stats.TopTraffic) > 5 {
 		stats.TopTraffic = stats.TopTraffic[:5]
 	}
-	uaRows, err := d.db.Query(`SELECT user_agent, COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? AND user_agent<>'' GROUP BY user_agent ORDER BY COUNT(*) DESC LIMIT 5`, todayStart.UnixMilli(), tomorrow.UnixMilli())
+	// One client can appear under several versions, so the raw user agents are
+	// over-fetched and folded together in Go; a bare LIMIT 5 would drop a client
+	// whose versions are individually small but together rank in the top five.
+	uaRows, err := d.db.Query(`SELECT user_agent, COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? AND user_agent<>'' GROUP BY user_agent ORDER BY COUNT(*) DESC LIMIT 200`, todayStart.UnixMilli(), tomorrow.UnixMilli())
 	if err != nil {
 		return stats, err
 	}
@@ -500,12 +524,19 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 			uaRows.Close()
 			return stats, err
 		}
+		// Several versions of the same client must fold into one row, so the
+		// version is stripped before the counts are summed rather than after.
+		name := telegramReportClientName(ua)
+		if name == "" {
+			name = "未知客户端"
+		}
 		stats.TopUserAgents = append(stats.TopUserAgents, struct {
 			Name  string
 			Count int64
-		}{Name: ua, Count: count})
+		}{Name: name, Count: count})
 	}
 	uaRows.Close()
+	stats.TopUserAgents = aggregateTelegramReportClients(stats.TopUserAgents, 5)
 	retentionRows, err := d.db.Query(`SELECT name, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms
 		FROM sites WHERE account_retention_days>0 ORDER BY sort_order, id`)
 	if err != nil {
@@ -587,11 +618,13 @@ func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings
 		}
 		node.SiteCount = int(sites)
 		node.TodayTraffic = trafficBillableBytes(billingMode, bytesIn, bytesOut)
-		// The node charges its own billing cycle with its own stored mode, so the
-		// cycle columns must not inherit the panel-wide mode: an outbound node
-		// under a bidirectional panel would otherwise report double usage and
-		// trip the proximity warning at half its real quota.
-		node.CycleTraffic = saturatingAddInt64(trafficBillableBytes(trafficBillingModeLabel(nodeBillingMode), periodIn, periodOut), manualOffset)
+		// A node's period counters are already charged by the Agent's own
+		// billing formula, so they must be summed the way the panel sums them:
+		// bidirectional adds both directions, outbound takes transmit only, and
+		// the manual offset is applied on top. Running them through
+		// trafficBillableBytes would apply the panel-wide multiplier a second
+		// time and report double the panel's figure.
+		node.CycleTraffic = saturatingAddInt64(telegramReportNodeChargedBytes(nodeBillingMode, periodIn, periodOut), manualOffset)
 		if node.CycleTraffic < 0 {
 			node.CycleTraffic = 0
 		}
@@ -726,6 +759,118 @@ func telegramReportUint64RatioAtLeastPercent(used, limit, percent uint64) bool {
 	return usedLow >= limitLow
 }
 
+// telegramReportClientName reduces a raw User-Agent to the product name the
+// operator reads: the token before the version separator, with any trailing
+// parenthetical platform detail dropped.
+//
+//	CapyPlayer/1.1.5                -> CapyPlayer
+//	Hills/1.9.0-beta.1 (android;17) -> Hills
+//	Emby for iOS/2.2.5              -> Emby for iOS
+//	VLC/3.0.20 LibVLC/3.0.20        -> VLC
+//
+// The short form "Hills/1.9 (android; 17)" intentionally keeps "Hills" only:
+// a parenthetical always describes the build, never the product.
+func telegramReportClientName(userAgent string) string {
+	name := strings.TrimSpace(userAgent)
+	if name == "" || strings.HasPrefix(name, "(") {
+		// A bare parenthetical carries no product name at all.
+		return ""
+	}
+	// Compare against the lower-cased form so the search index still lines up
+	// with the original string.
+	lower := strings.ToLower(name)
+	for _, separator := range []string{"/", " ("} {
+		if index := strings.Index(lower, separator); index > 0 {
+			name = name[:index]
+			lower = lower[:index]
+		}
+	}
+	if index := strings.IndexAny(name, " \t"); index > 0 {
+		name = name[:index]
+	}
+	return strings.TrimSpace(name)
+}
+
+// aggregateTelegramReportClients folds per-version rows into one row per client,
+// keeps the heaviest, and orders them the way the report prints them.
+func aggregateTelegramReportClients(rows []struct {
+	Name  string
+	Count int64
+}, limit int) []struct {
+	Name  string
+	Count int64
+} {
+	totals := make(map[string]int64, len(rows))
+	order := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if _, seen := totals[row.Name]; !seen {
+			order = append(order, row.Name)
+		}
+		totals[row.Name] += row.Count
+	}
+	merged := make([]struct {
+		Name  string
+		Count int64
+	}, 0, len(order))
+	for _, name := range order {
+		merged = append(merged, struct {
+			Name  string
+			Count int64
+		}{Name: name, Count: totals[name]})
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].Count != merged[j].Count {
+			return merged[i].Count > merged[j].Count
+		}
+		return merged[i].Name < merged[j].Name
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
+}
+
+// telegramReportNodeChargedBytes applies a node's own billing mode to its
+// period counters. This mirrors scanControlNode exactly: a bidirectional node
+// sums both directions, an outbound node takes the transmit direction only.
+//
+// It deliberately differs from trafficBillableBytes, which converts the raw
+// relayed directions recorded in traffic_logs into the VPS billing convention
+// by doubling them. A node's period counters have already been through that
+// conversion, so doubling them again is the double-charge this function avoids.
+func telegramReportNodeChargedBytes(billingMode string, rx, tx int64) int64 {
+	if billingMode == trafficBillingModeOutbound {
+		return tx
+	}
+	return saturatingAddInt64(rx, tx)
+}
+
+// telegramReportPeakWindow finds the busiest wall-clock hour of the day and how
+// many requests fell inside it. Shifting the timestamps by the day's own offset
+// keeps the buckets aligned with local hour boundaries even for a timezone whose
+// offset is not a whole hour.
+func (d *DB) telegramReportPeakWindow(todayStart, tomorrow time.Time, location *time.Location) (start, end time.Time, requests int64, ok bool, err error) {
+	base := todayStart.In(location)
+	midnight := time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, location)
+	offsetMS := midnight.UnixMilli()
+	dayEnd := midnight.AddDate(0, 0, 1)
+	var bucket, count int64
+	err = d.db.QueryRow(`SELECT (recorded_at_ms - ?) / 3600000 AS hour_bucket, COUNT(*)
+		FROM request_logs
+		WHERE recorded_at_ms>=? AND recorded_at_ms<?
+		GROUP BY hour_bucket
+		ORDER BY COUNT(*) DESC, hour_bucket ASC
+		LIMIT 1`, offsetMS, offsetMS, dayEnd.UnixMilli()).Scan(&bucket, &count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, time.Time{}, 0, false, nil
+	}
+	if err != nil {
+		return time.Time{}, time.Time{}, 0, false, err
+	}
+	windowStart := midnight.Add(time.Duration(bucket) * time.Hour)
+	return windowStart, windowStart.Add(time.Hour), count, true, nil
+}
+
 func formatTelegramBytes(value int64) string {
 	if value < 1024 {
 		return fmt.Sprintf("%d B", value)
@@ -750,18 +895,23 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	fmt.Fprintf(&b, "⏱️ 统计时间：%s\n\n", stats.GeneratedAt.Format("2006-01-02 15:04"))
 
 	b.WriteString("✨ 今日概览\n")
-	fmt.Fprintf(&b, "• 📈 请求总数：%d 次\n", stats.Requests)
-	fmt.Fprintf(&b, "• 🎬 视频请求：%d 次\n", stats.VideoRequests)
-	fmt.Fprintf(&b, "• 🗂 媒体库站点：%d 个（启用 %d 个）\n", stats.SiteCount, stats.RunningSiteCount)
-	// This figure is the busiest time window, not a head count: it is the
-	// largest number of distinct clients seen inside any single minute, so the
-	// label has to say so rather than read as concurrent viewers.
-	fmt.Fprintf(&b, "• ⚡️ 活跃高峰：%d 人（最忙的 1 分钟内）\n", stats.ActivePeak)
+	// No list bullets here: these are the headline figures, and the operator
+	// asked for this block to read without them.
+	fmt.Fprintf(&b, "📈 请求总数：%d 次\n", stats.Requests)
+	fmt.Fprintf(&b, "🎬 视频请求：%d 次\n", stats.VideoRequests)
+	fmt.Fprintf(&b, "🗂 媒体库站点：%d 个（启用 %d 个）\n", stats.SiteCount, stats.RunningSiteCount)
+	// The peak line reports the busiest hour of the day and how many requests
+	// landed in it, which is a time window rather than a head count.
+	if stats.HasPeakWindow {
+		fmt.Fprintf(&b, "⏰ 活跃高峰：%s - %s（%d 次）\n", stats.PeakStart.Format("15:04"), stats.PeakEnd.Format("15:04"), stats.PeakRequests)
+	} else {
+		b.WriteString("⏰ 活跃高峰：暂无数据\n")
+	}
 	if len(stats.TopTraffic) > 0 {
 		hottest := stats.TopTraffic[0]
-		fmt.Fprintf(&b, "• 🏆 今日最热媒体库：%s（%s）\n", truncateTelegramText(hottest.Name, 48), formatTelegramBytes(hottest.Traffic))
+		fmt.Fprintf(&b, "🏆 今日最热媒体库：%s（%s）\n", truncateTelegramText(hottest.Name, 48), formatTelegramBytes(hottest.Traffic))
 	} else {
-		b.WriteString("• 🏆 今日最热媒体库：暂无数据\n")
+		b.WriteString("🏆 今日最热媒体库：暂无数据\n")
 	}
 	b.WriteString("\n")
 
@@ -800,12 +950,15 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	b.WriteString("🌐 流量统计\n")
 	fmt.Fprintf(&b, "• 当天：%s\n", formatTelegramBytes(stats.TodayTraffic))
 	fmt.Fprintf(&b, "• 七天内：%s\n", formatTelegramBytes(stats.SevenDayTraffic))
-	fmt.Fprintf(&b, "• 30 天内：%s\n", formatTelegramBytes(stats.ThirtyDayTraffic))
-	fmt.Fprintf(&b, "• 历史累计：%s\n", formatTelegramBytes(stats.HistoryTraffic))
+	if stats.CycleStart.IsZero() {
+		fmt.Fprintf(&b, "• 当月流量：%s\n", formatTelegramBytes(stats.CycleTraffic))
+	} else {
+		fmt.Fprintf(&b, "• 当月流量（%s 起）：%s\n", stats.CycleStart.Format("01-02"), formatTelegramBytes(stats.CycleTraffic))
+	}
 	fmt.Fprintf(&b, "• 计费口径：%s\n", telegramReportBillingSummary(stats.BillingMode))
 	b.WriteString("\n")
 
-	b.WriteString("🔥 今日节点热度 TOP 5\n")
+	b.WriteString("🔥 今日站点热度 TOP 5\n")
 	if len(stats.TopTraffic) == 0 {
 		b.WriteString("• 暂无流量数据\n")
 	} else {
