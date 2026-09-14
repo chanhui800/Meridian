@@ -127,7 +127,7 @@ func TestTelegramReportDeploymentSectionListsNodes(t *testing.T) {
 	message := buildTelegramReportMessage(telegramReportStats{
 		GeneratedAt:        time.Now(),
 		TrafficWarnPercent: telegramReportTrafficWarnDisableValue,
-		Nodes:              []telegramReportNodeStat{{Name: "唯一节点", TodayTraffic: 1 << 30, CycleTraffic: 2 << 30, Remaining: 8 << 30, HasQuota: true, SiteCount: 11}},
+		Nodes:              []telegramReportNodeStat{{Name: "唯一节点", ResetDay: 1, TodayTraffic: 1 << 30, CycleTraffic: 2 << 30, Remaining: 8 << 30, HasQuota: true, SiteCount: 11}},
 	})
 	if !strings.Contains(message, "• 唯一节点（11 个站点）：今日 1.00 GB 丨 当月 2.00 GB 丨 剩余 8.00 GB") {
 		t.Fatalf("node line is wrong:\n%s", message)

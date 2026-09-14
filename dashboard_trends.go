@@ -343,11 +343,22 @@ func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName 
 	for i := range points {
 		points[i].Traffic = trafficBillableBytes(billingMode, points[i].BytesIn, points[i].BytesOut)
 		seconds := bucket.Seconds()
+		bucketStart := start.Add(time.Duration(i) * bucket)
 		if rangeName == "custom" {
-			bucketStart := start.Add(time.Duration(i) * bucket)
 			bucketEnd := start.Add(time.Duration(i+1) * bucket)
 			if bucketEnd.After(end) {
 				seconds = end.Sub(bucketStart).Seconds()
+			}
+		} else if !current.Before(bucketStart) && current.Before(bucketStart.Add(bucket)) {
+			// The final bucket is still accumulating. Every range except custom
+			// aligns its last bucket around the current wall-clock bucket, so
+			// dividing its partial bytes by the full bucket understates the live
+			// rate — by 3x at 14:20 on the day range and by up to ~120x on the
+			// month range. The custom branch above and the client both divide by
+			// the elapsed time, so this branch has to match.
+			elapsed := current.Sub(bucketStart).Seconds()
+			if elapsed < seconds {
+				seconds = elapsed
 			}
 		}
 		if seconds <= 0 {
