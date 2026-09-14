@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/bits"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -696,10 +697,33 @@ func telegramReportProximityWarning(kind, name string, used, remaining int64, wa
 	if warnPercent <= telegramReportTrafficWarnDisableValue || limit <= 0 {
 		return telegramReportTrafficWarning{}, false
 	}
-	if used*100 < limit*int64(warnPercent) {
+	if !telegramReportRatioAtLeastPercent(used, limit, warnPercent) {
 		return telegramReportTrafficWarning{}, false
 	}
 	return telegramReportTrafficWarning{Kind: kind, Name: name, Used: used, Limit: limit, Remaining: remaining}, true
+}
+
+// telegramReportRatioAtLeastPercent compares used/limit against a percentage
+// without the int64 overflow of the obvious `used*100 < limit*percent`: both
+// products are taken as 128-bit values. A quota above ~92 PB is unrealistic, but
+// a wrapped product compares negative and silently drops a real warning, which
+// is exactly the failure this feature exists to prevent.
+//
+// Callers must pass a non-negative used and a positive limit.
+func telegramReportRatioAtLeastPercent(used, limit int64, percent int) bool {
+	// #nosec G115 -- byte counters are never negative and the caller has already
+	// rejected a non-positive limit; only the wrap-around of the two 64-bit
+	// products is in question, and the wide comparison below removes it.
+	return telegramReportUint64RatioAtLeastPercent(uint64(used), uint64(limit), uint64(percent))
+}
+
+func telegramReportUint64RatioAtLeastPercent(used, limit, percent uint64) bool {
+	usedHigh, usedLow := bits.Mul64(used, 100)
+	limitHigh, limitLow := bits.Mul64(limit, percent)
+	if usedHigh != limitHigh {
+		return usedHigh > limitHigh
+	}
+	return usedLow >= limitLow
 }
 
 func formatTelegramBytes(value int64) string {
