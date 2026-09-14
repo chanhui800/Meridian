@@ -318,6 +318,7 @@ func (d *DB) migrateOnce() error {
 		schedule_time TEXT NOT NULL DEFAULT '20:00',
 		frequency TEXT NOT NULL DEFAULT 'daily',
 		weekday INTEGER NOT NULL DEFAULT 1,
+		traffic_warning_percent INTEGER NOT NULL DEFAULT 80,
 		last_sent_key TEXT NOT NULL DEFAULT '',
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
@@ -1042,6 +1043,9 @@ func (d *DB) migrateOnce() error {
 	if err := ensurePanelSettingsListenPortSchema(ctx, conn); err != nil {
 		return err
 	}
+	if err := ensureTelegramReportSettingsSchema(ctx, conn); err != nil {
+		return err
+	}
 	for _, migration := range []struct{ column, sql string }{
 		{"inbound_colo", "ALTER TABLE request_logs ADD COLUMN inbound_colo TEXT NOT NULL DEFAULT ''"},
 		{"outbound_colo", "ALTER TABLE request_logs ADD COLUMN outbound_colo TEXT NOT NULL DEFAULT ''"},
@@ -1218,6 +1222,23 @@ func ensurePanelSettingsListenPortSchema(ctx context.Context, conn *sql.Conn) er
 		}
 	}
 	return nil
+}
+
+// ensureTelegramReportSettingsSchema adds the traffic proximity warning
+// threshold to databases created before the column existed. The DEFAULT is the
+// product default (80%), so an existing row is backfilled to a working warning
+// line rather than to the 0 sentinel that means "warnings disabled". That
+// distinction matters because 0 is the operator's explicit opt-out value.
+func ensureTelegramReportSettingsSchema(ctx context.Context, conn *sql.Conn) error {
+	var found int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('telegram_report_settings') WHERE name='traffic_warning_percent'").Scan(&found); err != nil {
+		return err
+	}
+	if found != 0 {
+		return nil
+	}
+	_, err := conn.ExecContext(ctx, "ALTER TABLE telegram_report_settings ADD COLUMN traffic_warning_percent INTEGER NOT NULL DEFAULT 80")
+	return err
 }
 
 // ensureSiteNodeDrainsSchema upgrades the original site_id-only drain table to

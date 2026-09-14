@@ -54,6 +54,11 @@ function renderTelegramReport() {
             </select>
           </label>
           <label class="telegram-field">
+            <span>流量预警阈值</span>
+            <input class="form-input" type="number" id="telegram-traffic-warning" min="0" max="100" step="1" inputmode="numeric" value="80">
+            <small>节点或站点已用流量达到该百分比时，日报会追加“流量预警”段落；填 0 关闭预警。</small>
+          </label>
+          <label class="telegram-field">
             <span>发送时间</span>
             <input class="form-input" type="time" id="telegram-schedule-time" value="20:00">
             <small>默认使用北京时间（UTC+8），可在“全局设置 → 系统 UI”中调整调度时区。</small>
@@ -71,11 +76,13 @@ function renderTelegramReport() {
           <div><h2>日报内容</h2><p>通知会自动包含以下统计。</p></div>
         </div>
         <div class="telegram-report-items">
-          <div><span>01</span><p><strong>当日概览</strong><small>请求总数、独立客户端、视频请求、站点数量</small></p></div>
-          <div><span>02</span><p><strong>流量统计</strong><small>今日、近 7 日、近 30 日与历史累计</small></p></div>
-          <div><span>03</span><p><strong>请求量排行</strong><small>当日请求次数最高的前 5 个站点</small></p></div>
-          <div><span>04</span><p><strong>流量排行</strong><small>当日流量使用最高的前 5 个站点</small></p></div>
-          <div><span>05</span><p><strong>客户端分布</strong><small>访问次数最高的前 5 个客户端标识</small></p></div>
+          <div><span>01</span><p><strong>今日概览</strong><small>独立访客、请求总数、视频请求、站点数量、活跃高峰与最热媒体库</small></p></div>
+          <div><span>02</span><p><strong>服务器部署信息</strong><small>各落地节点的今日流量、当月用量与剩余额度</small></p></div>
+          <div><span>03</span><p><strong>客户端分布</strong><small>访问次数最高的前 5 个客户端标识及占比</small></p></div>
+          <div><span>04</span><p><strong>流量统计</strong><small>当天、七天内、30 天内与历史累计</small></p></div>
+          <div><span>05</span><p><strong>今日节点热度 TOP 5</strong><small>当日流量最高的前 5 个媒体库站点</small></p></div>
+          <div><span>06</span><p><strong>流量预警</strong><small>用量触及阈值百分比的节点与站点（阈值可调）</small></p></div>
+          <div><span>07</span><p><strong>保号提醒</strong><small>开启保号的站点完成状态与剩余天数</small></p></div>
         </div>
       </aside></div></main>
     </div>`;
@@ -106,6 +113,8 @@ async function loadTelegramReportSettings() {
     document.getElementById('telegram-frequency').value = settings.frequency || 'daily';
     document.getElementById('telegram-weekday').value = String(Number.isInteger(settings.weekday) ? settings.weekday : 1);
     document.getElementById('telegram-schedule-time').value = settings.schedule_time || '20:00';
+    document.getElementById('telegram-traffic-warning').value =
+      Number.isInteger(settings.traffic_warning_percent) ? String(settings.traffic_warning_percent) : '80';
     document.getElementById('telegram-token-state').textContent = settings.configured
       ? 'Bot Token 已保存并持续显示'
       : '尚未配置 Bot Token';
@@ -116,6 +125,13 @@ async function loadTelegramReportSettings() {
   }
 }
 
+function telegramTrafficWarningPercent() {
+  const raw = document.getElementById('telegram-traffic-warning').value.trim();
+  if (!/^\d{1,3}$/.test(raw)) return 80;
+  const value = parseInt(raw, 10);
+  return value >= 0 && value <= 100 ? value : 80;
+}
+
 function telegramReportPayload(action) {
   return {
     enabled: document.getElementById('telegram-report-enabled').checked,
@@ -124,6 +140,7 @@ function telegramReportPayload(action) {
     frequency: document.getElementById('telegram-frequency').value,
     weekday: Number(document.getElementById('telegram-weekday').value),
     schedule_time: document.getElementById('telegram-schedule-time').value,
+    traffic_warning_percent: telegramTrafficWarningPercent(),
     ...(action ? { action } : {}),
   };
 }
