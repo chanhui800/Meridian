@@ -653,7 +653,17 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 		writeAgentAuthFailure(a, w, r)
 		return
 	}
-	node, agentToken, err := a.db.EnrollControlNode(identity.Token, time.Now())
+	// The address the operator left blank is filled from where this request came
+	// from, because the controller can observe that directly while the Agent
+	// cannot know which of its addresses is reachable from here. requestClientKey
+	// only honours X-Real-IP from a configured trusted proxy, so a request that
+	// arrived through an untrusted hop yields the hop, which the routability
+	// check then rejects.
+	enrollmentSource := ""
+	if peer := remoteAddressIP(r.RemoteAddr); peer != nil {
+		enrollmentSource = requestClientKey(r, a.trustedProxies)
+	}
+	node, agentToken, err := a.db.EnrollControlNodeFromSource(identity.Token, time.Now(), enrollmentSource)
 	if err != nil {
 		if errors.Is(err, errPersistentJWTRequired) {
 			a.jsonErr(w, http.StatusConflict, "请先配置持久 JWT_SECRET，再注册 Agent 节点")

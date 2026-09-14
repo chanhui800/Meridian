@@ -346,6 +346,35 @@ mv -f "$install_dir/meridian-agent.new" "$install_dir/meridian-agent"
 # A normal reinstall keeps durable enrollment state. The explicit re-enroll
 # path is used by the panel's "regenerate script" action and forces the Agent
 # to exchange the fresh one-time enrollment token.
+# Reads the Agent credential out of the persisted state file. A JSON file with
+# one flat token field is parsed with sed rather than jq so the installer keeps
+# working on a minimal system; the sed pattern matches the same field the
+# registration wait below already relies on.
+state_agent_token() {
+  sed -n 's/.*"agent_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" 2>/dev/null | head -n 1
+}
+
+# A node can already be enrolled to a different Controller. The stored credential
+# is then useless here, and skipping enrollment would leave the panel waiting for
+# an Agent that never registers while this script still reports success. Probe
+# the Controller with the stored credential instead: 401/403 means the node
+# belongs somewhere else (a revoked token answers the same way), which needs an
+# explicit --reenroll; any other outcome means the credential was accepted, or
+# the probe itself was inconclusive and the previous behaviour is kept.
+agent_enrolled_with_controller() {
+  token="$(state_agent_token)"
+  [ -n "$token" ] || return 1
+  # The capture is required: under set -e a failing outer command would abort
+  # the installer, and an unreachable Controller must not read as "not enrolled".
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer $token" \
+    "$controller_url/api/agent/config" 2>/dev/null)" || code=000
+  case "$code" in
+    401|403) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 if [ "$reenroll" -eq 1 ]; then
   rm -f "$state_file"
   install -m 0600 "$token_tmp" "$token_file.new"
@@ -353,6 +382,28 @@ if [ "$reenroll" -eq 1 ]; then
 elif [ ! -f "$state_file" ]; then
   install -m 0600 "$token_tmp" "$token_file.new"
   mv -f "$token_file.new" "$token_file"
+else
+  # state.json survived, so either this node is already enrolled to this
+  # Controller (keep it) or it belongs to another one (must re-enroll).
+  if ! agent_enrolled_with_controller; then
+    echo '' >&2
+    echo 'This node is already enrolled to a different Meridian Controller.' >&2
+    echo 'The stored Agent credential was rejected, so it was NOT registered here' >&2
+    echo 'and the panel will keep showing it as pending until it is.' >&2
+    echo '' >&2
+    echo 'Re-run the installer with a fresh enrollment token from this panel:' >&2
+    echo '' >&2
+    echo "  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL '$controller_url/api/agent/install.sh' | sudo bash -s -- -e '$controller_url' -t '<NEW_ENROLLMENT_TOKEN>' --reenroll" >&2
+    echo '' >&2
+    echo 'Use the token shown in the node list (create the node again, or press' >&2
+    echo '"regenerate script" for this node). Enrollment tokens are single use.' >&2
+    echo '' >&2
+    exit 1
+  fi
+  # Already enrolled here: the stored state is authoritative and must survive
+  # both this install and any rollback.
+  enrollment_committed=1
+  rm -f "$token_file"
 fi
 cmd_service_install "$service_tmp"
 wait_for_registration() {

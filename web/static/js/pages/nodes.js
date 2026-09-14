@@ -69,8 +69,16 @@ function renderNodeCards() {
     const applyError = String(node.agent_apply_error || '').trim();
     const listenerError = String(node.agent_listener_error || '').trim();
     const configState = applyError ? `应用失败：${applyError}` : (listenerError ? `监听异常：${listenerError}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用站点配置'));
+    // An address the controller inferred from the enrollment request is marked so
+    // it gets reviewed: this value is published as the site's DNS record, and a
+    // wrong guess points the site at the wrong host.
+    const addressText = node.address
+      ? (node.address_source === 'enrollment'
+        ? `${node.address}（自动探测，请核对）`
+        : node.address)
+      : '未填写地址';
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
-      <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(node.address || '未填写地址')} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
+      <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(addressText)} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
       <div class="node-stats"><span><b>${usage}</b><small>${esc(node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费')}</small></span><span><b>${esc(reset)}</b><small>独立流量周期</small></span><span><b>${node.priority}</b><small>优先级${node.active ? ' · 当前选中' : ''}</small></span></div>
       <div class="node-entry-state"><div class="node-entry-details"><span>${esc(entry)}</span><small class="node-agent-version">Agent ${esc(node.agent_version || '未上报')}</small></div><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div>
@@ -124,6 +132,7 @@ function openNodeForm(node) {
   document.getElementById('modal-body').innerHTML = `<form id="node-form" class="node-form">
     <label>节点名称<input class="form-input" id="node-name" maxlength="64" required value="${esc(node ? node.name : '')}"></label>
     <label>显示地址<input class="form-input" id="node-address" maxlength="255" value="${esc(node ? node.address : '')}" placeholder="例如 203.0.113.10"></label>
+    <div class="form-help">留空时，节点首次注册会自动填入主控观测到的来源 IP 并标记「自动探测」。此地址会作为站点的 DNS A/AAAA 记录发布，请务必核对后保存；保存即视为人工确认。</div>
     <label>端口<input class="form-input" id="node-port" type="number" min="1" max="65535" value="${node && node.port ? node.port : (location.port || 443)}"></label>
     <div class="form-help">Agent 仅提供 TLS/HTTPS。同一节点上的所有调度站点共用此端口并按域名区分；端口必须未被该 VPS 上的其他程序占用。默认采用当前主控端口，保存后独立管理。</div>
     <div class="node-form-grid"><label>流量上限（GiB，0 为不限）<input class="form-input" id="node-quota" type="number" min="0" step="0.01" value="${node ? (Number(node.traffic_quota) / 1073741824).toFixed(2) : '0'}"></label><label>重置日<input class="form-input" id="node-reset" type="number" min="0" max="31" value="${node ? node.reset_day : 1}"></label></div>

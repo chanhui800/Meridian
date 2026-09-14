@@ -83,4 +83,23 @@ assert_present 'NoNewPrivileges=true' 'the systemd unit lost NoNewPrivileges'
 assert_present 'ProtectSystem=strict' 'the systemd unit lost ProtectSystem=strict'
 assert_present 'WantedBy=multi-user.target' 'the systemd unit lost its install target'
 
+echo '[8] a node enrolled to another Controller is reported, not silently skipped'
+# The stored credential must be checked against the Controller before the
+# installer concludes the node is already enrolled: an install that skips
+# enrollment yet prints success leaves the panel waiting forever.
+assert_present 'agent_enrolled_with_controller()' 'the installer does not verify the stored credential'
+assert_present 'state_agent_token()' 'the installer does not read the stored Agent token'
+assert_present '/api/agent/config' 'the credential probe does not target the config endpoint'
+assert_present '401|403' 'the probe does not treat an auth rejection as "another Controller"'
+assert_present 'already enrolled to a different Meridian Controller' 'the refusal does not say what is wrong'
+assert_present 'keep showing it as pending' 'the refusal does not explain the visible symptom'
+assert_present "'<NEW_ENROLLMENT_TOKEN>' --reenroll" 'the refusal does not hand over a runnable --reenroll command'
+# Guard the ordering: the credential probe must run before the service starts, so
+# a refused install never leaves an Agent running against the wrong Controller.
+probe_line=$(grep -n 'agent_enrolled_with_controller;' "$SCRIPT" | head -n 1 | cut -d: -f1)
+start_line=$(grep -n 'if ! cmd_service_start' "$SCRIPT" | head -n 1 | cut -d: -f1)
+if [ -z "$probe_line" ] || [ -z "$start_line" ] || [ "$probe_line" -ge "$start_line" ]; then
+    fail "the credential probe must run before the service is started (probe=$probe_line start=$start_line)"
+fi
+
 echo 'agent installer structure tests passed'

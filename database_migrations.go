@@ -381,6 +381,7 @@ func (d *DB) migrateOnce() error {
 		guid TEXT NOT NULL UNIQUE,
 		name TEXT NOT NULL COLLATE NOCASE UNIQUE,
 		address TEXT NOT NULL DEFAULT '',
+		address_source TEXT NOT NULL DEFAULT 'manual',
 		entry_mode TEXT NOT NULL DEFAULT 'direct' CHECK(entry_mode IN ('direct','shared')),
 		http_port INTEGER NOT NULL DEFAULT 0,
 		https_port INTEGER NOT NULL DEFAULT 443,
@@ -800,6 +801,9 @@ func (d *DB) migrateOnce() error {
 	}
 	for _, migration := range []struct{ table, column, sql string }{
 		{"control_nodes", "traffic_manual_offset_bytes", "ALTER TABLE control_nodes ADD COLUMN traffic_manual_offset_bytes BIGINT NOT NULL DEFAULT 0"},
+		// Every pre-existing row was entered by an operator, so the backfill
+		// default 'manual' states the truth rather than an unknown value.
+		{"control_nodes", "address_source", "ALTER TABLE control_nodes ADD COLUMN address_source TEXT NOT NULL DEFAULT 'manual'"},
 		{"control_nodes", "last_report_session_id", "ALTER TABLE control_nodes ADD COLUMN last_report_session_id TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "active_agent_session_id", "ALTER TABLE control_nodes ADD COLUMN active_agent_session_id TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "agent_session_epoch", "ALTER TABLE control_nodes ADD COLUMN agent_session_epoch BIGINT NOT NULL DEFAULT 0"},
