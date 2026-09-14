@@ -100,10 +100,14 @@ type telegramReportRetentionStat struct {
 // same billing mode as the rest of the report; CycleTraffic and Remaining reuse
 // the node's own persisted billing cycle so the numbers match the panel.
 type telegramReportNodeStat struct {
+	ID           int64
 	Name         string
 	TodayTraffic int64
 	CycleTraffic int64
 	Remaining    int64
+	// CycleStartMS is the node's own billing-cycle boundary, used to scope the
+	// alert ledger to one cycle.
+	CycleStartMS int64
 	// Limit is the node's configured quota. Remaining is clamped at zero once the
 	// quota is exhausted, so the ratio must be taken against this figure rather
 	// than against used+remaining.
@@ -589,45 +593,51 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	return stats, nil
 }
 
-// appendTelegramReportDeployment fills the landing-node section and the quota
-// proximity warning. It is a separate pass because both read the node/site
-// tables rather than request_logs, and a failure here must be a real error: the
-// report would otherwise claim a healthy deployment with no nodes listed.
-func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings SystemSettings, localNow, todayStart, tomorrow time.Time) error {
-	location := timezoneLocation(settings.ScheduleTimezone)
-	billingMode := settings.TrafficBillingMode
+// telegramReportNodeStats measures every landing node. assignedOnly limits the
+// result to nodes that are actually carrying an enabled site, which is what the
+// daily report lists. The threshold alert passes false: a node with no sites can
+// still be over its quota, and silently ignoring it would hide a real cost.
+//
+// The charge follows the panel exactly: a node's period counters already carry
+// the Agent's own billing formula, so they are summed (bidirectional) or taken
+// as transmit only (outbound) and the manual offset is added on top. Running
+// them through trafficBillableBytes would charge every byte twice.
+func (d *DB) telegramReportNodeStats(localNow, todayStart, tomorrow time.Time, billingMode string, assignedOnly bool) ([]telegramReportNodeStat, error) {
 	todayStartMS, tomorrowMS := todayStart.UnixMilli(), tomorrow.UnixMilli()
-
-	nodeRows, err := d.db.Query(`
-		SELECT n.name, n.billing_mode, n.traffic_quota, n.period_rx_bytes, n.period_tx_bytes, n.traffic_manual_offset_bytes,
-			COUNT(sch.site_id),
+	query := `
+		SELECT n.id, n.name, n.billing_mode, n.traffic_quota, n.period_rx_bytes, n.period_tx_bytes,
+			n.traffic_manual_offset_bytes, n.cycle_started_at_ms, COUNT(sch.site_id),
 			COALESCE((SELECT SUM(t.bytes_in) FROM node_site_traffic_logs t WHERE t.node_id=n.id AND t.recorded_at_ms>=? AND t.recorded_at_ms<?),0),
 			COALESCE((SELECT SUM(t.bytes_out) FROM node_site_traffic_logs t WHERE t.node_id=n.id AND t.recorded_at_ms>=? AND t.recorded_at_ms<?),0)
-		FROM control_nodes n
+		FROM control_nodes n`
+	if assignedOnly {
+		query += `
 		JOIN site_node_schedules sch ON sch.applied_node_id=n.id AND sch.enabled=1
-		JOIN sites s ON s.id=sch.site_id AND s.enabled=1
-		GROUP BY n.id, n.name, n.billing_mode, n.traffic_quota, n.period_rx_bytes, n.period_tx_bytes, n.traffic_manual_offset_bytes
-		ORDER BY COUNT(sch.site_id) DESC, n.name`, todayStartMS, tomorrowMS, todayStartMS, tomorrowMS)
+		JOIN sites s ON s.id=sch.site_id AND s.enabled=1`
+	} else {
+		query += `
+		LEFT JOIN site_node_schedules sch ON sch.applied_node_id=n.id AND sch.enabled=1`
+	}
+	query += `
+		GROUP BY n.id, n.name, n.billing_mode, n.traffic_quota, n.period_rx_bytes, n.period_tx_bytes,
+			n.traffic_manual_offset_bytes, n.cycle_started_at_ms
+		ORDER BY COUNT(sch.site_id) DESC, n.name`
+
+	rows, err := d.db.Query(query, todayStartMS, tomorrowMS, todayStartMS, tomorrowMS)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	nodes := make([]telegramReportNodeStat, 0)
-	for nodeRows.Next() {
+	for rows.Next() {
 		var node telegramReportNodeStat
 		var quota, periodIn, periodOut, manualOffset, sites, bytesIn, bytesOut int64
 		var nodeBillingMode string
-		if err := nodeRows.Scan(&node.Name, &nodeBillingMode, &quota, &periodIn, &periodOut, &manualOffset, &sites, &bytesIn, &bytesOut); err != nil {
-			nodeRows.Close()
-			return err
+		if err := rows.Scan(&node.ID, &node.Name, &nodeBillingMode, &quota, &periodIn, &periodOut, &manualOffset, &node.CycleStartMS, &sites, &bytesIn, &bytesOut); err != nil {
+			rows.Close()
+			return nil, err
 		}
 		node.SiteCount = int(sites)
 		node.TodayTraffic = trafficBillableBytes(billingMode, bytesIn, bytesOut)
-		// A node's period counters are already charged by the Agent's own
-		// billing formula, so they must be summed the way the panel sums them:
-		// bidirectional adds both directions, outbound takes transmit only, and
-		// the manual offset is applied on top. Running them through
-		// trafficBillableBytes would apply the panel-wide multiplier a second
-		// time and report double the panel's figure.
 		node.CycleTraffic = saturatingAddInt64(telegramReportNodeChargedBytes(nodeBillingMode, periodIn, periodOut), manualOffset)
 		if node.CycleTraffic < 0 {
 			node.CycleTraffic = 0
@@ -642,11 +652,26 @@ func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings
 		}
 		nodes = append(nodes, node)
 	}
-	if err := nodeRows.Err(); err != nil {
-		nodeRows.Close()
-		return err
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
-	if err := nodeRows.Close(); err != nil {
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// appendTelegramReportDeployment fills the landing-node section and the quota
+// proximity warning. It is a separate pass because both read the node/site
+// tables rather than request_logs, and a failure here must be a real error: the
+// report would otherwise claim a healthy deployment with no nodes listed.
+func (d *DB) appendTelegramReportDeployment(stats *telegramReportStats, settings SystemSettings, localNow, todayStart, tomorrow time.Time) error {
+	location := timezoneLocation(settings.ScheduleTimezone)
+	billingMode := settings.TrafficBillingMode
+
+	nodes, err := d.telegramReportNodeStats(localNow, todayStart, tomorrow, billingMode, true)
+	if err != nil {
 		return err
 	}
 	stats.Nodes = nodes

@@ -323,6 +323,26 @@ func (d *DB) migrateOnce() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO telegram_report_settings (id) VALUES (1);
+	-- One row per alert already delivered, so a resource that sits above the
+	-- threshold for days is announced once per billing cycle instead of on every
+	-- scheduler tick. alert_bucket lets a resource escalate once it crosses the
+	-- next step, and cycle_start separates one billing cycle from the next.
+	CREATE TABLE IF NOT EXISTS telegram_traffic_alerts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		kind TEXT NOT NULL,
+		resource_id INTEGER NOT NULL,
+		cycle_start_ms INTEGER NOT NULL DEFAULT 0,
+		alert_bucket INTEGER NOT NULL DEFAULT 0,
+		name TEXT NOT NULL DEFAULT '',
+		used_bytes BIGINT NOT NULL DEFAULT 0,
+		limit_bytes BIGINT NOT NULL DEFAULT 0,
+		remaining_bytes BIGINT NOT NULL DEFAULT 0,
+		cycle_traffic BIGINT NOT NULL DEFAULT 0,
+		daily_traffic BIGINT NOT NULL DEFAULT 0,
+		sent_at_ms INTEGER NOT NULL DEFAULT 0,
+		UNIQUE(kind, resource_id, cycle_start_ms, alert_bucket)
+	);
+	CREATE INDEX IF NOT EXISTS idx_telegram_traffic_alerts_sent ON telegram_traffic_alerts(sent_at_ms DESC);
 	CREATE TABLE IF NOT EXISTS system_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		ui_mode TEXT NOT NULL DEFAULT 'novice', ui_radius INTEGER NOT NULL DEFAULT 10,
