@@ -524,7 +524,11 @@ function watchHistoryBindCards(grid) {
         event.preventDefault();
         event.stopPropagation();
         const index = Number(card.dataset.historyIndex);
-        watchHistoryDeleteItem(watchHistoryState.items[index]);
+        // Resolve the collection from the card's own source, exactly like the
+        // details opener above. A 正在观看 card carries an index into liveItems,
+        // so indexing watchHistoryState.items here deleted an unrelated history
+        // row (or silently did nothing when the index was out of range).
+        watchHistoryDeleteItem(watchHistoryItemsForSource(card.dataset.historySource)[index]);
       });
     }
     card.addEventListener('click', event => {

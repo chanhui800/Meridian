@@ -122,6 +122,12 @@ function renderDashboard() {
   `;
 
   startDashSSE();
+  // The periodic refreshes are owned by this page render. stopDashSSE() runs on
+  // every entry (and on teardown), so an app-level one-shot call at login cannot
+  // keep them alive: without this, navigating away and back left the cache card,
+  // the insight cards and every non-SSE site column frozen for the rest of the
+  // session, because app.js only calls startDashboardRefreshTimers() once.
+  startDashboardRefreshTimers();
   restoreDashboardRealtimeSamples();
   setupDashboardTrendControls();
   observeDashboardTrendResize();
@@ -1717,14 +1723,12 @@ function stopDashSSE() {
     dashboardBootstrapPromise = null;
   }
   dashboardSecondaryPromise = null;
-  if (dashboardSecondaryRefreshTimer) {
-    clearInterval(dashboardSecondaryRefreshTimer);
-    dashboardSecondaryRefreshTimer = null;
-  }
-  if (dashboardTrendRefreshTimer) {
-    clearInterval(dashboardTrendRefreshTimer);
-    dashboardTrendRefreshTimer = null;
-  }
+  // The refresh intervals are deliberately NOT cleared here. This function runs
+  // on every dashboard entry (through startDashSSE) as well as on teardown, so
+  // clearing them here killed the 60 s bootstrap refresh and the 15 s realtime
+  // trend refresh on the first navigation away and back: app.js only starts them
+  // once per page load. renderDashboard owns starting them, and teardown calls
+  // stopDashboardRefreshTimers().
   if (dashSSE) {
     dashSSE.close();
     dashSSE = null;
