@@ -1,9 +1,16 @@
 // Telegram scheduled report settings
+// Guards the save/test buttons against acting on a form that has not been filled
+// from the server yet. It must be cleared on EVERY render: the form is rebuilt
+// with template defaults, so a flag left over from a previous visit would let an
+// early click submit those defaults and silently overwrite the saved schedule,
+// the enabled flag and the warning threshold.
 let telegramReportLoaded = false;
 
 function renderTelegramReport() {
   const page = document.getElementById('page-telegram-report');
   if (!page) return;
+  telegramReportLoaded = false;
+  setTelegramReportButtonsPending(true);
   page.innerHTML = `
     <div class="settings-layout fade-up">
       ${globalSettingsNav('telegram')}
@@ -103,11 +110,23 @@ function updateTelegramFrequencyFields() {
   weekday.disabled = !weekly;
 }
 
+// setTelegramReportButtonsPending keeps the save/test buttons disabled until the
+// form actually reflects the saved settings. Without it an early click on a
+// freshly rendered form either does nothing with no explanation or, worse,
+// submits the template defaults over the operator's configuration.
+function setTelegramReportButtonsPending(pending) {
+  ['telegram-save', 'telegram-test'].forEach(id => {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.disabled = pending;
+    button.title = pending ? '正在读取已保存的设置…' : '';
+  });
+}
+
 async function loadTelegramReportSettings() {
   try {
     const settings = await API.getTelegramReportSettings();
     if (!settings || Router.current !== 'telegram-report') return;
-    telegramReportLoaded = true;
     document.getElementById('telegram-report-enabled').checked = !!settings.enabled;
     document.getElementById('telegram-bot-token').value = settings.bot_token || '';
     document.getElementById('telegram-chat-id').value = settings.chat_id || '';
@@ -120,8 +139,15 @@ async function loadTelegramReportSettings() {
       ? 'Bot Token 已保存并持续显示'
       : '尚未配置 Bot Token';
     document.getElementById('telegram-secret-warning').hidden = settings.secret_stable !== false;
+    // Only once every field holds the server value may a click be accepted.
+    telegramReportLoaded = true;
     updateTelegramFrequencyFields();
+    setTelegramReportButtonsPending(false);
   } catch (error) {
+    // The form still shows template defaults, so it must stay unsubmittable. The
+    // buttons deliberately stay clickable so the operator can retry after the
+    // read succeeds; submitTelegramReport explains the refusal.
+    telegramReportLoaded = false;
     Toast.error('读取 Telegram 日报设置失败：' + error.message);
   }
 }
@@ -147,7 +173,12 @@ function telegramReportPayload(action) {
 }
 
 async function submitTelegramReport(testOnly) {
-  if (!telegramReportLoaded) return;
+  if (!telegramReportLoaded) {
+    // Never submit a form that has not been filled from the server, and never
+    // fail silently: the operator has to know why nothing happened.
+    Toast.error('设置尚未读取完成，请稍候再试');
+    return;
+  }
   const button = document.getElementById(testOnly ? 'telegram-test' : 'telegram-save');
   const original = button.textContent;
   button.disabled = true;

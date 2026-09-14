@@ -64,7 +64,10 @@ function renderNodeCards() {
   }
   container.innerHTML = nodesSnapshot.nodes.map(node => {
     const usage = node.traffic_quota > 0 ? `${nodeBytes(node.traffic_used)} / ${nodeBytes(node.traffic_quota)}` : `${nodeBytes(node.traffic_used)} / 不限`;
-    const reset = node.reset_day === 0 ? '不自动重置' : `每月 ${node.reset_day} 日重置`;
+    // reset_day 0 means the node's counters never reset, so the same number is a
+    // lifetime total rather than a cycle one. Say so instead of letting a
+    // depleted node look like a monthly quota that should recover on its own.
+    const reset = node.reset_day === 0 ? '不自动重置（上限为累计值）' : `每月 ${node.reset_day} 日重置`;
     const entry = `HTTPS :${node.port}`;
     const applyError = String(node.agent_apply_error || '').trim();
     const listenerError = String(node.agent_listener_error || '').trim();
@@ -80,6 +83,7 @@ function renderNodeCards() {
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
       <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(addressText)} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
+      ${node.depleted ? '<div class="node-card-warning is-error">已超出流量上限，不再参与调度。提高上限、清除上限或改回每月重置日即可恢复。</div>' : ''}
       <div class="node-stats"><span><b>${usage}</b><small>${esc(node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费')}</small></span><span><b>${esc(reset)}</b><small>独立流量周期</small></span><span><b>${node.priority}</b><small>优先级${node.active ? ' · 当前选中' : ''}</small></span></div>
       <div class="node-entry-state"><div class="node-entry-details"><span>${esc(entry)}</span><small class="node-agent-version">Agent ${esc(node.agent_version || '未上报')}</small></div><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div>
       <div class="node-actions"><button type="button" data-action="edit" data-id="${node.id}">编辑</button><button type="button" data-action="enroll" data-id="${node.id}">重新生成脚本</button><button type="button" class="is-danger" data-action="delete" data-id="${node.id}">删除</button></div>
@@ -136,6 +140,7 @@ function openNodeForm(node) {
     <label>端口<input class="form-input" id="node-port" type="number" min="1" max="65535" value="${node && node.port ? node.port : (location.port || 443)}"></label>
     <div class="form-help">Agent 仅提供 TLS/HTTPS。同一节点上的所有调度站点共用此端口并按域名区分；端口必须未被该 VPS 上的其他程序占用。默认采用当前主控端口，保存后独立管理。</div>
     <div class="node-form-grid"><label>流量上限（GiB，0 为不限）<input class="form-input" id="node-quota" type="number" min="0" step="0.01" value="${node ? (Number(node.traffic_quota) / 1073741824).toFixed(2) : '0'}"></label><label>重置日<input class="form-input" id="node-reset" type="number" min="0" max="31" value="${node ? node.reset_day : 1}"></label></div>
+    <div class="form-help">重置日填 0 表示不自动重置，此时「流量上限」是累计上限：节点用量只增不减，一旦达到上限就不再参与调度，也不会自动恢复（可改回每月重置日，或清除流量上限）。</div>
     ${editing ? `<label>流量校正（GiB，可正负）<input class="form-input" id="node-offset" type="number" step="0.01" value="${(Number(node.traffic_manual_offset_bytes || 0) / 1073741824).toFixed(2)}"></label><div class="form-help">校正值叠加在网卡周期统计上，后续 Agent 上报不会覆盖。要把显示值调到目标值，可填写正数或负数。</div>` : ''}
     <div class="node-form-grid"><label>计费方式<select class="form-input" id="node-billing"><option value="outbound">上行</option><option value="bidirectional">上下行</option></select></label><label>优先级<input class="form-input" id="node-priority" type="number" min="0" max="1000" value="${node ? node.priority : 100}"></label></div>
     ${editing ? '<label class="node-check"><input id="node-enabled" type="checkbox" checked> 启用节点</label>' : '<label>控制器地址<input class="form-input" id="node-controller" type="url" required></label>'}

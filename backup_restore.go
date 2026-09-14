@@ -2806,7 +2806,35 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 		if pairErr != nil {
 			return pairErr
 		}
-		for _, entry := range restoreDirectoryTLSEntries(rollback) {
+		// restoreDirectoryTLSEntries reads the incoming restore's marker, not the
+		// rollback tree, so the entries it returns name the files the *pending
+		// restore* would have replaced. A rollback can hold TLS per-entry (the
+		// pre-snapshot layout) or as the tls-tree/ snapshot handled above, and an
+		// entry that is simply absent means it never existed locally. The
+		// dangerous shape is the one where the snapshot is missing for that
+		// reason: TLS is expected, every entry that would replace a live file has
+		// no rollback source, and deleting it would destroy the only copy — the
+		// panel certificate, the ACME account key and every Edge node pair —
+		// while still reporting success. Treat that as a partially written
+		// rollback and fail, so the caller keeps the rollback directory and the
+		// applied marker for the next startup retry.
+		entries := restoreDirectoryTLSEntries(rollback)
+		liveTargets, sources := 0, 0
+		for _, entry := range entries {
+			if targetTLSPath(dbPath, entry) == "" {
+				continue
+			}
+			if _, err := os.Lstat(targetTLSPath(dbPath, entry)); err == nil { // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
+				liveTargets++
+			}
+			if _, err := os.Stat(filepath.Join(rollback, filepath.FromSlash(entry))); err == nil { // #nosec G703 G304 -- source is an allowlisted rollback TLS entry.
+				sources++
+			}
+		}
+		if liveTargets > 0 && sources == 0 {
+			return errors.New("回滚副本缺少 TLS 快照，拒绝删除实时 TLS 文件")
+		}
+		for _, entry := range entries {
 			if isPanelCertificatePairEntry(entry) && panelPairRestored {
 				continue
 			}
@@ -2814,12 +2842,15 @@ func rollbackRestoreFiles(dbPath, rollback string) error {
 			if target == "" {
 				continue
 			}
-			_ = os.Remove(target) // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
 			source := filepath.Join(rollback, filepath.FromSlash(entry))
-			if _, err := os.Stat(source); err == nil { // #nosec G703 G304 -- source is an allowlisted rollback TLS entry.
-				if err := copyPrivateFile(source, target); err != nil {
-					return err
-				}
+			if _, err := os.Stat(source); err != nil { // #nosec G703 G304 -- source is an allowlisted rollback TLS entry.
+				// Absent from the rollback means the entry never existed locally;
+				// never delete a live file that has no rollback copy to restore.
+				continue
+			}
+			_ = os.Remove(target) // #nosec G703 G304 -- target is derived from the fixed TLS allowlist.
+			if err := copyPrivateFile(source, target); err != nil {
+				return err
 			}
 		}
 	}

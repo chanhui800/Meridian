@@ -101,17 +101,38 @@ function renderSiteAccessVisibilityIcon(hidden) {
 
 function siteCardsRenderSignature(sites, activeSiteIDs) {
   const active = activeSiteIDs instanceof Set ? activeSiteIDs : new Set();
-  return JSON.stringify((Array.isArray(sites) ? sites : []).map(site => [
-    site && site.id, site && site.name, site && site.target_url, site && site.public_host,
-    site && site.icon_name, site && site.icon_url,
-    site && site.ingress_mode, site && site.listen_port, site && site.ua_mode,
-    site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used,
-    site && site.media_movie_count, site && site.media_series_count, site && site.media_episode_count,
-    site && site.account_retention_days, site && site.account_retention_started_at_ms,
-    site && site.account_retention_last_completed_at_ms,
-    Array.isArray(site && site.upstream_headers) ? site.upstream_headers.length : 0,
-    active.has(String(site && site.id)),
-  ]));
+  return JSON.stringify((Array.isArray(sites) ? sites : []).map(site => {
+    // The early return in renderSiteCards skips BOTH the repaint and the handler
+    // re-binding, and every edit/icon handler closes over the sitesById map built
+    // on that path. Anything the card renders or the edit modal pre-fills must
+    // therefore be part of this signature: a field missing here leaves the stale
+    // object in place, so re-opening 编辑 shows the pre-save value and the next
+    // save silently reverts the operator's change.
+    const retention = siteAccountRetentionStatus(site);
+    return [
+      site && site.id, site && site.name, site && site.target_url, site && site.public_host,
+      site && site.icon_name, site && site.icon_url,
+      site && site.ingress_mode, site && site.listen_port, site && site.ua_mode,
+      site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used,
+      site && site.media_movie_count, site && site.media_series_count, site && site.media_episode_count,
+      site && site.account_retention_days, site && site.account_retention_started_at_ms,
+      site && site.account_retention_last_completed_at_ms,
+      retention.enabled, retention.remainingDays, retention.overdue,
+      Array.isArray(site && site.upstream_headers) ? site.upstream_headers.length : 0,
+      // Edit-modal inputs: changing any of these without a repaint is what makes a
+      // later save write the previous value back.
+      site && site.playback_target_url, site && site.playback_mode,
+      site && site.main_video_stream_mode, site && site.client_ip_mode,
+      site && site.speed_limit, site && site.watch_history_enabled,
+      site && site.path_prefix, site && site.primary_line_name,
+      site && site.asset_cache_enabled, site && site.asset_cache_ttl_sec,
+      site && site.asset_cache_max_bytes, site && site.asset_cache_rules,
+      site && site.custom_user_agent, site && site.custom_client, site && site.custom_version,
+      JSON.stringify(site && site.failover_lines || null),
+      JSON.stringify(site && site.stream_hosts || null),
+      active.has(String(site && site.id)),
+    ];
+  }));
 }
 
 function renderSites() {

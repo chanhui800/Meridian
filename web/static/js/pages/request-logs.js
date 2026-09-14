@@ -391,6 +391,12 @@ function renderRequestLogRows(logs) {
     return;
   }
   body.innerHTML = logs.map(requestLogRowHTML).join('');
+  // Column visibility lives on the parsed cells, so a fresh innerHTML drops it
+  // while the header stays in its previous state. The incremental path re-applies
+  // the settings after inserting and the UA width is re-applied on every render;
+  // this full-render path has to match, or a filter, refresh or search makes the
+  // operator-hidden columns reappear and the table misalign.
+  requestLogApplyDisplaySettings(requestLogLastDisplaySettings);
 }
 
 function requestLogRowHTML(entry) {

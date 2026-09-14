@@ -108,6 +108,10 @@ type telegramReportNodeStat struct {
 	// CycleStartMS is the node's own billing-cycle boundary, used to scope the
 	// alert ledger to one cycle.
 	CycleStartMS int64
+	// ResetDay is the node's own configured reset day. Zero means the node's
+	// period counters never reset, so its "cycle" figure is a lifetime total and
+	// must not be labelled as a monthly one.
+	ResetDay int
 	// Limit is the node's configured quota. Remaining is clamped at zero once the
 	// quota is exhausted, so the ratio must be taken against this figure rather
 	// than against used+remaining.
@@ -143,8 +147,11 @@ type telegramReportStats struct {
 	// day, timezone and billing mode as the panel. It is named apart from the
 	// per-node telegramReportNodeStat.CycleTraffic on purpose: those are two
 	// different quantities that must never be assigned to each other.
-	CycleTraffic        int64
-	CycleStart          time.Time
+	CycleTraffic int64
+	CycleStart   time.Time
+	// TrafficResetDay is the global billing reset day. Zero means the cycle is
+	// disabled and CycleTraffic carries the lifetime total instead.
+	TrafficResetDay     int
 	LifetimeTraffic     int64
 	BillingMode         string
 	SiteCount           int
@@ -437,6 +444,11 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	// The cycle figures follow the panel's own billing cycle: the configured
 	// reset day (e.g. the 15th) in the scheduling timezone, charged with the
 	// global billing mode. A rolling 30-day window would disagree with the panel.
+	// A reset day of zero disables the cycle entirely, which the panel documents
+	// as "use the lifetime total"; trafficSum(cycleStart) then degenerates to the
+	// all-time sum, so the renderer labels it as a cumulative figure rather than
+	// presenting an all-time number as a monthly one.
+	stats.TrafficResetDay = settings.TrafficResetDay
 	cycleStart := trafficCycleStart(localNow, settings.TrafficResetDay, location)
 	if !cycleStart.IsZero() {
 		if stats.CycleTraffic, err = trafficSum(cycleStart); err != nil {
@@ -606,7 +618,7 @@ func (d *DB) telegramReportNodeStats(localNow, todayStart, tomorrow time.Time, b
 	todayStartMS, tomorrowMS := todayStart.UnixMilli(), tomorrow.UnixMilli()
 	query := `
 		SELECT n.id, n.name, n.billing_mode, n.traffic_quota, n.period_rx_bytes, n.period_tx_bytes,
-			n.traffic_manual_offset_bytes, n.cycle_started_at_ms, COUNT(sch.site_id),
+			n.traffic_manual_offset_bytes, n.cycle_started_at_ms, n.reset_day, COUNT(sch.site_id),
 			COALESCE((SELECT SUM(t.bytes_in) FROM node_site_traffic_logs t WHERE t.node_id=n.id AND t.recorded_at_ms>=? AND t.recorded_at_ms<?),0),
 			COALESCE((SELECT SUM(t.bytes_out) FROM node_site_traffic_logs t WHERE t.node_id=n.id AND t.recorded_at_ms>=? AND t.recorded_at_ms<?),0)
 		FROM control_nodes n`
@@ -620,7 +632,7 @@ func (d *DB) telegramReportNodeStats(localNow, todayStart, tomorrow time.Time, b
 	}
 	query += `
 		GROUP BY n.id, n.name, n.billing_mode, n.traffic_quota, n.period_rx_bytes, n.period_tx_bytes,
-			n.traffic_manual_offset_bytes, n.cycle_started_at_ms
+			n.traffic_manual_offset_bytes, n.cycle_started_at_ms, n.reset_day
 		ORDER BY COUNT(sch.site_id) DESC, n.name`
 
 	rows, err := d.db.Query(query, todayStartMS, tomorrowMS, todayStartMS, tomorrowMS)
@@ -632,7 +644,7 @@ func (d *DB) telegramReportNodeStats(localNow, todayStart, tomorrow time.Time, b
 		var node telegramReportNodeStat
 		var quota, periodIn, periodOut, manualOffset, sites, bytesIn, bytesOut int64
 		var nodeBillingMode string
-		if err := rows.Scan(&node.ID, &node.Name, &nodeBillingMode, &quota, &periodIn, &periodOut, &manualOffset, &node.CycleStartMS, &sites, &bytesIn, &bytesOut); err != nil {
+		if err := rows.Scan(&node.ID, &node.Name, &nodeBillingMode, &quota, &periodIn, &periodOut, &manualOffset, &node.CycleStartMS, &node.ResetDay, &sites, &bytesIn, &bytesOut); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -958,8 +970,15 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 		if node.HasQuota {
 			remaining = formatTelegramBytes(node.Remaining)
 		}
-		fmt.Fprintf(&b, "• %s（%d 个站点）：今日 %s 丨 当月 %s 丨 剩余 %s\n",
-			truncateTelegramText(node.Name, 48), node.SiteCount, formatTelegramBytes(node.TodayTraffic), formatTelegramBytes(node.CycleTraffic), remaining)
+		// The node's period counters only reset when its own reset day is set; a
+		// node with reset_day=0 accumulates for its whole lifetime, so the same
+		// number must not be labelled 当月 for it.
+		cycleLabel := "当月"
+		if node.ResetDay == 0 {
+			cycleLabel = "累计"
+		}
+		fmt.Fprintf(&b, "• %s（%d 个站点）：今日 %s 丨 %s %s 丨 剩余 %s\n",
+			truncateTelegramText(node.Name, 48), node.SiteCount, formatTelegramBytes(node.TodayTraffic), cycleLabel, formatTelegramBytes(node.CycleTraffic), remaining)
 	}
 	b.WriteString("\n")
 
@@ -984,8 +1003,11 @@ func buildTelegramReportMessage(stats telegramReportStats) string {
 	b.WriteString("🌐 流量统计\n")
 	fmt.Fprintf(&b, "• 当天：%s\n", formatTelegramBytes(stats.TodayTraffic))
 	fmt.Fprintf(&b, "• 七天内：%s\n", formatTelegramBytes(stats.SevenDayTraffic))
-	if stats.CycleStart.IsZero() {
-		fmt.Fprintf(&b, "• 当月流量：%s\n", formatTelegramBytes(stats.CycleTraffic))
+	if stats.TrafficResetDay == 0 {
+		// With the billing cycle disabled there is no reset boundary, so the
+		// figure the panel and the quota both use is the lifetime total. Calling
+		// it 当月流量 would report an all-time number under a monthly label.
+		fmt.Fprintf(&b, "• 累计流量（未设置重置日）：%s\n", formatTelegramBytes(stats.CycleTraffic))
 	} else {
 		fmt.Fprintf(&b, "• 当月流量（%s 起）：%s\n", stats.CycleStart.Format("01-02"), formatTelegramBytes(stats.CycleTraffic))
 	}

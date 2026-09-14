@@ -1590,7 +1590,26 @@ func (m *panelCertificateManager) restoreInstalledFiles(backup installedPanelCer
 	if err := restoreOptionalFile(filepath.Join(m.accountDir, "enabled"), backup.marker, backup.markerExists); err != nil {
 		return fmt.Errorf("restore TLS marker: %w", err)
 	}
+	// Reload the restored pair instead of dropping the in-memory certificate.
+	// tlsConfig's GetCertificate fails every handshake while this pointer is nil,
+	// and nothing else repopulates it: status() reads the certificate from disk,
+	// so a restored-on-disk pair looks healthy and no renewal is scheduled. A
+	// rollback that only cleared the pointer therefore took the panel's HTTPS
+	// down until a manual restart.
+	//
+	// The pair paths are re-resolved here on purpose: the ones captured above
+	// describe the state before the rollback, so a manager whose active pair sits
+	// in the atomic generation pointer resolved to the legacy path while the
+	// pointer was absent, and loading from there would read the wrong file (or
+	// nothing at all). panelPairPaths() is also what tlsConfig itself uses, so
+	// resolving it now loads exactly the certificate the listener will serve.
 	m.currentCertificate = nil
+	restoredCert, restoredKey := m.panelPairPaths()
+	if restored, err := tls.LoadX509KeyPair(restoredCert, restoredKey); err == nil {
+		m.currentCertificate = &restored
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reload restored certificate pair: %w", err)
+	}
 	return nil
 }
 
