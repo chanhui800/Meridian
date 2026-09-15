@@ -2219,6 +2219,56 @@ func probeNodeAddress(ctx context.Context, node ControlNode, host string, probeS
 	return nil
 }
 
+// probeNodeSiteAssignment asks the node to serve the scheduled host and treats
+// the Agent's own "site not assigned" refusal as a failed probe.
+//
+// This is deliberately separate from the health endpoint, which the Agent
+// exempts from its site-assignment check: a node whose live route table has lost
+// the site still answers the health check with 200, so the Controller would
+// publish DNS pointing at a node that answers every real request with 421. Only
+// the status code is inspected, and only the Agent's refusal fails the probe:
+// whatever the upstream answers (404 for a path that does not exist, 401 for an
+// unauthenticated call) still proves the node routed the request to the site.
+func probeNodeSiteAssignment(ctx context.Context, node ControlNode, host string, probeSecret []byte, address string) error {
+	return probeNodeSiteAssignmentWithRoots(ctx, node, host, probeSecret, address, nil)
+}
+
+func probeNodeSiteAssignmentWithRoots(ctx context.Context, node ControlNode, host string, probeSecret []byte, address string, roots *x509.CertPool) error {
+	dialAddress, err := nodeDialAddress(address, nodeHTTPSProbePort(node))
+	if err != nil {
+		return err
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, dialAddress)
+		},
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host, RootCAs: roots},
+		DisableKeepAlives: true,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Meridian-Probe", encodeRuntimeKey(probeSecret))
+	response, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	if response.StatusCode == http.StatusMisdirectedRequest {
+		// The site identifier, not the hostname: logs are shared in bug reports.
+		log.Printf("[node-scheduler] node %d refused the site host with HTTP %d: the Agent's route table does not hold it",
+			node.ID, response.StatusCode)
+		return errors.New("node refused the site: the Agent's route table does not hold this host")
+	}
+	return nil
+}
+
 func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
 	unlockSite := a.lockSiteSchedule(schedule.SiteID)
 	defer unlockSite()
@@ -2284,8 +2334,18 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	// published AAAA that points at an address the node does not actually serve
 	// looks healthy in the panel while every IPv6 client fails to connect.
 	families := node.DNSPublishFamilies()
-	if err := probeScheduledNodeAddresses(ctx, node, schedule.PublicHost, probeSecret, probeTargetsForFamilies(node, families)); err != nil {
-		return readinessError(readinessProbe, fmt.Errorf("entry health check: %w", err))
+	targets := probeTargetsForFamilies(node, families)
+	for _, target := range targets {
+		if err := probeScheduledNodeAddresses(ctx, node, schedule.PublicHost, probeSecret, []probeTarget{target}); err != nil {
+			return readinessError(readinessProbe, fmt.Errorf("entry health check: %w", err))
+		}
+		// The health endpoint is exempt from the Agent's site-assignment check, so
+		// a node whose route table lost this site answers it while refusing every
+		// real request with 421. Ask it to serve the site as well, otherwise DNS
+		// is published pointing at a node that serves nobody.
+		if err := probeNodeSiteAssignment(ctx, node, schedule.PublicHost, probeSecret, target.address); err != nil {
+			return readinessError(readinessProbe, fmt.Errorf("%s entry route check: %w", dnsFamilyLabel(target.family), err))
+		}
 	}
 	if err := a.db.clearSiteNodeProbeFailure(schedule.SiteID, node.ID); err != nil {
 		return fmt.Errorf("clear entry health check cooldown: %w", err)

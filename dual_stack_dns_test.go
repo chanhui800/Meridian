@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -306,6 +308,180 @@ func TestProbeFailureNamesTheRefusedFamily(t *testing.T) {
 		if !strings.Contains(message, needle) {
 			t.Fatalf("probe error %q must name %q so the panel can say which record was refused", message, needle)
 		}
+	}
+}
+
+// The entry health check is exempt from the Agent's site-assignment check, so a
+// node whose route table has lost the site still answers it. Publishing DNS on
+// that node points the site at a host that refuses every real request with 421,
+// which looks healthy in the panel while no client can connect. The route check
+// exists to catch exactly that, so it must fail on the Agent's own refusal and
+// pass on anything else the upstream happens to answer.
+func TestSiteRouteProbeRefusesANodeThatDoesNotServeTheSite(t *testing.T) {
+	cases := []struct {
+		name       string
+		siteStatus int
+		wantErr    bool
+	}{
+		// The Agent's own "site not assigned" refusal.
+		{"agent refuses the host", http.StatusMisdirectedRequest, true},
+		// Anything the upstream answers still proves the node routed the request.
+		{"upstream answers", http.StatusOK, false},
+		{"upstream has no such path", http.StatusNotFound, false},
+		{"upstream wants auth", http.StatusUnauthorized, false},
+		{"upstream is broken", http.StatusBadGateway, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var sawProbeHeader string
+			var sawHost string
+			var sawPath string
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sawProbeHeader = r.Header.Get("X-Meridian-Probe")
+				sawHost = requestPublicHost(r.Host)
+				sawPath = r.URL.Path
+				w.WriteHeader(testCase.siteStatus)
+			}))
+			defer server.Close()
+			certificate, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			address, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			port, err := strconv.Atoi(portText)
+			if err != nil {
+				t.Fatal(err)
+			}
+			host := "127.0.0.1"
+			if len(certificate.DNSNames) > 0 {
+				host = certificate.DNSNames[0]
+			}
+			secret, err := newNodeProbeSecret()
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeNodeProbeSecret(secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			roots := x509.NewCertPool()
+			roots.AddCert(certificate)
+			node := ControlNode{GUID: "route-probe-guid", Address: address, Port: port}
+			probeErr := probeNodeSiteAssignmentWithRoots(context.Background(), node, host, decoded, address, roots)
+			if testCase.wantErr {
+				if probeErr == nil {
+					t.Fatal("a node answering 421 for the site must fail the route probe")
+				}
+				if !strings.Contains(probeErr.Error(), "route table") {
+					t.Fatalf("probe error %q must say the node does not hold the site", probeErr)
+				}
+			} else if probeErr != nil {
+				t.Fatalf("probe failed on HTTP %d: %v", testCase.siteStatus, probeErr)
+			}
+			// The probe has to look like a real client request for the site, and it
+			// still has to authenticate so an outside prober cannot use it as an
+			// oracle for which hosts a node serves.
+			if sawProbeHeader != encodeRuntimeKey(decoded) {
+				t.Fatalf("probe header = %q, want the node's runtime key", sawProbeHeader)
+			}
+			if sawHost != host {
+				t.Fatalf("probe Host = %q, want %q", sawHost, host)
+			}
+			if sawPath != "/" {
+				t.Fatalf("probe path = %q, want /", sawPath)
+			}
+		})
+	}
+}
+
+// A redirect must not be followed: the answer that matters is the node's own, and
+// a followed redirect would report the final target's status instead.
+func TestSiteRouteProbeDoesNotFollowRedirects(t *testing.T) {
+	var secondHit bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/elsewhere" {
+			secondHit = true
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	defer server.Close()
+	certificate, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "127.0.0.1"
+	if len(certificate.DNSNames) > 0 {
+		host = certificate.DNSNames[0]
+	}
+	secret, err := newNodeProbeSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeNodeProbeSecret(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	node := ControlNode{GUID: "route-probe-guid", Address: address, Port: port}
+	if err := probeNodeSiteAssignmentWithRoots(context.Background(), node, host, decoded, address, roots); err != nil {
+		t.Fatalf("a redirect is not a refusal: %v", err)
+	}
+	if secondHit {
+		t.Fatal("the probe followed the redirect instead of judging the node's own answer")
+	}
+}
+
+// The readiness gate must ask the node to serve the site, not only to answer the
+// health endpoint: the Agent exempts that endpoint from its site-assignment
+// check, so a node whose route table lost the site passes the health probe and
+// then refuses every real request with 421. Publishing DNS on such a node takes
+// the site off the air, which is worse than staying on the Controller.
+//
+// The probe's own behaviour is covered by TestSiteRouteProbeRefusesANodeThatDoesNotServeTheSite;
+// what is pinned here is that the reconcile path consults it per published family
+// and turns its refusal into a readiness failure.
+func TestReconcileChecksTheSiteRoutePerPublishedFamily(t *testing.T) {
+	source, err := os.ReadFile("site_node_scheduler.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(source)
+	// The checkout may be CRLF or LF depending on the developer's git settings, so
+	// line endings are normalised before matching.
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	// The full statement, not just the call: dropping the readiness failure while
+	// keeping the call would leave the decision unreported.
+	refusal := `if err := probeNodeSiteAssignment(ctx, node, schedule.PublicHost, probeSecret, target.address); err != nil {
+			return readinessError(readinessProbe, fmt.Errorf("%s entry route check: %w", dnsFamilyLabel(target.family), err))
+		}`
+	if !strings.Contains(body, refusal) {
+		t.Fatal("the reconcile path must turn a refused site route into a readiness failure")
+	}
+	// It has to run inside the per-family loop, after that family's health probe,
+	// so the error names the family that was refused.
+	loopIndex := strings.Index(body, "for _, target := range targets {")
+	healthIndex := strings.Index(body, "probeScheduledNodeAddresses(ctx, node, schedule.PublicHost, probeSecret, []probeTarget{target})")
+	routeIndex := strings.Index(body, refusal)
+	if loopIndex < 0 || healthIndex < 0 || routeIndex < 0 {
+		t.Fatalf("unexpected reconcile probe layout: loop=%d health=%d route=%d", loopIndex, healthIndex, routeIndex)
+	}
+	if !(loopIndex < healthIndex && healthIndex < routeIndex) {
+		t.Fatalf("the route check must follow the health probe inside the family loop: loop=%d health=%d route=%d",
+			loopIndex, healthIndex, routeIndex)
 	}
 }
 
