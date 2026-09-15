@@ -330,6 +330,9 @@ func TestSiteRouteProbeRefusesANodeThatDoesNotServeTheSite(t *testing.T) {
 		{"upstream has no such path", http.StatusNotFound, false},
 		{"upstream wants auth", http.StatusUnauthorized, false},
 		{"upstream is broken", http.StatusBadGateway, false},
+		// The Agent's own "indexed but no instance": a site it was told to serve
+		// and currently cannot, so it must not be treated as reachable either.
+		{"agent has no instance for the host", http.StatusServiceUnavailable, true},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -375,7 +378,7 @@ func TestSiteRouteProbeRefusesANodeThatDoesNotServeTheSite(t *testing.T) {
 				if probeErr == nil {
 					t.Fatal("a node answering 421 for the site must fail the route probe")
 				}
-				if !strings.Contains(probeErr.Error(), "route table") {
+				if !strings.Contains(probeErr.Error(), "route table") && !strings.Contains(probeErr.Error(), "no instance") {
 					t.Fatalf("probe error %q must say the node does not hold the site", probeErr)
 				}
 			} else if probeErr != nil {

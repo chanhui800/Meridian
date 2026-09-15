@@ -2260,11 +2260,22 @@ func probeNodeSiteAssignmentWithRoots(ctx context.Context, node ControlNode, hos
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-	if response.StatusCode == http.StatusMisdirectedRequest {
+	switch response.StatusCode {
+	case http.StatusMisdirectedRequest:
+		// The Agent's own "site not assigned": it has no route for this host.
 		// The site identifier, not the hostname: logs are shared in bug reports.
 		log.Printf("[node-scheduler] node %d refused the site host with HTTP %d: the Agent's route table does not hold it",
 			node.ID, response.StatusCode)
 		return errors.New("node refused the site: the Agent's route table does not hold this host")
+	case http.StatusServiceUnavailable:
+		// The Agent has the host indexed but no instance serving it, which is a
+		// site it was told to serve and currently cannot. Publishing DNS here would
+		// send every client to a node that answers 503, so it counts as a refusal
+		// just like 421 does. Both are the Agent's own answers, which is what makes
+		// them different from whatever the upstream returns.
+		log.Printf("[node-scheduler] node %d answered HTTP %d for the site host: it has no instance serving it",
+			node.ID, response.StatusCode)
+		return errors.New("node cannot serve the site: it has no instance for this host")
 	}
 	return nil
 }
