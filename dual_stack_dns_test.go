@@ -1466,6 +1466,10 @@ func TestAdoptionPromotesIPv4OverAnInferredPrimary(t *testing.T) {
 // already filled and nothing left to probe: with every family satisfied the
 // adoption loop verifies nothing new, and reading the stored state back must
 // still move the primary rather than short-circuiting on "no change".
+//
+// The IPv6 address lives only in the primary column on such a node, so the
+// promotion must keep it in its own slot: dropping it takes that family out of
+// the published set and deletes the AAAA record the site was already serving.
 func TestUpgradedNodeStillPromotesItsFilledIPv4(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
@@ -1528,6 +1532,19 @@ func TestUpgradedNodeStillPromotesItsFilledIPv4(t *testing.T) {
 	}
 	if after.Address != "203.0.113.10" {
 		t.Fatalf("stored primary address = %q, want the already-adopted IPv4", after.Address)
+	}
+	// The v6 address was only ever in the primary column. Moving the primary to
+	// IPv4 without keeping it would drop the family, and the site would lose its
+	// AAAA record on the next reconcile.
+	if after.AddressV6 != "2001:db8::9" {
+		t.Fatalf("address_v6 = %q, want the promoted node's own v6 address kept", after.AddressV6)
+	}
+	if after.IPv6Address() != "2001:db8::9" {
+		t.Fatalf("IPv6Address = %q, want the v6 family to stay resolvable", after.IPv6Address())
+	}
+	families := after.DNSPublishFamilies()
+	if len(families) != 2 {
+		t.Fatalf("published families = %v, want both after the promotion", families)
 	}
 }
 

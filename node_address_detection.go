@@ -332,6 +332,16 @@ func mergeAdoptedNodeAddresses(node ControlNode, addressV4, addressV6, sourceV6 
 			nodeAddressFamily(node.Address) == "v6" &&
 			nodeAddressSourceInferred(node.AddressSource) &&
 			normalizeNodeDNSPublish(node.DNSPublish) != nodeDNSPublishV6 {
+			// The v6 address lives only in the primary column on a node that
+			// enrolled over IPv6, so moving the primary to IPv4 would drop that
+			// family from the published set and delete its AAAA record. Keep it
+			// in its own slot first, with the provenance it already had.
+			if strings.TrimSpace(result.addressV6) == "" {
+				result.addressV6 = node.Address
+				if result.addressV6Src == "" {
+					result.addressV6Src = node.AddressSource
+				}
+			}
 			result.address, result.source = result.addressV4, nodeAddressSourceDetected
 		}
 	}
