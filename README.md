@@ -4,7 +4,9 @@
 [![Release](https://img.shields.io/github/v/release/chanhui800/Meridian)](https://github.com/chanhui800/Meridian/releases/latest)
 [![License](https://img.shields.io/github/license/chanhui800/Meridian)](LICENSE)
 
-Meridian 是 Emby 和 Jellyfin 的多站点反向代理面板。它把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 和可选的节点调度放在一个控制面板里。
+Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板。它把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 和可选的边缘 Agent 放在一个控制面板里。
+
+当前稳定版为 **v1.11.0**。这一版本把节点调度的地址族选择、双栈 DNS 发布和 Agent 安装链路整理为一套可审计的主控配置：不启用调度的站点继续使用原面板入口，启用后才会把入口交给选定的节点。
 
 ## 界面预览
 
@@ -32,6 +34,9 @@ Meridian 是 Emby 和 Jellyfin 的多站点反向代理面板。它把站点入�
 - 可选观看历史、媒体库数量、保号提醒、TMDB 补全和 Telegram 日报。
 - 支持 ACME DNS-01、自动续签、加密备份与恢复。
 - 可选节点调度：一个 Controller 管理多台 Linux Agent，DNS 只切换新连接。
+- 主控模式按站点启用：关闭时保留原面板入口；启用时可跟随全局调度或固定到指定节点。
+- Agent 地址族可按节点能力发布：V4 节点发布 A，V6 节点发布 AAAA，双栈节点默认同时发布 A/AAAA，也可在节点级手动只发布其中一个。
+- Agent 支持 Linux amd64/arm64，安装器从当前主控获取并校验匹配版本的二进制；Controller 不需要把 Agent 打进镜像。
 - 站点图标由用户上传图标包，支持按图标名称搜索和分配；项目不内置图标包。
 
 ## 快速安装
@@ -128,9 +133,17 @@ sudo journalctl -u meridian -f
 
 域名入口需要在“全局设置 → TLS 设置”中分别填写面板完整域名（例如 `panel.admin.example.com`）和节点泛域名（例如 `*.example.com`）。两者必须属于同一注册域但不能相同，现有站点域名无需迁移。Controller 证书会按配置覆盖面板域名，并在需要承载 Host 入口时包含节点泛域名；每台 Edge Agent 使用自己的证书和私钥，不共享 Controller 私钥。
 
-## 节点调度
+## 节点调度与主控模式
 
-节点调度是可选模块。Controller 保存节点、站点分配、优先级、流量周期和 DNS 状态；每台 VPS 只运行一个轻量 `meridian-agent`，不需要安装完整面板。详细步骤见：[节点调度](docs/node-scheduling.md) 和 [Agent 安装与卸载](docs/agent-installation.md)。
+节点调度是可选模块。Controller 保存节点、站点分配、优先级、流量周期、地址族和 DNS 状态；每台 VPS 只运行一个轻量 `meridian-agent`，不需要安装完整面板。详细步骤见：[节点调度](docs/node-scheduling.md) 和 [Agent 安装与卸载](docs/agent-installation.md)。
+
+站点的调度开关在“主控模式”分组中逐站点设置：
+
+- **节点调度未启用**：继续使用原面板入口，站点不会创建或切换 Agent DNS 记录。
+- **跟随全局节点**：由 Controller 按优先级、心跳、配置状态和流量额度选择可用节点。
+- **固定到指定节点**：只使用管理员选择的节点；节点不可用时保持等待，不会悄悄切换到其他节点。
+
+节点保存独立的 IPv4 和 IPv6 地址。DNS 发布策略默认按节点地址能力工作：只有 IPv4 时发布 A，只有 IPv6 时发布 AAAA，同时拥有两者时发布 A 与 AAAA。需要兼容特定网络时，可以手动选择“仅 IPv4”或“仅 IPv6”；切换地址族时 Controller 只维护自己创建的对应记录，不会删除用户手工创建的同名记录。
 
 调度过程如下：
 
