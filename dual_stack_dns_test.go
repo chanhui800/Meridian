@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -433,6 +437,169 @@ func TestNodeAddressAdoptionIsThrottled(t *testing.T) {
 	}
 	if final.AddressV6 != "" {
 		t.Fatalf("a skipped attempt still adopted %q", final.AddressV6)
+	}
+}
+
+// A backup taken while dual-stack publishing is active must restore with the
+// per-family address slots and the tracked record ledger intact. Losing the
+// ledger would make the scheduler treat live Meridian records as untracked and
+// refuse to touch them, so the site would stop following its node.
+func TestBackupRestoreRoundTripsDualStackState(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	sourceDB, err := openDB(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A restore refuses a backup with no administrator account, so the source has
+	// to look like a real installation.
+	if _, err := sourceDB.db.Exec(`INSERT INTO users (username, password_hash) VALUES ('admin', 'hash')`); err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	node, _, err := sourceDB.CreateControlNode(NodeCreateInput{
+		Name: "dual", AddressV4: "203.0.113.10", AddressV6: "2001:db8::1", DNSPublish: nodeDNSPublishV6,
+		Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	site, err := sourceDB.CreateSite("dual-site", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	// A restore deliberately clears sites whose ingress it cannot preserve, so the
+	// fixture uses a supported host ingress to keep its schedule row.
+	if _, err := sourceDB.db.Exec(`UPDATE sites SET public_host='dual.example.test',ingress_mode=?,enabled=1 WHERE id=?`,
+		ingressModeHost, site.ID); err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	ledgerTx, err := sourceDB.db.Begin()
+	if err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	if err := replaceSiteDNSRecordsTx(ledgerTx, site.ID, []siteDNSRecord{
+		{Family: "v4", ZoneID: "zone-1", RecordID: "rec-v4", RecordType: "A", Address: "203.0.113.10"},
+		{Family: "v6", ZoneID: "zone-1", RecordID: "rec-v6", RecordType: "AAAA", Address: "2001:db8::1"},
+	}, now.UnixMilli()); err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	if err := ledgerTx.Commit(); err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	// CreateSite does not create a schedule row, so the fixture supplies one: the
+	// published family set only exists on a site that is actually scheduled.
+	if _, err := sourceDB.db.Exec(`INSERT INTO site_node_schedules (site_id,enabled,mode,dns_status,schedule_revision,created_at_ms,updated_at_ms)
+		VALUES(?,1,'global','active',1,?,?)`, site.ID, now.UnixMilli(), now.UnixMilli()); err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	if _, err := sourceDB.db.Exec(`UPDATE site_node_schedules SET dns_families=?,dns_status='active',cf_record_id='rec-v4',cf_record_type='A',applied_address='203.0.113.10' WHERE site_id=?`,
+		encodeDNSFamilies([]string{"v4", "v6"}), site.ID); err != nil {
+		sourceDB.Close()
+		t.Fatal(err)
+	}
+	// The source schedule row must exist for the family set to be meaningful, so
+	// the fixture asserts it wrote one rather than reading back a default row the
+	// restore's own migration may have created.
+	var sourceFamilies, sourceRecord string
+	if err := sourceDB.db.QueryRow(`SELECT dns_families,cf_record_id FROM site_node_schedules WHERE site_id=?`, site.ID).
+		Scan(&sourceFamilies, &sourceRecord); err != nil {
+		sourceDB.Close()
+		t.Fatalf("source schedule row: %v", err)
+	}
+	sourceDB.Close()
+	if sourceFamilies == "" || sourceRecord == "" {
+		t.Fatalf("fixture did not write the source schedule: families=%q record=%q", sourceFamilies, sourceRecord)
+	}
+
+	backupData, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetPath := filepath.Join(dir, "target.db")
+	targetDB, err := openDB(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := targetDB.db.Exec(`INSERT INTO users (username, password_hash) VALUES ('admin', 'hash')`); err != nil {
+		targetDB.Close()
+		t.Fatal(err)
+	}
+	if _, err := targetDB.db.Exec(`UPDATE panel_settings SET panel_domain='target.example.test', route_domain='route.example.test', listen_port=9443, tls_enabled=0, configured=1 WHERE id=1`); err != nil {
+		targetDB.Close()
+		t.Fatal(err)
+	}
+	// The restore preserves the target's panel settings, so it needs them.
+	preserved, err := readBackupPanelSettings(targetDB.db)
+	if err != nil {
+		targetDB.Close()
+		t.Fatal(err)
+	}
+	targetDB.Close()
+	// The source rows were encrypted with the process signing key (see
+	// TestMain), so that is the "old" secret the restore has to decrypt with. The
+	// target uses a different key, which is what makes the restore re-encrypt the
+	// node probe secret instead of passing ciphertext through.
+	oldJWT := []byte(strings.Repeat("test-jwt-secret-", 3))
+	targetJWT := bytes.Repeat([]byte("n"), 32)
+	includeTLS := false
+	manifest := backupManifest{
+		Format:            "meridian-backup",
+		FormatVersion:     backupFormatVersion,
+		Files:             []string{backupDatabaseEntry},
+		IncludeTLS:        &includeTLS,
+		JWTSecret:         base64.RawStdEncoding.EncodeToString(oldJWT),
+		UpstreamHeaderKey: base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte("h"), 32)),
+	}
+	if _, err := writeRestorePending(targetPath, manifest,
+		map[string][]byte{backupDatabaseEntry: backupData},
+		targetJWT, bytes.Repeat([]byte("k"), 32), preserved, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyPendingRestore(targetPath); err != nil {
+		t.Fatal(err)
+	}
+
+	restoredDB, err := openDB(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restoredDB.Close()
+	restoredNode, err := restoredDB.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatalf("restored node: %v", err)
+	}
+	if restoredNode.AddressV4 != "203.0.113.10" || restoredNode.AddressV6 != "2001:db8::1" {
+		t.Fatalf("address slots lost in restore: %q/%q", restoredNode.AddressV4, restoredNode.AddressV6)
+	}
+	if restoredNode.DNSPublish != nodeDNSPublishV6 {
+		t.Fatalf("dns_publish lost in restore: %q", restoredNode.DNSPublish)
+	}
+	if families := restoredNode.DNSPublishFamilies(); len(families) != 1 || families[0] != "v6" {
+		t.Fatalf("restored families = %v, want only v6", families)
+	}
+	records, err := restoredDB.siteDNSRecords(site.ID)
+	if err != nil {
+		t.Fatalf("restored ledger: %v", err)
+	}
+	if len(records) != 2 || records[0].RecordID != "rec-v4" || records[1].RecordID != "rec-v6" {
+		t.Fatalf("tracked record ledger lost in restore: %+v", records)
+	}
+	schedule, err := restoredDB.siteNodeSchedule(site.ID)
+	if err != nil {
+		t.Fatalf("restored schedule: %v", err)
+	}
+	if len(schedule.AppliedFamilies) != 2 {
+		t.Fatalf("restored dns_families = %v, want both families", schedule.AppliedFamilies)
 	}
 }
 
