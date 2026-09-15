@@ -1772,19 +1772,15 @@ func (a *App) deleteTrackedSiteDNSRemoteSet(ctx context.Context, schedule SiteNo
 	if err != nil {
 		return err
 	}
-	log.Printf("[dns-cleanup-diag] site %d: %d tracked record(s), legacy id set=%t, families=%v",
-		schedule.SiteID, len(records), schedule.cfRecordID != "", schedule.AppliedFamilies)
 	if len(records) == 0 && schedule.cfRecordID == "" {
-		log.Printf("[dns-cleanup-diag] site %d: nothing to remove", schedule.SiteID)
 		return nil
 	}
 	cf, err := a.cloudflareForScheduling()
 	if err != nil {
-		log.Printf("[dns-cleanup-diag] site %d: Cloudflare client unavailable: %v", schedule.SiteID, err)
 		return err
 	}
 	if err := deleteTrackedSiteDNSFamilyRecords(ctx, cf, schedule, records); err != nil {
-		log.Printf("[dns-cleanup-diag] site %d: family delete failed: %v", schedule.SiteID, err)
+		log.Printf("[node-scheduler] site %s: removing published DNS records failed: %v", schedule.PublicHost, err)
 		// Best effort across records: one that could not be removed keeps its
 		// tracking row and is retried by the next cleanup pass, while the rows
 		// of records that are confirmed gone are dropped so the retry does not
@@ -1792,19 +1788,9 @@ func (a *App) deleteTrackedSiteDNSRemoteSet(ctx context.Context, schedule SiteNo
 		a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
 		return err
 	}
-	log.Printf("[dns-cleanup-diag] site %d: %d family record(s) removed", schedule.SiteID, len(records))
 	if schedule.cfRecordID != "" {
-		log.Printf("[dns-cleanup-diag] site %d: legacy idlen=%d zone=%t is one of the family ids=%t",
-			schedule.SiteID, len(schedule.cfRecordID), schedule.cfZoneID != "", func() bool {
-				for _, record := range records {
-					if strings.TrimSpace(record.RecordID) == schedule.cfRecordID {
-						return true
-					}
-				}
-				return false
-			}())
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
-			log.Printf("[dns-cleanup-diag] site %d: legacy record delete failed: %v", schedule.SiteID, err)
+			log.Printf("[node-scheduler] site %s: removing the mirrored DNS record failed: %v", schedule.PublicHost, err)
 			a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
 			return err
 		}
@@ -1860,14 +1846,9 @@ func deleteTrackedSiteDNSFamilyRecords(ctx context.Context, cf *cloudflareClient
 			zoneID = strings.TrimSpace(schedule.cfZoneID)
 		}
 		err := deleteTrackedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID)
-		log.Printf("[dns-cleanup-diag] site %d: family=%s idlen=%d zone=%t err=%v",
-			schedule.SiteID, record.Family, len(recordID), zoneID != "", err)
-		if err == nil {
-			if _, readErr, ok := readOwnedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID); readErr != nil {
-				log.Printf("[dns-cleanup-diag] site %d: family=%s verify failed: %v", schedule.SiteID, record.Family, readErr)
-			} else {
-				log.Printf("[dns-cleanup-diag] site %d: family=%s still present remotely=%t", schedule.SiteID, record.Family, ok)
-			}
+		if err != nil {
+			log.Printf("[node-scheduler] site %s: %s record %s could not be deleted: %v",
+				schedule.PublicHost, record.RecordType, recordID, err)
 		}
 		if err != nil && firstErr == nil {
 			firstErr = err

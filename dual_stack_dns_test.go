@@ -1237,6 +1237,61 @@ func TestSiteDisableDispatchConsultsFamilyRecords(t *testing.T) {
 	}
 }
 
+// Deleting a site must remove every record Meridian published for it, not just
+// the one mirrored into the legacy columns: the leftover family record would
+// keep pointing the hostname at a node no site uses any more.
+func TestDeletingASiteRemovesEveryPublishedFamily(t *testing.T) {
+	app, fake, cf, schedule, node := newDualStackFixture(t)
+	app.cloudflareClientOverride = cf
+	ctx := context.Background()
+	now := time.Now()
+	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}
+	published, err := app.publishSiteAddressFamilies(ctx, cf, schedule, node, node.DNSPublishFamilies(), "zone-1", addresses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSiteDNSRecordsTx(tx, schedule.SiteID, published, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.snapshot()) != 2 {
+		t.Fatalf("fixture published %+v, want two records", fake.snapshot())
+	}
+	primary := primaryPublishedRecord(published)
+	if primary == nil {
+		t.Fatal("no primary record")
+	}
+	// Model the panel's delete path: the legacy mirror is set, the per-family
+	// rows are the only other handle on the second record.
+	if _, err := app.db.SaveSiteNodeSchedule(schedule.SiteID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(
+		"UPDATE site_node_schedules SET cf_zone_id=?,cf_record_id=?,cf_record_type=?,enabled=0 WHERE site_id=?",
+		primary.ZoneID, primary.RecordID, primary.RecordType, schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.removeSiteNodeSchedule(ctx, schedule.SiteID); err != nil {
+		t.Fatalf("removeSiteNodeSchedule: %v", err)
+	}
+	if remaining := fake.snapshot(); len(remaining) != 0 {
+		t.Fatalf("records left live after the site was deleted: %+v", remaining)
+	}
+	rows, err := app.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("tracking rows left behind: %+v", rows)
+	}
+}
+
 // Pinning a dual-stack node to one family must remove the other family's record
 // while leaving the pinned one in place.
 func TestPublishSiteAddressFamiliesRemovesUnpublishedFamily(t *testing.T) {
