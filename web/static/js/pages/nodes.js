@@ -57,6 +57,43 @@ function nodeFamilyAddress(node, family) {
   return '';
 }
 
+// nodeAddressRows renders one line per address family the node actually has. A
+// dual-stack host therefore shows both its IPv4 and its IPv6 address, while a
+// single-stack host shows the one line that exists instead of an empty slot. An
+// address the controller inferred or verified keeps its review marker, because
+// the value becomes a public DNS record.
+function nodeAddressRows(node) {
+  const inferred = ['enrollment', 'detected'].includes(String(node.address_source || ''));
+  const rows = [];
+  for (const [family, label] of [['v4', 'IPv4'], ['v6', 'IPv6']]) {
+    const address = nodeFamilyAddress(node, family);
+    if (!address) continue;
+    // The primary column's provenance is the only one recorded, and it is
+    // surfaced on the family that column currently holds.
+    const review = inferred && nodeAddressFamily(node.address) === family ? '（自动探测，请核对）' : '';
+    const published = nodeFamilyPublishes(node, family) ? `发布 ${nodeFamilyRecordType(family)}` : '不发布记录';
+    rows.push({ family, label, text: `${label} ${address}${review} · ${published}` });
+  }
+  if (!rows.length) {
+    rows.push({ family: 'none', label: '地址', text: '未填写地址' });
+  }
+  return rows;
+}
+
+function nodeFamilyRecordType(family) {
+  return family === 'v6' ? 'AAAA' : 'A';
+}
+
+// nodeFamilyPublishes answers whether this family is actually being published,
+// which is a different question from whether the node has an address for it: an
+// operator can pin a dual-stack node to one family.
+function nodeFamilyPublishes(node, family) {
+  if (!nodeFamilyAddress(node, family)) return false;
+  const mode = String(node.dns_publish || 'auto');
+  if (family === 'v4') return mode !== 'v6';
+  return mode !== 'v4';
+}
+
 function nodeDNSPublishModeLabel(node) {
   switch (String(node.dns_publish || 'auto')) {
     case 'v4': return '仅 IPv4';
@@ -101,7 +138,7 @@ function siteScheduleFeedback(site, now = Date.now()) {
   const enabled = site?.enabled === true;
   const lastError = String(site?.last_error || '').trim();
   const pendingSince = Number(site?.config_pending_since_ms || 0);
-  if (!enabled) return { kind: 'disabled', className: '', text: '未启用节点调度，继续使用原面板入口' };
+  if (!enabled) return { kind: 'disabled', className: '', text: '未启用节点调度，继续使用主控入口' };
 
   // The scheduler uses this readiness error while an Agent is still fetching
   // the first snapshot. It is expected progress, not a failed operation.
@@ -139,21 +176,17 @@ function renderNodeCards() {
     const applyError = String(node.agent_apply_error || '').trim();
     const listenerError = String(node.agent_listener_error || '').trim();
     const configState = applyError ? `应用失败：${applyError}` : (listenerError ? `监听异常：${listenerError}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用站点配置'));
-    // An address the controller inferred (from enrollment) or verified from the
-    // Agent's own report is marked so it gets reviewed: this value is published
-    // as the site's DNS record, and a wrong guess points the site at the wrong
-    // host.
-    const addressText = node.address
-      ? (node.address_source === 'enrollment' || node.address_source === 'detected'
-        ? `${node.address}（自动探测，请核对）`
-        : node.address)
-      : '未填写地址';
+    // One line per family the node has, so a dual-stack host shows both its IPv4
+    // and IPv6 address and a single-stack host shows the one it actually has.
+    const addressRows = nodeAddressRows(node)
+      .map(row => `<span class="node-address is-${esc(row.family)}">${esc(row.text)}</span>`)
+      .join('');
     // Which records this node publishes. The family list is what the scheduler
     // actually resolved to, so a family with no address shows as unpublished
     // instead of silently looking configured.
     const published = nodeDNSPublishSummary(node);
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
-      <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(addressText)} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
+      <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p class="node-address-list">${addressRows}</p><p>${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
       ${node.depleted ? '<div class="node-card-warning is-error">已超出流量上限，不再参与调度。提高上限、清除上限或改回每月重置日即可恢复。</div>' : ''}
       <div class="node-stats"><span><b>${usage}</b><small>${esc(node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费')}</small></span><span><b>${esc(reset)}</b><small>独立流量周期</small></span><span><b>${node.priority}</b><small>优先级${node.active ? ' · 当前选中' : ''}</small></span></div>
@@ -362,10 +395,10 @@ function renderSiteSchedules() {
     const dirty = !!draft;
     const feedback = siteScheduleFeedback(site);
     const stateLabel = dirty
-      ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
+      ? `${savedEnabled ? '调度已启用' : '使用主控入口'} · 待保存`
       : (feedback.kind === 'pending' || feedback.kind === 'warning' || feedback.kind === 'error'
         ? feedback.text
-        : (savedEnabled ? '调度已启用' : '使用面板入口'));
+        : (savedEnabled ? '调度已启用' : '使用主控入口'));
     const nodeOptions = nodesSnapshot.nodes.map(node => `<option value="${node.id}" ${Number(view.fixed_node_id) === Number(node.id) ? 'selected' : ''}>${esc(node.name)}</option>`).join('');
     const error = `<small class="${feedback.className}">${esc(feedback.text)}</small>`;
     const dirtyNote = dirty ? '<small class="node-site-dirty">当前修改尚未保存，保存后才会生效</small>' : '';
@@ -376,7 +409,7 @@ function renderSiteSchedules() {
         <label class="node-site-field">调度方式<select class="form-input" data-field="mode" ${formEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select></label>
         <label class="node-site-field">固定节点<select class="form-input" data-field="fixed-node" ${formEnabled && view.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select></label>
       </div>
-      <div class="node-site-status"><span>${savedEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}${siteDNSSummary(site)}` : '原面板模式 · 节点调度未启用'}</span>${savedEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}${dirtyNote}</div>
+      <div class="node-site-status"><span>${savedEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}${siteDNSSummary(site)}` : '主控模式 · 节点调度未启用'}</span>${savedEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}${dirtyNote}</div>
       <footer class="node-site-card-actions"><button type="button" class="node-button is-primary" data-action="save-site">保存站点设置</button></footer>
     </article>`;
   }).join('');
@@ -395,10 +428,10 @@ function refreshSiteScheduleRowState(row) {
     state.className = `node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}`;
     const feedback = siteScheduleFeedback(server);
     state.textContent = dirty
-      ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
+      ? `${savedEnabled ? '调度已启用' : '使用主控入口'} · 待保存`
       : (feedback.kind === 'pending' || feedback.kind === 'warning' || feedback.kind === 'error'
         ? feedback.text
-        : (savedEnabled ? '调度已启用' : '使用面板入口'));
+        : (savedEnabled ? '调度已启用' : '使用主控入口'));
   }
   const status = row.querySelector('.node-site-status');
   if (!status) return;
@@ -480,7 +513,7 @@ function renderNodes() {
       <div class="node-mode"><label><input type="radio" name="node-mode" id="node-mode-auto" value="auto"> 自动</label><label><input type="radio" name="node-mode" id="node-mode-manual" value="manual"> 手动</label></div>
       <div id="node-manual-choices" class="node-choices"></div><button class="node-button is-primary" id="node-save-scheduler">保存调度</button>
     </section><div id="node-list" class="node-list"><div class="node-empty">正在加载…</div></div>
-    <section class="node-site-section"><div class="node-section-head"><div><h2>站点调度</h2><p>在此分组逐个选择是否接入节点调度；关闭时保持原面板模式，可跟随全局节点或固定到指定节点。</p></div></div><div id="node-site-list" class="node-site-list"><div class="node-empty">正在加载…</div></div></section></div>`;
+    <section class="node-site-section"><div class="node-section-head"><div><h2>站点调度</h2><p>在此分组逐个选择是否接入节点调度；关闭时保持主控模式，可跟随全局节点或固定到指定节点。</p></div></div><div id="node-site-list" class="node-site-list"><div class="node-empty">正在加载…</div></div></section></div>`;
   document.getElementById('node-add').onclick = () => openNodeForm(null);
   document.getElementById('node-list').onclick = handleNodeAction;
   document.getElementById('node-site-list').onclick = handleSiteScheduleAction;

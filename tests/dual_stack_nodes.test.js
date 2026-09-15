@@ -137,7 +137,10 @@ test('dual stack: the site card names the records the scheduler published', () =
 test('dual stack: an auto-detected address is flagged for review', () => {
   const page = fs.readFileSync(path.join(root, 'web/static/js/pages/nodes.js'), 'utf8');
   // Both provenance values the controller can set must ask for a review, not
-  // just the enrollment-inferred one.
-  assert.match(page, /node\.address_source === 'enrollment' \|\| node\.address_source === 'detected'/);
+  // just the enrollment-inferred one. The marker is attached to the family the
+  // primary column currently holds, because that column is the one whose
+  // provenance is recorded.
+  assert.match(page, /\['enrollment', 'detected'\]\.includes\(String\(node\.address_source \|\| ''\)\)/);
+  assert.match(page, /nodeAddressFamily\(node\.address\) === family \? '（自动探测，请核对）' : ''/);
   assert.match(page, /自动探测，请核对/);
 });

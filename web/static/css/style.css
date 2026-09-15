@@ -7206,6 +7206,8 @@ html[data-theme="light"] .page:not(#page-watch-history) .account-session-card h2
 .node-scheduler-card, .node-card, .node-empty { padding: 20px; border: 1px solid var(--glass-border); border-radius: 14px; background: var(--panel); }
 .node-section-head, .node-card-head, .node-actions { display: flex; justify-content: space-between; gap: 14px; align-items: center; }
 .node-section-head h2, .node-card h3 { margin: 0; }.node-section-head p, .node-card-head p { margin: 5px 0 0; color: var(--white-60); }
+.node-address-list { display: grid; gap: 2px; }.node-address { color: var(--white-80); font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.node-status { white-space: nowrap; }
 .node-mode { display: flex; gap: 18px; margin: 18px 0 12px; }.node-mode label, .node-choice, .node-check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .node-choices { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 14px; }.node-choice { padding: 9px 12px; border: 1px solid var(--glass-border); border-radius: 9px; }.node-choice small { color: var(--white-60); }
 .node-list { display: grid; gap: 12px; }.node-card.is-active { border-color: color-mix(in srgb, var(--green) 55%, var(--glass-border)); box-shadow: inset 3px 0 var(--green); }

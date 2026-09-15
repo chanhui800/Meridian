@@ -79,8 +79,8 @@ test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {
   assert.match(page, /跟随全局调度/);
   assert.match(page, /固定节点/);
   assert.match(page, /创建或更新精确 DNS 记录/);
-  assert.match(page, /未启用节点调度，继续使用原面板入口/);
-  assert.match(page, /原面板模式 · 节点调度未启用/);
+  assert.match(page, /未启用节点调度，继续使用主控入口/);
+  assert.match(page, /主控模式 · 节点调度未启用/);
   assert.match(page, /syncSiteScheduleRow/);
   assert.match(page, /refreshSiteScheduleRowState/);
   assert.match(page, /getElementById\('node-site-list'\)\.oninput = handleSiteScheduleAction/);
@@ -166,7 +166,88 @@ test('unsaved schedule draft does not change persisted status label', () => {
   vm.runInContext(page, sandbox);
   vm.runInContext(`nodesSnapshot = { nodes: [] }; siteSchedulesSnapshot = { sites: [{ site_id: 7, site_name: 'site', public_host: 'site.example', enabled: false, mode: 'global', fixed_node_id: 0, desired_node_id: 0, applied_node_id: 0, dns_status: 'disabled', last_error: '' }] }; siteScheduleDrafts = new Map([[7, { enabled: true, mode: 'global', fixed_node_id: 0 }]]);`, sandbox);
   sandbox.renderSiteSchedules();
-  assert.match(container.innerHTML, /使用面板入口 · 待保存/);
+  assert.match(container.innerHTML, /使用主控入口 · 待保存/);
   assert.doesNotMatch(container.innerHTML, /调度已启用 · 待保存/);
-  assert.match(container.innerHTML, /原面板模式 · 节点调度未启用/);
+  assert.match(container.innerHTML, /主控模式 · 节点调度未启用/);
+});
+
+// renderNodeCardHTML renders the node cards into a container, so the card's
+// address lines can be asserted instead of only grepping the source.
+function renderNodeCards(nodes) {
+  const container = { innerHTML: '' };
+  const sandbox = {
+    console,
+    Map,
+    Number,
+    String,
+    Math,
+    Array,
+    document: { getElementById(id) { return id === 'node-list' ? container : null; } },
+    esc(value) { return String(value); },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  vm.runInContext(`nodesSnapshot = { nodes: ${JSON.stringify(nodes)} };`, sandbox);
+  sandbox.renderNodeCards();
+  return container.innerHTML;
+}
+
+const dualStackNode = {
+  id: 17,
+  name: 'dual',
+  address: '203.0.113.10',
+  address_source: 'detected',
+  address_v4: '203.0.113.10',
+  address_v6: '2001:db8::1',
+  dns_publish: 'auto',
+  status: 'online',
+  port: 9090,
+  traffic_quota: 0,
+  traffic_used: 0,
+  reset_day: 1,
+  billing_mode: 'outbound',
+  priority: 100,
+};
+
+test('a dual-stack node card lists both address families and what each publishes', () => {
+  const html = renderNodeCards([dualStackNode]);
+  assert.match(html, /IPv4 203\.0\.113\.10/);
+  assert.match(html, /IPv6 2001:db8::1/);
+  assert.match(html, /发布 A/);
+  assert.match(html, /发布 AAAA/);
+  // The review marker belongs on the family the primary column currently holds.
+  assert.equal((html.match(/自动探测，请核对/g) || []).length, 1);
+  assert.match(html, /IPv4 203\.0\.113\.10（自动探测，请核对） · 发布 A/);
+});
+
+test('a single-stack node card shows only the family it actually has', () => {
+  const v4Only = renderNodeCards([{ ...dualStackNode, address_v4: '203.0.113.10', address_v6: '', address_source: 'manual' }]);
+  assert.match(v4Only, /IPv4 203\.0\.113\.10/);
+  assert.doesNotMatch(v4Only, /IPv6/);
+  assert.doesNotMatch(v4Only, /自动探测，请核对/);
+  const v6Only = renderNodeCards([{ ...dualStackNode, address: '2001:db8::1', address_v4: '', address_v6: '2001:db8::1' }]);
+  assert.match(v6Only, /IPv6 2001:db8::1/);
+  assert.doesNotMatch(v6Only, /IPv4/);
+});
+
+test('a family pinned off is shown as having an address that is not published', () => {
+  const pinned = renderNodeCards([{ ...dualStackNode, dns_publish: 'v4' }]);
+  assert.match(pinned, /IPv6 2001:db8::1 · 不发布记录/);
+  assert.match(pinned, /IPv4 203\.0\.113\.10/);
+  assert.match(pinned, /发布 A/);
+  assert.doesNotMatch(pinned, /发布 AAAA/);
+});
+
+test('a node with no address says so instead of rendering an empty family row', () => {
+  const html = renderNodeCards([{ ...dualStackNode, address: '', address_v4: '', address_v6: '' }]);
+  assert.match(html, /未填写地址/);
+  assert.doesNotMatch(html, /IPv4/);
+  assert.doesNotMatch(html, /IPv6/);
+});
+
+test('the node card address list is a styled list rather than a single line', () => {
+  assert.match(page, /class="node-area-list"|class="node-address-list"/);
+  assert.match(page, /nodeAddressRows\(node\)/);
+  assert.match(style, /\.node-address-list\s*\{/);
+  assert.match(style, /\.node-address\s*\{/);
 });
