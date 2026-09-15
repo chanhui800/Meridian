@@ -305,6 +305,137 @@ func TestProbeFailureNamesTheRefusedFamily(t *testing.T) {
 	}
 }
 
+// The reported addresses have to survive the report path, because adoption reads
+// them back from the stored column rather than from the request.
+func TestNodeReportStoresAddressHints(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	node, enrollmentToken, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "reporter", Address: "203.0.113.10", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = node
+	// Reporting authenticates with the agent token, which only exists after
+	// enrollment consumes the one-time token. The enrollment token was issued at
+	// `now`, so it is redeemed a moment later.
+	_, agentToken, err := app.db.EnrollControlNodeFromSource(enrollmentToken, now.Add(time.Second), "")
+	if err != nil {
+		t.Fatalf("EnrollControlNodeFromSource: %v", err)
+	}
+	report := NodeReport{
+		BootID: "boot", Sequence: 1, InterfaceName: "eth0", RXBytes: 1, TXBytes: 1,
+		NetAddresses: []NodeNetAddress{
+			{Family: "v4", Address: "203.0.113.10", Interface: "eth0"},
+			{Family: "v6", Address: "2001:db8::1", Interface: "eth0"},
+			{Family: "v4", Address: "10.0.0.5", Interface: "eth0"},
+		},
+	}
+	if _, err := app.db.RecordNodeReport(agentToken, report, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("RecordNodeReport: %v", err)
+	}
+	reportAt := now.Add(2 * time.Second)
+	stored, err := app.db.controlNodeByID(node.ID, reportAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hints := decodeNodeNetAddressHints(stored.NetAddressHints)
+	if len(hints) != 2 {
+		t.Fatalf("stored hints = %+v, want the routable v4 and v6 pair", hints)
+	}
+	if stored.NetAddressHintsAtMS != reportAt.UnixMilli() {
+		t.Fatalf("hint clock = %d, want %d", stored.NetAddressHintsAtMS, reportAt.UnixMilli())
+	}
+	for _, hint := range hints {
+		if hint.Address == "10.0.0.5" {
+			t.Fatal("a private address reached the stored hints")
+		}
+	}
+	// A report without addresses must clear the hints rather than leave a stale
+	// set that a later tick would adopt.
+	report.NetAddresses = nil
+	if _, err := app.db.RecordNodeReport(agentToken, report, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := app.db.controlNodeByID(node.ID, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.NetAddressHints != "" {
+		t.Fatalf("stale hints survived an empty report: %q", cleared.NetAddressHints)
+	}
+}
+
+// Adoption attempts are throttled: a candidate that does not answer keeps not
+// answering, so probing it on every scheduler tick would be pure network churn.
+// The guard is proven by timing, because the alternative is a real dial that
+// blocks until the probe timeout.
+func TestNodeAddressAdoptionIsThrottled(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "throttled", Address: "203.0.113.10", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hint := encodeNodeNetAddressHints([]NodeNetAddress{{Family: "v6", Address: "2001:db8::1"}})
+	if _, err := app.db.db.Exec(
+		`UPDATE control_nodes SET net_address_hints=?,net_address_hints_at_ms=?,address_v6='',address_v6_source='',net_address_adoption_at_ms=0 WHERE id=?`,
+		hint, now.UnixMilli(), node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decodeNodeNetAddressHints(current.NetAddressHints)) != 1 {
+		t.Fatal("fixture did not store a hint")
+	}
+
+	// A stale hint must be ignored outright, and must do so without consuming an
+	// attempt, so a fresh report can still be adopted immediately afterwards.
+	staleNow := now.Add(2 * nodeNetAddressHintFreshness)
+	start := time.Now()
+	if _, err := app.adoptProbedNodeAddresses(context.Background(), current, staleNow); err != nil {
+		t.Fatalf("stale hint: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("a stale hint cost %s, so it was probed instead of ignored", elapsed)
+	}
+	afterStale, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterStale.NetAddressAdoptionAttemptAtMS != 0 {
+		t.Fatal("ignoring a stale hint must not consume an adoption attempt")
+	}
+
+	// Within the interval a second attempt must be skipped for the same reason.
+	if err := app.db.markNodeAddressAdoptionAttempt(node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	throttled, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start = time.Now()
+	if _, err := app.adoptProbedNodeAddresses(context.Background(), throttled, now.Add(time.Second)); err != nil {
+		t.Fatalf("throttled attempt: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("a throttled attempt cost %s, so the guard did not apply", elapsed)
+	}
+	final, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.AddressV6 != "" {
+		t.Fatalf("a skipped attempt still adopted %q", final.AddressV6)
+	}
+}
+
 // --- cloudflare publishing -------------------------------------------------
 
 // fakeCloudflare is a same-name A/AAAA record store that enough of the
