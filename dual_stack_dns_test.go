@@ -963,6 +963,18 @@ func newDualStackFixture(t *testing.T) (*App, *fakeCloudflare, *cloudflareClient
 	return app, fake, cf, schedule, node
 }
 
+// stubSchedulingCloudflare points the panel's scheduling DNS client at this
+// test's stub for the duration of the test. The panel builds that client from
+// stored credentials, which a test cannot provision, so the override is what
+// makes the real cleanup paths testable end to end.
+func stubSchedulingCloudflare(t *testing.T, app *App, cf *cloudflareClient) {
+	t.Helper()
+	previous := cloudflareSchedulingClientForTest
+	cloudflareSchedulingClientForTest = func(*cloudflareClient) *cloudflareClient { return cf }
+	t.Cleanup(func() { cloudflareSchedulingClientForTest = previous })
+	app.cloudflareClientOverride = cf
+}
+
 // writeEdgeCertificate writes a throwaway certificate/key pair for the panel
 // certificate manager and returns their paths.
 func writeEdgeCertificate(t *testing.T) (string, string) {
@@ -1092,7 +1104,7 @@ func TestSiteDNSRecordsPersistAndReplaceByFamily(t *testing.T) {
 // DNS forever, because the local row that named it was cleared straight after.
 func TestDisablingASiteRemovesEveryPublishedFamily(t *testing.T) {
 	app, fake, cf, schedule, node := newDualStackFixture(t)
-	app.cloudflareClientOverride = cf
+	stubSchedulingCloudflare(t, app, cf)
 	ctx := context.Background()
 	now := time.Now()
 	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}
@@ -1172,7 +1184,7 @@ func TestDisablingASiteRemovesEveryPublishedFamily(t *testing.T) {
 // treating that as "nothing to do" skipped the DNS cleanup altogether.
 func TestSiteDisableDispatchConsultsFamilyRecords(t *testing.T) {
 	app, fake, cf, schedule, node := newDualStackFixture(t)
-	app.cloudflareClientOverride = cf
+	stubSchedulingCloudflare(t, app, cf)
 	ctx := context.Background()
 	now := time.Now()
 	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}
@@ -1242,7 +1254,7 @@ func TestSiteDisableDispatchConsultsFamilyRecords(t *testing.T) {
 // keep pointing the hostname at a node no site uses any more.
 func TestDeletingASiteRemovesEveryPublishedFamily(t *testing.T) {
 	app, fake, cf, schedule, node := newDualStackFixture(t)
-	app.cloudflareClientOverride = cf
+	stubSchedulingCloudflare(t, app, cf)
 	ctx := context.Background()
 	now := time.Now()
 	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}

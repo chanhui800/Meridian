@@ -1570,8 +1570,8 @@ func (a *App) handleSiteNodeScheduleByID(w http.ResponseWriter, r *http.Request)
 }
 
 func (a *App) cloudflareForScheduling() (*cloudflareClient, error) {
-	if a.cloudflareClientOverride != nil {
-		return a.cloudflareClientOverride, nil
+	if a.cloudflareClientOverride != nil && cloudflareSchedulingClientForTest != nil {
+		return cloudflareSchedulingClientForTest(a.cloudflareClientOverride), nil
 	}
 	settings, err := a.db.PanelSettings()
 	if err != nil {
@@ -1780,7 +1780,7 @@ func (a *App) deleteTrackedSiteDNSRemoteSet(ctx context.Context, schedule SiteNo
 		return err
 	}
 	if err := deleteTrackedSiteDNSFamilyRecords(ctx, cf, schedule, records); err != nil {
-		log.Printf("[node-scheduler] site %s: removing published DNS records failed: %v", schedule.PublicHost, err)
+		log.Printf("[node-scheduler] site %d: removing published DNS records failed: %v", schedule.SiteID, err)
 		// Best effort across records: one that could not be removed keeps its
 		// tracking row and is retried by the next cleanup pass, while the rows
 		// of records that are confirmed gone are dropped so the retry does not
@@ -1790,7 +1790,7 @@ func (a *App) deleteTrackedSiteDNSRemoteSet(ctx context.Context, schedule SiteNo
 	}
 	if schedule.cfRecordID != "" {
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
-			log.Printf("[node-scheduler] site %s: removing the mirrored DNS record failed: %v", schedule.PublicHost, err)
+			log.Printf("[node-scheduler] site %d: removing the mirrored DNS record failed: %v", schedule.SiteID, err)
 			a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
 			return err
 		}
@@ -1847,8 +1847,9 @@ func deleteTrackedSiteDNSFamilyRecords(ctx context.Context, cf *cloudflareClient
 		}
 		err := deleteTrackedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID)
 		if err != nil {
-			log.Printf("[node-scheduler] site %s: %s record %s could not be deleted: %v",
-				schedule.PublicHost, record.RecordType, recordID, err)
+			// The site id, not the hostname: logs are shared in bug reports.
+			log.Printf("[node-scheduler] site %d: %s record %s could not be deleted: %v",
+				schedule.SiteID, record.RecordType, recordID, err)
 		}
 		if err != nil && firstErr == nil {
 			firstErr = err

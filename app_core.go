@@ -47,9 +47,14 @@ type App struct {
 	nodeSchedulerQueueMu sync.Mutex
 	nodeSchedulerQueue   *nodeSchedulerQueue
 	// cloudflareClientOverride lets a test point the scheduling DNS client at a
-	// stub. Production always builds the client from the configured credentials.
+	// stub; cloudflareSchedulingClientForTest gates it and is set only from test
+	// code, so a shipped binary can never be diverted away from the real API.
 	cloudflareClientOverride *cloudflareClient
 }
+
+// cloudflareSchedulingClientForTest is nil in every real binary. A test that
+// needs a stubbed scheduling client assigns it for the duration of the test.
+var cloudflareSchedulingClientForTest func(*cloudflareClient) *cloudflareClient
 
 // siteScheduleLock serializes every local/remote mutation for one site. A
 // scheduler worker must not PUT or DELETE a Cloudflare record while an admin
