@@ -1794,6 +1794,15 @@ func (a *App) deleteTrackedSiteDNSRemoteSet(ctx context.Context, schedule SiteNo
 	}
 	log.Printf("[dns-cleanup-diag] site %d: %d family record(s) removed", schedule.SiteID, len(records))
 	if schedule.cfRecordID != "" {
+		log.Printf("[dns-cleanup-diag] site %d: legacy id=%s zone=%t is one of the family ids=%t",
+			schedule.SiteID, schedule.cfRecordID[:8], schedule.cfZoneID != "", func() bool {
+				for _, record := range records {
+					if strings.TrimSpace(record.RecordID) == schedule.cfRecordID {
+						return true
+					}
+				}
+				return false
+			}())
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
 			log.Printf("[dns-cleanup-diag] site %d: legacy record delete failed: %v", schedule.SiteID, err)
 			a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
@@ -1850,7 +1859,10 @@ func deleteTrackedSiteDNSFamilyRecords(ctx context.Context, cf *cloudflareClient
 		if zoneID == "" {
 			zoneID = strings.TrimSpace(schedule.cfZoneID)
 		}
-		if err := deleteTrackedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID); err != nil && firstErr == nil {
+		err := deleteTrackedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID)
+		log.Printf("[dns-cleanup-diag] site %d: family=%s id=%s zone=%t err=%v",
+			schedule.SiteID, record.Family, recordID[:8], zoneID != "", err)
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
