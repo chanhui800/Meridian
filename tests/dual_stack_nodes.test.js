@@ -80,6 +80,39 @@ test('dual stack: the publish mode label is shown on the card', () => {
   assert.equal(call('nodeDNSPublishModeLabel({dns_publish:"v6"})'), '仅 IPv6');
 });
 
+// The card labels each family line with what that family publishes, so the
+// per-family decision is what the operator reads. It has to agree with the
+// summary above for every combination, including "the node has the address but
+// the pin stops it being published" and "the pin has no address to publish".
+test('dual stack: each family line states whether that family is published', () => {
+  const cases = [
+    // [node, family, expected]
+    ['{"address":"203.0.113.10"}', 'v4', true],
+    ['{"address":"203.0.113.10"}', 'v6', false],
+    ['{"address":"2001:db8::1"}', 'v6', true],
+    ['{"address":"2001:db8::1"}', 'v4', false],
+    ['{"address_v4":"203.0.113.10","address_v6":"2001:db8::1"}', 'v4', true],
+    ['{"address_v4":"203.0.113.10","address_v6":"2001:db8::1"}', 'v6', true],
+    // A dual-stack node pinned to one family still HAS the other address, but
+    // that family is not published and the card must say so rather than hide it.
+    ['{"address_v4":"203.0.113.10","address_v6":"2001:db8::1","dns_publish":"v4"}', 'v4', true],
+    ['{"address_v4":"203.0.113.10","address_v6":"2001:db8::1","dns_publish":"v4"}', 'v6', false],
+    ['{"address_v4":"203.0.113.10","address_v6":"2001:db8::1","dns_publish":"v6"}', 'v4', false],
+    ['{"address_v4":"203.0.113.10","address_v6":"2001:db8::1","dns_publish":"v6"}', 'v6', true],
+    // A pin with no address of its own family publishes nothing at all, so both
+    // family lines are reported as unpublished.
+    ['{"address":"203.0.113.10","dns_publish":"v6"}', 'v4', false],
+    ['{"address":"203.0.113.10","dns_publish":"v6"}', 'v6', false],
+    ['{}', 'v4', false],
+    ['{}', 'v6', false],
+  ];
+  for (const [node, family, want] of cases) {
+    assert.equal(call(`nodeFamilyPublishes(${node}, "${family}")`), want, `publishes(${node}, ${family})`);
+  }
+  assert.equal(call('nodeFamilyRecordType("v4")'), 'A');
+  assert.equal(call('nodeFamilyRecordType("v6")'), 'AAAA');
+});
+
 test('dual stack: the form preview names the consequence of each combination', () => {
   const cases = [
     // Both families with auto: the dual-stack default.
