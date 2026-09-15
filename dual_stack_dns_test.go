@@ -963,6 +963,22 @@ func newDualStackFixture(t *testing.T) (*App, *fakeCloudflare, *cloudflareClient
 	return app, fake, cf, schedule, node
 }
 
+// writeEdgeCertificate writes a throwaway certificate/key pair for the panel
+// certificate manager and returns their paths.
+func writeEdgeCertificate(t *testing.T) (string, string) {
+	t.Helper()
+	certPEM, keyPEM := selfSignedPanelPair(t)
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem")
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
 func familyRecords(records []cloudflareAddressRecord, recordType string) []cloudflareAddressRecord {
 	matches := make([]cloudflareAddressRecord, 0, len(records))
 	for _, record := range records {
@@ -1067,6 +1083,157 @@ func TestSiteDNSRecordsPersistAndReplaceByFamily(t *testing.T) {
 	}
 	if cleared, err := app.db.siteDNSRecords(7); err != nil || len(cleared) != 0 {
 		t.Fatalf("cleared records = %+v err=%v", cleared, err)
+	}
+}
+
+// Disabling a site must remove every record Meridian published for it. A
+// dual-stack site has one record per family, and only the single record mirrored
+// into the legacy columns used to be deleted: the other family's record stayed in
+// DNS forever, because the local row that named it was cleared straight after.
+func TestDisablingASiteRemovesEveryPublishedFamily(t *testing.T) {
+	app, fake, cf, schedule, node := newDualStackFixture(t)
+	app.cloudflareClientOverride = cf
+	ctx := context.Background()
+	now := time.Now()
+	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}
+	published, err := app.publishSiteAddressFamilies(ctx, cf, schedule, node, node.DNSPublishFamilies(), "zone-1", addresses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(published) != 2 || len(fake.snapshot()) != 2 {
+		t.Fatalf("published=%+v remote=%+v, want two records", published, fake.snapshot())
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSiteDNSRecordsTx(tx, schedule.SiteID, published, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the single-record columns exactly as the schedule writer does, so
+	// the legacy path has one record of its own to remove.
+	primary := primaryPublishedRecord(published)
+	if primary == nil {
+		t.Fatal("no primary record was published")
+	}
+	schedule.cfZoneID = primary.ZoneID
+	schedule.cfRecordID = primary.RecordID
+	schedule.cfRecordType = primary.RecordType
+	schedule.AppliedFamilies = []string{"v4", "v6"}
+
+	had, err := app.siteScheduleHasTrackedDNS(schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !had {
+		t.Fatal("a site with one tracked record per family reported nothing to remove")
+	}
+	// The legacy column alone must not decide this: that is what skipped the
+	// per-family records entirely. Drive the real disable path — the one the
+	// panel calls when scheduling is turned off — with the legacy columns empty,
+	// so only the per-family tracking rows can tell it there is work to do.
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET cf_record_id='',cf_record_type='',enabled=0 WHERE site_id=?", schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	schedule.cfRecordID = ""
+	schedule.cfRecordType = ""
+	disabled, err := app.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.deleteTrackedSiteDNS(ctx, disabled); err != nil {
+		t.Fatalf("deleteTrackedSiteDNS: %v", err)
+	}
+	if remaining := fake.snapshot(); len(remaining) != 0 {
+		t.Fatalf("records left behind in DNS: %+v", remaining)
+	}
+	rows, err := app.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("tracking rows left behind: %+v", rows)
+	}
+	cleaned, err := app.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleaned.DNSStatus != "disabled" || cleaned.cfRecordID != "" || cleaned.AppliedNodeID != 0 {
+		t.Fatalf("schedule not finalized: %+v", cleaned)
+	}
+}
+
+// A site whose only tracked records are the per-family ones must still be seen as
+// having DNS to remove when it is disabled. The legacy single-record columns are
+// empty for a dual-stack site whose primary mirror was never written, and
+// treating that as "nothing to do" skipped the DNS cleanup altogether.
+func TestSiteDisableDispatchConsultsFamilyRecords(t *testing.T) {
+	app, fake, cf, schedule, node := newDualStackFixture(t)
+	app.cloudflareClientOverride = cf
+	ctx := context.Background()
+	now := time.Now()
+	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}
+	published, err := app.publishSiteAddressFamilies(ctx, cf, schedule, node, node.DNSPublishFamilies(), "zone-1", addresses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_dns_records SET zone_id='' WHERE site_id=?", schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteSiteDNSRecordsTx(tx, schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSiteDNSRecordsTx(tx, schedule.SiteID, published, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// The site is off while its schedule is still on: only the per-family rows
+	// remain, with no legacy record ID or zone, which is exactly what the old
+	// decision could not see.
+	if _, err := app.db.SaveSiteNodeSchedule(schedule.SiteID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(
+		"UPDATE site_node_schedules SET cf_record_id='',cf_record_type='',cf_zone_id='' WHERE site_id=?", schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE sites SET enabled=0 WHERE id=?", schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := app.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled.Enabled {
+		t.Fatalf("the schedule must stay on for this case (Enabled=%v SiteEnabled=%v)", disabled.Enabled, disabled.SiteEnabled)
+	}
+	if disabled.SiteEnabled {
+		t.Fatal("the site must be off for this case")
+	}
+	if err := app.reconcileOneSiteScheduleLocked(ctx, disabled, now); err != nil {
+		t.Fatalf("reconcileOneSiteScheduleLocked: %v", err)
+	}
+	// The local rows are cleared by the runtime finalizer either way, so the
+	// remote store is what proves this: taking the legacy-only decision leaves
+	// both records live in DNS while the local rows vanish.
+	if remaining := fake.snapshot(); len(remaining) != 0 {
+		t.Fatalf("records left live in DNS: %+v", remaining)
+	}
+	records, err := app.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("per-family records survived the disable: %+v", records)
 	}
 }
 
@@ -1292,6 +1459,106 @@ func TestAdoptionPromotesIPv4OverAnInferredPrimary(t *testing.T) {
 	}
 	if after.PrimaryAddress() != "203.0.113.10" {
 		t.Fatalf("PrimaryAddress = %q, want the adopted IPv4", after.PrimaryAddress())
+	}
+}
+
+// The same promotion has to reach a node that was upgraded with its v4 slot
+// already filled and nothing left to probe: with every family satisfied the
+// adoption loop verifies nothing new, and reading the stored state back must
+// still move the primary rather than short-circuiting on "no change".
+func TestUpgradedNodeStillPromotesItsFilledIPv4(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	// The probe identity comes from the configured route domain, so the pass has
+	// to be allowed to run at all before the promotion can be observed.
+	if _, err := app.db.db.Exec("UPDATE panel_settings SET route_domain='example.test' WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "upgraded", Address: "2001:db8::9", AddressV4: "203.0.113.10",
+		Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The state an earlier version leaves behind: an inferred IPv6 primary, the
+	// IPv4 already adopted into its slot, no v6 slot, and an Agent still
+	// reporting both families so the adoption pass is eligible but has nothing
+	// left to verify.
+	hint := encodeNodeNetAddressHints([]NodeNetAddress{
+		{Family: "v4", Address: "203.0.113.10"},
+		{Family: "v6", Address: "2001:db8::9"},
+	})
+	if _, err := app.db.db.Exec(
+		"UPDATE control_nodes SET address=?,address_source=?,address_v4=?,address_v6='',address_v6_source='',net_address_hints=?,net_address_hints_at_ms=?,net_address_adoption_at_ms=0 WHERE id=?",
+		"2001:db8::9", nodeAddressSourceEnrollment, "203.0.113.10", hint, now.UnixMilli(), node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Guard the fixture: if the primary did not start on the inferred v6 address,
+	// the promotion under test had already happened and the assertions below
+	// would prove nothing.
+	if current.Address != "2001:db8::9" || current.AddressV4 != "203.0.113.10" ||
+		current.AddressSource != nodeAddressSourceEnrollment {
+		t.Fatalf("fixture is not the upgraded state: address=%q v4=%q source=%q",
+			current.Address, current.AddressV4, current.AddressSource)
+	}
+	updated, err := app.adoptProbedNodeAddresses(context.Background(), current, now)
+	if err != nil {
+		t.Fatalf("adoptProbedNodeAddresses: %v", err)
+	}
+	if updated.Address != "203.0.113.10" {
+		t.Fatalf("primary address = %q, want the already-adopted IPv4", updated.Address)
+	}
+	if updated.AddressV4 != "203.0.113.10" {
+		t.Fatalf("address_v4 = %q, want it unchanged", updated.AddressV4)
+	}
+	// The hints are unreachable here, so the v4 value cannot have come from a
+	// fresh probe: reaching this state proves the no-change branch re-read the
+	// stored slots instead of returning early.
+	if updated.AddressSource != nodeAddressSourceDetected {
+		t.Fatalf("address_source = %q, want %q", updated.AddressSource, nodeAddressSourceDetected)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Address != "203.0.113.10" {
+		t.Fatalf("stored primary address = %q, want the already-adopted IPv4", after.Address)
+	}
+}
+
+// A no-op adoption must not write, so an unchanged node keeps its revision and
+// its schedules are not re-dirtied on every scheduler tick.
+func TestUnchangedAdoptionWritesNothing(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "steady", AddressV4: "203.0.113.10", AddressV6: "2001:db8::9",
+		Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.adoptNodeAddresses(current.ID, current.AddressV4, current.AddressV6, current.AddressV6Source, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.UpdatedAtMS != current.UpdatedAtMS {
+		t.Fatalf("a no-op adoption rewrote the node: updated_at %d -> %d", current.UpdatedAtMS, after.UpdatedAtMS)
+	}
+	if after.Address != current.Address {
+		t.Fatalf("a no-op adoption changed the primary: %q -> %q", current.Address, after.Address)
 	}
 }
 

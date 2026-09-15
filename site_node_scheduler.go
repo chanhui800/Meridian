@@ -1570,6 +1570,9 @@ func (a *App) handleSiteNodeScheduleByID(w http.ResponseWriter, r *http.Request)
 }
 
 func (a *App) cloudflareForScheduling() (*cloudflareClient, error) {
+	if a.cloudflareClientOverride != nil {
+		return a.cloudflareClientOverride, nil
+	}
 	settings, err := a.db.PanelSettings()
 	if err != nil {
 		return nil, err
@@ -1732,16 +1735,73 @@ func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedul
 }
 
 func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeSchedule) error {
-	if schedule.cfRecordID != "" {
+	if err := a.deleteTrackedSiteDNSRemoteAll(ctx, schedule); err != nil {
+		return err
+	}
+	return a.finalizeDisabledSiteNodeSchedule(schedule)
+}
+
+// deleteTrackedSiteDNSRemoteAll removes every record Meridian published for a
+// site, then clears the local tracking rows. A dual-stack site has one record per
+// family, so the per-family rows are removed alongside the single record mirrored
+// into the legacy columns: deleting only that one left the other family's record
+// in DNS, and the local row naming it was cleared with the rest of the schedule,
+// so nothing could find it again. Every disable path must go through here so the
+// two cannot drift apart.
+func (a *App) deleteTrackedSiteDNSRemoteAll(ctx context.Context, schedule SiteNodeSchedule) error {
+	records, err := a.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		return err
+	}
+	if len(records) > 0 || schedule.cfRecordID != "" {
 		cf, err := a.cloudflareForScheduling()
 		if err != nil {
 			return err
 		}
-		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
+		if err := deleteTrackedSiteDNSFamilyRecords(ctx, cf, schedule, records); err != nil {
+			// Best effort across records: one that could not be removed keeps its
+			// tracking row and is retried by the next cleanup pass, while the rows
+			// of records that are confirmed gone are dropped so the retry does not
+			// keep re-reading them.
+			a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
 			return err
 		}
+		if schedule.cfRecordID != "" {
+			if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
+				a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
+				return err
+			}
+		}
 	}
-	return a.finalizeDisabledSiteNodeSchedule(schedule)
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := deleteSiteDNSRecordsTx(tx, schedule.SiteID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// pruneDeletedSiteDNSRecords drops the tracking rows for records that are
+// confirmed gone after a partial cleanup. A record whose deletion failed keeps
+// its row and is retried by the next pass.
+func (a *App) pruneDeletedSiteDNSRecords(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule, records []siteDNSRecord) {
+	for _, record := range records {
+		recordID := strings.TrimSpace(record.RecordID)
+		if recordID == "" {
+			continue
+		}
+		zoneID := strings.TrimSpace(record.ZoneID)
+		if zoneID == "" {
+			zoneID = strings.TrimSpace(schedule.cfZoneID)
+		}
+		if _, err, ok := readOwnedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID); err != nil || ok {
+			continue
+		}
+		_, _ = a.db.db.Exec("DELETE FROM site_node_dns_records WHERE site_id=? AND record_id=?", schedule.SiteID, recordID)
+	}
 }
 
 // deleteTrackedSiteDNSForSiteDisable removes the active DNS/runtime
@@ -1749,22 +1809,51 @@ func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeS
 // operator's scheduling preference (enabled, mode and fixed_node_id). A site
 // can therefore be re-enabled without silently losing its selected node.
 func (a *App) deleteTrackedSiteDNSForSiteDisable(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
-	if schedule.cfRecordID != "" {
-		cf, err := a.cloudflareForScheduling()
-		if err != nil {
-			return err
-		}
-		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
-			return err
-		}
+	if err := a.deleteTrackedSiteDNSRemoteAll(ctx, schedule); err != nil {
+		return err
 	}
 	return a.finalizeDisabledSiteNodeRuntime(schedule, now)
+}
+
+// deleteTrackedSiteDNSFamilyRecords removes every per-family tracked record in
+// order, returning the first failure after attempting the rest. Deleting is
+// idempotent, so a retry after a partial failure is safe.
+func deleteTrackedSiteDNSFamilyRecords(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule, records []siteDNSRecord) error {
+	var firstErr error
+	seen := make(map[string]bool, len(records))
+	for _, record := range records {
+		recordID := strings.TrimSpace(record.RecordID)
+		if recordID == "" || seen[recordID] {
+			continue
+		}
+		seen[recordID] = true
+		zoneID := strings.TrimSpace(record.ZoneID)
+		if zoneID == "" {
+			zoneID = strings.TrimSpace(schedule.cfZoneID)
+		}
+		if err := deleteTrackedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// siteScheduleHasTrackedDNS reports whether disabling this site still has a
+// record to remove, either per family or in the legacy single-record columns.
+func (a *App) siteScheduleHasTrackedDNS(schedule SiteNodeSchedule) (bool, error) {
+	if strings.TrimSpace(schedule.cfRecordID) != "" || strings.TrimSpace(schedule.cfZoneID) != "" {
+		return true, nil
+	}
+	records, err := a.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		return false, err
+	}
+	return len(records) > 0, nil
 }
 
 // finalizeDisabledSiteNodeRuntime clears assignments and revokes old routes
 // without changing the site's scheduling preference. This is intentionally
 // separate from finalizeDisabledSiteNodeSchedule, which is used when an
-// operator explicitly disables scheduling and must clear that preference.
 func (a *App) finalizeDisabledSiteNodeRuntime(schedule SiteNodeSchedule, now time.Time) error {
 	if a == nil || a.db == nil || schedule.SiteID <= 0 {
 		return nil
@@ -1872,19 +1961,26 @@ func siteNodeScheduleNeedsCleanup(value SiteNodeSchedule) bool {
 }
 
 func deleteTrackedSiteDNSRemote(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule) error {
-	if schedule.cfRecordID == "" {
+	return deleteTrackedSiteDNSRecordByID(ctx, cf, schedule.cfZoneID, schedule.cfRecordID, schedule.SiteID)
+}
+
+// deleteTrackedSiteDNSRecordByID removes one tracked record after re-reading it.
+// A record that is already gone is an idempotent success, so a retry after a
+// partial failure cannot get stuck on the record that did disappear.
+func deleteTrackedSiteDNSRecordByID(ctx context.Context, cf *cloudflareClient, zoneID, recordID string, siteID int64) error {
+	if strings.TrimSpace(recordID) == "" {
 		return nil
 	}
 	if cf == nil {
 		return errors.New("Cloudflare DNS client is unavailable")
 	}
-	if schedule.cfZoneID == "" {
+	if strings.TrimSpace(zoneID) == "" {
 		return errors.New("tracked DNS zone is missing")
 	}
-	if err := verifyTrackedSiteDNSOwnership(ctx, cf, schedule); err != nil {
+	if err := verifyTrackedSiteDNSOwnershipByID(ctx, cf, zoneID, recordID, siteID); err != nil {
 		return err
 	}
-	if err := cf.deleteRecord(ctx, schedule.cfZoneID, schedule.cfRecordID); err != nil && !isCloudflareRecordNotFoundError(err) {
+	if err := cf.deleteRecord(ctx, zoneID, recordID); err != nil && !isCloudflareRecordNotFoundError(err) {
 		return err
 	}
 	return nil
@@ -1897,14 +1993,18 @@ func deleteTrackedSiteDNSRemote(ctx context.Context, cf *cloudflareClient, sched
 // place for the operator to resolve. A record that no longer exists remains an
 // idempotent success so the local cleanup can complete.
 func verifyTrackedSiteDNSOwnership(ctx context.Context, cf *cloudflareClient, schedule SiteNodeSchedule) error {
-	record, err := cf.dnsRecordByID(ctx, schedule.cfZoneID, schedule.cfRecordID)
+	return verifyTrackedSiteDNSOwnershipByID(ctx, cf, schedule.cfZoneID, schedule.cfRecordID, schedule.SiteID)
+}
+
+func verifyTrackedSiteDNSOwnershipByID(ctx context.Context, cf *cloudflareClient, zoneID, recordID string, siteID int64) error {
+	record, err := cf.dnsRecordByID(ctx, zoneID, recordID)
 	if err != nil {
 		if isCloudflareRecordNotFoundError(err) {
 			return nil
 		}
 		return err
 	}
-	return verifySiteDNSRecordOwnership(record, schedule.SiteID, cf.installUUID, "refusing to delete")
+	return verifySiteDNSRecordOwnership(record, siteID, cf.installUUID, "refusing to delete")
 }
 
 // readOwnedTrackedSiteDNSRecord re-reads a tracked record by ID and returns it
@@ -2114,7 +2214,14 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 		return err
 	}
 	if !site.Enabled {
-		if schedule.cfRecordID != "" {
+		// The legacy columns are not the whole tracked set any more: a
+		// dual-stack site is tracked per family, so the decision to run the DNS
+		// cleanup must look at those rows too or the second record is orphaned.
+		hasTrackedDNS, trackedErr := a.siteScheduleHasTrackedDNS(schedule)
+		if trackedErr != nil {
+			return trackedErr
+		}
+		if hasTrackedDNS {
 			return a.deleteTrackedSiteDNSForSiteDisable(ctx, schedule, now)
 		}
 		return a.finalizeDisabledSiteNodeRuntime(schedule, now)

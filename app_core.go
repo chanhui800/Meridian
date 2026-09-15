@@ -46,6 +46,9 @@ type App struct {
 	siteScheduleLocks    map[int64]*siteScheduleLock
 	nodeSchedulerQueueMu sync.Mutex
 	nodeSchedulerQueue   *nodeSchedulerQueue
+	// cloudflareClientOverride lets a test point the scheduling DNS client at a
+	// stub. Production always builds the client from the configured credentials.
+	cloudflareClientOverride *cloudflareClient
 }
 
 // siteScheduleLock serializes every local/remote mutation for one site. A

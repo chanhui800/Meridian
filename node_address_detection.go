@@ -256,7 +256,20 @@ func (a *App) adoptProbedNodeAddresses(ctx context.Context, node ControlNode, no
 		}
 	}
 	if updateV4 == "" && updateV6 == "" {
-		return node, nil
+		// Nothing new was verified, but the primary may still need to move: a
+		// node whose IPv4 was adopted by an earlier version keeps showing the
+		// enrolled IPv6 family as its primary for good otherwise, because the
+		// merge is only ever consulted on a change. Adoption re-reads the stored
+		// slots and applies the same rules, which is a no-op when they already
+		// agree.
+		current, readErr := a.db.controlNodeByID(node.ID, now)
+		if readErr != nil {
+			return node, readErr
+		}
+		if err := a.db.adoptNodeAddresses(node.ID, current.AddressV4, current.AddressV6, current.AddressV6Source, now); err != nil {
+			return node, err
+		}
+		return a.db.controlNodeByID(node.ID, now)
 	}
 	if err := a.db.adoptNodeAddresses(node.ID, updateV4, updateV6, sourceV6, now); err != nil {
 		return node, err
@@ -347,11 +360,11 @@ func (a *App) scheduledPublicHostForNode(nodeID int64) (string, bool, error) {
 }
 
 // adoptNodeAddresses writes the verified addresses into their per-family slots.
-// The legacy primary column is only filled when it is still empty, so adopting a
-// detected IPv4 address can never displace an operator-chosen one, and the
-// family the node dials keeps its existing meaning.
+// A recorded value is never displaced by an empty argument, an operator value is
+// never replaced, and a write happens only when something actually differs, so a
+// caller may pass what it read back without causing churn.
 func (d *DB) adoptNodeAddresses(nodeID int64, addressV4, addressV6, sourceV6 string, now time.Time) error {
-	if d == nil || nodeID <= 0 || (addressV4 == "" && addressV6 == "") {
+	if d == nil || nodeID <= 0 {
 		return nil
 	}
 	tx, err := d.db.Begin()
