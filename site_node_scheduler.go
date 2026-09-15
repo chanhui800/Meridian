@@ -1749,29 +1749,8 @@ func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeS
 // so nothing could find it again. Every disable path must go through here so the
 // two cannot drift apart.
 func (a *App) deleteTrackedSiteDNSRemoteAll(ctx context.Context, schedule SiteNodeSchedule) error {
-	records, err := a.db.siteDNSRecords(schedule.SiteID)
-	if err != nil {
+	if err := a.deleteTrackedSiteDNSRemoteSet(ctx, schedule); err != nil {
 		return err
-	}
-	if len(records) > 0 || schedule.cfRecordID != "" {
-		cf, err := a.cloudflareForScheduling()
-		if err != nil {
-			return err
-		}
-		if err := deleteTrackedSiteDNSFamilyRecords(ctx, cf, schedule, records); err != nil {
-			// Best effort across records: one that could not be removed keeps its
-			// tracking row and is retried by the next cleanup pass, while the rows
-			// of records that are confirmed gone are dropped so the retry does not
-			// keep re-reading them.
-			a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
-			return err
-		}
-		if schedule.cfRecordID != "" {
-			if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
-				a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
-				return err
-			}
-		}
 	}
 	tx, err := a.db.db.Begin()
 	if err != nil {
@@ -1782,6 +1761,46 @@ func (a *App) deleteTrackedSiteDNSRemoteAll(ctx context.Context, schedule SiteNo
 		return err
 	}
 	return tx.Commit()
+}
+
+// deleteTrackedSiteDNSRemoteSet removes the remote records only, leaving the
+// local rows to the caller's own transaction. Callers that finalize the schedule
+// themselves use this, so the local bookkeeping lands in the same transaction as
+// the rest of their cleanup.
+func (a *App) deleteTrackedSiteDNSRemoteSet(ctx context.Context, schedule SiteNodeSchedule) error {
+	records, err := a.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		return err
+	}
+	log.Printf("[dns-cleanup-diag] site %d: %d tracked record(s), legacy id set=%t, families=%v",
+		schedule.SiteID, len(records), schedule.cfRecordID != "", schedule.AppliedFamilies)
+	if len(records) == 0 && schedule.cfRecordID == "" {
+		log.Printf("[dns-cleanup-diag] site %d: nothing to remove", schedule.SiteID)
+		return nil
+	}
+	cf, err := a.cloudflareForScheduling()
+	if err != nil {
+		log.Printf("[dns-cleanup-diag] site %d: Cloudflare client unavailable: %v", schedule.SiteID, err)
+		return err
+	}
+	if err := deleteTrackedSiteDNSFamilyRecords(ctx, cf, schedule, records); err != nil {
+		log.Printf("[dns-cleanup-diag] site %d: family delete failed: %v", schedule.SiteID, err)
+		// Best effort across records: one that could not be removed keeps its
+		// tracking row and is retried by the next cleanup pass, while the rows
+		// of records that are confirmed gone are dropped so the retry does not
+		// keep re-reading them.
+		a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
+		return err
+	}
+	log.Printf("[dns-cleanup-diag] site %d: %d family record(s) removed", schedule.SiteID, len(records))
+	if schedule.cfRecordID != "" {
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
+			log.Printf("[dns-cleanup-diag] site %d: legacy record delete failed: %v", schedule.SiteID, err)
+			a.pruneDeletedSiteDNSRecords(ctx, cf, schedule, records)
+			return err
+		}
+	}
+	return nil
 }
 
 // pruneDeletedSiteDNSRecords drops the tracking rows for records that are
@@ -2670,16 +2689,9 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if value.cfRecordID != "" {
-		cf, err := a.cloudflareForScheduling()
-		if err != nil {
-			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), siteID)
-			return err
-		}
-		if err := deleteTrackedSiteDNSRemote(ctx, cf, value); err != nil {
-			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), siteID)
-			return err
-		}
+	if err := a.deleteTrackedSiteDNSRemoteSet(ctx, value); err != nil {
+		_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), siteID)
+		return err
 	}
 	// Keep the child row as the durable deletion handle until DeleteSite's
 	// database transaction commits. This avoids the partial-commit window where
@@ -2722,20 +2734,6 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 			unlockSites[i]()
 		}
 	}()
-	needsCloudflare := false
-	for _, value := range affected {
-		if strings.TrimSpace(value.cfRecordID) != "" {
-			needsCloudflare = true
-			break
-		}
-	}
-	var cf *cloudflareClient
-	if needsCloudflare {
-		cf, err = a.cloudflareForScheduling()
-		if err != nil {
-			return err
-		}
-	}
 	// Freeze every affected row in one local transaction before the remote phase.
 	// This makes a partial Cloudflare failure safe: all rows are disabled and
 	// retain their record IDs for retry, so the scheduler cannot recreate a
@@ -2768,10 +2766,7 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 		return err
 	}
 	for _, value := range affected {
-		if strings.TrimSpace(value.cfRecordID) == "" {
-			continue
-		}
-		if err := deleteTrackedSiteDNSRemote(ctx, cf, value); err != nil {
+		if err := a.deleteTrackedSiteDNSRemoteSet(ctx, value); err != nil {
 			// Keep every row disabled and retain tracked IDs so a later delete
 			// request can resume the remote phase idempotently.
 			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), value.SiteID)
