@@ -1255,3 +1255,123 @@ func TestLegacySingleAddressNodeStillPublishesOneFamily(t *testing.T) {
 		t.Fatalf("legacy families = %v, want only v4", families)
 	}
 }
+
+// A dual-stack node enrolling over IPv6 gets its IPv4 adopted, and the panel
+// shows and dials IPv4. The Controller wrote that IPv6 primary itself from the
+// enrolment source address, so it is not an operator value and may be replaced.
+func TestAdoptionPromotesIPv4OverAnInferredPrimary(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "dual", Address: "2001:db8::9", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(
+		"UPDATE control_nodes SET address_source=?,address_v4='',address_v6='' WHERE id=?",
+		nodeAddressSourceEnrollment, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.adoptNodeAddresses(current.ID, "203.0.113.10", "", "", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Address != "203.0.113.10" {
+		t.Fatalf("primary address = %q, want the adopted IPv4", after.Address)
+	}
+	if after.AddressSource != nodeAddressSourceDetected {
+		t.Fatalf("address_source = %q, want %q", after.AddressSource, nodeAddressSourceDetected)
+	}
+	if after.PrimaryAddress() != "203.0.113.10" {
+		t.Fatalf("PrimaryAddress = %q, want the adopted IPv4", after.PrimaryAddress())
+	}
+}
+
+// The promotion must not touch an address an operator typed, either way round: a
+// hand-entered IPv6 primary stays the primary even once IPv4 is verified.
+func TestAdoptionKeepsAnOperatorPrimary(t *testing.T) {
+	cases := []struct {
+		name   string
+		source string
+	}{
+		{"manual", nodeAddressSourceManual},
+		{"pre-column blank source", ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			app := newTestApp(t)
+			now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+			node, _, err := app.db.CreateControlNode(NodeCreateInput{
+				Name: "operator", Address: "2001:db8::9", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+			}, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := app.db.db.Exec(
+				"UPDATE control_nodes SET address_source=?,address_v4='',address_v6='' WHERE id=?",
+				testCase.source, node.ID); err != nil {
+				t.Fatal(err)
+			}
+			current, err := app.db.controlNodeByID(node.ID, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := app.db.adoptNodeAddresses(current.ID, "203.0.113.10", "", "", now.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			after, err := app.db.controlNodeByID(node.ID, now.Add(time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Address != "2001:db8::9" {
+				t.Fatalf("operator primary was replaced: %q", after.Address)
+			}
+			if after.AddressV4 != "203.0.113.10" {
+				t.Fatalf("address_v4 = %q, want the verified IPv4", after.AddressV4)
+			}
+		})
+	}
+}
+
+// A node pinned to IPv6 is showing the operator's chosen family on purpose, so
+// adoption fills the v4 slot for any future switch without moving the primary.
+func TestAdoptionKeepsAV6PinnedPrimary(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "pinned", Address: "2001:db8::9", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(
+		"UPDATE control_nodes SET address_source=?,dns_publish=?,address_v4='',address_v6='' WHERE id=?",
+		nodeAddressSourceEnrollment, nodeDNSPublishV6, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.adoptNodeAddresses(current.ID, "203.0.113.10", "", "", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Address != "2001:db8::9" {
+		t.Fatalf("a v6 pin lost its primary: %q", after.Address)
+	}
+	if after.AddressV4 != "203.0.113.10" {
+		t.Fatalf("address_v4 = %q, want the verified IPv4 kept for later", after.AddressV4)
+	}
+}

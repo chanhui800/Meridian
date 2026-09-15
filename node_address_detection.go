@@ -277,9 +277,10 @@ type nodeAddressAdoption struct {
 }
 
 // mergeAdoptedNodeAddresses fills only the empty per-family slots. An operator
-// value is never replaced, and the family the node dials keeps its existing
-// meaning: the legacy primary column is only filled when it is still empty, and
-// then with IPv4 first, matching PrimaryAddress().
+// value is never replaced, and the legacy primary column keeps its meaning as
+// the address the panel shows and the node is dialed on: it is filled when it is
+// still empty, and it moves to IPv4 in the one case where the Controller filled
+// it itself from the connecting source address.
 func mergeAdoptedNodeAddresses(node ControlNode, addressV4, addressV6, sourceV6 string) nodeAddressAdoption {
 	result := nodeAddressAdoption{
 		address:      node.Address,
@@ -294,7 +295,8 @@ func mergeAdoptedNodeAddresses(node ControlNode, addressV4, addressV6, sourceV6 
 		result.addressV6 = addressV6
 		result.addressV6Src = sourceV6
 	}
-	if strings.TrimSpace(node.Address) == "" {
+	switch {
+	case strings.TrimSpace(node.Address) == "":
 		switch {
 		case nodeAddressFamily(node.AddressV4) != "":
 			// The node already dials on IPv4; keep that family as the primary.
@@ -307,6 +309,17 @@ func mergeAdoptedNodeAddresses(node ControlNode, addressV4, addressV6, sourceV6 
 			result.address, result.source = result.addressV4, nodeAddressSourceDetected
 		case nodeAddressFamily(result.addressV6) != "":
 			result.address, result.source = result.addressV6, nodeAddressSourceDetected
+		}
+	default:
+		// A dual-stack node is dialed and shown on IPv4, matching
+		// PrimaryAddress(). This only ever moves an address the Controller
+		// inferred for itself: an operator-entered value keeps its family, and a
+		// node pinned to IPv6 keeps its primary until the other family is free.
+		if result.addressV4 != "" &&
+			nodeAddressFamily(node.Address) == "v6" &&
+			nodeAddressSourceInferred(node.AddressSource) &&
+			normalizeNodeDNSPublish(node.DNSPublish) != nodeDNSPublishV6 {
+			result.address, result.source = result.addressV4, nodeAddressSourceDetected
 		}
 	}
 	result.changed = result.address != node.Address || result.addressV4 != node.AddressV4 || result.addressV6 != node.AddressV6
@@ -346,14 +359,18 @@ func (d *DB) adoptNodeAddresses(nodeID int64, addressV4, addressV6, sourceV6 str
 		return err
 	}
 	defer tx.Rollback()
-	var currentAddress, currentV4, currentV6, currentSource, currentV6Source string
-	if err := tx.QueryRow("SELECT address,address_source,address_v4,address_v6,address_v6_source FROM control_nodes WHERE id=?", nodeID).
-		Scan(&currentAddress, &currentSource, &currentV4, &currentV6, &currentV6Source); err != nil {
+	var currentAddress, currentV4, currentV6, currentSource, currentV6Source, currentPublish string
+	if err := tx.QueryRow("SELECT address,address_source,address_v4,address_v6,address_v6_source,dns_publish FROM control_nodes WHERE id=?", nodeID).
+		Scan(&currentAddress, &currentSource, &currentV4, &currentV6, &currentV6Source, &currentPublish); err != nil {
 		return err
 	}
 	current := ControlNode{
 		Address: currentAddress, AddressSource: currentSource,
 		AddressV4: currentV4, AddressV6: currentV6, AddressV6Source: currentV6Source,
+		// The publish pin decides whether an adopted IPv4 may take over the
+		// primary address, so it has to be read inside the same transaction
+		// rather than assumed.
+		DNSPublish: currentPublish,
 	}
 	result := mergeAdoptedNodeAddresses(current, addressV4, addressV6, sourceV6)
 	if !result.changed {

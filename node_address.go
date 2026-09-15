@@ -29,6 +29,18 @@ const (
 // becomes a public DNS record.
 const nodeAddressSourceDetected = "detected"
 
+// nodeAddressSourceInferred reports whether the primary address was written by
+// the Controller rather than entered by an operator. A blank source predates the
+// column and therefore states nothing, so it is treated as an operator value.
+func nodeAddressSourceInferred(source string) bool {
+	switch strings.TrimSpace(source) {
+	case nodeAddressSourceDetected, nodeAddressSourceEnrollment:
+		return true
+	default:
+		return false
+	}
+}
+
 // nodeDNSPublishModes lists the accepted dns_publish values in display order.
 func nodeDNSPublishModes() []string {
 	return []string{nodeDNSPublishAuto, nodeDNSPublishV4, nodeDNSPublishV6}
