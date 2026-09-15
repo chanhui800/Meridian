@@ -1425,6 +1425,26 @@ func logAppliedRoutes(config AgentRuntimeConfig, siteIDs map[string]int64, manag
 		log.Printf("[diag-routes] route site=%d host_len=%d served=%t manager_configured=%t mode=%s handler_set=%t",
 			route.SiteID, len(host), served, configured, mode, handler != nil)
 	}
+	// A host the manager still indexes with no instance behind it is a site this
+	// Agent was told to serve and cannot: the ingress answers 503 for it, and the
+	// Controller refuses to publish DNS on that answer. Naming the site here is what
+	// turns "the node will not serve it" into a cause.
+	manager.mu.RLock()
+	indexed := make(map[string]int64, len(manager.publicHosts))
+	for host, id := range manager.publicHosts {
+		indexed[host] = id
+	}
+	live := make(map[int64]bool, len(manager.proxies))
+	for id := range manager.proxies {
+		live[id] = true
+	}
+	manager.mu.RUnlock()
+	for host, id := range indexed {
+		if !live[id] {
+			log.Printf("[diag-routes] host indexed with no instance: site=%d routed_in_this_config=%t",
+				id, siteIDs[host] > 0)
+		}
+	}
 }
 
 // logRefusedHost reports a request the Agent refused because no site claims that
