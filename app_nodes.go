@@ -177,6 +177,9 @@ func agentBinaryIdentityForPlatform(platform string) (string, string, error) {
 type nodeAPIInput struct {
 	Name                     string `json:"name"`
 	Address                  string `json:"address"`
+	AddressV4                string `json:"address_v4"`
+	AddressV6                string `json:"address_v6"`
+	DNSPublish               string `json:"dns_publish"`
 	Port                     int    `json:"port"`
 	HTTPSPort                int    `json:"https_port"` // Deprecated compatibility for cached pre-single-port pages.
 	Enabled                  *bool  `json:"enabled"`
@@ -194,7 +197,7 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 		port = input.HTTPSPort
 	}
 	return NodeCreateInput{
-		Name: input.Name, Address: input.Address, Port: port, Priority: input.Priority,
+		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, Port: port, Priority: input.Priority,
 		TrafficQuota: input.TrafficQuota, BillingMode: input.BillingMode, ResetDay: input.ResetDay,
 		TrafficManualOffsetBytes: input.TrafficManualOffsetBytes,
 	}
@@ -248,7 +251,7 @@ func buildNodeInstallCommandWithOptions(controllerURL, enrollmentToken string, r
 	if reenroll {
 		reenrollArg = " --reenroll"
 	}
-	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL %s | sudo bash -s -- -e %s -t %s%s",
+	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL %s | sudo bash -s -- -e %s -t %s%s",
 		shellSingleQuote(endpoint),
 		shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken), reenrollArg)
 }
@@ -457,6 +460,16 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.jsonErr(w, http.StatusConflict, "legacy Agent must send X-Meridian-Agent-Platform; reinstall it to enable updates")
+		return
+	}
+	// Development/test images serve the architecture-matched binary bundled in
+	// the image. There is no GitHub Release for a prerelease build, so do not
+	// attempt the release manifest lookup below.
+	if !validAgentReleaseVersion(strings.TrimSpace(appVersion)) {
+		if executable, pathErr := configuredAgentBinaryPathForPlatform(platform); pathErr == nil && serveAgentBinaryFile(w, executable, platform) {
+			return
+		}
+		a.jsonErr(w, http.StatusServiceUnavailable, "agent binary unavailable")
 		return
 	}
 	// Resolve the immutable Release checksum before considering any local

@@ -208,7 +208,19 @@ func agentReleaseManifestForPlatform(ctx context.Context, platform string) (Agen
 	}
 	version := strings.TrimSpace(appVersion)
 	if !validAgentReleaseVersion(version) {
-		return AgentBinaryManifest{}, errors.New("agent release manifest is unavailable for a development build")
+		// Test/development Controller images do not publish a GitHub Release.
+		// They carry both Agent architectures in the image instead, so the
+		// protected Controller binary endpoint can serve the exact bytes built
+		// alongside this Controller.
+		executable, pathErr := configuredAgentBinaryPathForPlatform(normalized)
+		if pathErr != nil {
+			return AgentBinaryManifest{}, errors.New("agent release manifest is unavailable for a development build")
+		}
+		digest, digestErr := agentBinarySHA256(executable)
+		if digestErr != nil {
+			return AgentBinaryManifest{}, fmt.Errorf("development Agent binary unavailable: %w", digestErr)
+		}
+		return AgentBinaryManifest{Version: version, Platform: normalized, DownloadURL: "/api/agent/binary", SHA256: digest}, nil
 	}
 	values, err := fetchAgentReleaseChecksums(ctx, version)
 	if err != nil {

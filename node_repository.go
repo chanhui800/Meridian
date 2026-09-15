@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,10 +36,15 @@ var (
 )
 
 type ControlNode struct {
-	ID      int64  `json:"id"`
-	GUID    string `json:"guid"`
-	Name    string `json:"name"`
-	Address string `json:"address"`
+	ID              int64            `json:"id"`
+	GUID            string           `json:"guid"`
+	Name            string           `json:"name"`
+	Address         string           `json:"address"`
+	AddressV4       string           `json:"address_v4"`
+	AddressV6       string           `json:"address_v6"`
+	AddressV6Source string           `json:"address_v6_source,omitempty"`
+	DNSPublish      string           `json:"dns_publish"`
+	NetAddresses    []NodeNetAddress `json:"net_addresses,omitempty"`
 	// AddressSource records where Address came from: "manual" when an operator
 	// entered it, "enrollment" when it was inferred from the source address of
 	// the Agent's own enrollment request. The panel surfaces the difference so
@@ -127,6 +133,9 @@ type AgentSecurityDiagnostics struct {
 type NodeCreateInput struct {
 	Name                     string
 	Address                  string
+	AddressV4                string
+	AddressV6                string
+	DNSPublish               string
 	Port                     int
 	Priority                 int
 	TrafficQuota             int64
@@ -147,6 +156,7 @@ type NodeReport struct {
 	// It lets the Controller reject a delayed sample from either channel.
 	TelemetrySequence     int64                    `json:"telemetry_sequence,omitempty"`
 	InterfaceName         string                   `json:"interface_name"`
+	NetAddresses          []NodeNetAddress         `json:"net_addresses,omitempty"`
 	RXBytes               int64                    `json:"rx_bytes"`
 	TXBytes               int64                    `json:"tx_bytes"`
 	AgentVersion          string                   `json:"agent_version"`
@@ -165,6 +175,12 @@ type NodeReport struct {
 	Retention             []NodeRetentionStatus    `json:"retention,omitempty"`
 	Observations          []NodeDynamicObservation `json:"observations,omitempty"`
 	Events                []NodeRequestEvent       `json:"events,omitempty"`
+}
+
+type NodeNetAddress struct {
+	Family    string `json:"family"`
+	Address   string `json:"address"`
+	Interface string `json:"interface,omitempty"`
 }
 
 // NodeLiveReport is the lightweight runtime sample used by the dashboard.
@@ -327,6 +343,43 @@ func hashNodeToken(value string) string {
 func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	input.Address = strings.TrimSpace(input.Address)
+	input.AddressV4 = strings.TrimSpace(input.AddressV4)
+	input.AddressV6 = strings.TrimSpace(input.AddressV6)
+	input.DNSPublish = strings.ToLower(strings.TrimSpace(input.DNSPublish))
+	if input.DNSPublish == "" {
+		input.DNSPublish = "auto"
+	}
+	if input.DNSPublish != "auto" && input.DNSPublish != "v4" && input.DNSPublish != "v6" {
+		return input, errors.New("dns_publish must be auto, v4, or v6")
+	}
+	if input.AddressV4 != "" {
+		ip := net.ParseIP(input.AddressV4)
+		if ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			return input, errors.New("address_v4 must be an IPv4 address")
+		}
+		input.AddressV4 = ip.To4().String()
+	}
+	if input.AddressV6 != "" {
+		ip := net.ParseIP(input.AddressV6)
+		if ip == nil || ip.To4() != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			return input, errors.New("address_v6 must be an IPv6 address")
+		}
+		input.AddressV6 = ip.String()
+	}
+	if ip := net.ParseIP(input.Address); ip != nil {
+		if ip.To4() != nil && input.AddressV4 == "" {
+			input.AddressV4 = ip.To4().String()
+		}
+		if ip.To4() == nil && input.AddressV6 == "" {
+			input.AddressV6 = ip.String()
+		}
+	}
+	if input.DNSPublish == "v4" && input.AddressV4 == "" {
+		return input, errors.New("dns_publish v4 requires an IPv4 address")
+	}
+	if input.DNSPublish == "v6" && input.AddressV6 == "" {
+		return input, errors.New("dns_publish v6 requires an IPv6 address")
+	}
 	// The browser supplies the controller's current port for new nodes. Keep a
 	// 443 fallback for API callers that omit the optional convenience default.
 	if input.Port == 0 {
@@ -454,9 +507,9 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	// address_source is left to its column default here: a row created from the
 	// panel always carries an operator-entered address.
 	result, err := d.db.Exec(`INSERT INTO control_nodes
-		(guid,name,address,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
+		(guid,name,address,address_v4,address_v6,dns_publish,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
 		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.Port, input.Priority, input.TrafficQuota,
+		VALUES(?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, input.Priority, input.TrafficQuota,
 		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), probeSecretCiphertext, nowMS, nowMS)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -474,7 +527,7 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const controlNodeSelect = `SELECT id,guid,name,address,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
+const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
@@ -484,7 +537,8 @@ const controlNodeSelect = `SELECT id,guid,name,address,address_source,https_port
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
 	var enabled, configDirty int
-	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
+	var reportedAddresses string
+	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
@@ -494,6 +548,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	if err != nil {
 		return ControlNode{}, err
 	}
+	_ = json.Unmarshal([]byte(reportedAddresses), &node.NetAddresses)
 	node.Enabled = enabled != 0
 	node.ConfigDirty = configDirty != 0
 	node.EnrollmentAvailable = node.enrollmentTokenHash != "" && now.UnixMilli() < node.enrollmentExpiresMS
@@ -817,12 +872,12 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
 			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
+			input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -1134,6 +1189,15 @@ func validateNodeReport(report NodeReport) error {
 	}
 	if report.InterfaceName == "" || len(report.InterfaceName) > 64 || len(report.AgentVersion) > 128 || len(report.AppliedConfigHash) > 128 || len(report.ApplyError) > 1024 || len(report.ListenerError) > 1024 || len(report.EventSpoolError) > 1024 || report.EventQueueDepth < 0 || report.EventQueueDepth > edgeEventQueueLimit || report.EventDropped < 0 {
 		return errors.New("invalid agent metadata")
+	}
+	if len(report.NetAddresses) > 32 {
+		return errors.New("too many network addresses")
+	}
+	for _, candidate := range report.NetAddresses {
+		ip := net.ParseIP(strings.TrimSpace(candidate.Address))
+		if ip == nil || (candidate.Family == "v4" && ip.To4() == nil) || (candidate.Family == "v6" && ip.To4() != nil) {
+			return errors.New("invalid network address")
+		}
 	}
 	if len(report.SiteStats) > 512 {
 		return errors.New("too many site stats")
@@ -1857,15 +1921,36 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		applyErrorAtMS = 0
 		applyFailures = 0
 	}
+	addressesJSON, _ := json.Marshal(report.NetAddresses)
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 			lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,agent_lease_expires_at_ms=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,reported_net_addresses=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,agent_lease_expires_at_ms=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), appliedHash, report.AppliedConfigRevision, applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), string(addressesJSON), appliedHash, report.AppliedConfigRevision, applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
 		clearAppliedConfig,
 		report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration,
 		now.Add(agentLeaseTTL).UnixMilli(), now.UnixMilli(), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
+	}
+	// Adopt only empty address slots from Agent hints. Manual values are never
+	// overwritten; DNS publication remains controlled by dns_publish.
+	var hintedV4, hintedV6 string
+	for _, candidate := range report.NetAddresses {
+		ip := net.ParseIP(strings.TrimSpace(candidate.Address))
+		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			continue
+		}
+		if ip.To4() != nil && hintedV4 == "" {
+			hintedV4 = ip.To4().String()
+		}
+		if ip.To4() == nil && hintedV6 == "" {
+			hintedV6 = ip.String()
+		}
+	}
+	if hintedV4 != "" || hintedV6 != "" {
+		if _, err := tx.Exec(`UPDATE control_nodes SET address_v4=CASE WHEN TRIM(address_v4)='' THEN ? ELSE address_v4 END,address_v6=CASE WHEN TRIM(address_v6)='' THEN ? ELSE address_v6 END,updated_at_ms=? WHERE id=?`, hintedV4, hintedV6, now.UnixMilli(), id); err != nil {
+			return nodeReportCommitResult{}, err
+		}
 	}
 	// A cold-started Agent may report before it has successfully applied the
 	// desired runtime config. Start the scheduler's pending clock from that

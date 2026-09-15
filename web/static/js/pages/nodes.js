@@ -34,7 +34,7 @@ function siteScheduleFeedback(site, now = Date.now()) {
   const enabled = site?.enabled === true;
   const lastError = String(site?.last_error || '').trim();
   const pendingSince = Number(site?.config_pending_since_ms || 0);
-  if (!enabled) return { kind: 'disabled', className: '', text: '未启用节点调度，继续使用原面板入口' };
+  if (!enabled) return { kind: 'disabled', className: '', text: '未启用节点调度，继续使用主控入口' };
 
   // The scheduler uses this readiness error while an Agent is still fetching
   // the first snapshot. It is expected progress, not a failed operation.
@@ -75,11 +75,8 @@ function renderNodeCards() {
     // An address the controller inferred from the enrollment request is marked so
     // it gets reviewed: this value is published as the site's DNS record, and a
     // wrong guess points the site at the wrong host.
-    const addressText = node.address
-      ? (node.address_source === 'enrollment'
-        ? `${node.address}（自动探测，请核对）`
-        : node.address)
-      : '未填写地址';
+    const families = [node.address_v4 ? `V4 ${node.address_v4}` : '', node.address_v6 ? `V6 ${node.address_v6}` : ''].filter(Boolean);
+    const addressText = families.length ? families.join(' · ') : (node.address || '未填写地址');
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
       <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(addressText)} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
@@ -135,8 +132,11 @@ function openNodeForm(node) {
   document.getElementById('modal-title').textContent = editing ? '编辑节点' : '创建节点';
   document.getElementById('modal-body').innerHTML = `<form id="node-form" class="node-form">
     <label>节点名称<input class="form-input" id="node-name" maxlength="64" required value="${esc(node ? node.name : '')}"></label>
-    <label>显示地址<input class="form-input" id="node-address" maxlength="255" value="${esc(node ? node.address : '')}" placeholder="例如 203.0.113.10"></label>
-    <div class="form-help">留空时，节点首次注册会自动填入主控观测到的来源 IP 并标记「自动探测」。此地址会作为站点的 DNS A/AAAA 记录发布，请务必核对后保存；保存即视为人工确认。</div>
+    <label>兼容地址<input class="form-input" id="node-address" maxlength="255" value="${esc(node ? node.address : '')}" placeholder="可留空"></label>
+    <div class="node-form-grid"><label>IPv4 地址<input class="form-input" id="node-address-v4" value="${esc(node ? (node.address_v4 || '') : '')}" placeholder="例如 203.0.113.10"></label><label>IPv6 地址<input class="form-input" id="node-address-v6" value="${esc(node ? (node.address_v6 || '') : '')}" placeholder="例如 2001:db8::10"></label></div>
+    <label>DNS 发布<select class="form-input" id="node-dns-publish"><option value="auto">自动（双栈同时发布）</option><option value="v4">仅 IPv4</option><option value="v6">仅 IPv6</option></select></label>
+    <div class="form-help" id="node-dns-preview" role="status" aria-live="polite"></div>
+    <div class="form-help">Agent 会上报可用地址作为候选，仅填充空白槽位；人工填写的地址不会被覆盖。自动模式按实际可用族发布 A/AAAA。</div>
     <label>端口<input class="form-input" id="node-port" type="number" min="1" max="65535" value="${node && node.port ? node.port : (location.port || 443)}"></label>
     <div class="form-help">Agent 仅提供 TLS/HTTPS。同一节点上的所有调度站点共用此端口并按域名区分；端口必须未被该 VPS 上的其他程序占用。默认采用当前主控端口，保存后独立管理。</div>
     <div class="node-form-grid"><label>流量上限（GiB，0 为不限）<input class="form-input" id="node-quota" type="number" min="0" step="0.01" value="${node ? (Number(node.traffic_quota) / 1073741824).toFixed(2) : '0'}"></label><label>重置日<input class="form-input" id="node-reset" type="number" min="0" max="31" value="${node ? node.reset_day : 1}"></label></div>
@@ -146,6 +146,22 @@ function openNodeForm(node) {
     ${editing ? '<label class="node-check"><input id="node-enabled" type="checkbox" checked> 启用节点</label>' : '<label>控制器地址<input class="form-input" id="node-controller" type="url" required></label>'}
   </form>`;
   document.getElementById('node-billing').value = node ? node.billing_mode : 'outbound';
+  document.getElementById('node-dns-publish').value = node ? (node.dns_publish || 'auto') : 'auto';
+  const refreshDNSPreview = () => {
+    const v4 = document.getElementById('node-address-v4').value.trim();
+    const v6 = document.getElementById('node-address-v6').value.trim();
+    const mode = document.getElementById('node-dns-publish').value;
+    const records = [];
+    if (v4 && mode !== 'v6') records.push(`A → ${v4}`);
+    if (v6 && mode !== 'v4') records.push(`AAAA → ${v6}`);
+    const missing = mode === 'v4' && !v4 || mode === 'v6' && !v6;
+    const preview = document.getElementById('node-dns-preview');
+    preview.textContent = missing ? '所选地址族尚未填写，无法保存。' : (records.length ? `将发布：${records.join('；')}` : '地址上报后将按可用地址族发布。');
+    preview.classList.toggle('is-error', missing);
+    return !missing;
+  };
+  ['node-address-v4', 'node-address-v6', 'node-dns-publish'].forEach(id => document.getElementById(id).addEventListener('input', refreshDNSPreview));
+  refreshDNSPreview();
   if (editing) document.getElementById('node-enabled').checked = node.enabled;
   else document.getElementById('node-controller').value = location.origin;
   document.getElementById('modal-footer').innerHTML = '<button type="button" class="node-button" id="node-form-cancel">取消</button><button type="submit" form="node-form" class="node-button is-primary">保存</button>';
@@ -153,7 +169,8 @@ function openNodeForm(node) {
   document.getElementById('node-form-cancel').onclick = closeModal;
   document.getElementById('node-form').onsubmit = async event => {
     event.preventDefault();
-    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
+    if (!refreshDNSPreview()) return Toast.error('请填写所选 DNS 地址族');
+    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), address_v4: document.getElementById('node-address-v4').value.trim(), address_v6: document.getElementById('node-address-v6').value.trim(), dns_publish: document.getElementById('node-dns-publish').value, port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
     try {
       if (editing) { payload.enabled = document.getElementById('node-enabled').checked; await API.updateNode(node.id, payload); closeModal(); Toast.success('节点已更新'); }
       else { payload.controller_url = document.getElementById('node-controller').value.trim(); const result = await API.createNode(payload); showNodeScript(result.install_script, result.install_command); }
@@ -214,10 +231,10 @@ function renderSiteSchedules() {
     const dirty = !!draft;
     const feedback = siteScheduleFeedback(site);
     const stateLabel = dirty
-      ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
+      ? `${savedEnabled ? '调度已启用' : '使用主控入口'} · 待保存`
       : (feedback.kind === 'pending' || feedback.kind === 'warning' || feedback.kind === 'error'
         ? feedback.text
-        : (savedEnabled ? '调度已启用' : '使用面板入口'));
+        : (savedEnabled ? '调度已启用' : '使用主控入口'));
     const nodeOptions = nodesSnapshot.nodes.map(node => `<option value="${node.id}" ${Number(view.fixed_node_id) === Number(node.id) ? 'selected' : ''}>${esc(node.name)}</option>`).join('');
     const error = `<small class="${feedback.className}">${esc(feedback.text)}</small>`;
     const dirtyNote = dirty ? '<small class="node-site-dirty">当前修改尚未保存，保存后才会生效</small>' : '';
@@ -228,7 +245,7 @@ function renderSiteSchedules() {
         <label class="node-site-field">调度方式<select class="form-input" data-field="mode" ${formEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select></label>
         <label class="node-site-field">固定节点<select class="form-input" data-field="fixed-node" ${formEnabled && view.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select></label>
       </div>
-      <div class="node-site-status"><span>${savedEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}` : '原面板模式 · 节点调度未启用'}</span>${savedEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}${dirtyNote}</div>
+      <div class="node-site-status"><span>${savedEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}` : '主控模式 · 节点调度未启用'}</span>${savedEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}${dirtyNote}</div>
       <footer class="node-site-card-actions"><button type="button" class="node-button is-primary" data-action="save-site">保存站点设置</button></footer>
     </article>`;
   }).join('');
@@ -247,10 +264,10 @@ function refreshSiteScheduleRowState(row) {
     state.className = `node-site-state ${savedEnabled ? 'is-enabled' : ''} ${dirty ? 'is-pending' : ''}`;
     const feedback = siteScheduleFeedback(server);
     state.textContent = dirty
-      ? `${savedEnabled ? '调度已启用' : '使用面板入口'} · 待保存`
+      ? `${savedEnabled ? '调度已启用' : '使用主控入口'} · 待保存`
       : (feedback.kind === 'pending' || feedback.kind === 'warning' || feedback.kind === 'error'
         ? feedback.text
-        : (savedEnabled ? '调度已启用' : '使用面板入口'));
+        : (savedEnabled ? '调度已启用' : '使用主控入口'));
   }
   const status = row.querySelector('.node-site-status');
   if (!status) return;
@@ -332,7 +349,7 @@ function renderNodes() {
       <div class="node-mode"><label><input type="radio" name="node-mode" id="node-mode-auto" value="auto"> 自动</label><label><input type="radio" name="node-mode" id="node-mode-manual" value="manual"> 手动</label></div>
       <div id="node-manual-choices" class="node-choices"></div><button class="node-button is-primary" id="node-save-scheduler">保存调度</button>
     </section><div id="node-list" class="node-list"><div class="node-empty">正在加载…</div></div>
-    <section class="node-site-section"><div class="node-section-head"><div><h2>站点调度</h2><p>在此分组逐个选择是否接入节点调度；关闭时保持原面板模式，可跟随全局节点或固定到指定节点。</p></div></div><div id="node-site-list" class="node-site-list"><div class="node-empty">正在加载…</div></div></section></div>`;
+    <section class="node-site-section"><div class="node-section-head"><div><h2>站点调度</h2><p>在此逐个选择是否接入节点调度；关闭时保持主控模式，开启后可跟随全局节点或固定到指定节点。</p></div></div><div id="node-site-list" class="node-site-list"><div class="node-empty">正在加载…</div></div></section></div>`;
   document.getElementById('node-add').onclick = () => openNodeForm(null);
   document.getElementById('node-list').onclick = handleNodeAction;
   document.getElementById('node-site-list').onclick = handleSiteScheduleAction;

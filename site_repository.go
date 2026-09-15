@@ -12,55 +12,55 @@ import (
 var errInvalidSiteOrder = errors.New("invalid site order")
 
 type Site struct {
-	ID                            int64                `json:"id"`
-	SortOrder                     int64                `json:"sort_order"`
-	Name                          string               `json:"name"`
-	IconName                      string               `json:"icon_name"`
-	IconURL                       string               `json:"icon_url"`
-	ListenPort                    int                  `json:"listen_port"`
-	PublicHost                    string               `json:"public_host"`
-	PathPrefix                    string               `json:"path_prefix"`
-	IngressMode                   string               `json:"ingress_mode"`
-	TargetURL                     string               `json:"target_url"`
-	PrimaryLineName               string               `json:"primary_line_name"`
-	PlaybackTargetURL             string               `json:"playback_target_url"`
-	PlaybackMode                  string               `json:"playback_mode"`
-	MainVideoStreamMode           string               `json:"main_video_stream_mode"`
-	FailoverTargets               string               `json:"-"`
-	FailoverTargetList            []string             `json:"failover_targets"`
-	StoredFailoverLines           string               `json:"-"`
-	FailoverLines                 []FailoverLine       `json:"failover_lines"`
-	StreamHosts                   string               `json:"-"`
-	StreamHostList                []string             `json:"stream_hosts"`
-	UAMode                        string               `json:"ua_mode"`
-	CustomUserAgent               string               `json:"custom_user_agent"`
-	CustomClient                  string               `json:"custom_client"`
-	CustomVersion                 string               `json:"custom_version"`
-	ClientIPMode                  string               `json:"client_ip_mode"`
-	StoredUpstreamHeaders         string               `json:"-"`
-	UpstreamHeaders               []UpstreamHeaderView `json:"upstream_headers"`
-	DynamicPolicyRevision         int64                `json:"dynamic_policy_revision"`
-	AssetCacheEnabled             bool                 `json:"asset_cache_enabled"`
-	AssetCacheTTLSec              int                  `json:"asset_cache_ttl_sec"`
-	AssetCacheMaxBytes            int64                `json:"asset_cache_max_bytes"`
-	AssetCacheRules               string               `json:"asset_cache_rules"`
-	WatchHistoryEnabled           bool                 `json:"watch_history_enabled"`
-	AccountRetentionDays          int                  `json:"account_retention_days"`
-	AccountRetentionStartedMS     int64                `json:"account_retention_started_at_ms"`
-	AccountRetentionCompletedMS   int64                `json:"account_retention_last_completed_at_ms"`
-	MediaMovieCount               int64                `json:"media_movie_count"`
-	MediaSeriesCount              int64                `json:"media_series_count"`
-	MediaEpisodeCount             int64                `json:"media_episode_count"`
-	MediaCountUpdatedMS           int64                `json:"media_count_updated_at_ms"`
-	Enabled                       bool                 `json:"enabled"`
-	TrafficQuota                  int64                `json:"traffic_quota"`
-	TrafficUsed                   int64                `json:"traffic_used"`
-	TrafficUsedIn                 int64                `json:"-"`
-	TrafficUsedOut                int64                `json:"-"`
-	SpeedLimit                    int                  `json:"speed_limit"`
-	CreatedAt                     string               `json:"created_at"`
-	UpdatedAt                     string               `json:"updated_at"`
-	RuntimeUpstreamHeaders        map[string][]string  `json:"-"`
+	ID                          int64                `json:"id"`
+	SortOrder                   int64                `json:"sort_order"`
+	Name                        string               `json:"name"`
+	IconName                    string               `json:"icon_name"`
+	IconURL                     string               `json:"icon_url"`
+	ListenPort                  int                  `json:"listen_port"`
+	PublicHost                  string               `json:"public_host"`
+	PathPrefix                  string               `json:"path_prefix"`
+	IngressMode                 string               `json:"ingress_mode"`
+	TargetURL                   string               `json:"target_url"`
+	PrimaryLineName             string               `json:"primary_line_name"`
+	PlaybackTargetURL           string               `json:"playback_target_url"`
+	PlaybackMode                string               `json:"playback_mode"`
+	MainVideoStreamMode         string               `json:"main_video_stream_mode"`
+	FailoverTargets             string               `json:"-"`
+	FailoverTargetList          []string             `json:"failover_targets"`
+	StoredFailoverLines         string               `json:"-"`
+	FailoverLines               []FailoverLine       `json:"failover_lines"`
+	StreamHosts                 string               `json:"-"`
+	StreamHostList              []string             `json:"stream_hosts"`
+	UAMode                      string               `json:"ua_mode"`
+	CustomUserAgent             string               `json:"custom_user_agent"`
+	CustomClient                string               `json:"custom_client"`
+	CustomVersion               string               `json:"custom_version"`
+	ClientIPMode                string               `json:"client_ip_mode"`
+	StoredUpstreamHeaders       string               `json:"-"`
+	UpstreamHeaders             []UpstreamHeaderView `json:"upstream_headers"`
+	DynamicPolicyRevision       int64                `json:"dynamic_policy_revision"`
+	AssetCacheEnabled           bool                 `json:"asset_cache_enabled"`
+	AssetCacheTTLSec            int                  `json:"asset_cache_ttl_sec"`
+	AssetCacheMaxBytes          int64                `json:"asset_cache_max_bytes"`
+	AssetCacheRules             string               `json:"asset_cache_rules"`
+	WatchHistoryEnabled         bool                 `json:"watch_history_enabled"`
+	AccountRetentionDays        int                  `json:"account_retention_days"`
+	AccountRetentionStartedMS   int64                `json:"account_retention_started_at_ms"`
+	AccountRetentionCompletedMS int64                `json:"account_retention_last_completed_at_ms"`
+	MediaMovieCount             int64                `json:"media_movie_count"`
+	MediaSeriesCount            int64                `json:"media_series_count"`
+	MediaEpisodeCount           int64                `json:"media_episode_count"`
+	MediaCountUpdatedMS         int64                `json:"media_count_updated_at_ms"`
+	Enabled                     bool                 `json:"enabled"`
+	TrafficQuota                int64                `json:"traffic_quota"`
+	TrafficUsed                 int64                `json:"traffic_used"`
+	TrafficUsedIn               int64                `json:"-"`
+	TrafficUsedOut              int64                `json:"-"`
+	SpeedLimit                  int                  `json:"speed_limit"`
+	CreatedAt                   string               `json:"created_at"`
+	UpdatedAt                   string               `json:"updated_at"`
+	RuntimeUpstreamHeaders      map[string][]string  `json:"-"`
 	// AssetCacheNamespace is runtime-only. Agent runtimes recreate their local
 	// SQLite rows whenever a configuration is applied, so cache identity must
 	// come from the controller rather than the local row ID.
@@ -145,7 +145,6 @@ func hydrateSiteConfiguration(site *Site, assetCacheEnabled, watchHistoryEnabled
 	}
 	return nil
 }
-
 
 func (d *DB) ListSites() ([]Site, error) {
 	rows, err := d.db.Query("SELECT id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at FROM sites ORDER BY sort_order, id")
@@ -752,6 +751,9 @@ func (d *DB) DeleteSite(id int64) error {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM site_node_schedules WHERE site_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM site_node_dns_records WHERE site_id=?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM tmdb_cache WHERE NOT EXISTS (
