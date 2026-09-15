@@ -485,6 +485,106 @@ func TestReconcileChecksTheSiteRoutePerPublishedFamily(t *testing.T) {
 	}
 }
 
+// A schedule the Controller cannot serve must not stay published on the node:
+// marking it "waiting" only says the Controller is not ready to switch, while the
+// records already published keep pointing clients at a node that answers 421.
+// Withdrawing them puts clients back on the Controller, and the tracking rows are
+// kept so the same set is republished once the node is ready.
+func TestWaitingScheduleWithdrawsItsPublishedRecords(t *testing.T) {
+	app, fake, cf, schedule, node := newDualStackFixture(t)
+	stubSchedulingCloudflare(t, app, cf)
+	ctx := context.Background()
+	now := time.Now()
+	addresses := map[string]string{"v4": node.IPv4Address(), "v6": node.IPv6Address()}
+	published, err := app.publishSiteAddressFamilies(ctx, cf, schedule, node, node.DNSPublishFamilies(), "zone-1", addresses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSiteDNSRecordsTx(tx, schedule.SiteID, published, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	primary := primaryPublishedRecord(published)
+	if primary == nil {
+		t.Fatal("no primary record was published")
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(schedule.SiteID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(
+		"UPDATE site_node_schedules SET dns_status='active',cf_zone_id=?,cf_record_id=?,cf_record_type=?,applied_address=?,schedule_revision=42 WHERE site_id=?",
+		primary.ZoneID, primary.RecordID, primary.RecordType, node.IPv4Address(), schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.snapshot()) != 2 {
+		t.Fatalf("fixture published %+v, want two records", fake.snapshot())
+	}
+	waiting, err := app.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model the readiness failure: the outcome handler records "waiting" and then
+	// withdraws what was published for that generation.
+	if _, err := app.db.db.Exec(
+		"UPDATE site_node_schedules SET dns_status='waiting',last_error=? WHERE site_id=?", "IPv4 entry route check", schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	app.withdrawSiteDNSWhileWaiting(ctx, waiting, now)
+	if remaining := fake.snapshot(); len(remaining) != 0 {
+		t.Fatalf("records left published on a node that cannot serve the site: %+v", remaining)
+	}
+	rows, err := app.db.siteDNSRecords(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("tracking rows = %d, want the two families kept so they can be republished", len(rows))
+	}
+	after, err := app.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.cfRecordID != "" || after.AppliedAddress != "" {
+		t.Fatalf("the mirrored record columns still name a withdrawn record: id=%q address=%q", after.cfRecordID, after.AppliedAddress)
+	}
+	if after.DNSStatus != "waiting" {
+		t.Fatalf("dns_status = %q, want waiting", after.DNSStatus)
+	}
+}
+
+// A site that is already withdrawn must not be withdrawn again on every tick: the
+// decision is gated on the schedule actually being published.
+func TestWaitingWithdrawalIsIdempotent(t *testing.T) {
+	app, fake, cf, schedule, _ := newDualStackFixture(t)
+	stubSchedulingCloudflare(t, app, cf)
+	ctx := context.Background()
+	now := time.Now()
+	if _, err := app.db.SaveSiteNodeSchedule(schedule.SiteID, true, "global", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(
+		"UPDATE site_node_schedules SET dns_status='waiting',schedule_revision=7 WHERE site_id=?", schedule.SiteID); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := app.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nothing is published and no Cloudflare client is configured: a second pass
+	// must do nothing rather than fail or call the API.
+	app.cloudflareClientOverride = nil
+	app.withdrawSiteDNSWhileWaiting(ctx, waiting, now)
+	if len(fake.snapshot()) != 0 {
+		t.Fatalf("unexpected records: %+v", fake.snapshot())
+	}
+}
+
 // The reported addresses have to survive the report path, because adoption reads
 // them back from the stored column rather than from the request.
 func TestNodeReportStoresAddressHints(t *testing.T) {

@@ -131,7 +131,7 @@ func (a *App) runNodeSchedulerJob(ctx context.Context, queue *nodeSchedulerQueue
 		return a.reconcileOneSiteScheduleLocked(workCtx, current, time.Now())
 	}()
 	cancel()
-	a.processNodeSchedulerOutcome(job, err)
+	a.processNodeSchedulerOutcome(ctx, job, err)
 	queue.mu.Lock()
 	delete(queue.inFlight, job.value.SiteID)
 	queue.mu.Unlock()
@@ -2476,7 +2476,7 @@ func upsertSiteNodeDrainTx(tx *sql.Tx, siteID, nodeID int64, publicHost string, 
 	return err
 }
 
-func (a *App) processNodeSchedulerOutcome(job nodeSchedulerJob, err error) {
+func (a *App) processNodeSchedulerOutcome(ctx context.Context, job nodeSchedulerJob, err error) {
 	if a == nil || err == nil {
 		return
 	}
@@ -2505,7 +2505,59 @@ func (a *App) processNodeSchedulerOutcome(job nodeSchedulerJob, err error) {
 	}
 	if value.DNSStatus != "waiting" || value.LastError != err.Error() {
 		_, _ = a.db.db.Exec("UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=1 AND desired_node_id=? AND schedule_revision=?", err.Error(), now.UnixMilli(), value.SiteID, value.DesiredNodeID, value.ScheduleRevision)
+		// A site the node cannot serve must not stay published on it. Marking the
+		// schedule "waiting" only says the Controller is not ready to switch; the
+		// records already published keep pointing clients at that node, so a node
+		// that stopped serving the site would answer every request with 421 while
+		// the panel looked healthy. Withdrawing them puts clients back on the
+		// Controller through the zone's own routing until the node recovers.
+		// Tracking rows are kept, so the records come back once it is ready.
+		a.withdrawSiteDNSWhileWaiting(ctx, value, now)
 	}
+}
+
+// withdrawSiteDNSWhileWaiting removes the records published for a schedule that
+// cannot currently be served, without forgetting them: the rows stay so the next
+// successful reconcile republishes the same set.
+//
+// Best effort by design. A failure here leaves the previous state, which is the
+// state the operator already had, and the next tick retries.
+func (a *App) withdrawSiteDNSWhileWaiting(ctx context.Context, value SiteNodeSchedule, now time.Time) {
+	if a == nil || a.db == nil || value.SiteID <= 0 {
+		return
+	}
+	current, err := a.db.siteNodeSchedule(value.SiteID)
+	if err != nil {
+		return
+	}
+	// Only withdraw what is actually published, and only while the schedule is
+	// still the generation that failed.
+	if current.DNSStatus != "waiting" || current.ScheduleRevision != value.ScheduleRevision {
+		return
+	}
+	records, err := a.db.siteDNSRecords(value.SiteID)
+	if err != nil || (len(records) == 0 && strings.TrimSpace(current.cfRecordID) == "") {
+		return
+	}
+	cf, err := a.cloudflareForScheduling()
+	if err != nil {
+		log.Printf("[node-scheduler] site %d: cannot withdraw DNS while waiting: %v", value.SiteID, err)
+		return
+	}
+	if err := deleteTrackedSiteDNSFamilyRecords(ctx, cf, current, records); err != nil {
+		log.Printf("[node-scheduler] site %d: withdrawing DNS while waiting failed: %v", value.SiteID, err)
+		return
+	}
+	if id := strings.TrimSpace(current.cfRecordID); id != "" {
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, current); err != nil {
+			log.Printf("[node-scheduler] site %d: withdrawing the mirrored record while waiting failed: %v", value.SiteID, err)
+			return
+		}
+	}
+	_, _ = a.db.db.Exec(
+		"UPDATE site_node_schedules SET cf_record_id='',cf_record_type='',applied_address='' WHERE site_id=? AND dns_status='waiting' AND schedule_revision=?",
+		value.SiteID, value.ScheduleRevision)
+	log.Printf("[node-scheduler] site %d: withdrew %d published record(s) because the node cannot serve it", value.SiteID, len(records))
 }
 
 // recordSiteNodeProbeFailureForJob records the health-check cooldown only when
