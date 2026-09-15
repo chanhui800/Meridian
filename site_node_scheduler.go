@@ -2719,7 +2719,12 @@ func probeScheduledNodeAddresses(ctx context.Context, node ControlNode, host str
 	}
 	for _, target := range targets {
 		if err := probeNodeAddress(ctx, node, host, probeSecret, nil, target.address); err != nil {
-			return fmt.Errorf("%s (%s): %w", dnsRecordType(target.family), target.family, err)
+			// Name the family and the address in the message the panel shows:
+			// "AAAA (IPv6) 2001:db8::1: ..." tells the operator which record was
+			// refused, which matters most for the IPv6 half of a dual-stack node
+			// (a host with net.ipv6.bindv6only=1 accepts no IPv4 connection, so
+			// its A record must not be published either).
+			return fmt.Errorf("%s (%s) %s: %w", dnsRecordType(target.family), dnsFamilyLabel(target.family), target.address, err)
 		}
 	}
 	return nil

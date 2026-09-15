@@ -263,6 +263,48 @@ func TestMergeAdoptedNodeAddressesNeverOverwritesOperatorValues(t *testing.T) {
 	}
 }
 
+// A failed probe must name the record family and the address it refused to
+// publish, because the operator reads this in the panel: "AAAA (IPv6) <addr>"
+// says which half of a dual-stack node is unreachable.
+func TestProbeFailureNamesTheRefusedFamily(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now()
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "unreachable", Address: "127.0.0.1", AddressV6: "2001:db8::1",
+		Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := newNodeProbeSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedSecret, err := decodeNodeProbeSecret(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Loopback refuses immediately, so the probe fails without waiting out a
+	// five-second dial timeout. The address is still a real IPv6 literal, which is
+	// what nodeDialAddress requires.
+	closed.Port = 1
+	targets := []probeTarget{{family: "v6", address: "::1"}}
+	probeErr := probeScheduledNodeAddresses(context.Background(), closed, "dual.example.test", decodedSecret, targets)
+	if probeErr == nil {
+		t.Fatal("probing an unreachable address must fail")
+	}
+	message := probeErr.Error()
+	for _, needle := range []string{"AAAA", "IPv6", "::1"} {
+		if !strings.Contains(message, needle) {
+			t.Fatalf("probe error %q must name %q so the panel can say which record was refused", message, needle)
+		}
+	}
+}
+
 // --- cloudflare publishing -------------------------------------------------
 
 // fakeCloudflare is a same-name A/AAAA record store that enough of the

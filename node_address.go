@@ -167,6 +167,15 @@ func dnsRecordType(family string) string {
 	return "A"
 }
 
+// dnsFamilyLabel names a family for operator-facing messages, so a failed probe
+// says which record it refused to publish.
+func dnsFamilyLabel(family string) string {
+	if family == "v6" {
+		return "IPv6"
+	}
+	return "IPv4"
+}
+
 // dnsFamilyForRecordType is the inverse of dnsRecordType, used when adopting or
 // matching a record that already exists remotely.
 func dnsFamilyForRecordType(recordType string) string {
