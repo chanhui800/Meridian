@@ -1719,6 +1719,16 @@ func classifyOwnedAddressRecords(records []cloudflareAddressRecord, name string,
 	return owned, ownedCount == 1, unownedCount, ownedCount > 1
 }
 
+func addressRecordsOfType(records []cloudflareAddressRecord, recordType string) []cloudflareAddressRecord {
+	result := make([]cloudflareAddressRecord, 0, len(records))
+	for _, record := range records {
+		if strings.EqualFold(strings.TrimSpace(record.Type), recordType) {
+			result = append(result, record)
+		}
+	}
+	return result
+}
+
 func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedule) error {
 	unlockSite := a.lockSiteSchedule(schedule.SiteID)
 	defer unlockSite()
@@ -1734,6 +1744,9 @@ func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeS
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
 			return err
 		}
+	}
+	if err := a.deleteAdditionalSiteDNS(ctx, schedule.SiteID); err != nil {
+		return err
 	}
 	return a.finalizeDisabledSiteNodeSchedule(schedule)
 }
@@ -1751,6 +1764,9 @@ func (a *App) deleteTrackedSiteDNSForSiteDisable(ctx context.Context, schedule S
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, schedule); err != nil {
 			return err
 		}
+	}
+	if err := a.deleteAdditionalSiteDNS(ctx, schedule.SiteID); err != nil {
+		return err
 	}
 	return a.finalizeDisabledSiteNodeRuntime(schedule, now)
 }
@@ -2085,6 +2101,150 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 	return a.reconcileOneSiteScheduleLocked(ctx, schedule, now)
 }
 
+type nodeDNSAddress struct{ family, recordType, address string }
+
+func desiredNodeDNSAddresses(node ControlNode) ([]nodeDNSAddress, error) {
+	v4, v6 := strings.TrimSpace(node.AddressV4), strings.TrimSpace(node.AddressV6)
+	if ip := net.ParseIP(strings.TrimSpace(node.Address)); ip != nil {
+		if ip.To4() != nil && v4 == "" {
+			v4 = ip.To4().String()
+		}
+		if ip.To4() == nil && v6 == "" {
+			v6 = ip.String()
+		}
+	}
+	mode := strings.ToLower(strings.TrimSpace(node.DNSPublish))
+	if mode == "" {
+		mode = "auto"
+	}
+	result := make([]nodeDNSAddress, 0, 2)
+	if mode != "v6" && v4 != "" {
+		ip := net.ParseIP(v4)
+		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			return nil, errors.New("node IPv4 address is not publicly routable")
+		}
+		result = append(result, nodeDNSAddress{"v4", "A", v4})
+	}
+	if mode != "v4" && v6 != "" {
+		ip := net.ParseIP(v6)
+		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			return nil, errors.New("node IPv6 address is not publicly routable")
+		}
+		result = append(result, nodeDNSAddress{"v6", "AAAA", v6})
+	}
+	if len(result) == 0 {
+		return nil, errors.New("node has no address for the selected DNS family")
+	}
+	return result, nil
+}
+
+func (a *App) syncAdditionalSiteDNS(ctx context.Context, schedule SiteNodeSchedule, zoneID string, desired []nodeDNSAddress, now time.Time) error {
+	if len(desired) < 2 {
+		return a.deleteAdditionalSiteDNSExcept(ctx, schedule.SiteID, desired[0].family)
+	}
+	secondary := desired[1]
+	cf, err := a.cloudflareForScheduling()
+	if err != nil {
+		return err
+	}
+	var oldZone, oldID, oldType, oldAddress string
+	err = a.db.db.QueryRow(`SELECT zone_id,record_id,record_type,address FROM site_node_dns_records WHERE site_id=? AND family=?`, schedule.SiteID, secondary.family).Scan(&oldZone, &oldID, &oldType, &oldAddress)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	marker := siteDNSOwnershipMarker(schedule.SiteID, a.db.installUUID)
+	if oldID != "" {
+		tracked := schedule
+		tracked.cfZoneID, tracked.cfRecordID, tracked.cfRecordType = oldZone, oldID, oldType
+		if _, readErr, owned := readOwnedTrackedSiteDNSRecord(ctx, cf, tracked); readErr != nil {
+			return readErr
+		} else if !owned {
+			oldID = ""
+		}
+	}
+	if oldID == "" {
+		records, listErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
+		if listErr != nil {
+			return listErr
+		}
+		owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, secondary.recordType), schedule.PublicHost, func(comment string) bool { return siteDNSMarkerOwned(comment, schedule.SiteID, a.db.installUUID) })
+		if ambiguous {
+			return errors.New("multiple Meridian DNS records match this address family; manual cleanup required")
+		}
+		if unowned > 0 {
+			return fmt.Errorf("an untracked exact %s record already exists; Meridian will not overwrite it", secondary.recordType)
+		}
+		if ok {
+			oldID = owned.ID
+		}
+	}
+	recordID, err := cf.writeAddressRecord(ctx, zoneID, oldID, secondary.recordType, schedule.PublicHost, secondary.address, marker)
+	if err != nil {
+		return err
+	}
+	_, err = a.db.db.Exec(`INSERT INTO site_node_dns_records(site_id,family,zone_id,record_id,record_type,address,updated_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id,family) DO UPDATE SET zone_id=excluded.zone_id,record_id=excluded.record_id,record_type=excluded.record_type,address=excluded.address,updated_at_ms=excluded.updated_at_ms`, schedule.SiteID, secondary.family, zoneID, recordID, secondary.recordType, secondary.address, now.UnixMilli())
+	return err
+}
+
+func (a *App) deleteAdditionalSiteDNSExcept(ctx context.Context, siteID int64, keepFamily string) error {
+	var zoneID, recordID, recordType string
+	err := a.db.db.QueryRow(`SELECT zone_id,record_id,record_type FROM site_node_dns_records WHERE site_id=? AND family<>? LIMIT 1`, siteID, keepFamily).Scan(&zoneID, &recordID, &recordType)
+	if errors.Is(err, sql.ErrNoRows) {
+		// A record promoted from the per-family ledger to the compatibility
+		// columns must no longer be tracked twice, but stays live remotely.
+		_, err = a.db.db.Exec(`DELETE FROM site_node_dns_records WHERE site_id=? AND family=?`, siteID, keepFamily)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	cf, err := a.cloudflareForScheduling()
+	if err != nil {
+		return err
+	}
+	tracked := SiteNodeSchedule{SiteID: siteID, cfZoneID: zoneID, cfRecordID: recordID, cfRecordType: recordType}
+	if err := deleteTrackedSiteDNSRemote(ctx, cf, tracked); err != nil {
+		return err
+	}
+	_, err = a.db.db.Exec(`DELETE FROM site_node_dns_records WHERE site_id=? AND family<>?`, siteID, keepFamily)
+	return err
+}
+
+func (a *App) deleteAdditionalSiteDNS(ctx context.Context, siteID int64) error {
+	rows, err := a.db.db.Query(`SELECT family,zone_id,record_id,record_type FROM site_node_dns_records WHERE site_id=?`, siteID)
+	if err != nil {
+		return err
+	}
+	type tracked struct{ family, zone, id, typ string }
+	var values []tracked
+	for rows.Next() {
+		var v tracked
+		if err := rows.Scan(&v.family, &v.zone, &v.id, &v.typ); err != nil {
+			rows.Close()
+			return err
+		}
+		values = append(values, v)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	cf, err := a.cloudflareForScheduling()
+	if err != nil {
+		return err
+	}
+	for _, v := range values {
+		s := SiteNodeSchedule{SiteID: siteID, cfZoneID: v.zone, cfRecordID: v.id, cfRecordType: v.typ}
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, s); err != nil {
+			return err
+		}
+	}
+	_, err = a.db.db.Exec(`DELETE FROM site_node_dns_records WHERE site_id=?`, siteID)
+	return err
+}
+
 func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
 	if !schedule.Enabled {
 		return nil
@@ -2115,6 +2275,10 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	if !siteScheduleConfigReady(schedule, node) {
 		return readinessError(readinessConfig, errors.New("Agent has not applied the site configuration"))
 	}
+	desiredAddresses, err := desiredNodeDNSAddresses(node)
+	if err != nil {
+		return readinessError(readinessProbe, err)
+	}
 	if a.panelCertificates == nil {
 		return readinessError(readinessCertificate, errors.New("edge TLS certificate is unavailable"))
 	}
@@ -2133,12 +2297,17 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	if err != nil {
 		return readinessError(readinessProbe, errors.New("node health probe secret is invalid"))
 	}
-	if err := probeScheduledNode(ctx, node, schedule.PublicHost, probeSecret); err != nil {
-		return readinessError(readinessProbe, fmt.Errorf("entry health check: %w", err))
+	for _, candidate := range desiredAddresses {
+		probeNode := node
+		probeNode.Address = candidate.address
+		if err := probeScheduledNode(ctx, probeNode, schedule.PublicHost, probeSecret); err != nil {
+			return readinessError(readinessProbe, fmt.Errorf("%s entry health check: %w", candidate.recordType, err))
+		}
 	}
 	if err := a.db.clearSiteNodeProbeFailure(schedule.SiteID, node.ID); err != nil {
 		return fmt.Errorf("clear entry health cooldown: %w", err)
 	}
+	node.Address = desiredAddresses[0].address
 	ip := net.ParseIP(strings.TrimSpace(node.Address))
 	if ip == nil {
 		return errors.New("node address must be an IP address for DNS scheduling")
@@ -2200,7 +2369,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 			return err
 		}
 		if len(records) > 0 {
-			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, isOwnedComment)
+			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, recordType), schedule.PublicHost, isOwnedComment)
 			if ambiguous {
 				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
 			}
@@ -2235,7 +2404,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 		// record even when the response was lost. Re-read exact records and
 		// adopt only a uniquely matching Meridian marker.
 		if records, getErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost); getErr == nil {
-			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, isOwnedComment)
+			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, recordType), schedule.PublicHost, isOwnedComment)
 			if ambiguous {
 				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
 			} else if unowned > 0 {
@@ -2259,7 +2428,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 			var records []cloudflareAddressRecord
 			records, err = cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
 			if err == nil && len(records) > 0 {
-				owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(records, schedule.PublicHost, isOwnedComment)
+				owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, recordType), schedule.PublicHost, isOwnedComment)
 				switch {
 				case ambiguous:
 					err = errors.New("multiple Meridian DNS records match this site; manual cleanup required")
@@ -2351,7 +2520,7 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	if err = tx.Commit(); err != nil {
 		return cleanupTransaction(err)
 	}
-	return nil
+	return a.syncAdditionalSiteDNS(ctx, schedule, zoneID, desiredAddresses, now)
 }
 
 // upsertSiteNodeDrainTx starts a fresh lifecycle whenever a site returns to a
@@ -2668,6 +2837,10 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 			return err
 		}
 	}
+	if err := a.deleteAdditionalSiteDNS(ctx, siteID); err != nil {
+		_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), siteID)
+		return err
+	}
 	// Keep the child row as the durable deletion handle until DeleteSite's
 	// database transaction commits. This avoids the partial-commit window where
 	// Cloudflare has been cleaned but a later site-row deletion fails.
@@ -2758,6 +2931,12 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 		if err := deleteTrackedSiteDNSRemote(ctx, cf, value); err != nil {
 			// Keep every row disabled and retain tracked IDs so a later delete
 			// request can resume the remote phase idempotently.
+			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), value.SiteID)
+			return err
+		}
+	}
+	for _, value := range affected {
+		if err := a.deleteAdditionalSiteDNS(ctx, value.SiteID); err != nil {
 			_, _ = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=?`, err.Error(), time.Now().UnixMilli(), value.SiteID)
 			return err
 		}

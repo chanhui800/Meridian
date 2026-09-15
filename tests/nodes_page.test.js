@@ -79,8 +79,8 @@ test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {
   assert.match(page, /跟随全局调度/);
   assert.match(page, /固定节点/);
   assert.match(page, /创建或更新精确 DNS 记录/);
-  assert.match(page, /未启用节点调度，继续使用原面板入口/);
-  assert.match(page, /原面板模式 · 节点调度未启用/);
+  assert.match(page, /未启用节点调度，继续使用主控入口/);
+  assert.match(page, /主控模式 · 节点调度未启用/);
   assert.match(page, /syncSiteScheduleRow/);
   assert.match(page, /refreshSiteScheduleRowState/);
   assert.match(page, /getElementById\('node-site-list'\)\.oninput = handleSiteScheduleAction/);
@@ -166,7 +166,7 @@ test('unsaved schedule draft does not change persisted status label', () => {
   vm.runInContext(page, sandbox);
   vm.runInContext(`nodesSnapshot = { nodes: [] }; siteSchedulesSnapshot = { sites: [{ site_id: 7, site_name: 'site', public_host: 'site.example', enabled: false, mode: 'global', fixed_node_id: 0, desired_node_id: 0, applied_node_id: 0, dns_status: 'disabled', last_error: '' }] }; siteScheduleDrafts = new Map([[7, { enabled: true, mode: 'global', fixed_node_id: 0 }]]);`, sandbox);
   sandbox.renderSiteSchedules();
-  assert.match(container.innerHTML, /使用面板入口 · 待保存/);
+  assert.match(container.innerHTML, /使用主控入口 · 待保存/);
   assert.doesNotMatch(container.innerHTML, /调度已启用 · 待保存/);
-  assert.match(container.innerHTML, /原面板模式 · 节点调度未启用/);
+  assert.match(container.innerHTML, /主控模式 · 节点调度未启用/);
 });

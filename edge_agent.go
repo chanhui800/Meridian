@@ -2425,7 +2425,63 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	if err != nil {
 		return NodeReport{}, err
 	}
-	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
+	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion, NetAddresses: edgeCollectNetAddresses(interfaceName)}, nil
+}
+
+func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	result := make([]NodeNetAddress, 0, 8)
+	seen := map[string]bool{}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		name := strings.ToLower(iface.Name)
+		if strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "virbr") || strings.HasPrefix(name, "tun") || strings.HasPrefix(name, "tap") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, raw := range addrs {
+			text := strings.TrimSpace(raw.String())
+			if slash := strings.IndexByte(text, '/'); slash >= 0 {
+				text = text[:slash]
+			}
+			ip := net.ParseIP(text)
+			if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+				continue
+			}
+			family := "v6"
+			normalized := ip.String()
+			if ip.To4() != nil {
+				family = "v4"
+				normalized = ip.To4().String()
+			}
+			key := family + ":" + normalized
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			result = append(result, NodeNetAddress{Family: family, Address: normalized, Interface: iface.Name})
+			if len(result) >= 16 {
+				return result
+			}
+		}
+	}
+	// Keep the interface used for counters first, which improves adoption
+	// determinism when multiple public addresses are present.
+	for i := range result {
+		if result[i].Interface == preferred {
+			result[0], result[i] = result[i], result[0]
+			break
+		}
+	}
+	return result
 }
 
 func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, _ int64, runtime *edgeAgentRuntime) error {

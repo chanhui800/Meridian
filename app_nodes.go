@@ -177,6 +177,9 @@ func agentBinaryIdentityForPlatform(platform string) (string, string, error) {
 type nodeAPIInput struct {
 	Name                     string `json:"name"`
 	Address                  string `json:"address"`
+	AddressV4                string `json:"address_v4"`
+	AddressV6                string `json:"address_v6"`
+	DNSPublish               string `json:"dns_publish"`
 	Port                     int    `json:"port"`
 	HTTPSPort                int    `json:"https_port"` // Deprecated compatibility for cached pre-single-port pages.
 	Enabled                  *bool  `json:"enabled"`
@@ -194,7 +197,7 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 		port = input.HTTPSPort
 	}
 	return NodeCreateInput{
-		Name: input.Name, Address: input.Address, Port: port, Priority: input.Priority,
+		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, Port: port, Priority: input.Priority,
 		TrafficQuota: input.TrafficQuota, BillingMode: input.BillingMode, ResetDay: input.ResetDay,
 		TrafficManualOffsetBytes: input.TrafficManualOffsetBytes,
 	}

@@ -382,6 +382,11 @@ func (d *DB) migrateOnce() error {
 		name TEXT NOT NULL COLLATE NOCASE UNIQUE,
 		address TEXT NOT NULL DEFAULT '',
 		address_source TEXT NOT NULL DEFAULT 'manual',
+		address_v4 TEXT NOT NULL DEFAULT '',
+		address_v6 TEXT NOT NULL DEFAULT '',
+		address_v6_source TEXT NOT NULL DEFAULT '',
+		dns_publish TEXT NOT NULL DEFAULT 'auto' CHECK(dns_publish IN ('auto','v4','v6')),
+		reported_net_addresses TEXT NOT NULL DEFAULT '[]',
 		entry_mode TEXT NOT NULL DEFAULT 'direct' CHECK(entry_mode IN ('direct','shared')),
 		http_port INTEGER NOT NULL DEFAULT 0,
 		https_port INTEGER NOT NULL DEFAULT 443,
@@ -460,6 +465,16 @@ func (d *DB) migrateOnce() error {
 		updated_at_ms INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_schedules_desired ON site_node_schedules(desired_node_id,enabled);
+	CREATE TABLE IF NOT EXISTS site_node_dns_records (
+		site_id INTEGER NOT NULL,
+		family TEXT NOT NULL CHECK(family IN ('v4','v6')),
+		zone_id TEXT NOT NULL DEFAULT '',
+		record_id TEXT NOT NULL DEFAULT '',
+		record_type TEXT NOT NULL DEFAULT '',
+		address TEXT NOT NULL DEFAULT '',
+		updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(site_id,family)
+	);
 	CREATE TABLE IF NOT EXISTS site_node_probe_failures (
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
@@ -560,6 +575,11 @@ func (d *DB) migrateOnce() error {
 		{"agent_apply_failures", "ALTER TABLE control_nodes ADD COLUMN agent_apply_failures BIGINT NOT NULL DEFAULT 0"},
 		{"agent_listener_error", "ALTER TABLE control_nodes ADD COLUMN agent_listener_error TEXT NOT NULL DEFAULT ''"},
 		{"agent_lease_expires_at_ms", "ALTER TABLE control_nodes ADD COLUMN agent_lease_expires_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"address_v4", "ALTER TABLE control_nodes ADD COLUMN address_v4 TEXT NOT NULL DEFAULT ''"},
+		{"address_v6", "ALTER TABLE control_nodes ADD COLUMN address_v6 TEXT NOT NULL DEFAULT ''"},
+		{"address_v6_source", "ALTER TABLE control_nodes ADD COLUMN address_v6_source TEXT NOT NULL DEFAULT ''"},
+		{"dns_publish", "ALTER TABLE control_nodes ADD COLUMN dns_publish TEXT NOT NULL DEFAULT 'auto'"},
+		{"reported_net_addresses", "ALTER TABLE control_nodes ADD COLUMN reported_net_addresses TEXT NOT NULL DEFAULT '[]'"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('control_nodes') WHERE name=?", migration.column).Scan(&found); err != nil {
