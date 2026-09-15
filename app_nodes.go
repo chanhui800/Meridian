@@ -462,6 +462,16 @@ func (a *App) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusConflict, "legacy Agent must send X-Meridian-Agent-Platform; reinstall it to enable updates")
 		return
 	}
+	// Development/test images serve the architecture-matched binary bundled in
+	// the image. There is no GitHub Release for a prerelease build, so do not
+	// attempt the release manifest lookup below.
+	if !validAgentReleaseVersion(strings.TrimSpace(appVersion)) {
+		if executable, pathErr := configuredAgentBinaryPathForPlatform(platform); pathErr == nil && serveAgentBinaryFile(w, executable, platform) {
+			return
+		}
+		a.jsonErr(w, http.StatusServiceUnavailable, "agent binary unavailable")
+		return
+	}
 	// Resolve the immutable Release checksum before considering any local
 	// legacy bundle. Standalone v1.9.29 Controllers may still have stale
 	// platform binaries on disk; serving one would make an old Agent download

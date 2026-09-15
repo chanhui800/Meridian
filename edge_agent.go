@@ -2616,12 +2616,16 @@ func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token
 		return assetErr
 	}
 	if err := validateAgentReleaseDownloadURL(downloadURL, strings.TrimSpace(config.AgentVersion), asset); err != nil {
-		return err
+		if !strings.HasPrefix(downloadURL, strings.TrimRight(controller, "/")+"/api/agent/binary") {
+			return err
+		}
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return err
 	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set(agentPlatformHeader, platform)
 	releaseClient := *client
 	releaseClient.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
 		if req.URL.Scheme != "https" {
@@ -2712,10 +2716,12 @@ func edgeFetchAgentManifest(ctx context.Context, client *http.Client, controller
 	if err != nil {
 		return AgentBinaryManifest{}, err
 	}
-	if !strings.EqualFold(manifest.Platform, goruntime.GOOS+"/"+goruntime.GOARCH) || !validAgentReleaseVersion(manifest.Version) || len(manifest.SHA256) != sha256.Size*2 {
+	if !strings.EqualFold(manifest.Platform, goruntime.GOOS+"/"+goruntime.GOARCH) || len(manifest.SHA256) != sha256.Size*2 {
 		return AgentBinaryManifest{}, errors.New("controller returned an invalid Agent release manifest")
 	}
-	if err := validateAgentReleaseDownloadURL(manifest.DownloadURL, manifest.Version, asset); err != nil {
+	if strings.HasPrefix(manifest.DownloadURL, "/") {
+		manifest.DownloadURL = strings.TrimRight(controller, "/") + manifest.DownloadURL
+	} else if err := validateAgentReleaseDownloadURL(manifest.DownloadURL, manifest.Version, asset); err != nil {
 		return AgentBinaryManifest{}, err
 	}
 	return manifest, nil

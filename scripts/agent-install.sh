@@ -228,6 +228,7 @@ if [ "$served_platform" != "$agent_platform" ]; then
 fi
 download_url=$(awk 'tolower($1) == "x-meridian-agent-download-url:" {sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); print; exit}' "$manifest_headers_tmp")
 case "$download_url" in
+  /api/agent/binary) download_url="$controller_url$download_url" ;;
   https://github.com/chanhui800/Meridian/releases/download/*/meridian-agent-linux-amd64|https://github.com/chanhui800/Meridian/releases/download/*/meridian-agent-linux-arm64) ;;
   *) echo 'Agent release manifest returned an invalid download URL.' >&2; exit 1 ;;
 esac
@@ -237,6 +238,8 @@ if ! printf '%s' "$expected_sha" | grep -Eq '^[[:xdigit:]]{64}$'; then
   exit 1
 fi
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL -D "$headers_tmp" \
+  -H "Authorization: Bearer $enrollment_token" \
+  -H "X-Meridian-Agent-Platform: $agent_platform" \
   "$download_url" -o "$binary_tmp"
 served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
 if [ -n "$served_platform" ] && [ "$served_platform" != "$agent_platform" ]; then
