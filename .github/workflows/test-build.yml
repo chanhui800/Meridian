@@ -1,0 +1,98 @@
+name: Test build
+
+# Builds a pre-release image for the operator to exercise on the test
+# deployment. This is deliberately separate from release.yml: a test build never
+# creates a GitHub Release, never moves the `latest` tag, and never publishes the
+# agent binaries the Controller hands out for self-update. Promotion to a real
+# release stays exactly where it was — a stable vX.Y.Z tag on main through
+# release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '预发布标签（例如 v1.11.0-pre.1）'
+        required: true
+        type: string
+
+concurrency:
+  group: meridian-test-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/meridian
+      TEST_TAG: ${{ inputs.tag }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate the pre-release tag
+        run: |
+          set -euo pipefail
+          # A test build must be recognisable as one, so a stable release tag can
+          # never be produced here by accident.
+          if ! [[ "$TEST_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pre\.[1-9][0-9]*$ ]]; then
+            echo "Test build tags must look like vX.Y.Z-pre.N, got '$TEST_TAG'." >&2
+            exit 1
+          fi
+          if bash scripts/release-policy.sh is-valid "$TEST_TAG"; then
+            echo "Refusing to build a stable release tag through the test-build path." >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify the tree before building an image
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test -count=1 ./...
+
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an existing test image tag
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE_NAME:$TEST_TAG" >/dev/null 2>&1; then
+            echo "Container tag $IMAGE_NAME:$TEST_TAG already exists and is immutable." >&2
+            exit 1
+          fi
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ env.TEST_TAG }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.TEST_TAG }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Confirm the published image carries the test tag
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "$IMAGE_NAME:$TEST_TAG" >/dev/null
+          echo "Published $IMAGE_NAME:$TEST_TAG (no release, no latest tag)."
