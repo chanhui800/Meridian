@@ -125,6 +125,27 @@ func decodeNodeNetAddressHints(value string) []NodeNetAddress {
 	return hints
 }
 
+// nodeEdgeProbeHost returns the per-node edge hostname, whose certificate the
+// node serves as soon as it is enrolled. It is the probe identity for a node that
+// has no scheduled site yet, and it needs no DNS record: the probe dials the
+// literal address and uses this name only for SNI and certificate verification.
+func (a *App) nodeEdgeProbeHost(node ControlNode) (string, error) {
+	if strings.TrimSpace(node.GUID) == "" {
+		return "", nil
+	}
+	settings, err := a.db.PanelSettings()
+	if err != nil {
+		return "", err
+	}
+	routeDomain := strings.TrimSpace(settings.RouteDomain)
+	if routeDomain == "" {
+		// Without a configured route domain there is no per-node certificate, so
+		// adoption has to wait for a scheduled site.
+		return "", nil
+	}
+	return edgeCertificateHost(routeDomain, node.GUID), nil
+}
+
 // adoptProbedNodeAddressesForScheduler walks every enrolled node that reported
 // address hints and tries to adopt a verified one. A per-node failure is logged
 // by the caller and never stops the other nodes.
@@ -174,6 +195,30 @@ func (a *App) adoptProbedNodeAddresses(ctx context.Context, node ControlNode, no
 	if node.NetAddressAdoptionAttemptAtMS > 0 && now.Sub(time.UnixMilli(node.NetAddressAdoptionAttemptAtMS)) < nodeNetAddressAdoptionInterval {
 		return node, nil
 	}
+	// The probe needs a hostname whose certificate this node serves. A scheduled
+	// site's public host works, but requiring one created a chicken-and-egg
+	// problem: a freshly enrolled dual-stack node has no site yet, so the Agent's
+	// reported IPv4 could never be adopted and the node published only the family
+	// it happened to enrol over. Every node gets its own edge certificate as soon
+	// as it is enrolled, and that certificate carries the per-node edge host, so
+	// that host is the fallback and adoption works with nothing scheduled.
+	host, ok, err := a.scheduledPublicHostForNode(node.ID)
+	if err != nil {
+		return node, err
+	}
+	if !ok {
+		host, err = a.nodeEdgeProbeHost(node)
+		if err != nil {
+			return node, err
+		}
+	}
+	if host == "" {
+		// Nothing can vouch for a candidate address yet, so no probe is attempted
+		// and the attempt clock is deliberately NOT consumed: once a site is
+		// scheduled (or a route domain is configured) adoption should run at once
+		// rather than wait out an interval for a probe that never happened.
+		return node, nil
+	}
 	if err := a.db.markNodeAddressAdoptionAttempt(node.ID, now); err != nil {
 		return node, err
 	}
@@ -183,14 +228,6 @@ func (a *App) adoptProbedNodeAddresses(ctx context.Context, node ControlNode, no
 	}
 	probeSecret, err := decodeNodeProbeSecret(probeSecretText)
 	if err != nil {
-		return node, err
-	}
-	// Reuse the scheduling identity for the probe so the check exercises exactly
-	// the path a scheduled site would take. The public host of a scheduled site
-	// is what the certificate covers; without one there is nothing to publish
-	// for, so this step waits until the node is scheduled.
-	host, ok, err := a.scheduledPublicHostForNode(node.ID)
-	if err != nil || !ok {
 		return node, err
 	}
 	updateV4, updateV6 := "", ""
@@ -276,13 +313,17 @@ func mergeAdoptedNodeAddresses(node ControlNode, addressV4, addressV6, sourceV6 
 	return result
 }
 
-// scheduledPublicHostForNode returns the public host of any site currently
-// scheduled on this node. The probe needs a hostname whose certificate the node
-// serves; a node with no scheduled site has nothing to publish for yet.
+// scheduledPublicHostForNode returns the public host of a site currently
+// scheduled on this node. The probe prefers a hostname whose certificate the node
+// serves; a node with no scheduled site falls back to its own edge host.
 func (a *App) scheduledPublicHostForNode(nodeID int64) (string, bool, error) {
 	var host string
-	err := a.db.db.QueryRow(`SELECT public_host FROM site_node_schedules
-		WHERE applied_node_id=? AND enabled=1 AND TRIM(public_host)<>'' ORDER BY site_id LIMIT 1`, nodeID).Scan(&host)
+	// public_host lives on sites, not on site_node_schedules: the schedule table
+	// only records which node the site is assigned to.
+	err := a.db.db.QueryRow(`SELECT s.public_host FROM site_node_schedules n
+		JOIN sites s ON s.id = n.site_id
+		WHERE n.applied_node_id=? AND n.enabled=1 AND TRIM(COALESCE(s.public_host,''))<>''
+		ORDER BY n.site_id LIMIT 1`, nodeID).Scan(&host)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil

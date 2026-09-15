@@ -1206,9 +1206,38 @@ func (d *DB) EnrollControlNodeFromSource(token string, now time.Time, sourceIP s
 	}
 	if inferred, ok := enrollSourceAddressAnswer(sourceIP); ok {
 		// Only fills a blank: an operator-entered address is never overwritten.
-		if _, err := tx.Exec(`UPDATE control_nodes SET address=?,address_source=? WHERE id=? AND TRIM(address)=''`,
-			inferred, nodeAddressSourceEnrollment, id); err != nil {
+		var pinned string
+		if err := tx.QueryRow("SELECT dns_publish FROM control_nodes WHERE id=?", id).Scan(&pinned); err != nil {
 			return ControlNode{}, "", err
+		}
+		// The observer saw exactly one address, and it can only be filed under its
+		// own family. When the operator pinned the other family, nothing is written
+		// here: the Agent's reported candidates fill both slots by probe a few
+		// minutes later, which is the path that can honour the pin. Writing it into
+		// the pinned slot regardless would put an IPv6 address in the IPv4 field.
+		mode := normalizeNodeDNSPublish(pinned)
+		family := nodeAddressFamily(inferred)
+		writeIt := mode == nodeDNSPublishAuto ||
+			(mode == nodeDNSPublishV4 && family == "v4") ||
+			(mode == nodeDNSPublishV6 && family == "v6")
+		if writeIt {
+			if family == "v6" {
+				// The v6 slot has its own provenance column, so the primary
+				// address's provenance is deliberately untouched.
+				if _, err := tx.Exec(`UPDATE control_nodes SET address_v6=?,address_v6_source=?,address=CASE WHEN TRIM(address)='' THEN ? ELSE address END WHERE id=? AND TRIM(COALESCE(address_v6,''))=''`,
+					inferred, nodeAddressSourceEnrollment, inferred, id); err != nil {
+					return ControlNode{}, "", err
+				}
+			} else {
+				// address_source describes the primary address, so it is only marked
+				// as inferred when this call actually filled that blank. An
+				// operator-entered address keeps its 'manual' provenance even though
+				// the v4 slot now mirrors it.
+				if _, err := tx.Exec(`UPDATE control_nodes SET address_v4=?,address=CASE WHEN TRIM(address)='' THEN ? ELSE address END,address_source=CASE WHEN TRIM(address)='' THEN ? ELSE address_source END WHERE id=? AND TRIM(COALESCE(address_v4,''))=''`,
+					inferred, inferred, nodeAddressSourceEnrollment, id); err != nil {
+					return ControlNode{}, "", err
+				}
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

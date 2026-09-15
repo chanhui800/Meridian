@@ -603,6 +603,194 @@ func TestBackupRestoreRoundTripsDualStackState(t *testing.T) {
 	}
 }
 
+// Adoption must not wait for a scheduled site. A freshly enrolled dual-stack node
+// has no site yet, so requiring one meant the Agent's reported IPv4 could never be
+// adopted and the node published only the family it happened to enrol over. The
+// per-node edge certificate exists from enrollment, so it is the probe identity.
+func TestAdoptionProbesWithoutAScheduledSite(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	if _, err := app.db.db.Exec(`UPDATE panel_settings SET route_domain='route.example.test', configured=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	node, enrollmentToken, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "fresh", AddressV6: "::1", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNodeFromSource(enrollmentToken, now.Add(time.Second), ""); err != nil {
+		t.Fatal(err)
+	}
+	// No site is scheduled on this node, which is the whole point.
+	if host, ok, err := app.scheduledPublicHostForNode(node.ID); err != nil || ok {
+		t.Fatalf("fixture expected no scheduled site: host=%q ok=%v err=%v", host, ok, err)
+	}
+	hint := encodeNodeNetAddressHints([]NodeNetAddress{{Family: "v6", Address: "2001:db8::1"}})
+	if _, err := app.db.db.Exec(
+		`UPDATE control_nodes SET net_address_hints=?,net_address_hints_at_ms=?,address_v6='',address_v6_source='',net_address_adoption_at_ms=0 WHERE id=?`,
+		hint, now.UnixMilli(), node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The edge host is what the probe uses when nothing is scheduled. The
+	// candidate is 2001:db8::1 (documentation space), so the probe itself fails;
+	// what matters is that adoption got as far as probing instead of returning
+	// early for want of a site.
+	edgeHost, err := app.nodeEdgeProbeHost(current)
+	if err != nil {
+		t.Fatalf("nodeEdgeProbeHost: %v", err)
+	}
+	if edgeHost == "" || edgeHost != edgeCertificateHost("route.example.test", node.GUID) {
+		t.Fatalf("edge probe host = %q, want the node's own certificate host", edgeHost)
+	}
+	if _, err := app.adoptProbedNodeAddresses(context.Background(), current, now); err != nil {
+		t.Fatalf("adoptProbedNodeAddresses: %v", err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.NetAddressAdoptionAttemptAtMS == 0 {
+		t.Fatal("adoption never ran: with no scheduled site it returned before probing")
+	}
+	if after.AddressV6 != "" {
+		t.Fatalf("an unreachable candidate was adopted: %q", after.AddressV6)
+	}
+}
+
+// With no route domain configured there is no per-node certificate, so adoption
+// must decline rather than probe a host nothing can vouch for. It must also not
+// consume an attempt: no probe happened, so the next tick should be free to run
+// the moment a probe identity exists.
+func TestAdoptionWithoutRouteDomainDeclines(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	if _, err := app.db.db.Exec(`UPDATE panel_settings SET route_domain='' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	node, enrollmentToken, err := app.db.CreateControlNode(NodeCreateInput{
+		Name: "no-route", Address: "203.0.113.10", Priority: 100, BillingMode: "outbound", ResetDay: 1,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNodeFromSource(enrollmentToken, now.Add(time.Second), ""); err != nil {
+		t.Fatal(err)
+	}
+	host, err := app.nodeEdgeProbeHost(node)
+	if err != nil {
+		t.Fatalf("nodeEdgeProbeHost: %v", err)
+	}
+	if host != "" {
+		t.Fatalf("edge probe host = %q, want none without a route domain", host)
+	}
+	// A fresh hint for the empty family, so adoption has something it would probe
+	// if it had a probe identity.
+	hint := encodeNodeNetAddressHints([]NodeNetAddress{{Family: "v6", Address: "2001:db8::1"}})
+	if _, err := app.db.db.Exec(
+		`UPDATE control_nodes SET net_address_hints=?,net_address_hints_at_ms=?,address_v6='',address_v6_source='',net_address_adoption_at_ms=0 WHERE id=?`,
+		hint, now.UnixMilli(), node.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.adoptProbedNodeAddresses(context.Background(), current, now); err != nil {
+		t.Fatalf("adoptProbedNodeAddresses: %v", err)
+	}
+	after, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.NetAddressAdoptionAttemptAtMS != 0 {
+		t.Fatal("a declined adoption consumed an attempt, delaying the next real probe")
+	}
+	if after.AddressV6 != "" {
+		t.Fatalf("an unverifiable candidate was adopted: %q", after.AddressV6)
+	}
+}
+
+// The enrollment fallback records the address the Controller observed, so it can
+// only ever fill the slot for that address's own family. A pin for the other
+// family must leave the slot to the probe-adoption path instead of writing an
+// IPv6 address into the IPv4 field.
+func TestEnrollHonoursThePinnedFamily(t *testing.T) {
+	cases := []struct {
+		name           string
+		publish        string
+		observed       string
+		wantV4         string
+		wantV6         string
+		wantPrimary    string
+		wantPrimarySrc string
+	}{
+		{
+			name: "auto fills the observed family", publish: nodeDNSPublishAuto, observed: "203.0.113.10",
+			wantV4: "203.0.113.10", wantPrimary: "203.0.113.10", wantPrimarySrc: nodeAddressSourceEnrollment,
+		},
+		{
+			// The v6 slot has its own provenance column, so the primary address's
+			// marker stays 'manual': that blank was never filled by inference.
+			name: "auto fills v6 as the v6 slot", publish: nodeDNSPublishAuto, observed: "2001:db8::7",
+			wantV6: "2001:db8::7", wantPrimary: "2001:db8::7", wantPrimarySrc: nodeAddressSourceManual,
+		},
+		{
+			name: "a v4 pin with an observed v4 fills it", publish: nodeDNSPublishV4, observed: "203.0.113.10",
+			wantV4: "203.0.113.10", wantPrimary: "203.0.113.10", wantPrimarySrc: nodeAddressSourceEnrollment,
+		},
+		{
+			name: "a v6 pin with an observed v6 fills it", publish: nodeDNSPublishV6, observed: "2001:db8::7",
+			wantV6: "2001:db8::7", wantPrimary: "2001:db8::7", wantPrimarySrc: nodeAddressSourceManual,
+		},
+		{
+			// The pin and the observation disagree, so nothing is written and the
+			// probe-adoption path decides later.
+			name: "a v4 pin ignores an observed v6", publish: nodeDNSPublishV4, observed: "2001:db8::7",
+			wantPrimarySrc: nodeAddressSourceManual,
+		},
+		{
+			name: "a v6 pin ignores an observed v4", publish: nodeDNSPublishV6, observed: "203.0.113.10",
+			wantPrimarySrc: nodeAddressSourceManual,
+		},
+	}
+	for _, testCase := range cases {
+		app := newTestApp(t)
+		now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+		node, enrollmentToken, err := app.db.CreateControlNode(NodeCreateInput{
+			Name: "pinned", DNSPublish: testCase.publish, Priority: 100, BillingMode: "outbound", ResetDay: 1,
+		}, now)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.name, err)
+		}
+		enrolled, _, err := app.db.EnrollControlNodeFromSource(enrollmentToken, now.Add(time.Second), testCase.observed)
+		if err != nil {
+			t.Fatalf("%s: enroll: %v", testCase.name, err)
+		}
+		if enrolled.AddressV4 != testCase.wantV4 {
+			t.Fatalf("%s: address_v4 = %q, want %q", testCase.name, enrolled.AddressV4, testCase.wantV4)
+		}
+		if enrolled.AddressV6 != testCase.wantV6 {
+			t.Fatalf("%s: address_v6 = %q, want %q", testCase.name, enrolled.AddressV6, testCase.wantV6)
+		}
+		if enrolled.PrimaryAddress() != testCase.wantPrimary {
+			t.Fatalf("%s: primary = %q, want %q", testCase.name, enrolled.PrimaryAddress(), testCase.wantPrimary)
+		}
+		if enrolled.AddressSource != testCase.wantPrimarySrc {
+			t.Fatalf("%s: address_source = %q, want %q", testCase.name, enrolled.AddressSource, testCase.wantPrimarySrc)
+		}
+		if testCase.wantV6 != "" && enrolled.AddressV6Source != nodeAddressSourceEnrollment {
+			t.Fatalf("%s: address_v6_source = %q, want the inferred marker", testCase.name, enrolled.AddressV6Source)
+		}
+		_ = node
+	}
+}
+
 // --- cloudflare publishing -------------------------------------------------
 
 // fakeCloudflare is a same-name A/AAAA record store that enough of the
