@@ -1388,6 +1388,82 @@ func edgeClientIP(remote string) string {
 	return remote
 }
 
+// edgeRouteDiagnosticsEnabled is opt-in: route decisions only reach the log when
+// an operator is actively diagnosing why a node refuses a site, because the log
+// otherwise carries site host names.
+func edgeRouteDiagnosticsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MERIDIAN_DIAG_ROUTES"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// logAppliedRoutes reports which hosts this Agent is actually serving, so "the
+// Controller published DNS but the node answers site not assigned" can be told
+// apart from a Controller-side mistake without reading the code.
+func logAppliedRoutes(config AgentRuntimeConfig, siteIDs map[string]int64, manager *ProxyManager) {
+	if !edgeRouteDiagnosticsEnabled() {
+		return
+	}
+	hosts := make([]string, 0, len(siteIDs))
+	for host := range siteIDs {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	log.Printf("[diag-routes] applied config revision=%d hash=%s routes=%d listening=%t hosts=%v",
+		config.ConfigRevision, config.ConfigHash, len(config.Routes), len(siteIDs) > 0, hosts)
+	for _, route := range config.Routes {
+		host := strings.ToLower(strings.TrimSpace(route.Host))
+		_, served := siteIDs[host]
+		// The manager keeps its own host index, and the ingress lookup reads that
+		// one. Logging both makes "the config reached the Agent but the site is
+		// unreachable" tell apart a missing route from a site the manager refused
+		// to start.
+		handler, configured, mode := manager.PublicHostRoute(host)
+		log.Printf("[diag-routes] route site=%d host_len=%d served=%t manager_configured=%t mode=%s handler_set=%t",
+			route.SiteID, len(host), served, configured, mode, handler != nil)
+	}
+}
+
+// logRefusedHost reports a request the Agent refused because no site claims that
+// host, which is the failure mode a stale route table produces.
+func logRefusedHost(r *http.Request, siteIDs map[string]int64) {
+	if !edgeRouteDiagnosticsEnabled() {
+		return
+	}
+	requested := requestPublicHost(r.Host)
+	hosts := make([]string, 0, len(siteIDs))
+	for host := range siteIDs {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	// Both sides in full, plus the value the lookup actually returned: a host that
+	// is present as a key but maps to zero is a different bug from a host that is
+	// missing, and the two need telling apart.
+	log.Printf("[diag-routes] refused requested=%q known=%q lookup=%d raw=%q",
+		requested, hosts, siteIDs[requested], r.Host)
+}
+
+// logManagerHosts reports what the proxy manager itself indexes, which is the
+// second gate a request passes: the Agent's own map can accept a host while the
+// manager has no handler installed for it.
+func logManagerHosts(manager *ProxyManager, r *http.Request) {
+	if !edgeRouteDiagnosticsEnabled() || manager == nil {
+		return
+	}
+	manager.mu.RLock()
+	indexed := make([]string, 0, len(manager.publicHosts))
+	for host, id := range manager.publicHosts {
+		indexed = append(indexed, fmt.Sprintf("%s=%d", host, id))
+	}
+	instances := len(manager.proxies)
+	manager.mu.RUnlock()
+	sort.Strings(indexed)
+	log.Printf("[diag-routes] manager refused requested=%q index=%v instances=%d", requestPublicHost(r.Host), indexed, instances)
+}
+
 func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Handler, probeSecret ...[]byte) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The scheduler probes this endpoint before a site has been assigned to
@@ -1406,6 +1482,7 @@ func (runtime *edgeAgentRuntime) observe(siteIDs map[string]int64, next http.Han
 		host := requestPublicHost(r.Host)
 		siteID := siteIDs[host]
 		if siteID == 0 {
+			logRefusedHost(r, siteIDs)
 			http.Error(w, "site not assigned", http.StatusMisdirectedRequest)
 			return
 		}
@@ -1664,15 +1741,28 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 			return
 		}
 		host := requestPublicHost(r.Host)
-		handler, configured := manager.PublicHostHandler(host)
-		if !configured || handler == nil {
+		// The manager reports a host it has indexed separately from whether it has
+		// an instance for it. Both outcomes mean this Agent accepted the host, so
+		// both answer the same way: a host that is indexed without an instance is a
+		// site this Agent was told to serve and currently cannot, which is a
+		// temporary condition (503), not an unknown host (421). Reporting it as
+		// "site not assigned" told an operator their node did not have the site at
+		// all when the index said it did.
+		handler, configured, _ := manager.PublicHostRoute(host)
+		if !configured {
+			logRefusedHost(r, siteIDs)
 			http.Error(w, "site not assigned", http.StatusMisdirectedRequest)
+			return
+		}
+		if handler == nil {
+			http.Error(w, "site unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		ctx := context.WithValue(r.Context(), publicHostIngressContextKey{}, true)
 		handler.ServeHTTP(w, r.WithContext(ctx))
 	})
 	bundle.handler = runtime.observe(siteIDs, router, probeSecret)
+	logAppliedRoutes(config, siteIDs, manager)
 	return bundle, nil
 }
 

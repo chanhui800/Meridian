@@ -558,6 +558,26 @@ func TestWaitingScheduleWithdrawsItsPublishedRecords(t *testing.T) {
 	}
 }
 
+// Withdrawing only helps if the outcome handler actually calls it, so the
+// integration point is pinned too: the call has to follow the statement that
+// marks the schedule waiting, because that state is what it checks.
+func TestWaitingOutcomeWithdrawsPublishedRecords(t *testing.T) {
+	source, err := os.ReadFile("site_node_scheduler.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.ReplaceAll(string(source), "\r\n", "\n")
+	mark := "dns_status='waiting',last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=1 AND desired_node_id=? AND schedule_revision=?"
+	call := "\n\t\ta.withdrawSiteDNSWhileWaiting(ctx, value, now)\n"
+	markAt, callAt := strings.Index(body, mark), strings.Index(body, call)
+	if markAt < 0 || callAt < 0 {
+		t.Fatalf("unexpected outcome handler layout: mark=%d call=%d", markAt, callAt)
+	}
+	if callAt < markAt {
+		t.Fatal("the withdrawal must run after the schedule is marked waiting, which is the state it checks")
+	}
+}
+
 // A site that is already withdrawn must not be withdrawn again on every tick: the
 // decision is gated on the schedule actually being published.
 func TestWaitingWithdrawalIsIdempotent(t *testing.T) {
@@ -582,6 +602,70 @@ func TestWaitingWithdrawalIsIdempotent(t *testing.T) {
 	app.withdrawSiteDNSWhileWaiting(ctx, waiting, now)
 	if len(fake.snapshot()) != 0 {
 		t.Fatalf("unexpected records: %+v", fake.snapshot())
+	}
+}
+
+// A force-stopped site must actually leave the manager, matched by the instance's
+// own site id rather than by whichever map key it happened to sit under. A live
+// dual-stack node got stuck with the reverse: the host stayed indexed while the
+// instance was still installed under a stale key, so an ingress lookup reported
+// the site as configured and handed back no handler. Callers surface that as
+// "site not assigned" for a site the Agent was told to serve, and it never
+// recovers on its own because the Controller has already stopped sending the
+// revocation.
+func TestForceStoppedSiteLeavesTheManager(t *testing.T) {
+	app := newTestApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer upstream.Close()
+
+	port := freePort(t)
+	site, err := app.db.CreateSite("forced-stop", port, upstream.URL, "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CreateSite takes no public host, so the ingress host is set explicitly.
+	host := "forced-stop.example.test"
+	site.PublicHost = host
+	site.IngressMode = ingressModeHost
+	if _, err := app.db.db.Exec("UPDATE sites SET public_host=?, ingress_mode=? WHERE id=?", host, ingressModeHost, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	releasePort(port)
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	if _, configured := app.pm.PublicHostHandler(host); !configured {
+		t.Fatal("the started site's host is not routed")
+	}
+	// Model the state the removal has to survive: the instance installed under a
+	// stale id as well as its real one. Removing by the key it was found under
+	// alone leaves the real entry behind, which is what kept a live node refusing
+	// its site.
+	app.pm.mu.Lock()
+	if inst := app.pm.proxies[site.ID]; inst != nil {
+		app.pm.proxies[site.ID+1000] = inst
+	}
+	app.pm.mu.Unlock()
+
+	app.pm.ForceStopSites(context.Background(), map[int64]struct{}{site.ID: {}})
+
+	app.pm.mu.RLock()
+	instances := len(app.pm.proxies)
+	inst := app.pm.proxies[site.ID]
+	stale := app.pm.proxies[site.ID+1000]
+	app.pm.mu.RUnlock()
+	if instances != 0 || inst != nil || stale != nil {
+		t.Fatalf("force stop left %d instance(s) installed (site present=%t, stale key present=%t), want the revoked site fully removed",
+			instances, inst != nil, stale != nil)
+	}
+	// The host keeps a placeholder on purpose: a stopped site must answer 503
+	// rather than look like a host this process has never heard of.
+	handler, configured := app.pm.PublicHostHandler(host)
+	if !configured {
+		t.Fatal("a stopped site's host lost its placeholder, so it now answers as an unknown host")
+	}
+	if handler != nil {
+		t.Fatal("a stopped site's host still has a live handler")
 	}
 }
 
