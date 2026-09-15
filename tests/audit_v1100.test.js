@@ -252,7 +252,9 @@ function loadTelegramSandbox() {
 test('audit: rendering the telegram settings page clears the loaded guard', () => {
   const { sandbox } = loadTelegramSandbox();
   vm.runInContext('telegramReportLoaded = true', sandbox);
-  const page = source('web/static/js/pages/telegram-report.js');
+  // Normalize line endings so the assertion does not depend on the checkout's
+  // CRLF/LF setting.
+  const page = source('web/static/js/pages/telegram-report.js').replace(/\r\n/g, '\n');
   const renderBody = page.slice(
     page.indexOf('function renderTelegramReport()'),
     page.indexOf('function updateTelegramFrequencyFields()'),

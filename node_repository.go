@@ -43,46 +43,67 @@ type ControlNode struct {
 	// entered it, "enrollment" when it was inferred from the source address of
 	// the Agent's own enrollment request. The panel surfaces the difference so
 	// an inferred address is reviewed rather than trusted silently.
-	AddressSource               string `json:"address_source"`
-	Port                        int    `json:"port"`
-	Enabled                     bool   `json:"enabled"`
-	Priority                    int    `json:"priority"`
-	TrafficQuota                int64  `json:"traffic_quota"`
-	TrafficManualOffset         int64  `json:"traffic_manual_offset_bytes"`
-	BillingMode                 string `json:"billing_mode"`
-	ResetDay                    int    `json:"reset_day"`
-	CycleStartedAtMS            int64  `json:"cycle_started_at_ms"`
-	PeriodRXBytes               int64  `json:"period_rx_bytes"`
-	PeriodTXBytes               int64  `json:"period_tx_bytes"`
-	LifetimeRXBytes             int64  `json:"lifetime_rx_bytes"`
-	LifetimeTXBytes             int64  `json:"lifetime_tx_bytes"`
-	InterfaceName               string `json:"interface_name"`
-	AgentVersion                string `json:"agent_version"`
-	DesiredConfigHash           string `json:"desired_config_hash"`
-	ConfigDirty                 bool   `json:"config_dirty"`
-	AppliedConfigHash           string `json:"applied_config_hash"`
-	ConfigRevision              int64  `json:"config_revision"`
-	DesiredConfigRevision       int64  `json:"desired_config_revision"`
-	AppliedConfigRevision       int64  `json:"applied_config_revision"`
-	AgentApplyError             string `json:"agent_apply_error"`
-	AgentApplyErrorAtMS         int64  `json:"agent_apply_error_at_ms"`
-	AgentApplyFailures          int64  `json:"agent_apply_failures"`
-	AgentListenerError          string `json:"agent_listener_error"`
-	EventSpoolError             string `json:"event_spool_error"`
-	EventQueueDepth             int    `json:"event_queue_depth"`
-	EventDropped                int64  `json:"event_dropped"`
-	CacheClearGeneration        int64  `json:"cache_clear_generation"`
-	CacheClearAppliedGeneration int64  `json:"cache_clear_applied_generation"`
-	EnrolledAtMS                int64  `json:"enrolled_at_ms"`
-	LastSeenAtMS                int64  `json:"last_seen_at_ms"`
-	CreatedAtMS                 int64  `json:"created_at_ms"`
-	UpdatedAtMS                 int64  `json:"updated_at_ms"`
-	Status                      string `json:"status"`
-	TrafficUsed                 int64  `json:"traffic_used"`
-	TrafficRemaining            int64  `json:"traffic_remaining"`
-	EnrollmentAvailable         bool   `json:"enrollment_available"`
-	Depleted                    bool   `json:"depleted"`
-	Active                      bool   `json:"active"`
+	AddressSource string `json:"address_source"`
+	// AddressV4/AddressV6 hold a per-family address so one dual-stack node can
+	// publish both an A and an AAAA record for a site. Empty means "derive this
+	// family from Address", which is why an existing database needs no rewrite.
+	AddressV4 string `json:"address_v4"`
+	AddressV6 string `json:"address_v6"`
+	// AddressV6Source mirrors AddressSource for the IPv6 slot, so an address the
+	// Controller adopted from the Agent's own report is reviewed by the operator
+	// instead of being trusted silently.
+	AddressV6Source string `json:"address_v6_source"`
+	// DNSPublish selects which families are published: auto (every family the
+	// node has), v4 or v6 (that family only). It can never publish a family the
+	// node has no address for.
+	DNSPublish string `json:"dns_publish"`
+	// NetAddressHints holds the addresses the Agent reported from its own
+	// interfaces, as a bounded JSON document. They are hints awaiting a probe,
+	// never published values.
+	NetAddressHints     string `json:"-"`
+	NetAddressHintsAtMS int64  `json:"-"`
+	// NetAddressAdoptionAttemptAtMS bounds how often the Controller probes a
+	// node's reported candidates.
+	NetAddressAdoptionAttemptAtMS int64  `json:"-"`
+	Port                          int    `json:"port"`
+	Enabled                       bool   `json:"enabled"`
+	Priority                      int    `json:"priority"`
+	TrafficQuota                  int64  `json:"traffic_quota"`
+	TrafficManualOffset           int64  `json:"traffic_manual_offset_bytes"`
+	BillingMode                   string `json:"billing_mode"`
+	ResetDay                      int    `json:"reset_day"`
+	CycleStartedAtMS              int64  `json:"cycle_started_at_ms"`
+	PeriodRXBytes                 int64  `json:"period_rx_bytes"`
+	PeriodTXBytes                 int64  `json:"period_tx_bytes"`
+	LifetimeRXBytes               int64  `json:"lifetime_rx_bytes"`
+	LifetimeTXBytes               int64  `json:"lifetime_tx_bytes"`
+	InterfaceName                 string `json:"interface_name"`
+	AgentVersion                  string `json:"agent_version"`
+	DesiredConfigHash             string `json:"desired_config_hash"`
+	ConfigDirty                   bool   `json:"config_dirty"`
+	AppliedConfigHash             string `json:"applied_config_hash"`
+	ConfigRevision                int64  `json:"config_revision"`
+	DesiredConfigRevision         int64  `json:"desired_config_revision"`
+	AppliedConfigRevision         int64  `json:"applied_config_revision"`
+	AgentApplyError               string `json:"agent_apply_error"`
+	AgentApplyErrorAtMS           int64  `json:"agent_apply_error_at_ms"`
+	AgentApplyFailures            int64  `json:"agent_apply_failures"`
+	AgentListenerError            string `json:"agent_listener_error"`
+	EventSpoolError               string `json:"event_spool_error"`
+	EventQueueDepth               int    `json:"event_queue_depth"`
+	EventDropped                  int64  `json:"event_dropped"`
+	CacheClearGeneration          int64  `json:"cache_clear_generation"`
+	CacheClearAppliedGeneration   int64  `json:"cache_clear_applied_generation"`
+	EnrolledAtMS                  int64  `json:"enrolled_at_ms"`
+	LastSeenAtMS                  int64  `json:"last_seen_at_ms"`
+	CreatedAtMS                   int64  `json:"created_at_ms"`
+	UpdatedAtMS                   int64  `json:"updated_at_ms"`
+	Status                        string `json:"status"`
+	TrafficUsed                   int64  `json:"traffic_used"`
+	TrafficRemaining              int64  `json:"traffic_remaining"`
+	EnrollmentAvailable           bool   `json:"enrollment_available"`
+	Depleted                      bool   `json:"depleted"`
+	Active                        bool   `json:"active"`
 
 	lastRawRXBytes        int64
 	lastRawTXBytes        int64
@@ -127,6 +148,9 @@ type AgentSecurityDiagnostics struct {
 type NodeCreateInput struct {
 	Name                     string
 	Address                  string
+	AddressV4                string
+	AddressV6                string
+	DNSPublish               string
 	Port                     int
 	Priority                 int
 	TrafficQuota             int64
@@ -165,6 +189,19 @@ type NodeReport struct {
 	Retention             []NodeRetentionStatus    `json:"retention,omitempty"`
 	Observations          []NodeDynamicObservation `json:"observations,omitempty"`
 	Events                []NodeRequestEvent       `json:"events,omitempty"`
+	// NetAddresses carries the addresses the Agent found on its own interfaces.
+	// They are only ever hints: the Controller must health-probe an address
+	// before it becomes a published DNS record, because the value is public and a
+	// wrong guess points the site at a host that does not answer.
+	NetAddresses []NodeNetAddress `json:"net_addresses,omitempty"`
+}
+
+// NodeNetAddress is one candidate address reported by an Agent. Family is "v4"
+// or "v6"; anything else is ignored rather than guessed.
+type NodeNetAddress struct {
+	Family    string `json:"family"`
+	Address   string `json:"address"`
+	Interface string `json:"interface,omitempty"`
 }
 
 // NodeLiveReport is the lightweight runtime sample used by the dashboard.
@@ -311,6 +348,11 @@ const maxNodeRequestEventsPerReport = 128
 const maxNodeTelemetryItemsPerReport = 128
 const maxNodeSiteStatsPerReport = 512
 
+// maxNodeNetAddressesPerReport bounds the Agent's interface-address hints. A
+// dual-stack host needs two; the ceiling only has to stop a misbehaving Agent
+// from inflating the report.
+const maxNodeNetAddressesPerReport = 16
+
 func newNodeToken() (string, error) {
 	value := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, value); err != nil {
@@ -327,6 +369,8 @@ func hashNodeToken(value string) string {
 func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	input.Address = strings.TrimSpace(input.Address)
+	input.AddressV4 = strings.TrimSpace(input.AddressV4)
+	input.AddressV6 = strings.TrimSpace(input.AddressV6)
 	// The browser supplies the controller's current port for new nodes. Keep a
 	// 443 fallback for API callers that omit the optional convenience default.
 	if input.Port == 0 {
@@ -336,11 +380,25 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	if input.BillingMode == "" {
 		input.BillingMode = "outbound"
 	}
+	input.DNSPublish = normalizeNodeDNSPublish(input.DNSPublish)
 	if input.Name == "" || len(input.Name) > 64 {
 		return input, errors.New("node name must be 1-64 characters")
 	}
-	if len(input.Address) > 255 {
+	if len(input.Address) > 255 || len(input.AddressV4) > 255 || len(input.AddressV6) > 255 {
 		return input, errors.New("node address is too long")
+	}
+	// The per-family slots decide which DNS records get published, so a value in
+	// the wrong slot is refused instead of being silently published under the
+	// other family. An empty slot is valid: the family is then derived from the
+	// primary address, or simply not published.
+	if input.AddressV4 != "" && nodeAddressFamily(input.AddressV4) != "v4" {
+		return input, errors.New("IPv4 地址必须是 IPv4 字面量")
+	}
+	if input.AddressV6 != "" && nodeAddressFamily(input.AddressV6) != "v6" {
+		return input, errors.New("IPv6 地址必须是 IPv6 字面量，且不能带方括号或端口")
+	}
+	if input.Address != "" && nodeAddressFamily(input.Address) == "" {
+		return input, errors.New("节点地址必须是 IPv4 或 IPv6 字面量")
 	}
 	if input.Port < 1 || input.Port > 65535 {
 		return input, errors.New("node port must be between 1 and 65535")
@@ -362,6 +420,21 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 
 func daysInMonth(year int, month time.Month) int {
 	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// primaryAddressForInput resolves the legacy single address and its provenance
+// from an operator/API input. A value typed into a per-family slot is
+// operator-confirmed, which is what clears the "自动探测，请核对" marker. A row
+// created from the panel always carries an operator-entered address, so the
+// provenance is explicitly manual rather than left to the column default.
+func primaryAddressForInput(input NodeCreateInput) (address, source string) {
+	if input.AddressV4 != "" {
+		return input.AddressV4, nodeAddressSourceManual
+	}
+	if input.Address == "" && input.AddressV6 != "" {
+		return input.AddressV6, nodeAddressSourceManual
+	}
+	return input.Address, nodeAddressSourceManual
 }
 
 func nodeCycleStart(now time.Time, resetDay, offsetMinutes int) int64 {
@@ -451,12 +524,19 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	}
 	nowMS := now.UnixMilli()
 	cycleStart := nodeCycleStart(now, input.ResetDay, d.currentSystemSettings().ScheduleTimezone)
-	// address_source is left to its column default here: a row created from the
-	// panel always carries an operator-entered address.
+	// A node carries up to one address per family, but the legacy single column is
+	// what the Agent listener is dialed on and what the panel shows as THE
+	// address. Keep it filled from the IPv4 slot when the caller only supplied
+	// per-family values, so every existing reader keeps a usable primary address.
+	primaryAddress, primarySource := primaryAddressForInput(input)
+	// address_source is left to its column default when the caller supplied only
+	// the legacy field: a row created from the panel always carries an
+	// operator-entered address.
 	result, err := d.db.Exec(`INSERT INTO control_nodes
-		(guid,name,address,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
+		(guid,name,address,address_source,address_v4,address_v6,dns_publish,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
 		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.Port, input.Priority, input.TrafficQuota,
+		VALUES(?,?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, primaryAddress, primarySource, input.AddressV4, input.AddressV6,
+		normalizeNodeDNSPublish(input.DNSPublish), input.Port, input.Priority, input.TrafficQuota,
 		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), probeSecretCiphertext, nowMS, nowMS)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -474,7 +554,7 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const controlNodeSelect = `SELECT id,guid,name,address,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
+const controlNodeSelect = `SELECT id,guid,name,address,address_source,address_v4,address_v6,address_v6_source,dns_publish,net_address_hints,net_address_hints_at_ms,net_address_adoption_at_ms,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
@@ -484,7 +564,7 @@ const controlNodeSelect = `SELECT id,guid,name,address,address_source,https_port
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
 	var enabled, configDirty int
-	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
+	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressSource, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &node.NetAddressHints, &node.NetAddressHintsAtMS, &node.NetAddressAdoptionAttemptAtMS, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
@@ -801,9 +881,10 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, err
 	}
 	defer tx.Rollback()
-	var currentAddress string
+	var currentAddress, currentV4, currentV6, currentPublish string
 	var currentPort, currentResetDay, currentEnabled int
-	if err := tx.QueryRow("SELECT address,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRow("SELECT address,address_v4,address_v6,dns_publish,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).
+		Scan(&currentAddress, &currentV4, &currentV6, &currentPublish, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errNodeNotFound
 	} else if err != nil {
 		return ControlNode{}, err
@@ -811,18 +892,29 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 
 	portChanged := currentPort != input.Port
 	enabledChanged := currentEnabled != sqliteBool(enabled)
-	// Saving from the panel always records the address as operator-confirmed, so
-	// an address that enrollment once inferred loses its "please verify" marker
-	// the moment a human touches the form.
+	// The published address set is what the DNS scheduler resolves from, so any
+	// change to it (or to the family preference) must bump every schedule on this
+	// node, exactly like a port change does. Without the bump the scheduler sees
+	// an unchanged revision and keeps serving the old record set.
+	familiesChanged := currentV4 != input.AddressV4 || currentV6 != input.AddressV6 ||
+		normalizeNodeDNSPublish(currentPublish) != normalizeNodeDNSPublish(input.DNSPublish)
+	// A save from the panel is an operator confirmation, so every slot it carries
+	// loses the "自动探测，请核对" marker; the v6 slot keeps its own provenance.
+	primaryAddress, primarySource := primaryAddressForInput(input)
+	v6Source := ""
+	if input.AddressV6 != "" {
+		v6Source = nodeAddressSourceManual
+	}
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
-			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source=?,address_v4=?,address_v6=?,address_v6_source=?,dns_publish=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, primaryAddress, primarySource, input.AddressV4, input.AddressV6, v6Source, normalizeNodeDNSPublish(input.DNSPublish),
 			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_source=?,address_v4=?,address_v6=?,address_v6_source=?,dns_publish=?,entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+			input.Name, primaryAddress, primarySource, input.AddressV4, input.AddressV6, v6Source, normalizeNodeDNSPublish(input.DNSPublish),
+			input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -841,6 +933,8 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		if _, err := tx.Exec(`UPDATE control_nodes SET desired_config_hash='',desired_config_revision=0 WHERE id=?`, id); err != nil {
 			return ControlNode{}, err
 		}
+	}
+	if portChanged || familiesChanged {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET
 			config_hash='',
 			config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
@@ -859,6 +953,9 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 			return ControlNode{}, err
 		}
 	}
+	// An address-family change does not alter the Agent's runtime config, so it
+	// must not mark the Agent dirty: the schedule revision bump above is what
+	// makes the scheduler republish the record set.
 	if err := tx.Commit(); err != nil {
 		return ControlNode{}, err
 	}
@@ -1137,6 +1234,17 @@ func validateNodeReport(report NodeReport) error {
 	}
 	if len(report.SiteStats) > 512 {
 		return errors.New("too many site stats")
+	}
+	if len(report.NetAddresses) > maxNodeNetAddressesPerReport {
+		return errors.New("too many network addresses")
+	}
+	for _, address := range report.NetAddresses {
+		if len(strings.TrimSpace(address.Interface)) > 64 {
+			return errors.New("invalid network interface name")
+		}
+		if len(strings.TrimSpace(address.Address)) > 64 {
+			return errors.New("invalid network address")
+		}
 	}
 	if len(report.MediaCounts) > maxNodeTelemetryItemsPerReport || len(report.Retention) > maxNodeTelemetryItemsPerReport || len(report.Observations) > maxNodeTelemetryItemsPerReport {
 		return errors.New("too many telemetry items")
@@ -1865,6 +1973,13 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		clearAppliedConfig,
 		report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration,
 		now.Add(agentLeaseTTL).UnixMilli(), now.UnixMilli(), now.UnixMilli(), id); err != nil {
+		return nodeReportCommitResult{}, err
+	}
+	// Interface-address hints are stored, not published. Adoption requires a
+	// successful health probe from the Controller, which runs outside this
+	// transaction so a slow node can never stall the report path.
+	if _, err = tx.Exec(`UPDATE control_nodes SET net_address_hints=?,net_address_hints_at_ms=? WHERE id=?`,
+		encodeNodeNetAddressHints(report.NetAddresses), now.UnixMilli(), id); err != nil {
 		return nodeReportCommitResult{}, err
 	}
 	// A cold-started Agent may report before it has successfully applied the

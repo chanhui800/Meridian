@@ -2425,7 +2425,100 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	if err != nil {
 		return NodeReport{}, err
 	}
-	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion}, nil
+	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion, NetAddresses: edgeLocalAddressCandidates(interfaceName)}, nil
+}
+
+// virtualInterfacePrefixes names interfaces whose addresses are never reachable
+// from the public internet. Reporting them would only invite the Controller to
+// probe a container or tunnel address.
+var virtualInterfacePrefixes = []string{"lo", "docker", "veth", "br-", "virbr", "tun", "tap", "tailscale", "wg", "zt", "dummy", "vnet", "vmnet", "flannel", "cni", "kube"}
+
+func edgeInterfaceIsVirtual(name string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range virtualInterfacePrefixes {
+		if strings.HasPrefix(lowered, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// edgeLocalAddressCandidates reports the globally routable addresses this host
+// holds, so a dual-stack node can publish both an A and an AAAA record.
+//
+// These are hints, not decisions: the Controller stores them, probes each one,
+// and only adopts an address it can actually reach. That is deliberate, because
+// this host cannot know its own NAT-visible IPv4 address, and a published record
+// pointing at an unreachable address takes the site down for that family.
+//
+// The billing interface comes first so its address wins when a host has several
+// candidates in one family, keeping the published address and the traffic
+// counters describing the same link. Loopback, down, and container/tunnel
+// interfaces are skipped.
+func edgeLocalAddressCandidates(preferredInterface string) []NodeNetAddress {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	type candidate struct {
+		order int
+		value NodeNetAddress
+	}
+	preferred := strings.TrimSpace(preferredInterface)
+	candidates := make([]candidate, 0, 4)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if edgeInterfaceIsVirtual(iface.Name) {
+			continue
+		}
+		addrs, addrErr := iface.Addrs()
+		if addrErr != nil {
+			continue
+		}
+		order := 1
+		if iface.Name == preferred {
+			order = 0
+		}
+		for _, addr := range addrs {
+			ip, _, parseErr := net.ParseCIDR(addr.String())
+			if parseErr != nil {
+				// A bare address (no prefix) is still usable.
+				ip = net.ParseIP(strings.TrimSpace(addr.String()))
+			}
+			if ip == nil || !nodeAddressIsGlobalUnicast(ip) {
+				continue
+			}
+			family := "v6"
+			if ip.To4() != nil {
+				family = "v4"
+			}
+			candidates = append(candidates, candidate{order: order, value: NodeNetAddress{Family: family, Address: ip.String(), Interface: iface.Name}})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].order != candidates[j].order {
+			return candidates[i].order < candidates[j].order
+		}
+		if candidates[i].value.Family != candidates[j].value.Family {
+			return candidates[i].value.Family == "v4"
+		}
+		return candidates[i].value.Address < candidates[j].value.Address
+	})
+	result := make([]NodeNetAddress, 0, len(candidates))
+	seen := map[string]bool{}
+	for _, item := range candidates {
+		if seen[item.value.Address] {
+			continue
+		}
+		seen[item.value.Address] = true
+		result = append(result, item.value)
+		if len(result) >= maxNodeNetAddressesPerReport {
+			break
+		}
+	}
+	return result
 }
 
 func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, _ int64, runtime *edgeAgentRuntime) error {

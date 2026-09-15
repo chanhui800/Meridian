@@ -30,6 +30,57 @@ function nodeStatusLabel(node) {
   return { online: '在线', offline: '离线', pending: '待安装' }[node.status] || node.status;
 }
 
+// nodeAddressFamily mirrors the controller: only a literal IP has a family, and
+// everything else is treated as "not set" rather than guessed.
+function nodeAddressFamily(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(text)) {
+    return text.split('.').every(part => Number(part) <= 255) ? 'v4' : '';
+  }
+  // An IPv6 literal. Brackets, a zone or a port all make it unusable as a DNS
+  // record, so they are rejected here exactly like the controller rejects them
+  // rather than being silently trimmed into a different value.
+  if (text.includes(':')) {
+    if (text.includes('[') || text.includes(']') || text.includes('%') || text.includes('/')) return '';
+    return text.split(':').every(part => /^[0-9a-fA-F]{0,4}$/.test(part)) ? 'v6' : '';
+  }
+  return '';
+}
+
+// nodeFamilyAddress is the address the controller will publish for a family: the
+// per-family slot, or the primary address when it belongs to that family.
+function nodeFamilyAddress(node, family) {
+  const slot = family === 'v4' ? node.address_v4 : node.address_v6;
+  if (nodeAddressFamily(slot) === family) return String(slot).trim();
+  if (nodeAddressFamily(node.address) === family) return String(node.address).trim();
+  return '';
+}
+
+function nodeDNSPublishModeLabel(node) {
+  switch (String(node.dns_publish || 'auto')) {
+    case 'v4': return '仅 IPv4';
+    case 'v6': return '仅 IPv6';
+    default: return '自动';
+  }
+}
+
+// nodeDNSPublishSummary states which records this node actually publishes, so a
+// dual-stack host pinned to one family is visibly different from a single-stack
+// host that cannot publish the other one at all.
+function nodeDNSPublishSummary(node) {
+  const hasV4 = nodeFamilyAddress(node, 'v4') !== '';
+  const hasV6 = nodeFamilyAddress(node, 'v6') !== '';
+  const mode = String(node.dns_publish || 'auto');
+  const families = [];
+  if (hasV4 && mode !== 'v6') families.push('A（IPv4）');
+  if (hasV6 && mode !== 'v4') families.push('AAAA（IPv6）');
+  if (!families.length) {
+    return hasV4 || hasV6 ? '不发布 DNS 记录' : '待填写地址';
+  }
+  return `发布 ${families.join(' + ')}`;
+}
+
 function siteScheduleFeedback(site, now = Date.now()) {
   const enabled = site?.enabled === true;
   const lastError = String(site?.last_error || '').trim();
@@ -72,20 +123,26 @@ function renderNodeCards() {
     const applyError = String(node.agent_apply_error || '').trim();
     const listenerError = String(node.agent_listener_error || '').trim();
     const configState = applyError ? `应用失败：${applyError}` : (listenerError ? `监听异常：${listenerError}` : (node.desired_config_hash && node.desired_config_hash === node.applied_config_hash ? '配置已应用' : '等待 Agent 应用站点配置'));
-    // An address the controller inferred from the enrollment request is marked so
-    // it gets reviewed: this value is published as the site's DNS record, and a
-    // wrong guess points the site at the wrong host.
+    // An address the controller inferred (from enrollment) or verified from the
+    // Agent's own report is marked so it gets reviewed: this value is published
+    // as the site's DNS record, and a wrong guess points the site at the wrong
+    // host.
     const addressText = node.address
-      ? (node.address_source === 'enrollment'
+      ? (node.address_source === 'enrollment' || node.address_source === 'detected'
         ? `${node.address}（自动探测，请核对）`
         : node.address)
       : '未填写地址';
+    // Which records this node publishes. The family list is what the scheduler
+    // actually resolved to, so a family with no address shows as unpublished
+    // instead of silently looking configured.
+    const published = nodeDNSPublishSummary(node);
     return `<article class="node-card ${node.active ? 'is-active' : ''}">
       <div class="node-card-head"><div><h3>${esc(node.name)}</h3><p>${esc(addressText)} · ${esc(node.interface_name || '等待识别网卡')}</p></div>
       <span class="node-status is-${esc(node.status)}">${esc(nodeStatusLabel(node))}</span></div>
       ${node.depleted ? '<div class="node-card-warning is-error">已超出流量上限，不再参与调度。提高上限、清除上限或改回每月重置日即可恢复。</div>' : ''}
       <div class="node-stats"><span><b>${usage}</b><small>${esc(node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费')}</small></span><span><b>${esc(reset)}</b><small>独立流量周期</small></span><span><b>${node.priority}</b><small>优先级${node.active ? ' · 当前选中' : ''}</small></span></div>
-      <div class="node-entry-state"><div class="node-entry-details"><span>${esc(entry)}</span><small class="node-agent-version">Agent ${esc(node.agent_version || '未上报')}</small></div><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div>
+      <div class="node-entry-state"><div class="node-entry-details"><span>${esc(published)}</span><small class="node-agent-version">DNS 解析 · ${esc(nodeDNSPublishModeLabel(node))}</small></div><small class="node-agent-version">${esc(entry)} · Agent ${esc(node.agent_version || '未上报')}</small></div>
+      <div class="node-entry-state"><div class="node-entry-details"><small class="${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</small></div></div>
       <div class="node-actions"><button type="button" data-action="edit" data-id="${node.id}">编辑</button><button type="button" data-action="enroll" data-id="${node.id}">重新生成脚本</button><button type="button" class="is-danger" data-action="delete" data-id="${node.id}">删除</button></div>
     </article>`;
   }).join('');
@@ -135,8 +192,13 @@ function openNodeForm(node) {
   document.getElementById('modal-title').textContent = editing ? '编辑节点' : '创建节点';
   document.getElementById('modal-body').innerHTML = `<form id="node-form" class="node-form">
     <label>节点名称<input class="form-input" id="node-name" maxlength="64" required value="${esc(node ? node.name : '')}"></label>
-    <label>显示地址<input class="form-input" id="node-address" maxlength="255" value="${esc(node ? node.address : '')}" placeholder="例如 203.0.113.10"></label>
-    <div class="form-help">留空时，节点首次注册会自动填入主控观测到的来源 IP 并标记「自动探测」。此地址会作为站点的 DNS A/AAAA 记录发布，请务必核对后保存；保存即视为人工确认。</div>
+    <div class="node-form-grid">
+      <label>IPv4 地址<input class="form-input" id="node-address-v4" maxlength="255" value="${esc(node ? node.address_v4 || (nodeAddressFamily(node.address) === 'v4' ? node.address : '') : '')}" placeholder="例如 203.0.113.10"></label>
+      <label>IPv6 地址<input class="form-input" id="node-address-v6" maxlength="255" value="${esc(node ? node.address_v6 || (nodeAddressFamily(node.address) === 'v6' ? node.address : '') : '')}" placeholder="例如 2001:db8::1"></label>
+    </div>
+    <div class="form-help">填入哪个族就发布哪条记录：只填 IPv4 发 A，只填 IPv6 发 AAAA，两个都填则同时发 A 和 AAAA（客户端按自身网络选择）。IPv6 只接受字面量，不要带方括号或端口。留空时节点首次注册会用主控观测到的来源 IP 兜底，Agent 上报的地址也会在主控探测通过后自动填入，并标记「自动探测」待你核对——该值会成为公开 DNS 记录。</div>
+    <label>DNS 解析<select class="form-input" id="node-dns-publish"><option value="auto">自动（按已填地址发布）</option><option value="v4">仅 IPv4（只发 A）</option><option value="v6">仅 IPv6（只发 AAAA）</option></select></label>
+    <div class="form-help" id="node-dns-publish-hint">双栈节点默认同时发布 A 和 AAAA；只发布其中一个时，另一个族的客户端会连不上，请确认你的落地机确实两组地址都能访问。</div>
     <label>端口<input class="form-input" id="node-port" type="number" min="1" max="65535" value="${node && node.port ? node.port : (location.port || 443)}"></label>
     <div class="form-help">Agent 仅提供 TLS/HTTPS。同一节点上的所有调度站点共用此端口并按域名区分；端口必须未被该 VPS 上的其他程序占用。默认采用当前主控端口，保存后独立管理。</div>
     <div class="node-form-grid"><label>流量上限（GiB，0 为不限）<input class="form-input" id="node-quota" type="number" min="0" step="0.01" value="${node ? (Number(node.traffic_quota) / 1073741824).toFixed(2) : '0'}"></label><label>重置日<input class="form-input" id="node-reset" type="number" min="0" max="31" value="${node ? node.reset_day : 1}"></label></div>
@@ -146,6 +208,17 @@ function openNodeForm(node) {
     ${editing ? '<label class="node-check"><input id="node-enabled" type="checkbox" checked> 启用节点</label>' : '<label>控制器地址<input class="form-input" id="node-controller" type="url" required></label>'}
   </form>`;
   document.getElementById('node-billing').value = node ? node.billing_mode : 'outbound';
+  document.getElementById('node-dns-publish').value = node ? String(node.dns_publish || 'auto') : 'auto';
+  const dnsHint = document.getElementById('node-dns-publish-hint');
+  const refreshDNSHint = () => {
+    const addressV4 = document.getElementById('node-address-v4').value.trim();
+    const addressV6 = document.getElementById('node-address-v6').value.trim();
+    const mode = document.getElementById('node-dns-publish').value;
+    dnsHint.textContent = nodeDNSPublishDraftSummary(addressV4, addressV6, mode);
+  };
+  ['node-address-v4', 'node-address-v6'].forEach(id => { document.getElementById(id).oninput = refreshDNSHint; });
+  document.getElementById('node-dns-publish').onchange = refreshDNSHint;
+  refreshDNSHint();
   if (editing) document.getElementById('node-enabled').checked = node.enabled;
   else document.getElementById('node-controller').value = location.origin;
   document.getElementById('modal-footer').innerHTML = '<button type="button" class="node-button" id="node-form-cancel">取消</button><button type="submit" form="node-form" class="node-button is-primary">保存</button>';
@@ -153,13 +226,72 @@ function openNodeForm(node) {
   document.getElementById('node-form-cancel').onclick = closeModal;
   document.getElementById('node-form').onsubmit = async event => {
     event.preventDefault();
-    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
+    const addressV4 = document.getElementById('node-address-v4').value.trim();
+    const addressV6 = document.getElementById('node-address-v6').value.trim();
+    const dnsPublish = document.getElementById('node-dns-publish').value;
+    // A pinned family with no address for it would publish nothing at all, which
+    // is a silent outage for that family. Refuse it here rather than after the
+    // scheduler has already removed the record.
+    const pinError = nodeDNSPublishDraftError(addressV4, addressV6, dnsPublish);
+    if (pinError) { Toast.error(pinError); return; }
+    // The primary/legacy address keeps naming one family so a cached panel build
+    // and the Agent dial logic still see a usable address.
+    const payload = {
+      name: document.getElementById('node-name').value.trim(),
+      address: addressV4 || addressV6,
+      address_v4: addressV4,
+      address_v6: addressV6,
+      dns_publish: dnsPublish,
+      port: Number(document.getElementById('node-port').value),
+      traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824),
+      reset_day: Number(document.getElementById('node-reset').value),
+      billing_mode: document.getElementById('node-billing').value,
+      priority: Number(document.getElementById('node-priority').value),
+      traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824),
+    };
     try {
       if (editing) { payload.enabled = document.getElementById('node-enabled').checked; await API.updateNode(node.id, payload); closeModal(); Toast.success('节点已更新'); }
       else { payload.controller_url = document.getElementById('node-controller').value.trim(); const result = await API.createNode(payload); showNodeScript(result.install_script, result.install_command); }
       await loadNodes();
     } catch (error) { Toast.error(error.message || '保存失败'); }
   };
+}
+
+// nodeDNSPublishDraftSummary explains, in the form, exactly which records the
+// current combination would publish. The operator is about to change what a
+// public hostname resolves to, so the consequence is stated rather than implied.
+function nodeDNSPublishDraftSummary(addressV4, addressV6, dnsPublish) {
+  const hasV4 = nodeAddressFamily(addressV4) === 'v4';
+  const hasV6 = nodeAddressFamily(addressV6) === 'v6';
+  const families = [];
+  if (hasV4 && dnsPublish !== 'v6') families.push('A（IPv4）');
+  if (hasV6 && dnsPublish !== 'v4') families.push('AAAA（IPv6）');
+  if (!families.length) {
+    if (dnsPublish === 'v4') return '当前不会发布任何记录：已选择仅 IPv4，但未填写 IPv4 地址。';
+    if (dnsPublish === 'v6') return '当前不会发布任何记录：已选择仅 IPv6，但未填写 IPv6 地址。';
+    return '当前不会发布任何记录：至少填写一个地址。';
+  }
+  let text = `将发布 ${families.join(' + ')}。`;
+  if (dnsPublish === 'auto' && hasV4 && hasV6) {
+    text += '双栈：客户端会按自身网络选择，IPv6 优先。';
+  } else if (dnsPublish !== 'auto' && hasV4 && hasV6) {
+    text += `已手动限定为仅 ${dnsPublish === 'v4' ? 'IPv4' : 'IPv6'}，另一族的客户端将无法连接。`;
+  } else if (hasV4 && !hasV6) {
+    text += '仅 IPv4：纯 IPv6 客户端无法连接。';
+  } else if (hasV6 && !hasV4) {
+    text += '仅 IPv6：纯 IPv4 客户端无法连接。';
+  }
+  return text;
+}
+
+// nodeDNSPublishDraftError validates the form's address/publish combination
+// before it reaches the controller, so the operator gets the reason immediately.
+function nodeDNSPublishDraftError(addressV4, addressV6, dnsPublish) {
+  if (addressV4 && nodeAddressFamily(addressV4) !== 'v4') return 'IPv4 地址格式不正确';
+  if (addressV6 && nodeAddressFamily(addressV6) !== 'v6') return 'IPv6 地址请填字面量，不要带方括号或端口';
+  if (dnsPublish === 'v4' && !addressV4) return '已选择仅 IPv4，但未填写 IPv4 地址';
+  if (dnsPublish === 'v6' && !addressV6) return '已选择仅 IPv6，但未填写 IPv6 地址';
+  return '';
 }
 
 async function handleNodeAction(event) {

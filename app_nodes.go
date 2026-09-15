@@ -186,6 +186,12 @@ type nodeAPIInput struct {
 	BillingMode              string `json:"billing_mode"`
 	ResetDay                 int    `json:"reset_day"`
 	ControllerURL            string `json:"controller_url"`
+	// Dual-stack publishing. Address stays the primary/legacy field so a cached
+	// panel build keeps working; the per-family slots and the publish mode are
+	// what decide which DNS records a site gets.
+	AddressV4  string `json:"address_v4"`
+	AddressV6  string `json:"address_v6"`
+	DNSPublish string `json:"dns_publish"`
 }
 
 func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
@@ -197,6 +203,7 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 		Name: input.Name, Address: input.Address, Port: port, Priority: input.Priority,
 		TrafficQuota: input.TrafficQuota, BillingMode: input.BillingMode, ResetDay: input.ResetDay,
 		TrafficManualOffsetBytes: input.TrafficManualOffsetBytes,
+		AddressV4:                input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish,
 	}
 }
 

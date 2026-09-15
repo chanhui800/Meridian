@@ -382,6 +382,13 @@ func (d *DB) migrateOnce() error {
 		name TEXT NOT NULL COLLATE NOCASE UNIQUE,
 		address TEXT NOT NULL DEFAULT '',
 		address_source TEXT NOT NULL DEFAULT 'manual',
+		address_v4 TEXT NOT NULL DEFAULT '',
+		address_v6 TEXT NOT NULL DEFAULT '',
+		address_v6_source TEXT NOT NULL DEFAULT '',
+		dns_publish TEXT NOT NULL DEFAULT 'auto' CHECK(dns_publish IN ('auto','v4','v6')),
+		net_address_hints TEXT NOT NULL DEFAULT '',
+		net_address_hints_at_ms INTEGER NOT NULL DEFAULT 0,
+		net_address_adoption_at_ms INTEGER NOT NULL DEFAULT 0,
 		entry_mode TEXT NOT NULL DEFAULT 'direct' CHECK(entry_mode IN ('direct','shared')),
 		http_port INTEGER NOT NULL DEFAULT 0,
 		https_port INTEGER NOT NULL DEFAULT 443,
@@ -451,6 +458,7 @@ func (d *DB) migrateOnce() error {
 		cf_record_id TEXT NOT NULL DEFAULT '',
 		cf_record_type TEXT NOT NULL DEFAULT '',
 		applied_address TEXT NOT NULL DEFAULT '',
+		dns_families TEXT NOT NULL DEFAULT '',
 		dns_status TEXT NOT NULL DEFAULT 'disabled',
 		config_hash TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
@@ -460,6 +468,21 @@ func (d *DB) migrateOnce() error {
 		updated_at_ms INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_site_node_schedules_desired ON site_node_schedules(desired_node_id,enabled);
+	-- One address record per family per site. A dual-stack node publishes an A and
+	-- an AAAA for the same hostname, so the tracked record can no longer be the
+	-- single cf_record_id column on site_node_schedules. That column remains as a
+	-- compatibility mirror of the primary family's record for older panel builds.
+	CREATE TABLE IF NOT EXISTS site_node_dns_records (
+		site_id INTEGER NOT NULL,
+		family TEXT NOT NULL CHECK(family IN ('v4','v6')),
+		zone_id TEXT NOT NULL DEFAULT '',
+		record_id TEXT NOT NULL DEFAULT '',
+		record_type TEXT NOT NULL DEFAULT '',
+		address TEXT NOT NULL DEFAULT '',
+		updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(site_id,family)
+	);
+	CREATE INDEX IF NOT EXISTS idx_site_node_dns_records_record ON site_node_dns_records(record_id);
 	CREATE TABLE IF NOT EXISTS site_node_probe_failures (
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
@@ -804,6 +827,17 @@ func (d *DB) migrateOnce() error {
 		// Every pre-existing row was entered by an operator, so the backfill
 		// default 'manual' states the truth rather than an unknown value.
 		{"control_nodes", "address_source", "ALTER TABLE control_nodes ADD COLUMN address_source TEXT NOT NULL DEFAULT 'manual'"},
+		// Dual-stack publishing. Left empty on upgrade: the family is then derived
+		// from the existing address column, so no row needs rewriting and a node
+		// that has only ever had one address keeps publishing exactly that one.
+		{"control_nodes", "address_v4", "ALTER TABLE control_nodes ADD COLUMN address_v4 TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "address_v6", "ALTER TABLE control_nodes ADD COLUMN address_v6 TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "address_v6_source", "ALTER TABLE control_nodes ADD COLUMN address_v6_source TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "dns_publish", "ALTER TABLE control_nodes ADD COLUMN dns_publish TEXT NOT NULL DEFAULT 'auto'"},
+		{"control_nodes", "net_address_hints", "ALTER TABLE control_nodes ADD COLUMN net_address_hints TEXT NOT NULL DEFAULT ''"},
+		{"control_nodes", "net_address_hints_at_ms", "ALTER TABLE control_nodes ADD COLUMN net_address_hints_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"control_nodes", "net_address_adoption_at_ms", "ALTER TABLE control_nodes ADD COLUMN net_address_adoption_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"site_node_schedules", "dns_families", "ALTER TABLE site_node_schedules ADD COLUMN dns_families TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "last_report_session_id", "ALTER TABLE control_nodes ADD COLUMN last_report_session_id TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "active_agent_session_id", "ALTER TABLE control_nodes ADD COLUMN active_agent_session_id TEXT NOT NULL DEFAULT ''"},
 		{"control_nodes", "agent_session_epoch", "ALTER TABLE control_nodes ADD COLUMN agent_session_epoch BIGINT NOT NULL DEFAULT 0"},
