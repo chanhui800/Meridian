@@ -81,6 +81,22 @@ function nodeDNSPublishSummary(node) {
   return `发布 ${families.join(' + ')}`;
 }
 
+// siteDNSSummary states which address records a site currently publishes, plus
+// the primary address the legacy column mirrors. The scheduler records the
+// published families per generation, so the panel can show whether a site
+// resolves on A, AAAA or both instead of leaving the operator to guess from a
+// single address.
+function siteDNSSummary(site) {
+  const families = Array.isArray(site && site.applied_families) ? site.applied_families : [];
+  const parts = [];
+  if (families.includes('v4')) parts.push('A');
+  if (families.includes('v6')) parts.push('AAAA');
+  if (!parts.length) return '';
+  const recordList = parts.join(' + ');
+  const address = String((site && site.applied_address) || '').trim();
+  return address ? ` · 已发布 ${recordList}（${address}）` : ` · 已发布 ${recordList}`;
+}
+
 function siteScheduleFeedback(site, now = Date.now()) {
   const enabled = site?.enabled === true;
   const lastError = String(site?.last_error || '').trim();
@@ -360,7 +376,7 @@ function renderSiteSchedules() {
         <label class="node-site-field">调度方式<select class="form-input" data-field="mode" ${formEnabled ? '' : 'disabled'}><option value="global" ${view.mode !== 'fixed' ? 'selected' : ''}>跟随全局调度</option><option value="fixed" ${view.mode === 'fixed' ? 'selected' : ''}>固定节点</option></select></label>
         <label class="node-site-field">固定节点<select class="form-input" data-field="fixed-node" ${formEnabled && view.mode === 'fixed' ? '' : 'disabled'}><option value="">选择节点</option>${nodeOptions}</select></label>
       </div>
-      <div class="node-site-status"><span>${savedEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}` : '原面板模式 · 节点调度未启用'}</span>${savedEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}${dirtyNote}</div>
+      <div class="node-site-status"><span>${savedEnabled ? `期望 ${esc(site.desired_node_name || nodeName(site.desired_node_id))} · 生效 ${esc(site.applied_node_name || nodeName(site.applied_node_id))}${site.applied_node_port ? ` :${esc(site.applied_node_port)}` : ''} · DNS ${esc(site.dns_status || 'disabled')}${siteDNSSummary(site)}` : '原面板模式 · 节点调度未启用'}</span>${savedEnabled && site.agent_last_request_at_ms ? `<small>最近请求 ${meridianFormatDateTime(site.agent_last_request_at_ms)} · ${Number(site.agent_request_count || 0)} 次 · HTTP ${Number(site.agent_last_status || 0)}</small>` : ''}${error}${dirtyNote}</div>
       <footer class="node-site-card-actions"><button type="button" class="node-button is-primary" data-action="save-site">保存站点设置</button></footer>
     </article>`;
   }).join('');

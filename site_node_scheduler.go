@@ -160,29 +160,33 @@ func (a *App) enqueueNodeSchedulerJob(queue *nodeSchedulerQueue, job nodeSchedul
 }
 
 type SiteNodeSchedule struct {
-	SiteID               int64  `json:"site_id"`
-	SiteName             string `json:"site_name"`
-	PublicHost           string `json:"public_host"`
-	Enabled              bool   `json:"enabled"`
-	Mode                 string `json:"mode"`
-	FixedNodeID          int64  `json:"fixed_node_id"`
-	DesiredNodeID        int64  `json:"desired_node_id"`
-	AppliedNodeID        int64  `json:"applied_node_id"`
-	AppliedAddress       string `json:"applied_address"`
-	DNSStatus            string `json:"dns_status"`
-	ConfigHash           string `json:"config_hash"`
-	LastError            string `json:"last_error"`
-	DesiredNodeName      string `json:"desired_node_name"`
-	AppliedNodeName      string `json:"applied_node_name"`
-	AppliedNodePort      int    `json:"applied_node_port"`
-	AgentBootID          string `json:"agent_boot_id,omitempty"`
-	AgentRequestCount    int64  `json:"agent_request_count"`
-	AgentLastRequestAtMS int64  `json:"agent_last_request_at_ms"`
-	AgentLastStatus      int    `json:"agent_last_status"`
-	ConfigPendingSinceMS int64  `json:"config_pending_since_ms"`
-	ScheduleRevision     int64  `json:"schedule_revision"`
-	SiteEnabled          bool   `json:"site_enabled"`
-	UpdatedAtMS          int64  `json:"updated_at_ms"`
+	SiteID         int64  `json:"site_id"`
+	SiteName       string `json:"site_name"`
+	PublicHost     string `json:"public_host"`
+	Enabled        bool   `json:"enabled"`
+	Mode           string `json:"mode"`
+	FixedNodeID    int64  `json:"fixed_node_id"`
+	DesiredNodeID  int64  `json:"desired_node_id"`
+	AppliedNodeID  int64  `json:"applied_node_id"`
+	AppliedAddress string `json:"applied_address"`
+	// AppliedFamilies names the address families this generation actually
+	// published, so the panel can show whether a site resolves on A, AAAA or
+	// both instead of only which single address is mirrored in the legacy column.
+	AppliedFamilies      []string `json:"applied_families,omitempty"`
+	DNSStatus            string   `json:"dns_status"`
+	ConfigHash           string   `json:"config_hash"`
+	LastError            string   `json:"last_error"`
+	DesiredNodeName      string   `json:"desired_node_name"`
+	AppliedNodeName      string   `json:"applied_node_name"`
+	AppliedNodePort      int      `json:"applied_node_port"`
+	AgentBootID          string   `json:"agent_boot_id,omitempty"`
+	AgentRequestCount    int64    `json:"agent_request_count"`
+	AgentLastRequestAtMS int64    `json:"agent_last_request_at_ms"`
+	AgentLastStatus      int      `json:"agent_last_status"`
+	ConfigPendingSinceMS int64    `json:"config_pending_since_ms"`
+	ScheduleRevision     int64    `json:"schedule_revision"`
+	SiteEnabled          bool     `json:"site_enabled"`
+	UpdatedAtMS          int64    `json:"updated_at_ms"`
 	cfZoneID             string
 	cfRecordID           string
 	cfRecordType         string
@@ -251,10 +255,12 @@ func scanSiteNodeSchedule(scanner interface{ Scan(...any) error }) (SiteNodeSche
 	var value SiteNodeSchedule
 	var enabled, siteEnabled int
 	var fixed, desired, applied sql.NullInt64
+	var appliedFamilies string
 	err := scanner.Scan(&value.SiteID, &value.SiteName, &value.PublicHost, &enabled, &value.Mode, &fixed, &desired, &applied,
-		&value.cfZoneID, &value.cfRecordID, &value.cfRecordType, &value.AppliedAddress, &value.DNSStatus,
+		&value.cfZoneID, &value.cfRecordID, &value.cfRecordType, &value.AppliedAddress, &appliedFamilies, &value.DNSStatus,
 		&value.ConfigHash, &value.LastError, &value.DesiredNodeName, &value.AppliedNodeName, &value.AppliedNodePort,
 		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.ConfigPendingSinceMS, &value.ScheduleRevision, &value.UpdatedAtMS, &siteEnabled)
+	value.AppliedFamilies = decodeDNSFamilies(appliedFamilies)
 	value.Enabled = enabled != 0
 	value.SiteEnabled = siteEnabled != 0
 	if fixed.Valid {
@@ -271,7 +277,7 @@ func scanSiteNodeSchedule(scanner interface{ Scan(...any) error }) (SiteNodeSche
 
 const siteNodeScheduleSelect = `SELECT s.id,s.name,s.public_host,COALESCE(n.enabled,0),COALESCE(n.mode,'global'),
 	n.fixed_node_id,n.desired_node_id,n.applied_node_id,COALESCE(n.cf_zone_id,''),COALESCE(n.cf_record_id,''),
-	COALESCE(n.cf_record_type,''),COALESCE(n.applied_address,''),COALESCE(n.dns_status,'disabled'),
+	COALESCE(n.cf_record_type,''),COALESCE(n.applied_address,''),COALESCE(n.dns_families,''),COALESCE(n.dns_status,'disabled'),
 	COALESCE(n.config_hash,''),COALESCE(n.last_error,''),COALESCE(d.name,''),COALESCE(an.name,''),COALESCE(an.https_port,0),
 	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.config_pending_since_ms,0),COALESCE(n.schedule_revision,1),COALESCE(n.updated_at_ms,0),COALESCE(s.enabled,1)
 	FROM sites s LEFT JOIN site_node_schedules n ON n.site_id=s.id

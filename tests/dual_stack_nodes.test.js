@@ -112,6 +112,28 @@ test('dual stack: the form refuses combinations that would publish nothing', () 
   assert.match(call('nodeDNSPublishDraftError("", "[2001:db8::1]", "auto")'), /IPv6 地址请填字面量/);
 });
 
+test('dual stack: the site card names the records the scheduler published', () => {
+  const cases = [
+    // The scheduler records the families it published per generation, so the
+    // panel can show what a hostname actually resolves to.
+    ['{"applied_families":["v4"],"applied_address":"203.0.113.10"}', ['已发布 A（203.0.113.10）'], ['已发布 AAAA', '+ AAAA']],
+    ['{"applied_families":["v6"],"applied_address":"2001:db8::1"}', ['已发布 AAAA（2001:db8::1）'], ['已发布 A（', 'A +']],
+    ['{"applied_families":["v4","v6"],"applied_address":"203.0.113.10"}', ['已发布 A + AAAA（203.0.113.10）'], []],
+    // Nothing published yet must not claim anything.
+    ['{"applied_families":[],"applied_address":""}', [], ['已发布']],
+    ['{}', [], ['已发布']],
+  ];
+  for (const [site, needles, absent] of cases) {
+    const got = call(`siteDNSSummary(${site})`);
+    for (const needle of needles) {
+      assert.ok(got.includes(needle), `${site} -> ${got} must mention ${needle}`);
+    }
+    for (const needle of absent) {
+      assert.ok(!got.includes(needle), `${site} -> ${got} must not mention ${needle}`);
+    }
+  }
+});
+
 test('dual stack: an auto-detected address is flagged for review', () => {
   const page = fs.readFileSync(path.join(root, 'web/static/js/pages/nodes.js'), 'utf8');
   // Both provenance values the controller can set must ask for a review, not
