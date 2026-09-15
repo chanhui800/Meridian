@@ -251,7 +251,7 @@ func buildNodeInstallCommandWithOptions(controllerURL, enrollmentToken string, r
 	if reenroll {
 		reenrollArg = " --reenroll"
 	}
-	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL %s | sudo bash -s -- -e %s -t %s%s",
+	return fmt.Sprintf("curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL %s | sudo bash -s -- -e %s -t %s%s",
 		shellSingleQuote(endpoint),
 		shellSingleQuote(controllerURL), shellSingleQuote(enrollmentToken), reenrollArg)
 }

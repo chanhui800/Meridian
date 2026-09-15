@@ -217,7 +217,7 @@ service_tmp="$work_dir/meridian-agent.service"
 # Download the release manifest from the controller, then fetch the immutable
 # GitHub asset directly. This keeps the Controller image free of per-platform
 # Agent binaries while retaining a controller-authenticated enrollment step.
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$manifest_headers_tmp" \
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL -D "$manifest_headers_tmp" \
   -H "Authorization: Bearer $enrollment_token" \
   -H "X-Meridian-Agent-Platform: $agent_platform" \
   "$controller_url/api/agent/manifest" -o "$work_dir/agent-manifest.json"
@@ -236,7 +236,7 @@ if ! printf '%s' "$expected_sha" | grep -Eq '^[[:xdigit:]]{64}$'; then
   echo 'Agent release manifest returned an invalid SHA-256.' >&2
   exit 1
 fi
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -D "$headers_tmp" \
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL -D "$headers_tmp" \
   "$download_url" -o "$binary_tmp"
 served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
 if [ -n "$served_platform" ] && [ "$served_platform" != "$agent_platform" ]; then
