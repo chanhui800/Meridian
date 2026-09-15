@@ -1862,6 +1862,13 @@ func deleteTrackedSiteDNSFamilyRecords(ctx context.Context, cf *cloudflareClient
 		err := deleteTrackedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID)
 		log.Printf("[dns-cleanup-diag] site %d: family=%s idlen=%d zone=%t err=%v",
 			schedule.SiteID, record.Family, len(recordID), zoneID != "", err)
+		if err == nil {
+			if _, readErr, ok := readOwnedSiteDNSRecordByID(ctx, cf, zoneID, recordID, schedule.SiteID); readErr != nil {
+				log.Printf("[dns-cleanup-diag] site %d: family=%s verify failed: %v", schedule.SiteID, record.Family, readErr)
+			} else {
+				log.Printf("[dns-cleanup-diag] site %d: family=%s still present remotely=%t", schedule.SiteID, record.Family, ok)
+			}
+		}
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
