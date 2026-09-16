@@ -1026,12 +1026,107 @@ test('dashboard realtime display density adapts to plot width without changing t
     };
   })()`, sandbox);
   assert.equal(result.rawLength, 150);
-  assert.equal(result.desktop.length, 50);
-  assert.equal(result.mobile.length, 32);
+  assert.ok(result.desktop.length >= 49 && result.desktop.length <= 50);
+  assert.ok(result.mobile.length >= 31 && result.mobile.length <= 32);
   assert.equal(Array.from(result.desktop).reduce((sum, point) => sum + point.traffic_bytes, 0), 150);
   assert.equal(Array.from(result.desktop).reduce((sum, point) => sum + point.requests, 0), 50);
   assert.equal(Array.from(result.mobile).reduce((sum, point) => sum + point.traffic_bytes, 0), 150);
   assert.equal(Array.from(result.mobile).reduce((sum, point) => sum + point.requests, 0), 50);
+});
+
+test('dashboard realtime buckets and smoothed history stay stable as the window rolls', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const target = dashboardTrendDisplayPointTarget(500);
+    const duration = Math.ceil(dashboardRealtimeWindowDurationMS / Math.max(1, target - 1));
+    const anchor = duration * 1000;
+    const points = Array.from({ length: 151 }, (_, index) => ({
+      timestamp_ms: anchor + index * dashboardRealtimeSampleIntervalMS,
+      download_bps: index % 11 === 0 ? 900 : 100 + (index % 7) * 40,
+      upload_bps: index % 13 === 0 ? 120 : 10,
+      traffic_bytes: 10 + (index % 5),
+      requests: index % 9 === 0 ? 1 : 0,
+    }));
+    const capture = source => {
+      const display = dashboardTrendDisplayPoints(source, 'traffic', 500);
+      const traffic = dashboardTrendRenderSeries(display, 'traffic')[0];
+      const speed = dashboardTrendRenderSeries(display, 'speed')[0];
+      return display.map((point, index) => ({
+        id: point.display_bucket_id,
+        start: point.bucket_start_ms,
+        end: point.bucket_end_ms,
+        traffic: point.traffic_bytes,
+        requests: point.requests,
+        renderedTraffic: traffic[index],
+        renderedSpeed: speed[index],
+      }));
+    };
+    const firstSource = points.slice(0, 150);
+    const secondSource = points.slice(1);
+    return {
+      duration,
+      first: capture(firstSource),
+      second: capture(secondSource),
+      firstTraffic: firstSource.reduce((sum, point) => sum + point.traffic_bytes, 0),
+      secondTraffic: secondSource.reduce((sum, point) => sum + point.traffic_bytes, 0),
+      firstRequests: firstSource.reduce((sum, point) => sum + point.requests, 0),
+      secondRequests: secondSource.reduce((sum, point) => sum + point.requests, 0),
+    };
+  })()`, sandbox);
+
+  const first = Array.from(result.first, point => ({ ...point }));
+  const second = Array.from(result.second, point => ({ ...point }));
+  assert.ok(first.every(point => Number.isInteger(point.id)), 'every display point must expose an absolute bucket id');
+  assert.ok(first.every(point => point.start % result.duration === 0), 'bucket starts must be aligned to absolute time');
+  assert.equal(first.reduce((sum, point) => sum + point.traffic, 0), result.firstTraffic);
+  assert.equal(second.reduce((sum, point) => sum + point.traffic, 0), result.secondTraffic);
+  assert.equal(first.reduce((sum, point) => sum + point.requests, 0), result.firstRequests);
+  assert.equal(second.reduce((sum, point) => sum + point.requests, 0), result.secondRequests);
+
+  const firstByID = new Map(first.map(point => [point.id, point]));
+  const secondByID = new Map(second.map(point => [point.id, point]));
+  const shared = [...firstByID.keys()].filter(id => secondByID.has(id)).sort((a, b) => a - b);
+  assert.ok(shared.length >= 45, 'rolling by one sample should retain almost every display bucket');
+  shared.slice(1, -1).forEach(id => {
+    assert.deepEqual(secondByID.get(id), firstByID.get(id), `closed bucket ${id} must not change after the window rolls`);
+  });
+});
+
+test('dashboard sparse realtime smoothing keeps overlapping raw points stable', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = Array.from({ length: 21 }, (_, index) => ({
+      timestamp_ms: 100000 + index * dashboardRealtimeSampleIntervalMS,
+      download_bps: index % 4 === 0 ? 400 : 40,
+      upload_bps: 0,
+      traffic_bytes: index % 3 === 0 ? 90 : 10,
+      requests: index % 5 === 0 ? 1 : 0,
+    }));
+    const capture = source => {
+      const display = dashboardTrendDisplayPoints(source, 'traffic', 500);
+      const rendered = dashboardTrendRenderSeries(display, 'traffic')[0];
+      return display.map((point, index) => ({ id: point.display_bucket_id, raw: point.traffic_bytes, rendered: rendered[index] }));
+    };
+    return { first: capture(points.slice(0, 20)), second: capture(points.slice(1)) };
+  })()`, sandbox);
+  const first = new Map(Array.from(result.first, point => [point.id, { raw: point.raw, rendered: point.rendered }]));
+  const second = new Map(Array.from(result.second, point => [point.id, { raw: point.raw, rendered: point.rendered }]));
+  const shared = [...first.keys()].filter(id => second.has(id));
+  assert.equal(shared.length, 19);
+  shared.forEach(id => assert.deepEqual(second.get(id), first.get(id)));
+});
+
+test('dashboard teardown clears realtime smoothing state', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardRealtimeSmoothingCache.set('all|traffic|0|2000|bidirectional', new Map([[1, { raw: 1, smoothed: 1 }]]));
+    const before = dashboardRealtimeSmoothingCache.size;
+    stopDashSSE();
+    return { before, after: dashboardRealtimeSmoothingCache.size };
+  })()`, sandbox);
+  assert.deepEqual({ before: result.before, after: result.after }, { before: 1, after: 0 });
 });
 
 test('dashboard realtime buckets preserve weighted speed and per-site totals', () => {
