@@ -2510,7 +2510,25 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 		}
 		report.AgentLeaseID, _ = runtime.reportIdentity()
 		var ack struct{}
-		return edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
+		// A live sample must never inherit the two-minute general API timeout:
+		// one stalled Controller request would otherwise pause this loop and make
+		// the dashboard appear to stop for the whole outage. Bound each attempt
+		// to one reporting interval and retry once with a short backoff.
+		requestCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		err := edgeAPIRequest(requestCtx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+		requestCtx, cancel = context.WithTimeout(ctx, 1500*time.Millisecond)
+		err = edgeAPIRequest(requestCtx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
+		cancel()
+		return err
 	}
 	// Send one sample immediately so a freshly applied route does not wait for
 	// the first ticker boundary.

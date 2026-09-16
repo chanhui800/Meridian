@@ -204,6 +204,8 @@ type NodeLiveSiteTraffic struct {
 	CumulativeBytesOut int64  `json:"cumulative_bytes_out"`
 	Requests           int64  `json:"requests"`
 	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
+	AgentSampledAtMS   int64  `json:"-"`
+	ReceivedAtMS       int64  `json:"-"`
 }
 
 // NodeReportResult keeps the protocol acknowledgement tied to the exact

@@ -40,27 +40,40 @@ type SiteTraffic struct {
 	MonthlyTraffic     int64  `json:"monthly_traffic"`
 	Requests           int64  `json:"requests"`
 	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
-	CacheSizeBytes     int64  `json:"cache_size_bytes,omitempty"`
-	AgentRuntime       bool   `json:"-"`
+	// AgentSampledAtMS is the timestamp captured on the remote Agent. It is
+	// separate from SampledAtMS, which is the Controller receive timestamp.
+	AgentSampledAtMS  int64 `json:"agent_sampled_at_ms,omitempty"`
+	CacheSizeBytes    int64 `json:"cache_size_bytes,omitempty"`
+	AgentRuntime      bool  `json:"-"`
+	AgentReceivedAtMS int64 `json:"agent_received_at_ms,omitempty"`
+}
+
+type RealtimeTelemetryStatus struct {
+	AgentSites        int   `json:"agent_sites"`
+	StaleSites        int   `json:"stale_sites"`
+	LastReceivedAtMS  int64 `json:"last_received_at_ms,omitempty"`
+	LastSampledAtMS   int64 `json:"last_sampled_at_ms,omitempty"`
+	MaxReceiveDelayMS int64 `json:"max_receive_delay_ms,omitempty"`
 }
 
 // TrafficSnapshot is the single authoritative global traffic payload shared by
 // /api/dashboard, /api/traffic/overview and SSE events.
 type TrafficSnapshot struct {
-	TotalSites      int                  `json:"total_sites"`
-	OnlineSites     int                  `json:"online_sites"`
-	RunningSites    int                  `json:"running_sites"`
-	TotalTraffic    int64                `json:"total_traffic"`
-	MonthlyTraffic  int64                `json:"monthly_traffic"`
-	BillingMode     string               `json:"billing_mode"`
-	TrafficResetDay int                  `json:"traffic_reset_day"`
-	TotalRequests   int64                `json:"total_requests"`
-	UptimeSeconds   int64                `json:"uptime_seconds"`
-	PanelDomain     string               `json:"panel_domain,omitempty"`
-	PanelAccessURL  string               `json:"panel_access_url,omitempty"`
-	GeneratedAtMS   int64                `json:"generated_at_ms"`
-	LiveSites       []SiteTraffic        `json:"live_sites"`
-	RealtimeTrend   *dashboardTrendPoint `json:"realtime_trend,omitempty"`
+	TotalSites        int                      `json:"total_sites"`
+	OnlineSites       int                      `json:"online_sites"`
+	RunningSites      int                      `json:"running_sites"`
+	TotalTraffic      int64                    `json:"total_traffic"`
+	MonthlyTraffic    int64                    `json:"monthly_traffic"`
+	BillingMode       string                   `json:"billing_mode"`
+	TrafficResetDay   int                      `json:"traffic_reset_day"`
+	TotalRequests     int64                    `json:"total_requests"`
+	UptimeSeconds     int64                    `json:"uptime_seconds"`
+	PanelDomain       string                   `json:"panel_domain,omitempty"`
+	PanelAccessURL    string                   `json:"panel_access_url,omitempty"`
+	GeneratedAtMS     int64                    `json:"generated_at_ms"`
+	LiveSites         []SiteTraffic            `json:"live_sites"`
+	RealtimeTrend     *dashboardTrendPoint     `json:"realtime_trend,omitempty"`
+	RealtimeTelemetry *RealtimeTelemetryStatus `json:"realtime_telemetry,omitempty"`
 }
 
 // NodeSiteLiveTraffic is the last persisted runtime sample from an applied
@@ -73,6 +86,8 @@ type NodeSiteLiveTraffic struct {
 	CumulativeBytesOut int64
 	Requests           int64
 	SampledAtMS        int64
+	AgentSampledAtMS   int64
+	ReceivedAtMS       int64
 	CacheSizeBytes     int64
 }
 
@@ -346,11 +361,12 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 			return nil, err
 		}
 		liveKey := nodeLiveTrafficKey{nodeID: value.NodeID, siteID: value.SiteID}
-		if live, ok := liveOverlay[liveKey]; ok && live.SampledAtMS >= value.SampledAtMS {
+		if live, ok := liveOverlay[liveKey]; ok && live.ReceivedAtMS >= value.SampledAtMS {
 			value.CumulativeBytesIn = live.CumulativeBytesIn
 			value.CumulativeBytesOut = live.CumulativeBytesOut
 			value.Requests = live.Requests
 			value.SampledAtMS = live.SampledAtMS
+			value.AgentSampledAtMS = live.AgentSampledAtMS
 		}
 		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow
 		siteFresh := value.SampledAtMS > 0 && now.Sub(time.UnixMilli(value.SampledAtMS)) <= nodeOnlineWindow

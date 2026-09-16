@@ -897,13 +897,21 @@ function dashboardTrendSummary(data) {
   if (unit) unit.textContent = data?.billing_mode === 'outbound' ? '单向计费流量总数' : '双向计费流量总数';
 }
 
-function dashboardUpdateTrendHelp(resetEnabled) {
+function dashboardUpdateTrendHelp(resetEnabled, telemetry) {
   const help = document.getElementById('dashboard-trend-help');
   if (!help) return;
   const prefix = resetEnabled
     ? '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量按全局重置日统计'
     : '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量累计不重置';
-  help.textContent = `${prefix} · 数据时间 `;
+  const agentSites = Number(telemetry?.agent_sites || 0);
+  const staleSites = Number(telemetry?.stale_sites || 0);
+  let telemetryLabel = '';
+  if (agentSites > 0) {
+    telemetryLabel = staleSites > 0
+      ? ` · Agent 实时数据 ${staleSites}/${agentSites} 个站点暂不可用`
+      : ` · Agent 实时数据正常（${agentSites} 个站点）`;
+  }
+  help.textContent = `${prefix}${telemetryLabel} · 数据时间 `;
   const timezone = document.createElement('span');
   timezone.id = 'dashboard-trend-timezone';
   timezone.textContent = meridianTimezoneLabel();
@@ -1385,7 +1393,7 @@ function updateDashboardLive(stats) {
 	const resetEnabled = Number(stats.traffic_reset_day == null ? 1 : stats.traffic_reset_day) !== 0;
 	const trafficTitle = document.getElementById('s-traffic-title');
 	if (trafficTitle) trafficTitle.textContent = '已用流量';
-  dashboardUpdateTrendHelp(resetEnabled);
+  dashboardUpdateTrendHelp(resetEnabled, stats?.realtime_telemetry);
 
   const uptimeEl = document.getElementById('s-uptime');
   if (uptimeEl) uptimeEl.textContent = formatUptime(stats.uptime_seconds || 0);

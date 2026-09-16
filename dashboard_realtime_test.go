@@ -48,6 +48,51 @@ func TestDashboardRealtimePointFromSnapshotUsesCounterDeltas(t *testing.T) {
 	}
 }
 
+func TestDashboardRealtimeRemoteRepeatedSampleKeepsLastRate(t *testing.T) {
+	first := &TrafficSnapshot{BillingMode: "bidirectional", LiveSites: []SiteTraffic{{
+		ID: 7, CumulativeBytesIn: 100, CumulativeBytesOut: 200, Requests: 4,
+		AgentRuntime: true, AgentSampledAtMS: 1_000, AgentReceivedAtMS: 1_000,
+	}}}
+	_, previous := dashboardRealtimePointFromSnapshot(first, nil, 1_000)
+	second := &TrafficSnapshot{BillingMode: "bidirectional", LiveSites: []SiteTraffic{{
+		ID: 7, CumulativeBytesIn: 140, CumulativeBytesOut: 260, Requests: 5,
+		AgentRuntime: true, AgentSampledAtMS: 3_000, AgentReceivedAtMS: 3_000,
+	}}}
+	point, previous := dashboardRealtimePointFromSnapshot(second, previous, 3_000)
+	if point.DownloadBPS != 30 || point.UploadBPS != 20 {
+		t.Fatalf("remote initial rate=%v/%v, want 30/20", point.DownloadBPS, point.UploadBPS)
+	}
+	repeated := &TrafficSnapshot{BillingMode: "bidirectional", LiveSites: []SiteTraffic{{
+		ID: 7, CumulativeBytesIn: 140, CumulativeBytesOut: 260, Requests: 5,
+		AgentRuntime: true, AgentSampledAtMS: 3_000, AgentReceivedAtMS: 3_000,
+	}}}
+	point, _ = dashboardRealtimePointFromSnapshot(repeated, previous, 5_000)
+	if point.BytesIn != 0 || point.BytesOut != 0 || point.DownloadBPS != 30 || point.UploadBPS != 20 {
+		t.Fatalf("repeated remote sample=%+v, want zero deltas with held 30/20 rate", point)
+	}
+}
+
+func TestDashboardRealtimeRemoteStaleSampleClearsRate(t *testing.T) {
+	first := &TrafficSnapshot{BillingMode: "bidirectional", LiveSites: []SiteTraffic{{
+		ID: 9, CumulativeBytesIn: 100, CumulativeBytesOut: 200, Requests: 4,
+		AgentRuntime: true, AgentSampledAtMS: 1_000, AgentReceivedAtMS: 1_000,
+	}}}
+	_, previous := dashboardRealtimePointFromSnapshot(first, nil, 1_000)
+	second := &TrafficSnapshot{BillingMode: "bidirectional", LiveSites: []SiteTraffic{{
+		ID: 9, CumulativeBytesIn: 140, CumulativeBytesOut: 260, Requests: 5,
+		AgentRuntime: true, AgentSampledAtMS: 3_000, AgentReceivedAtMS: 3_000,
+	}}}
+	_, previous = dashboardRealtimePointFromSnapshot(second, previous, 3_000)
+	stale := &TrafficSnapshot{BillingMode: "bidirectional", LiveSites: []SiteTraffic{{
+		ID: 9, CumulativeBytesIn: 140, CumulativeBytesOut: 260, Requests: 5,
+		AgentRuntime: true, AgentSampledAtMS: 3_000, AgentReceivedAtMS: 3_000,
+	}}}
+	point, _ := dashboardRealtimePointFromSnapshot(stale, previous, 3_000+nodeOnlineWindow.Milliseconds()+1)
+	if point.DownloadBPS != 0 || point.UploadBPS != 0 {
+		t.Fatalf("stale remote sample retained rate=%v/%v, want zero", point.DownloadBPS, point.UploadBPS)
+	}
+}
+
 func TestAppendDashboardRealtimePointBoundsAndReplacement(t *testing.T) {
 	points := make([]dashboardTrendPoint, 0, dashboardRealtimeServerMaxPoints+10)
 	for i := int64(0); i < dashboardRealtimeServerMaxPoints+10; i++ {

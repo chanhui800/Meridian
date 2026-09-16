@@ -16,10 +16,15 @@ const (
 )
 
 type dashboardRealtimeCounter struct {
-	BytesIn     int64
-	BytesOut    int64
-	Requests    int64
-	SampledAtMS int64
+	BytesIn           int64
+	BytesOut          int64
+	Requests          int64
+	SampledAtMS       int64
+	AgentSampledAtMS  int64
+	AgentReceivedAtMS int64
+	AgentRuntime      bool
+	LastDownloadBPS   float64
+	LastUploadBPS     float64
 }
 
 // startDashboardRealtimeSampler starts one process-wide sampler. It is
@@ -99,6 +104,10 @@ func cloneTrafficSnapshot(snapshot *TrafficSnapshot) *TrafficSnapshot {
 		trend := cloneDashboardTrendPoint(*snapshot.RealtimeTrend)
 		cloned.RealtimeTrend = &trend
 	}
+	if snapshot.RealtimeTelemetry != nil {
+		status := *snapshot.RealtimeTelemetry
+		cloned.RealtimeTelemetry = &status
+	}
 	return &cloned
 }
 
@@ -126,10 +135,13 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			continue
 		}
 		current := dashboardRealtimeCounter{
-			BytesIn:     maxNonNegativeInt64(site.CumulativeBytesIn),
-			BytesOut:    maxNonNegativeInt64(site.CumulativeBytesOut),
-			Requests:    maxNonNegativeInt64(site.Requests),
-			SampledAtMS: sampledAtMS,
+			BytesIn:           maxNonNegativeInt64(site.CumulativeBytesIn),
+			BytesOut:          maxNonNegativeInt64(site.CumulativeBytesOut),
+			Requests:          maxNonNegativeInt64(site.Requests),
+			SampledAtMS:       sampledAtMS,
+			AgentSampledAtMS:  site.AgentSampledAtMS,
+			AgentReceivedAtMS: site.AgentReceivedAtMS,
+			AgentRuntime:      site.AgentRuntime,
 		}
 		prior, exists := previous[site.ID]
 		deltaIn, deltaOut, deltaRequests := int64(0), int64(0), int64(0)
@@ -138,8 +150,14 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			deltaIn = counterDelta(current.BytesIn, prior.BytesIn)
 			deltaOut = counterDelta(current.BytesOut, prior.BytesOut)
 			deltaRequests = counterDelta(current.Requests, prior.Requests)
-			if elapsed := time.Duration(sampledAtMS-prior.SampledAtMS) * time.Millisecond; elapsed > 0 {
-				seconds = elapsed.Seconds()
+			if current.AgentRuntime && current.AgentSampledAtMS > prior.AgentSampledAtMS && prior.AgentSampledAtMS > 0 {
+				if elapsed := time.Duration(current.AgentSampledAtMS-prior.AgentSampledAtMS) * time.Millisecond; elapsed > 0 {
+					seconds = elapsed.Seconds()
+				}
+			} else if !current.AgentRuntime {
+				if elapsed := time.Duration(sampledAtMS-prior.SampledAtMS) * time.Millisecond; elapsed > 0 {
+					seconds = elapsed.Seconds()
+				}
 			}
 		}
 		sitePoint := dashboardTrendPoint{
@@ -150,6 +168,14 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			DownloadBPS: float64(deltaOut) / seconds,
 			UploadBPS:   float64(deltaIn) / seconds,
 		}
+		remoteFresh := current.AgentReceivedAtMS > 0 && sampledAtMS >= current.AgentReceivedAtMS && sampledAtMS-current.AgentReceivedAtMS <= nodeOnlineWindow.Milliseconds()
+		if exists && current.AgentRuntime && remoteFresh && current.AgentSampledAtMS <= prior.AgentSampledAtMS && deltaIn == 0 && deltaOut == 0 {
+			// A delayed/repeated remote sample is not proof that traffic stopped.
+			// Keep the last measured rate for this short controller tick; freshness
+			// still clears it when the Agent truly goes stale.
+			sitePoint.DownloadBPS = prior.LastDownloadBPS
+			sitePoint.UploadBPS = prior.LastUploadBPS
+		}
 		// Keep a per-site traffic value so the frontend can render a selected
 		// site from the same authoritative aggregate sample.
 		sitePoint.Traffic = trafficBillableBytes(snapshot.BillingMode, deltaIn, deltaOut)
@@ -157,11 +183,13 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 		point.BytesIn += deltaIn
 		point.BytesOut += deltaOut
 		point.Requests += deltaRequests
+		point.DownloadBPS += sitePoint.DownloadBPS
+		point.UploadBPS += sitePoint.UploadBPS
+		current.LastDownloadBPS = sitePoint.DownloadBPS
+		current.LastUploadBPS = sitePoint.UploadBPS
 		next[site.ID] = current
 	}
 	point.Traffic = trafficBillableBytes(snapshot.BillingMode, point.BytesIn, point.BytesOut)
-	point.DownloadBPS = float64(point.BytesOut) / dashboardRealtimeElapsedSeconds(sampledAtMS, previous)
-	point.UploadBPS = float64(point.BytesIn) / dashboardRealtimeElapsedSeconds(sampledAtMS, previous)
 	if len(point.SiteContributions) == 0 {
 		point.SiteContributions = nil
 	}

@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -138,6 +139,57 @@ func TestAgentTelemetrySequenceIsBoundToSnapshotOrder(t *testing.T) {
 	secondSequence := <-secondDone
 	if firstSequence <= 0 || secondSequence != firstSequence+1 {
 		t.Fatalf("telemetry sequence order=%d,%d, want consecutive snapshot order", firstSequence, secondSequence)
+	}
+}
+
+func TestEdgeLiveReportRetriesAfterBoundedTimeout(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondReceived := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			// Outlive the 1.5s per-attempt deadline without depending on
+			// server-side request-context cancellation semantics.
+			time.Sleep(1600 * time.Millisecond)
+			return
+		}
+		close(secondReceived)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		done <- edgeLiveReportLoop(ctx, server.Client(), server.URL, "token", "session", 0, &edgeAgentRuntime{})
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live report did not start")
+	}
+	select {
+	case <-secondReceived:
+	case <-time.After(4 * time.Second):
+		t.Fatal("live report did not retry after the bounded timeout")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("live report loop returned error after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live report loop did not stop after cancellation")
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("bounded live retry took %v, want under 4s", elapsed)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("live report attempts=%d, want at least 2", got)
 	}
 }
 

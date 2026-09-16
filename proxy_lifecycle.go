@@ -464,6 +464,8 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 			st.CumulativeBytesOut = remote.CumulativeBytesOut
 			st.Requests = remote.Requests
 			st.SampledAtMS = remote.SampledAtMS
+			st.AgentSampledAtMS = remote.AgentSampledAtMS
+			st.AgentReceivedAtMS = remote.ReceivedAtMS
 			st.CacheSizeBytes = remote.CacheSizeBytes
 			st.AgentRuntime = true
 			st.BytesIn = 0
@@ -486,6 +488,31 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 	snap.UptimeSeconds = int64(now.Sub(startTime).Seconds())
 	if snap.UptimeSeconds < 0 {
 		snap.UptimeSeconds = 0
+	}
+	telemetry := &RealtimeTelemetryStatus{}
+	for _, site := range snap.LiveSites {
+		if !site.AgentRuntime {
+			continue
+		}
+		telemetry.AgentSites++
+		if !site.Running {
+			telemetry.StaleSites++
+		}
+		if site.AgentReceivedAtMS > telemetry.LastReceivedAtMS {
+			telemetry.LastReceivedAtMS = site.AgentReceivedAtMS
+		}
+		if site.AgentSampledAtMS > telemetry.LastSampledAtMS {
+			telemetry.LastSampledAtMS = site.AgentSampledAtMS
+		}
+		if site.AgentReceivedAtMS > 0 {
+			delay := now.UnixMilli() - site.AgentReceivedAtMS
+			if delay > telemetry.MaxReceiveDelayMS {
+				telemetry.MaxReceiveDelayMS = delay
+			}
+		}
+	}
+	if telemetry.AgentSites > 0 {
+		snap.RealtimeTelemetry = telemetry
 	}
 	snap.RealtimeTrend = pm.dashboardRealtimeTrendLatest()
 	return snap
