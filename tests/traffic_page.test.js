@@ -1008,11 +1008,107 @@ test('dashboard realtime smoothing is time-aware and leaves historical ranges ra
   assert.deepEqual(Array.from(result.historical), [100, 0]);
 });
 
+test('dashboard realtime display density adapts to plot width without changing the raw window', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = Array.from({ length: 150 }, (_, index) => ({
+      timestamp_ms: (index + 1) * 2000,
+      download_bps: index,
+      upload_bps: index / 2,
+      traffic_bytes: 1,
+      requests: index % 3 === 0 ? 1 : 0,
+    }));
+    return {
+      rawLength: points.length,
+      desktop: dashboardTrendDisplayPoints(points, 'traffic', 500),
+      mobile: dashboardTrendDisplayPoints(points, 'traffic', 320),
+    };
+  })()`, sandbox);
+  assert.equal(result.rawLength, 150);
+  assert.equal(result.desktop.length, 50);
+  assert.equal(result.mobile.length, 32);
+  assert.equal(Array.from(result.desktop).reduce((sum, point) => sum + point.traffic_bytes, 0), 150);
+  assert.equal(Array.from(result.desktop).reduce((sum, point) => sum + point.requests, 0), 50);
+  assert.equal(Array.from(result.mobile).reduce((sum, point) => sum + point.traffic_bytes, 0), 150);
+  assert.equal(Array.from(result.mobile).reduce((sum, point) => sum + point.requests, 0), 50);
+});
+
+test('dashboard realtime buckets preserve weighted speed and per-site totals', () => {
+  const { sandbox } = makeTrafficHarness();
+  const point = vm.runInContext(`dashboardAggregateTrendBucket([
+    {
+      timestamp_ms: 2000, download_bps: 10, upload_bps: 4, traffic_bytes: 12, requests: 1,
+      site_contributions: {
+        a: { download_bps: 4, upload_bps: 1, traffic_bytes: 5, requests: 1 },
+        b: { download_bps: 6, upload_bps: 3, traffic_bytes: 7, requests: 0 },
+      },
+    },
+    {
+      timestamp_ms: 4000, download_bps: 20, upload_bps: 8, traffic_bytes: 18, requests: 0,
+      site_contributions: {
+        a: { download_bps: 8, upload_bps: 2, traffic_bytes: 6, requests: 0 },
+        b: { download_bps: 12, upload_bps: 6, traffic_bytes: 12, requests: 0 },
+      },
+    },
+    {
+      timestamp_ms: 8000, download_bps: 40, upload_bps: 16, traffic_bytes: 30, requests: 2,
+      site_contributions: {
+        a: { download_bps: 16, upload_bps: 4, traffic_bytes: 10, requests: 1 },
+        b: { download_bps: 24, upload_bps: 12, traffic_bytes: 20, requests: 1 },
+      },
+    },
+  ], [2000, 2000, 4000])`, sandbox);
+  assert.equal(point.download_bps, 27.5);
+  assert.equal(point.upload_bps, 11);
+  assert.equal(point.traffic_bytes, 60);
+  assert.equal(point.requests, 3);
+  assert.equal(point.bucket_start_ms, 2000);
+  assert.equal(point.bucket_end_ms, 8000);
+  assert.equal(point.sample_count, 3);
+  const sites = point.site_contributions;
+  assert.equal(sites.a.traffic_bytes + sites.b.traffic_bytes, point.traffic_bytes);
+  assert.equal(sites.a.requests + sites.b.requests, point.requests);
+  assert.equal(sites.a.download_bps + sites.b.download_bps, point.download_bps);
+  assert.equal(sites.a.upload_bps + sites.b.upload_bps, point.upload_bps);
+});
+
+test('dashboard monotone controls stay inside adjacent value ranges', () => {
+  const { sandbox } = makeTrafficHarness();
+  const controls = vm.runInContext(`dashboardTrendMonotoneControls([
+    { x: 0, y: 20 },
+    { x: 10, y: 80 },
+    { x: 20, y: 30 },
+    { x: 30, y: 60 },
+  ])`, sandbox);
+  Array.from(controls).forEach((control, index) => {
+    const values = [20, 80, 30, 60];
+    const min = Math.min(values[index], values[index + 1]);
+    const max = Math.max(values[index], values[index + 1]);
+    assert.ok(control.cp1y >= min && control.cp1y <= max);
+    assert.ok(control.cp2y >= min && control.cp2y <= max);
+  });
+  const source = readScript('pages/dashboard.js');
+  assert.match(source, /const monotone = metric !== 'requests'/);
+  assert.match(source, /dashboardTrendTracePath\(ctx, segment, monotone\)/);
+});
+
+test('dashboard realtime bucket tooltip keeps its time range compact', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`dashboardTrendTooltipTime({
+    timestamp_ms: Date.UTC(2026, 8, 16, 10, 0, 6),
+    bucket_start_ms: Date.UTC(2026, 8, 16, 10, 0, 0),
+    bucket_end_ms: Date.UTC(2026, 8, 16, 10, 0, 6),
+  }, 'realtime')`, sandbox);
+  assert.match(result, / - \d{2}:\d{2}:\d{2}$/);
+  assert.equal((result.match(/2026/g) || []).length, 1);
+});
+
 test('dashboard area fill closes at real samples and cannot imply a boundary drop', () => {
   const source = readScript('pages/dashboard.js');
   assert.match(source, /const pointsOnCanvas = item\.points;/);
   assert.doesNotMatch(source, /dashboardTrendPaddedPathPoints/);
-  assert.match(source, /pointsOnCanvas\[pointsOnCanvas\.length - 1\]\.x, top \+ plotH/);
+  assert.match(source, /segment\[segment\.length - 1\]\.x, top \+ plotH/);
   assert.match(source, /dashboardTrendLineSegments\(pointsOnCanvas\)/);
 });
 
