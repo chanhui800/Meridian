@@ -711,18 +711,6 @@ test('dashboard realtime chart uses a fixed five-minute window and sparse bounda
   assert.equal(vm.runInContext('dashboardTrendAxisLabel(1, [{ timestamp_ms: 179000 } , { timestamp_ms: 180000 }], "realtime", -120000, 180000)', h.sandbox), 180000);
 });
 
-test('dashboard realtime paths stay anchored to both chart boundaries', () => {
-  const h = makeTrafficHarness();
-  const padded = vm.runInContext(`dashboardTrendPaddedPathPoints(
-    [{ x: 120, y: 80 }, { x: 180, y: 80 }], 20, 280, 180, true
-  )`, h.sandbox);
-  assert.equal(padded[0].x, 20);
-  assert.equal(padded.at(-1).x, 280);
-  assert.equal(padded[0].y, 180);
-  assert.equal(padded.at(-1).y, 180);
-  assert.equal(padded.length, 4);
-});
-
 test('dashboard realtime Agent baseline converts cumulative samples into a lossless tail', () => {
   const h = makeTrafficHarness();
   const points = vm.runInContext(`(() => {
@@ -978,18 +966,54 @@ test('dashboard zero-value trend scales never render negative or invalid labels'
   assert.equal(vm.runInContext('dashboardTrendValueLabel(0, "requests")', sandbox), '0');
 });
 
-test('dashboard realtime speed keeps unavailable samples as line gaps', () => {
+test('dashboard realtime speed and traffic stay continuous without changing requests', () => {
   const { sandbox } = makeTrafficHarness();
   const normalized = vm.runInContext('dashboardNormalizeRealtimePoint({ timestamp_ms: 1000, download_bps: 42, upload_bps: 7, speed_unavailable: true })', sandbox);
   assert.equal(normalized.speed_unavailable, true);
   assert.equal(vm.runInContext('dashboardTrendMetricLine({ speed_unavailable: true }, "speed")', sandbox), '速度暂不可用');
-  const segments = vm.runInContext(`dashboardTrendLineSegments([
-    { x: 0, y: 10, valid: true },
-    { x: 1, y: null, valid: false },
-    { x: 2, y: 20, valid: true },
-    { x: 3, y: 30, valid: true }
-  ])`, sandbox);
-  assert.deepEqual(Array.from(segments, segment => Array.from(segment, point => point.x)), [[0], [2, 3]]);
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = [
+      { timestamp_ms: 1000, download_bps: 100, traffic_bytes: 200, requests: 1 },
+      { timestamp_ms: 3000, download_bps: 0, traffic_bytes: 0, requests: 0 },
+      { timestamp_ms: 5000, download_bps: 100, traffic_bytes: 200, requests: 1 },
+      { timestamp_ms: 7000, download_bps: 0, traffic_bytes: 0, requests: 0, speed_unavailable: true },
+    ];
+    return {
+      speed: dashboardTrendRenderSeries(points, 'speed')[0],
+      traffic: dashboardTrendRenderSeries(points, 'traffic')[0],
+      requests: dashboardTrendRenderSeries(points, 'requests')[0],
+    };
+  })()`, sandbox);
+  assert.deepEqual(Array.from(result.speed, Math.round), [100, 65, 77, 50]);
+  assert.deepEqual(Array.from(result.traffic, Math.round), [200, 130, 155, 100]);
+  assert.deepEqual(Array.from(result.requests), [1, 0, 1, 0], 'request deltas must remain exact and unsmoothed');
+  assert.ok(Array.from(result.speed).every(Number.isFinite), 'unavailable speed samples must decay instead of splitting the line');
+});
+
+test('dashboard realtime smoothing is time-aware and leaves historical ranges raw', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    const points = [
+      { timestamp_ms: 1000, traffic_bytes: 100 },
+      { timestamp_ms: 9000, traffic_bytes: 0 },
+    ];
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const realtime = dashboardTrendRenderSeries(points, 'traffic')[0];
+    dashboardTrendState.range = 'hour';
+    const historical = dashboardTrendRenderSeries(points, 'traffic')[0];
+    return { realtime, historical };
+  })()`, sandbox);
+  assert.ok(result.realtime[1] < 20 && result.realtime[1] > 0, 'a long gap should decay quickly without snapping to zero');
+  assert.deepEqual(Array.from(result.historical), [100, 0]);
+});
+
+test('dashboard area fill closes at real samples and cannot imply a boundary drop', () => {
+  const source = readScript('pages/dashboard.js');
+  assert.match(source, /const pointsOnCanvas = item\.points;/);
+  assert.doesNotMatch(source, /dashboardTrendPaddedPathPoints/);
+  assert.match(source, /pointsOnCanvas\[pointsOnCanvas\.length - 1\]\.x, top \+ plotH/);
+  assert.match(source, /dashboardTrendLineSegments\(pointsOnCanvas\)/);
 });
 
 test('global traffic settings expose reset and no-reset billing cycles', () => {

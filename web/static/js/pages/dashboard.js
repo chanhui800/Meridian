@@ -952,15 +952,6 @@ function dashboardRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-function dashboardTrendPaddedPathPoints(points, left, right, baselineY, realtime) {
-  if (!realtime || !Array.isArray(points) || !points.length) return points || [];
-  const padded = points.slice();
-  const epsilon = 0.5;
-  if (padded[0].x > left + epsilon) padded.unshift({ x: left, y: baselineY, synthetic: true });
-  if (padded[padded.length - 1].x < right - epsilon) padded.push({ x: right, y: baselineY, synthetic: true });
-  return padded;
-}
-
 function dashboardTrendLineSegments(points) {
   if (!Array.isArray(points) || !points.length) return [];
   const segments = [];
@@ -977,6 +968,48 @@ function dashboardTrendLineSegments(points) {
   return segments;
 }
 
+// Realtime proxy traffic is sampled in two-second buckets. Video clients fill
+// their buffers in bursts, so plotting every raw zero between two chunks makes
+// an otherwise healthy stream look disconnected. Smooth only the visual
+// series: summaries, tooltips, persisted counters and request deltas continue
+// to use the exact Controller values.
+function dashboardRealtimeSmoothedValues(points, values, alpha = 0.35) {
+  if (!Array.isArray(values) || !values.length) return [];
+  let smoothed = null;
+  let previousTimestamp = 0;
+  return values.map((value, index) => {
+    const numeric = Number(value);
+    const current = Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
+    const timestamp = Number(points?.[index]?.timestamp_ms || 0);
+    if (smoothed === null) {
+      smoothed = current;
+    } else {
+      const elapsed = timestamp > previousTimestamp && previousTimestamp > 0
+        ? timestamp - previousTimestamp
+        : 2000;
+      // Make the filter stable when a delayed sample spans several nominal
+      // intervals. The cap lets a long outage decay quickly without snapping.
+      const intervals = Math.max(0.5, Math.min(4, elapsed / 2000));
+      const effectiveAlpha = 1 - Math.pow(1 - alpha, intervals);
+      smoothed += effectiveAlpha * (current - smoothed);
+      if (current === 0 && smoothed < 0.5) smoothed = 0;
+    }
+    if (timestamp > 0) previousTimestamp = timestamp;
+    return smoothed;
+  });
+}
+
+function dashboardTrendRenderSeries(points, metric) {
+  const raw = metric === 'speed'
+    ? [
+        points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.download_bps || 0))),
+        points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.upload_bps || 0))),
+      ]
+    : [points.map(point => dashboardTrendMetricValue(point, metric))];
+  if (dashboardTrendState.range !== 'realtime' || metric === 'requests') return raw;
+  return raw.map(values => dashboardRealtimeSmoothedValues(points, values));
+}
+
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
   const points = dashboardTrendChartPoints();
@@ -991,9 +1024,10 @@ function drawDashboardTrendChart(metric) {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
+  const renderValues = dashboardTrendRenderSeries(points, metric);
   const series = metric === 'speed'
-    ? [{ values: points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.download_bps || 0))), color: '#3b9cff' }, { values: points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.upload_bps || 0))), color: '#a78bfa' }]
-    : [{ values: points.map(point => dashboardTrendMetricValue(point, metric)), color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
+    ? [{ values: renderValues[0], color: '#3b9cff' }, { values: renderValues[1], color: '#a78bfa' }]
+    : [{ values: renderValues[0], color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
   const scaleValues = series.flatMap(item => item.values).filter(value => Number.isFinite(value));
   const scale = dashboardRequestScale(Math.max(0, ...scaleValues), metric);
   ctx.font = `${width < 360 ? 10 : 11}px system-ui`;
@@ -1030,20 +1064,9 @@ function drawDashboardTrendChart(metric) {
     x: xForTimestamp(points[index]?.timestamp_ms),
     y: Number.isFinite(value) ? top + plotH * (1 - (value / (scale.max || 1))) : null,
     valid: Number.isFinite(value),
-  })), pathPoints: [] }));
+  })) }));
   canvasSeries.forEach(item => {
-    item.pathPoints = metric === 'speed'
-      ? item.points
-      : dashboardTrendPaddedPathPoints(
-        item.points,
-        left,
-        width - right,
-        top + plotH,
-        dashboardTrendState.range === 'realtime',
-      );
-  });
-  canvasSeries.forEach(item => {
-    const pointsOnCanvas = item.pathPoints;
+    const pointsOnCanvas = item.points;
     if (metric !== 'speed') {
       ctx.beginPath();
       pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
