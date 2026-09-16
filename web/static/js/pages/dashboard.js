@@ -206,7 +206,7 @@ function dashboardRequestScale(maxValue, metric = '') {
     // Request deltas are integer counts. Keep the axis integer-valued so a
     // single request is not rendered with rounded fractional labels such as
     // 000111, which makes the chart look like it contains duplicate events.
-    const ceiling = Math.max(1, Math.ceil(Number(maxValue) || 0));
+    const ceiling = Math.max(5, Math.ceil(Number(maxValue) || 0));
     if (ceiling <= 6) return { max: ceiling, step: 1, ticks: ceiling };
     const roughStep = ceiling / 6;
     const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
@@ -374,6 +374,7 @@ function dashboardTrendTimeLabel(timestamp, range) {
 
 function dashboardTrendMetricLine(point, metric) {
   if (!point) return '暂无数据';
+  if (metric === 'speed' && point.speed_unavailable === true) return '速度暂不可用';
   if (metric === 'speed') return `↓ ${formatRate(point.download_bps)} · ↑ ${formatRate(point.upload_bps)}`;
   if (metric === 'requests') return `请求 ${formatNumber(point.requests || 0)} 次`;
   if (metric === 'traffic') return `流量 ${formatBytes(point.traffic_bytes || 0)}`;
@@ -400,7 +401,7 @@ function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
         // turning a sparse array lookup into a misleading zero.
         let sample;
         if (metric === 'speed') {
-          sample = dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms) || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+          sample = dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms) || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0, speed_unavailable: true };
         } else {
           // Traffic and request values describe the contribution to this
           // aggregate interval. Carrying forward the previous sparse sample
@@ -504,6 +505,7 @@ function dashboardNormalizeRealtimePoint(value) {
     bytes_in: numberOrZero(value.bytes_in),
     bytes_out: numberOrZero(value.bytes_out),
     requests: numberOrZero(value.requests),
+    speed_unavailable: value.speed_unavailable === true,
   };
   // Cumulative counters let the realtime tail start from the exact
   // persisted Agent baseline returned by the Controller. Older localStorage
@@ -959,6 +961,22 @@ function dashboardTrendPaddedPathPoints(points, left, right, baselineY, realtime
   return padded;
 }
 
+function dashboardTrendLineSegments(points) {
+  if (!Array.isArray(points) || !points.length) return [];
+  const segments = [];
+  let current = [];
+  points.forEach(point => {
+    if (point && point.valid !== false && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+      current.push(point);
+      return;
+    }
+    if (current.length) segments.push(current);
+    current = [];
+  });
+  if (current.length) segments.push(current);
+  return segments;
+}
+
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
   const points = dashboardTrendChartPoints();
@@ -974,9 +992,10 @@ function drawDashboardTrendChart(metric) {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
   const series = metric === 'speed'
-    ? [{ values: points.map(point => Math.max(0, Number(point.download_bps || 0))), color: '#3b9cff' }, { values: points.map(point => Math.max(0, Number(point.upload_bps || 0))), color: '#a78bfa' }]
+    ? [{ values: points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.download_bps || 0))), color: '#3b9cff' }, { values: points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.upload_bps || 0))), color: '#a78bfa' }]
     : [{ values: points.map(point => dashboardTrendMetricValue(point, metric)), color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
-  const scale = dashboardRequestScale(Math.max(0, ...series.flatMap(item => item.values)), metric);
+  const scaleValues = series.flatMap(item => item.values).filter(value => Number.isFinite(value));
+  const scale = dashboardRequestScale(Math.max(0, ...scaleValues), metric);
   ctx.font = `${width < 360 ? 10 : 11}px system-ui`;
   const yLabelWidth = Math.max(...Array.from({ length: scale.ticks + 1 }, (_, index) => ctx.measureText(dashboardTrendValueLabel(scale.max - scale.step * index, metric)).width));
   const left = Math.min(Math.max(50, Math.ceil(yLabelWidth) + 16), Math.floor(width * .36));
@@ -1009,31 +1028,37 @@ function drawDashboardTrendChart(metric) {
   if (ctx.setLineDash) ctx.setLineDash([]);
   const canvasSeries = series.map(item => ({ ...item, points: item.values.map((value, index) => ({
     x: xForTimestamp(points[index]?.timestamp_ms),
-    y: top + plotH * (1 - (value / (scale.max || 1))),
+    y: Number.isFinite(value) ? top + plotH * (1 - (value / (scale.max || 1))) : null,
+    valid: Number.isFinite(value),
   })), pathPoints: [] }));
   canvasSeries.forEach(item => {
-    item.pathPoints = dashboardTrendPaddedPathPoints(
-      item.points,
-      left,
-      width - right,
-      top + plotH,
-      dashboardTrendState.range === 'realtime',
-    );
+    item.pathPoints = metric === 'speed'
+      ? item.points
+      : dashboardTrendPaddedPathPoints(
+        item.points,
+        left,
+        width - right,
+        top + plotH,
+        dashboardTrendState.range === 'realtime',
+      );
   });
   canvasSeries.forEach(item => {
     const pointsOnCanvas = item.pathPoints;
-    ctx.beginPath();
-    pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
     if (metric !== 'speed') {
-      ctx.lineTo(pointsOnCanvas[pointsOnCanvas.length - 1].x, top + plotH); ctx.lineTo(pointsOnCanvas[0].x, top + plotH); ctx.closePath();
-      ctx.globalAlpha = .12; ctx.fillStyle = item.color; ctx.fill(); ctx.globalAlpha = 1;
       ctx.beginPath();
       pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+      ctx.lineTo(pointsOnCanvas[pointsOnCanvas.length - 1].x, top + plotH); ctx.lineTo(pointsOnCanvas[0].x, top + plotH); ctx.closePath();
+      ctx.globalAlpha = .12; ctx.fillStyle = item.color; ctx.fill(); ctx.globalAlpha = 1;
     }
-    ctx.strokeStyle = item.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+    ctx.strokeStyle = item.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    dashboardTrendLineSegments(pointsOnCanvas).forEach(segment => {
+      ctx.beginPath();
+      segment.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+      ctx.stroke();
+    });
   });
   const pointsOnCanvas = canvasSeries[0].points;
-  if (chart.hoverIndex >= 0 && pointsOnCanvas[chart.hoverIndex]) {
+  if (chart.hoverIndex >= 0 && pointsOnCanvas[chart.hoverIndex]?.valid !== false) {
     const point = pointsOnCanvas[chart.hoverIndex];
     ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = canvasSeries[0].color; ctx.lineWidth = 2; ctx.stroke();
   }

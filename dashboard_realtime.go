@@ -13,18 +13,25 @@ const (
 	dashboardRealtimeServerInterval  = 2 * time.Second
 	dashboardRealtimeServerWindow    = 5 * time.Minute
 	dashboardRealtimeServerMaxPoints = 150
+	agentRealtimeRateHoldWindow      = 3 * dashboardRealtimeServerInterval
+	agentRealtimeBackfillMaxPoints   = 8
 )
 
 type dashboardRealtimeCounter struct {
-	BytesIn           int64
-	BytesOut          int64
-	Requests          int64
-	SampledAtMS       int64
-	AgentSampledAtMS  int64
-	AgentReceivedAtMS int64
-	AgentRuntime      bool
-	LastDownloadBPS   float64
-	LastUploadBPS     float64
+	BytesIn            int64
+	BytesOut           int64
+	Requests           int64
+	SampledAtMS        int64
+	AgentSampledAtMS   int64
+	AgentReceivedAtMS  int64
+	AgentRuntime       bool
+	AgentDownloadBPS   float64
+	AgentUploadBPS     float64
+	AgentRateValid     bool
+	LastDownloadBPS    float64
+	LastUploadBPS      float64
+	LastRateValid      bool
+	LastAgentAdvanceMS int64
 }
 
 // startDashboardRealtimeSampler starts one process-wide sampler. It is
@@ -78,6 +85,7 @@ func (pm *ProxyManager) captureDashboardRealtimeSample() {
 	}
 	pm.dashboardRealtimeBillingMode = snapshot.BillingMode
 	point, next := dashboardRealtimePointFromSnapshot(snapshot, pm.dashboardRealtimePrev, sampledAtMS)
+	backfillDashboardRealtimeAgentTraffic(pm.dashboardRealtimePoints, &point, snapshot.BillingMode, pm.dashboardRealtimePrev, next)
 	pm.dashboardRealtimePrev = next
 	pm.dashboardRealtimeLastMS = sampledAtMS
 	pm.dashboardRealtimePoints = appendDashboardRealtimePoint(pm.dashboardRealtimePoints, point)
@@ -142,8 +150,18 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			AgentSampledAtMS:  site.AgentSampledAtMS,
 			AgentReceivedAtMS: site.AgentReceivedAtMS,
 			AgentRuntime:      site.AgentRuntime,
+			AgentDownloadBPS:  site.AgentDownloadBPS,
+			AgentUploadBPS:    site.AgentUploadBPS,
+			AgentRateValid:    site.AgentRateValid,
 		}
 		prior, exists := previous[site.ID]
+		if current.AgentRuntime {
+			if !exists || current.AgentSampledAtMS > prior.AgentSampledAtMS {
+				current.LastAgentAdvanceMS = sampledAtMS
+			} else {
+				current.LastAgentAdvanceMS = prior.LastAgentAdvanceMS
+			}
+		}
 		deltaIn, deltaOut, deltaRequests := int64(0), int64(0), int64(0)
 		seconds := dashboardRealtimeServerInterval.Seconds()
 		if exists {
@@ -168,13 +186,20 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			DownloadBPS: float64(deltaOut) / seconds,
 			UploadBPS:   float64(deltaIn) / seconds,
 		}
-		remoteFresh := current.AgentReceivedAtMS > 0 && sampledAtMS >= current.AgentReceivedAtMS && sampledAtMS-current.AgentReceivedAtMS <= nodeOnlineWindow.Milliseconds()
-		if exists && current.AgentRuntime && remoteFresh && current.AgentSampledAtMS <= prior.AgentSampledAtMS && deltaIn == 0 && deltaOut == 0 {
+		remoteFresh := current.AgentReceivedAtMS > 0 && sampledAtMS >= current.AgentReceivedAtMS && sampledAtMS-current.AgentReceivedAtMS <= agentRealtimeRateHoldWindow.Milliseconds()
+		if current.AgentRuntime && remoteFresh && current.AgentRateValid {
+			sitePoint.DownloadBPS = current.AgentDownloadBPS
+			sitePoint.UploadBPS = current.AgentUploadBPS
+		} else if exists && current.AgentRuntime && remoteFresh && current.AgentSampledAtMS <= prior.AgentSampledAtMS && deltaIn == 0 && deltaOut == 0 && prior.LastRateValid {
 			// A delayed/repeated remote sample is not proof that traffic stopped.
 			// Keep the last measured rate for this short controller tick; freshness
 			// still clears it when the Agent truly goes stale.
 			sitePoint.DownloadBPS = prior.LastDownloadBPS
 			sitePoint.UploadBPS = prior.LastUploadBPS
+		} else if current.AgentRuntime {
+			sitePoint.SpeedUnavailable = true
+			sitePoint.DownloadBPS = 0
+			sitePoint.UploadBPS = 0
 		}
 		// Keep a per-site traffic value so the frontend can render a selected
 		// site from the same authoritative aggregate sample.
@@ -185,8 +210,12 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 		point.Requests += deltaRequests
 		point.DownloadBPS += sitePoint.DownloadBPS
 		point.UploadBPS += sitePoint.UploadBPS
+		if sitePoint.SpeedUnavailable {
+			point.SpeedUnavailable = true
+		}
 		current.LastDownloadBPS = sitePoint.DownloadBPS
 		current.LastUploadBPS = sitePoint.UploadBPS
+		current.LastRateValid = !sitePoint.SpeedUnavailable
 		next[site.ID] = current
 	}
 	point.Traffic = trafficBillableBytes(snapshot.BillingMode, point.BytesIn, point.BytesOut)
@@ -194,6 +223,72 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 		point.SiteContributions = nil
 	}
 	return point, next
+}
+
+// backfillDashboardRealtimeAgentTraffic redistributes a short Agent reporting
+// gap over the controller buckets it actually covered. The cumulative counter
+// remains the source of truth, and integer remainders are retained exactly, so
+// the visible bucket sum always equals the accepted counter delta.
+func backfillDashboardRealtimeAgentTraffic(points []dashboardTrendPoint, current *dashboardTrendPoint, billingMode string, previous, next map[int64]dashboardRealtimeCounter) {
+	if current == nil || len(points) == 0 {
+		return
+	}
+	for siteID, nextCounter := range next {
+		prior, ok := previous[siteID]
+		if !ok || !nextCounter.AgentRuntime || nextCounter.AgentSampledAtMS <= prior.AgentSampledAtMS || prior.LastAgentAdvanceMS <= 0 {
+			continue
+		}
+		currentSite, ok := current.SiteContributions[siteID]
+		if !ok || (currentSite.BytesIn == 0 && currentSite.BytesOut == 0) {
+			continue
+		}
+		targets := make([]*dashboardTrendPoint, 0, agentRealtimeBackfillMaxPoints)
+		for index := range points {
+			if points[index].TimestampMS <= prior.LastAgentAdvanceMS {
+				continue
+			}
+			if _, exists := points[index].SiteContributions[siteID]; exists {
+				targets = append(targets, &points[index])
+			}
+		}
+		targets = append(targets, current)
+		if len(targets) <= 1 || len(targets) > agentRealtimeBackfillMaxPoints {
+			continue
+		}
+		for index, target := range targets {
+			bytesIn := distributedCounterPart(currentSite.BytesIn, len(targets), index)
+			bytesOut := distributedCounterPart(currentSite.BytesOut, len(targets), index)
+			setDashboardRealtimeSiteTraffic(target, siteID, billingMode, bytesIn, bytesOut)
+		}
+	}
+}
+
+func distributedCounterPart(total int64, count, index int) int64 {
+	if total <= 0 || count <= 0 || index < 0 || index >= count {
+		return 0
+	}
+	value := total / int64(count)
+	if int64(index) < total%int64(count) {
+		value++
+	}
+	return value
+}
+
+func setDashboardRealtimeSiteTraffic(point *dashboardTrendPoint, siteID int64, billingMode string, bytesIn, bytesOut int64) {
+	if point == nil || point.SiteContributions == nil {
+		return
+	}
+	contribution, ok := point.SiteContributions[siteID]
+	if !ok {
+		return
+	}
+	point.BytesIn += bytesIn - contribution.BytesIn
+	point.BytesOut += bytesOut - contribution.BytesOut
+	contribution.BytesIn = bytesIn
+	contribution.BytesOut = bytesOut
+	contribution.Traffic = trafficBillableBytes(billingMode, bytesIn, bytesOut)
+	point.SiteContributions[siteID] = contribution
+	point.Traffic = trafficBillableBytes(billingMode, point.BytesIn, point.BytesOut)
 }
 
 func dashboardRealtimeElapsedSeconds(sampledAtMS int64, previous map[int64]dashboardRealtimeCounter) float64 {

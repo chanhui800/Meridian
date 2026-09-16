@@ -39,7 +39,7 @@ func TestNodeLiveReportOverlaysDashboardWithoutPersistingTraffic(t *testing.T) {
 	}
 	accepted, discarded, err := app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
 		ReportSessionID: "live-session", CounterEpoch: "kernel:eth0", Sequence: 2, SampledAtMS: now.Add(time.Second).UnixMilli(),
-		SiteStats: []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 900, CumulativeBytesOut: 1200, Requests: 17}},
+		SiteStats: []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 900, CumulativeBytesOut: 1200, Requests: 17, DownloadBPS: 321, UploadBPS: 123, RateValid: true}},
 	}, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestNodeLiveReportOverlaysDashboardWithoutPersistingTraffic(t *testing.T) {
 		t.Fatal(err)
 	}
 	value, ok := snapshot[site.ID]
-	if !ok || value.CumulativeBytesIn != 900 || value.CumulativeBytesOut != 1200 || value.Requests != 17 {
+	if !ok || value.CumulativeBytesIn != 900 || value.CumulativeBytesOut != 1200 || value.Requests != 17 || value.DownloadBPS != 321 || value.UploadBPS != 123 || !value.RateValid || value.ReceivedAtMS != now.Add(time.Second).UnixMilli() {
 		t.Fatalf("live overlay did not reach dashboard snapshot: %#v", snapshot)
 	}
 	var logCountAfter int
@@ -61,6 +61,62 @@ func TestNodeLiveReportOverlaysDashboardWithoutPersistingTraffic(t *testing.T) {
 	}
 	if logCountAfter != logCountBefore {
 		t.Fatalf("live sample unexpectedly persisted traffic logs: before=%d after=%d", logCountBefore, logCountAfter)
+	}
+}
+
+func TestNodeFullTelemetryOnlyTakesOverAfterLiveChannelStalls(t *testing.T) {
+	app := newTestApp(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "fallback-node", Address: "203.0.113.75", Port: 19075}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "fallback-site", ListenPort: freePort(t), PublicHost: "fallback.example", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:1", PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec("UPDATE site_node_schedules SET applied_node_id=?, dns_status='active' WHERE site_id=?", node.ID, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
+		ReportSessionID: "fallback-session", CounterEpoch: "kernel:eth0", Sequence: 1, TelemetrySequence: 10, SampledAtMS: now.UnixMilli(),
+		SiteStats: []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 100, CumulativeBytesOut: 200, Requests: 4, DownloadBPS: 20, UploadBPS: 10, RateValid: true}},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	app.db.recordNodeFullTelemetry(node.ID, NodeReport{
+		BootID: "fallback-boot", ReportSessionID: "fallback-session", CounterEpoch: "kernel:eth0", TelemetrySequence: 11, SampledAtMS: now.Add(2 * time.Second).UnixMilli(),
+		SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 999, CumulativeBytesOut: 999, RequestCount: 99}},
+	}, []int64{site.ID}, now.Add(2*time.Second))
+	snapshot, err := app.db.NodeSiteLiveTrafficSnapshot(now.Add(2 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot[site.ID]; got.CumulativeBytesIn != 100 || got.CumulativeBytesOut != 200 || got.DownloadBPS != 20 {
+		t.Fatalf("healthy live sample was overwritten by full report: %+v", got)
+	}
+
+	app.db.recordNodeFullTelemetry(node.ID, NodeReport{
+		BootID: "fallback-boot", ReportSessionID: "fallback-session", CounterEpoch: "kernel:eth0", TelemetrySequence: 12, SampledAtMS: now.Add(5 * time.Second).UnixMilli(),
+		SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 150, CumulativeBytesOut: 300, RequestCount: 6}},
+	}, []int64{site.ID}, now.Add(5*time.Second))
+	snapshot, err = app.db.NodeSiteLiveTrafficSnapshot(now.Add(5 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := snapshot[site.ID]
+	if got.CumulativeBytesIn != 150 || got.CumulativeBytesOut != 300 || got.AgentSampledAtMS != now.Add(5*time.Second).UnixMilli() {
+		t.Fatalf("stalled live channel did not fall back to full report: %+v", got)
+	}
+	if !got.RateValid || got.DownloadBPS != 20 || got.UploadBPS != 10 {
+		t.Fatalf("full report fallback rate=%+v, want download=20 upload=10", got)
 	}
 }
 

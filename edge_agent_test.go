@@ -142,6 +142,32 @@ func TestAgentTelemetrySequenceIsBoundToSnapshotOrder(t *testing.T) {
 	}
 }
 
+func TestCaptureLiveTelemetryUsesAgentSampleInterval(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	counter := runtime.trafficCounterFor(42, "rate.example.test")
+	firstAt := time.Unix(1_700_000_000, 0)
+	firstSequence, firstSampledAt, first := runtime.captureLiveTelemetryAt(firstAt)
+	if firstSequence != 1 || firstSampledAt != firstAt.UnixMilli() || len(first) != 1 || first[0].RateValid {
+		t.Fatalf("first live telemetry=%d/%d/%+v, want baseline without rate", firstSequence, firstSampledAt, first)
+	}
+	counter.cumulativeIn.Store(40)
+	counter.cumulativeOut.Store(60)
+	counter.requests.Store(1)
+	secondSequence, secondSampledAt, second := runtime.captureLiveTelemetryAt(firstAt.Add(2 * time.Second))
+	if secondSequence != 2 || secondSampledAt != firstAt.Add(2*time.Second).UnixMilli() || len(second) != 1 {
+		t.Fatalf("second live telemetry=%d/%d/%+v", secondSequence, secondSampledAt, second)
+	}
+	if !second[0].RateValid || second[0].UploadBPS != 20 || second[0].DownloadBPS != 30 {
+		t.Fatalf("Agent rates=%+v, want upload=20 download=30", second[0])
+	}
+	counter.cumulativeIn.Store(1)
+	counter.cumulativeOut.Store(2)
+	_, _, reset := runtime.captureLiveTelemetryAt(firstAt.Add(4 * time.Second))
+	if len(reset) != 1 || reset[0].RateValid {
+		t.Fatalf("counter reset produced a rate: %+v", reset)
+	}
+}
+
 func TestEdgeMetadataIPv4FromResponse(t *testing.T) {
 	for _, test := range []struct {
 		name  string

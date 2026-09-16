@@ -466,6 +466,9 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 			st.SampledAtMS = remote.SampledAtMS
 			st.AgentSampledAtMS = remote.AgentSampledAtMS
 			st.AgentReceivedAtMS = remote.ReceivedAtMS
+			st.AgentDownloadBPS = remote.DownloadBPS
+			st.AgentUploadBPS = remote.UploadBPS
+			st.AgentRateValid = remote.RateValid
 			st.CacheSizeBytes = remote.CacheSizeBytes
 			st.AgentRuntime = true
 			st.BytesIn = 0

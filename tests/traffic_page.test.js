@@ -970,12 +970,26 @@ test('dashboard zero-value trend scales never render negative or invalid labels'
   const scale = vm.runInContext('dashboardRequestScale(0)', sandbox);
   assert.deepEqual({ max: scale.max, step: scale.step, ticks: scale.ticks }, { max: 6, step: 1, ticks: 6 });
   const oneRequest = vm.runInContext('dashboardRequestScale(1, "requests")', sandbox);
-  assert.deepEqual({ max: oneRequest.max, step: oneRequest.step, ticks: oneRequest.ticks }, { max: 1, step: 1, ticks: 1 });
+  assert.deepEqual({ max: oneRequest.max, step: oneRequest.step, ticks: oneRequest.ticks }, { max: 5, step: 1, ticks: 5 });
   const seventeenRequests = vm.runInContext('dashboardRequestScale(17, "requests")', sandbox);
   assert.deepEqual({ max: seventeenRequests.max, step: seventeenRequests.step, ticks: seventeenRequests.ticks }, { max: 20, step: 5, ticks: 4 });
   assert.equal(vm.runInContext('formatBytes(-5)', sandbox), '0 B');
   assert.equal(vm.runInContext('formatBytes(Number.NaN)', sandbox), '0 B');
   assert.equal(vm.runInContext('dashboardTrendValueLabel(0, "requests")', sandbox), '0');
+});
+
+test('dashboard realtime speed keeps unavailable samples as line gaps', () => {
+  const { sandbox } = makeTrafficHarness();
+  const normalized = vm.runInContext('dashboardNormalizeRealtimePoint({ timestamp_ms: 1000, download_bps: 42, upload_bps: 7, speed_unavailable: true })', sandbox);
+  assert.equal(normalized.speed_unavailable, true);
+  assert.equal(vm.runInContext('dashboardTrendMetricLine({ speed_unavailable: true }, "speed")', sandbox), '速度暂不可用');
+  const segments = vm.runInContext(`dashboardTrendLineSegments([
+    { x: 0, y: 10, valid: true },
+    { x: 1, y: null, valid: false },
+    { x: 2, y: 20, valid: true },
+    { x: 3, y: 30, valid: true }
+  ])`, sandbox);
+  assert.deepEqual(Array.from(segments, segment => Array.from(segment, point => point.x)), [[0], [2, 3]]);
 });
 
 test('global traffic settings expose reset and no-reset billing cycles', () => {

@@ -155,6 +155,7 @@ type NodeReport struct {
 	// TelemetrySequence is shared by the full and lightweight report channels.
 	// It lets the Controller reject a delayed sample from either channel.
 	TelemetrySequence     int64                    `json:"telemetry_sequence,omitempty"`
+	SampledAtMS           int64                    `json:"sampled_at_ms,omitempty"`
 	InterfaceName         string                   `json:"interface_name"`
 	NetAddresses          []NodeNetAddress         `json:"net_addresses,omitempty"`
 	RXBytes               int64                    `json:"rx_bytes"`
@@ -198,14 +199,17 @@ type NodeLiveReport struct {
 }
 
 type NodeLiveSiteTraffic struct {
-	SiteID             int64  `json:"site_id"`
-	Host               string `json:"host"`
-	CumulativeBytesIn  int64  `json:"cumulative_bytes_in"`
-	CumulativeBytesOut int64  `json:"cumulative_bytes_out"`
-	Requests           int64  `json:"requests"`
-	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
-	AgentSampledAtMS   int64  `json:"-"`
-	ReceivedAtMS       int64  `json:"-"`
+	SiteID             int64   `json:"site_id"`
+	Host               string  `json:"host"`
+	CumulativeBytesIn  int64   `json:"cumulative_bytes_in"`
+	CumulativeBytesOut int64   `json:"cumulative_bytes_out"`
+	Requests           int64   `json:"requests"`
+	DownloadBPS        float64 `json:"download_bps,omitempty"`
+	UploadBPS          float64 `json:"upload_bps,omitempty"`
+	RateValid          bool    `json:"rate_valid,omitempty"`
+	SampledAtMS        int64   `json:"sampled_at_ms,omitempty"`
+	AgentSampledAtMS   int64   `json:"-"`
+	ReceivedAtMS       int64   `json:"-"`
 }
 
 // NodeReportResult keeps the protocol acknowledgement tied to the exact

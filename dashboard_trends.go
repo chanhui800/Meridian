@@ -65,6 +65,7 @@ type dashboardTrendPoint struct {
 	Requests          int64                         `json:"requests"`
 	DownloadBPS       float64                       `json:"download_bps"`
 	UploadBPS         float64                       `json:"upload_bps"`
+	SpeedUnavailable  bool                          `json:"speed_unavailable,omitempty"`
 	SiteContributions map[int64]dashboardTrendPoint `json:"site_contributions,omitempty"`
 }
 

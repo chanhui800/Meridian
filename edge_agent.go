@@ -593,6 +593,8 @@ type edgeAgentRuntime struct {
 	// only after the snapshot is captured while this lock is held, so a larger
 	// sequence can never refer to an older counter snapshot.
 	telemetrySampleMu sync.Mutex
+	liveRateSampledAt time.Time
+	liveRatePrevious  map[int64]NodeLiveSiteTraffic
 	telemetryMu       sync.Mutex
 	mediaCounts       map[int64]NodeMediaCount
 	retention         map[int64]NodeRetentionStatus
@@ -1124,6 +1126,40 @@ func (runtime *edgeAgentRuntime) liveSiteTrafficSnapshot() []NodeLiveSiteTraffic
 	return result
 }
 
+// captureLiveTelemetry keeps rate calculation on the Agent's monotonic clock.
+// Network delivery can be delayed or retried without changing the interval
+// represented by the sample.
+func (runtime *edgeAgentRuntime) captureLiveTelemetry() (sequence, sampledAtMS int64, stats []NodeLiveSiteTraffic) {
+	return runtime.captureLiveTelemetryAt(time.Now())
+}
+
+func (runtime *edgeAgentRuntime) captureLiveTelemetryAt(sampledAt time.Time) (sequence, sampledAtMS int64, stats []NodeLiveSiteTraffic) {
+	if runtime == nil {
+		return 0, 0, nil
+	}
+	runtime.telemetrySampleMu.Lock()
+	defer runtime.telemetrySampleMu.Unlock()
+
+	stats = runtime.liveSiteTrafficSnapshot()
+	elapsed := sampledAt.Sub(runtime.liveRateSampledAt).Seconds()
+	for index := range stats {
+		previous, ok := runtime.liveRatePrevious[stats[index].SiteID]
+		if !ok || elapsed <= 0 || stats[index].CumulativeBytesIn < previous.CumulativeBytesIn || stats[index].CumulativeBytesOut < previous.CumulativeBytesOut {
+			continue
+		}
+		stats[index].UploadBPS = float64(stats[index].CumulativeBytesIn-previous.CumulativeBytesIn) / elapsed
+		stats[index].DownloadBPS = float64(stats[index].CumulativeBytesOut-previous.CumulativeBytesOut) / elapsed
+		stats[index].RateValid = true
+	}
+	runtime.liveRatePrevious = make(map[int64]NodeLiveSiteTraffic, len(stats))
+	for _, stat := range stats {
+		runtime.liveRatePrevious[stat.SiteID] = stat
+	}
+	runtime.liveRateSampledAt = sampledAt
+	sequence = runtime.nextTelemetrySequence()
+	return sequence, sampledAt.UnixMilli(), stats
+}
+
 // sampleTelemetry runs one complete telemetry capture under the shared
 // sampler lock and allocates the ordering sequence afterwards. The callback
 // must capture all data represented by the sequence before returning.
@@ -1154,6 +1190,7 @@ func (runtime *edgeAgentRuntime) captureFullTelemetry(bootID string, sequence in
 	pendingStats := runtime.prepareSiteStats()
 	pendingTelemetry := runtime.prepareTelemetry()
 	report.TelemetrySequence = runtime.nextTelemetrySequence()
+	report.SampledAtMS = time.Now().UnixMilli()
 	report.SiteStats = pendingStats.stats
 	report.MediaCounts = pendingTelemetry.media
 	report.Retention = pendingTelemetry.retention
@@ -2580,62 +2617,93 @@ func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, to
 	if runtime == nil {
 		return nil
 	}
-	sequence := int64(0)
-	send := func() error {
-		if runtime.isQuiesced() {
-			return nil
+	loopCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	// Sampling must keep its fixed cadence even while the Controller is slow.
+	// A small bounded queue absorbs transient latency; when it fills, discard
+	// the oldest sample so the sender converges on current state. Cumulative
+	// counters let the Controller reconcile the skipped interval without losing
+	// accounted bytes.
+	const liveReportQueueSize = 8
+	reports := make(chan NodeLiveReport, liveReportQueueSize)
+	go func() {
+		defer close(reports)
+		sequence := int64(0)
+		capture := func() {
+			if runtime.isQuiesced() {
+				return
+			}
+			sequence++
+			telemetrySequence, sampledAtMS, stats := runtime.captureLiveTelemetry()
+			leaseID, currentEpoch := runtime.reportIdentity()
+			report := NodeLiveReport{
+				ReportSessionID: sessionID, SessionEpoch: currentEpoch, AgentLeaseID: leaseID,
+				CounterEpoch: edgeCounterEpoch(edgeDefaultInterface()), Sequence: sequence,
+				TelemetrySequence: telemetrySequence, SampledAtMS: sampledAtMS, SiteStats: stats,
+			}
+			select {
+			case reports <- report:
+				return
+			default:
+			}
+			select {
+			case <-reports:
+			default:
+			}
+			select {
+			case reports <- report:
+			case <-loopCtx.Done():
+			}
 		}
-		sequence++
-		var stats []NodeLiveSiteTraffic
-		telemetrySequence, sampledAtMS := runtime.sampleTelemetry(func() {
-			stats = runtime.liveSiteTrafficSnapshot()
-		})
-		_, currentEpoch := runtime.reportIdentity()
-		report := NodeLiveReport{
-			ReportSessionID:   sessionID,
-			SessionEpoch:      currentEpoch,
-			CounterEpoch:      edgeCounterEpoch(edgeDefaultInterface()),
-			Sequence:          sequence,
-			TelemetrySequence: telemetrySequence,
-			SampledAtMS:       sampledAtMS,
-			SiteStats:         stats,
+		capture()
+		ticker := time.NewTicker(agentLiveReportInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C:
+				capture()
+			}
 		}
-		report.AgentLeaseID, _ = runtime.reportIdentity()
+	}()
+
+	send := func(report NodeLiveReport) error {
 		var ack struct{}
 		// A live sample must never inherit the two-minute general API timeout:
 		// one stalled Controller request would otherwise pause this loop and make
 		// the dashboard appear to stop for the whole outage. Bound each attempt
 		// to one reporting interval and retry once with a short backoff.
-		requestCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		requestCtx, cancel := context.WithTimeout(loopCtx, 1500*time.Millisecond)
 		err := edgeAPIRequest(requestCtx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
 		cancel()
 		if err == nil {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-loopCtx.Done():
+			return loopCtx.Err()
 		case <-time.After(250 * time.Millisecond):
 		}
-		requestCtx, cancel = context.WithTimeout(ctx, 1500*time.Millisecond)
+		requestCtx, cancel = context.WithTimeout(loopCtx, 1500*time.Millisecond)
 		err = edgeAPIRequest(requestCtx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
 		cancel()
 		return err
 	}
-	// Send one sample immediately so a freshly applied route does not wait for
-	// the first ticker boundary.
-	if err := send(); err != nil && (isEdgeAgentRevoked(err) || isEdgeAgentStale(err)) {
-		return err
-	}
-	ticker := time.NewTicker(agentLiveReportInterval)
-	defer ticker.Stop()
 	var lastLog time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			if err := send(); err != nil {
+		case report, ok := <-reports:
+			if !ok {
+				return nil
+			}
+			if err := send(report); err != nil {
+				if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+					return nil
+				}
 				if isEdgeAgentRevoked(err) || isEdgeAgentStale(err) {
 					return err
 				}

@@ -42,10 +42,13 @@ type SiteTraffic struct {
 	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
 	// AgentSampledAtMS is the timestamp captured on the remote Agent. It is
 	// separate from SampledAtMS, which is the Controller receive timestamp.
-	AgentSampledAtMS  int64 `json:"agent_sampled_at_ms,omitempty"`
-	CacheSizeBytes    int64 `json:"cache_size_bytes,omitempty"`
-	AgentRuntime      bool  `json:"-"`
-	AgentReceivedAtMS int64 `json:"agent_received_at_ms,omitempty"`
+	AgentSampledAtMS  int64   `json:"agent_sampled_at_ms,omitempty"`
+	AgentDownloadBPS  float64 `json:"agent_download_bps,omitempty"`
+	AgentUploadBPS    float64 `json:"agent_upload_bps,omitempty"`
+	AgentRateValid    bool    `json:"agent_rate_valid,omitempty"`
+	CacheSizeBytes    int64   `json:"cache_size_bytes,omitempty"`
+	AgentRuntime      bool    `json:"-"`
+	AgentReceivedAtMS int64   `json:"agent_received_at_ms,omitempty"`
 }
 
 type RealtimeTelemetryStatus struct {
@@ -88,6 +91,9 @@ type NodeSiteLiveTraffic struct {
 	SampledAtMS        int64
 	AgentSampledAtMS   int64
 	ReceivedAtMS       int64
+	DownloadBPS        float64
+	UploadBPS          float64
+	RateValid          bool
 	CacheSizeBytes     int64
 }
 
@@ -367,6 +373,10 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 			value.Requests = live.Requests
 			value.SampledAtMS = live.SampledAtMS
 			value.AgentSampledAtMS = live.AgentSampledAtMS
+			value.ReceivedAtMS = live.ReceivedAtMS
+			value.DownloadBPS = live.DownloadBPS
+			value.UploadBPS = live.UploadBPS
+			value.RateValid = live.RateValid
 		}
 		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow
 		siteFresh := value.SampledAtMS > 0 && now.Sub(time.UnixMilli(value.SampledAtMS)) <= nodeOnlineWindow
