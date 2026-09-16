@@ -18,6 +18,7 @@ let dashboardLiveSpeeds = new Map();
 let dashboardRealtimeTrendSamples = new Map();
 let dashboardRealtimeTrendSiteSamples = new Map();
 let dashboardLatestRatesBySite = new Map();
+let dashboardRealtimeSmoothingCache = new Map();
 let dashboardBillingMode = null;
 let dashboardRealtimePersistedBillingMode = null;
 // Once the Controller exposes its authoritative realtime sequence, the
@@ -201,11 +202,25 @@ async function loadDashboardBootstrap() {
   return dashboardBootstrapPromise;
 }
 
-function dashboardRequestScale(maxValue) {
-  // Keep six horizontal bands on every chart. Only the step changes with the
-	// data range, so cards remain visually comparable while labels stay useful.
-	const ticks = 6;
-	if (!(maxValue > 0)) return { max: ticks, step: 1, ticks };
+function dashboardRequestScale(maxValue, metric = '') {
+  if (metric === 'requests') {
+    // Request deltas are integer counts. Keep the axis integer-valued so a
+    // single request is not rendered with rounded fractional labels such as
+    // 000111, which makes the chart look like it contains duplicate events.
+    const ceiling = Math.max(5, Math.ceil(Number(maxValue) || 0));
+    if (ceiling <= 6) return { max: ceiling, step: 1, ticks: ceiling };
+    const roughStep = ceiling / 6;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
+    const fraction = roughStep / magnitude;
+    const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+    const step = Math.max(1, Math.ceil(niceFraction * magnitude));
+    const max = step * Math.ceil(ceiling / step);
+    return { max, step, ticks: Math.max(1, Math.ceil(max / step)) };
+  }
+  // Keep six horizontal bands on speed and traffic charts. Only the step
+  // changes with the data range, so cards remain visually comparable.
+  const ticks = 6;
+  if (!(maxValue > 0)) return { max: ticks, step: 1, ticks };
   const roughStep = maxValue / ticks;
   const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
   const fraction = roughStep / magnitude;
@@ -360,14 +375,24 @@ function dashboardTrendTimeLabel(timestamp, range) {
 
 function dashboardTrendMetricLine(point, metric) {
   if (!point) return '暂无数据';
+  if (metric === 'speed' && point.speed_unavailable === true) return '速度暂不可用';
   if (metric === 'speed') return `↓ ${formatRate(point.download_bps)} · ↑ ${formatRate(point.upload_bps)}`;
   if (metric === 'requests') return `请求 ${formatNumber(point.requests || 0)} 次`;
   if (metric === 'traffic') return `流量 ${formatBytes(point.traffic_bytes || 0)}`;
   return '';
 }
 
+function dashboardTrendTooltipTime(point, range) {
+  const bucketStart = Number(point?.bucket_start_ms || 0);
+  const bucketEnd = Number(point?.bucket_end_ms || point?.timestamp_ms || 0);
+  if (bucketStart > 0 && bucketEnd > bucketStart) {
+    return `${meridianFormatDateTime(bucketStart)} - ${dashboardTrendTimeLabel(bucketEnd, range)}`;
+  }
+  return meridianFormatDateTime(point?.timestamp_ms);
+}
+
 function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
-  const time = meridianFormatDateTime(point.timestamp_ms);
+  const time = dashboardTrendTooltipTime(point, range);
   const siteSelect = document.getElementById('dashboard-trend-site');
   const selectedOption = siteSelect?.selectedOptions?.[0];
   const selectedSiteID = dashboardTrendState.siteId === 'all' ? null : String(dashboardTrendState.siteId);
@@ -386,7 +411,9 @@ function dashboardTrendTooltip(point, metric, range, pointIndex = -1) {
         // turning a sparse array lookup into a misleading zero.
         let sample;
         if (metric === 'speed') {
-          sample = dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms) || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0 };
+          sample = point.site_contributions?.[String(site.id)]
+            || dashboardRealtimeSiteSampleAt(site.id, point.timestamp_ms)
+            || { download_bps: 0, upload_bps: 0, requests: 0, traffic_bytes: 0, speed_unavailable: true };
         } else {
           // Traffic and request values describe the contribution to this
           // aggregate interval. Carrying forward the previous sparse sample
@@ -490,6 +517,7 @@ function dashboardNormalizeRealtimePoint(value) {
     bytes_in: numberOrZero(value.bytes_in),
     bytes_out: numberOrZero(value.bytes_out),
     requests: numberOrZero(value.requests),
+    speed_unavailable: value.speed_unavailable === true,
   };
   // Cumulative counters let the realtime tail start from the exact
   // persisted Agent baseline returned by the Controller. Older localStorage
@@ -897,13 +925,21 @@ function dashboardTrendSummary(data) {
   if (unit) unit.textContent = data?.billing_mode === 'outbound' ? '单向计费流量总数' : '双向计费流量总数';
 }
 
-function dashboardUpdateTrendHelp(resetEnabled) {
+function dashboardUpdateTrendHelp(resetEnabled, telemetry) {
   const help = document.getElementById('dashboard-trend-help');
   if (!help) return;
   const prefix = resetEnabled
     ? '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量按全局重置日统计'
     : '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量累计不重置';
-  help.textContent = `${prefix} · 数据时间 `;
+  const agentSites = Number(telemetry?.agent_sites || 0);
+  const staleSites = Number(telemetry?.stale_sites || 0);
+  let telemetryLabel = '';
+  if (agentSites > 0) {
+    telemetryLabel = staleSites > 0
+      ? ` · Agent 实时数据 ${staleSites}/${agentSites} 个站点暂不可用`
+      : ` · Agent 实时数据正常（${agentSites} 个站点）`;
+  }
+  help.textContent = `${prefix}${telemetryLabel} · 数据时间 `;
   const timezone = document.createElement('span');
   timezone.id = 'dashboard-trend-timezone';
   timezone.textContent = meridianTimezoneLabel();
@@ -928,19 +964,315 @@ function dashboardRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-function dashboardTrendPaddedPathPoints(points, left, right, baselineY, realtime) {
-  if (!realtime || !Array.isArray(points) || !points.length) return points || [];
-  const padded = points.slice();
-  const epsilon = 0.5;
-  if (padded[0].x > left + epsilon) padded.unshift({ x: left, y: baselineY, synthetic: true });
-  if (padded[padded.length - 1].x < right - epsilon) padded.push({ x: right, y: baselineY, synthetic: true });
-  return padded;
+function dashboardTrendLineSegments(points) {
+  if (!Array.isArray(points) || !points.length) return [];
+  const segments = [];
+  let current = [];
+  points.forEach(point => {
+    if (point && point.valid !== false && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+      current.push(point);
+      return;
+    }
+    if (current.length) segments.push(current);
+    current = [];
+  });
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+function dashboardTrendDisplayPointTarget(plotWidth) {
+  const width = Math.max(1, Number(plotWidth) || 1);
+  return Math.max(30, Math.min(50, Math.round(width / 10)));
+}
+
+function dashboardTrendSampleWeights(points) {
+  return points.map((point, index) => {
+    const timestamp = Number(point?.timestamp_ms || 0);
+    const adjacent = index > 0
+      ? Number(points[index - 1]?.timestamp_ms || 0)
+      : Number(points[index + 1]?.timestamp_ms || 0);
+    let elapsed = index > 0 ? timestamp - adjacent : adjacent - timestamp;
+    if (!Number.isFinite(elapsed) || elapsed <= 0) elapsed = dashboardRealtimeSampleIntervalMS;
+    return Math.max(500, Math.min(dashboardRealtimeSampleIntervalMS * 4, elapsed));
+  });
+}
+
+function dashboardAggregateTrendValues(samples, weights) {
+  let totalWeight = 0;
+  let downloadWeighted = 0;
+  let uploadWeighted = 0;
+  let bytesIn = 0;
+  let bytesOut = 0;
+  let requests = 0;
+  let trafficBytes = 0;
+  let availableSamples = 0;
+  samples.forEach((sample, index) => {
+    const weight = Math.max(1, Number(weights?.[index]) || dashboardRealtimeSampleIntervalMS);
+    const unavailable = sample?.speed_unavailable === true;
+    const download = unavailable ? 0 : Math.max(0, Number(sample?.download_bps || 0));
+    const upload = unavailable ? 0 : Math.max(0, Number(sample?.upload_bps || 0));
+    totalWeight += weight;
+    downloadWeighted += download * weight;
+    uploadWeighted += upload * weight;
+    bytesIn += Math.max(0, Number(sample?.bytes_in || 0));
+    bytesOut += Math.max(0, Number(sample?.bytes_out || 0));
+    requests += Math.max(0, Number(sample?.requests || 0));
+    trafficBytes += Math.max(0, Number(sample?.traffic_bytes || 0));
+    if (!unavailable) availableSamples++;
+  });
+  return {
+    download_bps: totalWeight > 0 ? downloadWeighted / totalWeight : 0,
+    upload_bps: totalWeight > 0 ? uploadWeighted / totalWeight : 0,
+    bytes_in: bytesIn,
+    bytes_out: bytesOut,
+    requests,
+    traffic_bytes: trafficBytes,
+    speed_unavailable: availableSamples === 0,
+  };
+}
+
+function dashboardAggregateTrendBucket(samples, weights, bucket = null) {
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const aggregate = {
+    ...last,
+    ...dashboardAggregateTrendValues(samples, weights),
+    timestamp_ms: Number(last?.timestamp_ms || 0),
+    bucket_start_ms: Number(first?.timestamp_ms || 0),
+    bucket_end_ms: Number(last?.timestamp_ms || 0),
+    sample_count: samples.length,
+  };
+  const bucketID = Number(bucket?.id);
+  const bucketStart = Number(bucket?.start);
+  const bucketEnd = Number(bucket?.end);
+  if (Number.isInteger(bucketID) && bucketStart >= 0 && bucketEnd > bucketStart) {
+    aggregate.display_bucket_id = bucketID;
+    aggregate.display_bucket_duration_ms = bucketEnd - bucketStart;
+    aggregate.bucket_start_ms = bucketStart;
+    aggregate.bucket_end_ms = bucket.closed ? bucketEnd : Number(last?.timestamp_ms || bucketEnd);
+    aggregate.timestamp_ms = aggregate.bucket_end_ms;
+  }
+  const siteIDs = new Set();
+  samples.forEach(point => {
+    if (!point?.site_contributions || typeof point.site_contributions !== 'object') return;
+    Object.keys(point.site_contributions).forEach(siteID => siteIDs.add(siteID));
+  });
+  if (siteIDs.size) {
+    aggregate.site_contributions = {};
+    siteIDs.forEach(siteID => {
+      const siteSamples = samples.map(point => point?.site_contributions?.[siteID] || {
+        download_bps: 0,
+        upload_bps: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        requests: 0,
+        traffic_bytes: 0,
+        speed_unavailable: true,
+      });
+      aggregate.site_contributions[siteID] = {
+        ...dashboardAggregateTrendValues(siteSamples, weights),
+        timestamp_ms: aggregate.timestamp_ms,
+        bucket_start_ms: aggregate.bucket_start_ms,
+        bucket_end_ms: aggregate.bucket_end_ms,
+        sample_count: samples.length,
+      };
+    });
+  }
+  return aggregate;
+}
+
+function dashboardTrendBucketDurationMS(target) {
+  return Math.max(
+    dashboardRealtimeSampleIntervalMS,
+    Math.ceil(dashboardRealtimeWindowDurationMS / Math.max(1, Number(target) - 1)),
+  );
+}
+
+function dashboardTrendDisplayPoints(points, metric, plotWidth) {
+  if (!Array.isArray(points) || dashboardTrendState.range !== 'realtime') return points || [];
+  const target = dashboardTrendDisplayPointTarget(plotWidth);
+  if (points.length <= target) {
+    return points.map(point => {
+      const timestamp = Number(point?.timestamp_ms || 0);
+      if (!Number.isFinite(timestamp) || timestamp < 0) return point;
+      return {
+        ...point,
+        display_bucket_id: timestamp,
+        display_bucket_duration_ms: dashboardRealtimeSampleIntervalMS,
+      };
+    });
+  }
+  const bucketDuration = dashboardTrendBucketDurationMS(target);
+  const weights = dashboardTrendSampleWeights(points);
+  const groups = new Map();
+  points.forEach((point, index) => {
+    const timestamp = Number(point?.timestamp_ms || 0);
+    if (!Number.isFinite(timestamp) || timestamp < 0) return;
+    const bucketID = Math.floor(timestamp / bucketDuration);
+    if (!groups.has(bucketID)) groups.set(bucketID, { samples: [], weights: [] });
+    const group = groups.get(bucketID);
+    group.samples.push(point);
+    group.weights.push(weights[index]);
+  });
+  if (!groups.size) return points;
+  const bucketIDs = Array.from(groups.keys()).sort((a, b) => a - b);
+  const latestBucketID = bucketIDs[bucketIDs.length - 1];
+  const result = [];
+  bucketIDs.forEach(bucketID => {
+    const group = groups.get(bucketID);
+    const start = bucketID * bucketDuration;
+    result.push(dashboardAggregateTrendBucket(group.samples, group.weights, {
+      id: bucketID,
+      start,
+      end: start + bucketDuration,
+      closed: bucketID < latestBucketID,
+    }));
+  });
+  return result;
+}
+
+function dashboardTrendMonotoneControls(points) {
+  if (!Array.isArray(points) || points.length < 2) return [];
+  const secants = [];
+  for (let index = 0; index < points.length - 1; index++) {
+    const width = points[index + 1].x - points[index].x;
+    secants.push(width > 0 ? (points[index + 1].y - points[index].y) / width : 0);
+  }
+  const tangents = points.map((_, index) => {
+    if (index === 0) return secants[0];
+    if (index === points.length - 1) return secants[secants.length - 1];
+    return secants[index - 1] * secants[index] <= 0 ? 0 : (secants[index - 1] + secants[index]) / 2;
+  });
+  secants.forEach((slope, index) => {
+    if (slope === 0) {
+      tangents[index] = 0;
+      tangents[index + 1] = 0;
+      return;
+    }
+    const left = tangents[index] / slope;
+    const right = tangents[index + 1] / slope;
+    const magnitude = Math.hypot(left, right);
+    if (magnitude > 3) {
+      const scale = 3 / magnitude;
+      tangents[index] = scale * left * slope;
+      tangents[index + 1] = scale * right * slope;
+    }
+  });
+  return secants.map((_, index) => {
+    const first = points[index];
+    const last = points[index + 1];
+    const width = last.x - first.x;
+    return {
+      cp1x: first.x + width / 3,
+      cp1y: first.y + tangents[index] * width / 3,
+      cp2x: last.x - width / 3,
+      cp2y: last.y - tangents[index + 1] * width / 3,
+      x: last.x,
+      y: last.y,
+    };
+  });
+}
+
+function dashboardTrendTracePath(ctx, points, monotone) {
+  if (!Array.isArray(points) || !points.length) return;
+  ctx.moveTo(points[0].x, points[0].y);
+  if (!monotone || points.length < 3 || typeof ctx.bezierCurveTo !== 'function') {
+    points.slice(1).forEach(point => ctx.lineTo(point.x, point.y));
+    return;
+  }
+  dashboardTrendMonotoneControls(points).forEach(control => {
+    ctx.bezierCurveTo(control.cp1x, control.cp1y, control.cp2x, control.cp2y, control.x, control.y);
+  });
+}
+
+// Realtime proxy traffic is sampled in two-second buckets. Video clients fill
+// their buffers in bursts, so plotting every raw zero between two chunks makes
+// an otherwise healthy stream look disconnected. Smooth only the visual
+// series: summaries, tooltips, persisted counters and request deltas continue
+// to use the exact Controller values.
+function dashboardRealtimeSmoothingKey(points, metric, seriesIndex) {
+  const bucketDuration = Number(points?.[0]?.display_bucket_duration_ms || 0);
+  if (!(bucketDuration > 0) || !points.every(point => Number.isInteger(point?.display_bucket_id))) return '';
+  const siteID = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
+  const billingMode = metric === 'traffic' ? String(dashboardBillingMode || dashboardTrendData?.billing_mode || '') : '';
+  return `${siteID}|${metric}|${seriesIndex}|${bucketDuration}|${billingMode}`;
+}
+
+function dashboardRealtimeSmoothingState(key) {
+  if (!key) return null;
+  const existing = dashboardRealtimeSmoothingCache.get(key);
+  if (existing) {
+    dashboardRealtimeSmoothingCache.delete(key);
+    dashboardRealtimeSmoothingCache.set(key, existing);
+    return existing;
+  }
+  const state = new Map();
+  dashboardRealtimeSmoothingCache.set(key, state);
+  while (dashboardRealtimeSmoothingCache.size > 64) {
+    dashboardRealtimeSmoothingCache.delete(dashboardRealtimeSmoothingCache.keys().next().value);
+  }
+  return state;
+}
+
+function dashboardRealtimeSmoothedValues(points, values, alpha = 0.35, cacheKey = '') {
+  if (!Array.isArray(values) || !values.length) return [];
+  const cache = dashboardRealtimeSmoothingState(cacheKey);
+  let smoothed = null;
+  let previousTimestamp = 0;
+  const rendered = values.map((value, index) => {
+    const numeric = Number(value);
+    const current = Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
+    const timestamp = Number(points?.[index]?.timestamp_ms || 0);
+    const bucketID = Number(points?.[index]?.display_bucket_id);
+    const cached = cache && Number.isInteger(bucketID) ? cache.get(bucketID) : null;
+    if (cached && cached.raw === current) {
+      smoothed = cached.smoothed;
+    } else if (smoothed === null) {
+      smoothed = current;
+    } else {
+      const elapsed = timestamp > previousTimestamp && previousTimestamp > 0
+        ? timestamp - previousTimestamp
+        : 2000;
+      // Make the filter stable when a delayed sample spans several nominal
+      // intervals. The cap lets a long outage decay quickly without snapping.
+      const intervals = Math.max(0.5, Math.min(4, elapsed / 2000));
+      const effectiveAlpha = 1 - Math.pow(1 - alpha, intervals);
+      smoothed += effectiveAlpha * (current - smoothed);
+      if (current === 0 && smoothed < 0.5) smoothed = 0;
+    }
+    if (cache && Number.isInteger(bucketID)) cache.set(bucketID, { raw: current, smoothed });
+    if (timestamp > 0) previousTimestamp = timestamp;
+    return smoothed;
+  });
+  if (cache) {
+    const bucketIDs = new Set(points.map(point => Number(point?.display_bucket_id)).filter(Number.isInteger));
+    Array.from(cache.keys()).forEach(bucketID => {
+      if (!bucketIDs.has(bucketID)) cache.delete(bucketID);
+    });
+  }
+  return rendered;
+}
+
+function dashboardTrendRenderSeries(points, metric) {
+  const raw = metric === 'speed'
+    ? [
+        points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.download_bps || 0))),
+        points.map(point => point.speed_unavailable === true ? null : Math.max(0, Number(point.upload_bps || 0))),
+      ]
+    : [points.map(point => dashboardTrendMetricValue(point, metric))];
+  if (dashboardTrendState.range !== 'realtime' || metric === 'requests') return raw;
+  return raw.map((values, index) => dashboardRealtimeSmoothedValues(
+    points,
+    values,
+    0.35,
+    dashboardRealtimeSmoothingKey(points, metric, index),
+  ));
 }
 
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
-  const points = dashboardTrendChartPoints();
-  if (!chart || !chart.canvas || !chart.canvas.getContext || !points.length) return;
+  const rawPoints = dashboardTrendChartPoints();
+  if (!chart || !chart.canvas || !chart.canvas.getContext || !rawPoints.length) return;
   const canvas = chart.canvas;
   const wrap = canvas.parentElement;
   const width = Math.max(220, wrap.clientWidth || 320);
@@ -951,10 +1283,16 @@ function drawDashboardTrendChart(metric) {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
+  const preliminaryLeft = Math.min(74, Math.floor(width * .36));
+  const points = dashboardTrendDisplayPoints(rawPoints, metric, Math.max(1, width - preliminaryLeft - 12));
+  chart.displayPoints = points;
+  if (chart.hoverIndex >= points.length) chart.hoverIndex = points.length - 1;
+  const renderValues = dashboardTrendRenderSeries(points, metric);
   const series = metric === 'speed'
-    ? [{ values: points.map(point => Math.max(0, Number(point.download_bps || 0))), color: '#3b9cff' }, { values: points.map(point => Math.max(0, Number(point.upload_bps || 0))), color: '#a78bfa' }]
-    : [{ values: points.map(point => dashboardTrendMetricValue(point, metric)), color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
-  const scale = dashboardRequestScale(Math.max(0, ...series.flatMap(item => item.values)));
+    ? [{ values: renderValues[0], color: '#3b9cff' }, { values: renderValues[1], color: '#a78bfa' }]
+    : [{ values: renderValues[0], color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
+  const scaleValues = series.flatMap(item => item.values).filter(value => Number.isFinite(value));
+  const scale = dashboardRequestScale(Math.max(0, ...scaleValues), metric);
   ctx.font = `${width < 360 ? 10 : 11}px system-ui`;
   const yLabelWidth = Math.max(...Array.from({ length: scale.ticks + 1 }, (_, index) => ctx.measureText(dashboardTrendValueLabel(scale.max - scale.step * index, metric)).width));
   const left = Math.min(Math.max(50, Math.ceil(yLabelWidth) + 16), Math.floor(width * .36));
@@ -987,31 +1325,29 @@ function drawDashboardTrendChart(metric) {
   if (ctx.setLineDash) ctx.setLineDash([]);
   const canvasSeries = series.map(item => ({ ...item, points: item.values.map((value, index) => ({
     x: xForTimestamp(points[index]?.timestamp_ms),
-    y: top + plotH * (1 - (value / (scale.max || 1))),
-  })), pathPoints: [] }));
+    y: Number.isFinite(value) ? top + plotH * (1 - (value / (scale.max || 1))) : null,
+    valid: Number.isFinite(value),
+  })) }));
   canvasSeries.forEach(item => {
-    item.pathPoints = dashboardTrendPaddedPathPoints(
-      item.points,
-      left,
-      width - right,
-      top + plotH,
-      dashboardTrendState.range === 'realtime',
-    );
-  });
-  canvasSeries.forEach(item => {
-    const pointsOnCanvas = item.pathPoints;
-    ctx.beginPath();
-    pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+    const pointsOnCanvas = item.points;
+    const monotone = metric !== 'requests';
     if (metric !== 'speed') {
-      ctx.lineTo(pointsOnCanvas[pointsOnCanvas.length - 1].x, top + plotH); ctx.lineTo(pointsOnCanvas[0].x, top + plotH); ctx.closePath();
-      ctx.globalAlpha = .12; ctx.fillStyle = item.color; ctx.fill(); ctx.globalAlpha = 1;
-      ctx.beginPath();
-      pointsOnCanvas.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+      dashboardTrendLineSegments(pointsOnCanvas).forEach(segment => {
+        ctx.beginPath();
+        dashboardTrendTracePath(ctx, segment, monotone);
+        ctx.lineTo(segment[segment.length - 1].x, top + plotH); ctx.lineTo(segment[0].x, top + plotH); ctx.closePath();
+        ctx.globalAlpha = .12; ctx.fillStyle = item.color; ctx.fill(); ctx.globalAlpha = 1;
+      });
     }
-    ctx.strokeStyle = item.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+    ctx.strokeStyle = item.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    dashboardTrendLineSegments(pointsOnCanvas).forEach(segment => {
+      ctx.beginPath();
+      dashboardTrendTracePath(ctx, segment, monotone);
+      ctx.stroke();
+    });
   });
   const pointsOnCanvas = canvasSeries[0].points;
-  if (chart.hoverIndex >= 0 && pointsOnCanvas[chart.hoverIndex]) {
+  if (chart.hoverIndex >= 0 && pointsOnCanvas[chart.hoverIndex]?.valid !== false) {
     const point = pointsOnCanvas[chart.hoverIndex];
     ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = canvasSeries[0].color; ctx.lineWidth = 2; ctx.stroke();
   }
@@ -1152,7 +1488,7 @@ function setupDashboardTrendControls() {
     const canvas = document.getElementById(metric === 'speed' ? 'dashboardSpeedTrend' : metric === 'requests' ? 'dashboardRequestsTrend' : 'dashboardTrafficTrend');
     if (!canvas) return;
     const tooltip = canvas.parentElement.querySelector('.dashboard-chart-tooltip');
-    const chart = { canvas, tooltip, hoverIndex: -1, hoverX: null, hoverY: null, pointerActive: false, geometry: null };
+    const chart = { canvas, tooltip, hoverIndex: -1, hoverX: null, hoverY: null, pointerActive: false, geometry: null, displayPoints: [] };
     dashboardTrendCharts.set(metric, chart);
     const clearHover = () => {
       chart.hoverIndex = -1; chart.hoverX = null; chart.hoverY = null;
@@ -1160,7 +1496,7 @@ function setupDashboardTrendControls() {
       drawDashboardTrendChart(metric);
     };
     const updateHover = event => {
-      const points = dashboardTrendChartPoints();
+      const points = chart.displayPoints?.length ? chart.displayPoints : dashboardTrendChartPoints();
       if (!points.length) return;
       const rect = canvas.getBoundingClientRect();
       // Touch pointer capture continues delivering pointermove events after
@@ -1385,7 +1721,7 @@ function updateDashboardLive(stats) {
 	const resetEnabled = Number(stats.traffic_reset_day == null ? 1 : stats.traffic_reset_day) !== 0;
 	const trafficTitle = document.getElementById('s-traffic-title');
 	if (trafficTitle) trafficTitle.textContent = '已用流量';
-  dashboardUpdateTrendHelp(resetEnabled);
+  dashboardUpdateTrendHelp(resetEnabled, stats?.realtime_telemetry);
 
   const uptimeEl = document.getElementById('s-uptime');
   if (uptimeEl) uptimeEl.textContent = formatUptime(stats.uptime_seconds || 0);
@@ -1696,6 +2032,7 @@ function stopDashSSE() {
   dashboardRealtimePersistedBillingMode = null;
   dashboardRealtimeTrendSamples = new Map();
   dashboardRealtimeTrendSiteSamples = new Map();
+  dashboardRealtimeSmoothingCache = new Map();
   dashboardLastSnapshotMS = 0;
   dashboardLastObservedSiteCount = -1;
   dashboardTrendData = null;

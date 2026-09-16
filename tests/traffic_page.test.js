@@ -711,18 +711,6 @@ test('dashboard realtime chart uses a fixed five-minute window and sparse bounda
   assert.equal(vm.runInContext('dashboardTrendAxisLabel(1, [{ timestamp_ms: 179000 } , { timestamp_ms: 180000 }], "realtime", -120000, 180000)', h.sandbox), 180000);
 });
 
-test('dashboard realtime paths stay anchored to both chart boundaries', () => {
-  const h = makeTrafficHarness();
-  const padded = vm.runInContext(`dashboardTrendPaddedPathPoints(
-    [{ x: 120, y: 80 }, { x: 180, y: 80 }], 20, 280, 180, true
-  )`, h.sandbox);
-  assert.equal(padded[0].x, 20);
-  assert.equal(padded.at(-1).x, 280);
-  assert.equal(padded[0].y, 180);
-  assert.equal(padded.at(-1).y, 180);
-  assert.equal(padded.length, 4);
-});
-
 test('dashboard realtime Agent baseline converts cumulative samples into a lossless tail', () => {
   const h = makeTrafficHarness();
   const points = vm.runInContext(`(() => {
@@ -969,9 +957,254 @@ test('dashboard zero-value trend scales never render negative or invalid labels'
   const { sandbox } = makeTrafficHarness();
   const scale = vm.runInContext('dashboardRequestScale(0)', sandbox);
   assert.deepEqual({ max: scale.max, step: scale.step, ticks: scale.ticks }, { max: 6, step: 1, ticks: 6 });
+  const oneRequest = vm.runInContext('dashboardRequestScale(1, "requests")', sandbox);
+  assert.deepEqual({ max: oneRequest.max, step: oneRequest.step, ticks: oneRequest.ticks }, { max: 5, step: 1, ticks: 5 });
+  const seventeenRequests = vm.runInContext('dashboardRequestScale(17, "requests")', sandbox);
+  assert.deepEqual({ max: seventeenRequests.max, step: seventeenRequests.step, ticks: seventeenRequests.ticks }, { max: 20, step: 5, ticks: 4 });
   assert.equal(vm.runInContext('formatBytes(-5)', sandbox), '0 B');
   assert.equal(vm.runInContext('formatBytes(Number.NaN)', sandbox), '0 B');
   assert.equal(vm.runInContext('dashboardTrendValueLabel(0, "requests")', sandbox), '0');
+});
+
+test('dashboard realtime speed and traffic stay continuous without changing requests', () => {
+  const { sandbox } = makeTrafficHarness();
+  const normalized = vm.runInContext('dashboardNormalizeRealtimePoint({ timestamp_ms: 1000, download_bps: 42, upload_bps: 7, speed_unavailable: true })', sandbox);
+  assert.equal(normalized.speed_unavailable, true);
+  assert.equal(vm.runInContext('dashboardTrendMetricLine({ speed_unavailable: true }, "speed")', sandbox), '速度暂不可用');
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = [
+      { timestamp_ms: 1000, download_bps: 100, traffic_bytes: 200, requests: 1 },
+      { timestamp_ms: 3000, download_bps: 0, traffic_bytes: 0, requests: 0 },
+      { timestamp_ms: 5000, download_bps: 100, traffic_bytes: 200, requests: 1 },
+      { timestamp_ms: 7000, download_bps: 0, traffic_bytes: 0, requests: 0, speed_unavailable: true },
+    ];
+    return {
+      speed: dashboardTrendRenderSeries(points, 'speed')[0],
+      traffic: dashboardTrendRenderSeries(points, 'traffic')[0],
+      requests: dashboardTrendRenderSeries(points, 'requests')[0],
+    };
+  })()`, sandbox);
+  assert.deepEqual(Array.from(result.speed, Math.round), [100, 65, 77, 50]);
+  assert.deepEqual(Array.from(result.traffic, Math.round), [200, 130, 155, 100]);
+  assert.deepEqual(Array.from(result.requests), [1, 0, 1, 0], 'request deltas must remain exact and unsmoothed');
+  assert.ok(Array.from(result.speed).every(Number.isFinite), 'unavailable speed samples must decay instead of splitting the line');
+});
+
+test('dashboard realtime smoothing is time-aware and leaves historical ranges raw', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    const points = [
+      { timestamp_ms: 1000, traffic_bytes: 100 },
+      { timestamp_ms: 9000, traffic_bytes: 0 },
+    ];
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const realtime = dashboardTrendRenderSeries(points, 'traffic')[0];
+    dashboardTrendState.range = 'hour';
+    const historical = dashboardTrendRenderSeries(points, 'traffic')[0];
+    return { realtime, historical };
+  })()`, sandbox);
+  assert.ok(result.realtime[1] < 20 && result.realtime[1] > 0, 'a long gap should decay quickly without snapping to zero');
+  assert.deepEqual(Array.from(result.historical), [100, 0]);
+});
+
+test('dashboard realtime display density adapts to plot width without changing the raw window', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = Array.from({ length: 150 }, (_, index) => ({
+      timestamp_ms: (index + 1) * 2000,
+      download_bps: index,
+      upload_bps: index / 2,
+      traffic_bytes: 1,
+      requests: index % 3 === 0 ? 1 : 0,
+    }));
+    return {
+      rawLength: points.length,
+      desktop: dashboardTrendDisplayPoints(points, 'traffic', 500),
+      mobile: dashboardTrendDisplayPoints(points, 'traffic', 320),
+    };
+  })()`, sandbox);
+  assert.equal(result.rawLength, 150);
+  assert.ok(result.desktop.length >= 49 && result.desktop.length <= 50);
+  assert.ok(result.mobile.length >= 31 && result.mobile.length <= 32);
+  assert.equal(Array.from(result.desktop).reduce((sum, point) => sum + point.traffic_bytes, 0), 150);
+  assert.equal(Array.from(result.desktop).reduce((sum, point) => sum + point.requests, 0), 50);
+  assert.equal(Array.from(result.mobile).reduce((sum, point) => sum + point.traffic_bytes, 0), 150);
+  assert.equal(Array.from(result.mobile).reduce((sum, point) => sum + point.requests, 0), 50);
+});
+
+test('dashboard realtime buckets and smoothed history stay stable as the window rolls', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const target = dashboardTrendDisplayPointTarget(500);
+    const duration = Math.ceil(dashboardRealtimeWindowDurationMS / Math.max(1, target - 1));
+    const anchor = duration * 1000;
+    const points = Array.from({ length: 151 }, (_, index) => ({
+      timestamp_ms: anchor + index * dashboardRealtimeSampleIntervalMS,
+      download_bps: index % 11 === 0 ? 900 : 100 + (index % 7) * 40,
+      upload_bps: index % 13 === 0 ? 120 : 10,
+      traffic_bytes: 10 + (index % 5),
+      requests: index % 9 === 0 ? 1 : 0,
+    }));
+    const capture = source => {
+      const display = dashboardTrendDisplayPoints(source, 'traffic', 500);
+      const traffic = dashboardTrendRenderSeries(display, 'traffic')[0];
+      const speed = dashboardTrendRenderSeries(display, 'speed')[0];
+      return display.map((point, index) => ({
+        id: point.display_bucket_id,
+        start: point.bucket_start_ms,
+        end: point.bucket_end_ms,
+        traffic: point.traffic_bytes,
+        requests: point.requests,
+        renderedTraffic: traffic[index],
+        renderedSpeed: speed[index],
+      }));
+    };
+    const firstSource = points.slice(0, 150);
+    const secondSource = points.slice(1);
+    return {
+      duration,
+      first: capture(firstSource),
+      second: capture(secondSource),
+      firstTraffic: firstSource.reduce((sum, point) => sum + point.traffic_bytes, 0),
+      secondTraffic: secondSource.reduce((sum, point) => sum + point.traffic_bytes, 0),
+      firstRequests: firstSource.reduce((sum, point) => sum + point.requests, 0),
+      secondRequests: secondSource.reduce((sum, point) => sum + point.requests, 0),
+    };
+  })()`, sandbox);
+
+  const first = Array.from(result.first, point => ({ ...point }));
+  const second = Array.from(result.second, point => ({ ...point }));
+  assert.ok(first.every(point => Number.isInteger(point.id)), 'every display point must expose an absolute bucket id');
+  assert.ok(first.every(point => point.start % result.duration === 0), 'bucket starts must be aligned to absolute time');
+  assert.equal(first.reduce((sum, point) => sum + point.traffic, 0), result.firstTraffic);
+  assert.equal(second.reduce((sum, point) => sum + point.traffic, 0), result.secondTraffic);
+  assert.equal(first.reduce((sum, point) => sum + point.requests, 0), result.firstRequests);
+  assert.equal(second.reduce((sum, point) => sum + point.requests, 0), result.secondRequests);
+
+  const firstByID = new Map(first.map(point => [point.id, point]));
+  const secondByID = new Map(second.map(point => [point.id, point]));
+  const shared = [...firstByID.keys()].filter(id => secondByID.has(id)).sort((a, b) => a - b);
+  assert.ok(shared.length >= 45, 'rolling by one sample should retain almost every display bucket');
+  shared.slice(1, -1).forEach(id => {
+    assert.deepEqual(secondByID.get(id), firstByID.get(id), `closed bucket ${id} must not change after the window rolls`);
+  });
+});
+
+test('dashboard sparse realtime smoothing keeps overlapping raw points stable', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = Array.from({ length: 21 }, (_, index) => ({
+      timestamp_ms: 100000 + index * dashboardRealtimeSampleIntervalMS,
+      download_bps: index % 4 === 0 ? 400 : 40,
+      upload_bps: 0,
+      traffic_bytes: index % 3 === 0 ? 90 : 10,
+      requests: index % 5 === 0 ? 1 : 0,
+    }));
+    const capture = source => {
+      const display = dashboardTrendDisplayPoints(source, 'traffic', 500);
+      const rendered = dashboardTrendRenderSeries(display, 'traffic')[0];
+      return display.map((point, index) => ({ id: point.display_bucket_id, raw: point.traffic_bytes, rendered: rendered[index] }));
+    };
+    return { first: capture(points.slice(0, 20)), second: capture(points.slice(1)) };
+  })()`, sandbox);
+  const first = new Map(Array.from(result.first, point => [point.id, { raw: point.raw, rendered: point.rendered }]));
+  const second = new Map(Array.from(result.second, point => [point.id, { raw: point.raw, rendered: point.rendered }]));
+  const shared = [...first.keys()].filter(id => second.has(id));
+  assert.equal(shared.length, 19);
+  shared.forEach(id => assert.deepEqual(second.get(id), first.get(id)));
+});
+
+test('dashboard teardown clears realtime smoothing state', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    dashboardRealtimeSmoothingCache.set('all|traffic|0|2000|bidirectional', new Map([[1, { raw: 1, smoothed: 1 }]]));
+    const before = dashboardRealtimeSmoothingCache.size;
+    stopDashSSE();
+    return { before, after: dashboardRealtimeSmoothingCache.size };
+  })()`, sandbox);
+  assert.deepEqual({ before: result.before, after: result.after }, { before: 1, after: 0 });
+});
+
+test('dashboard realtime buckets preserve weighted speed and per-site totals', () => {
+  const { sandbox } = makeTrafficHarness();
+  const point = vm.runInContext(`dashboardAggregateTrendBucket([
+    {
+      timestamp_ms: 2000, download_bps: 10, upload_bps: 4, traffic_bytes: 12, requests: 1,
+      site_contributions: {
+        a: { download_bps: 4, upload_bps: 1, traffic_bytes: 5, requests: 1 },
+        b: { download_bps: 6, upload_bps: 3, traffic_bytes: 7, requests: 0 },
+      },
+    },
+    {
+      timestamp_ms: 4000, download_bps: 20, upload_bps: 8, traffic_bytes: 18, requests: 0,
+      site_contributions: {
+        a: { download_bps: 8, upload_bps: 2, traffic_bytes: 6, requests: 0 },
+        b: { download_bps: 12, upload_bps: 6, traffic_bytes: 12, requests: 0 },
+      },
+    },
+    {
+      timestamp_ms: 8000, download_bps: 40, upload_bps: 16, traffic_bytes: 30, requests: 2,
+      site_contributions: {
+        a: { download_bps: 16, upload_bps: 4, traffic_bytes: 10, requests: 1 },
+        b: { download_bps: 24, upload_bps: 12, traffic_bytes: 20, requests: 1 },
+      },
+    },
+  ], [2000, 2000, 4000])`, sandbox);
+  assert.equal(point.download_bps, 27.5);
+  assert.equal(point.upload_bps, 11);
+  assert.equal(point.traffic_bytes, 60);
+  assert.equal(point.requests, 3);
+  assert.equal(point.bucket_start_ms, 2000);
+  assert.equal(point.bucket_end_ms, 8000);
+  assert.equal(point.sample_count, 3);
+  const sites = point.site_contributions;
+  assert.equal(sites.a.traffic_bytes + sites.b.traffic_bytes, point.traffic_bytes);
+  assert.equal(sites.a.requests + sites.b.requests, point.requests);
+  assert.equal(sites.a.download_bps + sites.b.download_bps, point.download_bps);
+  assert.equal(sites.a.upload_bps + sites.b.upload_bps, point.upload_bps);
+});
+
+test('dashboard monotone controls stay inside adjacent value ranges', () => {
+  const { sandbox } = makeTrafficHarness();
+  const controls = vm.runInContext(`dashboardTrendMonotoneControls([
+    { x: 0, y: 20 },
+    { x: 10, y: 80 },
+    { x: 20, y: 30 },
+    { x: 30, y: 60 },
+  ])`, sandbox);
+  Array.from(controls).forEach((control, index) => {
+    const values = [20, 80, 30, 60];
+    const min = Math.min(values[index], values[index + 1]);
+    const max = Math.max(values[index], values[index + 1]);
+    assert.ok(control.cp1y >= min && control.cp1y <= max);
+    assert.ok(control.cp2y >= min && control.cp2y <= max);
+  });
+  const source = readScript('pages/dashboard.js');
+  assert.match(source, /const monotone = metric !== 'requests'/);
+  assert.match(source, /dashboardTrendTracePath\(ctx, segment, monotone\)/);
+});
+
+test('dashboard realtime bucket tooltip keeps its time range compact', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`dashboardTrendTooltipTime({
+    timestamp_ms: Date.UTC(2026, 8, 16, 10, 0, 6),
+    bucket_start_ms: Date.UTC(2026, 8, 16, 10, 0, 0),
+    bucket_end_ms: Date.UTC(2026, 8, 16, 10, 0, 6),
+  }, 'realtime')`, sandbox);
+  assert.match(result, / - \d{2}:\d{2}:\d{2}$/);
+  assert.equal((result.match(/2026/g) || []).length, 1);
+});
+
+test('dashboard area fill closes at real samples and cannot imply a boundary drop', () => {
+  const source = readScript('pages/dashboard.js');
+  assert.match(source, /const pointsOnCanvas = item\.points;/);
+  assert.doesNotMatch(source, /dashboardTrendPaddedPathPoints/);
+  assert.match(source, /segment\[segment\.length - 1\]\.x, top \+ plotH/);
+  assert.match(source, /dashboardTrendLineSegments\(pointsOnCanvas\)/);
 });
 
 test('global traffic settings expose reset and no-reset billing cycles', () => {

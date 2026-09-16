@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"time"
 )
@@ -9,6 +10,7 @@ import (
 const (
 	agentFullReportInterval   = 5 * time.Second
 	agentLiveReportInterval   = 2 * time.Second
+	agentLiveFallbackWindow   = 2 * agentLiveReportInterval
 	maxNodeLiveSitesPerReport = maxNodeSiteStatsPerReport
 )
 
@@ -45,7 +47,8 @@ func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
 		return errors.New("invalid live report timestamp")
 	}
 	for _, stat := range report.SiteStats {
-		if stat.SiteID <= 0 || strings.TrimSpace(stat.Host) == "" || len(stat.Host) > 255 || stat.CumulativeBytesIn < 0 || stat.CumulativeBytesOut < 0 || stat.Requests < 0 {
+		invalidRate := stat.RateValid && (math.IsNaN(stat.DownloadBPS) || math.IsInf(stat.DownloadBPS, 0) || stat.DownloadBPS < 0 || math.IsNaN(stat.UploadBPS) || math.IsInf(stat.UploadBPS, 0) || stat.UploadBPS < 0)
+		if stat.SiteID <= 0 || strings.TrimSpace(stat.Host) == "" || len(stat.Host) > 255 || stat.CumulativeBytesIn < 0 || stat.CumulativeBytesOut < 0 || stat.Requests < 0 || invalidRate {
 			return errors.New("invalid live site traffic")
 		}
 	}
@@ -132,7 +135,12 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 				CumulativeBytesIn:  stat.CumulativeBytesIn,
 				CumulativeBytesOut: stat.CumulativeBytesOut,
 				Requests:           stat.Requests,
+				DownloadBPS:        stat.DownloadBPS,
+				UploadBPS:          stat.UploadBPS,
+				RateValid:          stat.RateValid,
 				SampledAtMS:        serverSampledAt,
+				AgentSampledAtMS:   report.SampledAtMS,
+				ReceivedAtMS:       serverSampledAt,
 			},
 			reportSessionID:   report.ReportSessionID,
 			counterEpoch:      report.CounterEpoch,
@@ -170,6 +178,10 @@ func (d *DB) recordNodeFullTelemetry(nodeID int64, report NodeReport, acceptedSi
 		sessionID = strings.TrimSpace(report.BootID)
 	}
 	counterEpoch := strings.TrimSpace(report.CounterEpoch)
+	agentSampledAtMS := report.SampledAtMS
+	if agentSampledAtMS <= 0 || agentSampledAtMS > now.Add(2*time.Minute).UnixMilli() {
+		agentSampledAtMS = now.UnixMilli()
+	}
 	for _, stat := range report.SiteStats {
 		if _, ok := allowed[stat.SiteID]; !ok {
 			continue
@@ -187,22 +199,34 @@ func (d *DB) recordNodeFullTelemetry(nodeID int64, report NodeReport, acceptedSi
 		}
 		key := nodeLiveTrafficKey{nodeID: nodeID, siteID: stat.SiteID}
 		previous, exists := d.agentLive[key]
+		// The lightweight channel owns the realtime cadence. A healthy live
+		// sample must not be replaced by the five-second persistence report.
+		if exists && previous.sequence > 0 && !previous.updatedAt.IsZero() && now.Sub(previous.updatedAt) <= agentLiveFallbackWindow {
+			continue
+		}
 		if exists && telemetrySequenceIsStale(previous, sessionID, counterEpoch, report.TelemetrySequence) {
 			continue
 		}
-		liveSequence := int64(0)
-		if exists {
-			liveSequence = previous.sequence
+		downloadBPS, uploadBPS := float64(0), float64(0)
+		rateValid := false
+		if exists && previous.AgentSampledAtMS > 0 && agentSampledAtMS > previous.AgentSampledAtMS && currentIn >= previous.CumulativeBytesIn && currentOut >= previous.CumulativeBytesOut {
+			seconds := float64(agentSampledAtMS-previous.AgentSampledAtMS) / 1000
+			if seconds > 0 {
+				downloadBPS = float64(currentOut-previous.CumulativeBytesOut) / seconds
+				uploadBPS = float64(currentIn-previous.CumulativeBytesIn) / seconds
+				rateValid = true
+			}
 		}
 		d.agentLive[key] = nodeLiveTrafficState{
 			NodeLiveSiteTraffic: NodeLiveSiteTraffic{
 				SiteID: stat.SiteID, Host: host,
 				CumulativeBytesIn: currentIn, CumulativeBytesOut: currentOut,
-				Requests: stat.RequestCount, SampledAtMS: now.UnixMilli(),
+				Requests: stat.RequestCount, DownloadBPS: downloadBPS, UploadBPS: uploadBPS, RateValid: rateValid,
+				SampledAtMS: now.UnixMilli(), AgentSampledAtMS: agentSampledAtMS, ReceivedAtMS: now.UnixMilli(),
 			},
 			reportSessionID:   sessionID,
 			counterEpoch:      counterEpoch,
-			sequence:          liveSequence,
+			sequence:          0,
 			telemetrySequence: report.TelemetrySequence,
 			updatedAt:         now,
 		}

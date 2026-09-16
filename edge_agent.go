@@ -593,6 +593,8 @@ type edgeAgentRuntime struct {
 	// only after the snapshot is captured while this lock is held, so a larger
 	// sequence can never refer to an older counter snapshot.
 	telemetrySampleMu sync.Mutex
+	liveRateSampledAt time.Time
+	liveRatePrevious  map[int64]NodeLiveSiteTraffic
 	telemetryMu       sync.Mutex
 	mediaCounts       map[int64]NodeMediaCount
 	retention         map[int64]NodeRetentionStatus
@@ -1124,6 +1126,40 @@ func (runtime *edgeAgentRuntime) liveSiteTrafficSnapshot() []NodeLiveSiteTraffic
 	return result
 }
 
+// captureLiveTelemetry keeps rate calculation on the Agent's monotonic clock.
+// Network delivery can be delayed or retried without changing the interval
+// represented by the sample.
+func (runtime *edgeAgentRuntime) captureLiveTelemetry() (sequence, sampledAtMS int64, stats []NodeLiveSiteTraffic) {
+	return runtime.captureLiveTelemetryAt(time.Now())
+}
+
+func (runtime *edgeAgentRuntime) captureLiveTelemetryAt(sampledAt time.Time) (sequence, sampledAtMS int64, stats []NodeLiveSiteTraffic) {
+	if runtime == nil {
+		return 0, 0, nil
+	}
+	runtime.telemetrySampleMu.Lock()
+	defer runtime.telemetrySampleMu.Unlock()
+
+	stats = runtime.liveSiteTrafficSnapshot()
+	elapsed := sampledAt.Sub(runtime.liveRateSampledAt).Seconds()
+	for index := range stats {
+		previous, ok := runtime.liveRatePrevious[stats[index].SiteID]
+		if !ok || elapsed <= 0 || stats[index].CumulativeBytesIn < previous.CumulativeBytesIn || stats[index].CumulativeBytesOut < previous.CumulativeBytesOut {
+			continue
+		}
+		stats[index].UploadBPS = float64(stats[index].CumulativeBytesIn-previous.CumulativeBytesIn) / elapsed
+		stats[index].DownloadBPS = float64(stats[index].CumulativeBytesOut-previous.CumulativeBytesOut) / elapsed
+		stats[index].RateValid = true
+	}
+	runtime.liveRatePrevious = make(map[int64]NodeLiveSiteTraffic, len(stats))
+	for _, stat := range stats {
+		runtime.liveRatePrevious[stat.SiteID] = stat
+	}
+	runtime.liveRateSampledAt = sampledAt
+	sequence = runtime.nextTelemetrySequence()
+	return sequence, sampledAt.UnixMilli(), stats
+}
+
 // sampleTelemetry runs one complete telemetry capture under the shared
 // sampler lock and allocates the ordering sequence afterwards. The callback
 // must capture all data represented by the sequence before returning.
@@ -1154,6 +1190,7 @@ func (runtime *edgeAgentRuntime) captureFullTelemetry(bootID string, sequence in
 	pendingStats := runtime.prepareSiteStats()
 	pendingTelemetry := runtime.prepareTelemetry()
 	report.TelemetrySequence = runtime.nextTelemetrySequence()
+	report.SampledAtMS = time.Now().UnixMilli()
 	report.SiteStats = pendingStats.stats
 	report.MediaCounts = pendingTelemetry.media
 	report.Retention = pendingTelemetry.retention
@@ -2428,6 +2465,84 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion, NetAddresses: edgeCollectNetAddresses(interfaceName)}, nil
 }
 
+var edgeAWSMetadataMu sync.Mutex
+var edgeAWSMetadataIPv4 string
+var edgeAWSMetadataCheckedAt time.Time
+
+const edgeAWSMetadataCacheDuration = 5 * time.Minute
+
+func edgeMetadataIPv4FromResponse(value string) string {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	return ip.To4().String()
+}
+
+// edgeAWSMetadataPublicIPv4 handles the AWS address model where the public
+// IPv4 is an instance mapping and therefore does not appear in net.Interfaces.
+// IMDSv2 is queried only at fixed link-local endpoints and the result is cached
+// so a non-AWS Agent does not pay a metadata timeout on every full report.
+func edgeAWSMetadataPublicIPv4() string {
+	now := time.Now()
+	edgeAWSMetadataMu.Lock()
+	if !edgeAWSMetadataCheckedAt.IsZero() && now.Sub(edgeAWSMetadataCheckedAt) < edgeAWSMetadataCacheDuration {
+		value := edgeAWSMetadataIPv4
+		edgeAWSMetadataMu.Unlock()
+		return value
+	}
+	edgeAWSMetadataCheckedAt = now
+	edgeAWSMetadataMu.Unlock()
+
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   750 * time.Millisecond,
+	}
+	defer client.CloseIdleConnections()
+	for _, endpoint := range []string{"http://169.254.169.254", "http://[fd00:ec2::254]"} {
+		tokenRequest, err := http.NewRequest(http.MethodPut, endpoint+"/latest/api/token", nil)
+		if err != nil {
+			continue
+		}
+		tokenRequest.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+		// #nosec G107 -- endpoint is one of the fixed AWS EC2 metadata addresses.
+		tokenResponse, err := client.Do(tokenRequest)
+		if err != nil {
+			continue
+		}
+		token, readErr := io.ReadAll(io.LimitReader(tokenResponse.Body, 256))
+		_ = tokenResponse.Body.Close()
+		if readErr != nil || tokenResponse.StatusCode < 200 || tokenResponse.StatusCode >= 300 || strings.TrimSpace(string(token)) == "" {
+			continue
+		}
+		addressRequest, err := http.NewRequest(http.MethodGet, endpoint+"/latest/meta-data/public-ipv4", nil)
+		if err != nil {
+			continue
+		}
+		addressRequest.Header.Set("X-aws-ec2-metadata-token", strings.TrimSpace(string(token)))
+		// #nosec G107 -- endpoint is one of the fixed AWS EC2 metadata addresses.
+		addressResponse, err := client.Do(addressRequest)
+		if err != nil {
+			continue
+		}
+		address, readErr := io.ReadAll(io.LimitReader(addressResponse.Body, 128))
+		_ = addressResponse.Body.Close()
+		if readErr != nil || addressResponse.StatusCode < 200 || addressResponse.StatusCode >= 300 {
+			continue
+		}
+		if value := edgeMetadataIPv4FromResponse(string(address)); value != "" {
+			edgeAWSMetadataMu.Lock()
+			edgeAWSMetadataIPv4 = value
+			edgeAWSMetadataMu.Unlock()
+			return value
+		}
+	}
+	edgeAWSMetadataMu.Lock()
+	edgeAWSMetadataIPv4 = ""
+	edgeAWSMetadataMu.Unlock()
+	return ""
+}
+
 func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -2448,6 +2563,9 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 			continue
 		}
 		for _, raw := range addrs {
+			if len(result) >= 16 {
+				break
+			}
 			text := strings.TrimSpace(raw.String())
 			if slash := strings.IndexByte(text, '/'); slash >= 0 {
 				text = text[:slash]
@@ -2468,9 +2586,11 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 			}
 			seen[key] = true
 			result = append(result, NodeNetAddress{Family: family, Address: normalized, Interface: iface.Name})
-			if len(result) >= 16 {
-				return result
-			}
+		}
+	}
+	if !hasNetworkAddressFamily(result, "v4") {
+		if address := edgeAWSMetadataPublicIPv4(); address != "" {
+			result = append(result, NodeNetAddress{Family: "v4", Address: address, Interface: "metadata"})
 		}
 	}
 	// Keep the interface used for counters first, which improves adoption
@@ -2484,48 +2604,106 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 	return result
 }
 
+func hasNetworkAddressFamily(addresses []NodeNetAddress, family string) bool {
+	for _, address := range addresses {
+		if address.Family == family {
+			return true
+		}
+	}
+	return false
+}
+
 func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, _ int64, runtime *edgeAgentRuntime) error {
 	if runtime == nil {
 		return nil
 	}
-	sequence := int64(0)
-	send := func() error {
-		if runtime.isQuiesced() {
+	loopCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	// Sampling must keep its fixed cadence even while the Controller is slow.
+	// A small bounded queue absorbs transient latency; when it fills, discard
+	// the oldest sample so the sender converges on current state. Cumulative
+	// counters let the Controller reconcile the skipped interval without losing
+	// accounted bytes.
+	const liveReportQueueSize = 8
+	reports := make(chan NodeLiveReport, liveReportQueueSize)
+	go func() {
+		defer close(reports)
+		sequence := int64(0)
+		capture := func() {
+			if runtime.isQuiesced() {
+				return
+			}
+			sequence++
+			telemetrySequence, sampledAtMS, stats := runtime.captureLiveTelemetry()
+			leaseID, currentEpoch := runtime.reportIdentity()
+			report := NodeLiveReport{
+				ReportSessionID: sessionID, SessionEpoch: currentEpoch, AgentLeaseID: leaseID,
+				CounterEpoch: edgeCounterEpoch(edgeDefaultInterface()), Sequence: sequence,
+				TelemetrySequence: telemetrySequence, SampledAtMS: sampledAtMS, SiteStats: stats,
+			}
+			select {
+			case reports <- report:
+				return
+			default:
+			}
+			select {
+			case <-reports:
+			default:
+			}
+			select {
+			case reports <- report:
+			case <-loopCtx.Done():
+			}
+		}
+		capture()
+		ticker := time.NewTicker(agentLiveReportInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C:
+				capture()
+			}
+		}
+	}()
+
+	send := func(report NodeLiveReport) error {
+		var ack struct{}
+		// A live sample must never inherit the two-minute general API timeout:
+		// one stalled Controller request would otherwise pause this loop and make
+		// the dashboard appear to stop for the whole outage. Bound each attempt
+		// to one reporting interval and retry once with a short backoff.
+		requestCtx, cancel := context.WithTimeout(loopCtx, 1500*time.Millisecond)
+		err := edgeAPIRequest(requestCtx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
+		cancel()
+		if err == nil {
 			return nil
 		}
-		sequence++
-		var stats []NodeLiveSiteTraffic
-		telemetrySequence, sampledAtMS := runtime.sampleTelemetry(func() {
-			stats = runtime.liveSiteTrafficSnapshot()
-		})
-		_, currentEpoch := runtime.reportIdentity()
-		report := NodeLiveReport{
-			ReportSessionID:   sessionID,
-			SessionEpoch:      currentEpoch,
-			CounterEpoch:      edgeCounterEpoch(edgeDefaultInterface()),
-			Sequence:          sequence,
-			TelemetrySequence: telemetrySequence,
-			SampledAtMS:       sampledAtMS,
-			SiteStats:         stats,
+		select {
+		case <-loopCtx.Done():
+			return loopCtx.Err()
+		case <-time.After(250 * time.Millisecond):
 		}
-		report.AgentLeaseID, _ = runtime.reportIdentity()
-		var ack struct{}
-		return edgeAPIRequest(ctx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
-	}
-	// Send one sample immediately so a freshly applied route does not wait for
-	// the first ticker boundary.
-	if err := send(); err != nil && (isEdgeAgentRevoked(err) || isEdgeAgentStale(err)) {
+		requestCtx, cancel = context.WithTimeout(loopCtx, 1500*time.Millisecond)
+		err = edgeAPIRequest(requestCtx, client, http.MethodPost, controller+"/api/agent/live", token, report, &ack)
+		cancel()
 		return err
 	}
-	ticker := time.NewTicker(agentLiveReportInterval)
-	defer ticker.Stop()
 	var lastLog time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			if err := send(); err != nil {
+		case report, ok := <-reports:
+			if !ok {
+				return nil
+			}
+			if err := send(report); err != nil {
+				if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+					return nil
+				}
 				if isEdgeAgentRevoked(err) || isEdgeAgentStale(err) {
 					return err
 				}

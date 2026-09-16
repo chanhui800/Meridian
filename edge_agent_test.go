@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -138,6 +139,101 @@ func TestAgentTelemetrySequenceIsBoundToSnapshotOrder(t *testing.T) {
 	secondSequence := <-secondDone
 	if firstSequence <= 0 || secondSequence != firstSequence+1 {
 		t.Fatalf("telemetry sequence order=%d,%d, want consecutive snapshot order", firstSequence, secondSequence)
+	}
+}
+
+func TestCaptureLiveTelemetryUsesAgentSampleInterval(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	counter := runtime.trafficCounterFor(42, "rate.example.test")
+	firstAt := time.Unix(1_700_000_000, 0)
+	firstSequence, firstSampledAt, first := runtime.captureLiveTelemetryAt(firstAt)
+	if firstSequence != 1 || firstSampledAt != firstAt.UnixMilli() || len(first) != 1 || first[0].RateValid {
+		t.Fatalf("first live telemetry=%d/%d/%+v, want baseline without rate", firstSequence, firstSampledAt, first)
+	}
+	counter.cumulativeIn.Store(40)
+	counter.cumulativeOut.Store(60)
+	counter.requests.Store(1)
+	secondSequence, secondSampledAt, second := runtime.captureLiveTelemetryAt(firstAt.Add(2 * time.Second))
+	if secondSequence != 2 || secondSampledAt != firstAt.Add(2*time.Second).UnixMilli() || len(second) != 1 {
+		t.Fatalf("second live telemetry=%d/%d/%+v", secondSequence, secondSampledAt, second)
+	}
+	if !second[0].RateValid || second[0].UploadBPS != 20 || second[0].DownloadBPS != 30 {
+		t.Fatalf("Agent rates=%+v, want upload=20 download=30", second[0])
+	}
+	counter.cumulativeIn.Store(1)
+	counter.cumulativeOut.Store(2)
+	_, _, reset := runtime.captureLiveTelemetryAt(firstAt.Add(4 * time.Second))
+	if len(reset) != 1 || reset[0].RateValid {
+		t.Fatalf("counter reset produced a rate: %+v", reset)
+	}
+}
+
+func TestEdgeMetadataIPv4FromResponse(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "public ipv4", value: "198.51.100.42\n", want: "198.51.100.42"},
+		{name: "ipv6 rejected", value: "2001:db8::42", want: ""},
+		{name: "invalid rejected", value: "not-an-ip", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := edgeMetadataIPv4FromResponse(test.value); got != test.want {
+				t.Fatalf("metadata IPv4=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEdgeLiveReportRetriesAfterBoundedTimeout(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondReceived := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			// Outlive the 1.5s per-attempt deadline without depending on
+			// server-side request-context cancellation semantics.
+			time.Sleep(1600 * time.Millisecond)
+			return
+		}
+		close(secondReceived)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		done <- edgeLiveReportLoop(ctx, server.Client(), server.URL, "token", "session", 0, &edgeAgentRuntime{})
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live report did not start")
+	}
+	select {
+	case <-secondReceived:
+	case <-time.After(4 * time.Second):
+		t.Fatal("live report did not retry after the bounded timeout")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("live report loop returned error after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live report loop did not stop after cancellation")
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("bounded live retry took %v, want under 4s", elapsed)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("live report attempts=%d, want at least 2", got)
 	}
 }
 
@@ -845,7 +941,7 @@ func TestEdgeProxyReusesPrimaryPlaybackAndHeaderPolicies(t *testing.T) {
 			Headers: map[string][]string{"X-Origin-Secret": {"configured"}},
 			Site: Site{Name: "edge", PublicHost: "edge.example.test", IngressMode: ingressModeHost,
 				TargetURL: api.URL, PlaybackTargetURL: playback.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy",
-				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,},
+				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth},
 			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
@@ -932,7 +1028,6 @@ func TestBuildAgentConfigCarriesCompleteDynamicSiteWithoutNestedQueryDeadlock(t 
 	site, err := app.db.CreateSiteRecord(Site{
 		Name: "dynamic", PublicHost: "dynamic.example.test", IngressMode: ingressModeHost, TargetURL: "https://origin.example.test",
 		PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode,
-
 	})
 	if err != nil {
 		t.Fatal(err)
