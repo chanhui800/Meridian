@@ -201,11 +201,25 @@ async function loadDashboardBootstrap() {
   return dashboardBootstrapPromise;
 }
 
-function dashboardRequestScale(maxValue) {
-  // Keep six horizontal bands on every chart. Only the step changes with the
-	// data range, so cards remain visually comparable while labels stay useful.
-	const ticks = 6;
-	if (!(maxValue > 0)) return { max: ticks, step: 1, ticks };
+function dashboardRequestScale(maxValue, metric = '') {
+  if (metric === 'requests') {
+    // Request deltas are integer counts. Keep the axis integer-valued so a
+    // single request is not rendered with rounded fractional labels such as
+    // 000111, which makes the chart look like it contains duplicate events.
+    const ceiling = Math.max(1, Math.ceil(Number(maxValue) || 0));
+    if (ceiling <= 6) return { max: ceiling, step: 1, ticks: ceiling };
+    const roughStep = ceiling / 6;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
+    const fraction = roughStep / magnitude;
+    const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+    const step = Math.max(1, Math.ceil(niceFraction * magnitude));
+    const max = step * Math.ceil(ceiling / step);
+    return { max, step, ticks: Math.max(1, Math.ceil(max / step)) };
+  }
+  // Keep six horizontal bands on speed and traffic charts. Only the step
+  // changes with the data range, so cards remain visually comparable.
+  const ticks = 6;
+  if (!(maxValue > 0)) return { max: ticks, step: 1, ticks };
   const roughStep = maxValue / ticks;
   const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
   const fraction = roughStep / magnitude;
@@ -962,7 +976,7 @@ function drawDashboardTrendChart(metric) {
   const series = metric === 'speed'
     ? [{ values: points.map(point => Math.max(0, Number(point.download_bps || 0))), color: '#3b9cff' }, { values: points.map(point => Math.max(0, Number(point.upload_bps || 0))), color: '#a78bfa' }]
     : [{ values: points.map(point => dashboardTrendMetricValue(point, metric)), color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
-  const scale = dashboardRequestScale(Math.max(0, ...series.flatMap(item => item.values)));
+  const scale = dashboardRequestScale(Math.max(0, ...series.flatMap(item => item.values)), metric);
   ctx.font = `${width < 360 ? 10 : 11}px system-ui`;
   const yLabelWidth = Math.max(...Array.from({ length: scale.ticks + 1 }, (_, index) => ctx.measureText(dashboardTrendValueLabel(scale.max - scale.step * index, metric)).width));
   const left = Math.min(Math.max(50, Math.ceil(yLabelWidth) + 16), Math.floor(width * .36));

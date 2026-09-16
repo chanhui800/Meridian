@@ -142,6 +142,24 @@ func TestAgentTelemetrySequenceIsBoundToSnapshotOrder(t *testing.T) {
 	}
 }
 
+func TestEdgeMetadataIPv4FromResponse(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "public ipv4", value: "198.51.100.42\n", want: "198.51.100.42"},
+		{name: "ipv6 rejected", value: "2001:db8::42", want: ""},
+		{name: "invalid rejected", value: "not-an-ip", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := edgeMetadataIPv4FromResponse(test.value); got != test.want {
+				t.Fatalf("metadata IPv4=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestEdgeLiveReportRetriesAfterBoundedTimeout(t *testing.T) {
 	firstStarted := make(chan struct{})
 	secondReceived := make(chan struct{})
@@ -897,7 +915,7 @@ func TestEdgeProxyReusesPrimaryPlaybackAndHeaderPolicies(t *testing.T) {
 			Headers: map[string][]string{"X-Origin-Secret": {"configured"}},
 			Site: Site{Name: "edge", PublicHost: "edge.example.test", IngressMode: ingressModeHost,
 				TargetURL: api.URL, PlaybackTargetURL: playback.URL, PlaybackMode: "direct", MainVideoStreamMode: "proxy",
-				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth,},
+				StreamHosts: "[]", UAMode: passthroughUAMode, ClientIPMode: clientIPModeBoth},
 			FailoverTargets: "[]", StreamHostsRaw: "[]",
 		}},
 	}
@@ -984,7 +1002,6 @@ func TestBuildAgentConfigCarriesCompleteDynamicSiteWithoutNestedQueryDeadlock(t 
 	site, err := app.db.CreateSiteRecord(Site{
 		Name: "dynamic", PublicHost: "dynamic.example.test", IngressMode: ingressModeHost, TargetURL: "https://origin.example.test",
 		PlaybackMode: "direct", MainVideoStreamMode: "proxy", StreamHosts: "[]", UAMode: passthroughUAMode,
-
 	})
 	if err != nil {
 		t.Fatal(err)

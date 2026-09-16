@@ -2428,6 +2428,84 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion, NetAddresses: edgeCollectNetAddresses(interfaceName)}, nil
 }
 
+var edgeAWSMetadataMu sync.Mutex
+var edgeAWSMetadataIPv4 string
+var edgeAWSMetadataCheckedAt time.Time
+
+const edgeAWSMetadataCacheDuration = 5 * time.Minute
+
+func edgeMetadataIPv4FromResponse(value string) string {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	return ip.To4().String()
+}
+
+// edgeAWSMetadataPublicIPv4 handles the AWS address model where the public
+// IPv4 is an instance mapping and therefore does not appear in net.Interfaces.
+// IMDSv2 is queried only at fixed link-local endpoints and the result is cached
+// so a non-AWS Agent does not pay a metadata timeout on every full report.
+func edgeAWSMetadataPublicIPv4() string {
+	now := time.Now()
+	edgeAWSMetadataMu.Lock()
+	if !edgeAWSMetadataCheckedAt.IsZero() && now.Sub(edgeAWSMetadataCheckedAt) < edgeAWSMetadataCacheDuration {
+		value := edgeAWSMetadataIPv4
+		edgeAWSMetadataMu.Unlock()
+		return value
+	}
+	edgeAWSMetadataCheckedAt = now
+	edgeAWSMetadataMu.Unlock()
+
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   750 * time.Millisecond,
+	}
+	defer client.CloseIdleConnections()
+	for _, endpoint := range []string{"http://169.254.169.254", "http://[fd00:ec2::254]"} {
+		tokenRequest, err := http.NewRequest(http.MethodPut, endpoint+"/latest/api/token", nil)
+		if err != nil {
+			continue
+		}
+		tokenRequest.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+		// #nosec G107 -- endpoint is one of the fixed AWS EC2 metadata addresses.
+		tokenResponse, err := client.Do(tokenRequest)
+		if err != nil {
+			continue
+		}
+		token, readErr := io.ReadAll(io.LimitReader(tokenResponse.Body, 256))
+		_ = tokenResponse.Body.Close()
+		if readErr != nil || tokenResponse.StatusCode < 200 || tokenResponse.StatusCode >= 300 || strings.TrimSpace(string(token)) == "" {
+			continue
+		}
+		addressRequest, err := http.NewRequest(http.MethodGet, endpoint+"/latest/meta-data/public-ipv4", nil)
+		if err != nil {
+			continue
+		}
+		addressRequest.Header.Set("X-aws-ec2-metadata-token", strings.TrimSpace(string(token)))
+		// #nosec G107 -- endpoint is one of the fixed AWS EC2 metadata addresses.
+		addressResponse, err := client.Do(addressRequest)
+		if err != nil {
+			continue
+		}
+		address, readErr := io.ReadAll(io.LimitReader(addressResponse.Body, 128))
+		_ = addressResponse.Body.Close()
+		if readErr != nil || addressResponse.StatusCode < 200 || addressResponse.StatusCode >= 300 {
+			continue
+		}
+		if value := edgeMetadataIPv4FromResponse(string(address)); value != "" {
+			edgeAWSMetadataMu.Lock()
+			edgeAWSMetadataIPv4 = value
+			edgeAWSMetadataMu.Unlock()
+			return value
+		}
+	}
+	edgeAWSMetadataMu.Lock()
+	edgeAWSMetadataIPv4 = ""
+	edgeAWSMetadataMu.Unlock()
+	return ""
+}
+
 func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -2448,6 +2526,9 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 			continue
 		}
 		for _, raw := range addrs {
+			if len(result) >= 16 {
+				break
+			}
 			text := strings.TrimSpace(raw.String())
 			if slash := strings.IndexByte(text, '/'); slash >= 0 {
 				text = text[:slash]
@@ -2468,9 +2549,11 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 			}
 			seen[key] = true
 			result = append(result, NodeNetAddress{Family: family, Address: normalized, Interface: iface.Name})
-			if len(result) >= 16 {
-				return result
-			}
+		}
+	}
+	if !hasNetworkAddressFamily(result, "v4") {
+		if address := edgeAWSMetadataPublicIPv4(); address != "" {
+			result = append(result, NodeNetAddress{Family: "v4", Address: address, Interface: "metadata"})
 		}
 	}
 	// Keep the interface used for counters first, which improves adoption
@@ -2482,6 +2565,15 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 		}
 	}
 	return result
+}
+
+func hasNetworkAddressFamily(addresses []NodeNetAddress, family string) bool {
+	for _, address := range addresses {
+		if address.Family == family {
+			return true
+		}
+	}
+	return false
 }
 
 func edgeLiveReportLoop(ctx context.Context, client *http.Client, controller, token, sessionID string, _ int64, runtime *edgeAgentRuntime) error {
