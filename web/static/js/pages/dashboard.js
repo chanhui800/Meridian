@@ -982,35 +982,20 @@ function dashboardTrendDisplayPointTarget(plotWidth) {
   return Math.max(30, Math.min(50, Math.round(width / 10)));
 }
 
-function dashboardTrendSampleWeights(points) {
-  return points.map((point, index) => {
-    const timestamp = Number(point?.timestamp_ms || 0);
-    const adjacent = index > 0
-      ? Number(points[index - 1]?.timestamp_ms || 0)
-      : Number(points[index + 1]?.timestamp_ms || 0);
-    let elapsed = index > 0 ? timestamp - adjacent : adjacent - timestamp;
-    if (!Number.isFinite(elapsed) || elapsed <= 0) elapsed = dashboardRealtimeSampleIntervalMS;
-    return Math.max(500, Math.min(dashboardRealtimeSampleIntervalMS * 4, elapsed));
-  });
-}
-
-function dashboardAggregateTrendValues(samples, weights) {
-  let totalWeight = 0;
-  let downloadWeighted = 0;
-  let uploadWeighted = 0;
+function dashboardAggregateTrendValues(samples) {
+  let downloadPeak = 0;
+  let uploadPeak = 0;
   let bytesIn = 0;
   let bytesOut = 0;
   let requests = 0;
   let trafficBytes = 0;
   let availableSamples = 0;
-  samples.forEach((sample, index) => {
-    const weight = Math.max(1, Number(weights?.[index]) || dashboardRealtimeSampleIntervalMS);
+  samples.forEach(sample => {
     const unavailable = sample?.speed_unavailable === true;
     const download = unavailable ? 0 : Math.max(0, Number(sample?.download_bps || 0));
     const upload = unavailable ? 0 : Math.max(0, Number(sample?.upload_bps || 0));
-    totalWeight += weight;
-    downloadWeighted += download * weight;
-    uploadWeighted += upload * weight;
+    downloadPeak = Math.max(downloadPeak, download);
+    uploadPeak = Math.max(uploadPeak, upload);
     bytesIn += Math.max(0, Number(sample?.bytes_in || 0));
     bytesOut += Math.max(0, Number(sample?.bytes_out || 0));
     requests += Math.max(0, Number(sample?.requests || 0));
@@ -1018,8 +1003,8 @@ function dashboardAggregateTrendValues(samples, weights) {
     if (!unavailable) availableSamples++;
   });
   return {
-    download_bps: totalWeight > 0 ? downloadWeighted / totalWeight : 0,
-    upload_bps: totalWeight > 0 ? uploadWeighted / totalWeight : 0,
+    download_bps: downloadPeak,
+    upload_bps: uploadPeak,
     bytes_in: bytesIn,
     bytes_out: bytesOut,
     requests,
@@ -1028,12 +1013,12 @@ function dashboardAggregateTrendValues(samples, weights) {
   };
 }
 
-function dashboardAggregateTrendBucket(samples, weights, bucket = null) {
+function dashboardAggregateTrendBucket(samples, bucket = null) {
   const first = samples[0];
   const last = samples[samples.length - 1];
   const aggregate = {
     ...last,
-    ...dashboardAggregateTrendValues(samples, weights),
+    ...dashboardAggregateTrendValues(samples),
     timestamp_ms: Number(last?.timestamp_ms || 0),
     bucket_start_ms: Number(first?.timestamp_ms || 0),
     bucket_end_ms: Number(last?.timestamp_ms || 0),
@@ -1067,7 +1052,7 @@ function dashboardAggregateTrendBucket(samples, weights, bucket = null) {
         speed_unavailable: true,
       });
       aggregate.site_contributions[siteID] = {
-        ...dashboardAggregateTrendValues(siteSamples, weights),
+        ...dashboardAggregateTrendValues(siteSamples),
         timestamp_ms: aggregate.timestamp_ms,
         bucket_start_ms: aggregate.bucket_start_ms,
         bucket_end_ms: aggregate.bucket_end_ms,
@@ -1100,16 +1085,14 @@ function dashboardTrendDisplayPoints(points, metric, plotWidth) {
     });
   }
   const bucketDuration = dashboardTrendBucketDurationMS(target);
-  const weights = dashboardTrendSampleWeights(points);
   const groups = new Map();
-  points.forEach((point, index) => {
+  points.forEach(point => {
     const timestamp = Number(point?.timestamp_ms || 0);
     if (!Number.isFinite(timestamp) || timestamp < 0) return;
     const bucketID = Math.floor(timestamp / bucketDuration);
-    if (!groups.has(bucketID)) groups.set(bucketID, { samples: [], weights: [] });
+    if (!groups.has(bucketID)) groups.set(bucketID, { samples: [] });
     const group = groups.get(bucketID);
     group.samples.push(point);
-    group.weights.push(weights[index]);
   });
   if (!groups.size) return points;
   const bucketIDs = Array.from(groups.keys()).sort((a, b) => a - b);
@@ -1118,7 +1101,7 @@ function dashboardTrendDisplayPoints(points, metric, plotWidth) {
   bucketIDs.forEach(bucketID => {
     const group = groups.get(bucketID);
     const start = bucketID * bucketDuration;
-    result.push(dashboardAggregateTrendBucket(group.samples, group.weights, {
+    result.push(dashboardAggregateTrendBucket(group.samples, {
       id: bucketID,
       start,
       end: start + bucketDuration,
@@ -1185,8 +1168,8 @@ function dashboardTrendTracePath(ctx, points, monotone) {
 // Realtime proxy traffic is sampled in two-second buckets. Video clients fill
 // their buffers in bursts, so plotting every raw zero between two chunks makes
 // an otherwise healthy stream look disconnected. Smooth only the visual
-// series: the speed peak follows this rendered curve, while tooltips,
-// persisted counters and request deltas continue to use Controller values.
+// series. Speed keeps every positive peak and uses the filter only as a
+// decaying floor; persisted counters and request deltas stay untouched.
 function dashboardRealtimeSmoothingKey(points, metric, seriesIndex) {
   const bucketDuration = Number(points?.[0]?.display_bucket_duration_ms || 0);
   if (!(bucketDuration > 0) || !points.every(point => Number.isInteger(point?.display_bucket_id))) return '';
@@ -1211,7 +1194,7 @@ function dashboardRealtimeSmoothingState(key) {
   return state;
 }
 
-function dashboardRealtimeSmoothedValues(points, values, alpha = 0.35, cacheKey = '') {
+function dashboardRealtimeSmoothedValues(points, values, alpha = 0.35, cacheKey = '', preservePeaks = false) {
   if (!Array.isArray(values) || !values.length) return [];
   const cache = dashboardRealtimeSmoothingState(cacheKey);
   let smoothed = null;
@@ -1239,7 +1222,7 @@ function dashboardRealtimeSmoothedValues(points, values, alpha = 0.35, cacheKey 
     }
     if (cache && Number.isInteger(bucketID)) cache.set(bucketID, { raw: current, smoothed });
     if (timestamp > 0) previousTimestamp = timestamp;
-    return smoothed;
+    return preservePeaks ? Math.max(current, smoothed) : smoothed;
   });
   if (cache) {
     const bucketIDs = new Set(points.map(point => Number(point?.display_bucket_id)).filter(Number.isInteger));
@@ -1263,6 +1246,7 @@ function dashboardTrendRenderSeries(points, metric) {
     values,
     0.35,
     dashboardRealtimeSmoothingKey(points, metric, index),
+    metric === 'speed',
   ));
 }
 
