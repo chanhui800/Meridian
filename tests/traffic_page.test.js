@@ -985,7 +985,7 @@ test('dashboard realtime speed and traffic stay continuous without changing requ
       requests: dashboardTrendRenderSeries(points, 'requests')[0],
     };
   })()`, sandbox);
-  assert.deepEqual(Array.from(result.speed, Math.round), [100, 65, 77, 50]);
+  assert.deepEqual(Array.from(result.speed, Math.round), [100, 65, 100, 50]);
   assert.deepEqual(Array.from(result.traffic, Math.round), [200, 130, 155, 100]);
   assert.deepEqual(Array.from(result.requests), [1, 0, 1, 0], 'request deltas must remain exact and unsmoothed');
   assert.ok(Array.from(result.speed).every(Number.isFinite), 'unavailable speed samples must decay instead of splitting the line');
@@ -1008,7 +1008,7 @@ test('dashboard realtime smoothing is time-aware and leaves historical ranges ra
   assert.deepEqual(Array.from(result.historical), [100, 0]);
 });
 
-test('dashboard speed summary uses the same bucketed and smoothed values as the curve', () => {
+test('dashboard speed curve and summary preserve the raw peak after bucketing', () => {
   const { sandbox } = makeTrafficHarness();
   const summary = makeElement('dashboard-speed-summary');
   sandbox.document = makeDocument({ 'dashboard-speed-summary': summary });
@@ -1023,11 +1023,25 @@ test('dashboard speed summary uses the same bucketed and smoothed values as the 
     const rendered = dashboardTrendRenderSeries(display, 'speed');
     const rawPeak = Math.max(...points.map(point => point.download_bps));
     const renderedPeak = Math.max(...rendered[0]);
+    const rawUploadPeak = Math.max(...points.map(point => point.upload_bps));
+    const bucketedPeak = Math.max(...display.map(point => point.download_bps));
+    const bucketedUploadPeak = Math.max(...display.map(point => point.upload_bps));
     const renderedUploadPeak = Math.max(...rendered[1]);
     dashboardTrendSpeedSummary(rendered);
-    return { rawPeak, renderedPeak, renderedUploadPeak, text: document.getElementById('dashboard-speed-summary').textContent };
+    return {
+      rawPeak,
+      rawUploadPeak,
+      bucketedPeak,
+      bucketedUploadPeak,
+      renderedPeak,
+      renderedUploadPeak,
+      text: document.getElementById('dashboard-speed-summary').textContent,
+    };
   })()`, sandbox);
-  assert.ok(result.renderedPeak < result.rawPeak, 'the fixture must produce a visible difference between raw and rendered peaks');
+  assert.equal(result.bucketedPeak, result.rawPeak, 'display bucketing must retain the download peak');
+  assert.equal(result.bucketedUploadPeak, result.rawUploadPeak, 'display bucketing must retain the upload peak');
+  assert.equal(result.renderedPeak, result.rawPeak, 'continuity processing must not reduce the download peak');
+  assert.equal(result.renderedUploadPeak, result.rawUploadPeak, 'continuity processing must not reduce the upload peak');
   assert.equal(result.text, `↓ ${sandbox.formatRate(result.renderedPeak)} · ↑ ${sandbox.formatRate(result.renderedUploadPeak)}`);
   assert.match(readScript('pages/dashboard.js'), /if \(metric === 'speed'\) dashboardTrendSpeedSummary\(renderValues\);/);
 });
@@ -1162,7 +1176,7 @@ test('dashboard teardown clears realtime smoothing state', () => {
   assert.deepEqual({ before: result.before, after: result.after }, { before: 1, after: 0 });
 });
 
-test('dashboard realtime buckets preserve weighted speed and per-site totals', () => {
+test('dashboard realtime buckets preserve speed peaks and additive totals', () => {
   const { sandbox } = makeTrafficHarness();
   const point = vm.runInContext(`dashboardAggregateTrendBucket([
     {
@@ -1186,9 +1200,9 @@ test('dashboard realtime buckets preserve weighted speed and per-site totals', (
         b: { download_bps: 24, upload_bps: 12, traffic_bytes: 20, requests: 1 },
       },
     },
-  ], [2000, 2000, 4000])`, sandbox);
-  assert.equal(point.download_bps, 27.5);
-  assert.equal(point.upload_bps, 11);
+  ])`, sandbox);
+  assert.equal(point.download_bps, 40);
+  assert.equal(point.upload_bps, 16);
   assert.equal(point.traffic_bytes, 60);
   assert.equal(point.requests, 3);
   assert.equal(point.bucket_start_ms, 2000);
@@ -1197,8 +1211,10 @@ test('dashboard realtime buckets preserve weighted speed and per-site totals', (
   const sites = point.site_contributions;
   assert.equal(sites.a.traffic_bytes + sites.b.traffic_bytes, point.traffic_bytes);
   assert.equal(sites.a.requests + sites.b.requests, point.requests);
-  assert.equal(sites.a.download_bps + sites.b.download_bps, point.download_bps);
-  assert.equal(sites.a.upload_bps + sites.b.upload_bps, point.upload_bps);
+  assert.equal(sites.a.download_bps, 16);
+  assert.equal(sites.a.upload_bps, 4);
+  assert.equal(sites.b.download_bps, 24);
+  assert.equal(sites.b.upload_bps, 12);
 });
 
 test('dashboard monotone controls stay inside adjacent value ranges', () => {
