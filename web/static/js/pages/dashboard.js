@@ -911,15 +911,12 @@ function dashboardRealtimeChartBounds(points) {
 
 function dashboardTrendSummary(data) {
   const points = dashboardTrendPoints();
-  const downloadPeak = points.reduce((max, point) => Math.max(max, Number(point.download_bps || 0)), 0);
-  const uploadPeak = points.reduce((max, point) => Math.max(max, Number(point.upload_bps || 0)), 0);
   const requests = points.reduce((sum, point) => sum + Math.max(0, Number(point.requests || 0)), 0);
   const traffic = points.reduce((sum, point) => sum + Math.max(0, Number(point.traffic_bytes || 0)), 0);
-  const speed = document.getElementById('dashboard-speed-summary');
   const request = document.getElementById('dashboard-requests-summary');
   const trafficEl = document.getElementById('dashboard-traffic-summary');
   const unit = document.getElementById('dashboard-traffic-unit');
-  if (speed) speed.textContent = `↓ ${formatRate(downloadPeak)} · ↑ ${formatRate(uploadPeak)}`;
+  if (!points.length) dashboardTrendSpeedSummary([[], []]);
   if (request) request.textContent = `${formatNumber(requests)} 次`;
   if (trafficEl) trafficEl.textContent = formatBytes(traffic);
   if (unit) unit.textContent = data?.billing_mode === 'outbound' ? '单向计费流量总数' : '双向计费流量总数';
@@ -1188,8 +1185,8 @@ function dashboardTrendTracePath(ctx, points, monotone) {
 // Realtime proxy traffic is sampled in two-second buckets. Video clients fill
 // their buffers in bursts, so plotting every raw zero between two chunks makes
 // an otherwise healthy stream look disconnected. Smooth only the visual
-// series: summaries, tooltips, persisted counters and request deltas continue
-// to use the exact Controller values.
+// series: the speed peak follows this rendered curve, while tooltips,
+// persisted counters and request deltas continue to use Controller values.
 function dashboardRealtimeSmoothingKey(points, metric, seriesIndex) {
   const bucketDuration = Number(points?.[0]?.display_bucket_duration_ms || 0);
   if (!(bucketDuration > 0) || !points.every(point => Number.isInteger(point?.display_bucket_id))) return '';
@@ -1269,6 +1266,17 @@ function dashboardTrendRenderSeries(points, metric) {
   ));
 }
 
+function dashboardTrendSpeedSummary(renderValues) {
+  const peak = values => (Array.isArray(values) ? values : []).reduce(
+    (max, value) => Number.isFinite(value) ? Math.max(max, value) : max,
+    0,
+  );
+  const downloadPeak = peak(renderValues?.[0]);
+  const uploadPeak = peak(renderValues?.[1]);
+  const speed = document.getElementById('dashboard-speed-summary');
+  if (speed) speed.textContent = `↓ ${formatRate(downloadPeak)} · ↑ ${formatRate(uploadPeak)}`;
+}
+
 function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
   const rawPoints = dashboardTrendChartPoints();
@@ -1288,6 +1296,7 @@ function drawDashboardTrendChart(metric) {
   chart.displayPoints = points;
   if (chart.hoverIndex >= points.length) chart.hoverIndex = points.length - 1;
   const renderValues = dashboardTrendRenderSeries(points, metric);
+  if (metric === 'speed') dashboardTrendSpeedSummary(renderValues);
   const series = metric === 'speed'
     ? [{ values: renderValues[0], color: '#3b9cff' }, { values: renderValues[1], color: '#a78bfa' }]
     : [{ values: renderValues[0], color: metric === 'requests' ? '#3b82f6' : '#10b981' }];

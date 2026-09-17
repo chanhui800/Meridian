@@ -1008,6 +1008,39 @@ test('dashboard realtime smoothing is time-aware and leaves historical ranges ra
   assert.deepEqual(Array.from(result.historical), [100, 0]);
 });
 
+test('dashboard speed summary uses the same bucketed and smoothed values as the curve', () => {
+  const { sandbox } = makeTrafficHarness();
+  const summary = makeElement('dashboard-speed-summary');
+  sandbox.document = makeDocument({ 'dashboard-speed-summary': summary });
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    const points = Array.from({ length: 150 }, (_, index) => ({
+      timestamp_ms: (index + 1) * dashboardRealtimeSampleIntervalMS,
+      download_bps: index === 75 ? 100000000 : 0,
+      upload_bps: index === 90 ? 10000000 : 0,
+    }));
+    const display = dashboardTrendDisplayPoints(points, 'speed', 500);
+    const rendered = dashboardTrendRenderSeries(display, 'speed');
+    const rawPeak = Math.max(...points.map(point => point.download_bps));
+    const renderedPeak = Math.max(...rendered[0]);
+    const renderedUploadPeak = Math.max(...rendered[1]);
+    dashboardTrendSpeedSummary(rendered);
+    return { rawPeak, renderedPeak, renderedUploadPeak, text: document.getElementById('dashboard-speed-summary').textContent };
+  })()`, sandbox);
+  assert.ok(result.renderedPeak < result.rawPeak, 'the fixture must produce a visible difference between raw and rendered peaks');
+  assert.equal(result.text, `↓ ${sandbox.formatRate(result.renderedPeak)} · ↑ ${sandbox.formatRate(result.renderedUploadPeak)}`);
+  assert.match(readScript('pages/dashboard.js'), /if \(metric === 'speed'\) dashboardTrendSpeedSummary\(renderValues\);/);
+});
+
+test('global setting number fields hide native spinner controls without changing input semantics', () => {
+  const css = readScript('../css/style.css');
+  assert.match(css, /\.settings-field input\[type="number"\]\s*\{[^}]*appearance:\s*textfield/);
+  assert.match(css, /\.settings-field input\[type="number"\]::-webkit-inner-spin-button/);
+  assert.match(css, /\.settings-field input\[type="number"\]::-webkit-outer-spin-button[^}]*-webkit-appearance:\s*none/);
+  const settings = readScript('pages/global-settings.js');
+  assert.match(settings, /type="number" min="\$\{min\}" max="\$\{max\}"/);
+});
+
 test('dashboard realtime display density adapts to plot width without changing the raw window', () => {
   const { sandbox } = makeTrafficHarness();
   const result = vm.runInContext(`(() => {
