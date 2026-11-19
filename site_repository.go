@@ -738,6 +738,9 @@ func (d *DB) DeleteSite(id int64) error {
 	if _, err := tx.Exec("DELETE FROM node_site_counters WHERE site_id=?", id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM node_site_counter_epochs WHERE site_id=?", id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM agent_route_revocations WHERE site_id=?", id); err != nil {
 		return err
 	}

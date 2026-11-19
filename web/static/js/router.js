@@ -51,6 +51,10 @@ const Router = {
     }
 
     this.current = hash;
+    document.body?.classList?.add('console-shell');
+    if (previous !== hash) {
+      window.scrollTo?.({ top: 0, left: 0, behavior: 'instant' });
+    }
 
     let activeNav = null;
     document.querySelectorAll('.topnav-link').forEach(link => {

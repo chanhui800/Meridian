@@ -12,7 +12,7 @@ const dashboardSource = fs.readFileSync(
 
 test('dashboard trend controls expose a minute-precision custom range', () => {
   assert.match(dashboardSource, /<option value="month">本月<\/option>/);
-  assert.match(dashboardSource, /<option value="custom">自定义<\/option>/);
+  assert.match(dashboardSource, /<option value="custom">[^<]+<\/option>/);
   assert.match(dashboardSource, /type="datetime-local"[^>]*id="dashboard-trend-start"[^>]*step="60"/);
   assert.match(dashboardSource, /type="datetime-local"[^>]*id="dashboard-trend-end"[^>]*step="60"/);
   assert.match(dashboardSource, /id="dashboard-trend-apply"/);

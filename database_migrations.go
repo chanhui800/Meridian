@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 50
+	databaseSchemaVersion = 51
 )
 
 func (d *DB) migrate() error {
@@ -1065,6 +1065,57 @@ func (d *DB) migrateOnce() error {
 	}
 	if cacheSizeColumn == 0 {
 		if _, err := conn.ExecContext(ctx, "ALTER TABLE node_site_counters ADD COLUMN cache_size_bytes BIGINT NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	for _, migration := range []struct{ column, sql string }{
+		{"report_session_id", "ALTER TABLE node_site_counters ADD COLUMN report_session_id TEXT NOT NULL DEFAULT ''"},
+		{"report_sequence", "ALTER TABLE node_site_counters ADD COLUMN report_sequence BIGINT NOT NULL DEFAULT 0"},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('node_site_counters') WHERE name=?", migration.column).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_site_counter_epochs (
+		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		boot_id TEXT NOT NULL,
+		last_bytes_in BIGINT NOT NULL DEFAULT 0,
+		last_bytes_out BIGINT NOT NULL DEFAULT 0,
+		last_request_count BIGINT NOT NULL DEFAULT 0,
+		cache_size_bytes BIGINT NOT NULL DEFAULT 0,
+		report_session_id TEXT NOT NULL DEFAULT '',
+		report_sequence BIGINT NOT NULL DEFAULT 0,
+		updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(node_id,site_id,boot_id)
+	) WITHOUT ROWID;
+	CREATE INDEX IF NOT EXISTS idx_node_site_counter_epochs_session ON node_site_counter_epochs(node_id,report_session_id);`); err != nil {
+		return err
+	}
+	if previousSchemaVersion < 51 {
+		// Older rows are already represented in traffic history. Copy their
+		// watermark instead of recounting the first report after an upgrade.
+		// The node-wide sequence is not a site's captured sequence: another
+		// site's page may have advanced it, so leave unknown values at zero.
+		if _, err := conn.ExecContext(ctx, `UPDATE node_site_counters
+			SET report_session_id=COALESCE((
+				SELECT n.last_report_session_id FROM control_nodes n
+				WHERE n.id=node_site_counters.node_id AND n.last_report_session_id<>''
+				  AND (node_site_counters.boot_id=n.last_report_session_id
+				    OR substr(node_site_counters.boot_id,1,length(n.last_report_session_id)+1)=n.last_report_session_id||':')
+			),'') WHERE report_session_id=''`); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO node_site_counter_epochs
+			(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,report_session_id,report_sequence,updated_at_ms)
+			SELECT node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,report_session_id,report_sequence,updated_at_ms
+			FROM node_site_counters`); err != nil {
 			return err
 		}
 	}

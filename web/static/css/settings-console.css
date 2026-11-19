@@ -1,0 +1,176 @@
+/* Settings share the console's navigation, typography and quiet surfaces. */
+.settings-console { display: grid; gap: 24px; min-width: 0; --settings-success: #168569; }
+html[data-theme="dark"] .settings-console { --settings-success: #6acbae; }
+.settings-console [hidden] { display: none !important; }
+.settings-console .console-heading { margin-bottom: 0; }
+.settings-console .settings-category-nav {
+  position: static;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 4px 20px;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid var(--console-line);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  height: auto;
+  overflow: visible;
+}
+.settings-console .settings-category-nav .settings-nav-item { display: flex; align-items: center; min-height: 44px; padding: 10px 2px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--console-muted); font: inherit; font-size: 13px; font-weight: 500; line-height: 1.5; text-decoration: none; white-space: nowrap; cursor: pointer; }
+.settings-console .settings-category-nav .settings-nav-item.active { color: var(--console-accent); background: none; border-bottom-color: var(--console-accent); }
+.settings-console .settings-category-nav .settings-nav-item:hover { color: var(--console-ink); background: none; }
+.settings-console .settings-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; width: 100%; max-width: none; min-width: 0; margin: 0; }
+.settings-console .settings-panel { padding: 24px; border: 1px solid var(--console-line); border-radius: var(--console-radius); background: var(--console-surface); box-shadow: none; backdrop-filter: none; color: var(--console-ink); min-width: 0; }
+.settings-console .settings-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 0; padding: 0; margin: 0 0 22px; }
+.settings-console .settings-panel h2 { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.5; }
+.settings-console .settings-panel > header > span, .settings-console .settings-panel > header > b { color: var(--console-muted); background: none; border: 0; padding: 0; border-radius: 0; font-size: 12px; font-weight: 400; line-height: 1.5; letter-spacing: 0; }
+.settings-console .settings-panel > header > .console-status.is-online { color: var(--settings-success); }
+.settings-console .settings-panel > header > .console-status.is-warning { color: var(--console-warning); }
+.settings-console .settings-grid, .settings-console .settings-two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 22px 28px; }
+.settings-console .settings-field { display: grid; gap: 9px; min-width: 0; color: var(--console-ink); font-size: 13px; font-weight: 500; margin: 0; }
+.settings-console .settings-field > div { position: relative; min-width: 0; }
+.settings-console .settings-field-wide { grid-column: 1 / -1; }
+.settings-console .settings-field em { position: absolute; right: 13px; top: 12px; color: var(--console-muted); font-size: 12px; font-style: normal; font-weight: 400; pointer-events: none; }
+.settings-console .settings-field small, .settings-console .settings-panel-help, .settings-console .form-help { color: var(--console-muted); font-size: 12px; font-weight: 400; line-height: 1.65; margin: 0; overflow-wrap: anywhere; }
+.settings-console .settings-panel-help { margin-bottom: 18px; }
+.settings-console .form-input, .settings-console .form-select { width: 100%; max-width: 100%; min-width: 0; min-height: 42px; border: 1px solid var(--console-line); border-radius: 7px; padding: 10px 12px; box-shadow: none; background: var(--console-surface); color: var(--console-ink); font-size: 14px; line-height: 1.5; font-family: inherit; }
+.settings-console .settings-field:has(em) .form-input { padding-right: 48px; }
+.settings-console .form-input:focus, .settings-console .form-select:focus { border-color: var(--console-accent); outline: 2px solid var(--console-accent-soft); }
+.settings-console .settings-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; }
+.settings-console .settings-choice button { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--console-line); border-radius: 7px; min-height: 42px; padding: 9px 14px; color: var(--console-muted); background: var(--console-surface); font-size: 13px; font-weight: 500; cursor: pointer; }
+.settings-console .settings-choice button.active { background: var(--console-accent-soft); border-color: var(--console-accent); color: var(--console-accent); box-shadow: none; }
+.settings-console .settings-check { display: flex; gap: 11px; align-items: flex-start; color: var(--console-ink); font-size: 13px; min-height: 30px; margin: 0; cursor: pointer; }
+.settings-console .settings-check input { width: 17px; min-width: 17px; height: 17px; margin: 2px 0 0; accent-color: var(--console-accent); }
+.settings-console .settings-check-copy { display: grid; gap: 5px; }
+.settings-console .settings-check-copy strong { font-size: 13px; font-weight: 500; line-height: 1.5; }
+.settings-console .settings-check-copy small { color: var(--console-muted); font-size: 12px; line-height: 1.6; }
+.settings-console .settings-check-list { display: grid; gap: 14px; }
+.settings-console .settings-label { display: block; margin-bottom: 8px; font-size: 12px; font-weight: 500; color: var(--console-muted); }
+.settings-console .settings-group { margin-top: 22px; }
+.settings-console .settings-save-bar { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 22px; padding-top: 0; border: 0; }
+.settings-console .settings-content > .settings-save-bar { margin-top: 0; }
+.settings-console .settings-save-bar > .console-muted { margin-right: auto; font-size: 12px; }
+.settings-console .console-button.is-danger { color: var(--console-danger); border-color: var(--console-line); background: var(--console-surface); }
+.settings-console .console-button.is-danger:hover { background: var(--console-bg); border-color: var(--console-danger); }
+.settings-console .telegram-btn.console-button { min-height: 40px; padding: 9px 15px; border-radius: 7px; font: inherit; font-size: 13px; color: var(--console-ink); border: 1px solid var(--console-line); background: var(--console-surface); box-shadow: none; }
+.settings-console .telegram-btn.console-button.is-primary { color: #fff; background: var(--console-accent); border-color: var(--console-accent); }
+html[data-theme="dark"] .settings-console .telegram-btn.console-button.is-primary { color: #0a172b; }
+.settings-console .telegram-btn.console-button.is-danger { color: var(--console-danger); background: var(--console-surface); }
+.settings-console .settings-disclosure { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--console-line); }
+.settings-console .settings-content > .settings-disclosure, .settings-console .settings-two-column > .settings-disclosure { margin-top: 0; padding: 20px 24px; border: 1px solid var(--console-line); }
+.settings-console .settings-disclosure > summary { display: flex; align-items: center; gap: 12px; list-style: none; cursor: pointer; color: var(--console-ink); min-height: 26px; }
+.settings-console .settings-disclosure > summary::-webkit-details-marker { display: none; }
+.settings-console .settings-disclosure > summary::after { content: "+"; margin-left: auto; color: var(--console-muted); font-size: 18px; font-weight: 400; }
+.settings-console .settings-disclosure[open] > summary::after { content: "−"; }
+.settings-console .settings-disclosure > summary > strong { font-size: 13px; font-weight: 500; line-height: 1.5; }
+.settings-console .settings-disclosure > summary > span { color: var(--console-muted); font-size: 12px; line-height: 1.5; }
+.settings-console .settings-disclosure > .settings-grid, .settings-console .settings-disclosure > .settings-check-list, .settings-console .settings-disclosure > .settings-disclosure-body, .settings-console .settings-disclosure > .settings-report-sections, .settings-console .settings-disclosure > .diag-rows, .settings-console .settings-disclosure > .diag-note-list { padding-top: 20px; }
+.settings-console .settings-disclosure > .settings-panel-help { margin-top: 18px; }
+.settings-console .settings-help { margin-top: 20px; color: var(--console-muted); font-size: 12px; line-height: 1.65; }
+.settings-console .settings-help > summary { cursor: pointer; width: fit-content; }
+.settings-console .settings-help p { color: var(--console-muted); font-size: 12px; line-height: 1.7; margin: 10px 0 0; max-width: 800px; }
+.settings-console .settings-loading { padding: 42px 24px; color: var(--console-muted); text-align: center; font-size: 14px; }
+.settings-console .settings-load-error { margin: 10px 0 18px; color: var(--console-danger); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.settings-console .backup-warning, .settings-console .telegram-secret-warning { padding: 12px 14px; margin: 18px 0 0; border: 0; border-left: 2px solid var(--console-warning); border-radius: 0; background: var(--console-bg); color: var(--console-warning); font-size: 12px; line-height: 1.7; }
+.settings-console .backup-warning.danger { border-left-color: var(--console-danger); color: var(--console-danger); }
+.settings-console .backup-restore-content { width: 100%; max-width: none; }
+.settings-console .settings-backup-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+.settings-console .backup-restore-content .settings-check { margin-top: 20px; }
+.settings-console .backup-confirm-field { margin-top: 22px; }
+.settings-console input[type="file"] { font-size: 13px; }
+.settings-console input[type="file"]::file-selector-button { border: 0; border-right: 1px solid var(--console-line); padding: 2px 12px 2px 0; margin-right: 12px; background: transparent; color: var(--console-ink); font: inherit; cursor: pointer; }
+.settings-console .tls-address-preview { display: flex; align-items: center; min-height: 42px; padding: 10px 12px; border: 1px solid var(--console-line); border-radius: 7px; color: var(--console-muted); background: var(--console-bg); line-height: 1.5; }
+.settings-console .global-settings-status { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; padding: 0 !important; border: 0; border-radius: 0; background: transparent; }
+.settings-console .global-settings-status > .form-help { grid-column: 1 / -1; }
+.settings-console .settings-tmdb-logo { width: 94px; height: 22px; object-fit: contain; }
+.settings-console .tmdb-settings-status { display: flex; gap: 10px; border: 0; padding: 0 0 20px; margin: 0 0 20px; border-bottom: 1px solid var(--console-line); border-radius: 0; background: transparent; }
+.settings-console .tmdb-settings-status > span { width: 6px; height: 6px; flex: 0 0 6px; background: var(--console-muted); border: 0; box-shadow: none; border-radius: 50%; margin-top: 7px; }
+.settings-console .tmdb-settings-status.is-configured > span { background: var(--settings-success); box-shadow: none; }
+.settings-console .tmdb-settings-status.is-error > span { background: var(--console-danger); box-shadow: none; }
+.settings-console .tmdb-settings-status strong { font-size: 13px; font-weight: 500; color: var(--console-ink); }
+.settings-console .tmdb-settings-status small { color: var(--console-muted); font-size: 12px; line-height: 1.6; margin-top: 4px; }
+.settings-console .tmdb-cache-panel { margin: 0; padding: 24px; background: var(--console-surface); border: 1px solid var(--console-line); border-radius: var(--console-radius); }
+.settings-console .tmdb-cache-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+.settings-console .tmdb-attribution { margin: 0; padding: 0 2px; color: var(--console-muted); font-size: 11px; line-height: 1.6; }
+.settings-console .tmdb-attribution a, .settings-console .tmdb-token-field a { color: var(--console-accent); }
+.settings-console .telegram-enable { min-height: 0; align-items: center; }
+.settings-console .settings-form-section { display: block; padding: 0; margin: 22px 0 0; border: 0; min-width: 0; }
+.settings-console .settings-form-section + .settings-form-section { border-top: 1px solid var(--console-line); padding-top: 22px; }
+.settings-console .settings-form-section > legend { color: var(--console-muted); font-size: 12px; font-weight: 500; padding: 0 0 16px; }
+.settings-console .settings-report-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 26px; }
+.settings-console .settings-report-sections strong { color: var(--console-ink); font-weight: 500; font-size: 13px; }
+.settings-console .settings-report-sections p { color: var(--console-muted); font-size: 12px; line-height: 1.6; margin: 5px 0 0; }
+.settings-console .telegram-load-error { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+.settings-console .settings-account-summary { display: flex; flex-wrap: wrap; gap: 30px; align-items: center; justify-content: space-between; }
+.settings-console .settings-account-identity { display: flex; gap: 14px; align-items: center; min-width: 0; }
+.settings-console .settings-account-avatar { display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: var(--console-radius); background: var(--console-accent-soft); color: var(--console-accent); font-size: 21px; font-weight: 500; }
+.settings-console .settings-account-identity strong { color: var(--console-ink); font-size: 18px; font-weight: 600; overflow-wrap: anywhere; }
+.settings-console .settings-account-identity p { color: var(--console-muted); margin: 6px 0 0; font-size: 12px; }
+.settings-console .settings-account-meta { display: flex; flex-wrap: wrap; gap: 30px; margin: 0; }
+.settings-console .settings-account-meta dt { color: var(--console-muted); font-size: 11px; margin-bottom: 6px; }
+.settings-console .settings-account-meta dd { margin: 0; color: var(--console-ink); font-size: 13px; font-variant-numeric: tabular-nums; }
+.settings-console .settings-account-session { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.settings-console .settings-account-session p { color: var(--console-muted); font-size: 12px; margin: 7px 0 0; line-height: 1.5; }
+.settings-console .account-logout-button { min-width: 0; min-height: 40px; padding: 9px 15px; border: 1px solid var(--console-line); border-radius: 7px; background: var(--console-surface); color: var(--console-danger); }
+.settings-console .diag-selection { display: flex; align-items: flex-end; justify-content: space-between; gap: 22px; }
+.settings-console .diag-selection .settings-field { flex: 1; max-width: 470px; }
+.settings-console .diag-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 20px; }
+.settings-console .diag-report-wide { grid-column: 1 / -1; }
+.settings-console .diag-report-panel { min-width: 0; }
+.settings-console .diag-rows { display: grid; gap: 0; margin: 0; }
+.settings-console .diag-row { display: grid; grid-template-columns: minmax(82px, .7fr) minmax(0, 1.6fr); align-items: start; gap: 14px; padding: 11px 0; margin: 0; border: 0; border-bottom: 1px solid var(--console-line); background: transparent; border-radius: 0; min-width: 0; }
+.settings-console .diag-row:last-child { border-bottom: 0; }
+.settings-console .diag-key { color: var(--console-muted); font-size: 12px; font-weight: 400; line-height: 1.6; }
+.settings-console .diag-val { color: var(--console-ink); font-size: 12px; font-weight: 400; line-height: 1.6; margin: 0; min-width: 0; text-align: right; overflow-wrap: anywhere; white-space: normal; }
+.settings-console .diag-val.good, .settings-console .diag-result-status.good, .settings-console .diag-inline-status.good, .settings-console .diag-health-summary .good { color: var(--settings-success); }
+.settings-console .diag-val.warn, .settings-console .diag-result-status.warn, .settings-console .diag-inline-status.warn, .settings-console .diag-health-summary .warn { color: var(--console-warning); }
+.settings-console .diag-val.bad, .settings-console .diag-result-status.bad, .settings-console .diag-inline-status.bad, .settings-console .diag-health-summary .bad { color: var(--console-danger); }
+.settings-console .diag-result-status { font-size: 12px; }
+.settings-console .diag-inline-status { display: block; margin-top: 5px; }
+.settings-console .diag-health-summary { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.settings-console .diag-health-summary strong { font-size: 26px; line-height: 1.3; font-weight: 500; font-variant-numeric: tabular-nums; }
+.settings-console .diag-health-summary > span { color: var(--console-muted); font-size: 11px; }
+.settings-console .diag-note-list { padding-left: 18px; margin: 0; color: var(--console-muted); font-size: 12px; line-height: 1.8; }
+.settings-console .diag-note-list li + li { margin-top: 10px; }
+.settings-console button:focus-visible, .settings-console a:focus-visible, .settings-console summary:focus-visible { outline: 2px solid var(--console-accent); outline-offset: 3px; }
+@media (max-width: 950px) {
+  .settings-console .settings-panel { padding: 22px; }
+  .settings-console .settings-category-nav { gap: 0 16px; }
+  .settings-console .settings-grid, .settings-console .settings-two-column { gap: 20px; }
+}
+@media (max-width: 650px) {
+  .settings-console { gap: 20px; }
+  .settings-console .settings-category-nav { gap: 0 17px; }
+  .settings-console .settings-category-nav .settings-nav-item { min-height: 44px; font-size: 12px; }
+  .settings-console .settings-panel { padding: 20px; }
+  .settings-console .settings-panel > header { align-items: flex-start; flex-wrap: wrap; gap: 9px; margin-bottom: 20px; }
+  .settings-console .settings-panel > header > span { font-size: 11px; }
+  .settings-console .settings-grid, .settings-console .settings-two-column, .settings-console .settings-report-sections, .settings-console .diag-grid, .settings-console .global-settings-status { grid-template-columns: minmax(0, 1fr); }
+  .settings-console .settings-field-wide { grid-column: auto; }
+  .settings-console .form-input, .settings-console .form-select { min-height: 44px; font-size: 16px; }
+  .settings-console .settings-check { min-height: 36px; }
+  .settings-console .settings-disclosure > summary { flex-wrap: wrap; gap: 5px 12px; }
+  .settings-console .settings-disclosure > summary > span { flex-basis: 100%; order: 2; padding-right: 18px; }
+  .settings-console .settings-disclosure > summary::after { position: absolute; right: 0; top: 0; }
+  .settings-console .settings-disclosure > summary { position: relative; padding-right: 18px; min-height: 38px; }
+  .settings-console .settings-content > .settings-disclosure, .settings-console .settings-two-column > .settings-disclosure { padding: 20px; }
+  .settings-console .settings-save-bar .console-button, .settings-console .tmdb-cache-actions .console-button { min-height: 44px; flex: 1 1 auto; }
+  .settings-console .settings-save-bar > .console-muted { flex-basis: 100%; }
+  .settings-console .telegram-enable { min-height: 0; }
+  .settings-console .settings-account-summary { gap: 22px; }
+  .settings-console .settings-account-meta { gap: 20px; }
+  .settings-console .settings-account-session { flex-wrap: wrap; }
+  .settings-console .account-logout-button { min-height: 44px; }
+  .settings-console .diag-selection { align-items: stretch; flex-wrap: wrap; gap: 16px; }
+  .settings-console .diag-selection .settings-field { flex-basis: 100%; max-width: none; }
+  .settings-console .diag-selection .console-button { min-height: 44px; width: 100%; }
+  .settings-console .diag-row { grid-template-columns: minmax(76px, .7fr) minmax(0, 1.4fr); gap: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-console * { animation: none !important; transition: none !important; }
+}

@@ -1472,3 +1472,94 @@ test('dashboard site gauges use Agent rates and their independent freshness', ()
   assert.deepEqual({ ...result.advanced }, { down: 80, up: 40 });
   assert.deepEqual({ ...result.expired }, { down: 0, up: 0 });
 });
+
+test('console metric tabs reveal one chart and redraw without changing its raw window', () => {
+  const h = makeTrafficHarness();
+  for (const metric of ['speed', 'requests', 'traffic']) {
+    h.elements[`console-tab-${metric}`] = makeElement(`console-tab-${metric}`);
+    h.elements[`console-chart-${metric}`] = makeElement(`console-chart-${metric}`);
+  }
+  h.sandbox.document = makeDocument(h.elements);
+  vm.runInContext(`
+    dashboardTrendState.range = 'realtime';
+    dashboardRealtimeTrendSamples.set('all', [{ timestamp_ms: Date.now(), bytes_out: 37, requests: 2 }]);
+    globalThis.consoleDrawnMetrics = [];
+    drawDashboardTrendChart = metric => consoleDrawnMetrics.push(metric);
+    dashboardSelectConsoleMetric('traffic');
+  `, h.sandbox);
+  assert.equal(h.elements['console-chart-speed'].hidden, true);
+  assert.equal(h.elements['console-chart-requests'].hidden, true);
+  assert.equal(h.elements['console-chart-traffic'].hidden, false);
+  assert.equal(h.elements['console-tab-traffic'].tabIndex, 0);
+  assert.deepEqual(Array.from(h.sandbox.consoleDrawnMetrics), ['traffic']);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all')[0].bytes_out", h.sandbox), 37);
+});
+
+test('console site search preserves expanded details and escapes API text', () => {
+  const h = makeTrafficHarness();
+  h.elements['dash-table'] = makeElement('dash-table');
+  h.sandbox.document = makeDocument(h.elements);
+  vm.runInContext(`
+    dashboardSitesInitialized = true;
+    dashboardSites = [
+      { id: 1, name: '影院 <script>', target_url: 'https://cinema.example.com/', public_host: 'watch.example.com', ua_mode: 'infuse', running: true, cache_size_bytes: 2048 },
+      { id: 2, name: '备用', running: false }
+    ];
+    dashboardConsoleExpandedSites.add(1);
+    dashboardConsoleQuery = '影院';
+    renderDashboardTableRows();
+  `, h.sandbox);
+  const html = h.elements['dash-table'].innerHTML;
+  assert.match(html, /data-console-site="1" open/);
+  assert.ok(html.includes('影院 &lt;script&gt;'));
+  assert.ok(html.includes('https://cinema.example.com/'));
+  assert.ok(html.includes('Infuse') && html.includes('2 KB'));
+  assert.doesNotMatch(html, /data-console-site="2"/);
+});
+
+test('console bootstrap failure is visible and retains the last site view', async () => {
+  const h = makeTrafficHarness();
+  h.elements['console-bootstrap-error'] = makeElement('console-bootstrap-error');
+  h.elements['dash-table'] = makeElement('dash-table');
+  h.elements['dash-table'].innerHTML = 'existing site view';
+  h.sandbox.document = makeDocument(h.elements);
+  h.sandbox.console = { warn() {}, log() {} };
+  h.sandbox.Router.current = 'dashboard';
+  vm.runInContext(`
+    dashboardSitesInitialized = true;
+    API.dashboardBootstrap = () => Promise.reject(new Error('synthetic outage'));
+  `, h.sandbox);
+  assert.equal(await vm.runInContext('loadDashboardBootstrap()', h.sandbox), null);
+  assert.equal(h.elements['console-bootstrap-error'].hidden, false);
+  assert.equal(h.elements['dash-table'].innerHTML, 'existing site view');
+});
+
+test('console aggregate rate reports unavailable when an Agent gauge has expired', () => {
+  const h = makeTrafficHarness();
+  h.elements['console-current-download'] = makeElement('console-current-download');
+  h.elements['console-current-upload'] = makeElement('console-current-upload');
+  h.sandbox.document = makeDocument(h.elements);
+  vm.runInContext(`
+    dashboardLastSnapshotMS = 14000;
+    dashboardSites = [{ id: 1, running: true, agent_received_at_ms: 12000,
+      agent_rate_received_at_ms: 7000, agent_rate_valid: true, _liveSpeed: { down: 0, up: 0 } }];
+    dashboardUpdateConsoleRates();
+  `, h.sandbox);
+  assert.equal(h.elements['console-current-download'].textContent, '暂不可用');
+  assert.equal(h.elements['console-current-upload'].textContent, '等待实时采样');
+});
+
+test('console redraw captures a detail closed before its native toggle event', () => {
+  const h = makeTrafficHarness();
+  h.elements['dash-table'] = makeElement('dash-table');
+  h.elements['dash-table'].querySelectorAll = selector => selector === 'details[data-console-site]'
+    ? [{ dataset: { consoleSite: '1' }, open: false }] : [];
+  h.sandbox.document = makeDocument(h.elements);
+  vm.runInContext(`
+    dashboardSitesInitialized = true;
+    dashboardSites = [{ id: 1, name: '影院', running: true }];
+    dashboardConsoleExpandedSites.add(1);
+    renderDashboardTableRows();
+  `, h.sandbox);
+  assert.doesNotMatch(h.elements['dash-table'].innerHTML, /data-console-site="1" open/);
+});

@@ -996,6 +996,9 @@ func (d *DB) DeleteControlNode(id int64) error {
 	if _, err := tx.Exec("DELETE FROM node_site_counters WHERE node_id=?", id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM node_site_counter_epochs WHERE node_id=?", id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM node_site_traffic_logs WHERE node_id=?", id); err != nil {
 		return err
 	}
@@ -1580,119 +1583,8 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 	return err
 }
 
-func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat *NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite, delayedFullReport bool) (bool, error) {
-	site, ok := authorizedNodeSiteForStat(allowedSites, *stat)
-	if !ok {
-		return false, nil
-	}
-	siteID := site.ID
-	cumulativeReport := stat.CounterEpoch > 0 || stat.CumulativeBytesIn > 0 || stat.CumulativeBytesOut > 0
-	currentIn, currentOut := stat.CumulativeBytesIn, stat.CumulativeBytesOut
-	if currentIn == 0 && stat.BytesIn > 0 {
-		currentIn = stat.BytesIn
-	}
-	if currentOut == 0 && stat.BytesOut > 0 {
-		currentOut = stat.BytesOut
-	}
-	var previousBoot string
-	var previousIn, previousOut, previousRequests, previousCacheSize int64
-	err := tx.QueryRow(`SELECT boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes FROM node_site_counters WHERE node_id=? AND site_id=?`, nodeID, siteID).Scan(&previousBoot, &previousIn, &previousOut, &previousRequests, &previousCacheSize)
-	if errors.Is(err, sql.ErrNoRows) {
-		// The first sample is the delta from the Agent runtime's initial zero
-		// state, rather than merely a counter baseline. Persist it immediately
-		// so the first report is visible in history and lifetime site totals.
-		initialIn, initialOut := stat.BytesIn, stat.BytesOut
-		// RequestCount is the cumulative count for this Agent runtime epoch. The
-		// first report is the segment from zero, so persist it together with the
-		// first byte deltas instead of silently dropping the first batch.
-		initialRequests := stat.RequestCount
-		if initialIn > 0 || initialOut > 0 || initialRequests > 0 {
-			bucket := (nowMS / 60000) * 60000
-			if _, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, initialIn, initialOut, initialRequests, bucket); err != nil {
-				return false, err
-			}
-			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, initialIn, initialOut, initialIn, initialOut, siteID); err != nil {
-				return false, err
-			}
-		}
-		cacheSize := int64(0)
-		if stat.CacheSizeValid {
-			cacheSize = stat.CacheSizeBytes
-		}
-		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS)
-		return err == nil, err
-	}
-	if err != nil {
-		return false, err
-	}
-	if previousBoot == counterEpoch && delayedFullReport && !cumulativeReport && stat.RequestCount < previousRequests {
-		// RequestCount has always been cumulative, even for legacy reports
-		// which carry interval byte deltas. Preserve that watermark without
-		// discarding a legacy byte interval which may still need to land.
-		if stat.BytesIn == 0 && stat.BytesOut == 0 {
-			return false, nil
-		}
-		stat.RequestCount = previousRequests
-	}
-	if previousBoot == counterEpoch && cumulativeReport && (stat.CounterEpoch > 0 || delayedFullReport) &&
-		(currentIn < previousIn || currentOut < previousOut || stat.RequestCount < previousRequests) {
-		// A newer cumulative sample already covers this site's bytes. ACK the
-		// delayed report without lowering its durable baseline or replacing
-		// current site metadata. Other sites in the same report may still have
-		// unpersisted data and are processed independently.
-		return false, nil
-	}
-	var deltaIn, deltaOut, deltaRequests int64
-	if previousBoot != counterEpoch {
-		// A process restart, config apply, or route transition starts a new
-		// Agent-side counter epoch. BytesIn/BytesOut are already report deltas;
-		// RequestCount is cumulative from zero for the same epoch.
-		deltaIn, deltaOut, deltaRequests = stat.BytesIn, stat.BytesOut, stat.RequestCount
-		// Older Agents only reported cumulative site counters. Preserve their
-		// upgrade compatibility when the cumulative value is still monotonic;
-		// a reset (the normal new-runtime case) falls back to the explicit
-		// per-report delta above.
-		if currentIn >= previousIn && stat.BytesIn == 0 {
-			deltaIn = currentIn - previousIn
-		}
-		if currentOut >= previousOut && stat.BytesOut == 0 {
-			deltaOut = currentOut - previousOut
-		}
-		// Explicit per-site epochs are emitted by current Agents and reset the
-		// cumulative request counter to zero for the new route generation. Only
-		// legacy reports without CounterEpoch may use the old monotonic
-		// subtraction compatibility path; subtracting an older generation here
-		// would silently drop the first requests of the new generation.
-		if stat.CounterEpoch == 0 && stat.RequestCount >= previousRequests {
-			deltaRequests = stat.RequestCount - previousRequests
-		}
-	} else if currentIn >= previousIn && currentOut >= previousOut && stat.RequestCount >= previousRequests {
-		deltaIn, deltaOut, deltaRequests = currentIn-previousIn, currentOut-previousOut, stat.RequestCount-previousRequests
-	}
-	if deltaIn > 0 || deltaOut > 0 || deltaRequests > 0 {
-		bucket := (nowMS / 60000) * 60000
-		_, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, deltaIn, deltaOut, deltaRequests, bucket)
-		if err != nil {
-			return false, err
-		}
-		if deltaIn > 0 || deltaOut > 0 {
-			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, deltaIn, deltaOut, deltaIn, deltaOut, siteID); err != nil {
-				return false, err
-			}
-		}
-	}
-	cacheSize := previousCacheSize
-	if stat.CacheSizeValid {
-		cacheSize = stat.CacheSizeBytes
-	}
-	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,cache_size_bytes=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS, nodeID, siteID)
-	if err != nil {
-		return false, err
-	}
-	// Final is an Agent-side counter watermark, not proof that every paginated
-	// telemetry/event queue is empty. Keep the drain authorization tombstone
-	// until its bounded expiry so later pages remain accepted.
-	return true, nil
+func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat *NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite, delayedFullReport bool, identity nodeTrafficReportIdentity) (bool, error) {
+	return recordNodeTrafficPeriodTx(tx, nodeID, counterEpoch, stat, nowMS, allowedSites, delayedFullReport, identity)
 }
 
 type nodeReportCommitResult struct {
@@ -1886,6 +1778,17 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	} else if counterEpoch != "" {
 		siteCounterEpoch += ":" + counterEpoch
 	}
+	// Preserve the captured report identity before host counter ordering clamps
+	// report.Sequence. Site periods use their own durable watermarks.
+	siteReportIdentity := nodeTrafficReportIdentity{sessionID: sessionID, source: siteCounterEpoch, runtimeEpoch: siteEpoch, sequence: report.Sequence}
+	if activeSessionID != "" {
+		// Lease validation above makes earlier process sessions unreachable.
+		// Keep one watermark per period only within the current session rather
+		// than accumulating every process's periods over the node's lifetime.
+		if _, err := tx.Exec("DELETE FROM node_site_counter_epochs WHERE node_id=? AND report_session_id<>?", id, sessionID); err != nil {
+			return nodeReportCommitResult{}, err
+		}
+	}
 	deltaRX, deltaTX := int64(0), int64(0)
 	if counterEpoch == lastBootID && report.RXBytes >= lastRX && report.TXBytes >= lastTX && (sessionID != lastSessionID || report.Sequence > lastSequence) {
 		deltaRX = report.RXBytes - lastRX
@@ -2045,7 +1948,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		if stat.CounterEpoch > 0 {
 			statCounterEpoch = fmt.Sprintf("%s:%d", siteCounterEpoch, stat.CounterEpoch)
 		}
-		applied, err := recordNodeSiteTrafficTx(tx, id, statCounterEpoch, &stat, now.UnixMilli(), allowedSites, delayedFullReport)
+		applied, err := recordNodeSiteTrafficTx(tx, id, statCounterEpoch, &stat, now.UnixMilli(), allowedSites, delayedFullReport, siteReportIdentity)
 		if err != nil {
 			return nodeReportCommitResult{}, err
 		}

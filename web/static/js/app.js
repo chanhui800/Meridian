@@ -9,7 +9,6 @@
   const setupTokenInputEl = document.getElementById('inp-setup-token');
   const sidebarToggleEl = document.getElementById('sidebar-toggle');
   const sidebarDrawerCloseEl = document.getElementById('sidebar-drawer-close');
-  const sidebarEl = typeof document.querySelector === 'function' ? document.querySelector('.sidebar') : null;
   const sidebarStorageKey = 'meridian-sidebar-expanded';
   let sidebarPinned = false;
   let dashboardRefreshTimer = null;
@@ -25,10 +24,9 @@
 
   function storedSidebarExpanded() {
     try {
-      if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) return false;
-      return !!(window.localStorage && window.localStorage.getItem(sidebarStorageKey) === 'true');
+      return !window.localStorage || window.localStorage.getItem(sidebarStorageKey) !== 'false';
     } catch (_) {
-      return false;
+      return true;
     }
   }
 
@@ -45,7 +43,7 @@
   }
 
   sidebarPinned = storedSidebarExpanded();
-  setSidebarExpanded(sidebarPinned, false);
+  setSidebarExpanded(!isMobileSidebar() && sidebarPinned, false);
   if (sidebarToggleEl) {
     sidebarToggleEl.addEventListener('click', function() {
       if (isMobileSidebar()) {
@@ -58,22 +56,12 @@
   }
   if (sidebarDrawerCloseEl) sidebarDrawerCloseEl.addEventListener('click', () => setSidebarExpanded(false, true));
 
-  if (sidebarEl) {
-    sidebarEl.addEventListener('pointerenter', function() {
-      if (supportsSidebarHover()) setSidebarExpanded(true, false);
-    });
-    sidebarEl.addEventListener('pointerleave', function() {
-      if (supportsSidebarHover()) setSidebarExpanded(sidebarPinned, false);
-    });
-  }
-
   window.addEventListener('resize', function() {
     if (isMobileSidebar()) {
       setSidebarExpanded(false, false);
       return;
     }
-    const hovered = supportsSidebarHover() && !!(sidebarEl && sidebarEl.matches(':hover'));
-    setSidebarExpanded(sidebarPinned || hovered, false);
+    setSidebarExpanded(sidebarPinned, false);
   });
 
   const dismissMobileDrawer = () => {
@@ -108,6 +96,15 @@
     overlay.classList.add('active');
     overlay.setAttribute('aria-hidden', 'false');
     document.body.classList.add('modal-open');
+    const focusForm = () => {
+      if (!overlay.classList.contains('active') || typeof modal.querySelectorAll !== 'function') return;
+      const fields = Array.from(modal.querySelectorAll('input, select, textarea, button, a[href], [tabindex]'))
+        .filter(element => !element.disabled && element.tabIndex >= 0 && element.getClientRects().length > 0);
+      const preferred = fields.find(element => element.matches('input:not([type="hidden"]), select, textarea')) || fields[0];
+      preferred?.focus();
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(focusForm);
+    else focusForm();
   };
 
   window.closeModal = function() {
@@ -125,9 +122,25 @@
   });
 
   document.getElementById('modal-close').addEventListener('click', closeModal);
+  document.getElementById('modal')?.addEventListener('keydown', event => {
+    if (event.key !== 'Tab' || !document.getElementById('modal-overlay').classList.contains('active')) return;
+    const modal = document.getElementById('modal');
+    const fields = Array.from(modal.querySelectorAll('button, a[href], input, select, textarea, [tabindex]'))
+      .filter(element => !element.disabled && element.tabIndex >= 0 && element.getClientRects().length > 0);
+    const first = fields[0], last = fields.at(-1);
+    if (!first) return;
+    if (!modal.contains(document.activeElement) || event.shiftKey && document.activeElement === first || !event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+  });
 
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape' && document.getElementById('modal-overlay').classList.contains('active')) closeModal();
+    else if (e.key === 'Escape' && isMobileSidebar() && shellEl.classList.contains('sidebar-expanded')) {
+      setSidebarExpanded(false, false);
+      sidebarToggleEl?.focus();
+    }
   });
 
   async function checkAuth() {
@@ -216,21 +229,17 @@
     return !!(window.matchMedia && window.matchMedia('(max-width: 768px)').matches);
   }
 
-  function supportsSidebarHover() {
-    return !isMobileSidebar() && !!(window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches);
-  }
-
   function updateSidebarToggleState() {
     if (!sidebarToggleEl) return;
     const expanded = shellEl.classList.contains('sidebar-expanded');
     const mobile = isMobileSidebar();
     const label = mobile
       ? (expanded ? '关闭导航栏' : '打开导航栏')
-      : (sidebarPinned ? '取消固定导航栏' : '固定展开导航栏');
+      : (expanded ? '收起侧边栏' : '展开侧边栏');
     sidebarToggleEl.setAttribute('aria-expanded', String(expanded));
     sidebarToggleEl.setAttribute('aria-pressed', String(mobile ? expanded : sidebarPinned));
     sidebarToggleEl.setAttribute('aria-label', label);
-    sidebarToggleEl.removeAttribute('title');
+    sidebarToggleEl.title = label;
     sidebarToggleEl.classList.toggle('is-expanded', expanded);
     sidebarToggleEl.classList.toggle('is-pinned', !mobile && sidebarPinned);
   }
@@ -300,7 +309,7 @@
     if (username) username.textContent = API.username || '管理员';
     API.ingressCapabilities().then(capabilities => {
       if (!capabilities || !capabilities.app_version) return;
-      ['sidebar-version'].forEach(id => {
+      ['sidebar-version', 'sidebar-footer-version'].forEach(id => {
         const version = document.getElementById(id);
         if (version) version.textContent = capabilities.app_version;
       });

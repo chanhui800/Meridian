@@ -84,33 +84,23 @@ function tmdbSettingsStatusHTML(settings) {
 
 function renderTMDBSettingsForm(rawSettings) {
   const settings = normalizeTMDBSettings(rawSettings);
-  return `<section class="settings-panel tmdb-settings-panel">
-    <header><span>TMDB</span><h2>媒体资料补全</h2><b>${settings.enabled ? '已开启' : '可选'}</b></header>
-    <div class="tmdb-brand-row">
-      <img src="/tmdb-logo.svg" alt="The Movie Database (TMDB)">
-      <p class="settings-panel-help">TMDB 只用于后台补全观看历史的海报、影片名称与剧集资料；不参与代理、播放和站点可用性判断。</p>
-    </div>
+  return `<section class="console-panel settings-panel tmdb-settings-panel"><header><h2>资料补全服务</h2><img class="settings-tmdb-logo" src="/tmdb-logo.svg" alt="The Movie Database (TMDB)"></header>
     ${tmdbSettingsStatusHTML(settings)}
     <div class="settings-grid tmdb-settings-grid">
-      <label class="settings-field"><span>自动资料补全</span><div><select class="form-select" id="tmdb-enabled"><option value="off" ${!settings.enabled ? 'selected' : ''}>关闭</option><option value="on" ${settings.enabled ? 'selected' : ''}>开启</option></select></div><small>关闭后仍会记录本地观看历史，但不会向 TMDB 发起资料查询。</small></label>
-      <label class="settings-field tmdb-token-field"><span>TMDB API Read Access Token</span><div><input class="form-input" id="tmdb-api-token" type="password" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="${settings.configured ? '已配置，留空保持不变' : '粘贴 TMDB Read Access Token'}"></div><small>Token 仅加密保存在服务器中，读取设置时不会返回到浏览器。可前往 <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">TMDB API 设置</a>申请。</small></label>
-      <label class="settings-field"><span>资料语言</span><div><select class="form-select" id="tmdb-language"><option value="zh-CN" ${settings.language === 'zh-CN' ? 'selected' : ''}>简体中文（zh-CN）</option><option value="zh-TW" ${settings.language === 'zh-TW' ? 'selected' : ''}>繁體中文（zh-TW）</option><option value="en-US" ${settings.language === 'en-US' ? 'selected' : ''}>English（en-US）</option></select></div><small>匹配不到本地语言资料时，由后端保留已有本地标题作为回退。</small></label>
-      <label class="settings-field"><span>观看历史保留时间</span><div><input class="form-input" id="tmdb-history-retention" type="number" min="1" max="3650" step="1" inputmode="numeric" value="${settings.historyRetentionDays}"><em>天</em></div><small>仅清理过期观看会话；不会删除站点、请求日志或流量统计。</small></label>
+      <label class="settings-field"><span>自动资料补全</span><div><select class="form-select" id="tmdb-enabled"><option value="off" ${!settings.enabled ? 'selected' : ''}>关闭</option><option value="on" ${settings.enabled ? 'selected' : ''}>开启</option></select></div><small>关闭后继续记录本地观看历史。</small></label>
+      <label class="settings-field"><span>资料语言</span><div><select class="form-select" id="tmdb-language"><option value="zh-CN" ${settings.language === 'zh-CN' ? 'selected' : ''}>简体中文（zh-CN）</option><option value="zh-TW" ${settings.language === 'zh-TW' ? 'selected' : ''}>繁體中文（zh-TW）</option><option value="en-US" ${settings.language === 'en-US' ? 'selected' : ''}>English（en-US）</option></select></div></label>
+      <label class="settings-field settings-field-wide tmdb-token-field"><span>TMDB API Read Access Token</span><div><input class="form-input" id="tmdb-api-token" type="password" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="${settings.configured ? '已配置，留空保持不变' : '粘贴 TMDB Read Access Token'}"></div><small>Token 加密保存，不会回显。<a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">申请 Token</a></small></label>
+      <label class="settings-field"><span>观看历史保留时间</span><div><input class="form-input" id="tmdb-history-retention" type="number" min="1" max="3650" step="1" inputmode="numeric" value="${settings.historyRetentionDays}"><em>天</em></div><small>仅清理过期观看会话，不影响站点、请求日志或流量。</small></label>
     </div>
     <div class="settings-save-bar tmdb-settings-actions">
-      ${settings.configured ? '<button type="button" class="telegram-btn danger secondary" id="tmdb-remove-token">移除 Token</button>' : ''}
-      <button type="button" class="telegram-btn" id="tmdb-test">测试连接</button>
-      <button type="button" class="telegram-btn primary" id="tmdb-save">保存设置</button>
-    </div>
-    <section class="tmdb-cache-panel" aria-label="TMDB 缓存管理">
-      <header><div><span>TMDB CACHE</span><h3>缓存管理</h3></div><b id="tmdb-cache-summary">${settings.cacheEntries} 条 · ${esc(tmdbFormatCacheSize(settings.cacheSizeBytes))}</b></header>
-      <p>观看历史保留时间会联动清理过期和未引用的 TMDB 资料缓存；手动清理会同时失效历史记录中的复制资料并排队后台重新补全。删除单条历史时，只有没有其它记录引用的缓存才会同步删除。</p>
-      <div class="tmdb-cache-actions"><button type="button" class="telegram-btn" id="tmdb-cache-clean">清理过期与未引用</button><button type="button" class="telegram-btn danger secondary" id="tmdb-cache-clear-all">清空全部缓存</button></div>
-    </section>
-    <p class="tmdb-attribution">This product uses the TMDB API but is not endorsed or certified by TMDB. <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">The Movie Database</a></p>
-  </section>`;
+      ${settings.configured ? '<button type="button" class="console-button is-danger telegram-btn" id="tmdb-remove-token">移除 Token</button>' : ''}
+      <button type="button" class="console-button telegram-btn" id="tmdb-test">测试连接</button><button type="button" class="console-button is-primary telegram-btn" id="tmdb-save">保存设置</button>
+    </div></section>
+    <section class="console-panel settings-panel tmdb-cache-panel" aria-label="TMDB 缓存管理"><header><h2>资料缓存</h2><b id="tmdb-cache-summary">${settings.cacheEntries} 条 · ${esc(tmdbFormatCacheSize(settings.cacheSizeBytes))}</b></header><p class="settings-panel-help">缓存用来复用影片资料。清理后仍保留观看历史，并在后台重新补全。</p>
+      <div class="tmdb-cache-actions"><button type="button" class="console-button telegram-btn" id="tmdb-cache-clean">清理过期与未引用</button><button type="button" class="console-button is-danger telegram-btn" id="tmdb-cache-clear-all">清空全部缓存</button></div>
+      <details class="settings-help"><summary>缓存清理说明</summary><p>观看历史保留时间会联动清理过期和未引用的缓存；手动清理同时失效历史中的复制资料。删除单条历史时，仅删除没有其他记录引用的缓存。</p></details>
+    </section><p class="tmdb-attribution">This product uses the TMDB API but is not endorsed or certified by TMDB. <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">The Movie Database</a></p>`;
 }
-
 function tmdbSettingsCurrentPayload(clearToken) {
   return buildTMDBSettingsPayload(
     document.getElementById('tmdb-api-token')?.value,
@@ -304,7 +294,7 @@ async function loadTMDBSettings(page) {
   } catch (error) {
     if (generation !== tmdbSettingsLoadGeneration || Router.current !== 'settings-tmdb' || !page.isConnected) return;
     const content = page.querySelector('.settings-content');
-    if (content) content.innerHTML = `<section class="settings-panel"><div class="settings-loading request-log-error">读取 TMDB 设置失败：${esc(error.message || '请求失败')}</div><div class="settings-save-bar"><button type="button" class="telegram-btn" id="tmdb-settings-retry">重新加载</button></div></section>`;
+    if (content) content.innerHTML = `<section class="console-panel settings-panel"><div class="settings-load-error" role="alert">读取 TMDB 设置失败：${esc(error.message || '请求失败')}</div><div class="settings-save-bar"><button type="button" class="console-button" id="tmdb-settings-retry">重新加载</button></div></section>`;
     const retry = page.querySelector('#tmdb-settings-retry');
     if (retry) retry.onclick = () => renderTMDBSettings();
   }
@@ -315,7 +305,7 @@ function renderTMDBSettings() {
   if (!page) return;
   stopTMDBCacheRefresh();
   tmdbSettingsCache = null;
-  page.innerHTML = `<div class="settings-layout fade-up">${globalSettingsNav('tmdb')}<main class="settings-content"><section class="settings-panel"><div class="settings-loading">正在读取 TMDB 设置…</div></section></main></div>`;
+  page.innerHTML = settingsPageFrame('tmdb', '媒体资料', '配置 TMDB 资料补全和观看历史保留时间。', '<div class="console-panel settings-loading">正在读取 TMDB 设置…</div>');
   bindGlobalSettingsNav(page);
   loadTMDBSettings(page);
 }

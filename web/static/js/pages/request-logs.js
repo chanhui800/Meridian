@@ -9,6 +9,7 @@ let requestLogLatestID = 0;
 let requestLogLatestCursor = '';
 let requestLogDisplaySettings = { node: true, category: true, status: true, client_ip: true, ua: true, upstream_ua: true, backend_address: true, timeline: true };
 let requestLogLastDisplaySettings = null;
+let requestLogEntries = new Map();
 const requestLogUAWidthStorageKey = 'meridian-request-log-ua-width';
 
 function requestLogDateOnlyValue(value) {
@@ -146,100 +147,58 @@ function renderRequestLogs() {
   requestLogApplyUAWidth();
   requestLogLatestID = 0;
   requestLogLatestCursor = '';
+  requestLogEntries = new Map();
   const today = Date.now();
   const yesterday = today - 24 * 60 * 60 * 1000;
   requestLogCategoryFilter = 'all';
   requestLogStatusFilter = 'all';
 
   page.innerHTML = `
-    <h1 class="section-title fade-up">日志记录</h1>
-    <p class="section-sub fade-up">查看各站点的请求状态、客户端 IP、客户端 UA 与实际发往后端的上游 UA。日志不保存查询参数、令牌、Cookie 或正文。</p>
-
-    <section class="request-log-controls fade-up">
-      <div class="request-log-search-row">
-        <label class="request-log-date-field">
-          <span>开始日期</span>
-          <input type="date" class="form-input" id="request-log-from" value="${requestLogDateInputValue(yesterday)}">
-        </label>
-        <span class="request-log-date-separator">至</span>
-        <label class="request-log-date-field">
-          <span>结束日期</span>
-          <input type="date" class="form-input" id="request-log-to" value="${requestLogDateInputValue(today)}">
-        </label>
-        <label class="request-log-search-field">
-          <span class="sr-only">搜索日志</span>
-          <input type="search" class="form-input" id="request-log-search" placeholder="搜索节点、客户端 IP、客户端/上游 UA、路径或状态码（如 200）" autocomplete="off">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
-        </label>
-      </div>
-
-      <div class="request-log-filter-row">
-        <span class="request-log-filter-label">筛选模式</span>
-        <div class="request-log-pills" id="request-log-category-pills">
-          <button type="button" class="request-log-pill active" data-category="all">全部</button>
-          <button type="button" class="request-log-pill" data-category="playback">播放信息</button>
-          <button type="button" class="request-log-pill" data-category="playback_sync">播放状态同步</button>
-          <button type="button" class="request-log-pill" data-category="stream">主视频流</button>
-          <button type="button" class="request-log-pill" data-category="manifest">播放清单</button>
-          <button type="button" class="request-log-pill" data-category="segment">媒体分片</button>
-          <button type="button" class="request-log-pill" data-category="image">图片海报</button>
-          <button type="button" class="request-log-pill" data-category="metadata">媒体元数据</button>
-          <button type="button" class="request-log-pill" data-category="subtitle">字幕</button>
-          <button type="button" class="request-log-pill" data-category="asset">静态资源</button>
-          <button type="button" class="request-log-pill" data-category="websocket">WebSocket</button>
-          <button type="button" class="request-log-pill" data-category="api">常规 API</button>
-          <button type="button" class="request-log-pill" data-category="auth">用户认证</button>
+    <div class="console-page management-page management-log-page">
+      <header class="console-heading"><div><p class="console-eyebrow">访问与排查</p><h1>请求日志</h1><p class="console-lead">按时间、站点和客户端快速定位请求。</p></div><button type="button" class="console-button" id="request-log-refresh"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 6a8 8 0 0 1 14 6M4 12a8 8 0 0 0 14 6"/></svg>刷新日志</button></header>
+      <section class="console-panel management-log-controls" aria-label="查找日志">
+        <div class="management-log-search-row">
+          <label class="management-search"><span class="sr-only">搜索日志</span><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></svg><input type="search" class="form-input" id="request-log-search" placeholder="搜索节点、客户端 IP、UA、路径或状态码" autocomplete="off"></label>
+          <label class="management-date-field"><span>开始日期</span><input type="date" class="form-input" id="request-log-from" value="${requestLogDateInputValue(yesterday)}"></label>
+          <label class="management-date-field"><span>结束日期</span><input type="date" class="form-input" id="request-log-to" value="${requestLogDateInputValue(today)}"></label>
         </div>
-      </div>
-
-      <div class="request-log-filter-row">
-        <span class="request-log-filter-label">状态筛选</span>
-        <div class="request-log-pills" id="request-log-status-pills">
-          <button type="button" class="request-log-pill active" data-status="all">全部状态</button>
-          <button type="button" class="request-log-pill" data-status="4xx">只看 4XX</button>
-          <button type="button" class="request-log-pill" data-status="5xx">只看 5XX</button>
+        <details class="management-log-filters" id="request-log-advanced-filters">
+          <summary><span id="request-log-filter-summary">筛选与显示</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>
+          <div class="management-log-filter-content">
+            <div class="management-filter-group"><span class="management-field-label">资源类型</span><div class="request-log-pills" id="request-log-category-pills">
+              <button type="button" class="request-log-pill active" data-category="all" aria-pressed="true">全部</button>
+              <button type="button" class="request-log-pill" data-category="playback" aria-pressed="false">播放信息</button>
+              <button type="button" class="request-log-pill" data-category="playback_sync" aria-pressed="false">播放状态同步</button>
+              <button type="button" class="request-log-pill" data-category="stream" aria-pressed="false">主视频流</button>
+              <button type="button" class="request-log-pill" data-category="manifest" aria-pressed="false">播放清单</button>
+              <button type="button" class="request-log-pill" data-category="segment" aria-pressed="false">媒体分片</button>
+              <button type="button" class="request-log-pill" data-category="image" aria-pressed="false">图片海报</button>
+              <button type="button" class="request-log-pill" data-category="metadata" aria-pressed="false">媒体元数据</button>
+              <button type="button" class="request-log-pill" data-category="subtitle" aria-pressed="false">字幕</button>
+              <button type="button" class="request-log-pill" data-category="asset" aria-pressed="false">静态资源</button>
+              <button type="button" class="request-log-pill" data-category="websocket" aria-pressed="false">WebSocket</button>
+              <button type="button" class="request-log-pill" data-category="api" aria-pressed="false">常规 API</button>
+              <button type="button" class="request-log-pill" data-category="auth" aria-pressed="false">用户认证</button>
+            </div></div>
+            <div class="management-filter-group"><span class="management-field-label">响应状态</span><div class="request-log-pills" id="request-log-status-pills">
+              <button type="button" class="request-log-pill active" data-status="all" aria-pressed="true">全部状态</button><button type="button" class="request-log-pill" data-status="4xx" aria-pressed="false">只看 4XX</button><button type="button" class="request-log-pill" data-status="5xx" aria-pressed="false">只看 5XX</button>
+            </div></div>
+            <div class="management-log-storage"><div class="request-log-ua-width-control"><label for="request-log-ua-width">UA 列宽</label><input type="range" id="request-log-ua-width" min="180" max="420" step="10" value="${requestLogGetUAWidth()}"><output id="request-log-ua-width-value">${requestLogGetUAWidth()} px</output></div><div class="management-log-storage-actions"><button type="button" class="console-button" id="request-cache-clear">清除资源缓存</button><button type="button" class="console-button is-danger" id="request-log-clear">清空全部日志</button></div></div>
+          </div>
+        </details>
+      </section>
+      <section class="console-panel management-log-results" aria-label="请求日志列表">
+        <div class="management-list-meta"><span class="request-log-summary" id="request-log-summary">正在读取日志…</span><span class="console-muted">每 5 秒更新 · 点击记录查看详情</span></div>
+        <div class="request-log-table-scroll">
+          <table class="request-log-table">
+            <colgroup><col class="request-log-col-site"><col class="request-log-col-node"><col class="request-log-col-category"><col class="request-log-col-status"><col class="request-log-col-ip"><col class="request-log-col-ua"><col class="request-log-col-upstream-ua"><col class="request-log-col-backend"><col class="request-log-col-time"></colgroup>
+            <thead><tr><th data-log-field="site">站点</th><th data-log-field="node">节点</th><th data-log-field="category">资源类别</th><th data-log-field="status">状态</th><th data-log-field="ip">客户端 IP</th><th data-log-field="ua">客户端 UA</th><th data-log-field="upstream-ua">上游 UA</th><th data-log-field="backend-address">后端地址</th><th data-log-field="timeline">时间线</th></tr></thead>
+            <tbody id="request-log-body"><tr><td colspan="9" class="request-log-empty">正在加载…</td></tr></tbody>
+          </table>
         </div>
-      </div>
-
-      <div class="request-log-ua-width-control">
-        <label for="request-log-ua-width">UA 列宽</label>
-        <input type="range" id="request-log-ua-width" min="180" max="420" step="10" value="${requestLogGetUAWidth()}">
-        <output id="request-log-ua-width-value">${requestLogGetUAWidth()} px</output>
-      </div>
-
-      <div class="request-log-actions">
-        <button type="button" class="request-log-action danger" id="request-cache-clear">
-          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/><line x1="9" y1="10" x2="15" y2="16"/><line x1="15" y1="10" x2="9" y2="16"/></svg>
-          清除缓存
-        </button>
-        <button type="button" class="request-log-action danger" id="request-log-clear">
-          <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M8 6V4h8v2"/></svg>
-          清空日志
-        </button>
-        <button type="button" class="request-log-action" id="request-log-refresh">
-          <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.5 15a9 9 0 1 1-2.1-9.4L23 10"/></svg>
-          刷新
-        </button>
-        <span class="request-log-summary" id="request-log-summary">正在读取日志…</span>
-      </div>
-    </section>
-
-    <section class="request-log-table-card fade-up" aria-label="请求日志列表">
-      <div class="request-log-table-scroll">
-        <table class="request-log-table">
-          <colgroup>
-            <col class="request-log-col-site"><col class="request-log-col-node"><col class="request-log-col-category"><col class="request-log-col-status">
-            <col class="request-log-col-ip"><col class="request-log-col-ua"><col class="request-log-col-upstream-ua"><col class="request-log-col-backend"><col class="request-log-col-time">
-          </colgroup>
-          <thead><tr>
-            <th data-log-field="site">站点</th><th data-log-field="node">节点</th><th data-log-field="category">资源类别</th><th data-log-field="status">状态</th><th data-log-field="ip">客户端 IP</th><th data-log-field="ua">客户端 UA</th><th data-log-field="upstream-ua">上游 UA</th><th data-log-field="backend-address">后端地址</th><th data-log-field="timeline">时间线</th>
-          </tr></thead>
-          <tbody id="request-log-body">
-            <tr><td colspan="9" class="request-log-empty">正在加载…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+      </section>
+      <p class="management-footnote">日志不保存查询参数、令牌、Cookie 或正文。清空日志与资源缓存可以分别操作。</p>
+    </div>
   `;
   requestLogApplyUAWidth();
 
@@ -266,6 +225,11 @@ function renderRequestLogs() {
   document.getElementById('request-log-refresh').onclick = loadRequestLogs;
   document.getElementById('request-log-clear').onclick = clearRequestLogs;
   document.getElementById('request-cache-clear').onclick = clearAssetCache;
+  document.getElementById('request-log-body').onclick = event => {
+    const button = event.target.closest?.('[data-log-detail-id]');
+    const entry = button && requestLogEntries.get(Number(button.dataset.logDetailId));
+    if (entry) showRequestLogDetails(entry);
+  };
   const uaWidthInput = document.getElementById('request-log-ua-width');
   if (uaWidthInput) {
     const applyUAWidth = () => {
@@ -304,7 +268,15 @@ function stopRequestLogRefresh() {
 function setRequestLogActivePill(containerId, activeButton) {
   document.querySelectorAll(`#${containerId} .request-log-pill`).forEach(button => {
     button.classList.toggle('active', button === activeButton);
+    button.setAttribute?.('aria-pressed', String(button === activeButton));
   });
+  const summary = document.getElementById('request-log-filter-summary');
+  if (summary) {
+    const selected = [];
+    if (requestLogCategoryFilter !== 'all') selected.push(requestLogCategoryLabel(requestLogCategoryFilter));
+    if (requestLogStatusFilter !== 'all') selected.push(requestLogStatusFilter.toUpperCase());
+    summary.textContent = selected.length ? `筛选与显示 · ${selected.join(' / ')}` : '筛选与显示';
+  }
 }
 
 async function loadRequestLogs(options = {}) {
@@ -325,7 +297,7 @@ async function loadRequestLogs(options = {}) {
   const incremental = options.incremental === true && requestLogLatestID > 0;
   if (!incremental) requestLogLatestID = 0;
   const generation = ++requestLogLoadGeneration;
-  const scroller = body.closest('.request-log-table-scroll');
+  const scroller = document.scrollingElement || body.closest('.request-log-table-scroll');
   const previousScrollTop = scroller ? scroller.scrollTop : 0;
   const previousScrollHeight = scroller ? scroller.scrollHeight : 0;
   const preserveViewport = previousScrollTop > 0;
@@ -347,7 +319,11 @@ async function loadRequestLogs(options = {}) {
     if (incremental) {
       if (incoming.length) {
         body.insertAdjacentHTML('afterbegin', incoming.map(requestLogRowHTML).join(''));
-        while (body.querySelectorAll('tr[data-log-id]').length > 500) body.lastElementChild?.remove();
+        while (body.querySelectorAll('tr[data-log-id]').length > 500) {
+          const last = body.lastElementChild;
+          requestLogEntries.delete(Number(last?.dataset?.logId));
+          last?.remove();
+        }
         requestLogApplyDisplaySettings(requestLogLastDisplaySettings);
       }
     } else {
@@ -386,6 +362,7 @@ async function loadRequestLogs(options = {}) {
 function renderRequestLogRows(logs) {
   const body = document.getElementById('request-log-body');
   if (!body) return;
+  requestLogEntries = new Map();
   if (!logs.length) {
     body.innerHTML = '<tr><td colspan="9" class="request-log-empty">当前条件下暂无日志</td></tr>';
     return;
@@ -400,13 +377,14 @@ function renderRequestLogRows(logs) {
 }
 
 function requestLogRowHTML(entry) {
+    if (Number(entry.id) > 0) requestLogEntries.set(Number(entry.id), entry);
     const status = Number(entry.status_code || 0);
     const recordedAtMS = Number(entry.recorded_at_ms || 0);
     const exactTime = recordedAtMS ? requestLogFormatDateTime(recordedAtMS) : '未写入时间线';
     const requestTitle = `${String(entry.method || 'GET')} ${String(entry.path || '/')}`;
     return `
       <tr data-log-id="${esc(entry.id || '')}" title="${esc(requestTitle)}">
-        <td data-log-field="site"><span class="request-log-node">${esc(entry.site_name || '—')}</span></td>
+        <td data-log-field="site"><button type="button" class="management-log-open" data-log-detail-id="${esc(entry.id || '')}" aria-label="查看 ${esc(entry.site_name || '站点')} 请求详情"><strong>${esc(entry.site_name || '—')}</strong><span class="management-log-path">${esc(requestTitle)}</span></button></td>
         <td data-log-field="node"><span class="request-log-node">${esc(entry.final_node || '—')}</span></td>
         <td data-log-field="category"><span class="request-log-category">${esc(requestLogCategoryLabel(entry.resource_category))}</span></td>
         <td data-log-field="status"><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
@@ -417,6 +395,26 @@ function requestLogRowHTML(entry) {
         <td data-log-field="timeline"><time class="request-log-time"${recordedAtMS ? ` datetime="${new Date(recordedAtMS).toISOString()}"` : ''} title="${esc(exactTime)}">${esc(requestLogRelativeTime(recordedAtMS))}</time></td>
       </tr>
     `;
+}
+
+function showRequestLogDetails(entry) {
+  const time = Number(entry.recorded_at_ms || 0);
+  const fields = [
+    ['站点', entry.site_name], ['请求', `${entry.method || 'GET'} ${entry.path || '/'}`],
+    ['节点', entry.final_node, requestLogDisplaySettings.node],
+    ['资源类型', requestLogCategoryLabel(entry.resource_category), requestLogDisplaySettings.category],
+    ['响应状态', entry.status_code, requestLogDisplaySettings.status],
+    ['记录时间', time ? requestLogFormatDateTime(time) : '未写入时间线', requestLogDisplaySettings.timeline],
+    ['客户端 IP', `${entry.client_ip || '—'}${entry.client_region ? ` · ${entry.client_region}` : ''}`, requestLogDisplaySettings.client_ip],
+    ['客户端 UA', entry.user_agent, requestLogDisplaySettings.ua],
+    ['上游 UA', entry.upstream_user_agent, requestLogDisplaySettings.upstream_ua],
+    ['后端地址', entry.backend_address, requestLogDisplaySettings.backend_address],
+  ].filter(([, , visible]) => visible !== false);
+  document.getElementById('modal-title').textContent = '请求详情';
+  document.getElementById('modal-body').innerHTML = `<dl class="management-log-detail">${fields.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value == null || value === '' ? '—' : value)}</dd></div>`).join('')}</dl>`;
+  document.getElementById('modal-footer').innerHTML = '<button type="button" class="console-button" id="request-log-detail-close">关闭</button>';
+  openModal({ closeOnBackdrop: true, modalClass: 'management-log-modal' });
+  document.getElementById('request-log-detail-close').onclick = closeModal;
 }
 
 async function clearRequestLogs() {

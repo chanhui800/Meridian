@@ -43,29 +43,41 @@ test('custom UA form state exposes and hydrates all fields', () => {
   assert.equal(state.customVersion, '1.0.0');
 });
 
-test('preset form state hides and clears custom UA values', () => {
+test('legacy preset modes open as editable custom UA with equivalent values', () => {
   const { customUAFormState } = loadSiteHelpers();
-  const state = customUAFormState('web', {
+  const infuse = customUAFormState('infuse', {
     custom_user_agent: 'stale',
     custom_client: 'stale',
     custom_version: 'stale',
   });
 
-  assert.equal(state.visible, false);
-  assert.equal(state.required, false);
-  assert.equal(state.customUserAgent, '');
-  assert.equal(state.customClient, '');
-  assert.equal(state.customVersion, '');
+  assert.equal(infuse.visible, true);
+  assert.equal(infuse.required, true);
+  assert.equal(infuse.customUserAgent, 'Infuse/7.8.1');
+  assert.equal(infuse.customClient, 'Infuse');
+  assert.equal(infuse.customVersion, '7.8.1');
+
+  const web = customUAFormState('web', {});
+  assert.equal(web.visible, true);
+  assert.equal(web.customUserAgent, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Emby Theater');
+  assert.equal(web.customClient, 'Emby Web');
+  assert.equal(web.customVersion, '4.9.0.42');
+
+  const client = customUAFormState('client', {});
+  assert.equal(client.visible, true);
+  assert.equal(client.customUserAgent, 'Emby-Theater/4.7.0');
+  assert.equal(client.customClient, 'Emby Theater');
+  assert.equal(client.customVersion, '4.7.0');
 });
 
-test('custom UA payload trims custom values and preset payload clears them', () => {
+test('custom UA payload trims custom values and non-custom payload clears them', () => {
   const { buildCustomUAPayload } = loadSiteHelpers();
   const custom = buildCustomUAPayload('custom', ' UA ', ' Client ', ' 1.2.3 ');
   assert.equal(custom.custom_user_agent, 'UA');
   assert.equal(custom.custom_client, 'Client');
   assert.equal(custom.custom_version, '1.2.3');
 
-  const preset = buildCustomUAPayload('infuse', 'stale', 'stale', 'stale');
+  const preset = buildCustomUAPayload('passthrough', 'stale', 'stale', 'stale');
   assert.equal(preset.custom_user_agent, '');
   assert.equal(preset.custom_client, '');
   assert.equal(preset.custom_version, '');
@@ -97,7 +109,14 @@ test('passthrough payload clears the custom triplet', () => {
 test('new site form defaults UA mode to passthrough', () => {
   const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
   assert.match(source, /option value="passthrough" \$\{\(!isEdit \|\| site\.ua_mode === 'passthrough'\)/);
-  assert.match(source, /uaSelect\.value = isEdit && site\.ua_mode \? site\.ua_mode : 'passthrough'/);
+  assert.match(source, /uaSelect\.value = isEdit && uaModeIsCustomLike\(site\.ua_mode\) \? 'custom' : 'passthrough'/);
+});
+
+test('site form no longer offers built-in UA presets', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /option value="custom" \$\{isEdit && uaModeIsCustomLike\(site\.ua_mode\) \? 'selected' : ''\}>自定义<\/option>/);
+  assert.doesNotMatch(source, /<option value="(infuse|web|client)"/);
+  assert.match(source, /const legacyUAPresets = \{/);
 });
 
 test('custom identity fields stay inside the UA grid cell', () => {

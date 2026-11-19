@@ -111,7 +111,8 @@ test('request log panel exposes only concrete resource-category filters and live
     assert.match(source, new RegExp(`data-category="${category}"`));
   }
   assert.doesNotMatch(source, /data-category="video"/);
-  assert.doesNotMatch(source, /request-log-advanced-filters|<details|高级分类/);
+  assert.match(source, /<details class="management-log-filters" id="request-log-advanced-filters">/);
+  assert.match(source, /id="request-log-filter-summary"/);
   assert.match(source, /requestLogRefreshTimer = setInterval/);
   assert.match(source, /Router\.current === 'request-logs'/);
   assert.match(source, /class="request-log-ip mono"/);
@@ -281,4 +282,30 @@ test('request log timeline uses concise Chinese relative time', () => {
   assert.equal(sandbox.requestLogRelativeTime(now - 5 * 60_000, now), '5 分钟前');
   assert.equal(sandbox.requestLogRelativeTime(now - 2 * 60 * 60_000, now), '2 小时前');
   assert.equal(sandbox.requestLogRelativeTime(now - 3 * 24 * 60 * 60_000, now), '3 天前');
+});
+
+test('request details escape values and respect hidden display fields', () => {
+  const sandbox = loadRequestLogHelpers();
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'api.js'), 'utf8'), sandbox);
+  const elements = {
+    'modal-title': { textContent: '' },
+    'modal-body': { innerHTML: '' },
+    'modal-footer': { innerHTML: '' },
+    'request-log-detail-close': {},
+  };
+  let modalClass;
+  sandbox.document = { getElementById(id) { return elements[id]; } };
+  sandbox.openModal = options => { modalClass = options.modalClass; };
+  sandbox.closeModal = () => {};
+  vm.runInContext('requestLogDisplaySettings.ua = false;', sandbox);
+  sandbox.showRequestLogDetails({
+    site_name: '<img src=x onerror=alert(1)>',
+    method: 'GET', path: '/<script>synthetic</script>', status_code: 200,
+    recorded_at_ms: 1760000000000, user_agent: 'operator-hidden-UA',
+    upstream_user_agent: 'upstream-demo', backend_address: 'https://origin.example.com',
+  });
+  assert.equal(modalClass, 'management-log-modal');
+  assert.match(elements['modal-body'].innerHTML, /&lt;img/);
+  assert.doesNotMatch(elements['modal-body'].innerHTML, /<img|<script>|operator-hidden-UA/);
+  assert.match(elements['modal-body'].innerHTML, /upstream-demo/);
 });

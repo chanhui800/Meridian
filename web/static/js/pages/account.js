@@ -50,62 +50,15 @@ async function loadAccountPage() {
 
 function renderAccount() {
   const page = document.getElementById('page-account');
-  page.innerHTML = `
-    <div class="account-page fade-up">
-      <section class="account-profile-card">
-        <div class="account-profile-main">
-          <span class="account-profile-avatar" id="account-avatar">${esc((API.username || 'A')[0].toUpperCase())}</span>
-          <div>
-            <span class="account-eyebrow">当前账户</span>
-            <h2 id="account-current-username">${esc(API.username || '管理员')}</h2>
-            <p>单管理员模式</p>
-          </div>
-        </div>
-        <dl class="account-profile-meta">
-          <div><dt>账户类型</dt><dd id="account-role">管理员</dd></div>
-          <div><dt>创建时间</dt><dd id="account-created-at">正在读取…</dd></div>
-        </dl>
-      </section>
-
-      <section class="account-settings-card">
-        <div class="account-card-head">
-          <div><h2>账户设置</h2><p>修改用户名或密码时，需要验证当前密码。</p></div>
-        </div>
-        <form id="account-settings-form" class="account-settings-form">
-          <div class="form-group">
-            <label for="account-username">用户名</label>
-            <input class="form-input" id="account-username" type="text" maxlength="64" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
-          </div>
-          <div class="form-group">
-            <label for="account-current-password">当前密码</label>
-            <input class="form-input" id="account-current-password" type="password" maxlength="72" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" required>
-          </div>
-          <div class="account-password-grid">
-            <div class="form-group">
-              <label for="account-new-password">新密码</label>
-              <input class="form-input" id="account-new-password" type="password" maxlength="72" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="不修改请留空">
-              <div class="form-help">如需修改，密码长度为 12–72 个字符。</div>
-            </div>
-            <div class="form-group">
-              <label for="account-confirm-password">确认新密码</label>
-              <input class="form-input" id="account-confirm-password" type="password" maxlength="72" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="再次输入新密码">
-            </div>
-          </div>
-          <div class="account-form-actions">
-            <button class="btn-primary" id="account-save" type="submit">保存账户设置</button>
-          </div>
-        </form>
-      </section>
-
-      <section class="account-session-card">
-        <div><h2>退出登录</h2><p>退出当前设备上的面板登录状态。</p></div>
-        <button class="account-logout-button" id="account-logout" type="button">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3M15 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/></svg>
-          <span>退出登录</span>
-        </button>
-      </section>
-    </div>`;
-
+  page.innerHTML = `<div class="console-page settings-console account-console"><header class="console-heading"><div><p class="console-eyebrow">登录与安全</p><h1>账户</h1><p class="console-lead">管理当前管理员资料和此设备的登录状态。</p></div></header>
+    <section class="console-panel settings-panel settings-account-summary"><div class="settings-account-identity"><span class="settings-account-avatar" id="account-avatar">${esc((API.username || 'A')[0].toUpperCase())}</span><div><strong id="account-current-username">${esc(API.username || '管理员')}</strong><p>单管理员模式</p></div></div><dl class="settings-account-meta"><div><dt>账户类型</dt><dd id="account-role">管理员</dd></div><div><dt>创建时间</dt><dd id="account-created-at">正在读取…</dd></div></dl></section>
+    <section class="console-panel settings-panel"><header><h2>账户资料</h2><span>修改时验证当前密码</span></header><form id="account-settings-form" class="settings-account-form">
+      <div class="settings-grid"><label class="settings-field"><span>用户名</span><div><input class="form-input" id="account-username" type="text" maxlength="64" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required></div></label><label class="settings-field"><span>当前密码</span><div><input class="form-input" id="account-current-password" type="password" maxlength="72" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" required></div></label></div>
+      <details class="settings-disclosure"><summary><strong>修改密码</strong><span>不修改时留空</span></summary><div class="settings-grid"><label class="settings-field"><span>新密码</span><div><input class="form-input" id="account-new-password" type="password" maxlength="72" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="12–72 个字符"></div><small>密码长度为 12–72 个字符。</small></label><label class="settings-field"><span>确认新密码</span><div><input class="form-input" id="account-confirm-password" type="password" maxlength="72" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="再次输入新密码"></div></label></div></details>
+      <div class="settings-save-bar"><button class="console-button is-primary" id="account-save" type="submit">保存账户设置</button></div>
+    </form></section>
+    <section class="console-panel settings-panel settings-account-session"><div><h2>此设备的登录状态</h2><p>退出后需要重新输入管理员凭据。</p></div><button class="console-button is-danger account-logout-button" id="account-logout" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3M15 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/></svg><span>退出登录</span></button></section>
+  </div>`;
   document.getElementById('account-settings-form').addEventListener('submit', async event => {
     event.preventDefault();
     const username = document.getElementById('account-username').value.trim();

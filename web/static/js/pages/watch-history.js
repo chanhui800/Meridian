@@ -7,6 +7,8 @@ let watchHistoryRefreshTimer = 0;
 let watchHistoryKeydownHandler = null;
 let watchHistoryDetailItemID = '';
 let watchHistoryDetailSource = 'history';
+let watchHistoryDetailPreviousFocus = null;
+let watchHistoryImagePreviousFocus = null;
 let watchHistorySitesCache = [];
 let watchHistoryRenderedItemsSignature = '';
 let watchHistoryRenderedLiveSignature = '';
@@ -205,27 +207,25 @@ function watchHistoryCardHTML(item, index, context = {}) {
   const titleID = `watch-history-title-${source}-${safeIndex}`;
   const identity = watchHistoryIdentityLabel(item);
 
-  return `<article class="watch-history-card${live ? ' is-live' : ''}" role="button" tabindex="0" data-history-index="${safeIndex}" data-history-source="${source}" aria-labelledby="${titleID}" aria-haspopup="dialog">
+  return `<article class="watch-history-card history-record${live ? ' is-live' : ''}" role="button" tabindex="0" data-history-index="${safeIndex}" data-history-source="${source}" aria-labelledby="${titleID}" aria-haspopup="dialog">
     <div class="watch-history-poster">
       ${posterURL ? `<img src="${posterURL}"${imageFallbacks.length ? ` data-watch-history-card-fallbacks="${esc(JSON.stringify(imageFallbacks))}"` : ''} alt="" loading="lazy" decoding="async">` : ''}
       <span class="watch-history-poster-fallback" aria-hidden="true">
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m8 10 3 2-3 2z"/><path d="M15 8h3M15 12h3M15 16h3"/></svg>
       </span>
-      <span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span>
-      ${progress > 0 && elapsedLabel ? `<span class="watch-history-progress-time" aria-hidden="true">${esc(elapsedLabel)}</span>` : ''}
-      ${progress > 0 ? `<div class="watch-history-progress" role="progressbar" aria-label="观看进度 ${progressRounded}%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressRounded}"><span style="width:${progress}%"></span></div>` : ''}
     </div>
     <div class="watch-history-card-body">
       <div class="watch-history-card-heading">
-        <h2 id="${titleID}">${esc(title)}</h2>
+        <h3 id="${titleID}">${esc(title)}</h3>
         ${live ? '<span class="watch-history-live-badge"><i></i>正在观看</span>' : (pending ? '<span class="watch-history-pending">补全中</span>' : '')}
       </div>
       ${secondary ? `<p class="watch-history-secondary">${esc(secondary)}</p>` : ''}
-      <p class="watch-history-site"><span>${esc(siteName)}</span>${Number.isInteger(playCount) && playCount > 1 ? `<b>播放 ${playCount} 次</b>` : ''}</p>
+      <p class="watch-history-site"><span>${esc(siteName)}</span></p>
       ${identity ? `<p class="watch-history-identity">${esc(identity)}</p>` : ''}
-      <time class="watch-history-time" ${isoTime ? `datetime="${isoTime}"` : ''}>${live ? `同步于 ${esc(timeText)}` : esc(timeText)}</time>
+      ${progress > 0 ? `<div class="history-progress-line"><div class="watch-history-progress" role="progressbar" aria-label="观看进度 ${progressRounded}%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressRounded}"><span style="width:${progress}%"></span></div><span>${progressRounded}%</span>${elapsedLabel ? `<span class="watch-history-progress-time">${esc(elapsedLabel)}</span>` : ''}</div>` : ''}
     </div>
-    <button class="watch-history-card-delete" type="button" hidden aria-label="删除${esc(title)}">删除</button>
+    <div class="history-record-meta"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><time class="watch-history-time" ${isoTime ? `datetime="${isoTime}"` : ''}>${live ? `同步于 ${esc(timeText)}` : esc(timeText)}</time>${Number.isInteger(playCount) && playCount > 1 ? `<span class="history-play-count">播放 ${playCount} 次</span>` : ''}</div>
+    <button class="watch-history-card-delete history-delete-button" type="button" aria-label="删除${esc(title)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5"/></svg></button>
   </article>`;
 }
 
@@ -331,8 +331,8 @@ function watchHistoryDetailsHTML(item) {
     : posterURL
       ? `<div class="watch-history-detail-stills watch-history-detail-stills-fallback"><button type="button" class="watch-history-detail-still" data-watch-history-image="${esc(posterURL)}" data-watch-history-image-alt="海报" aria-label="放大查看海报"><img src="${esc(posterURL)}" alt="海报" loading="lazy" decoding="async"></button></div>`
       : '<p class="watch-history-detail-muted">暂无剧照或海报，等待 TMDB 资料补全。</p>';
-  return `<div class="watch-history-detail-shell">
-    ${backgroundURLs.length ? `<div class="watch-history-detail-background" data-watch-history-image="${esc(backgroundURLs[0])}" data-watch-history-image-alt="背景剧照" role="button" tabindex="0" aria-label="放大查看背景剧照"><img src="${esc(backgroundURLs[0])}" data-watch-history-background-fallbacks="${esc(JSON.stringify(backgroundURLs.slice(1)))}" alt=""></div>` : ''}
+  return `<div class="watch-history-detail-shell history-detail-shell${backgroundURLs.length ? ' has-art' : ''}">
+    ${backgroundURLs.length ? `<div class="watch-history-detail-background history-detail-art" data-watch-history-image="${esc(backgroundURLs[0])}" data-watch-history-image-alt="背景剧照" role="button" tabindex="0" aria-label="放大查看背景剧照"><img src="${esc(backgroundURLs[0])}" data-watch-history-background-fallbacks="${esc(JSON.stringify(backgroundURLs.slice(1)))}" alt=""><span>查看大图</span></div>` : ''}
     <div class="watch-history-detail-layout">
       <div class="watch-history-detail-main">
       <div class="watch-history-detail-heading"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><h2 id="watch-history-detail-title">${esc(title)}</h2></div>
@@ -357,6 +357,7 @@ function watchHistoryOpenDetails(index, source = 'history') {
   const normalizedSource = source === 'live' ? 'live' : 'history';
   const item = watchHistoryItemsForSource(normalizedSource)[Number(index)];
   if (!modal || !content || !item) return;
+  watchHistoryDetailPreviousFocus = document.activeElement;
   watchHistoryCloseImageViewer();
   watchHistoryDetailItemID = String(item && item.id || '');
   watchHistoryDetailSource = normalizedSource;
@@ -371,17 +372,23 @@ function watchHistoryOpenDetails(index, source = 'history') {
 function watchHistoryCloseDetails() {
   const modal = document.getElementById('watch-history-detail-modal');
   if (!modal) return;
+  const wasOpen = !modal.hidden;
   watchHistoryCloseImageViewer();
   modal.hidden = true;
   document.body.classList.remove('watch-history-dialog-open');
   watchHistoryDetailItemID = '';
   watchHistoryDetailSource = 'history';
+  if (wasOpen && typeof Router !== 'undefined' && Router.current === 'watch-history' && watchHistoryDetailPreviousFocus?.isConnected) {
+    watchHistoryDetailPreviousFocus.focus({ preventScroll: true });
+  }
+  watchHistoryDetailPreviousFocus = null;
 }
 
 function watchHistoryOpenImageViewer(source, alt) {
   const modal = document.getElementById('watch-history-image-modal');
   const image = document.getElementById('watch-history-image-viewer-image');
   if (!modal || !image || !String(source || '').trim()) return;
+  watchHistoryImagePreviousFocus = document.activeElement;
   image.src = String(source);
   image.alt = String(alt || '放大图片');
   modal.hidden = false;
@@ -400,7 +407,30 @@ function watchHistoryCloseImageViewer() {
     image.removeAttribute('src');
     image.alt = '';
   }
+  if (typeof Router !== 'undefined' && Router.current === 'watch-history' && watchHistoryImagePreviousFocus?.isConnected) {
+    watchHistoryImagePreviousFocus.focus({ preventScroll: true });
+  }
+  watchHistoryImagePreviousFocus = null;
   return true;
+}
+
+function watchHistoryTrapDialogFocus(event) {
+  if (event.key !== 'Tab') return;
+  const imageModal = document.getElementById('watch-history-image-modal');
+  const detailModal = document.getElementById('watch-history-detail-modal');
+  const modal = imageModal && !imageModal.hidden ? imageModal : detailModal && !detailModal.hidden ? detailModal : null;
+  const dialog = modal?.querySelector('[role="dialog"]');
+  if (!dialog) return;
+  const controls = Array.from(dialog.querySelectorAll('button:not([disabled]), a[href], [tabindex="0"]'))
+    .filter(element => !element.hidden && element.offsetParent !== null);
+  const first = controls[0], last = controls.at(-1);
+  if (!first) { event.preventDefault(); dialog.focus(); return; }
+  const outside = !dialog.contains(document.activeElement);
+  if (event.shiftKey && (document.activeElement === first || outside)) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || outside)) {
+    event.preventDefault(); first.focus();
+  }
 }
 
 function watchHistoryRefreshOpenDetails() {
@@ -463,7 +493,7 @@ function watchHistoryShowDeleteAction(card) {
     if (other !== card) {
       other.classList.remove('is-long-pressed');
       const button = other.querySelector('.watch-history-card-delete');
-      if (button) button.hidden = true;
+      if (button) button.hidden = false;
     }
   });
   card.classList.add('is-long-pressed');
@@ -528,7 +558,9 @@ function watchHistoryBindCards(grid) {
         // details opener above. A 正在观看 card carries an index into liveItems,
         // so indexing watchHistoryState.items here deleted an unrelated history
         // row (or silently did nothing when the index was out of range).
-        watchHistoryDeleteItem(watchHistoryItemsForSource(card.dataset.historySource)[index]);
+        const item = watchHistoryItemsForSource(card.dataset.historySource)[index];
+        if (!item || !confirm(`确认删除“${String(item.title || item.name || '未知媒体')}”的这条观看记录？`)) return;
+        watchHistoryDeleteItem(item);
       });
     }
     card.addEventListener('click', event => {
@@ -539,13 +571,14 @@ function watchHistoryBindCards(grid) {
       }
       if (card.classList.contains('is-long-pressed')) {
         card.classList.remove('is-long-pressed');
-        if (deleteButton) deleteButton.hidden = true;
+        if (deleteButton) deleteButton.hidden = false;
         event.preventDefault();
         return;
       }
       open();
     });
     card.addEventListener('keydown', event => {
+      if (event.target?.closest?.('.watch-history-card-delete')) return;
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
         open();
@@ -917,6 +950,8 @@ function stopWatchHistoryRefresh() {
   watchHistoryRenderedLiveSignature = '';
   watchHistoryCancelLongPress();
   watchHistoryLongPressTriggered = false;
+  watchHistoryDetailPreviousFocus = null;
+  watchHistoryImagePreviousFocus = null;
   watchHistoryCloseDetails();
   watchHistoryCloseImageViewer();
   if (watchHistoryKeydownHandler && typeof document !== 'undefined' && document.removeEventListener) {
@@ -940,47 +975,36 @@ function renderWatchHistory() {
   watchHistoryState.liveLoadError = '';
   watchHistoryRenderedItemsSignature = '';
   watchHistoryRenderedLiveSignature = '';
-  page.innerHTML = `<div class="watch-history-page">
-    <header class="watch-history-hero fade-up">
-      <div><p class="watch-history-eyebrow">PLAYBACK ARCHIVE</p><h1 class="section-title">观看历史</h1><p class="section-sub">把正在发生的播放与已看内容放在同一个清爽的观看空间。</p></div>
-      <div class="watch-history-hero-signal" aria-label="自动刷新中"><span></span><b>自动刷新</b><small>${WATCH_HISTORY_REFRESH_INTERVAL_MS / 1000} 秒</small></div>
+  page.innerHTML = `<div class="console-page history-console watch-history-page">
+    <header class="console-heading">
+      <div><p class="console-eyebrow">Meridian / playback</p><h1>观看历史</h1><p class="console-lead">查看当前播放、观看进度与已经保存的记录。</p></div>
+      <div class="console-heading-actions"><span class="console-status is-online">${WATCH_HISTORY_REFRESH_INTERVAL_MS / 1000} 秒自动刷新</span><button type="button" class="console-button" id="watch-history-refresh">刷新</button></div>
     </header>
-    <section class="watch-history-toolbar fade-up" aria-label="观看历史筛选">
-      <div class="watch-history-filters">
+    <div class="watch-history-notice history-notice" id="watch-history-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+    <section class="console-panel history-live-panel" id="watch-history-live-section" aria-labelledby="watch-history-live-title" hidden>
+      <header class="console-panel-heading"><div><h2 id="watch-history-live-title">正在观看 <b class="history-count" id="watch-history-live-count">0</b></h2><p id="watch-history-live-description">正在读取播放会话…</p></div><span class="console-status is-online">正在同步</span></header>
+      <div class="watch-history-live-grid history-record-list" id="watch-history-live-grid" aria-label="正在观看列表"></div>
+    </section>
+    <section class="console-panel history-library" aria-labelledby="watch-history-library-title">
+      <header class="console-panel-heading"><div><h2 id="watch-history-library-title">观看记录</h2><p id="watch-history-status" role="status" aria-live="polite">正在读取观看历史…</p></div><button type="button" class="console-button history-clear-button" id="watch-history-clear">清空记录</button></header>
+      <div class="history-filter-toolbar watch-history-toolbar" aria-label="观看历史筛选"><div class="watch-history-filters">
         <label><span>站点</span><select class="form-select" id="watch-history-site">${watchHistorySiteOptionsHTML()}</select></label>
-        <label><span>媒体类型</span><select class="form-select" id="watch-history-type">
-          <option value="all">全部类型</option><option value="movie">电影</option><option value="episode">剧集</option><option value="series">剧集合集</option>
-        </select></label>
-        <label><span>时间范围</span><select class="form-select" id="watch-history-range">
-          <option value="all">全部时间</option><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option>
-        </select></label>
-      </div>
-      <div class="watch-history-toolbar-actions">
-        <button type="button" class="request-log-action danger" id="watch-history-clear">清空记录</button>
-        <button type="button" class="request-log-action" id="watch-history-refresh">刷新</button>
-      </div>
-      <p class="watch-history-status" id="watch-history-status" role="status" aria-live="polite">正在读取观看历史…</p>
+        <label><span>媒体类型</span><select class="form-select" id="watch-history-type"><option value="all">全部类型</option><option value="movie">电影</option><option value="episode">剧集</option><option value="series">剧集合集</option></select></label>
+        <label><span>时间</span><select class="form-select" id="watch-history-range"><option value="all">全部时间</option><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select></label>
+      </div></div>
+      <div class="watch-history-grid history-record-list" id="watch-history-grid" aria-label="观看历史列表" aria-busy="true"></div>
+      <div class="watch-history-more-wrap"><button type="button" class="console-button" id="watch-history-more" hidden>加载更多</button></div>
     </section>
-    <div class="watch-history-notice" id="watch-history-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
-    <section class="watch-history-live-section fade-up" id="watch-history-live-section" aria-labelledby="watch-history-live-title" hidden>
-      <header class="watch-history-section-heading"><div><p class="watch-history-eyebrow">LIVE NOW</p><h2 id="watch-history-live-title">正在观看 <b id="watch-history-live-count">0</b></h2><p id="watch-history-live-description">正在读取播放会话…</p></div><span class="watch-history-live-mark" aria-hidden="true"><i></i>LIVE</span></header>
-      <div class="watch-history-grid watch-history-live-grid" id="watch-history-live-grid" aria-label="正在观看列表"></div>
-    </section>
-    <section class="watch-history-library fade-up" aria-labelledby="watch-history-library-title"><header class="watch-history-section-heading"><div><p class="watch-history-eyebrow">YOUR LIBRARY</p><h2 id="watch-history-library-title">观看记录</h2></div></header><div class="watch-history-grid" id="watch-history-grid" aria-label="观看历史列表" aria-busy="true"></div></section>
-    <div class="watch-history-more-wrap"><button type="button" class="btn-ghost" id="watch-history-more" hidden>加载更多</button></div>
     <div class="watch-history-detail-modal" id="watch-history-detail-modal" hidden>
       <div class="watch-history-detail-backdrop" data-watch-history-close></div>
       <div class="watch-history-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="watch-history-detail-title" tabindex="-1">
-        <button type="button" class="watch-history-detail-close" data-watch-history-close aria-label="关闭详情">×</button>
-        <div id="watch-history-detail-content"></div>
+        <button type="button" class="watch-history-detail-close" data-watch-history-close aria-label="关闭详情">×</button><div id="watch-history-detail-content"></div>
       </div>
     </div>
     <div class="watch-history-image-modal" id="watch-history-image-modal" hidden>
       <div class="watch-history-image-backdrop" data-watch-history-image-close></div>
       <div class="watch-history-image-dialog" role="dialog" aria-modal="true" aria-labelledby="watch-history-image-viewer-title" tabindex="-1">
-        <button type="button" class="watch-history-image-close" data-watch-history-image-close aria-label="关闭图片预览">×</button>
-        <h2 id="watch-history-image-viewer-title" class="sr-only">图片预览</h2>
-        <img id="watch-history-image-viewer-image" alt="" decoding="async">
+        <button type="button" class="watch-history-image-close" data-watch-history-image-close aria-label="关闭图片预览">×</button><h2 id="watch-history-image-viewer-title" class="sr-only">图片预览</h2><img id="watch-history-image-viewer-image" alt="" decoding="async">
       </div>
     </div>
     <footer class="watch-history-attribution">This product uses the TMDB API but is not endorsed or certified by TMDB. <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">了解 TMDB</a></footer>
@@ -1015,6 +1039,7 @@ function renderWatchHistory() {
   });
   watchHistoryKeydownHandler = event => {
     if (event.key === 'Escape' && !watchHistoryCloseImageViewer()) watchHistoryCloseDetails();
+    watchHistoryTrapDialogFocus(event);
   };
   if (typeof document.addEventListener === 'function') document.addEventListener('keydown', watchHistoryKeydownHandler);
   loadWatchHistory(true);
