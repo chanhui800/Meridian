@@ -93,12 +93,16 @@ type dashboardTrendsResponse struct {
 	// Keep this field in every response, including an empty object. The
 	// dashboard uses its presence to distinguish a request-time as_of_ms
 	// fallback from a durable live baseline when merging the client tail.
-	LiveBaselines  map[int64]dashboardTrendBaseline `json:"live_baselines"`
-	BucketSeconds  int64                            `json:"bucket_seconds"`
-	Points         []dashboardTrendPoint            `json:"points"`
-	SiteSeries     []dashboardTrendSite             `json:"site_series"`
-	RealtimePoints []dashboardTrendPoint            `json:"realtime_points"`
+	LiveBaselines    map[int64]dashboardTrendBaseline `json:"live_baselines"`
+	BucketSeconds    int64                            `json:"bucket_seconds"`
+	Points           []dashboardTrendPoint            `json:"points"`
+	SiteSeries       []dashboardTrendSite             `json:"site_series"`
+	RealtimePoints   []dashboardTrendPoint            `json:"realtime_points"`
+	RealtimeEpoch    string                           `json:"realtime_epoch,omitempty"`
+	RealtimeRevision uint64                           `json:"realtime_revision,omitempty"`
 }
+
+var errDashboardTrendPolicyChanged = errors.New("traffic billing policy changed during dashboard sampling")
 
 // dashboardTrendSite carries the same time buckets as the aggregate chart,
 // allowing the hover card to explain which sites contributed to a point when
@@ -395,8 +399,25 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 }
 
 func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName string, customWindow ...time.Time) (*dashboardTrendsResponse, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		response, err := pm.dashboardTrendsWithCurrentPolicy(siteID, rangeName, customWindow...)
+		if !errors.Is(err, errDashboardTrendPolicyChanged) {
+			return response, err
+		}
+	}
+	return nil, errDashboardTrendPolicyChanged
+}
+
+func (pm *ProxyManager) dashboardTrendsWithCurrentPolicy(siteID *int64, rangeName string, customWindow ...time.Time) (*dashboardTrendsResponse, error) {
 	settings := pm.database.currentSystemSettings()
 	billingMode := settings.TrafficBillingMode
+	window := pm.dashboardRealtimeWindowSnapshot(siteID)
+	if window.BillingMode != "" && window.BillingMode != trafficBillingModeLabel(billingMode) {
+		// A policy edit can arrive between two sampler ticks. Bring the
+		// authoritative window into that policy before combining it with
+		// historical data rather than relabeling the old points.
+		pm.captureDashboardRealtimeSample()
+	}
 	trendLocation := timezoneLocation(settings.ScheduleTimezone)
 	var customStart, customEnd time.Time
 	if len(customWindow) > 0 {
@@ -420,7 +441,7 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 		cacheTTL = 3 * time.Second
 	}
 	if cached := pm.dashboardTrendCached(cacheKey, now); cached != nil {
-		return cached, nil
+		return pm.dashboardTrendWithRealtimeWindow(cached, siteID)
 	}
 	var pendingBySite map[int64]dashboardPendingTraffic
 	var localBaselines map[int64]dashboardTrendBaseline
@@ -515,10 +536,27 @@ func (pm *ProxyManager) dashboardTrendsUncoalesced(siteID *int64, rangeName stri
 		BucketSeconds:  int64(bucket / time.Second),
 		Points:         points,
 		SiteSeries:     siteSeries,
-		RealtimePoints: pm.dashboardRealtimeTrendPoints(siteID),
+	}
+	response, err = pm.dashboardTrendWithRealtimeWindow(response, siteID)
+	if err != nil {
+		return nil, err
 	}
 	pm.cacheDashboardTrend(cacheKey, response, now.Add(cacheTTL))
 	return response, nil
+}
+
+func (pm *ProxyManager) dashboardTrendWithRealtimeWindow(response *dashboardTrendsResponse, siteID *int64) (*dashboardTrendsResponse, error) {
+	window := pm.dashboardRealtimeWindowSnapshot(siteID)
+	currentBillingMode := trafficBillingModeLabel(pm.database.currentSystemSettings().TrafficBillingMode)
+	if currentBillingMode != response.BillingMode || (window.BillingMode != "" && window.BillingMode != response.BillingMode) {
+		return nil, errDashboardTrendPolicyChanged
+	}
+	// Cache entries are immutable. Refresh only the realtime portion on a copy
+	// and obtain its epoch, revision and points from the same locked snapshot.
+	current := *response
+	current.RealtimePoints = window.Points
+	current.RealtimeEpoch, current.RealtimeRevision = window.Epoch, window.Revision
+	return &current, nil
 }
 
 func parseDashboardTrendCustomTime(value string, location *time.Location) (time.Time, error) {

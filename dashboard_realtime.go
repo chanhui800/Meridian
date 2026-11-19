@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 )
+
+var dashboardRealtimeEpochSequence atomic.Uint64
 
 // The Controller owns one fixed-cadence realtime sequence. Browsers consume
 // this sequence through SSE and the dashboard trend endpoint instead of
@@ -18,20 +22,25 @@ const (
 )
 
 type dashboardRealtimeCounter struct {
-	BytesIn            int64
-	BytesOut           int64
-	Requests           int64
-	SampledAtMS        int64
-	AgentSampledAtMS   int64
-	AgentReceivedAtMS  int64
-	AgentRuntime       bool
-	AgentDownloadBPS   float64
-	AgentUploadBPS     float64
-	AgentRateValid     bool
-	LastDownloadBPS    float64
-	LastUploadBPS      float64
-	LastRateValid      bool
-	LastAgentAdvanceMS int64
+	BytesIn               int64
+	BytesOut              int64
+	Requests              int64
+	SampledAtMS           int64
+	AgentSampledAtMS      int64
+	AgentReceivedAtMS     int64
+	AgentRateReceivedAtMS int64
+	AgentCounterDomain    uint64
+	AgentNodeID           int64
+	AgentReportSessionID  string
+	AgentCounterEpoch     uint64
+	AgentRuntime          bool
+	AgentDownloadBPS      float64
+	AgentUploadBPS        float64
+	AgentRateValid        bool
+	LastDownloadBPS       float64
+	LastUploadBPS         float64
+	LastRateValid         bool
+	LastAgentAdvanceMS    int64
 }
 
 // startDashboardRealtimeSampler starts one process-wide sampler. It is
@@ -77,27 +86,43 @@ func (pm *ProxyManager) captureDashboardRealtimeSample() {
 	if pm.dashboardRealtimePrev == nil {
 		pm.dashboardRealtimePrev = make(map[int64]dashboardRealtimeCounter)
 	}
+	if pm.dashboardRealtimeEpoch == "" {
+		pm.dashboardRealtimeEpoch = fmt.Sprintf("%x-%x", startTime.UnixNano(), dashboardRealtimeEpochSequence.Add(1))
+	}
 	if pm.dashboardRealtimeBillingMode != "" && pm.dashboardRealtimeBillingMode != snapshot.BillingMode {
 		// Billing policy changes make old traffic_bytes incomparable with new
 		// samples. Start a fresh visible window while keeping historical logs.
 		pm.dashboardRealtimePoints = nil
 		pm.dashboardRealtimePrev = make(map[int64]dashboardRealtimeCounter)
+		pm.dashboardRealtimeEpoch = fmt.Sprintf("%x-%x", startTime.UnixNano(), dashboardRealtimeEpochSequence.Add(1))
+		pm.dashboardRealtimeRevision = 0
+		pm.trendCacheMu.Lock()
+		pm.trendCache = nil
+		pm.trendCacheMu.Unlock()
 	}
 	pm.dashboardRealtimeBillingMode = snapshot.BillingMode
 	point, next := dashboardRealtimePointFromSnapshot(snapshot, pm.dashboardRealtimePrev, sampledAtMS)
-	backfillDashboardRealtimeAgentTraffic(pm.dashboardRealtimePoints, &point, snapshot.BillingMode, pm.dashboardRealtimePrev, next)
+	updates := backfillDashboardRealtimeAgentTraffic(pm.dashboardRealtimePoints, &point, snapshot.BillingMode, pm.dashboardRealtimePrev, next)
+	baseRevision := pm.dashboardRealtimeRevision
+	pm.dashboardRealtimeRevision++
 	pm.dashboardRealtimePrev = next
 	pm.dashboardRealtimeLastMS = sampledAtMS
 	pm.dashboardRealtimePoints = appendDashboardRealtimePoint(pm.dashboardRealtimePoints, point)
 	latest := cloneDashboardTrendPoint(point)
-	pm.dashboardRealtimeMu.Unlock()
 
 	// Publish one immutable snapshot after the trend point has been appended so
-	// SSE, dashboard and trend consumers observe the same sample sequence.
+	// SSE, dashboard and trend consumers observe the same revision. Keep the
+	// realtime lock until publication so a concurrent capture cannot publish an
+	// older snapshot after the newer one.
 	snapshot.RealtimeTrend = &latest
+	snapshot.RealtimeEpoch = pm.dashboardRealtimeEpoch
+	snapshot.RealtimeBaseRevision = baseRevision
+	snapshot.RealtimeRevision = pm.dashboardRealtimeRevision
+	snapshot.RealtimeUpdates = append(updates, cloneDashboardTrendPoint(point))
 	pm.dashboardSnapshotMu.Lock()
 	pm.dashboardSnapshot = cloneTrafficSnapshot(snapshot)
 	pm.dashboardSnapshotMu.Unlock()
+	pm.dashboardRealtimeMu.Unlock()
 }
 
 func cloneTrafficSnapshot(snapshot *TrafficSnapshot) *TrafficSnapshot {
@@ -112,6 +137,7 @@ func cloneTrafficSnapshot(snapshot *TrafficSnapshot) *TrafficSnapshot {
 		trend := cloneDashboardTrendPoint(*snapshot.RealtimeTrend)
 		cloned.RealtimeTrend = &trend
 	}
+	cloned.RealtimeUpdates = cloneDashboardTrendPoints(snapshot.RealtimeUpdates)
 	if snapshot.RealtimeTelemetry != nil {
 		status := *snapshot.RealtimeTelemetry
 		cloned.RealtimeTelemetry = &status
@@ -143,20 +169,41 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			continue
 		}
 		current := dashboardRealtimeCounter{
-			BytesIn:           maxNonNegativeInt64(site.CumulativeBytesIn),
-			BytesOut:          maxNonNegativeInt64(site.CumulativeBytesOut),
-			Requests:          maxNonNegativeInt64(site.Requests),
-			SampledAtMS:       sampledAtMS,
-			AgentSampledAtMS:  site.AgentSampledAtMS,
-			AgentReceivedAtMS: site.AgentReceivedAtMS,
-			AgentRuntime:      site.AgentRuntime,
-			AgentDownloadBPS:  site.AgentDownloadBPS,
-			AgentUploadBPS:    site.AgentUploadBPS,
-			AgentRateValid:    site.AgentRateValid,
+			BytesIn:               maxNonNegativeInt64(site.CumulativeBytesIn),
+			BytesOut:              maxNonNegativeInt64(site.CumulativeBytesOut),
+			Requests:              maxNonNegativeInt64(site.Requests),
+			SampledAtMS:           sampledAtMS,
+			AgentSampledAtMS:      site.AgentSampledAtMS,
+			AgentReceivedAtMS:     site.AgentReceivedAtMS,
+			AgentRateReceivedAtMS: site.AgentRateReceivedAtMS,
+			AgentCounterDomain:    site.AgentCounterDomain,
+			AgentNodeID:           site.AgentNodeID,
+			AgentReportSessionID:  site.AgentReportSessionID,
+			AgentCounterEpoch:     site.AgentCounterEpoch,
+			AgentRuntime:          site.AgentRuntime,
+			AgentDownloadBPS:      site.AgentDownloadBPS,
+			AgentUploadBPS:        site.AgentUploadBPS,
+			AgentRateValid:        site.AgentRateValid,
 		}
 		prior, exists := previous[site.ID]
+		if exists && current.AgentRuntime && prior.AgentRuntime && current.AgentNodeID == prior.AgentNodeID &&
+			current.AgentCounterDomain == 0 && prior.AgentCounterDomain > 0 {
+			// A claimed session which has not reported yet, or an expired live
+			// cache, can expose an older durable counter. It is unavailable data,
+			// not evidence of a runtime reset. Retain the difference watermark
+			// until an authoritative counter sample arrives.
+			current.BytesIn, current.BytesOut, current.Requests = prior.BytesIn, prior.BytesOut, prior.Requests
+			current.AgentCounterDomain = prior.AgentCounterDomain
+			current.AgentReportSessionID, current.AgentCounterEpoch = prior.AgentReportSessionID, prior.AgentCounterEpoch
+			current.AgentSampledAtMS = prior.AgentSampledAtMS
+		}
+		sourceChanged := exists && (current.AgentRuntime != prior.AgentRuntime ||
+			current.AgentRuntime && current.AgentNodeID != prior.AgentNodeID)
+		counterDomainChanged := !sourceChanged && exists && current.AgentRuntime && current.AgentCounterDomain > 0 &&
+			prior.AgentCounterDomain > 0 && current.AgentCounterDomain != prior.AgentCounterDomain &&
+			!dashboardAgentCounterIdentityMatches(prior, current)
 		if current.AgentRuntime {
-			if !exists || current.AgentSampledAtMS > prior.AgentSampledAtMS {
+			if !exists || sourceChanged || counterDomainChanged || current.AgentSampledAtMS > prior.AgentSampledAtMS {
 				current.LastAgentAdvanceMS = sampledAtMS
 			} else {
 				current.LastAgentAdvanceMS = prior.LastAgentAdvanceMS
@@ -168,6 +215,15 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			deltaIn = counterDelta(current.BytesIn, prior.BytesIn)
 			deltaOut = counterDelta(current.BytesOut, prior.BytesOut)
 			deltaRequests = counterDelta(current.Requests, prior.Requests)
+			if counterDomainChanged {
+				deltaIn, deltaOut, deltaRequests = current.BytesIn, current.BytesOut, current.Requests
+			}
+			if sourceChanged {
+				// A replacement node may already have large runtime counters.
+				// They establish its baseline rather than becoming this window's
+				// traffic. A reset on the same node is handled separately above.
+				deltaIn, deltaOut, deltaRequests = 0, 0, 0
+			}
 			if current.AgentRuntime && current.AgentSampledAtMS > prior.AgentSampledAtMS && prior.AgentSampledAtMS > 0 {
 				if elapsed := time.Duration(current.AgentSampledAtMS-prior.AgentSampledAtMS) * time.Millisecond; elapsed > 0 {
 					seconds = elapsed.Seconds()
@@ -186,7 +242,13 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 			DownloadBPS: float64(deltaOut) / seconds,
 			UploadBPS:   float64(deltaIn) / seconds,
 		}
-		remoteFresh := current.AgentReceivedAtMS > 0 && sampledAtMS >= current.AgentReceivedAtMS && sampledAtMS-current.AgentReceivedAtMS <= agentRealtimeRateHoldWindow.Milliseconds()
+		rateReceivedAtMS := current.AgentRateReceivedAtMS
+		if rateReceivedAtMS <= 0 && current.AgentCounterDomain == 0 {
+			// Compatibility for snapshots from older Agents/embedders which
+			// did not separate gauge freshness from counter receive time.
+			rateReceivedAtMS = current.AgentReceivedAtMS
+		}
+		remoteFresh := rateReceivedAtMS > 0 && sampledAtMS >= rateReceivedAtMS && sampledAtMS-rateReceivedAtMS <= agentRealtimeRateHoldWindow.Milliseconds()
 		if current.AgentRuntime && remoteFresh && current.AgentRateValid {
 			sitePoint.DownloadBPS = current.AgentDownloadBPS
 			sitePoint.UploadBPS = current.AgentUploadBPS
@@ -225,42 +287,74 @@ func dashboardRealtimePointFromSnapshot(snapshot *TrafficSnapshot, previous map[
 	return point, next
 }
 
+func dashboardAgentCounterIdentityMatches(previous, current dashboardRealtimeCounter) bool {
+	if previous.AgentNodeID != current.AgentNodeID || previous.AgentReportSessionID == "" ||
+		previous.AgentReportSessionID != current.AgentReportSessionID || previous.AgentCounterEpoch != current.AgentCounterEpoch {
+		return false
+	}
+	if current.AgentCounterEpoch > 0 {
+		return true
+	}
+	// Legacy samples cannot name a site epoch. A re-created cache with
+	// monotonic counters in the same session retains its existing baseline.
+	return current.BytesIn >= previous.BytesIn && current.BytesOut >= previous.BytesOut && current.Requests >= previous.Requests
+}
+
 // backfillDashboardRealtimeAgentTraffic redistributes a short Agent reporting
 // gap over the controller buckets it actually covered. The cumulative counter
 // remains the source of truth, and integer remainders are retained exactly, so
 // the visible bucket sum always equals the accepted counter delta.
-func backfillDashboardRealtimeAgentTraffic(points []dashboardTrendPoint, current *dashboardTrendPoint, billingMode string, previous, next map[int64]dashboardRealtimeCounter) {
+func backfillDashboardRealtimeAgentTraffic(points []dashboardTrendPoint, current *dashboardTrendPoint, billingMode string, previous, next map[int64]dashboardRealtimeCounter) []dashboardTrendPoint {
 	if current == nil || len(points) == 0 {
-		return
+		return nil
 	}
+	changed := make(map[int]bool)
 	for siteID, nextCounter := range next {
 		prior, ok := previous[siteID]
-		if !ok || !nextCounter.AgentRuntime || nextCounter.AgentSampledAtMS <= prior.AgentSampledAtMS || prior.LastAgentAdvanceMS <= 0 {
+		if !ok || !prior.AgentRuntime || !nextCounter.AgentRuntime || prior.AgentNodeID != nextCounter.AgentNodeID ||
+			nextCounter.AgentSampledAtMS <= prior.AgentSampledAtMS || prior.LastAgentAdvanceMS <= 0 ||
+			current.TimestampMS-prior.LastAgentAdvanceMS > int64(agentRealtimeBackfillMaxPoints)*dashboardRealtimeServerInterval.Milliseconds() ||
+			(prior.AgentCounterDomain > 0 && nextCounter.AgentCounterDomain > 0 && prior.AgentCounterDomain != nextCounter.AgentCounterDomain &&
+				!dashboardAgentCounterIdentityMatches(prior, nextCounter)) {
 			continue
 		}
 		currentSite, ok := current.SiteContributions[siteID]
 		if !ok || (currentSite.BytesIn == 0 && currentSite.BytesOut == 0) {
 			continue
 		}
-		targets := make([]*dashboardTrendPoint, 0, agentRealtimeBackfillMaxPoints)
+		type targetPoint struct {
+			point *dashboardTrendPoint
+			index int
+		}
+		targets := make([]targetPoint, 0, agentRealtimeBackfillMaxPoints)
 		for index := range points {
 			if points[index].TimestampMS <= prior.LastAgentAdvanceMS {
 				continue
 			}
-			if _, exists := points[index].SiteContributions[siteID]; exists {
-				targets = append(targets, &points[index])
+			if contribution, exists := points[index].SiteContributions[siteID]; exists && contribution.BytesIn == 0 && contribution.BytesOut == 0 {
+				targets = append(targets, targetPoint{point: &points[index], index: index})
 			}
 		}
-		targets = append(targets, current)
+		targets = append(targets, targetPoint{point: current, index: -1})
 		if len(targets) <= 1 || len(targets) > agentRealtimeBackfillMaxPoints {
 			continue
 		}
 		for index, target := range targets {
 			bytesIn := distributedCounterPart(currentSite.BytesIn, len(targets), index)
 			bytesOut := distributedCounterPart(currentSite.BytesOut, len(targets), index)
-			setDashboardRealtimeSiteTraffic(target, siteID, billingMode, bytesIn, bytesOut)
+			setDashboardRealtimeSiteTraffic(target.point, siteID, billingMode, bytesIn, bytesOut)
+			if target.index >= 0 && (bytesIn > 0 || bytesOut > 0) {
+				changed[target.index] = true
+			}
 		}
 	}
+	updates := make([]dashboardTrendPoint, 0, len(changed))
+	for index := range points {
+		if changed[index] {
+			updates = append(updates, cloneDashboardTrendPoint(points[index]))
+		}
+	}
+	return updates
 }
 
 func distributedCounterPart(total int64, count, index int) int64 {
@@ -355,13 +449,29 @@ func (pm *ProxyManager) dashboardRealtimeTrendLatest() *dashboardTrendPoint {
 }
 
 func (pm *ProxyManager) dashboardRealtimeTrendPoints(siteID *int64) []dashboardTrendPoint {
+	return pm.dashboardRealtimeWindowSnapshot(siteID).Points
+}
+
+type dashboardRealtimeWindow struct {
+	Epoch       string
+	Revision    uint64
+	BillingMode string
+	Points      []dashboardTrendPoint
+}
+
+// Metadata and the complete window are cloned under the same lock. Cached
+// historical responses may reuse their history, but never an older realtime
+// revision or a window calculated under a different billing policy.
+func (pm *ProxyManager) dashboardRealtimeWindowSnapshot(siteID *int64) dashboardRealtimeWindow {
 	if pm == nil {
-		return nil
+		return dashboardRealtimeWindow{}
 	}
 	pm.dashboardRealtimeMu.RLock()
 	defer pm.dashboardRealtimeMu.RUnlock()
+	window := dashboardRealtimeWindow{Epoch: pm.dashboardRealtimeEpoch, Revision: pm.dashboardRealtimeRevision, BillingMode: pm.dashboardRealtimeBillingMode}
 	if siteID == nil {
-		return cloneDashboardTrendPoints(pm.dashboardRealtimePoints)
+		window.Points = cloneDashboardTrendPoints(pm.dashboardRealtimePoints)
+		return window
 	}
 	points := make([]dashboardTrendPoint, 0, len(pm.dashboardRealtimePoints))
 	for _, aggregate := range pm.dashboardRealtimePoints {
@@ -370,7 +480,27 @@ func (pm *ProxyManager) dashboardRealtimeTrendPoints(siteID *int64) []dashboardT
 			points = append(points, cloneDashboardTrendPoint(site))
 		}
 	}
-	return points
+	window.Points = points
+	return window
+}
+
+func (pm *ProxyManager) dashboardRealtimePacketSnapshot() *TrafficSnapshot {
+	if pm == nil {
+		return nil
+	}
+	pm.dashboardSnapshotMu.RLock()
+	defer pm.dashboardSnapshotMu.RUnlock()
+	if pm.dashboardSnapshot == nil {
+		return nil
+	}
+	packet := &TrafficSnapshot{
+		RealtimeTrend:        pm.dashboardSnapshot.RealtimeTrend,
+		RealtimeEpoch:        pm.dashboardSnapshot.RealtimeEpoch,
+		RealtimeRevision:     pm.dashboardSnapshot.RealtimeRevision,
+		RealtimeBaseRevision: pm.dashboardSnapshot.RealtimeBaseRevision,
+		RealtimeUpdates:      pm.dashboardSnapshot.RealtimeUpdates,
+	}
+	return cloneTrafficSnapshot(packet)
 }
 
 func cloneDashboardTrendPoints(points []dashboardTrendPoint) []dashboardTrendPoint {

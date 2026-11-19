@@ -12,6 +12,8 @@ https://<你的主控域名>/api/agent/install.sh
 
 运行中的 Controller 会返回与自身版本绑定的安装器、平台信息、SHA-256 和 Release Manifest。安装器随后从该版本的 GitHub Release 下载对应架构的 Agent，并在替换本机服务前完成校验。
 
+清单请求使用 Controller 的注册或 Agent 令牌；公开的 GitHub Release 下载不携带这些令牌。开发构建没有正式 Release 时，清单会指定 Controller 自身需要认证的二进制接口。认证下载发生跨源重定向时，不转发 Controller 令牌。
+
 ## 一键安装
 
 在“节点调度”页面创建节点，复制一次性显示的命令，在目标 Linux VPS 以 root 执行：
@@ -64,6 +66,10 @@ sudo ss -lntp | grep ':9090'
 
 普通升级只替换经过校验的 Agent 二进制，并保留 `state.json`、节点 GUID 和长期令牌。不要为了升级而删除 `/var/lib/meridian-agent`。
 
+升级下载在独立任务中完成，期间 Agent 继续应用配置并发送完整心跳。网络失败只会使下载重试，不会让节点等待外部下载而停止上报；同一时刻只运行一个更新任务。
+
+下载文件先暂存并校验，目标版本、配置或注册身份变化时会丢弃旧任务。只有目标仍有效时，主循环才提交原子替换并退出，由 systemd 或 OpenRC 拉起新版本。下载失败、校验失败或任务取消会清理暂存文件，并保留当前程序。
+
 只有以下情况需要使用 `--reenroll`：
 
 - 在 Controller 中主动刷新了节点注册脚本；
@@ -103,3 +109,4 @@ sudo rm -rf /opt/meridian-agent /var/lib/meridian-agent /etc/meridian-agent
 - 只从自己的 Controller 获取安装脚本；安装命令中的域名和令牌应使用面板刚生成的值。
 - 不要让不可信用户获得 Controller 管理员账号，否则对方可以创建、删除或刷新节点。
 - `/api/agent/install.sh` 本身是公开脚本，但注册、配置、二进制清单和上报接口都需要有效的 Bearer 令牌。
+- 公开 Release 下载只使用固定版本地址和 SHA-256 校验；Controller 令牌只用于 Controller 的认证接口。

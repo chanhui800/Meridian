@@ -25,6 +25,14 @@ let dashboardRealtimePersistedBillingMode = null;
 // browser only renders/merges those points. The local path remains as a
 // compatibility fallback for older Controllers and unit harnesses.
 let dashboardControllerRealtimeEnabled = false;
+let dashboardRealtimeEpoch = '';
+let dashboardRealtimeRevision = 0;
+let dashboardRealtimeSiteRevisions = new Map();
+let dashboardRealtimeProtocolObserved = false;
+let dashboardRealtimeRetiredEpochs = new Set();
+let dashboardRealtimeNeedsRecovery = false;
+let dashboardRealtimeRecoveryAbortController = null;
+let dashboardRealtimeLastRecoveryMS = 0;
 const dashboardRealtimeStorageKey = 'meridian.dashboard.realtime-trends.v1';
 let dashboardLastSnapshotMS = 0;
 let dashboardLastObservedSiteCount = -1;
@@ -519,6 +527,8 @@ function dashboardNormalizeRealtimePoint(value) {
     requests: numberOrZero(value.requests),
     speed_unavailable: value.speed_unavailable === true,
   };
+  const revision = Number(value.realtime_revision || 0);
+  if (Number.isSafeInteger(revision) && revision > 0) point.realtime_revision = revision;
   // Cumulative counters let the realtime tail start from the exact
   // persisted Agent baseline returned by the Controller. Older localStorage
   // entries may omit them and continue through the legacy timestamp merge.
@@ -531,7 +541,7 @@ function dashboardNormalizeRealtimePoint(value) {
     Object.keys(value.site_contributions).slice(0, 512).forEach(siteID => {
       if (!/^\d+$/.test(siteID)) return;
       const source = value.site_contributions[siteID];
-      const contribution = dashboardNormalizeRealtimePoint({ ...source, timestamp_ms: timestamp });
+      const contribution = dashboardNormalizeRealtimePoint({ ...source, timestamp_ms: timestamp, realtime_revision: point.realtime_revision || source.realtime_revision });
       if (!contribution) return;
       delete contribution.site_contributions;
       contributions[siteID] = contribution;
@@ -569,6 +579,8 @@ function persistDashboardRealtimeSamples() {
       version: 1,
       saved_at_ms: Date.now(),
       billing_mode: dashboardBillingMode || dashboardRealtimePersistedBillingMode || null,
+      realtime_epoch: dashboardRealtimeEpoch || undefined,
+      realtime_revision: dashboardRealtimeRevision || undefined,
       all: dashboardPersistableRealtimeSamples(dashboardRealtimeTrendSamples.get('all') || []),
       sites,
     }));
@@ -613,15 +625,92 @@ function restoreDashboardRealtimeSamples(now = Date.now()) {
   if (all.length) dashboardRealtimeTrendSamples.set('all', all);
   const billingMode = String(payload.billing_mode || '').toLowerCase();
   dashboardRealtimePersistedBillingMode = billingMode === 'outbound' || billingMode === 'bidirectional' ? billingMode : null;
+  const metadata = dashboardRealtimeMetadata(payload);
+  if (metadata) {
+    dashboardRealtimeEpoch = metadata.epoch;
+    dashboardRealtimeRevision = metadata.revision;
+  }
   return all.length > 0 || sites.size > 0;
 }
 
-function dashboardMergeServerRealtimePoints(data) {
-  if (!data || !Object.prototype.hasOwnProperty.call(data, 'realtime_points')) return;
+function dashboardRealtimeMetadata(value) {
+  const epoch = String(value?.realtime_epoch || '').trim();
+  const revision = Number(value?.realtime_revision || 0);
+  if (!epoch || epoch.length > 128 || !Number.isSafeInteger(revision) || revision <= 0) return null;
+  const base = Number(value?.realtime_base_revision || 0);
+  return { epoch, revision, base: Number.isSafeInteger(base) && base >= 0 ? base : 0 };
+}
+
+function dashboardResetRealtimeEpoch(epoch) {
+  if (dashboardRealtimeRecoveryAbortController) {
+    dashboardRealtimeRecoveryAbortController.abort();
+    dashboardRealtimeRecoveryAbortController = null;
+  }
+  dashboardRealtimeLastRecoveryMS = 0;
+  if (dashboardRealtimeEpoch && dashboardRealtimeEpoch !== epoch) {
+    dashboardRealtimeRetiredEpochs.add(dashboardRealtimeEpoch);
+    while (dashboardRealtimeRetiredEpochs.size > 64) {
+      dashboardRealtimeRetiredEpochs.delete(dashboardRealtimeRetiredEpochs.values().next().value);
+    }
+  }
+  dashboardRealtimeEpoch = epoch;
+  dashboardRealtimeRevision = 0;
+  dashboardRealtimeSiteRevisions = new Map();
+  dashboardRealtimeNeedsRecovery = false;
+  dashboardRealtimeTrendSamples = new Map();
+  dashboardRealtimeTrendSiteSamples = new Map();
+  dashboardRealtimeSmoothingCache = new Map();
+  dashboardSpeedSamples = new Map();
+  dashboardLiveSpeeds = new Map();
+  dashboardLatestRatesBySite = new Map();
+  dashboardSites = dashboardSites.map(({ _liveSpeed, ...site }) => site);
+  dashboardLastSnapshotMS = 0;
+  if (dashboardTrendData) {
+    dashboardTrendData = { ...dashboardTrendData, points: [], site_series: [], live_baselines: {} };
+  }
+  clearDashboardRealtimeSamplesStorage();
+}
+
+function dashboardAcceptRealtimeEpoch(metadata, requestedEpoch) {
+  if (dashboardRealtimeRetiredEpochs.has(metadata.epoch)) return false;
+  if (metadata.epoch !== dashboardRealtimeEpoch) {
+    if (requestedEpoch !== undefined && requestedEpoch !== dashboardRealtimeEpoch) return false;
+    dashboardResetRealtimeEpoch(metadata.epoch);
+  }
+  dashboardRealtimeProtocolObserved = true;
+  return true;
+}
+
+function dashboardMergeServerRealtimePoints(data, requestedEpoch, requestedKey) {
+  if (!data || !Object.prototype.hasOwnProperty.call(data, 'realtime_points')) return true;
+  const metadata = dashboardRealtimeMetadata(data);
+  const incomingBillingMode = String(data.billing_mode || '').toLowerCase();
+  const epochChanged = metadata && metadata.epoch !== dashboardRealtimeEpoch;
+  if (metadata && !epochChanged && dashboardBillingMode &&
+      (incomingBillingMode === 'outbound' || incomingBillingMode === 'bidirectional') &&
+      incomingBillingMode !== dashboardBillingMode) return false;
+  if (metadata && !dashboardAcceptRealtimeEpoch(metadata, requestedEpoch)) return false;
+  if (!metadata && dashboardRealtimeProtocolObserved) return false;
+  if (metadata && (incomingBillingMode === 'outbound' || incomingBillingMode === 'bidirectional')) {
+    dashboardBillingMode = incomingBillingMode;
+    dashboardRealtimePersistedBillingMode = incomingBillingMode;
+  }
   dashboardControllerRealtimeEnabled = true;
-  const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
-  const normalized = dashboardNormalizeRealtimeSamples(data.realtime_points, Date.now());
+  const key = String(requestedKey || data.site_id || (dashboardTrendState.siteId === 'all' ? 'all' : dashboardTrendState.siteId));
+  const serverValues = Array.isArray(data.realtime_points) ? data.realtime_points : [];
+  const normalized = dashboardNormalizeRealtimeSamples(
+    metadata ? serverValues.map(point => ({ ...point, realtime_revision: metadata.revision })) : serverValues,
+    Date.now(),
+  );
   const mergeAuthoritative = (existing, serverPoints) => {
+    if (metadata) {
+      const merged = serverPoints.slice();
+      (existing || []).forEach(point => {
+        if (Number(point.realtime_revision || 0) > metadata.revision) upsertDashboardRealtimeSample(merged, point);
+      });
+      pruneDashboardRealtimeSamples(merged);
+      return merged;
+    }
     if (!serverPoints.length) return [];
     const latestServer = Number(serverPoints[serverPoints.length - 1]?.timestamp_ms || 0);
     // Keep only points that could have arrived through the in-flight SSE
@@ -649,10 +738,10 @@ function dashboardMergeServerRealtimePoints(data) {
     const existingSites = dashboardRealtimeTrendSiteSamples;
     dashboardRealtimeTrendSiteSamples = new Map();
     const serverSites = new Map();
-    normalized.forEach(point => {
+    merged.forEach(point => {
       if (!point.site_contributions || typeof point.site_contributions !== 'object') return;
       Object.keys(point.site_contributions).forEach(siteID => {
-        const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms });
+        const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms, realtime_revision: point.realtime_revision });
         if (!contribution) return;
         const samples = serverSites.get(siteID) || [];
         upsertDashboardRealtimeSample(samples, contribution);
@@ -661,13 +750,33 @@ function dashboardMergeServerRealtimePoints(data) {
     });
     serverSites.forEach((serverPoints, siteID) => {
       const mergedSite = mergeAuthoritative(existingSites.get(siteID) || [], serverPoints);
-      if (mergedSite.length) dashboardRealtimeTrendSiteSamples.set(siteID, mergedSite);
+      if (mergedSite.length) {
+        dashboardRealtimeTrendSiteSamples.set(siteID, mergedSite);
+        dashboardRealtimeTrendSamples.set(siteID, mergedSite);
+      }
     });
+  } else {
+    dashboardRealtimeTrendSiteSamples.set(key, merged);
+  }
+  if (metadata) {
+    if (key === 'all') {
+      if (metadata.revision >= dashboardRealtimeRevision) dashboardRealtimeNeedsRecovery = false;
+      dashboardRealtimeRevision = Math.max(dashboardRealtimeRevision, metadata.revision);
+      dashboardRealtimeTrendSiteSamples.forEach((_, siteID) => {
+        dashboardRealtimeSiteRevisions.set(siteID, Math.max(dashboardRealtimeSiteRevisions.get(siteID) || 0, metadata.revision));
+      });
+    } else {
+      // A selected-site HTTP window is only authoritative for that site.
+      // Advancing the aggregate watermark here would discard an SSE packet
+      // at the same revision before its other-site corrections were applied.
+      dashboardRealtimeSiteRevisions.set(key, Math.max(dashboardRealtimeSiteRevisions.get(key) || 0, metadata.revision));
+    }
   }
   persistDashboardRealtimeSamples();
+  return true;
 }
 
-function dashboardAppendServerRealtimeTrendSample(value) {
+function dashboardAppendServerRealtimeTrendSample(value, persist = true) {
   const point = dashboardNormalizeRealtimePoint(value);
   if (!point) return false;
   const all = dashboardRealtimeTrendSamples.get('all') || [];
@@ -676,12 +785,13 @@ function dashboardAppendServerRealtimeTrendSample(value) {
   dashboardRealtimeTrendSamples.set('all', all);
   if (point.site_contributions && typeof point.site_contributions === 'object') {
     Object.keys(point.site_contributions).forEach(siteID => {
-      const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms });
+      const contribution = dashboardNormalizeRealtimePoint({ ...point.site_contributions[siteID], timestamp_ms: point.timestamp_ms, realtime_revision: point.realtime_revision });
       if (!contribution) return;
       const samples = dashboardRealtimeTrendSiteSamples.get(siteID) || [];
       upsertDashboardRealtimeSample(samples, contribution);
       pruneDashboardRealtimeSamples(samples);
       dashboardRealtimeTrendSiteSamples.set(siteID, samples);
+      dashboardRealtimeTrendSamples.set(siteID, samples);
     });
   }
   // When a site is selected, its chart reads the site-keyed map. Keep that
@@ -697,8 +807,51 @@ function dashboardAppendServerRealtimeTrendSample(value) {
       dashboardRealtimeTrendSamples.set(siteID, selected);
     }
   }
-  persistDashboardRealtimeSamples();
+  if (persist) persistDashboardRealtimeSamples();
   return true;
+}
+
+function dashboardApplyRealtimePacket(stats, metadata) {
+  if (metadata.revision <= dashboardRealtimeRevision) {
+    if (dashboardRealtimeNeedsRecovery) dashboardRecoverRealtimeWindow();
+    return;
+  }
+  const previousRevision = dashboardRealtimeRevision;
+  const updates = Array.isArray(stats.realtime_updates) ? stats.realtime_updates : [];
+  updates.forEach(point => dashboardAppendServerRealtimeTrendSample({ ...point, realtime_revision: metadata.revision }, false));
+  if (stats.realtime_trend) {
+    dashboardAppendServerRealtimeTrendSample({ ...stats.realtime_trend, realtime_revision: metadata.revision }, false);
+  }
+  updates.forEach(point => {
+    Object.keys(point.site_contributions || {}).forEach(siteID => {
+      dashboardRealtimeSiteRevisions.set(siteID, Math.max(dashboardRealtimeSiteRevisions.get(siteID) || 0, metadata.revision));
+    });
+  });
+  dashboardRealtimeRevision = metadata.revision;
+  if (metadata.base !== previousRevision) dashboardRealtimeNeedsRecovery = true;
+  persistDashboardRealtimeSamples();
+  if (dashboardRealtimeNeedsRecovery) dashboardRecoverRealtimeWindow();
+}
+
+async function dashboardRecoverRealtimeWindow() {
+  if (!dashboardRealtimeNeedsRecovery || dashboardRealtimeRecoveryAbortController || Router.current !== 'dashboard' || dashboardTrendState.range !== 'realtime') return;
+  const now = Date.now();
+  if (dashboardRealtimeLastRecoveryMS > 0 && now - dashboardRealtimeLastRecoveryMS < 5000) return;
+  dashboardRealtimeLastRecoveryMS = now;
+  const controller = dashboardCreateAbortController();
+  dashboardRealtimeRecoveryAbortController = controller;
+  const epoch = dashboardRealtimeEpoch;
+  try {
+    // Recover the aggregate window so every site's cached view receives the
+    // missing revision, even while the selector is showing just one site.
+    const data = await API.dashboardTrends('all', 'realtime', '', '', controller.signal);
+    if (controller.signal.aborted || Router.current !== 'dashboard' || dashboardRealtimeEpoch !== epoch) return;
+    if (dashboardMergeServerRealtimePoints(data, epoch, 'all')) updateDashboardTrendRealtime();
+  } catch (error) {
+    if (error?.name !== 'AbortError') console.warn('Dashboard realtime recovery failed', error);
+  } finally {
+    if (dashboardRealtimeRecoveryAbortController === controller) dashboardRealtimeRecoveryAbortController = null;
+  }
 }
 
 function upsertDashboardRealtimeSample(samples, point) {
@@ -711,6 +864,8 @@ function upsertDashboardRealtimeSample(samples, point) {
     const middle = (low + high) >> 1;
     const candidate = Number(samples[middle]?.timestamp_ms || 0);
     if (candidate === timestamp) {
+      if (Number(point.realtime_revision || 0) > 0 &&
+          Number(samples[middle].realtime_revision || 0) > Number(point.realtime_revision)) return samples;
       samples[middle] = point;
       return samples;
     }
@@ -827,6 +982,9 @@ function dashboardTrendRealtimeOffset() {
 }
 
 function dashboardTrendPoints() {
+  if (dashboardTrendState.range === 'realtime' && dashboardRealtimeProtocolObserved) {
+    return dashboardRealtimeChartTrendPoints();
+  }
   const historicalPoints = dashboardRealtimeHistoricalPoints();
   if (dashboardTrendState.range !== 'realtime') return historicalPoints;
   const realtimePoints = dashboardRealtimeTrendPoints();
@@ -854,6 +1012,7 @@ function dashboardRealtimeChartTrendPoints() {
   const key = dashboardTrendState.siteId === 'all' ? 'all' : String(dashboardTrendState.siteId);
   const points = dashboardRealtimeTrendSamples.get(key) || [];
   if (!points.length) return [];
+  if (dashboardRealtimeProtocolObserved) return points;
   const baseline = dashboardRealtimeBaselineForKey(key);
   const anchor = dashboardRealtimeHistoryCutoffMS(baseline);
   if (!baseline || !Number.isFinite(anchor) || anchor <= 0) return points;
@@ -1549,6 +1708,8 @@ async function loadDashboardTrends() {
   if (dashboardTrendAbortController) dashboardTrendAbortController.abort();
   dashboardTrendAbortController = dashboardCreateAbortController();
   const signal = dashboardTrendAbortController.signal;
+  const requestedEpoch = dashboardRealtimeEpoch;
+  const requestedKey = String(dashboardTrendState.siteId);
   try {
     const data = await API.dashboardTrends(
       dashboardTrendState.siteId,
@@ -1568,8 +1729,8 @@ async function loadDashboardTrends() {
       if (startInput) startInput.value = customDefault.start;
       if (endInput) endInput.value = customDefault.end;
     }
+    if (!dashboardMergeServerRealtimePoints(data, requestedEpoch, requestedKey)) return;
     dashboardTrendData = data;
-    dashboardMergeServerRealtimePoints(data);
     for (const samples of dashboardRealtimeTrendSamples.values()) pruneDashboardRealtimeSamples(samples);
     for (const samples of dashboardRealtimeTrendSiteSamples.values()) pruneDashboardRealtimeSamples(samples);
     reconcileDashboardTrendSiteSelection();
@@ -1679,6 +1840,15 @@ async function startFetchSSE() {
 }
 
 function updateDashboardLive(stats) {
+  const metadata = dashboardRealtimeMetadata(stats);
+  if (!metadata && dashboardRealtimeProtocolObserved) return;
+  if (metadata) {
+    if (!dashboardAcceptRealtimeEpoch(metadata) || metadata.revision < dashboardRealtimeRevision) return;
+  } else if (dashboardRealtimeEpoch && !dashboardRealtimeProtocolObserved) {
+    // A restored cache may come from a newer Controller than the currently
+    // connected server. Missing metadata retains the legacy merge path.
+    dashboardResetRealtimeEpoch('');
+  }
 	const generatedAt = Number(stats?.generated_at_ms || 0);
 	if (generatedAt > 0 && generatedAt < dashboardLastSnapshotMS) return;
 	if (generatedAt > 0) dashboardLastSnapshotMS = generatedAt;
@@ -1695,6 +1865,9 @@ function updateDashboardLive(stats) {
 	  }
 	  dashboardBillingMode = incomingBillingMode;
 	  dashboardRealtimePersistedBillingMode = incomingBillingMode;
+	  if (metadata && dashboardTrendData && dashboardTrendState.range === 'realtime') {
+	    dashboardTrendData = { ...dashboardTrendData, billing_mode: incomingBillingMode };
+	  }
 	}
 	const panelDomainEl = document.getElementById('s-panel-domain');
 	const currentPanelURL = dashboardCurrentPanelURL(stats.panel_access_url);
@@ -1723,7 +1896,8 @@ function updateDashboardLive(stats) {
 	if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
   if (stats?.realtime_trend) dashboardControllerRealtimeEnabled = true;
 	updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
-  if (stats?.realtime_trend) dashboardAppendServerRealtimeTrendSample(stats.realtime_trend);
+  if (metadata) dashboardApplyRealtimePacket(stats, metadata);
+  else if (stats?.realtime_trend) dashboardAppendServerRealtimeTrendSample(stats.realtime_trend);
   updateDashboardTrendRealtime();
 }
 
@@ -1764,6 +1938,8 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       fresh,
     };
     const previous = dashboardSpeedSamples.get(siteID);
+    const gaugeReceivedAt = Number(site.agent_rate_received_at_ms || 0);
+    const hasAgentGauge = gaugeReceivedAt > 0 || Number(site.agent_received_at_ms || 0) > 0;
     if (!previous) {
       dashboardLiveSpeeds.set(siteID, { down: 0, up: 0 });
       changedSiteIDs.add(siteID);
@@ -1813,10 +1989,24 @@ function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {
       }
     } else {
       // A stale sample must never move the counter baseline backwards.
-      continue;
+      if (!hasAgentGauge) continue;
+    }
+    if (hasAgentGauge) {
+      // Counter and gauge snapshots can arrive independently. Use the Agent's
+      // measured rate even on the first browser sample or when only its gauge
+      // advanced, and never refresh it with a full-report counter timestamp.
+      const gaugeFresh = site.agent_rate_valid === true && gaugeReceivedAt > 0 &&
+        (snapshotValue <= 0 || (snapshotValue >= gaugeReceivedAt && snapshotValue - gaugeReceivedAt <= 6000));
+      const measuredDown = Number(site.agent_download_bps || 0);
+      const measuredUp = Number(site.agent_upload_bps || 0);
+      const down = gaugeFresh && Number.isFinite(measuredDown) && measuredDown >= 0 ? measuredDown : 0;
+      const up = gaugeFresh && Number.isFinite(measuredUp) && measuredUp >= 0 ? measuredUp : 0;
+      dashboardLiveSpeeds.set(siteID, { down, up });
+      changedSiteIDs.add(siteID);
+      rateSamples.set(String(siteID), { download_bps: down, upload_bps: up });
     }
     // Keep the latest sample even when a later SSE payload omits another site.
-    dashboardSpeedSamples.set(siteID, current);
+    if (!previous || current.timestamp >= previous.timestamp) dashboardSpeedSamples.set(siteID, current);
     const speed = dashboardLiveSpeeds.get(siteID) || { down: 0, up: 0 };
     dashboardLatestRatesBySite.set(siteID, { down: speed.down || 0, up: speed.up || 0, sampledAt: current.timestamp, running: current.running, fresh: current.fresh });
   }
@@ -2026,6 +2216,17 @@ function stopDashSSE() {
   dashboardRealtimeTrendSamples = new Map();
   dashboardRealtimeTrendSiteSamples = new Map();
   dashboardRealtimeSmoothingCache = new Map();
+  dashboardRealtimeEpoch = '';
+  dashboardRealtimeRevision = 0;
+  dashboardRealtimeSiteRevisions = new Map();
+  dashboardRealtimeProtocolObserved = false;
+  dashboardRealtimeRetiredEpochs = new Set();
+  dashboardRealtimeNeedsRecovery = false;
+  dashboardRealtimeLastRecoveryMS = 0;
+  if (dashboardRealtimeRecoveryAbortController) {
+    dashboardRealtimeRecoveryAbortController.abort();
+    dashboardRealtimeRecoveryAbortController = null;
+  }
   dashboardLastSnapshotMS = 0;
   dashboardLastObservedSiteCount = -1;
   dashboardTrendData = null;

@@ -42,13 +42,18 @@ type SiteTraffic struct {
 	SampledAtMS        int64  `json:"sampled_at_ms,omitempty"`
 	// AgentSampledAtMS is the timestamp captured on the remote Agent. It is
 	// separate from SampledAtMS, which is the Controller receive timestamp.
-	AgentSampledAtMS  int64   `json:"agent_sampled_at_ms,omitempty"`
-	AgentDownloadBPS  float64 `json:"agent_download_bps,omitempty"`
-	AgentUploadBPS    float64 `json:"agent_upload_bps,omitempty"`
-	AgentRateValid    bool    `json:"agent_rate_valid,omitempty"`
-	CacheSizeBytes    int64   `json:"cache_size_bytes,omitempty"`
-	AgentRuntime      bool    `json:"-"`
-	AgentReceivedAtMS int64   `json:"agent_received_at_ms,omitempty"`
+	AgentSampledAtMS      int64   `json:"agent_sampled_at_ms,omitempty"`
+	AgentDownloadBPS      float64 `json:"agent_download_bps,omitempty"`
+	AgentUploadBPS        float64 `json:"agent_upload_bps,omitempty"`
+	AgentRateValid        bool    `json:"agent_rate_valid,omitempty"`
+	CacheSizeBytes        int64   `json:"cache_size_bytes,omitempty"`
+	AgentRuntime          bool    `json:"-"`
+	AgentReceivedAtMS     int64   `json:"agent_received_at_ms,omitempty"`
+	AgentRateReceivedAtMS int64   `json:"agent_rate_received_at_ms,omitempty"`
+	AgentCounterDomain    uint64  `json:"-"`
+	AgentNodeID           int64   `json:"-"`
+	AgentReportSessionID  string  `json:"-"`
+	AgentCounterEpoch     uint64  `json:"-"`
 }
 
 type RealtimeTelemetryStatus struct {
@@ -62,21 +67,25 @@ type RealtimeTelemetryStatus struct {
 // TrafficSnapshot is the single authoritative global traffic payload shared by
 // /api/dashboard, /api/traffic/overview and SSE events.
 type TrafficSnapshot struct {
-	TotalSites        int                      `json:"total_sites"`
-	OnlineSites       int                      `json:"online_sites"`
-	RunningSites      int                      `json:"running_sites"`
-	TotalTraffic      int64                    `json:"total_traffic"`
-	MonthlyTraffic    int64                    `json:"monthly_traffic"`
-	BillingMode       string                   `json:"billing_mode"`
-	TrafficResetDay   int                      `json:"traffic_reset_day"`
-	TotalRequests     int64                    `json:"total_requests"`
-	UptimeSeconds     int64                    `json:"uptime_seconds"`
-	PanelDomain       string                   `json:"panel_domain,omitempty"`
-	PanelAccessURL    string                   `json:"panel_access_url,omitempty"`
-	GeneratedAtMS     int64                    `json:"generated_at_ms"`
-	LiveSites         []SiteTraffic            `json:"live_sites"`
-	RealtimeTrend     *dashboardTrendPoint     `json:"realtime_trend,omitempty"`
-	RealtimeTelemetry *RealtimeTelemetryStatus `json:"realtime_telemetry,omitempty"`
+	TotalSites           int                      `json:"total_sites"`
+	OnlineSites          int                      `json:"online_sites"`
+	RunningSites         int                      `json:"running_sites"`
+	TotalTraffic         int64                    `json:"total_traffic"`
+	MonthlyTraffic       int64                    `json:"monthly_traffic"`
+	BillingMode          string                   `json:"billing_mode"`
+	TrafficResetDay      int                      `json:"traffic_reset_day"`
+	TotalRequests        int64                    `json:"total_requests"`
+	UptimeSeconds        int64                    `json:"uptime_seconds"`
+	PanelDomain          string                   `json:"panel_domain,omitempty"`
+	PanelAccessURL       string                   `json:"panel_access_url,omitempty"`
+	GeneratedAtMS        int64                    `json:"generated_at_ms"`
+	LiveSites            []SiteTraffic            `json:"live_sites"`
+	RealtimeTrend        *dashboardTrendPoint     `json:"realtime_trend,omitempty"`
+	RealtimeEpoch        string                   `json:"realtime_epoch,omitempty"`
+	RealtimeRevision     uint64                   `json:"realtime_revision,omitempty"`
+	RealtimeBaseRevision uint64                   `json:"realtime_base_revision,omitempty"`
+	RealtimeUpdates      []dashboardTrendPoint    `json:"realtime_updates,omitempty"`
+	RealtimeTelemetry    *RealtimeTelemetryStatus `json:"realtime_telemetry,omitempty"`
 }
 
 // NodeSiteLiveTraffic is the last persisted runtime sample from an applied
@@ -94,6 +103,10 @@ type NodeSiteLiveTraffic struct {
 	DownloadBPS        float64
 	UploadBPS          float64
 	RateValid          bool
+	RateReceivedAtMS   int64
+	CounterDomain      uint64
+	ReportSessionID    string
+	CounterEpoch       uint64
 	CacheSizeBytes     int64
 }
 
@@ -344,7 +357,9 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 			COALESCE(n.last_seen_at_ms, 0),
 			COALESCE(n.enabled, 0),
 			COALESCE(n.agent_listener_error, ''),
-			COALESCE(sch.dns_status, '')
+			COALESCE(sch.dns_status, ''),
+			COALESCE(n.active_agent_session_id, ''),
+			COALESCE(n.last_report_session_id, '')
 		FROM site_node_schedules sch
 		JOIN sites s ON s.id=sch.site_id
 		JOIN control_nodes n ON n.id=sch.applied_node_id
@@ -362,12 +377,16 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 		var value NodeSiteLiveTraffic
 		var nodeLastSeenMS int64
 		var nodeEnabled int
-		var listenerError, dnsStatus string
-		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.CacheSizeBytes, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus); err != nil {
+		var listenerError, dnsStatus, activeSession, reportedSession string
+		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.CacheSizeBytes, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus, &activeSession, &reportedSession); err != nil {
 			return nil, err
 		}
 		liveKey := nodeLiveTrafficKey{nodeID: value.NodeID, siteID: value.SiteID}
-		if live, ok := liveOverlay[liveKey]; ok && live.ReceivedAtMS >= value.SampledAtMS {
+		// The overlay orders both report channels by capture sequence. A
+		// delayed full report can have a newer database receive timestamp
+		// without containing newer counters. Session changes still invalidate
+		// the old overlay before the new Agent's first sample arrives.
+		if live, ok := liveOverlay[liveKey]; ok && (activeSession == "" || activeSession == live.reportSessionID) {
 			value.CumulativeBytesIn = live.CumulativeBytesIn
 			value.CumulativeBytesOut = live.CumulativeBytesOut
 			value.Requests = live.Requests
@@ -377,8 +396,13 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 			value.DownloadBPS = live.DownloadBPS
 			value.UploadBPS = live.UploadBPS
 			value.RateValid = live.RateValid
+			value.RateReceivedAtMS = live.RateReceivedAtMS
+			value.CounterDomain = live.CounterDomain
+			value.ReportSessionID = live.reportSessionID
+			value.CounterEpoch = live.CounterEpoch
 		}
-		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow
+		nodeFresh := nodeLastSeenMS > 0 && now.Sub(time.UnixMilli(nodeLastSeenMS)) <= nodeOnlineWindow &&
+			(activeSession == "" || activeSession == reportedSession)
 		siteFresh := value.SampledAtMS > 0 && now.Sub(time.UnixMilli(value.SampledAtMS)) <= nodeOnlineWindow
 		value.Running = nodeEnabled != 0 && nodeFresh && siteFresh && strings.TrimSpace(listenerError) == "" && strings.EqualFold(strings.TrimSpace(dnsStatus), "active")
 		result[value.SiteID] = value

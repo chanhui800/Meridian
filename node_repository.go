@@ -204,12 +204,15 @@ type NodeLiveSiteTraffic struct {
 	CumulativeBytesIn  int64   `json:"cumulative_bytes_in"`
 	CumulativeBytesOut int64   `json:"cumulative_bytes_out"`
 	Requests           int64   `json:"requests"`
+	CounterEpoch       uint64  `json:"counter_epoch,omitempty"`
 	DownloadBPS        float64 `json:"download_bps,omitempty"`
 	UploadBPS          float64 `json:"upload_bps,omitempty"`
 	RateValid          bool    `json:"rate_valid,omitempty"`
 	SampledAtMS        int64   `json:"sampled_at_ms,omitempty"`
 	AgentSampledAtMS   int64   `json:"-"`
 	ReceivedAtMS       int64   `json:"-"`
+	RateReceivedAtMS   int64   `json:"-"`
+	CounterDomain      uint64  `json:"-"`
 }
 
 // NodeReportResult keeps the protocol acknowledgement tied to the exact
@@ -1577,12 +1580,13 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 	return err
 }
 
-func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite) error {
-	site, ok := authorizedNodeSiteForStat(allowedSites, stat)
+func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat *NodeSiteStat, nowMS int64, allowedSites map[int64]authorizedNodeSite, delayedFullReport bool) (bool, error) {
+	site, ok := authorizedNodeSiteForStat(allowedSites, *stat)
 	if !ok {
-		return nil
+		return false, nil
 	}
 	siteID := site.ID
+	cumulativeReport := stat.CounterEpoch > 0 || stat.CumulativeBytesIn > 0 || stat.CumulativeBytesOut > 0
 	currentIn, currentOut := stat.CumulativeBytesIn, stat.CumulativeBytesOut
 	if currentIn == 0 && stat.BytesIn > 0 {
 		currentIn = stat.BytesIn
@@ -1605,10 +1609,10 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 		if initialIn > 0 || initialOut > 0 || initialRequests > 0 {
 			bucket := (nowMS / 60000) * 60000
 			if _, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, initialIn, initialOut, initialRequests, bucket); err != nil {
-				return err
+				return false, err
 			}
 			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, initialIn, initialOut, initialIn, initialOut, siteID); err != nil {
-				return err
+				return false, err
 			}
 		}
 		cacheSize := int64(0)
@@ -1616,10 +1620,27 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 			cacheSize = stat.CacheSizeBytes
 		}
 		_, err = tx.Exec(`INSERT INTO node_site_counters(node_id,site_id,boot_id,last_bytes_in,last_bytes_out,last_request_count,cache_size_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)`, nodeID, siteID, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS)
-		return err
+		return err == nil, err
 	}
 	if err != nil {
-		return err
+		return false, err
+	}
+	if previousBoot == counterEpoch && delayedFullReport && !cumulativeReport && stat.RequestCount < previousRequests {
+		// RequestCount has always been cumulative, even for legacy reports
+		// which carry interval byte deltas. Preserve that watermark without
+		// discarding a legacy byte interval which may still need to land.
+		if stat.BytesIn == 0 && stat.BytesOut == 0 {
+			return false, nil
+		}
+		stat.RequestCount = previousRequests
+	}
+	if previousBoot == counterEpoch && cumulativeReport && (stat.CounterEpoch > 0 || delayedFullReport) &&
+		(currentIn < previousIn || currentOut < previousOut || stat.RequestCount < previousRequests) {
+		// A newer cumulative sample already covers this site's bytes. ACK the
+		// delayed report without lowering its durable baseline or replacing
+		// current site metadata. Other sites in the same report may still have
+		// unpersisted data and are processed independently.
+		return false, nil
 	}
 	var deltaIn, deltaOut, deltaRequests int64
 	if previousBoot != counterEpoch {
@@ -1652,11 +1673,11 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 		bucket := (nowMS / 60000) * 60000
 		_, err = tx.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET bytes_in=bytes_in+excluded.bytes_in,bytes_out=bytes_out+excluded.bytes_out,requests=requests+excluded.requests`, nodeID, siteID, deltaIn, deltaOut, deltaRequests, bucket)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if deltaIn > 0 || deltaOut > 0 {
 			if _, err = tx.Exec(`UPDATE sites SET traffic_used=traffic_used+?+?,traffic_used_in=traffic_used_in+?,traffic_used_out=traffic_used_out+?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, deltaIn, deltaOut, deltaIn, deltaOut, siteID); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
@@ -1666,17 +1687,19 @@ func recordNodeSiteTrafficTx(tx *sql.Tx, nodeID int64, counterEpoch string, stat
 	}
 	_, err = tx.Exec(`UPDATE node_site_counters SET boot_id=?,last_bytes_in=?,last_bytes_out=?,last_request_count=?,cache_size_bytes=?,updated_at_ms=? WHERE node_id=? AND site_id=?`, counterEpoch, currentIn, currentOut, stat.RequestCount, cacheSize, nowMS, nodeID, siteID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Final is an Agent-side counter watermark, not proof that every paginated
 	// telemetry/event queue is empty. Keep the drain authorization tombstone
 	// until its bounded expiry so later pages remain accepted.
-	return nil
+	return true, nil
 }
 
 type nodeReportCommitResult struct {
 	node                        ControlNode
 	acceptedSiteIDs             []int64
+	appliedTelemetrySiteIDs     []int64
+	appliedTelemetryStats       []NodeSiteStat
 	discardedSiteIDs            []int64
 	acceptedMediaSiteIDs        []int64
 	discardedMediaSiteIDs       []int64
@@ -1868,7 +1891,8 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		deltaRX = report.RXBytes - lastRX
 		deltaTX = report.TXBytes - lastTX
 	}
-	if sessionID == lastSessionID && report.Sequence <= lastSequence {
+	delayedFullReport := sessionID == lastSessionID && report.Sequence <= lastSequence
+	if delayedFullReport {
 		deltaRX, deltaTX = 0, 0
 		report.RXBytes, report.TXBytes, report.Sequence = lastRX, lastTX, lastSequence
 	}
@@ -2017,9 +2041,21 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			continue
 		}
 		scheduleID := authorizedSite.ID
+		statCounterEpoch := siteCounterEpoch
+		if stat.CounterEpoch > 0 {
+			statCounterEpoch = fmt.Sprintf("%s:%d", siteCounterEpoch, stat.CounterEpoch)
+		}
+		applied, err := recordNodeSiteTrafficTx(tx, id, statCounterEpoch, &stat, now.UnixMilli(), allowedSites, delayedFullReport)
+		if err != nil {
+			return nodeReportCommitResult{}, err
+		}
+		if !applied {
+			appendUniqueNodeSiteID(&result.acceptedSiteIDs, scheduleID)
+			continue
+		}
 		var previousBoot string
 		var previousCount int64
-		err := tx.QueryRow(`SELECT agent_boot_id,agent_request_count FROM site_node_schedules WHERE site_id=?`, scheduleID).Scan(&previousBoot, &previousCount)
+		err = tx.QueryRow(`SELECT agent_boot_id,agent_request_count FROM site_node_schedules WHERE site_id=?`, scheduleID).Scan(&previousBoot, &previousCount)
 		if err != nil {
 			return nodeReportCommitResult{}, err
 		}
@@ -2034,14 +2070,10 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			sessionID, count, stat.LastRequestAtMS, stat.LastStatus, now.UnixMilli(), scheduleID); err != nil {
 			return nodeReportCommitResult{}, err
 		}
-		statCounterEpoch := siteCounterEpoch
-		if stat.CounterEpoch > 0 {
-			statCounterEpoch = fmt.Sprintf("%s:%d", siteCounterEpoch, stat.CounterEpoch)
-		}
-		if err := recordNodeSiteTrafficTx(tx, id, statCounterEpoch, stat, now.UnixMilli(), allowedSites); err != nil {
-			return nodeReportCommitResult{}, err
-		}
 		appendUniqueNodeSiteID(&result.acceptedSiteIDs, scheduleID)
+		appendUniqueNodeSiteID(&result.appliedTelemetrySiteIDs, scheduleID)
+		stat.SiteID = scheduleID
+		result.appliedTelemetryStats = append(result.appliedTelemetryStats, stat)
 	}
 
 	for _, count := range report.MediaCounts {
@@ -2130,7 +2162,9 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	// Publish the committed full-report sample to the dashboard overlay only
 	// after the transaction succeeds. The shared telemetry sequence keeps this
 	// overlay ordered with the lightweight live-report channel.
-	d.recordNodeFullTelemetry(id, report, result.acceptedSiteIDs, now)
+	telemetryReport := report
+	telemetryReport.SiteStats = result.appliedTelemetryStats
+	d.recordNodeFullTelemetry(id, telemetryReport, result.appliedTelemetrySiteIDs, now)
 	result.node, err = d.controlNodeByID(id, now)
 	if err != nil {
 		return nodeReportCommitResult{}, err

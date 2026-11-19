@@ -6,7 +6,7 @@
 
 Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板。它把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 和可选的边缘 Agent 放在一个控制面板里。
 
-当前稳定版为 **v1.11.0**。这一版本把节点调度的地址族选择、双栈 DNS 发布和 Agent 安装链路整理为一套可审计的主控配置：不启用调度的站点继续使用原面板入口，启用后才会把入口交给选定的节点。
+正式安装版本和校验文件以 [最新 GitHub Release](https://github.com/chanhui800/Meridian/releases/latest) 为准。本文描述当前主分支；尚未发布的改动会随后续正式版本提供。节点调度按站点启用，未启用的站点继续使用原面板入口。
 
 ## 界面预览
 
@@ -31,6 +31,7 @@ Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面�
 - 改写 PlaybackInfo、HLS、DASH、HTTP 重定向、字幕、图片和 WebSocket 地址。
 - 主视频流可以反代，也可以在上游返回合法公网 30x 时让客户端直连 CDN。
 - 记录请求、最终后端、客户端信息、收发字节和趋势。
+- 实时趋势由 Controller 统一采样，支持缺报区间回填和历史点修订；速度保留真实峰值，流量与请求保持累计口径。
 - 可选观看历史、媒体库数量、保号提醒、TMDB 补全和 Telegram 日报。
 - 支持 ACME DNS-01、自动续签、加密备份与恢复。
 - 可选节点调度：一个 Controller 管理多台 Linux Agent，DNS 只切换新连接。
@@ -160,6 +161,10 @@ sudo journalctl -u meridian -f
 
 Agent 每 5 秒上报一次完整心跳、网卡累计收发字节、配置版本和监听错误；面板实时流量使用独立的 2 秒轻量采样。媒体库、观察记录、事件和完整站点状态仍随完整报告上报。Controller 会在报告写入前验证 Node → Site 授权，并对 HTTP、WebSocket 和实时采样使用同一套每节点速率与并发限制。一个被攻陷的 Agent 只能影响当前 `desired_node_id` 或 `applied_node_id` 范围内的站点。
 
+完整报告负责持久化，轻量采样负责实时速度。Controller 按遥测顺序合并计数，迟到的报告不会使实时计数回退，完整报告也不会把仍有效的实时速度清空。短暂缺报后的流量增量按覆盖区间回填，并立即同步页面上已显示的旧点。
+
+实时速度图按显示区间保留下载、上传峰值，短缺样使用有限衰减连接；流量和请求总量仍来自原始累计计数。速度摘要对应当前绘制序列，请求使用整数折线，最小纵轴范围为 0–5。
+
 主控配置 Cloudflare ACME 凭据后，可以执行：
 
 ```bash
@@ -198,18 +203,36 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
 
-升级 Controller 后，已注册 Agent 会通过受认证的配置接口获取匹配版本的二进制，校验平台和 SHA-256 后原子替换。普通升级不会使节点令牌失效，也不需要重新注册。只有节点令牌被主动刷新、状态文件丢失或节点更换 Controller 时，才需要运行面板生成的 `--reenroll` 安装命令。
+升级 Controller 后，已注册 Agent 会通过受认证的配置和清单接口获取匹配版本的下载信息。正式版从固定 GitHub Release 下载，下载请求不携带 Controller 令牌；开发构建使用需要认证的 Controller 二进制接口。
+
+Agent 在后台下载、校验平台和 SHA-256，期间继续应用配置和上报完整心跳。下载完成后确认目标版本和配置仍有效，再原子替换并由服务管理器重启。普通升级保留节点令牌和状态，不需要重新注册。只有节点令牌被主动刷新、状态文件丢失或节点更换 Controller 时，才需要运行面板生成的 `--reenroll` 安装命令。
+
+原生 Controller 安装器会保留更新前的程序和数据，用于失败回滚。启用捆绑 Agent 二进制时，部分替换失败也会恢复已替换的程序，避免留下混合版本。
 
 Windows 和 macOS 构建产物目前用于开发和测试；生产部署支持 Linux Controller 与 Linux amd64/arm64 Agent。
 
 ## 开发检查
 
+使用 `go.mod` 指定的 Go 工具链或更新的受支持版本；当前最低版本为 Go 1.26.11。与 GitHub CI 一致的基本检查：
+
 ```bash
+go mod verify
 go test ./...
 go test -race ./...
 go vet ./...
+GOOS=windows GOARCH=amd64 go vet ./...
+GOOS=darwin GOARCH=arm64 go vet ./...
 find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
 node --test tests/*.test.js
+bash -n install.sh
+bash -n scripts/agent-install.sh
+bash -n docker-entrypoint.sh
+```
+
+CI 另执行漏洞扫描、静态安全检查、安装器回归和 Docker 构建。Fuzz 每次针对根包中的单个目标运行，例如：
+
+```bash
+go test -run '^$' -fuzz '^FuzzNormalizeDynamicURL$' -fuzztime 60s .
 ```
 
 项目许可证见 [LICENSE](LICENSE)，安全问题请按 [SECURITY.md](SECURITY.md) 的方式私下报告。

@@ -512,6 +512,12 @@ download_release_binary() {
     fi
 }
 
+replace_installed_binary() {
+    local source="$1" destination="$2"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$source" "${destination}.new" || return 1
+    as_root mv -f "${destination}.new" "$destination"
+}
+
 env_file_path() {
     printf '%s/.env\n' "$DATA_DIR"
 }
@@ -1945,20 +1951,19 @@ do_update() {
             as_root rm -f -- "$PREVIOUS_AGENT_BIN_ARM64"
         fi
     fi
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
-    as_root mv -f "${current_binary}.new" "$current_binary"
-    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
-        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent_amd64}.new"
-        as_root mv -f "${current_agent_amd64}.new" "$current_agent_amd64"
-        as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent_arm64}.new"
-        as_root mv -f "${current_agent_arm64}.new" "$current_agent_arm64"
-        case "$DOWNLOADED_CONTROLLER_SUFFIX" in
-            linux-amd64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_AMD64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
-            linux-arm64) as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_AGENT_BINARY_ARM64" "${current_agent}.new"; as_root mv -f "${current_agent}.new" "$current_agent" ;;
-        esac
-        UPDATE_AGENT_CHANGED=1
-    fi
+    # Backups are complete. Mark the group before its first write so a failed
+    # later replacement, or a signal after rename, cannot skip rollback.
     UPDATE_BINARY_CHANGED=1
+    replace_installed_binary "$DOWNLOADED_BINARY" "$current_binary" || fail "主控程序替换失败"
+    if [ "$BUNDLE_AGENT_BINARIES" = "1" ]; then
+        UPDATE_AGENT_CHANGED=1
+        replace_installed_binary "$DOWNLOADED_AGENT_BINARY_AMD64" "$current_agent_amd64" || fail "amd64 Agent 程序替换失败"
+        replace_installed_binary "$DOWNLOADED_AGENT_BINARY_ARM64" "$current_agent_arm64" || fail "arm64 Agent 程序替换失败"
+        case "$DOWNLOADED_CONTROLLER_SUFFIX" in
+            linux-amd64) replace_installed_binary "$DOWNLOADED_AGENT_BINARY_AMD64" "$current_agent" || fail "Agent 程序替换失败" ;;
+            linux-arm64) replace_installed_binary "$DOWNLOADED_AGENT_BINARY_ARM64" "$current_agent" || fail "Agent 程序替换失败" ;;
+        esac
+    fi
 
     if is_systemd; then
         as_root systemctl restart "$SERVICE_NAME"

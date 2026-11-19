@@ -2,9 +2,14 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest release on the `main` branch. Upgrade
-the Controller and its Agents together when a release notes a compatibility or
-protocol change.
+Security fixes are developed on `main` and published through GitHub Releases.
+Use the latest supported release for production; changes documented on `main`
+may not be available in an older release. Upgrade the Controller and its Agents
+together when a release notes a compatibility or protocol change.
+
+Agent enrollment and runtime credentials are scoped to authenticated Controller
+endpoints. Public release downloads use version-pinned assets and SHA-256
+verification without sending Controller credentials to the download host.
 
 ## Reporting a vulnerability
 

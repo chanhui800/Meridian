@@ -469,6 +469,11 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 			st.AgentDownloadBPS = remote.DownloadBPS
 			st.AgentUploadBPS = remote.UploadBPS
 			st.AgentRateValid = remote.RateValid
+			st.AgentRateReceivedAtMS = remote.RateReceivedAtMS
+			st.AgentCounterDomain = remote.CounterDomain
+			st.AgentNodeID = remote.NodeID
+			st.AgentReportSessionID = remote.ReportSessionID
+			st.AgentCounterEpoch = remote.CounterEpoch
 			st.CacheSizeBytes = remote.CacheSizeBytes
 			st.AgentRuntime = true
 			st.BytesIn = 0
@@ -517,7 +522,13 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 	if telemetry.AgentSites > 0 {
 		snap.RealtimeTelemetry = telemetry
 	}
-	snap.RealtimeTrend = pm.dashboardRealtimeTrendLatest()
+	if packet := pm.dashboardRealtimePacketSnapshot(); packet != nil {
+		snap.RealtimeTrend = packet.RealtimeTrend
+		snap.RealtimeEpoch = packet.RealtimeEpoch
+		snap.RealtimeRevision = packet.RealtimeRevision
+		snap.RealtimeBaseRevision = packet.RealtimeBaseRevision
+		snap.RealtimeUpdates = packet.RealtimeUpdates
+	}
 	return snap
 }
 

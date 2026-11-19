@@ -166,6 +166,70 @@ func TestDashboardRealtimeAgentTrafficDoesNotInventLongBackfill(t *testing.T) {
 	}
 }
 
+func TestDashboardRealtimeBackfillKeepsPreviouslyAccountedBytes(t *testing.T) {
+	previous := map[int64]dashboardRealtimeCounter{
+		7: {AgentRuntime: true, AgentSampledAtMS: 1_000, LastAgentAdvanceMS: 1_000},
+	}
+	points := []dashboardTrendPoint{
+		{TimestampMS: 3_000, BytesIn: 10, BytesOut: 20, Traffic: 60, SiteContributions: map[int64]dashboardTrendPoint{7: {BytesIn: 10, BytesOut: 20, Traffic: 60}}},
+		{TimestampMS: 5_000, SiteContributions: map[int64]dashboardTrendPoint{7: {}}},
+	}
+	current := dashboardTrendPoint{
+		TimestampMS: 7_000, BytesIn: 41, BytesOut: 61, Traffic: 204,
+		SiteContributions: map[int64]dashboardTrendPoint{7: {BytesIn: 41, BytesOut: 61, Traffic: 204}},
+	}
+	next := map[int64]dashboardRealtimeCounter{
+		7: {AgentRuntime: true, AgentSampledAtMS: 7_000, LastAgentAdvanceMS: 7_000},
+	}
+	backfillDashboardRealtimeAgentTraffic(points, &current, "bidirectional", previous, next)
+	if points[0].BytesIn != 10 || points[0].BytesOut != 20 {
+		t.Fatalf("backfill changed already accounted bytes: %+v", points[0])
+	}
+	if points[1].BytesIn+current.BytesIn != 41 || points[1].BytesOut+current.BytesOut != 61 {
+		t.Fatalf("new delta was not conserved: gap=%+v current=%+v", points[1], current)
+	}
+}
+
+func TestDashboardRealtimeBackfillDoesNotCrossCounterDomains(t *testing.T) {
+	previous := map[int64]dashboardRealtimeCounter{
+		7: {AgentRuntime: true, AgentCounterDomain: 1, AgentSampledAtMS: 1_000, LastAgentAdvanceMS: 1_000},
+	}
+	points := []dashboardTrendPoint{
+		{TimestampMS: 3_000, SiteContributions: map[int64]dashboardTrendPoint{7: {}}},
+	}
+	current := dashboardTrendPoint{
+		TimestampMS: 5_000, BytesOut: 60, Traffic: 60,
+		SiteContributions: map[int64]dashboardTrendPoint{7: {BytesOut: 60, Traffic: 60}},
+	}
+	next := map[int64]dashboardRealtimeCounter{
+		7: {AgentRuntime: true, AgentCounterDomain: 2, AgentSampledAtMS: 5_000, LastAgentAdvanceMS: 5_000},
+	}
+	backfillDashboardRealtimeAgentTraffic(points, &current, "outbound", previous, next)
+	if points[0].BytesOut != 0 || current.BytesOut != 60 {
+		t.Fatalf("new counter domain was backfilled into an old bucket: old=%+v current=%+v", points[0], current)
+	}
+}
+
+func TestDashboardRealtimeSparseLongGapIsNotBackfilled(t *testing.T) {
+	previous := map[int64]dashboardRealtimeCounter{
+		7: {AgentRuntime: true, AgentSampledAtMS: 1_000, LastAgentAdvanceMS: 1_000},
+	}
+	points := []dashboardTrendPoint{
+		{TimestampMS: 20_000, SiteContributions: map[int64]dashboardTrendPoint{7: {}}},
+	}
+	current := dashboardTrendPoint{
+		TimestampMS: 30_000, BytesOut: 90, Traffic: 90,
+		SiteContributions: map[int64]dashboardTrendPoint{7: {BytesOut: 90, Traffic: 90}},
+	}
+	next := map[int64]dashboardRealtimeCounter{
+		7: {AgentRuntime: true, AgentSampledAtMS: 30_000, LastAgentAdvanceMS: 30_000},
+	}
+	backfillDashboardRealtimeAgentTraffic(points, &current, "outbound", previous, next)
+	if points[0].BytesOut != 0 || current.BytesOut != 90 {
+		t.Fatalf("long reporting outage was redistributed: old=%+v current=%+v", points[0], current)
+	}
+}
+
 func TestAppendDashboardRealtimePointBoundsAndReplacement(t *testing.T) {
 	points := make([]dashboardTrendPoint, 0, dashboardRealtimeServerMaxPoints+10)
 	for i := int64(0); i < dashboardRealtimeServerMaxPoints+10; i++ {

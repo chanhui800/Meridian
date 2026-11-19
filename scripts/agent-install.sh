@@ -217,7 +217,7 @@ service_tmp="$work_dir/meridian-agent.service"
 # Download the release manifest from the controller, then fetch the immutable
 # GitHub asset directly. This keeps the Controller image free of per-platform
 # Agent binaries while retaining a controller-authenticated enrollment step.
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL -D "$manifest_headers_tmp" \
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsS -D "$manifest_headers_tmp" \
   -H "Authorization: Bearer $enrollment_token" \
   -H "X-Meridian-Agent-Platform: $agent_platform" \
   "$controller_url/api/agent/manifest" -o "$work_dir/agent-manifest.json"
@@ -227,8 +227,9 @@ if [ "$served_platform" != "$agent_platform" ]; then
   exit 1
 fi
 download_url=$(awk 'tolower($1) == "x-meridian-agent-download-url:" {sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); print; exit}' "$manifest_headers_tmp")
+download_authenticated=0
 case "$download_url" in
-  /api/agent/binary) download_url="$controller_url$download_url" ;;
+  /api/agent/binary) download_url="$controller_url$download_url"; download_authenticated=1 ;;
   https://github.com/chanhui800/Meridian/releases/download/*/meridian-agent-linux-amd64|https://github.com/chanhui800/Meridian/releases/download/*/meridian-agent-linux-arm64) ;;
   *) echo 'Agent release manifest returned an invalid download URL.' >&2; exit 1 ;;
 esac
@@ -237,10 +238,22 @@ if ! printf '%s' "$expected_sha" | grep -Eq '^[[:xdigit:]]{64}$'; then
   echo 'Agent release manifest returned an invalid SHA-256.' >&2
   exit 1
 fi
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -fsSL -D "$headers_tmp" \
-  -H "Authorization: Bearer $enrollment_token" \
-  -H "X-Meridian-Agent-Platform: $agent_platform" \
-  "$download_url" -o "$binary_tmp"
+set -- --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused \
+  -D "$headers_tmp" -H "X-Meridian-Agent-Platform: $agent_platform"
+if [ "$download_authenticated" -eq 1 ]; then
+  # A protected development binary is served directly by the Controller.
+  # Never let an authenticated request follow a redirect to another origin.
+  set -- "$@" -fsS -H "Authorization: Bearer $enrollment_token"
+else
+  set -- "$@" -fsSL
+fi
+curl "$@" "$download_url" -o "$binary_tmp"
+if [ "$download_authenticated" -eq 1 ]; then
+  download_status=$(awk '$1 ~ /^HTTP\// {status=$2} END {print status}' "$headers_tmp")
+  case "$download_status" in
+    3??) echo 'Refusing an authenticated Agent binary redirect.' >&2; exit 1 ;;
+  esac
+fi
 served_platform=$(awk 'tolower($1) == "x-meridian-agent-platform:" {gsub(/\r/, "", $2); print tolower($2); exit}' "$headers_tmp")
 if [ -n "$served_platform" ] && [ "$served_platform" != "$agent_platform" ]; then
   echo "Agent binary platform mismatch (requested $agent_platform, received $served_platform)." >&2

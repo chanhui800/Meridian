@@ -10,7 +10,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
 
 cleanup() {
-    if [ "${EUID}" -eq 0 ]; then
+    if [ "${EUID}" -eq 0 ] || [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = bundled-update ]; then
         rm -rf -- "$TEST_ROOT"
     else
         sudo rm -rf -- "$TEST_ROOT"
@@ -120,6 +120,102 @@ run_as_test_root() {
         sudo "$@"
     fi
 }
+
+run_bundled_update_failure_tests() {
+    local failure_site scenario_root binary_name scenario_code
+    for failure_site in meridian-agent-linux-amd64 meridian-agent-linux-arm64 meridian-agent; do
+        scenario_root="${TEST_ROOT}/bundle-failure-${failure_site}"
+        mkdir -p "$scenario_root/bin" "$scenario_root/data" "$scenario_root/backups" "$scenario_root/tmp"
+        for binary_name in meridian meridian-agent meridian-agent-linux-amd64 meridian-agent-linux-arm64; do
+            printf '#!/usr/bin/env sh\nprintf "v9.9.11\\n"\n' > "$scenario_root/bin/$binary_name"
+            chmod 0755 "$scenario_root/bin/$binary_name"
+        done
+        printf 'DB_PATH=%s/data/meridian.db\n' "$scenario_root" > "$scenario_root/data/.env"
+        printf 'previous database\n' > "$scenario_root/data/meridian.db"
+        cp "$scenario_root/data/.env" "$scenario_root/env.before"
+        cp "$scenario_root/data/meridian.db" "$scenario_root/db.before"
+        printf '#!/usr/bin/env sh\nprintf "v9.9.12\\n"\n' > "$scenario_root/payload"
+        chmod 0755 "$scenario_root/payload"
+        cat > "$scenario_root/run.sh" <<'FAULT'
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${AGENT_TEST_REPO}/install.sh"
+init_privilege() { ROOT_PREFIX=(); }
+is_systemd() { return 1; }
+ensure_no_manual_process() { return 0; }
+validate_existing_secret_configuration() { return 0; }
+migrate_managed_nginx_redaction() { return 0; }
+restore_data_permissions() { return 0; }
+get_latest_version() { printf 'v9.9.12\n'; }
+detect_platform() { printf 'linux-amd64\n'; }
+prepare_data_and_config() {
+    printf 'configuration changed\n' >> "${DATA_DIR}/.env"
+    printf 'database changed\n' >> "${DATA_DIR}/meridian.db"
+}
+download() {
+    if [[ "$1" == */SHA256SUMS ]]; then
+        local digest
+        digest=$(sha256_file "$AGENT_TEST_ROOT/payload")
+        printf '%s  meridian-linux-amd64\n%s  meridian-agent-linux-amd64\n%s  meridian-agent-linux-arm64\n' \
+            "$digest" "$digest" "$digest" > "$2"
+    else
+        cp "$AGENT_TEST_ROOT/payload" "$2"
+    fi
+}
+as_root() {
+    local operation="$1" target directories=0
+    shift
+    case "$operation" in
+        install)
+            target="${!#}"
+            if [ "$target" = "$INSTALL_DIR/$AGENT_TEST_FAILURE_SITE.new" ]; then
+                printf 'injected bundled Agent replacement failure\n' >&2
+                return 57
+            fi
+            local arguments=()
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    -o|-g) shift 2 ;;
+                    -d) directories=1; shift ;;
+                    -m) shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            if [ "$directories" -eq 1 ]; then
+                mkdir -p "${arguments[@]}"
+            else
+                command install -m 0755 "${arguments[@]}"
+            fi
+            ;;
+        chown|chmod) return 0 ;; # Identity/modes are covered by the normal Linux tests.
+        *) command "$operation" "$@" ;;
+    esac
+}
+do_update
+FAULT
+        scenario_code=0
+        AGENT_TEST_REPO="$REPO_ROOT" AGENT_TEST_ROOT="$scenario_root" AGENT_TEST_FAILURE_SITE="$failure_site" \
+            MERIDIAN_ROOT_GROUP=synthetic-test-group MERIDIAN_INSTALL_DIR="$scenario_root/bin" \
+            MERIDIAN_DATA_DIR="$scenario_root/data" MERIDIAN_BACKUP_DIR="$scenario_root/backups" \
+            TMPDIR="$scenario_root/tmp" bash "$scenario_root/run.sh" > "$scenario_root/run.log" 2>&1 || scenario_code=$?
+        if [ "$scenario_code" -eq 0 ]; then
+            fail "bundled replacement failure was swallowed: $failure_site"
+        fi
+        assert_contains "$scenario_root/run.log" 'injected bundled Agent replacement failure'
+        for binary_name in meridian meridian-agent meridian-agent-linux-amd64 meridian-agent-linux-arm64; do
+            assert_eq 'v9.9.11' "$("$scenario_root/bin/$binary_name" --version)" "partial update restores $binary_name after $failure_site fails"
+        done
+        cmp -s "$scenario_root/env.before" "$scenario_root/data/.env" || { echo 'FAIL: partial update did not restore configuration' >&2; exit 1; }
+        cmp -s "$scenario_root/db.before" "$scenario_root/data/meridian.db" || { echo 'FAIL: partial update did not restore data' >&2; exit 1; }
+    done
+}
+
+run_bundled_update_failure_tests
+if [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = bundled-update ]; then
+    echo 'bundled update fault tests passed'
+    exit 0
+fi
 
 # Dynamic self-target protection snapshots local interface addresses at startup.
 # Go uses a netlink route socket for that enumeration on Linux, so the hardened

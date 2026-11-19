@@ -64,7 +64,7 @@ func TestNodeLiveReportOverlaysDashboardWithoutPersistingTraffic(t *testing.T) {
 	}
 }
 
-func TestNodeFullTelemetryOnlyTakesOverAfterLiveChannelStalls(t *testing.T) {
+func TestNodeFullTelemetryGaugeOnlyTakesOverAfterLiveChannelStalls(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "fallback-node", Address: "203.0.113.75", Port: 19075}, now)
@@ -93,14 +93,14 @@ func TestNodeFullTelemetryOnlyTakesOverAfterLiveChannelStalls(t *testing.T) {
 
 	app.db.recordNodeFullTelemetry(node.ID, NodeReport{
 		BootID: "fallback-boot", ReportSessionID: "fallback-session", CounterEpoch: "kernel:eth0", TelemetrySequence: 11, SampledAtMS: now.Add(2 * time.Second).UnixMilli(),
-		SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 999, CumulativeBytesOut: 999, RequestCount: 99}},
+		SiteStats: []NodeSiteStat{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 120, CumulativeBytesOut: 240, RequestCount: 5}},
 	}, []int64{site.ID}, now.Add(2*time.Second))
 	snapshot, err := app.db.NodeSiteLiveTrafficSnapshot(now.Add(2 * time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := snapshot[site.ID]; got.CumulativeBytesIn != 100 || got.CumulativeBytesOut != 200 || got.DownloadBPS != 20 {
-		t.Fatalf("healthy live sample was overwritten by full report: %+v", got)
+	if got := snapshot[site.ID]; got.CumulativeBytesIn != 120 || got.CumulativeBytesOut != 240 || got.DownloadBPS != 20 || got.RateReceivedAtMS != now.UnixMilli() {
+		t.Fatalf("full counters must advance while the healthy live gauge keeps its own freshness: %+v", got)
 	}
 
 	app.db.recordNodeFullTelemetry(node.ID, NodeReport{

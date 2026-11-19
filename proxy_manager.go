@@ -39,20 +39,20 @@ type ProxyInstance struct {
 	// single-site history snapshot and the live overlay in global snapshots.
 	// Lock order is pm.mu -> trafficMu; helpers that take trafficMu (e.g.
 	// flushProxyTraffic) must never be called from code that already holds it.
-	trafficMu                 sync.Mutex
-	bytesIn                   atomic.Int64
-	bytesOut                  atomic.Int64
-	cumulativeBytesIn         atomic.Int64
-	cumulativeBytesOut        atomic.Int64
-	persistedBytesIn          atomic.Int64
-	persistedBytesOut         atomic.Int64
-	reqCount                  atomic.Int64
-	pendingRequests           atomic.Int64
-	persistedTraffic          atomic.Int64
+	trafficMu          sync.Mutex
+	bytesIn            atomic.Int64
+	bytesOut           atomic.Int64
+	cumulativeBytesIn  atomic.Int64
+	cumulativeBytesOut atomic.Int64
+	persistedBytesIn   atomic.Int64
+	persistedBytesOut  atomic.Int64
+	reqCount           atomic.Int64
+	pendingRequests    atomic.Int64
+	persistedTraffic   atomic.Int64
 	// trafficGeneration backs the flush-generation fallback for controller
 	// local instances (no Agent runtime counter). The dashboard trend snapshot
 	// uses it to detect a flush that raced its SQLite history read.
-	trafficGeneration         atomic.Uint64
+	trafficGeneration atomic.Uint64
 	// quotaCheckSince is the site-wide byte accumulator for mid-stream quota
 	// probes: writers and readers across all concurrent streams share it, so
 	// the first stream to push it past quotaCheckBytes performs one shared
@@ -180,6 +180,8 @@ type ProxyManager struct {
 	dashboardRealtimePoints      []dashboardTrendPoint
 	dashboardRealtimePrev        map[int64]dashboardRealtimeCounter
 	dashboardRealtimeLastMS      int64
+	dashboardRealtimeEpoch       string
+	dashboardRealtimeRevision    uint64
 	dashboardRealtimeBillingMode string
 	dashboardRealtimeStarted     atomic.Bool
 	// dashboardSnapshot is the last process-wide traffic snapshot captured by
