@@ -30,4 +30,4 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Fuzz ${{ matrix.target }}
-        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 60s ./...
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 60s .
