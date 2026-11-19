@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meridian · Emby / Jellyfin 多站点反向代理与节点调度</title>
+  <meta name="description" content="Meridian 把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 证书与边缘 Agent 放在一个面板里。">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="#top">
+        <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="20" cy="20" r="20" fill="#10a165"/>
+          <path d="M9 28 L15 13 L19 21 L23 15 L31 28" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>Meridian</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#features">功能</a>
+        <a href="#screenshots">界面</a>
+        <a href="#install">安装</a>
+        <a href="https://github.com/chanhui800/Meridian/releases" target="_blank" rel="noopener">版本记录</a>
+      </nav>
+      <a class="nav-cta" href="https://github.com/chanhui800/Meridian" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="hero-badge"><span class="dot"></span>v1.11.4 已发布</p>
+        <h1>Emby / Jellyfin 多站点反向代理<br>与节点调度面板</h1>
+        <p class="hero-sub">站点入口、备用线路、播放改写、流量统计、请求日志、观看历史、TLS 证书和边缘 Agent，一个面板全部接管。</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="#install">快速开始</a>
+          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/latest" target="_blank" rel="noopener">下载正式版</a>
+        </div>
+        <div class="hero-stats">
+          <div><strong>多站点</strong><span>主线路 + 最多 7 条备用线路</span></div>
+          <div><strong>节点调度</strong><span>一个 Controller 管理多台 Agent</span></div>
+          <div><strong>零侵入</strong><span>不内置伪装 UA，默认透传</span></div>
+        </div>
+      </div>
+      <div class="hero-shot">
+        <div class="browser-bar"><span></span><span></span><span></span><em>meridian · 仪表盘</em></div>
+        <img src="images/dashboard.png" alt="Meridian 仪表盘界面" width="1440" height="900" loading="eager">
+      </div>
+    </section>
+
+    <section id="features" class="section">
+      <h2>为你的媒体服务而设计</h2>
+      <p class="section-sub">不需要拼装脚本和反向代理规则，Meridian 把日常运营收进一个面板。</p>
+      <div class="feature-grid">
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm1 4h5v8H5V9Zm7 0h7v3h-7V9Zm0 5h4v3h-4v-3Z" fill="currentColor"/></svg></div>
+          <h3>多站点与线路</h3>
+          <p>独立端口、路径前缀、域名前缀三种入口，主线路加最多七条备用线路，自动故障切换。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 9 9 0 0 0-9-9Zm1 4h-2v5h-3v2h5V7Zm0 10h-2v-2h2v2Z" fill="currentColor"/></svg></div>
+          <h3>播放地址改写</h3>
+          <p>PlaybackInfo、HLS、DASH、重定向、字幕、图片和 WebSocket 地址全部改写，主视频流可反代或直连 CDN。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 2 3 7v6c0 5 3.8 8.4 9 9 5.2-.6 9-4 9-9V7l-9-5Zm0 2.2 7 3.9V13c0 4.1-3 7-7 7.7-4-.7-7-3.6-7-7.7V8.1l7-3.9Z" fill="currentColor"/></svg></div>
+          <h3>UA 透明</h3>
+          <p>不内置伪装 UA，客户端 UA 默认原样透传；需要时可按站点指定自定义 UA。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M2 12h3l2.5-7 5 14L15 11h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <h3>趋势与流量</h3>
+          <p>实时网速、请求与计费流量统一采样，支持缺报区间回填，速度保留真实峰值。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 21a9 9 0 1 1 9-9 9 9 0 0 1-9 9Zm0-17v8l5.2 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <h3>观看历史</h3>
+          <p>同步当前播放会话与已保存记录，媒体库数量、保号提醒和 TMDB 补全可选开启。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 0 1 10 10c0 5.5-4.5 10-10 10a10 10 0 0 1-6.6-2.5L3 22l1.2-3.6A10 10 0 0 1 2 12 10 10 0 0 1 12 2Zm0 2a8 8 0 0 0-8 8c0 1.8.6 3.4 1.6 4.7l-.8 2.3 1.7-.5a8 8 0 0 0 5.5 1.5 8 8 0 0 0 8-8 8 8 0 0 0-8-8Zm-3 5h6a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2Z" fill="currentColor"/></svg></div>
+          <h3>Telegram 日报</h3>
+          <p>定时推送请求与流量数据，流量额度预警按档位提醒，可先发测试日报验证。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 0 1 5 5v2a5 5 0 0 1-10 0V7a5 5 0 0 1 5-5Zm0 2a3 3 0 0 0-3 3v2h6V7a3 3 0 0 0-3-3Zm-5 9h10v2H7v-2Zm10 4v2H7v-2h10Z" fill="currentColor"/></svg></div>
+          <h3>TLS 与备份</h3>
+          <p>ACME DNS-01 自动签发与续签，支持加密备份恢复，旧格式备份仍可读取。</p>
+        </article>
+        <article>
+          <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 1 3 3 3 3 0 0 1 3 3 3 3 0 0 1 3 3v9a2 2 0 0 1-2 2h-6a2 2 0 0 1-2-2v-9a3 3 0 0 1 3-3V6a1 1 0 0 0-2 0v1H9a3 3 0 0 1-1 1H6a3 3 0 0 1 3-3Zm-3 6v11H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h4Z" fill="currentColor"/></svg></div>
+          <h3>节点调度</h3>
+          <p>一台 Controller 管理多台 Linux Agent，DNS 只切换新连接，V4 发布 A、V6 发布 AAAA。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="flow-section">
+      <div class="section">
+        <h2>节点调度如何工作</h2>
+        <p class="section-sub">启用调度后，Controller 下发路由、线路、改写与 TLS 配置，Agent 通过健康检查后才切换 DNS。</p>
+        <div class="flow">
+          <div class="flow-node"><strong>客户端</strong><span>播放请求</span></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node"><strong>站点域名</strong><span>精确 DNS A/AAAA</span></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node accent"><strong>Edge Agent</strong><span>心跳 · 配置 · 流量</span></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node"><strong>上游</strong><span>Emby / Jellyfin</span></div>
+        </div>
+        <p class="flow-note">Controller 实时下发与校验；DNS 只影响新连接，已有播放不会被强制迁移。</p>
+      </div>
+    </section>
+
+    <section id="screenshots" class="section">
+      <h2>界面一览</h2>
+      <p class="section-sub">以下截图使用演示数据，不含任何生产环境域名、IP、令牌或证书。</p>
+      <div class="gallery">
+        <figure><button class="shot" data-full="images/dashboard.png" aria-label="放大查看仪表盘"><img src="images/dashboard.png" alt="仪表盘" loading="lazy" width="1440" height="900"></button><figcaption>仪表盘</figcaption></figure>
+        <figure><button class="shot" data-full="images/sites.png" aria-label="放大查看站点管理"><img src="images/sites.png" alt="站点管理" loading="lazy" width="1440" height="900"></button><figcaption>站点管理</figcaption></figure>
+        <figure><button class="shot" data-full="images/node-scheduling.png" aria-label="放大查看节点调度"><img src="images/node-scheduling.png" alt="节点调度" loading="lazy" width="1440" height="900"></button><figcaption>节点调度</figcaption></figure>
+        <figure><button class="shot" data-full="images/request-logs.png" aria-label="放大查看请求日志"><img src="images/request-logs.png" alt="请求日志" loading="lazy" width="1440" height="900"></button><figcaption>请求日志</figcaption></figure>
+        <figure><button class="shot" data-full="images/watch-history.png" aria-label="放大查看观看历史"><img src="images/watch-history.png" alt="观看历史" loading="lazy" width="1440" height="900"></button><figcaption>观看历史</figcaption></figure>
+        <figure><button class="shot" data-full="images/global-settings.png" aria-label="放大查看全局设置"><img src="images/global-settings.png" alt="全局设置" loading="lazy" width="1440" height="900"></button><figcaption>全局设置</figcaption></figure>
+        <figure><button class="shot" data-full="images/tls-certificate.png" aria-label="放大查看 TLS 设置"><img src="images/tls-certificate.png" alt="TLS 设置" loading="lazy" width="1440" height="900"></button><figcaption>TLS 与域名</figcaption></figure>
+        <figure><button class="shot" data-full="images/telegram-report.png" aria-label="放大查看 Telegram 通知"><img src="images/telegram-report.png" alt="Telegram 通知" loading="lazy" width="1440" height="900"></button><figcaption>Telegram 通知</figcaption></figure>
+      </div>
+    </section>
+
+    <section id="install" class="section">
+      <h2>一分钟开始</h2>
+      <p class="section-sub">Docker 一条 compose 启动；首次启动会输出管理员初始化令牌。</p>
+      <div class="install-card">
+        <div class="install-head">
+          <span>docker-compose.yml</span>
+          <button class="copy-btn" id="copyBtn">复制</button>
+        </div>
+        <pre><code id="installCode">services:
+  meridian:
+    image: ghcr.io/chanhui800/meridian:latest
+    container_name: meridian
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+    environment:
+      PORT: "9090"
+      DB_PATH: /app/data/meridian.db</code></pre>
+      </div>
+      <div class="install-actions">
+        <a class="btn btn-primary" href="https://github.com/chanhui800/Meridian#readme" target="_blank" rel="noopener">阅读完整文档</a>
+        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/latest" target="_blank" rel="noopener">Release 与校验文件</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="20" cy="20" r="20" fill="#10a165"/>
+          <path d="M9 28 L15 13 L19 21 L23 15 L31 28" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>Meridian</span>
+        <p>面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板。</p>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/chanhui800/Meridian" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/chanhui800/Meridian/releases" target="_blank" rel="noopener">发布版本</a>
+        <a href="https://github.com/chanhui800/Meridian/blob/main/LICENSE" target="_blank" rel="noopener">许可证</a>
+      </div>
+    </div>
+    <p class="footer-copy">© 2026 Meridian · MIT License</p>
+  </footer>
+
+  <div class="lightbox" id="lightbox" hidden>
+    <button class="lightbox-close" id="lightboxClose" aria-label="关闭">×</button>
+    <img id="lightboxImg" alt="">
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

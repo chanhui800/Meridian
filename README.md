@@ -1,8 +1,11 @@
+<p align="center"><img src="website/favicon.svg" width="96" height="96" alt="Meridian"></p>
+
 # Meridian
 
 [![CI](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/chanhui800/Meridian/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/chanhui800/Meridian)](https://github.com/chanhui800/Meridian/releases/latest)
 [![License](https://img.shields.io/github/license/chanhui800/Meridian)](LICENSE)
+[![官网](https://img.shields.io/badge/官网-emby.fydivine.com-10a165)](https://emby.fydivine.com)
 
 Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板。它把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 和可选的边缘 Agent 放在一个控制面板里。
 
@@ -17,8 +20,8 @@ Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面�
 | ![仪表盘](docs/images/dashboard.png) | ![站点管理](docs/images/sites.png) |
 | 节点调度 | 请求日志 |
 | ![节点调度](docs/images/node-scheduling.png) | ![请求日志](docs/images/request-logs.png) |
-| 观看历史 | 流量统计 |
-| ![观看历史](docs/images/watch-history.png) | ![流量统计](docs/images/traffic.png) |
+| 观看历史 | 全局设置 |
+| ![观看历史](docs/images/watch-history.png) | ![全局设置](docs/images/global-settings.png) |
 | TLS 设置 | Telegram 日报 |
 | ![TLS 设置](docs/images/tls-certificate.png) | ![Telegram 日报](docs/images/telegram-report.png) |
 
@@ -33,6 +36,9 @@ Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面�
 - 记录请求、最终后端、客户端信息、收发字节和趋势。
 - 实时趋势由 Controller 统一采样，支持缺报区间回填和历史点修订；速度保留真实峰值，流量与请求保持累计口径。
 - 可选观看历史、媒体库数量、保号提醒、TMDB 补全和 Telegram 日报。
+- 站点列表直接显示回源延迟，点击延迟结果即可重新测速，无需单独的测速按钮。
+- 客户端 UA 默认透传，不内置伪装 UA；需要时可给站点指定自定义 UA。
+- 添加站点时自动识别 `https` 和端口，地址不完整时自动补全。
 - 支持 ACME DNS-01、自动续签、加密备份与恢复。
 - 可选节点调度：一个 Controller 管理多台 Linux Agent，DNS 只切换新连接。
 - 主控模式按站点启用：关闭时保留原面板入口；启用时可跟随全局调度或固定到指定节点。
