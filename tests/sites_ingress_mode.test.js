@@ -72,29 +72,28 @@ test('ingress mode labels remain concise for the site card', () => {
   assert.equal(siteIngressModeLabel({ ingress_mode: 'unset' }), '入口未配置');
 });
 
-test('site cards place ingress mode above running status and omit playback rows', () => {
-  const source = loadSitesSource();
-  const start = source.indexOf('async function loadSites()');
-  const end = source.indexOf('function filterSiteCards', start);
-  const cardSource = source.slice(start, end);
-
-  assert.match(cardSource, /class="site-card-state"/);
-  assert.match(cardSource, /siteIngressModeLabel\(s\)/);
-  assert.match(cardSource, /normalizedIngressMode\(s\) === 'unset'/);
-  assert.match(cardSource, /待配置/);
-  assert.match(cardSource, /data-access-address/);
-  assert.match(cardSource, /toggleSiteAccessAddress/);
-	assert.match(cardSource, /renderSiteAccessVisibilityIcon\(true\)/);
-	assert.match(cardSource, /aria-pressed="false"/);
-	assert.doesNotMatch(cardSource, />◉<\/button>/);
-  assert.match(cardSource, /data-site-action="copy"/);
-  assert.match(cardSource, /copySiteAccessAddress/);
-  assert.match(cardSource, /class="status-badge site-status"/);
-  assert.doesNotMatch(cardSource, /renderPlaybackRow\(s\)/);
-  assert.doesNotMatch(cardSource, /renderIngressSummary\(s\)/);
-  assert.doesNotMatch(cardSource, /播放回源/);
-  assert.match(cardSource, /renderSiteMediaLibraryCounts\(s\)/);
-  assert.match(cardSource, /renderSiteAccountRetention\(s\)/);
+test('site rows retain ingress status, concealed access and secondary actions', () => {
+  const sandbox = loadHelpers();
+  sandbox.formatBytes = value => `${value} B`;
+  sandbox.uaNameMap = { passthrough: '透传' };
+  const row = sandbox.siteManagementRowHTML({
+    id: 1, name: 'synthetic site', ingress_mode: 'host', public_host: 'media.example.com',
+    target_url: 'https://origin.example.com', ua_mode: 'passthrough', enabled: true, running: true,
+    traffic_used: 20, traffic_quota: 100, media_movie_count: 1, media_series_count: 2, media_episode_count: 3,
+  }, new Set());
+  assert.match(row, /域名前缀 · 透传/);
+  assert.match(row, /运行中/);
+  assert.match(row, /id="site-details-1" hidden/);
+  assert.match(row, /data-access-address="[^" ]+"/);
+  assert.match(row, /aria-label="显示访问地址" aria-pressed="false"/);
+  for (const action of ['access', 'copy', 'latency', 'toggle', 'edit', 'delete', 'details']) {
+    assert.match(row, new RegExp(`data-site-action="${action}"`));
+  }
+  assert.match(row, /媒体库数量/);
+  assert.doesNotMatch(row, /播放回源/);
+  const unset = sandbox.siteManagementRowHTML({ id: 2, name: 'unset', ingress_mode: 'unset', ua_mode: 'passthrough' }, new Set());
+  assert.match(unset, /待配置/);
+  assert.match(unset, /disabled title="请先编辑并配置入口"/);
 });
 
 test('access address visibility uses closed and open eye icons with accessible state', () => {
@@ -141,10 +140,10 @@ test('site cards render media library counts and an accessible retention countdo
   assert.match(counts, /电影 <strong>19,778<\/strong>/);
   assert.match(counts, /剧集 <strong>28,127<\/strong>/);
   assert.match(counts, /集 <strong>339,044<\/strong>/);
-  assert.match(counts, /class="site-media-icon" aria-hidden="true">🎬<\/span>/);
-  assert.equal((counts.match(/>🎬<\/span>/g) || []).length, 1);
+  assert.match(counts, /class="site-media-icon" aria-hidden="true"><svg/);
+  assert.equal((counts.match(/class="site-media-icon"/g) || []).length, 1);
   assert.match(sandbox.renderSiteMediaLibraryCounts({}), /媒体库<\/span><strong>待同步/);
-  assert.match(sandbox.renderSiteMediaLibraryCounts({}), /aria-hidden="true">🎬<\/span><span>媒体库/);
+  assert.match(sandbox.renderSiteMediaLibraryCounts({}), /<\/svg><\/span><span>媒体库/);
 
   const now = Date.UTC(2026, 7, 24, 0, 0, 0);
   const status = sandbox.siteAccountRetentionStatus({
@@ -177,43 +176,19 @@ test('site card actions stay bottom-aligned without fixed card heights', () => {
   assert.match(actionsRule, /margin-top:\s*auto/);
 });
 
-test('drag handle aligns with the site title without shifting the media summary', () => {
+test('site management uses responsive rows with touch-capable reorder controls', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'management-console.css'), 'utf8');
   const source = loadSitesSource();
-  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
-  const cardRule = [...css.matchAll(/\.site-card\s*\{([^}]*)\}/g)]
-    .map(match => match[1])
-    .find(rule => rule.includes('position: relative')) || '';
-  const handleRule = css.match(/\.site-drag-handle\s*\{([^}]*)\}/)?.[1] || '';
-  const titleRule = [...css.matchAll(/\.site-heading-title-row\s*\{([^}]*)\}/g)]
-    .map(match => match[1])
-    .find(rule => rule.includes('min-height: 60px')) || '';
-  const mediaRule = css.match(/\.site-media-counts\s*\{([^}]*)\}/)?.[1] || '';
-  const mediaIconRule = css.match(/\.site-media-icon\s*\{([^}]*)\}/)?.[1] || '';
-  const siteTopRule = [...css.matchAll(/\.site-top\s*\{([^}]*)\}/g)].at(-1)?.[1] || '';
-  const card = source.indexOf('<div class="site-card"');
-  const handle = source.indexOf('class="site-drag-handle"', card);
-  const top = source.indexOf('class="site-top"', card);
-
-  assert.ok(card < top && top < handle);
-  assert.match(cardRule, /position:\s*relative/);
-  assert.match(handleRule, /position:\s*relative/);
-  assert.match(handleRule, /top:\s*auto/);
-  assert.match(handleRule, /left:\s*auto/);
-  assert.match(handleRule, /height:\s*40px/);
-  assert.doesNotMatch(handleRule, /transform:/);
-  assert.match(titleRule, /min-height:\s*60px/);
-  assert.match(titleRule, /align-items:\s*center/);
-  assert.match(titleRule, /padding-left:\s*0/);
-  assert.match(mediaRule, /width:\s*100%/);
-  assert.match(mediaRule, /margin-left:\s*0/);
-  assert.match(mediaIconRule, /width:\s*7px/);
-  assert.match(mediaIconRule, /flex:\s*0 0 7px/);
-  assert.match(mediaIconRule, /justify-content:\s*center/);
-  assert.match(siteTopRule, /margin-bottom:\s*6px/);
-  assert.doesNotMatch(css, /--site-media-label-shift/);
+  assert.match(source, /site-card management-site-row/);
+  assert.match(source, /management-site-identity/);
+  assert.match(source, /data-site-drag-handle/);
+  assert.match(css, /management-site-list\.sites-grid[^}]*display:\s*block/s);
+  assert.match(css, /\.site-drag-handle[^}]*touch-action:\s*none/s);
+  assert.match(css, /@media \(max-width: 768px\)/);
+  assert.doesNotMatch(css, /(?:height|max-height):\s*100(?:vh|dvh)/);
 });
 
-test('site identity icons stay circular and transparent in cards and dashboard rows', () => {
+test('site identity icons remain supported in site cards and console rows', () => {
   const dashboard = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'dashboard.js'), 'utf8');
   const sites = loadSitesSource();
   const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
@@ -223,17 +198,7 @@ test('site identity icons stay circular and transparent in cards and dashboard r
   assert.match(dashboard, /dashboard-site-identity/);
   assert.match(css, /\.site-icon\s*\{[\s\S]*?border-radius:\s*50%;[\s\S]*?background:\s*transparent;/);
   assert.match(css, /\.site-icon-button\s*\{[\s\S]*?width:\s*60px;[\s\S]*?background:\s*transparent;/);
-  assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?align-items:\s*center;/);
-  assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?justify-content:\s*center;/);
-  assert.match(css, /\.dashboard-site-identity\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*54px\s+minmax\(0,\s*1fr\);/);
-  assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?justify-self:\s*center;/);
-  assert.match(dashboard, /dashboard-site-column-heading[\s\S]*?站点/);
-  assert.match(css, /\.dashboard-site-column-heading\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*54px\s+minmax\(0,\s*1fr\);[\s\S]*?gap:\s*12px;/);
-  assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?text-align:\s*left;/);
-  assert.match(css, /\.dashboard-site-identity \.dashboard-site-icon\s*\{[\s\S]*?width:\s*42px;[\s\S]*?background:\s*transparent;/);
-  assert.match(css, /\.dashboard-site-status table\s*\{[\s\S]*?min-width:\s*980px;[\s\S]*?table-layout:\s*auto;/);
-  assert.match(css, /\.dashboard-site-status table th:first-child,[\s\S]*?\.dashboard-site-status table td:first-child\s*\{[\s\S]*?min-width:\s*210px;/);
-  assert.match(css, /\.dashboard-site-status table th:nth-child\(2\),[\s\S]*?\.dashboard-site-status table td:nth-child\(2\)\s*\{[\s\S]*?white-space:\s*nowrap;/);
+  assert.match(dashboard, /bindDashboardSiteIconFallbacks\(tbody\)/);
 });
 
 test('advanced settings keep cache and account limits in separate vertical columns', () => {

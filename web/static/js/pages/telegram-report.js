@@ -11,97 +11,32 @@ function renderTelegramReport() {
   if (!page) return;
   telegramReportLoaded = false;
   setTelegramReportButtonsPending(true);
-  page.innerHTML = `
-    <div class="settings-layout fade-up">
-      ${globalSettingsNav('telegram')}
-      <main class="settings-content"><div class="telegram-report-layout">
-      <section class="telegram-report-card fade-up">
-        <div class="telegram-report-card-head">
-          <div>
-            <h2>Telegram 定时日报</h2>
-            <p>每天或每周自动汇总 Meridian 的请求与流量数据。</p>
-          </div>
-          <label class="telegram-switch">
-            <input type="checkbox" id="telegram-report-enabled">
-            <span aria-hidden="true"></span>
-            <strong>启用通知</strong>
-          </label>
-        </div>
-
-        <div class="telegram-secret-warning" id="telegram-secret-warning" hidden>
-          当前 JWT_SECRET 为临时值，服务重启后将无法解密 Bot Token。请先固定 JWT_SECRET。
-        </div>
-
-        <div class="telegram-report-form-grid">
-          <label class="telegram-field telegram-field-wide">
-            <span>Bot Token</span>
-            <input class="form-input mono" type="text" id="telegram-bot-token" autocomplete="off" placeholder="Telegram Bot Token">
-            <small id="telegram-token-state">尚未配置</small>
-          </label>
-          <label class="telegram-field telegram-field-wide">
-            <span>Chat ID</span>
-            <input class="form-input" type="text" id="telegram-chat-id" autocomplete="off" placeholder="个人、群组或频道 Chat ID">
-            <small>机器人需要拥有向目标会话发送消息的权限。</small>
-          </label>
-          <label class="telegram-field">
-            <span>通知频率</span>
-            <select class="form-input" id="telegram-frequency">
-              <option value="daily">每天</option>
-              <option value="weekly">每周</option>
-            </select>
-            <small>每天会在设定时间发送；选择每周后，再按指定星期发送。</small>
-          </label>
-          <label class="telegram-field" id="telegram-weekday-field" hidden>
-            <span>每周发送日</span>
-            <select class="form-input" id="telegram-weekday">
-              <option value="1">星期一</option><option value="2">星期二</option>
-              <option value="3">星期三</option><option value="4">星期四</option>
-              <option value="5">星期五</option><option value="6">星期六</option>
-              <option value="0">星期日</option>
-            </select>
-          </label>
-          <label class="telegram-field">
-            <span>流量预警阈值</span>
-            <input class="form-input" type="number" id="telegram-traffic-warning" min="0" max="100" step="1" inputmode="numeric" value="80">
-            <small>节点或站点已用流量达到该百分比时，会<strong>立即单独推送一条预警</strong>；之后每再涨 5%（如 80→85→90）再提醒一次，同一档位不重复。填 0 关闭预警。</small>
-          </label>
-          <label class="telegram-field">
-            <span>发送时间</span>
-            <input class="form-input" type="time" id="telegram-schedule-time" value="20:00">
-            <small>默认使用北京时间（UTC+8），可在“全局设置 → 系统 UI”中调整调度时区。</small>
-          </label>
-        </div>
-
-        <div class="telegram-report-actions">
-          <button class="telegram-btn secondary" type="button" id="telegram-test">发送测试日报</button>
-          <button class="telegram-btn primary" type="button" id="telegram-save">保存设置</button>
-        </div>
-      </section>
-
-      <aside class="telegram-report-card telegram-report-preview fade-up stagger-1">
-        <div class="telegram-report-card-head compact">
-          <div><h2>日报内容</h2><p>通知会自动包含以下统计。</p></div>
-        </div>
-        <div class="telegram-report-items">
-          <div><span>01</span><p><strong>今日概览</strong><small>请求总数、视频请求、站点数量、活跃时段与最热媒体库</small></p></div>
-          <div><span>02</span><p><strong>服务器部署信息</strong><small>各落地节点的今日流量、当月用量与剩余额度（与面板同口径）</small></p></div>
-          <div><span>03</span><p><strong>客户端分布</strong><small>访问次数最高的前 5 个客户端及占比（不含版本号）</small></p></div>
-          <div><span>04</span><p><strong>流量统计</strong><small>当天、七天内、当月流量（按面板流量周期）与计费口径</small></p></div>
-          <div><span>05</span><p><strong>今日站点热度 TOP 5</strong><small>当日流量最高的前 5 个站点及请求次数</small></p></div>
-          <div><span>06</span><p><strong>流量预警</strong><small>用量触及阈值百分比的节点与站点（阈值可调）</small></p></div>
-          <div><span>07</span><p><strong>保号提醒</strong><small>开启保号的站点完成状态与剩余天数</small></p></div>
-          <div><span>08</span><p><strong>阈值预警（单独推送）</strong><small>用量达到阈值时立刻单独发一条，不占用日报；每再涨 5% 提醒一次</small></p></div>
-        </div>
-      </aside></div></main>
-    </div>`;
-
+  page.innerHTML = settingsPageFrame('telegram', 'Telegram 通知', '配置请求与流量日报，以及额度预警。', `
+    <section class="console-panel settings-panel telegram-settings-panel"><header><h2>通知设置</h2><label class="settings-check telegram-enable"><input type="checkbox" id="telegram-report-enabled"><span>启用通知</span></label></header>
+      <div class="telegram-secret-warning" id="telegram-secret-warning" hidden>当前 JWT_SECRET 为临时值，服务重启后将无法解密 Bot Token。请先固定 JWT_SECRET。</div>
+      <div class="settings-load-error telegram-load-error" id="telegram-load-error" role="alert" hidden><span id="telegram-error-message"></span><button type="button" class="console-button" id="telegram-retry">重新读取</button></div>
+      <fieldset class="settings-form-section"><legend>连接目标</legend><div class="settings-grid telegram-report-form-grid">
+        <label class="settings-field telegram-field"><span>Bot Token</span><div><input class="form-input mono" type="text" id="telegram-bot-token" autocomplete="off" placeholder="Telegram Bot Token"></div><small id="telegram-token-state">正在读取…</small></label>
+        <label class="settings-field telegram-field"><span>Chat ID</span><div><input class="form-input" type="text" id="telegram-chat-id" autocomplete="off" placeholder="个人、群组或频道 Chat ID"></div><small>机器人需要目标会话的消息发送权限。</small></label>
+      </div></fieldset>
+      <fieldset class="settings-form-section"><legend>发送计划</legend><div class="settings-grid telegram-report-form-grid">
+        <label class="settings-field telegram-field"><span>通知频率</span><div><select class="form-input" id="telegram-frequency"><option value="daily">每天</option><option value="weekly">每周</option></select></div></label>
+        <label class="settings-field telegram-field" id="telegram-weekday-field" hidden><span>每周发送日</span><div><select class="form-input" id="telegram-weekday"><option value="1">星期一</option><option value="2">星期二</option><option value="3">星期三</option><option value="4">星期四</option><option value="5">星期五</option><option value="6">星期六</option><option value="0">星期日</option></select></div></label>
+        <label class="settings-field telegram-field"><span>发送时间</span><div><input class="form-input" type="time" id="telegram-schedule-time" value="20:00"></div><small>调度时区由基础设置控制，默认 UTC+8。</small></label>
+        <label class="settings-field telegram-field"><span>流量预警阈值</span><div><input class="form-input" type="number" id="telegram-traffic-warning" min="0" max="100" step="1" inputmode="numeric" value="80"><em>%</em></div><small>触及阈值立即预警，之后每增加 5% 再提醒；同档位不重复。0 关闭预警。</small></label>
+      </div></fieldset>
+      <div class="settings-save-bar telegram-report-actions"><button class="console-button telegram-btn" type="button" id="telegram-test" disabled>发送测试日报</button><button class="console-button is-primary telegram-btn" type="button" id="telegram-save" disabled>保存设置</button></div>
+    </section>
+    <details class="console-panel settings-panel settings-disclosure telegram-report-preview"><summary><strong>日报会包含哪些内容</strong><span>概览、流量、客户端与保号提醒</span></summary><div class="settings-report-sections">
+      <div><strong>今日概览</strong><p>请求、视频请求、站点数量与活跃时段。</p></div><div><strong>服务器部署信息</strong><p>节点今日流量、当月用量与剩余额度。</p></div><div><strong>客户端分布</strong><p>访问次数最高的前 5 个客户端及占比。</p></div><div><strong>流量统计</strong><p>当天、七天与当前周期的计费流量。</p></div><div><strong>今日站点热度 TOP 5</strong><p>当日流量最高的站点及请求次数。</p></div><div><strong>流量预警</strong><p>用量触及预警阈值的节点与站点。</p></div><div><strong>保号提醒</strong><p>开启保号站点的完成状态与剩余天数。</p></div><div><strong>阈值预警（单独推送）</strong><p>阈值达到时立即推送，不占用定时日报。</p></div>
+    </div></details>`);
   bindGlobalSettingsNav(page);
   document.getElementById('telegram-frequency').onchange = updateTelegramFrequencyFields;
   document.getElementById('telegram-save').onclick = () => submitTelegramReport(false);
   document.getElementById('telegram-test').onclick = () => submitTelegramReport(true);
+  document.getElementById('telegram-retry').onclick = loadTelegramReportSettings;
   loadTelegramReportSettings();
 }
-
 function updateTelegramFrequencyFields() {
   const weekly = document.getElementById('telegram-frequency').value === 'weekly';
   const field = document.getElementById('telegram-weekday-field');
@@ -124,6 +59,8 @@ function setTelegramReportButtonsPending(pending) {
 }
 
 async function loadTelegramReportSettings() {
+  const errorPanel = document.getElementById('telegram-load-error');
+  const errorMessage = document.getElementById('telegram-error-message');
   try {
     const settings = await API.getTelegramReportSettings();
     if (!settings || Router.current !== 'telegram-report') return;
@@ -139,6 +76,7 @@ async function loadTelegramReportSettings() {
       ? 'Bot Token 已保存并持续显示'
       : '尚未配置 Bot Token';
     document.getElementById('telegram-secret-warning').hidden = settings.secret_stable !== false;
+    if (errorPanel) errorPanel.hidden = true;
     // Only once every field holds the server value may a click be accepted.
     telegramReportLoaded = true;
     updateTelegramFrequencyFields();
@@ -148,6 +86,8 @@ async function loadTelegramReportSettings() {
     // buttons deliberately stay clickable so the operator can retry after the
     // read succeeds; submitTelegramReport explains the refusal.
     telegramReportLoaded = false;
+    if (errorPanel) errorPanel.hidden = false;
+    if (errorMessage) errorMessage.textContent = '读取失败：' + error.message;
     Toast.error('读取 Telegram 日报设置失败：' + error.message);
   }
 }

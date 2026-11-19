@@ -116,3 +116,39 @@ test('positionDraggedSiteCard makes the floating card follow the pointer', () =>
   assert.equal(card.style.top, '350px');
   assert.equal(card.style.transform, 'translate3d(0, 0, 0)');
 });
+
+test('keyboard reorder saves the complete order and keeps focus on the handle', async () => {
+  let saved;
+  let focused = false;
+  const handlers = {};
+  const ordered = [1, 2].map(id => ({
+    dataset: { siteId: String(id) },
+    querySelector() {
+      return {
+        disabled: false,
+        addEventListener(name, fn) { if (id === 1) handlers[name] = fn; },
+        focus() { focused = true; },
+      };
+    },
+  }));
+  ordered.forEach(card => Object.defineProperty(card, 'nextSibling', { get() { return ordered[ordered.indexOf(card) + 1] || null; } }));
+  const grid = {
+    dataset: {},
+    classList: { add() {}, remove() {} },
+    querySelectorAll() { return ordered; },
+    insertBefore(card, reference) {
+      ordered.splice(ordered.indexOf(card), 1);
+      ordered.splice(reference ? ordered.indexOf(reference) : ordered.length, 0, card);
+    },
+  };
+  const sandbox = loadSiteOrderingSandbox({
+    window: { addEventListener() {}, removeEventListener() {} },
+    API: { async reorderSites(ids) { saved = Array.from(ids); } },
+    Toast: { success() {}, error() {} },
+  });
+  sandbox.setupSiteSorting(grid);
+  handlers.keydown({ key: 'ArrowDown', preventDefault() {} });
+  await Promise.resolve();
+  assert.deepEqual(saved, [2, 1]);
+  assert.equal(focused, true);
+});

@@ -63,7 +63,7 @@ test('audit: a 正在观看 card resolves its delete target from the live collec
   const page = source('web/static/js/pages/watch-history.js');
   assert.match(
     page,
-    /watchHistoryDeleteItem\(watchHistoryItemsForSource\(card\.dataset\.historySource\)\[index\]\)/,
+    /const item = watchHistoryItemsForSource\(card\.dataset\.historySource\)\[index\];[\s\S]*?watchHistoryDeleteItem\(item\)/,
     'the delete handler must resolve the collection from the card source',
   );
   assert.doesNotMatch(

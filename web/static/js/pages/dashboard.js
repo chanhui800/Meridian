@@ -36,6 +36,80 @@ let dashboardRealtimeLastRecoveryMS = 0;
 const dashboardRealtimeStorageKey = 'meridian.dashboard.realtime-trends.v1';
 let dashboardLastSnapshotMS = 0;
 let dashboardLastObservedSiteCount = -1;
+let dashboardConsoleMetric = 'speed';
+let dashboardConsoleQuery = '';
+let dashboardConsoleExpandedSites = new Set();
+
+function dashboardSelectConsoleMetric(metric, focus = false) {
+  if (!['speed', 'requests', 'traffic'].includes(metric)) return;
+  dashboardConsoleMetric = metric;
+  ['speed', 'requests', 'traffic'].forEach(key => {
+    const tab = document.getElementById(`console-tab-${key}`);
+    const panel = document.getElementById(`console-chart-${key}`);
+    if (tab) {
+      tab.setAttribute('aria-selected', String(key === metric));
+      tab.tabIndex = key === metric ? 0 : -1;
+      if (key === metric && focus) tab.focus();
+    }
+    if (panel) panel.hidden = key !== metric;
+  });
+  drawDashboardTrendChart(metric);
+}
+
+function setupDashboardConsoleControls() {
+  const metrics = ['speed', 'requests', 'traffic'];
+  metrics.forEach((metric, index) => {
+    const tab = document.getElementById(`console-tab-${metric}`);
+    if (!tab) return;
+    tab.onclick = () => dashboardSelectConsoleMetric(metric);
+    tab.onkeydown = event => {
+      const next = event.key === 'ArrowRight' ? metrics[(index + 1) % metrics.length]
+        : event.key === 'ArrowLeft' ? metrics[(index + metrics.length - 1) % metrics.length]
+        : event.key === 'Home' ? metrics[0] : event.key === 'End' ? metrics.at(-1) : null;
+      if (next) { event.preventDefault(); dashboardSelectConsoleMetric(next, true); }
+    };
+  });
+  const search = document.getElementById('console-site-search');
+  if (search) search.oninput = () => {
+    dashboardConsoleQuery = search.value.trim().toLocaleLowerCase();
+    renderDashboardTableRows();
+  };
+  const retrySites = document.getElementById('console-bootstrap-retry');
+  const retryTrends = document.getElementById('console-trend-retry');
+  if (retrySites) retrySites.onclick = () => { void loadDashboardBootstrap(); };
+  if (retryTrends) retryTrends.onclick = () => { void loadDashboardTrends(); };
+  const sites = document.getElementById('dash-table');
+  if (sites) sites.addEventListener('toggle', event => {
+    if (event.target?.isConnected === false) return;
+    const siteID = Number(event.target?.dataset?.consoleSite);
+    if (!siteID) return;
+    if (event.target.open) dashboardConsoleExpandedSites.add(siteID);
+    else dashboardConsoleExpandedSites.delete(siteID);
+  }, true);
+}
+
+function dashboardUpdateConsoleRates() {
+  const downEl = document.getElementById('console-current-download');
+  const upEl = document.getElementById('console-current-upload');
+  if (!downEl && !upEl) return;
+  let down = 0, up = 0, unavailable = false;
+  dashboardSites.forEach(site => {
+    if (!site.running) return;
+    const speed = site._liveSpeed;
+    const gaugeReceived = Number(site.agent_rate_received_at_ms || site.agent_received_at_ms || 0);
+    const snapshotMS = dashboardLastSnapshotMS || Date.now();
+    const agentGaugeUnavailable = Number(site.agent_received_at_ms || 0) > 0 &&
+      (site.agent_rate_valid !== true || gaugeReceived <= 0 || snapshotMS < gaugeReceived || snapshotMS - gaugeReceived > 6000);
+    if (!speed || agentGaugeUnavailable) {
+      unavailable = true;
+      return;
+    }
+    down += Math.max(0, Number(speed.down || 0));
+    up += Math.max(0, Number(speed.up || 0));
+  });
+  if (downEl) downEl.textContent = unavailable ? '暂不可用' : formatRate(down);
+  if (upEl) upEl.textContent = unavailable ? '等待实时采样' : `上传 ${formatRate(up)}`;
+}
 
 function dashboardCreateAbortController() {
   if (typeof AbortController === 'function') return new AbortController();
@@ -45,108 +119,73 @@ function dashboardCreateAbortController() {
 
 function renderDashboard() {
   const page = document.getElementById('page-dashboard');
+  dashboardConsoleMetric = 'speed';
+  dashboardConsoleQuery = '';
+  dashboardConsoleExpandedSites = new Set();
   page.innerHTML = `
-    <h1 class="section-title fade-up">仪表盘</h1>
-    <p class="section-sub fade-up stagger-1">Emby 反代服务运行概览 <span class="live-indicator" id="sse-status">● 实时</span></p>
-    <div class="form-help fade-up stagger-1" style="margin:-4px 0 18px">当前面板域名：<span class="mono" id="s-panel-domain">—</span></div>
-    <div class="stats-row" id="dash-stats">
-      <div class="stat-card c-blue fade-up stagger-1">
-        <div class="stat-icon-wrap blue">
-          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        </div>
-        <div class="stat-number" id="s-total">—</div>
-        <div class="stat-title">站点总数</div>
+    <div class="console-page">
+      <header class="console-heading">
+        <div><div class="console-eyebrow">Meridian / overview</div><h1>仪表盘</h1><p class="console-lead">站点运行情况与流量变化，一目了然。</p></div>
+        <div class="console-heading-actions"><span class="console-status" id="sse-status">正在连接</span><a class="console-button" href="#sites">管理站点<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a></div>
+      </header>
+      <section class="console-metrics" aria-label="运行摘要">
+        <div class="console-metric"><div class="console-metric-label">运行站点</div><div class="console-metric-value"><strong id="s-running">—</strong><span class="console-metric-fraction">/ <span id="s-total">—</span></span></div><div class="console-metric-note">已启用的反代入口</div></div>
+        <div class="console-metric"><div class="console-metric-label" id="s-traffic-title">已用流量</div><div class="console-metric-value" id="s-traffic">—</div><div class="console-metric-note" id="console-cycle-label">当前计费周期</div></div>
+        <div class="console-metric"><div class="console-metric-label">累计请求</div><div class="console-metric-value" id="s-requests">—</div><div class="console-metric-note">全部站点</div></div>
+        <div class="console-metric"><div class="console-metric-label">当前下载</div><div class="console-metric-value" id="console-current-download">—</div><div class="console-metric-note" id="console-current-upload">上传 —</div></div>
+      </section>
+      <div class="console-load-error" id="console-bootstrap-error" role="alert" hidden><span>站点信息暂时无法读取，稍后重试。</span><button type="button" class="console-button" id="console-bootstrap-retry">重新读取</button></div>
+      <div class="console-dashboard-body">
+        <section class="console-panel" aria-label="数据趋势">
+          <div class="console-panel-heading console-trend-head"><div><h2>流量与访问</h2><p>同一时间窗口，查看不同维度</p></div><div class="console-trend-filters">
+            <label><span class="sr-only">站点</span><select id="dashboard-trend-site" class="form-select" aria-label="选择趋势站点"><option value="all">全部站点</option></select></label>
+            <label><span class="sr-only">时间</span><select id="dashboard-trend-range" class="form-select" aria-label="选择趋势时间范围"><option value="realtime">实时 · 5 分钟</option><option value="hour">过去 1 小时</option><option value="6h">过去 6 小时</option><option value="day">过去 1 天</option><option value="7d">过去 7 天</option><option value="month">本月</option><option value="custom">自定义时间</option></select></label>
+          </div></div>
+          <div class="dashboard-trend-custom" id="dashboard-trend-custom" hidden>
+            <label>开始时间<input type="datetime-local" id="dashboard-trend-start" class="form-input" step="60" aria-label="趋势开始时间"></label><span class="dashboard-trend-custom-separator" aria-hidden="true">至</span>
+            <label>结束时间<input type="datetime-local" id="dashboard-trend-end" class="form-input" step="60" aria-label="趋势结束时间"></label><button type="button" class="console-button is-primary" id="dashboard-trend-apply">应用</button>
+          </div>
+          <div class="console-trend-error" id="dashboard-trend-custom-error" role="alert" hidden></div>
+          <div class="console-load-error" id="console-trend-load-error" role="alert" hidden><span>趋势暂时无法读取，已保留当前数据。</span><button type="button" class="console-button" id="console-trend-retry">重试</button></div>
+          <div class="console-trend-loading" id="console-trend-loading" role="status">正在读取趋势…</div>
+          <div class="console-trend-tabs" role="tablist" aria-label="趋势指标">
+            <button type="button" class="console-trend-tab" id="console-tab-speed" role="tab" aria-controls="console-chart-speed" aria-selected="true" tabindex="0" data-console-metric="speed">网速</button>
+            <button type="button" class="console-trend-tab" id="console-tab-requests" role="tab" aria-controls="console-chart-requests" aria-selected="false" tabindex="-1" data-console-metric="requests">请求</button>
+            <button type="button" class="console-trend-tab" id="console-tab-traffic" role="tab" aria-controls="console-chart-traffic" aria-selected="false" tabindex="-1" data-console-metric="traffic">计费流量</button>
+          </div>
+          <section class="console-chart" id="console-chart-speed" role="tabpanel" aria-labelledby="console-tab-speed" data-dashboard-chart="speed">
+            <div class="console-chart-heading"><span class="dashboard-trend-unit">所选时间内峰值</span><strong class="dashboard-trend-summary" id="dashboard-speed-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardSpeedTrend" aria-label="下载和上传速度趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="download"></i>下载</span><span><i class="upload"></i>上传</span></div>
+          </section>
+          <section class="console-chart" id="console-chart-requests" role="tabpanel" aria-labelledby="console-tab-requests" data-dashboard-chart="requests" hidden>
+            <div class="console-chart-heading"><span class="dashboard-trend-unit">所选时间内请求</span><strong class="dashboard-trend-summary" id="dashboard-requests-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardRequestsTrend" aria-label="请求次数趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="requests"></i>请求次数</span></div>
+          </section>
+          <section class="console-chart" id="console-chart-traffic" role="tabpanel" aria-labelledby="console-tab-traffic" data-dashboard-chart="traffic" hidden>
+            <div class="console-chart-heading"><span class="dashboard-trend-unit" id="dashboard-traffic-unit">所选时间内计费流量</span><strong class="dashboard-trend-summary" id="dashboard-traffic-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardTrafficTrend" aria-label="计费流量趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="traffic"></i>计费流量</span></div>
+          </section>
+          <div class="console-trend-help" id="dashboard-trend-help">数据时间 <span id="dashboard-trend-timezone">UTC+08:00</span></div>
+        </section>
+        <section class="console-panel" aria-label="站点运行状态">
+          <div class="console-panel-heading"><div><h2>站点状态</h2><p>展开站点可查看入口与回源信息</p></div><label><span class="sr-only">搜索站点</span><input class="console-site-search" type="search" id="console-site-search" placeholder="搜索站点" autocomplete="off"></label></div>
+          <div class="console-sites-head" aria-hidden="true"><span>站点</span><span>状态</span><span>实时网速</span><span style="text-align:right">已用流量</span><span></span></div>
+          <div id="dash-table"><div class="console-empty">正在读取站点…</div></div>
+        </section>
       </div>
-      <div class="stat-card c-green fade-up stagger-2">
-        <div class="stat-icon-wrap green">
-          <svg viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        </div>
-        <div class="stat-number" id="s-running">—</div>
-        <div class="stat-title">运行中</div>
-      </div>
-      <div class="stat-card c-teal fade-up stagger-3">
-        <div class="stat-icon-wrap teal">
-          <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        </div>
-      <div class="stat-number" id="s-traffic">0 B</div>
-		<div class="stat-title" id="s-traffic-title">已用流量</div>
-      </div>
-      <div class="stat-card c-orange fade-up stagger-4">
-        <div class="stat-icon-wrap orange">
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        </div>
-        <div class="stat-number" id="s-uptime">—</div>
-        <div class="stat-title">运行时长</div>
-      </div>
-      <div class="stat-card c-purple fade-up stagger-5">
-        <div class="stat-icon-wrap purple">
-          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
-        </div>
-        <div class="stat-number" id="s-cache">0 B</div>
-        <div class="stat-title">累计缓存</div>
-      </div>
-    </div>
-    <div class="dashboard-trend-toolbar fade-up stagger-4">
-      <div>
-        <div class="glass-card-title">数据趋势</div>
-        <div class="dashboard-trend-help" id="dashboard-trend-help">默认显示全部站点；“本月”按自然月 1 日至当前时间统计 · 数据时间 <span id="dashboard-trend-timezone">UTC+08:00</span></div>
-      </div>
-      <div class="dashboard-trend-controls">
-        <label>站点<select id="dashboard-trend-site" class="form-select" aria-label="选择趋势站点"><option value="all">全部站点</option></select></label>
-        <label>时间<select id="dashboard-trend-range" class="form-select" aria-label="选择趋势时间范围">
-          <option value="realtime">实时</option><option value="hour">1 小时</option><option value="6h">6 小时</option><option value="day">1 天</option><option value="7d">7 天</option><option value="month">本月</option><option value="custom">自定义</option>
-        </select></label>
-        <div class="dashboard-trend-custom" id="dashboard-trend-custom" hidden>
-          <label>开始时间<input type="datetime-local" id="dashboard-trend-start" class="form-input" step="60" aria-label="趋势开始时间"></label>
-          <span class="dashboard-trend-custom-separator" aria-hidden="true">至</span>
-          <label>结束时间<input type="datetime-local" id="dashboard-trend-end" class="form-input" step="60" aria-label="趋势结束时间"></label>
-          <button type="button" class="btn btn-primary dashboard-trend-apply" id="dashboard-trend-apply">应用</button>
-        </div>
-      </div>
-      <div class="dashboard-trend-custom-error" id="dashboard-trend-custom-error" role="alert" aria-live="polite" hidden></div>
-    </div>
-    <div class="dashboard-trend-grid fade-up stagger-4">
-      <section class="dashboard-trend-card" data-dashboard-chart="speed"><div class="glass-card-header"><div><div class="glass-card-title">速度</div><span class="dashboard-trend-unit">时间范围峰值</span></div><strong class="dashboard-trend-summary" id="dashboard-speed-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardSpeedTrend" aria-label="速度趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="download"></i>下载</span><span><i class="upload"></i>上传</span></div></section>
-      <section class="dashboard-trend-card" data-dashboard-chart="requests"><div class="glass-card-header"><div><div class="glass-card-title">请求</div><span class="dashboard-trend-unit">时间范围总数</span></div><strong class="dashboard-trend-summary" id="dashboard-requests-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardRequestsTrend" aria-label="请求趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="requests"></i>请求次数</span></div></section>
-      <section class="dashboard-trend-card" data-dashboard-chart="traffic"><div class="glass-card-header"><div><div class="glass-card-title">流量</div><span class="dashboard-trend-unit" id="dashboard-traffic-unit">计费流量总数</span></div><strong class="dashboard-trend-summary" id="dashboard-traffic-summary">—</strong></div><div class="dashboard-trend-wrap"><canvas id="dashboardTrafficTrend" aria-label="流量趋势图"></canvas><div class="dashboard-chart-tooltip" hidden></div></div><div class="dashboard-trend-legend"><span><i class="traffic"></i>计费流量</span></div></section>
-    </div>
-    <div class="dashboard-insights-grid fade-up stagger-5">
-      <section class="dashboard-insight-card" id="dashboard-log-health"><div class="dashboard-insight-head"><h2>日志写入</h2><span class="dashboard-health-dot is-disabled" aria-hidden="true"></span></div><p>正在读取…</p></section>
-      <section class="dashboard-insight-card" id="dashboard-schedule-health"><div class="dashboard-insight-head"><h2>定时任务</h2><span class="dashboard-health-dot is-disabled" aria-hidden="true"></span></div><p>正在读取…</p></section>
-    </div>
-    <div class="glass-card dashboard-site-status fade-up stagger-5">
-      <div class="glass-card-header">
-        <div class="glass-card-title"><span class="live-dot"></span>站点实时状态</div>
-        <div class="glass-card-title" style="font-size:.72rem;color:var(--white-38)" id="s-requests">0 请求</div>
-      </div>
-      <div style="overflow-x:auto">
-        <table>
-          <thead><tr>
-            <th><span class="dashboard-site-column-heading"><span aria-hidden="true"></span><span>站点</span></span></th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>实时网速</th><th>已用流量</th><th>缓存大小</th>
-          </tr></thead>
-          <tbody id="dash-table"></tbody>
-        </table>
-      </div>
-    </div>
-  `;
+      <details class="console-system"><summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg><span>系统状态</span><span class="console-system-meta">运行 <span id="s-uptime">—</span> · 缓存 <span id="s-cache">—</span></span></summary>
+        <div class="console-system-grid"><section id="dashboard-log-health"><div class="dashboard-insight-head"><h2>日志写入</h2><span class="dashboard-health-dot is-disabled" aria-hidden="true"></span></div><p>正在读取…</p></section><section id="dashboard-schedule-health"><div class="dashboard-insight-head"><h2>定时任务</h2><span class="dashboard-health-dot is-disabled" aria-hidden="true"></span></div><p>正在读取…</p></section></div>
+      </details>
+      <footer class="console-page-foot"><span>面板入口 <span id="s-panel-domain" class="console-mono">—</span></span><span>Meridian · 服务控制台</span></footer>
+    </div>`;
 
   startDashSSE();
-  // The periodic refreshes are owned by this page render. stopDashSSE() runs on
-  // every entry (and on teardown), so an app-level one-shot call at login cannot
-  // keep them alive: without this, navigating away and back left the cache card,
-  // the insight cards and every non-SSE site column frozen for the rest of the
-  // session, because app.js only calls startDashboardRefreshTimers() once.
   startDashboardRefreshTimers();
   restoreDashboardRealtimeSamples();
   setupDashboardTrendControls();
+  setupDashboardConsoleControls();
   observeDashboardTrendResize();
   void loadDashboardBootstrap();
   const deferTrends = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : fn => setTimeout(fn, 0);
-  deferTrends(() => {
-    if (Router.current === 'dashboard') void loadDashboardTrends();
-  });
+  deferTrends(() => { if (Router.current === 'dashboard') void loadDashboardTrends(); });
 }
-
 function applyDashboardInsights(insights) {
   if (!insights || Router.current !== 'dashboard') return;
   const setHealthState = (id, state) => {
@@ -177,6 +216,8 @@ function reconcileDashboardTrendSiteSelection() {
 
 async function loadDashboardBootstrap() {
   if (dashboardBootstrapPromise) return dashboardBootstrapPromise;
+  const loadError = document.getElementById('console-bootstrap-error');
+  if (loadError) loadError.hidden = true;
   dashboardBootstrapAbortController = dashboardCreateAbortController();
   const signal = dashboardBootstrapAbortController.signal;
   dashboardBootstrapPromise = API.dashboardBootstrap(signal).then(data => {
@@ -199,8 +240,12 @@ async function loadDashboardBootstrap() {
     return data;
   }).catch(error => {
     if (error && error.name === 'AbortError') return null;
+    if (signal.aborted || Router.current !== 'dashboard') return null;
     console.warn('Dashboard bootstrap load error', error);
-    throw error;
+    if (loadError) loadError.hidden = false;
+    const sites = document.getElementById('dash-table');
+    if (sites && !dashboardSitesInitialized) sites.innerHTML = '<div class="console-empty">暂时无法读取站点信息</div>';
+    return null;
   }).finally(() => {
     if (dashboardBootstrapAbortController?.signal === signal) {
       dashboardBootstrapAbortController = null;
@@ -1085,15 +1130,15 @@ function dashboardUpdateTrendHelp(resetEnabled, telemetry) {
   const help = document.getElementById('dashboard-trend-help');
   if (!help) return;
   const prefix = resetEnabled
-    ? '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量按全局重置日统计'
-    : '默认显示全部站点；“本月”为自然月 1 日至当前时间，已用流量累计不重置';
+    ? '“本月”按自然月统计；已用流量按重置周期统计'
+    : '“本月”按自然月统计；已用流量不自动重置';
   const agentSites = Number(telemetry?.agent_sites || 0);
   const staleSites = Number(telemetry?.stale_sites || 0);
   let telemetryLabel = '';
   if (agentSites > 0) {
     telemetryLabel = staleSites > 0
       ? ` · Agent 实时数据 ${staleSites}/${agentSites} 个站点暂不可用`
-      : ` · Agent 实时数据正常（${agentSites} 个站点）`;
+      : '';
   }
   help.textContent = `${prefix}${telemetryLabel} · 数据时间 `;
   const timezone = document.createElement('span');
@@ -1424,6 +1469,8 @@ function drawDashboardTrendChart(metric) {
   const chart = dashboardTrendCharts.get(metric);
   const rawPoints = dashboardTrendChartPoints();
   if (!chart || !chart.canvas || !chart.canvas.getContext || !rawPoints.length) return;
+  const panel = document.getElementById(`console-chart-${metric}`);
+  if (panel?.hidden) return;
   const canvas = chart.canvas;
   const wrap = canvas.parentElement;
   const width = Math.max(220, wrap.clientWidth || 320);
@@ -1432,6 +1479,12 @@ function drawDashboardTrendChart(metric) {
   canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
   canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
   const ctx = canvas.getContext('2d');
+  const theme = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(canvas) : null;
+  const chartAccent = theme?.getPropertyValue('--console-accent').trim() || '#148267';
+  const chartMuted = theme?.getPropertyValue('--console-muted').trim() || '#61716a';
+  const chartLine = theme?.getPropertyValue('--console-line').trim() || '#e2e8e3';
+  const chartSecondary = theme?.getPropertyValue('--console-chart-secondary').trim() || '#91aab6';
+  const chartLabel = theme?.getPropertyValue('--console-chart-label').trim() || '#236953';
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
   const preliminaryLeft = Math.min(74, Math.floor(width * .36));
@@ -1441,8 +1494,8 @@ function drawDashboardTrendChart(metric) {
   const renderValues = dashboardTrendRenderSeries(points, metric);
   if (metric === 'speed') dashboardTrendSpeedSummary(renderValues);
   const series = metric === 'speed'
-    ? [{ values: renderValues[0], color: '#3b9cff' }, { values: renderValues[1], color: '#a78bfa' }]
-    : [{ values: renderValues[0], color: metric === 'requests' ? '#3b82f6' : '#10b981' }];
+    ? [{ values: renderValues[0], color: chartAccent }, { values: renderValues[1], color: chartSecondary }]
+    : [{ values: renderValues[0], color: chartAccent }];
   const scaleValues = series.flatMap(item => item.values).filter(value => Number.isFinite(value));
   const scale = dashboardRequestScale(Math.max(0, ...scaleValues), metric);
   ctx.font = `${width < 360 ? 10 : 11}px system-ui`;
@@ -1469,9 +1522,9 @@ function drawDashboardTrendChart(metric) {
   for (let i = 0; i <= scale.ticks; i++) {
     const value = scale.max - scale.step * i;
     const y = top + plotH * i / scale.ticks;
-    ctx.strokeStyle = 'rgba(100,116,139,.18)'; ctx.lineWidth = 1;
+    ctx.strokeStyle = chartLine; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
-    ctx.textAlign = 'right'; ctx.fillStyle = '#64748b';
+    ctx.textAlign = 'right'; ctx.fillStyle = chartMuted;
     ctx.fillText(dashboardTrendValueLabel(value, metric), left - 7, y);
   }
   if (ctx.setLineDash) ctx.setLineDash([]);
@@ -1503,7 +1556,7 @@ function drawDashboardTrendChart(metric) {
     const point = pointsOnCanvas[chart.hoverIndex];
     ctx.beginPath(); ctx.arc(point.x, point.y, 4, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = canvasSeries[0].color; ctx.lineWidth = 2; ctx.stroke();
   }
-  ctx.fillStyle = '#64748b'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = chartMuted; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
   dashboardTimeLabelIndexes(points.length, plotW, dashboardTrendState.range, points, chartStartMS, chartEndMS).forEach(index => {
     const labelTimestamp = dashboardTrendAxisLabel(index, points, dashboardTrendState.range, chartStartMS, chartEndMS);
     const label = dashboardTrendTimeLabel(labelTimestamp, dashboardTrendState.range);
@@ -1531,7 +1584,7 @@ function drawDashboardTrendChart(metric) {
     const measureText = text => typeof ctx.measureText === 'function' ? ctx.measureText(text).width : String(text).length * 7;
     const yLabelWidth = Math.max(54, measureText(yLabel) + 18);
     const yLabelTop = Math.max(2, Math.min(height - 24, crosshairY - 12));
-    ctx.fillStyle = '#586ba7';
+    ctx.fillStyle = chartLabel;
     ctx.beginPath();
     dashboardRoundRect(ctx, 2, yLabelTop, yLabelWidth, 24, 5);
     ctx.fill();
@@ -1541,7 +1594,7 @@ function drawDashboardTrendChart(metric) {
     const xLabelWidth = Math.max(48, measureText(xLabel) + 18);
     const xLabelLeft = Math.max(left, Math.min(width - right - xLabelWidth, crosshairX - xLabelWidth / 2));
     const xLabelTop = height - bottom + 1;
-    ctx.fillStyle = '#586ba7';
+    ctx.fillStyle = chartLabel;
     ctx.beginPath();
     dashboardRoundRect(ctx, xLabelLeft, xLabelTop, xLabelWidth, 24, 5);
     ctx.fill();
@@ -1708,6 +1761,10 @@ async function loadDashboardTrends() {
   if (dashboardTrendAbortController) dashboardTrendAbortController.abort();
   dashboardTrendAbortController = dashboardCreateAbortController();
   const signal = dashboardTrendAbortController.signal;
+  const loadError = document.getElementById('console-trend-load-error');
+  const loading = document.getElementById('console-trend-loading');
+  if (loadError) loadError.hidden = true;
+  if (loading) loading.hidden = !!dashboardTrendData;
   const requestedEpoch = dashboardRealtimeEpoch;
   const requestedKey = String(dashboardTrendState.siteId);
   try {
@@ -1738,9 +1795,14 @@ async function loadDashboardTrends() {
     renderDashboardTrendCharts();
   } catch (error) {
     if (error && error.name === 'AbortError') return;
+    if (signal.aborted || Router.current !== 'dashboard') return;
     console.warn('Dashboard trends load error', error);
+    if (loadError) loadError.hidden = false;
   } finally {
-    if (dashboardTrendAbortController?.signal === signal) dashboardTrendAbortController = null;
+    if (dashboardTrendAbortController?.signal === signal) {
+      dashboardTrendAbortController = null;
+      if (loading) loading.hidden = true;
+    }
   }
 }
 
@@ -1803,7 +1865,7 @@ async function startFetchSSE() {
     if (!resp.ok) throw new Error('SSE failed');
     if (dashAbortController !== controller) return;
 
-    if (statusEl) statusEl.style.color = 'var(--green)';
+    if (statusEl) { statusEl.style.color = 'var(--console-accent, var(--green))'; statusEl.textContent = '实时连接'; }
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -1828,13 +1890,13 @@ async function startFetchSSE() {
     }
 
     if (!controller.signal.aborted && dashAbortController === controller && Router.current === 'dashboard') {
-      if (statusEl) statusEl.style.color = 'var(--red)';
+      if (statusEl) { statusEl.style.color = 'var(--red)'; statusEl.textContent = '连接中断'; }
       queueDashSSERetry();
     }
   } catch (e) {
     if (controller.signal.aborted || dashAbortController !== controller) return;
     console.warn('SSE connection lost, retrying in 5s...', e);
-    if (statusEl) statusEl.style.color = 'var(--red)';
+    if (statusEl) { statusEl.style.color = 'var(--red)'; statusEl.textContent = '正在重连'; }
     queueDashSSERetry();
   }
 }
@@ -1887,6 +1949,8 @@ function updateDashboardLive(stats) {
 	const resetEnabled = Number(stats.traffic_reset_day == null ? 1 : stats.traffic_reset_day) !== 0;
 	const trafficTitle = document.getElementById('s-traffic-title');
 	if (trafficTitle) trafficTitle.textContent = '已用流量';
+  const cycleLabel = document.getElementById('console-cycle-label');
+  if (cycleLabel) cycleLabel.textContent = resetEnabled ? `每月 ${Number(stats.traffic_reset_day || 1)} 日重置` : '累计流量 · 不自动重置';
   dashboardUpdateTrendHelp(resetEnabled, stats?.realtime_telemetry);
 
   const uptimeEl = document.getElementById('s-uptime');
@@ -1896,6 +1960,7 @@ function updateDashboardLive(stats) {
 	if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
   if (stats?.realtime_trend) dashboardControllerRealtimeEnabled = true;
 	updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
+  dashboardUpdateConsoleRates();
   if (metadata) dashboardApplyRealtimePacket(stats, metadata);
   else if (stats?.realtime_trend) dashboardAppendServerRealtimeTrendSample(stats.realtime_trend);
   updateDashboardTrendRealtime();
@@ -2327,13 +2392,22 @@ function bindDashboardSiteIconFallbacks(root) {
 function renderDashboardTableRows() {
   const tbody = document.getElementById('dash-table');
   if (!tbody) return;
+  if (typeof tbody.querySelectorAll === 'function') {
+    // Native toggle events are queued. Read the actual open state before an
+    // SSE or search redraw so a just-closed detail cannot reopen in that gap.
+    tbody.querySelectorAll('details[data-console-site]').forEach(detail => {
+      const siteID = Number(detail.dataset.consoleSite);
+      if (detail.open) dashboardConsoleExpandedSites.add(siteID);
+      else dashboardConsoleExpandedSites.delete(siteID);
+    });
+  }
   if (!dashboardSites.length) {
     if (!dashboardSitesInitialized) return;
     dashboardSpeedSamples.clear();
     dashboardLiveSpeeds.clear();
     dashboardLatestRatesBySite.clear();
     dashboardRealtimeTrendSiteSamples.clear();
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--white-38);padding:40px">暂无站点，前往站点管理添加</td></tr>';
+    tbody.innerHTML = '<div class="console-empty">暂无站点，<a href="#sites">前往站点管理添加</a></div>';
     return;
   }
   const known = new Set(dashboardSites.map(site => Number(site.id)));
@@ -2341,18 +2415,34 @@ function renderDashboardTableRows() {
     for (const siteID of map.keys()) if (!known.has(siteID)) map.delete(siteID);
   }
   for (const siteID of dashboardRealtimeTrendSiteSamples.keys()) if (!known.has(Number(siteID))) dashboardRealtimeTrendSiteSamples.delete(siteID);
-  tbody.innerHTML = dashboardSites.map(s => `
-      <tr>
-        <td><div class="dashboard-site-identity">${dashboardSiteIconMarkup(s)}<span class="dashboard-site-name">${esc(s.name)}</span></div></td>
-        <td><span class="status-badge"><span class="status-led ${s.running ? 'on' : 'off'}"></span>${s.running ? '运行中' : '已停止'}</span></td>
-        <td class="mono">${esc(s.target_url)}</td>
-        <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></td>
-        <td class="mono">${dashboardIngressLabel(s)}</td>
-		<td>${dashboardSpeedMarkup(s._liveSpeed)}</td>
-        <td>${formatBytes(s.monthly_traffic != null ? s.monthly_traffic : s.traffic_used)}</td>
-        <td>${formatBytes(s.cache_size_bytes)}</td>
-      </tr>
-    `).join('');
+  const visible = dashboardSites.filter(site => !dashboardConsoleQuery ||
+    `${site.name || ''} ${site.public_host || ''}`.toLocaleLowerCase().includes(dashboardConsoleQuery));
+  const focusedSite = Number(document.activeElement?.closest?.('[data-console-site]')?.dataset?.consoleSite);
+  tbody.innerHTML = visible.length ? visible.map(s => {
+    const unavailable = Number(s.agent_received_at_ms || 0) > 0 &&
+      (s.agent_rate_valid !== true || (dashboardLastSnapshotMS > 0 &&
+        dashboardLastSnapshotMS - Number(s.agent_rate_received_at_ms || s.agent_received_at_ms || 0) > 6000));
+    return `<details class="console-site" data-console-site="${Number(s.id)}" ${dashboardConsoleExpandedSites.has(Number(s.id)) ? 'open' : ''}>
+      <summary>
+        <span class="dashboard-site-identity">${dashboardSiteIconMarkup(s)}<span><span class="dashboard-site-name">${esc(s.name)}</span><small>${s.running ? '运行中' : '已停止'} · ${esc(s.public_host || '独立入口')}</small></span></span>
+        <span class="console-status ${s.running ? 'is-online' : ''}">${s.running ? '运行中' : '已停止'}</span>
+        <span class="console-site-rate">${unavailable && s.running ? '<span class="console-muted">实时数据暂不可用</span>' : dashboardSpeedMarkup(s._liveSpeed)}</span>
+        <span class="console-site-traffic">${formatBytes(s.monthly_traffic != null ? s.monthly_traffic : s.traffic_used)}</span>
+        <svg class="console-site-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+      </summary>
+      <dl class="console-site-detail">
+        <div class="console-site-detail-wide"><dt>回源地址</dt><dd class="console-mono">${esc(s.target_url || '—')}</dd></div>
+        <div class="console-site-detail-wide"><dt>入口</dt><dd class="console-mono">${dashboardIngressLabel(s)}</dd></div>
+        <div><dt>客户端标识</dt><dd>${esc(uaNameMap[s.ua_mode] || s.ua_mode || '—')}</dd></div>
+        <div><dt>缓存</dt><dd>${formatBytes(s.cache_size_bytes)}</dd></div>
+        <div><dt>已用流量</dt><dd>${formatBytes(s.monthly_traffic != null ? s.monthly_traffic : s.traffic_used)}</dd></div>
+        <div><dt>站点管理</dt><dd><a href="#sites">查看设置 →</a></dd></div>
+      </dl>
+    </details>`;
+  }).join('') : '<div class="console-empty">没有匹配的站点</div>';
+  if (focusedSite && typeof tbody.querySelector === 'function') {
+    tbody.querySelector(`[data-console-site="${focusedSite}"] > summary`)?.focus({ preventScroll: true });
+  }
   bindDashboardSiteIconFallbacks(tbody);
 }
 

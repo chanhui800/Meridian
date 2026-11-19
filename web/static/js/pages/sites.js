@@ -4,6 +4,8 @@ let siteSortingCleanup = null;
 let siteRefreshTimer = 0;
 let siteLoadGeneration = 0;
 let siteIconPack = { name: '', description: '', source_url: '', icons: [] };
+let siteManagementExpanded = new Set();
+let siteManagementLatency = new Map();
 
 function normalizeSiteIconPack(value) {
   const icons = Array.isArray(value && value.icons) ? value.icons.map(icon => ({
@@ -60,9 +62,9 @@ function renderSiteMediaLibraryCounts(site) {
     ['集', normalizedMediaLibraryCount(site && site.media_episode_count)],
   ];
   if (items.some(([, count]) => count === null)) {
-    return '<div class="site-media-counts is-pending"><span class="site-media-icon" aria-hidden="true">🎬</span><span>媒体库</span><strong>待同步</strong></div>';
+    return '<div class="site-media-counts is-pending"><span class="site-media-icon" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3Z"/></svg></span><span>媒体库</span><strong>待同步</strong></div>';
   }
-  return `<div class="site-media-counts" aria-label="媒体库数量"><span class="site-media-icon" aria-hidden="true">🎬</span>${items.map(([label, count]) => `<span>${label} <strong>${count.toLocaleString('zh-CN')}</strong></span>`).join('')}</div>`;
+  return `<div class="site-media-counts" aria-label="媒体库数量"><span class="site-media-icon" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3Z"/></svg></span>${items.map(([label, count]) => `<span>${label} <strong>${count.toLocaleString('zh-CN')}</strong></span>`).join('')}</div>`;
 }
 
 function siteAccountRetentionStatus(site, nowMS = Date.now()) {
@@ -138,28 +140,73 @@ function siteCardsRenderSignature(sites, activeSiteIDs) {
 function renderSites() {
   const page = document.getElementById('page-sites');
   stopSitesRefresh();
+  siteManagementExpanded = new Set();
   page.innerHTML = `
-    <div class="sites-page-head fade-up">
-      <div><h1 class="section-title">站点管理</h1><p class="section-sub">管理所有 Emby 反代站点与回源配置</p></div>
-      <div class="toolbar-info" id="sites-count"></div>
+    <div class="console-page management-page">
+      <header class="console-heading">
+        <div><p class="console-eyebrow">站点与入口</p><h1>站点管理</h1><p class="console-lead">集中管理访问入口、回源线路与站点策略。</p></div>
+        <button type="button" class="console-button is-primary" id="btn-add-site"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加站点</button>
+      </header>
+      <section class="console-panel management-sites" aria-label="站点列表">
+        <div class="management-toolbar">
+          <label class="management-search"><span class="sr-only">搜索站点</span><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></svg><input class="form-input" id="sites-search" type="search" placeholder="搜索站点、图标或回源地址" autocomplete="off"></label>
+          <div class="management-toolbar-actions"><button class="console-button" id="btn-site-icon-pack" type="button">管理图标包</button><button class="console-button" id="btn-test-all-sites" type="button">全部测速</button><button class="console-button management-refresh" id="sites-refresh" type="button" aria-label="刷新站点"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 6a8 8 0 0 1 14 6M4 12a8 8 0 0 0 14 6"/></svg></button></div>
+        </div>
+        <div class="management-list-meta"><span id="sites-count">正在读取站点…</span><span id="sites-load-state" class="console-muted" role="status">每 5 秒更新</span></div>
+        <div class="management-site-columns" aria-hidden="true"><span>站点</span><span>运行状态</span><span>已用流量</span><span>回源延迟</span><span></span></div>
+        <div class="sites-grid management-site-list" id="sites-grid"><div class="console-empty">正在读取站点…</div></div>
+        <div class="console-empty" id="sites-no-match" hidden>没有匹配的站点，试试其他关键词。</div>
+      </section>
+      <p class="management-footnote">拖动站点左侧的手柄调整顺序；聚焦手柄后也可使用上下方向键。</p>
     </div>
-    <div class="page-toolbar sites-toolbar fade-up stagger-1">
-      <button class="btn-add" id="btn-add-site">
-        <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-        添加站点
-      </button>
-      <label class="sites-search"><span class="sr-only">搜索站点</span><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16" y1="16" x2="21" y2="21"/></svg><input id="sites-search" type="search" placeholder="搜索站点名称、图标名称或回源地址"></label>
-      <button class="btn-ghost btn-site-icon-pack" id="btn-site-icon-pack" type="button"><span aria-hidden="true">✦</span> 图标包</button>
-      <button class="btn-ghost btn-test-all" id="btn-test-all-sites"><span aria-hidden="true">⌁</span> 全部测速</button>
-    </div>
-    <div class="sites-grid" id="sites-grid"></div>
   `;
 
   document.getElementById('btn-add-site').onclick = () => showSiteModal();
   document.getElementById('btn-site-icon-pack').onclick = showSiteIconPackModal;
   document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
+  document.getElementById('sites-refresh').onclick = () => loadSites();
   document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
   void loadSites();
+}
+
+function siteManagementRowHTML(s, activeSiteIDs) {
+  const quota = Math.max(0, Number(s.traffic_quota || 0));
+  const used = Math.max(0, Number(s.traffic_used || 0));
+  const percent = quota > 0 ? Math.min(100, used / quota * 100) : 0;
+  const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
+  const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
+  const hasActivePlayback = activeSiteIDs.has(String(s.id));
+  const expanded = siteManagementExpanded.has(Number(s.id));
+  const ingressReady = normalizedIngressMode(s) !== 'unset';
+  const latency = siteManagementLatency.get(Number(s.id)) || { text: '未测试', className: 'site-latency', title: '' };
+  return `<article class="site-card management-site-row" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.icon_name || ''} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
+    <div class="management-site-summary">
+      <div class="management-site-identity"><button type="button" class="site-drag-handle" data-site-drag-handle aria-label="调整 ${esc(s.name)} 的顺序" title="拖动或使用上下方向键调整顺序"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"/><circle cx="13" cy="5" r="1.25"/><circle cx="7" cy="10" r="1.25"/><circle cx="13" cy="10" r="1.25"/><circle cx="7" cy="15" r="1.25"/><circle cx="13" cy="15" r="1.25"/></svg></button>${renderSiteIconButton(s)}<div><h2 class="site-name">${esc(s.name)}</h2><p>${esc(siteIngressModeLabel(s))} · ${esc(uaNameMap[s.ua_mode] || s.ua_mode || '透传')}</p></div></div>
+      <div class="site-card-state"><span class="console-status ${s.running ? 'is-online' : 'is-muted'}">${!ingressReady ? '待配置' : s.running ? '运行中' : s.enabled ? '启动异常' : '已停用'}</span>${hasActivePlayback ? `<button type="button" class="site-live-link" data-site-action="live" data-site-id="${s.id}"><i class="site-live-pulse" aria-hidden="true"></i>正在播放</button>` : ''}</div>
+      <div class="management-site-usage"><strong>${formatBytes(used)}</strong><small>${quota ? `额度 ${formatBytes(quota)}` : '未设额度'}</small>${quota ? `<div class="management-quota-track ${percent >= 85 ? 'is-warning' : ''}" role="meter" aria-label="${esc(s.name)}流量额度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(percent)}"><i style="width:${percent.toFixed(2)}%"></i></div>` : ''}</div>
+      <div class="management-site-latency"><button type="button" class="site-latency-button" data-site-action="latency" data-site-id="${s.id}" aria-label="点击重新测速" title="点击重新测速"><strong class="${latency.className}" id="site-latency-${s.id}" title="${esc(latency.title)}">${esc(latency.text)}</strong></button></div>
+      <div class="management-site-primary-actions"><button type="button" class="console-button" data-site-action="edit" data-site-id="${s.id}">编辑</button><button type="button" class="console-button management-detail-toggle" data-site-action="details" data-site-id="${s.id}" aria-expanded="${expanded}" aria-controls="site-details-${s.id}">${expanded ? '收起' : '详情'}<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button></div>
+    </div>
+    <div class="management-site-details" id="site-details-${s.id}" ${expanded ? '' : 'hidden'}>
+      <div class="management-site-detail-grid">
+        <div class="site-access-row"><span class="management-field-label">访问地址</span><span class="site-access-value"><span class="console-mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg></button></span></div>
+        <div><span class="management-field-label">主回源地址</span><span class="console-mono">${esc(s.target_url)}</span></div>
+        <div><span class="management-field-label">上游请求头</span><span>${upstreamHeaderCount ? `${upstreamHeaderCount} 个（加密）` : '未配置'}</span></div>
+      </div>
+      <div class="management-site-supplement">${renderSiteMediaLibraryCounts(s)}${renderSiteAccountRetention(s)}</div>
+      <div class="management-site-secondary-actions"><button type="button" class="console-button" data-site-action="toggle" data-site-id="${s.id}" ${ingressReady ? '' : 'disabled title="请先编辑并配置入口"'}>${!ingressReady ? '待配置' : s.enabled ? '停用站点' : '启用站点'}</button><button type="button" class="console-button is-danger" data-site-action="delete" data-site-id="${s.id}">删除站点</button></div>
+    </div>
+  </article>`;
+}
+
+function toggleSiteManagementDetails(button) {
+  const id = Number(button.dataset.siteId);
+  const expanded = !siteManagementExpanded.has(id);
+  if (expanded) siteManagementExpanded.add(id); else siteManagementExpanded.delete(id);
+  const details = document.getElementById(`site-details-${id}`);
+  if (details) details.hidden = !expanded;
+  button.setAttribute('aria-expanded', String(expanded));
+  button.innerHTML = `${expanded ? '收起' : '详情'}<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
 }
 
 function scheduleSitesRefresh() {
@@ -211,82 +258,30 @@ async function loadSites() {
 		.filter(Boolean));
     const count = document.getElementById('sites-count');
     if (count) count.innerHTML = `共 <strong>${sites.length}</strong> 个站点`;
+    const loadState = document.getElementById('sites-load-state');
+    if (loadState) { loadState.textContent = '每 5 秒更新'; loadState.classList.remove('is-error'); }
 
     const grid = document.getElementById('sites-grid');
     if (!grid) return;
+    if (background && grid.classList?.contains?.('is-reordering')) return;
+    const knownSiteIDs = new Set(sites.map(site => Number(site.id)));
+    for (const id of siteManagementExpanded) if (!knownSiteIDs.has(id)) siteManagementExpanded.delete(id);
+    for (const id of siteManagementLatency.keys()) if (!knownSiteIDs.has(id)) siteManagementLatency.delete(id);
     const renderSignature = siteCardsRenderSignature(sites, activeSiteIDs);
     if (renderSignature === String(grid.dataset.siteRenderSignature || '')) return;
     if (!sites || sites.length === 0) {
-      grid.innerHTML = '<div style="text-align:center;color:var(--white-38);padding:60px;grid-column:1/-1">暂无站点，点击右上角添加</div>';
+      grid.innerHTML = '<div class="console-empty">还没有站点，添加一个访问入口开始使用。</div>';
       grid.dataset.siteRenderSignature = renderSignature;
       return;
     }
 
-	grid.innerHTML = sites.map((s, i) => {
-      const pct = s.traffic_quota > 0 ? (s.traffic_used / s.traffic_quota * 100).toFixed(1) : 0;
-      const pctClass = pct > 85 ? 'danger' : pct > 50 ? 'warn' : 'normal';
-		const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
-		const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
-		const hasActivePlayback = activeSiteIDs.has(String(s.id));
-
-      return `
-      <div class="site-card" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.icon_name || ''} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
-        <div class="site-top">
-          <div class="site-heading">
-            <div class="site-heading-content">
-              <div class="site-heading-title-row"><button type="button" class="site-drag-handle" data-site-drag-handle aria-label="拖拽调整 ${esc(s.name)} 的顺序" title="拖拽调整顺序"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"></circle><circle cx="13" cy="5" r="1.25"></circle><circle cx="7" cy="10" r="1.25"></circle><circle cx="13" cy="10" r="1.25"></circle><circle cx="7" cy="15" r="1.25"></circle><circle cx="13" cy="15" r="1.25"></svg></button>${renderSiteIconButton(s)}<div class="site-name">${esc(s.name)}</div><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></div>
-              ${renderSiteMediaLibraryCounts(s)}
-            </div>
-          </div>
-          <div class="site-card-state">
-            <span class="site-mode-badge">${siteIngressModeLabel(s)}</span>
-            <span class="status-badge site-status">
-              <span class="status-led ${s.running ? 'on' : 'off'}"></span>
-              ${s.running ? '运行中' : '已停止'}
-            </span>
-          </div>
-        </div>
-        <div class="site-latency-line"><span class="status-led ${s.running ? 'on' : 'off'}"></span><span>回源延迟：</span><strong class="site-latency" id="site-latency-${s.id}">未测试</strong></div>
-		<div class="site-rows">
-		  <div class="site-row site-access-row">
-		    <div class="site-access-heading"><span class="site-row-label">访问地址</span>${hasActivePlayback ? `<button type="button" class="site-live-link" data-site-action="live" data-site-id="${s.id}" aria-label="查看 ${esc(s.name)} 当前正在播放的详情"><i class="site-live-pulse" aria-hidden="true"></i><span>正在播放</span></button>` : ''}</div>
-		    <span class="site-access-value"><span class="mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false" title="显示访问地址">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" title="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2 2v1"></path></svg></button></span>
-		  </div>
-          <div class="site-row">
-            <span class="site-row-label">主回源地址</span>
-            <span class="mono">${esc(s.target_url)}</span>
-          </div>
-		  ${upstreamHeaderCount > 0 ? `
-		  <div class="site-row">
-			<span class="site-row-label">上游请求头</span>
-			<span>${upstreamHeaderCount} 个（加密）</span>
-		  </div>` : ''}
-          ${s.traffic_quota > 0 ? `
-          <div class="progress-wrap">
-            <div class="progress-labels">
-              <span>已用 ${formatBytes(s.traffic_used)}</span>
-              <span>${formatBytes(s.traffic_quota)}</span>
-            </div>
-            <div class="progress-track">
-              <div class="progress-fill ${pctClass}" style="width:${Math.min(pct, 100)}%"></div>
-            </div>
-          </div>
-          ` : `
-          <div class="site-row">
-            <span class="site-row-label">已用流量</span>
-            <span>${formatBytes(s.traffic_used)}</span>
-          </div>
-          `}
-          ${renderSiteAccountRetention(s)}
-        </div>
-        <div class="site-actions">
-          <button class="btn-ghost site-action-test" data-site-action="latency" data-site-id="${s.id}">测速</button>
-          <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}" ${normalizedIngressMode(s) === 'unset' ? 'disabled title="请先编辑并配置入口"' : ''}>${normalizedIngressMode(s) === 'unset' ? '待配置' : (s.enabled ? '停用' : '启用')}</button>
-          <button class="btn-ghost" data-site-action="edit" data-site-id="${s.id}">编辑</button>
-          <button class="btn-ghost danger" data-site-action="delete" data-site-id="${s.id}">删除</button>
-        </div>
-      </div>`;
-    }).join('');
+    const focused = document.activeElement;
+    const focusedCard = focused?.closest?.('.site-card');
+    const focusedSiteID = Number(focusedCard?.dataset?.siteId || 0);
+    const focusSelector = focused?.dataset?.siteAction ? `[data-site-action="${focused.dataset.siteAction}"]`
+      : focused?.dataset?.siteIconId ? '[data-site-icon-id]'
+      : focused?.matches?.('[data-site-drag-handle]') ? '[data-site-drag-handle]' : '';
+	grid.innerHTML = sites.map(site => siteManagementRowHTML(site, activeSiteIDs)).join('');
     grid.dataset.siteRenderSignature = renderSignature;
     bindSiteIconFallbacks(grid);
 
@@ -304,6 +299,7 @@ async function loadSites() {
         const id = Number(button.dataset.siteId);
         const site = sitesById.get(id);
         if (!site) return;
+		if (button.dataset.siteAction === 'details') toggleSiteManagementDetails(button);
 		if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
 		if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
 		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
@@ -314,13 +310,15 @@ async function loadSites() {
       });
     });
     setupSiteSorting(grid);
-    const currentSearch = document.getElementById('sites-search');
-    if (currentSearch && preservedSearch) {
-      currentSearch.value = preservedSearch;
-      filterSiteCards(preservedSearch);
+    if (focusedSiteID && focusSelector) {
+      grid.querySelector?.(`.site-card[data-site-id="${focusedSiteID}"]`)?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
     }
+    const currentSearch = document.getElementById('sites-search');
+    filterSiteCards(String(currentSearch?.value || preservedSearch));
   } catch (e) {
     if (generation !== siteLoadGeneration || Router.current !== 'sites' || !page.isConnected) return;
+    const loadState = document.getElementById('sites-load-state');
+    if (loadState) { loadState.textContent = '读取失败，点击刷新重试'; loadState.classList.add('is-error'); }
     if (background) console.warn('Sites refresh error', e);
     else Toast.error('加载站点失败: ' + e.message);
   } finally {
@@ -336,6 +334,8 @@ function filterSiteCards(query) {
   grid.querySelectorAll('.site-card').forEach(card => {
     card.hidden = !!needle && !String(card.dataset.siteSearch || '').includes(needle);
   });
+  const noMatch = document.getElementById('sites-no-match');
+  if (noMatch) noMatch.hidden = !needle || [...grid.querySelectorAll('.site-card')].some(card => !card.hidden);
   grid.querySelectorAll('[data-site-drag-handle]').forEach(handle => {
     handle.disabled = !!needle;
     handle.title = needle ? '清除搜索后可调整顺序' : '拖拽调整顺序';
@@ -398,9 +398,11 @@ async function persistSiteOrder(grid) {
   const siteIds = siteOrderFromGrid(grid);
   const nextOrder = siteIds.join(',');
   if (!siteIds.length || nextOrder === grid.dataset.siteOrder) return;
+  siteLoadGeneration += 1;
   grid.classList.add('is-saving-order');
   try {
     await API.reorderSites(siteIds);
+    siteLoadGeneration += 1;
     grid.dataset.siteOrder = nextOrder;
     Toast.success('站点顺序已保存，仪表盘已同步');
   } catch (error) {
@@ -408,6 +410,7 @@ async function persistSiteOrder(grid) {
     await loadSites();
   } finally {
     grid.classList.remove('is-saving-order');
+    scheduleSitesRefresh();
   }
 }
 
@@ -507,6 +510,17 @@ function setupSiteSorting(grid) {
         try { handle.setPointerCapture(event.pointerId); } catch (_) {}
       }
     });
+    handle.addEventListener('keydown', event => {
+      if (handle.disabled || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      event.preventDefault();
+      const ordered = [...grid.querySelectorAll('.site-card[data-site-id]')];
+      const index = ordered.indexOf(card);
+      const target = index + (event.key === 'ArrowUp' ? -1 : 1);
+      if (target < 0 || target >= ordered.length) return;
+      grid.insertBefore(card, event.key === 'ArrowUp' ? ordered[target] : ordered[target].nextSibling);
+      handle.focus({ preventScroll: true });
+      void persistSiteOrder(grid);
+    });
   });
 
   window.addEventListener('pointermove', movePointer, { passive: false });
@@ -528,9 +542,13 @@ function setupSiteSorting(grid) {
 }
 
 async function testSiteLatency(id, button) {
-  const value = document.getElementById(`site-latency-${id}`);
+  const paint = (text, className, title = '') => {
+    siteManagementLatency.set(Number(id), { text, className, title });
+    const value = document.getElementById(`site-latency-${id}`);
+    if (value) { value.textContent = text; value.className = className; value.title = title; }
+  };
   if (button) button.disabled = true;
-  if (value) value.textContent = '测速中…';
+  paint('测速中…', 'site-latency');
   try {
     const result = await API.diagSite(id);
     const health = result && result.upstreams && result.upstreams.primary
@@ -538,19 +556,12 @@ async function testSiteLatency(id, button) {
       : (result && result.health) || {};
     if (health.status === 'online' && Number.isFinite(Number(health.latency_ms))) {
       const latency = Number(health.latency_ms);
-      if (value) {
-        value.textContent = `${latency} ms`;
-        value.className = `site-latency ${latency < 200 ? 'good' : latency < 800 ? 'warn' : 'bad'}`;
-      }
+      paint(`${latency} ms`, `site-latency ${latency < 200 ? 'good' : latency < 800 ? 'warn' : 'bad'}`);
     } else {
       throw new Error(health.error || '回源不可用');
     }
   } catch (error) {
-    if (value) {
-      value.textContent = '测速失败';
-      value.className = 'site-latency bad';
-      value.title = error.message || '测速失败';
-    }
+    paint('测速失败', 'site-latency bad', error.message || '测速失败');
   } finally {
     if (button) button.disabled = false;
   }
@@ -567,14 +578,29 @@ async function testAllSitesLatency() {
   button.textContent = '全部测速';
 }
 
+// Built-in UA presets are no longer offered in the form. Legacy sites that
+// still store one keep their behavior by opening as custom UA with the
+// equivalent triplet, which is saved as an editable custom configuration.
+const legacyUAPresets = {
+  infuse: { custom_user_agent: 'Infuse/7.8.1', custom_client: 'Infuse', custom_version: '7.8.1' },
+  web: { custom_user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Emby Theater', custom_client: 'Emby Web', custom_version: '4.9.0.42' },
+  client: { custom_user_agent: 'Emby-Theater/4.7.0', custom_client: 'Emby Theater', custom_version: '4.7.0' },
+};
+
+function uaModeIsCustomLike(mode) {
+  return mode === 'custom' || Object.prototype.hasOwnProperty.call(legacyUAPresets, mode);
+}
+
 function customUAFormState(mode, site) {
-  const isCustom = mode === 'custom';
+  const legacy = legacyUAPresets[mode];
+  const isCustom = uaModeIsCustomLike(mode);
+  const source = mode === 'custom' && site ? site : legacy;
   return {
     visible: isCustom,
     required: isCustom,
-    customUserAgent: isCustom && site ? (site.custom_user_agent || '') : '',
-    customClient: isCustom && site ? (site.custom_client || '') : '',
-    customVersion: isCustom && site ? (site.custom_version || '') : '',
+    customUserAgent: isCustom && source ? (source.custom_user_agent || '') : '',
+    customClient: isCustom && source ? (source.custom_client || '') : '',
+    customVersion: isCustom && source ? (source.custom_version || '') : '',
   };
 }
 
@@ -847,6 +873,35 @@ function normalizedTargetAuthority(value) {
 		return `${scheme}//${parsed.hostname.toLowerCase()}:${parsed.port || defaultPort}`;
 	} catch (_) {
 		return '';
+	}
+}
+
+// When a user finishes typing an origin address, complete the missing scheme and
+// split an explicit port into the dedicated port field. Without a scheme the port
+// decides the protocol: 443 (or no port) defaults to https, any other port to http.
+function autoFillTargetAddress(addressInput, portInput) {
+	const raw = String(addressInput && addressInput.value || '').trim().replaceAll('：', ':');
+	if (!raw) return;
+	if (/\s/.test(raw)) return;
+	const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+	// URL normalizes default ports away (http :80, https :443), so read the
+	// explicitly typed port from the authority text before parsing.
+	const withoutScheme = explicitScheme ? raw.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') : raw;
+	const authority = withoutScheme.split(/[/?#]/, 1)[0];
+	const portMatch = authority.match(/^(?:\[[^\]]*\]|[^:]+):(\d+)$/);
+	const explicitPort = portMatch ? portMatch[1] : '';
+	try {
+		const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
+		if (!parsed.hostname) return;
+		const scheme = explicitScheme
+			? parsed.protocol
+			: (explicitPort === '443' || !explicitPort ? 'https:' : 'http:');
+		const hostname = parsed.hostname;
+		const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
+		addressInput.value = `${scheme}//${hostname}${path}`;
+		if (portInput) portInput.value = explicitPort || (scheme === 'https:' ? '443' : '80');
+	} catch (_) {
+		// Leave partially typed values untouched until they parse as an address.
 	}
 }
 
@@ -1311,7 +1366,7 @@ async function showSiteModal(site) {
 	</div>
 	<div class="form-group upstream-lines-card">
 	  <div class="upstream-lines-head">
-	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。备用线路沿用主线路的反代、自动发现和请求策略。</div></div>
+	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。</div></div>
 	    <div class="upstream-lines-buttons">
 	      <button type="button" class="btn-ghost upstream-test-all" id="m-test-all-lines">线路测速</button>
 	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
@@ -1330,16 +1385,9 @@ async function showSiteModal(site) {
 	    </div>
 	    <div id="m-failover-lines"></div>
 	  </div>
-	  <div class="form-help">域名栏可包含协议和 Base URL 路径；端口单独填写。443 默认 HTTPS，其他端口默认 HTTP。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
+	  <div class="form-help">域名栏自动识别协议与端口：直接输入域名会按 https 补全并自动填入端口 443，带其他端口（如 :8096）则按 http 补全；离开输入框后自动拆分端口。域名栏还可包含 Base URL 路径。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
 	</div>
-		<div class="form-group site-form-wide">
-		  <label>主回源固定请求头（可选）</label>
-		  <div id="m-upstream-headers"></div>
-		  <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
-		  <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
-		  ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
-		</div>
-    <details class="site-advanced-card site-form-wide" open>
+    <details class="site-advanced-card site-form-wide">
       <summary class="site-advanced-summary">
         <span>高级设置</span>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
@@ -1351,10 +1399,7 @@ async function showSiteModal(site) {
       <label for="m-ua">UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
         <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
-        <option value="infuse" ${isEdit && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
-        <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
-        <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
-        <option value="custom">自定义</option>
+        <option value="custom" ${isEdit && uaModeIsCustomLike(site.ua_mode) ? 'selected' : ''}>自定义</option>
       </select>
       <div class="site-custom-ua-fields" id="m-custom-ua-group" hidden>
         <label for="m-custom-ua">自定义身份</label>
@@ -1437,6 +1482,13 @@ async function showSiteModal(site) {
     </div>
     </div>
       </div>
+    <div class="form-group site-advanced-subsection">
+      <label>主回源固定请求头（可选）</label>
+      <div id="m-upstream-headers"></div>
+      <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
+      <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
+      ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
+    </div>
       </div>
     </details>
   `;
@@ -1484,6 +1536,12 @@ async function showSiteModal(site) {
 			};
 			row.querySelector('.upstream-line-name').oninput = event => { failoverLines[index].name = event.target.value; };
 			row.querySelector('.upstream-line-address').oninput = event => { failoverLines[index].address = event.target.value; };
+			row.querySelector('.upstream-line-address').onchange = event => {
+				const portInput = row.querySelector('.upstream-line-port');
+				autoFillTargetAddress(event.target, portInput);
+				failoverLines[index].address = event.target.value;
+				failoverLines[index].port = portInput.value;
+			};
 			row.querySelector('.upstream-line-port').oninput = event => { failoverLines[index].port = event.target.value; };
 			row.querySelector('.upstream-line-move-up').onclick = () => {
 				[failoverLines[index - 1], failoverLines[index]] = [failoverLines[index], failoverLines[index - 1]];
@@ -1526,6 +1584,9 @@ async function showSiteModal(site) {
 	}
 
 	renderFailoverLines();
+	document.getElementById('m-target-address').onchange = event => {
+		autoFillTargetAddress(event.target, document.getElementById('m-target-port'));
+	};
 	document.getElementById('m-add-failover-line').onclick = () => {
 		if (failoverLines.length >= 7) {
 			Toast.error('最多添加 7 条备用线路');
@@ -1596,7 +1657,7 @@ async function showSiteModal(site) {
     document.getElementById('m-custom-version'),
   ];
   const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'passthrough', site);
-  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'passthrough';
+  uaSelect.value = isEdit && uaModeIsCustomLike(site.ua_mode) ? 'custom' : 'passthrough';
   clientIPModeSelect.value = isEdit && ['both', 'real_ip', 'none'].includes(site.client_ip_mode) ? site.client_ip_mode : 'both';
   mainVideoModeSelect.value = isEdit && site.main_video_stream_mode === 'direct' ? 'direct' : 'proxy';
   watchHistorySelect.value = isEdit && site.watch_history_enabled ? 'on' : 'off';

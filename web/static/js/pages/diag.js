@@ -1,43 +1,32 @@
 // Diagnostics page
-function renderDiag() {
-  const page = document.getElementById('page-diagnostics');
-  page.innerHTML = `
-    <div class="settings-layout fade-up">
-      ${globalSettingsNav('diagnostics')}
-      <main class="settings-content">
-        <h1 class="section-title fade-up">故障诊断</h1>
-        <p class="section-sub fade-up stagger-1">查看主回源、播放回源、上游证书和代理配置状态</p>
-        <div class="diag-toolbar fade-up stagger-1">
-          <select class="form-select" id="diag-select">
-            <option value="">加载中...</option>
-          </select>
-          <button class="btn-scan" id="btn-scan">开始诊断</button>
-        </div>
-        <div class="diag-grid" id="diag-grid">
-          <div class="diag-card diag-card-wide fade-up stagger-2">
-            <div class="diag-empty">选择站点后开始诊断</div>
-          </div>
-        </div>
-      </main>
-    </div>
-  `;
+let diagnosticsGeneration = 0;
 
+function renderDiag() {
+  diagnosticsGeneration++;
+  const page = document.getElementById('page-diagnostics');
+  page.innerHTML = settingsPageFrame('diagnostics', '故障诊断', '检查站点入口、上游连接与证书状态。', `
+    <section class="console-panel settings-panel diag-selection"><label class="settings-field"><span>选择站点</span><div><select class="form-select" id="diag-select" aria-label="选择诊断站点"><option value="">正在读取…</option></select></div></label><button type="button" class="console-button is-primary" id="btn-scan" disabled>开始诊断</button></section>
+    <div class="diag-grid" id="diag-grid"><div class="console-panel console-empty diag-report-wide">选择一个站点，查看连接与代理诊断结果。</div></div>`);
   bindGlobalSettingsNav(page);
   loadDiagSites();
   document.getElementById('btn-scan').onclick = runDiag;
 }
-
 async function loadDiagSites() {
+  const generation = diagnosticsGeneration;
   try {
     const sites = await API.listSites();
+    if (generation !== diagnosticsGeneration || Router.current !== 'diagnostics') return;
     const sel = document.getElementById('diag-select');
     if (!sites || sites.length === 0) {
       sel.innerHTML = '<option value="">暂无站点</option>';
       return;
     }
     sel.innerHTML = sites.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+    document.getElementById('btn-scan').disabled = false;
   } catch (e) {
-    Toast.error('加载站点失败');
+    if (generation !== diagnosticsGeneration || Router.current !== 'diagnostics') return;
+    document.getElementById('diag-grid').innerHTML = '<section class="console-panel settings-panel diag-report-wide"><p class="settings-load-error" role="alert">加载站点失败，请重新读取。</p><button type="button" class="console-button" id="diag-retry">重新读取</button></section>';
+    document.getElementById('diag-retry').onclick = loadDiagSites;
   }
 }
 
@@ -49,11 +38,15 @@ async function runDiag() {
   }
 
   const btn = document.getElementById('btn-scan');
+  if (btn.disabled) return;
+  const generation = diagnosticsGeneration;
+  btn.disabled = true;
   btn.textContent = '诊断中...';
   btn.classList.add('running');
 
   try {
     const result = await API.diagSite(siteId);
+    if (!result || generation !== diagnosticsGeneration || Router.current !== 'diagnostics') return;
     const upstreams = result.upstreams || {};
     const primary = upstreams.primary || {};
     const playback = upstreams.playback || {};
@@ -89,190 +82,72 @@ async function runDiag() {
 
     document.getElementById('diag-grid').innerHTML = cards.filter(Boolean).join('');
   } catch (e) {
-    Toast.error('诊断失败: ' + e.message);
+    if (generation === diagnosticsGeneration && Router.current === 'diagnostics') {
+      document.getElementById('diag-grid').innerHTML = `<section class="console-panel settings-panel diag-report-wide"><p class="settings-load-error" role="alert">诊断失败：${esc(e.message)}</p></section>`;
+      Toast.error('诊断失败: ' + e.message);
+    }
   } finally {
     btn.classList.remove('running');
     btn.textContent = '开始诊断';
+    btn.disabled = false;
   }
 }
 
-function renderFailoverCard(failovers, staggerClass) {
-  return `
-    <div class="diag-card diag-card-wide fade-up ${staggerClass}">
-      <div class="diag-head">
-        <div class="diag-icon" style="background:var(--blue-dim)">
-          <svg viewBox="0 0 24 24" style="stroke:var(--blue)"><path d="M7 7h11l-3-3"/><path d="M18 17H7l3 3"/><path d="M18 7v4a3 3 0 0 1-3 3H7"/><path d="M7 17v-4a3 3 0 0 1 3-3h8"/></svg>
-        </div>
-        <div>
-          <div class="diag-title">备用线路健康</div>
-          <div class="diag-subtitle">按站点配置顺序探测；实际请求会在失败后临时优先使用可用线路</div>
-        </div>
-      </div>
-      <div class="diag-rows">
-        ${failovers.map((upstream, index) => {
-          const health = upstream.health || {};
-          const latency = typeof health.latency_ms === 'number' ? `${health.latency_ms}ms` : '--';
-          return `<div class="diag-row"><span class="diag-key">备用 ${index + 1}</span><span class="diag-val diag-wrap">${diagText(upstream.effective_url)}</span><span class="diag-val ${statusClass(health.status)}">${statusText(health.status)} ${latency}</span></div>`;
-        }).join('')}
-      </div>
-    </div>
-  `;
+function diagReportRow(label, value, className = '') {
+  return `<div class="diag-row"><dt class="diag-key">${esc(label)}</dt><dd class="diag-val ${className}">${value}</dd></div>`;
+}
+
+function renderFailoverCard(failovers) {
+  return `<section class="console-panel settings-panel diag-report-wide"><header><h2>备用线路</h2><span>按配置顺序探测</span></header><dl class="diag-rows">${failovers.map((upstream, index) => {
+    const health = upstream.health || {};
+    const latency = typeof health.latency_ms === 'number' ? `${health.latency_ms}ms` : '--';
+    return diagReportRow(`备用 ${index + 1}`, `<span class="diag-wrap">${diagText(upstream.effective_url)}</span><span class="diag-inline-status ${statusClass(health.status)}">${statusText(health.status)} · ${latency}</span>`);
+  }).join('')}</dl><p class="settings-panel-help">实际请求失败后，会临时优先使用可用线路。</p></section>`;
 }
 
 function renderDiagNotes(notes) {
-  return `
-    <div class="diag-card diag-card-wide fade-up stagger-2">
-      <div class="diag-head">
-        <div class="diag-icon" style="background:rgba(191,90,242,.16)">
-          <svg viewBox="0 0 24 24" style="stroke:var(--purple)"><path d="M12 16v.01"/><path d="M12 8a4 4 0 0 1 4 4c0 2-1.5 2.8-2.3 3.6-.5.5-.7.9-.7 1.4"/><circle cx="12" cy="12" r="10"/></svg>
-        </div>
-        <div>
-          <div class="diag-title">诊断说明</div>
-          <div class="diag-subtitle">播放回源关系和诊断语义由后端结构化返回</div>
-        </div>
-      </div>
-      <div class="diag-note-list">
-        ${notes.map(note => `<div class="diag-note-item">${esc(note)}</div>`).join('')}
-      </div>
-    </div>
-  `;
+  return `<details class="console-panel settings-panel settings-disclosure diag-report-wide"><summary><strong>诊断结果说明</strong><span>探测范围与回源关系</span></summary><ul class="diag-note-list">${notes.map(note => `<li>${esc(note)}</li>`).join('')}</ul></details>`;
 }
 
-function renderHealthCard(title, subtitle, upstream, staggerClass) {
+function renderHealthCard(title, subtitle, upstream) {
   const health = upstream.health || {};
   const probe = health.probe || {};
   const latency = typeof health.latency_ms === 'number' ? health.latency_ms : null;
   const latencyText = latency === null ? '--' : `${latency}ms`;
-
-  return `
-    <div class="diag-card fade-up ${staggerClass}">
-      <div class="diag-head">
-        <div class="diag-icon" style="background:var(--green-dim)">
-          <svg viewBox="0 0 24 24" style="stroke:var(--green)"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-        </div>
-        <div>
-          <div class="diag-title">${title}</div>
-          <div class="diag-subtitle">${subtitle}</div>
-        </div>
-      </div>
-      <div class="diag-rows">
-        <div class="diag-row"><span class="diag-key">实际目标</span><span class="diag-val diag-wrap">${diagText(upstream.effective_url, '未配置')}</span></div>
-        <div class="diag-row"><span class="diag-key">连接状态</span><span class="diag-val ${statusClass(health.status)}">${statusText(health.status)}</span></div>
-        <div class="diag-row"><span class="diag-key">Emby 版本</span><span class="diag-val">${diagText(health.emby_version)}</span></div>
-        <div class="diag-row"><span class="diag-key">响应延迟</span><span class="diag-val ${latencyClass(latency)}">${latencyText}</span></div>
-        <div class="diag-row"><span class="diag-key">探针类型</span><span class="diag-val">${esc(probeLabel(probe))}</span></div>
-        <div class="diag-row"><span class="diag-key">探针请求</span><span class="diag-val diag-wrap">${diagText(probeRequestText(probe))}</span></div>
-        ${typeof probe.http_status === 'number' && probe.http_status > 0 ? `<div class="diag-row"><span class="diag-key">探针响应</span><span class="diag-val">${probe.http_status}</span></div>` : ''}
-        ${health.error ? `<div class="diag-row"><span class="diag-key">探针结果</span><span class="diag-val bad diag-wrap">${esc(health.error)}</span></div>` : ''}
-      </div>
-    </div>
-  `;
+  return `<section class="console-panel settings-panel diag-report-panel"><header><h2>${esc(title)}</h2><span class="diag-result-status ${statusClass(health.status)}">${statusText(health.status)}</span></header>
+    <div class="diag-health-summary"><strong class="${latencyClass(latency)}">${latencyText}</strong><span>响应延迟</span></div><p class="settings-panel-help">${esc(subtitle)}</p>
+    <dl class="diag-rows">${diagReportRow('实际目标', diagText(upstream.effective_url, '未配置'), 'diag-wrap')}${diagReportRow('Emby 版本', diagText(health.emby_version))}</dl>
+    ${health.error ? `<p class="settings-load-error">${esc(health.error)}</p>` : ''}
+    <details class="settings-disclosure"><summary><strong>探针详情</strong><span>类型、请求与响应</span></summary><dl class="diag-rows">${diagReportRow('探针类型', esc(probeLabel(probe)))}${diagReportRow('探针请求', diagText(probeRequestText(probe)), 'diag-wrap')}${typeof probe.http_status === 'number' && probe.http_status > 0 ? diagReportRow('探针响应', String(probe.http_status)) : ''}</dl></details>
+  </section>`;
 }
 
-function renderTLSCard(title, subtitle, upstream, staggerClass) {
+function renderTLSCard(title, subtitle, upstream) {
   const tls = upstream.tls || {};
   const daysLeft = typeof tls.days_left === 'number' ? tls.days_left : null;
   const expiresText = tls.expires_at ? `${tls.expires_at}${daysLeft !== null ? ` (${daysLeft} 天)` : ''}` : '未获取';
-
-  return `
-    <div class="diag-card fade-up ${staggerClass}">
-      <div class="diag-head">
-        <div class="diag-icon" style="background:rgba(10,132,255,.15)">
-          <svg viewBox="0 0 24 24" style="stroke:var(--blue)"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-        </div>
-        <div>
-          <div class="diag-title">${title}</div>
-          <div class="diag-subtitle">${subtitle}</div>
-        </div>
-      </div>
-      <div class="diag-rows">
-        <div class="diag-row"><span class="diag-key">实际目标</span><span class="diag-val diag-wrap">${diagText(upstream.effective_url, '未配置')}</span></div>
-        ${tls.enabled ? `
-          <div class="diag-row"><span class="diag-key">证书状态</span><span class="diag-val ${tls.valid ? 'good' : 'bad'}">${tls.valid ? '有效' : '无效或已过期'}</span></div>
-          <div class="diag-row"><span class="diag-key">颁发机构</span><span class="diag-val diag-wrap">${diagText(tls.issuer)}</span></div>
-          <div class="diag-row"><span class="diag-key">到期时间</span><span class="diag-val ${daysLeft !== null && daysLeft < 30 ? 'warn' : 'good'}">${diagText(expiresText)}</span></div>
-          ${tls.error ? `<div class="diag-row"><span class="diag-key">TLS 结果</span><span class="diag-val bad diag-wrap">${esc(tls.error)}</span></div>` : ''}
-        ` : `
-          <div class="diag-row"><span class="diag-key">TLS</span><span class="diag-val" style="color:var(--white-38)">该上游未使用 HTTPS</span></div>
-        `}
-      </div>
-    </div>
-  `;
+  return `<section class="console-panel settings-panel diag-report-panel"><header><h2>${esc(title)}</h2><span class="diag-result-status ${tls.enabled ? tls.valid ? 'good' : 'bad' : ''}">${tls.enabled ? tls.valid ? '证书有效' : '无效或已过期' : '未使用 HTTPS'}</span></header><p class="settings-panel-help">${esc(subtitle)}</p>
+    <dl class="diag-rows">${diagReportRow('实际目标', diagText(upstream.effective_url, '未配置'), 'diag-wrap')}${tls.enabled ? diagReportRow('颁发机构', diagText(tls.issuer), 'diag-wrap') + diagReportRow('到期时间', diagText(expiresText), daysLeft !== null && daysLeft < 30 ? 'warn' : 'good') : diagReportRow('TLS', '该上游未使用 HTTPS')}${tls.error ? diagReportRow('TLS 结果', esc(tls.error), 'bad diag-wrap') : ''}</dl>
+  </section>`;
 }
 
-function renderHeadersCard(headers, staggerClass) {
-  const profileError = headers.profile_error
-    ? '<div class="diag-row"><span class="diag-key">身份配置</span><span class="diag-val bad diag-wrap">' + esc(headers.profile_error) + '</span></div>'
-    : '';
-
+function renderHeadersCard(headers) {
   let rows;
   if (headers.passthrough) {
-    rows = `
-      <div class="diag-row"><span class="diag-key">UA 透传</span><span class="diag-val good diag-wrap">保留客户端原值</span></div>
-    `;
+    rows = diagReportRow('UA 透传', '保留客户端原值', 'good');
   } else {
-    rows = `
-      <div class="diag-row"><span class="diag-key">UA 改写</span><span class="diag-val ${headers.ua_applied ? 'good' : 'bad'}">${headers.ua_applied ? '已启用' : '未启用'}</span></div>
-      <div class="diag-row"><span class="diag-key">当前 UA</span><span class="diag-val diag-wrap">${diagText(headers.current_ua)}</span></div>
-      <div class="diag-row"><span class="diag-key">Client 字段</span><span class="diag-val">${diagText(headers.client_field)}</span></div>
-      <div class="diag-row"><span class="diag-key">Version 字段</span><span class="diag-val">${diagText(headers.version_field)}</span></div>
-    `;
+    rows = diagReportRow('UA 改写', headers.ua_applied ? '已启用' : '未启用', headers.ua_applied ? 'good' : 'bad') + diagReportRow('当前 UA', diagText(headers.current_ua), 'diag-wrap') + diagReportRow('Client 字段', diagText(headers.client_field)) + diagReportRow('Version 字段', diagText(headers.version_field));
   }
-
-  return `
-    <div class="diag-card fade-up ${staggerClass}">
-      <div class="diag-head">
-        <div class="diag-icon" style="background:var(--teal-dim)">
-          <svg viewBox="0 0 24 24" style="stroke:var(--teal)"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-        </div>
-        <div>
-          <div class="diag-title">请求头配置</div>
-          <div class="diag-subtitle">Meridian 发往上游时将带上的 UA / Client / Version</div>
-        </div>
-      </div>
-      <div class="diag-rows">
-        ${rows}
-        ${profileError}
-      </div>
-    </div>
-  `;
+  if (headers.profile_error) rows += diagReportRow('身份配置', esc(headers.profile_error), 'bad diag-wrap');
+  return `<details class="console-panel settings-panel settings-disclosure diag-report-panel"><summary><strong>请求头配置</strong><span>发往上游的身份字段</span></summary><dl class="diag-rows">${rows}</dl></details>`;
 }
 
-function renderProxyCard(proxy, staggerClass) {
-	const mode = String(proxy.ingress_mode || (proxy.public_host ? 'host' : 'port')).toLowerCase();
-	const modeLabel = { port: '仅独立端口', path: '共享路径', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
-	const pathRow = proxy.path_prefix
-	  ? `<div class="diag-row"><span class="diag-key">路径前缀</span><span class="diag-val">${esc(proxy.path_prefix)}</span></div>`
-	  : '';
-	const hostRow = proxy.public_host
-	  ? `<div class="diag-row"><span class="diag-key">共享域名</span><span class="diag-val">${esc(proxy.public_host)}</span></div>`
-	  : '';
-	const portValue = proxy.port_listening
-	  ? `:${esc(proxy.listen_port || '--')}（监听中）`
-	  : mode === 'host' ? `:${esc(proxy.listen_port || '--')}（仅保留，未监听）` : `:${esc(proxy.listen_port || '--')}（未监听）`;
-  return `
-    <div class="diag-card fade-up ${staggerClass}">
-      <div class="diag-head">
-        <div class="diag-icon" style="background:var(--orange-dim)">
-          <svg viewBox="0 0 24 24" style="stroke:var(--orange)"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        </div>
-        <div>
-          <div class="diag-title">代理状态</div>
-          <div class="diag-subtitle">Meridian 本地反代进程与监听状态</div>
-        </div>
-      </div>
-      <div class="diag-rows">
-		<div class="diag-row"><span class="diag-key">代理运行</span><span class="diag-val ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></div>
-			<div class="diag-row"><span class="diag-key">入口模式</span><span class="diag-val">${esc(modeLabel)}</span></div>
-	  ${hostRow}
-	  ${pathRow}
-		<div class="diag-row"><span class="diag-key">端口状态</span><span class="diag-val">${portValue}</span></div>
-        <div class="diag-row"><span class="diag-key">总请求数</span><span class="diag-val">${typeof proxy.total_requests === 'number' ? proxy.total_requests : '--'}</span></div>
-      </div>
-    </div>
-  `;
+function renderProxyCard(proxy) {
+  const mode = String(proxy.ingress_mode || (proxy.public_host ? 'host' : 'port')).toLowerCase();
+  const modeLabel = { port: '仅独立端口', path: '共享路径', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+  const portValue = proxy.port_listening ? `:${esc(proxy.listen_port || '--')}（监听中）` : mode === 'host' ? `:${esc(proxy.listen_port || '--')}（仅保留，未监听）` : `:${esc(proxy.listen_port || '--')}（未监听）`;
+  return `<section class="console-panel settings-panel diag-report-panel"><header><h2>代理状态</h2><span class="diag-result-status ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></header><dl class="diag-rows">${diagReportRow('入口模式', esc(modeLabel))}${proxy.public_host ? diagReportRow('共享域名', esc(proxy.public_host), 'diag-wrap') : ''}${proxy.path_prefix ? diagReportRow('路径前缀', esc(proxy.path_prefix)) : ''}${diagReportRow('端口状态', portValue)}${diagReportRow('总请求数', typeof proxy.total_requests === 'number' ? String(proxy.total_requests) : '--')}</dl></section>`;
 }
-
 function primaryProbeNote(primary) {
   const probe = primary && primary.health ? primary.health.probe || {} : {};
   if (probe.kind !== 'reachability_fallback') return '';

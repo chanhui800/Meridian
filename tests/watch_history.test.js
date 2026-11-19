@@ -490,35 +490,58 @@ test('site advanced settings default viewing history off and submit a boolean', 
   assert.match(sites, /令牌仅加密保存且绝不显示或回传/);
 });
 
-test('viewing history layout reuses theme tokens and keeps a two-column mobile poster grid', () => {
-  const css = source('web/static/css/style.css');
-  assert.match(css, /\.watch-history-grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fill, minmax\(170px, 1fr\)\)/s);
-  assert.match(css, /\.watch-history-poster\s*\{[^}]*aspect-ratio:\s*2 \/ 3/s);
-  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.watch-history-grid\s*\{\s*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
-  assert.match(css, /\.watch-history-card\s*\{[^}]*background:\s*var\(--panel\)/s);
-  assert.match(css, /\.watch-history-detail-dialog\s*\{[^}]*display:\s*flex;[^}]*overflow:\s*hidden;/s);
-  assert.match(css, /\.watch-history-detail-dialog\s*>\s*#watch-history-detail-content\s*\{[^}]*overflow:\s*auto;/s);
-  assert.match(css, /\.watch-history-detail-modal\s*\{[^}]*inset:\s*var\(--nav-h\) 0 0;/s);
-  assert.match(css, /\.watch-history-detail-modal\s*\{[^}]*place-items:\s*center;[^}]*padding:\s*20px;/s);
-  assert.match(css, /\.watch-history-detail-dialog\s*\{[^}]*width:\s*min\(68vw, 1080px\);[^}]*height:\s*84vh;[^}]*max-width:\s*calc\(100vw - var\(--sidebar-w\) - 40px\);[^}]*max-height:\s*calc\(100dvh - var\(--nav-h\) - 32px\);[^}]*height:\s*84dvh;[^}]*transform:\s*translateX\(calc\(var\(--sidebar-w\) \/ 2\)\);/s);
-  assert.match(css, /\.watch-history-detail-dialog\s*\{[^}]*border-radius:\s*var\(--ui-radius\);[^}]*background:\s*var\(--panel\);[^}]*box-shadow:\s*0 18px 60px/s);
-  assert.match(css, /\.watch-history-detail-dialog\s*\{[^}]*padding:\s*0;/s);
-  assert.match(css, /\.watch-history-detail-shell\s*>\s*\.watch-history-detail-layout\s*\{[^}]*padding:\s*228px 24px 24px;/s);
-  assert.match(css, /\.watch-history-detail-meta\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[^}]*grid-auto-flow:\s*row;[^}]*align-items:\s*start;[^}]*gap:\s*10px 24px;/s);
-  assert.match(css, /@media\s*\(max-width:\s*768px\)[\s\S]*?\.watch-history-detail-modal\s*\{[^}]*place-items:\s*stretch;[^}]*padding:\s*8px max\(8px, env\(safe-area-inset-right\)\) max\(8px, env\(safe-area-inset-bottom\)\) max\(8px, env\(safe-area-inset-left\)\);/s);
-  assert.match(css, /@media\s*\(max-width:\s*768px\)[\s\S]*?\.watch-history-detail-dialog\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*none;[^}]*height:\s*100%;[^}]*max-height:\s*none;[^}]*transform:\s*none;/s);
-  assert.match(css, /@media\s*\(max-width:\s*768px\)[\s\S]*?\.watch-history-detail-shell\s*>\s*\.watch-history-detail-layout\s*\{[^}]*padding:\s*194px max\(18px, env\(safe-area-inset-right\)\) 24px max\(18px, env\(safe-area-inset-left\)\);/s);
-  assert.match(css, /html\[data-theme="light"\] \.watch-history-detail-heading h2[\s\S]*?color:\s*#0f172a;/s);
-  assert.match(css, /\.watch-history-detail-background\s*\{[^}]*inset:\s*0;[^}]*background:\s*var\(--panel\)/s);
-  assert.match(css, /\.watch-history-detail-background\s*\{[^}]*cursor:\s*zoom-in;/s);
-  assert.match(css, /\.watch-history-detail-background::after[\s\S]*?linear-gradient\(180deg,[\s\S]*?transparent 0%[\s\S]*?transparent 24%[\s\S]*?var\(--panel\) 100%/s);
-  assert.match(css, /\.watch-history-image-modal\s*\{[^}]*inset:\s*var\(--nav-h\) 0 0 var\(--sidebar-w\);[^}]*z-index:\s*1300;/s);
-  assert.match(css, /\.watch-history-image-dialog\s*\{[^}]*width:\s*min\(68vw, 960px\);[^}]*max-width:\s*calc\(100vw - var\(--sidebar-w\) - 64px\);[^}]*max-height:\s*calc\(100dvh - 96px\);/s);
-  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.watch-history-image-dialog\s*\{[^}]*width:\s*calc\(100vw - 48px\);[^}]*max-width:\s*calc\(100vw - 48px\);[^}]*max-height:\s*calc\(100dvh - 48px\);/s);
-  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.watch-history-image-modal\s*\{[^}]*inset:\s*0;/s);
-  assert.match(css, /\.watch-history-toolbar button:focus-visible[\s\S]*?outline:\s*2px solid var\(--blue\)/s);
-  assert.match(css, /"video cache-limits retention"\s*"history \. \.":?/s);
-  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.watch-history-filters \.form-select,[\s\S]*?\.tmdb-settings-actions \.telegram-btn \{ min-height: 44px; \}/s);
+test('history console keeps the filter, live and detail interfaces in the new list layout', () => {
+  const history = source('web/static/js/pages/watch-history.js');
+  const css = source('web/static/css/history-console.css');
+  for (const id of ['watch-history-site', 'watch-history-type', 'watch-history-range', 'watch-history-live-grid', 'watch-history-grid', 'watch-history-more', 'watch-history-detail-modal', 'watch-history-image-modal']) {
+    assert.ok(history.includes(`id="${id}"`), `the existing ${id} interface must remain available`);
+  }
+  assert.match(css, /--console-surface/);
+  assert.match(css, /--console-ink/);
+  assert.match(css, /history-record-list[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(css, /watch-history-detail-dialog[\s\S]*?max-height:\s*calc\(100dvh - 40px\)/);
+});
+
+test('history dialog Tab navigation stays in the active modal', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const document = { activeElement: null, getElementById(id) { return id === 'watch-history-detail-modal' ? modal : null; } };
+  const first = { hidden: false, offsetParent: {}, focus() { document.activeElement = first; } };
+  const last = { hidden: false, offsetParent: {}, focus() { document.activeElement = last; } };
+  const dialog = { querySelectorAll() { return [first, last]; }, contains(element) { return element === first || element === last; } };
+  const modal = { hidden: false, querySelector() { return dialog; } };
+  sandbox.document = document;
+  document.activeElement = last;
+  let prevented = 0;
+  sandbox.watchHistoryTrapDialogFocus({ key: 'Tab', shiftKey: false, preventDefault() { prevented++; } });
+  assert.equal(document.activeElement, first);
+  sandbox.watchHistoryTrapDialogFocus({ key: 'Tab', shiftKey: true, preventDefault() { prevented++; } });
+  assert.equal(document.activeElement, last);
+  assert.equal(prevented, 2);
+});
+
+test('history delete control uses its own live source and cannot open details on Enter', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const cardEvents = {}, deleteEvents = {};
+  const button = { addEventListener(name, handler) { deleteEvents[name] = handler; } };
+  const card = {
+    dataset: { historyIndex: '0', historySource: 'live' },
+    querySelector() { return button; },
+    addEventListener(name, handler) { cardEvents[name] = handler; },
+    classList: { contains() { return false; }, add() {}, remove() {} },
+  };
+  const grid = { querySelectorAll(selector) { return selector.includes('data-history-index') ? [card] : []; } };
+  sandbox.document = {};
+  sandbox.confirm = () => true;
+  const deleted = [];
+  let opened = 0;
+  sandbox.watchHistoryDeleteItem = item => deleted.push(item.id);
+  sandbox.watchHistoryOpenDetails = () => { opened++; };
+  vm.runInContext("watchHistoryState.items = [{id:1,title:'历史'}]; watchHistoryState.liveItems = [{id:2,title:'当前播放'}];", sandbox);
+  sandbox.watchHistoryBindCards(grid);
+  cardEvents.keydown({ key: 'Enter', target: { closest() { return button; } }, preventDefault() {} });
+  deleteEvents.click({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(opened, 0);
+  assert.deepEqual(deleted, [2]);
 });
 
 test('TMDB official logo is stored locally for the panel CSP', () => {
