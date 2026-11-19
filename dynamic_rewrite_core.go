@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/idna"
 )
 
 type dynamicRewriteSession struct {
@@ -232,10 +234,10 @@ func newDynamicPolicyDenialError(err error) *dynamicPolicyDenialError {
 }
 
 // dynamicURLScanCandidate reports whether a downstream-visible string is
-// shaped like an absolute URL a client would follow, and whether it is safe to
-// hand over unproxied. Only the destination selector is considered: a fragment
-// or userinfo cannot be carried by a Meridian capability, so a URL using either
-// would be followed by the player directly.
+// shaped like an absolute URL or authority-relative URI a client would follow,
+// and whether it is safe to hand over unproxied. Only the destination selector
+// is considered: a fragment or userinfo cannot be carried by a Meridian
+// capability, so a URL using either would be followed by the player directly.
 //
 // A string that is not URL-shaped (a relative path, a bare filename, a DRM
 // key-format identifier) is deliberately not a candidate: it cannot reach a
@@ -250,6 +252,12 @@ func dynamicURLScanCandidate(value string) (candidate, safe bool) {
 		scheme = "http://"
 	case strings.HasPrefix(lowered, "https://"):
 		scheme = "https://"
+	case strings.HasPrefix(lowered, "//"),
+		strings.HasPrefix(lowered, `/\`), strings.HasPrefix(lowered, `\/`), strings.HasPrefix(lowered, `\\`):
+		// A network-path reference selects its own authority while inheriting
+		// the manifest's HTTP(S) scheme. Browser URL parsers also treat leading
+		// backslashes as slashes; those spellings are rejected below.
+		scheme = "//"
 	default:
 		// Non-http schemes are deliberately not candidates here. The strict
 		// parsers already refuse them as a policy denial, so those bodies are
@@ -272,7 +280,7 @@ func dynamicURLScanCandidate(value string) (candidate, safe bool) {
 		}
 		return false, false
 	}
-	if len(trimmed) < len("http://x") {
+	if len(trimmed) <= len(scheme) {
 		return true, false
 	}
 	// A URL-shaped string must be safe. Anything about it that cannot be
@@ -328,7 +336,7 @@ func dynamicURLScanCandidate(value string) (candidate, safe bool) {
 		return true, false
 	}
 	parsed, err := url.Parse(trimmed)
-	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
+	if err != nil || scheme != "//" && !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
 		return true, false
 	}
 	if len(parsed.String()) > maxDynamicTargetURLBytes {
@@ -339,7 +347,7 @@ func dynamicURLScanCandidate(value string) (candidate, safe bool) {
 	if parsed.Fragment != "" || parsed.RawFragment != "" {
 		return true, false
 	}
-	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+	if scheme != "//" && !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
 		return true, false
 	}
 	if !dynamicURLDecodedComponentIsSafe(parsed.EscapedPath(), false) || !dynamicURLDecodedComponentIsSafe(parsed.RawQuery, true) {
@@ -379,6 +387,12 @@ func dynamicURLScanCandidate(value string) (candidate, safe bool) {
 // body that names one would expose it to the client instead.
 func dynamicScanHostIsNonPublicShorthand(host string) bool {
 	trimmed := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	// IDNA mapping precedes numeric IPv4 parsing. Numeric labels may exceed
+	// DNS length limits, so the DNS host validator must not discard the ASCII
+	// mapping before the numbers are interpreted.
+	if ascii, err := idna.Lookup.ToASCII(strings.TrimSpace(host)); err == nil {
+		trimmed = strings.TrimSuffix(strings.ToLower(ascii), ".")
+	}
 	if trimmed == "" {
 		return false
 	}
@@ -389,41 +403,44 @@ func dynamicScanHostIsNonPublicShorthand(host string) bool {
 	if len(parts) > 4 {
 		return false
 	}
-	octets := make([]int64, 0, len(parts))
+	octets := make([]uint64, 0, len(parts))
 	for _, part := range parts {
 		if part == "" {
 			return false
 		}
-		// Base 0 accepts the decimal, octal and hexadecimal spellings a
-		// resolver accepts; anything outside a 32-bit range is not an address.
-		value, err := strconv.ParseInt(part, 0, 64)
-		if err != nil || value < 0 || value > 0xffffffff {
-			return false
+		// WHATWG numbers use decimal, a leading-zero octal prefix,
+		// or 0x hexadecimal. Unlike Go's base-0 parser they do not admit signs,
+		// underscores, binary prefixes, or 0o prefixes. Bare 0x means zero.
+		digits, base := part, 10
+		if strings.HasPrefix(digits, "0x") {
+			digits, base = digits[2:], 16
+		} else if len(digits) > 1 && digits[0] == '0' {
+			digits, base = digits[1:], 8
+		}
+		var value uint64
+		if digits != "" {
+			var err error
+			value, err = strconv.ParseUint(digits, base, 32)
+			if err != nil {
+				return false
+			}
 		}
 		octets = append(octets, value)
 	}
 	// Every part before the last is a single octet; the last absorbs all
-	// remaining bytes, which is why "127.1" means 127.0.0.1 and "2130706433"
-	// means 127.0.0.1 as well. Every shift below operates on a value already
-	// proven to be in [0, 0xffffffff], so the additions cannot overflow.
-	address := int64(0)
-	if len(octets) == 1 {
-		address = octets[0]
-	} else {
-		for index := 0; index < len(octets)-1; index++ {
-			if octets[index] > 0xff {
-				return false
-			}
-			address |= octets[index] << (8 * (3 - index))
+	// remaining low bytes, which is why "127.1" means 127.0.0.1 and
+	// "2130706433" means 127.0.0.1 as well. Its allowed width is 32, 24, 16,
+	// or 8 bits for one, two, three, or four parts respectively.
+	trailing := octets[len(octets)-1]
+	if trailing >= uint64(1)<<(8*(5-len(octets))) {
+		return false
+	}
+	address := trailing
+	for index := 0; index < len(octets)-1; index++ {
+		if octets[index] > 0xff {
+			return false
 		}
-		trailing := octets[len(octets)-1]
-		switch len(octets) {
-		case 2:
-			trailing <<= 16
-		case 3:
-			trailing <<= 8
-		}
-		address |= trailing
+		address |= octets[index] << (8 * (3 - index))
 	}
 	bytes4 := [4]byte{
 		byte((address >> 24) & 0xff),

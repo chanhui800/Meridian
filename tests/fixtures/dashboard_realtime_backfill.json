@@ -1,0 +1,11 @@
+{
+  "billing_mode": "bidirectional",
+  "epoch": "telemetry-fixture",
+  "points": [
+    { "timestamp_ms": 100000, "bytes_in": 0, "bytes_out": 0, "requests": 0, "traffic_bytes": 0 },
+    { "timestamp_ms": 102000, "bytes_in": 40, "bytes_out": 60, "requests": 1, "traffic_bytes": 200 },
+    { "timestamp_ms": 104000, "bytes_in": 0, "bytes_out": 0, "requests": 0, "traffic_bytes": 0 },
+    { "timestamp_ms": 106000, "bytes_in": 20, "bytes_out": 45, "requests": 2, "traffic_bytes": 130 }
+  ],
+  "correction": { "timestamp_ms": 104000, "bytes_in": 20, "bytes_out": 45, "requests": 0, "traffic_bytes": 130 }
+}

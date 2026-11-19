@@ -1120,6 +1120,7 @@ func (runtime *edgeAgentRuntime) liveSiteTrafficSnapshot() []NodeLiveSiteTraffic
 			CumulativeBytesIn:  counter.cumulativeIn.Load(),
 			CumulativeBytesOut: counter.cumulativeOut.Load(),
 			Requests:           counter.requests.Load(),
+			CounterEpoch:       counter.epoch,
 		})
 	}
 	runtime.mu.RUnlock()
@@ -1144,7 +1145,7 @@ func (runtime *edgeAgentRuntime) captureLiveTelemetryAt(sampledAt time.Time) (se
 	elapsed := sampledAt.Sub(runtime.liveRateSampledAt).Seconds()
 	for index := range stats {
 		previous, ok := runtime.liveRatePrevious[stats[index].SiteID]
-		if !ok || elapsed <= 0 || stats[index].CumulativeBytesIn < previous.CumulativeBytesIn || stats[index].CumulativeBytesOut < previous.CumulativeBytesOut {
+		if !ok || elapsed <= 0 || stats[index].CounterEpoch != previous.CounterEpoch || stats[index].CumulativeBytesIn < previous.CumulativeBytesIn || stats[index].CumulativeBytesOut < previous.CumulativeBytesOut {
 			continue
 		}
 		stats[index].UploadBPS = float64(stats[index].CumulativeBytesIn-previous.CumulativeBytesIn) / elapsed
@@ -2769,120 +2770,6 @@ func edgeExecutableDigest() (string, string, error) {
 	return executable, hex.EncodeToString(digest.Sum(nil)), err
 }
 
-func edgeMaybeUpdate(ctx context.Context, client *http.Client, controller, token string, config AgentRuntimeConfig) error {
-	if len(config.AgentSHA256) != sha256.Size*2 {
-		return nil
-	}
-	executable, current, err := edgeExecutableDigest()
-	if err != nil || strings.EqualFold(current, config.AgentSHA256) {
-		return err
-	}
-	downloadURL := strings.TrimSpace(config.AgentDownloadURL)
-	if downloadURL == "" {
-		manifest, manifestErr := edgeFetchAgentManifest(ctx, client, controller, token)
-		if manifestErr != nil {
-			return manifestErr
-		}
-		downloadURL = manifest.DownloadURL
-		if !strings.EqualFold(manifest.SHA256, config.AgentSHA256) {
-			return errors.New("Agent release checksum differs from controller configuration")
-		}
-	}
-	platform := goruntime.GOOS + "/" + goruntime.GOARCH
-	asset, assetErr := agentReleaseAssetName(platform)
-	if assetErr != nil {
-		return assetErr
-	}
-	if err := validateAgentReleaseDownloadURL(downloadURL, strings.TrimSpace(config.AgentVersion), asset); err != nil {
-		if !strings.HasPrefix(downloadURL, strings.TrimRight(controller, "/")+"/api/agent/binary") {
-			return err
-		}
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set(agentPlatformHeader, platform)
-	releaseClient := *client
-	releaseClient.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
-		if req.URL.Scheme != "https" {
-			return errors.New("refusing non-HTTPS Agent release redirect")
-		}
-		return nil
-	}
-	response, err := releaseClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("Agent update returned %s", response.Status)
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(executable), ".meridian-agent-update-*")
-	if err != nil {
-		return err
-	}
-	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
-	digest := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(response.Body, 128<<20))
-	if copyErr != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("Agent update download failed: %w", copyErr)
-	}
-	if written <= 0 {
-		_ = temporary.Close()
-		return errors.New("Agent update download was empty")
-	}
-	if !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), config.AgentSHA256) {
-		_ = temporary.Close()
-		return errors.New("Agent update checksum mismatch")
-	}
-	if err := temporary.Chmod(0o755); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryName, executable); err != nil {
-		return err
-	}
-	// The rename already committed the replacement: from here the on-disk
-	// binary is the new one, so a failed durability sync must NOT turn into a
-	// plain update error — the process would keep running the old code while
-	// the next digest check reads the new binary from disk and concludes no
-	// restart is needed. Surface the sync failure as a warning and still
-	// demand the restart.
-	if err := syncDirectory(filepath.Dir(executable)); err != nil {
-		fmt.Fprintf(os.Stderr, "Meridian Agent update directory sync failed (replacement already applied): %v\n", err)
-	}
-	return errEdgeAgentUpdated
-}
-
-func syncDirectory(path string) error {
-	if goruntime.GOOS == "windows" {
-		// Windows does not expose a directory fsync operation. The file itself
-		// is flushed before rename; directory metadata durability is best effort.
-		return nil
-	}
-	directory, err := os.Open(path) // #nosec G304 G703 -- path is the parent directory of the Agent executable selected by Meridian.
-	if err != nil {
-		return err
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
-}
-
 func edgeFetchAgentManifest(ctx context.Context, client *http.Client, controller, token string) (AgentBinaryManifest, error) {
 	var manifest AgentBinaryManifest
 	if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/manifest", token, nil, &manifest, http.Header{
@@ -2897,8 +2784,12 @@ func edgeFetchAgentManifest(ctx context.Context, client *http.Client, controller
 	if !strings.EqualFold(manifest.Platform, goruntime.GOOS+"/"+goruntime.GOARCH) || len(manifest.SHA256) != sha256.Size*2 {
 		return AgentBinaryManifest{}, errors.New("controller returned an invalid Agent release manifest")
 	}
-	if strings.HasPrefix(manifest.DownloadURL, "/") {
-		manifest.DownloadURL = strings.TrimRight(controller, "/") + manifest.DownloadURL
+	if manifest.DownloadURL == "/api/agent/binary" {
+		binaryURL, err := edgeControllerBinaryURL(controller)
+		if err != nil {
+			return AgentBinaryManifest{}, err
+		}
+		manifest.DownloadURL = binaryURL.String()
 	} else if err := validateAgentReleaseDownloadURL(manifest.DownloadURL, manifest.Version, asset); err != nil {
 		return AgentBinaryManifest{}, err
 	}
@@ -3049,9 +2940,12 @@ func runEdgeAgent() (runErr error) {
 		}
 	}
 	defer stopLiveReporter()
+	updates := newEdgeAgentUpdateWorker(ctx, func(updateCtx context.Context, config AgentRuntimeConfig) (*edgeAgentUpdate, error) {
+		return edgePrepareAgentUpdate(updateCtx, client, controller, state.Token, config)
+	})
+	defer updates.close()
 	sequence := int64(0)
 	const configRefreshInterval = 60 * time.Second
-	const agentUpdateRetryInterval = 5 * time.Minute
 	const agentApplyRetryBase = 5 * time.Second
 	const agentApplyRetryMax = 60 * time.Second
 	const agentStaleRecoveryBase = 30 * time.Second
@@ -3060,13 +2954,16 @@ func runEdgeAgent() (runErr error) {
 	// runtime is quiesced, keeping the CPU idle between retry attempts.
 	const agentQuiescedPollInterval = 2 * time.Second
 	lastConfigAt := time.Time{}
-	lastUpdateAttempt := time.Time{}
 	nextApplyAttempt := time.Time{}
 	applyFailures := 0
 	var pendingConfig *AgentRuntimeConfig
+	var approvedUpdateTarget edgeAgentUpdateTarget
+	updateConfigValid := false
 	staleRecoveryAt := time.Time{}
 	staleRecoveryDelay := agentStaleRecoveryBase
 	handleStale := func() {
+		updateConfigValid = false
+		updates.invalidate()
 		stopLiveReporter()
 		edgeQuiesceStale(runtime)
 		pendingConfig = nil
@@ -3082,14 +2979,69 @@ func runEdgeAgent() (runErr error) {
 			staleRecoveryDelay = agentStaleRecoveryMax
 		}
 	}
+	handleUpdateResult := func(result edgeAgentUpdateResult) error {
+		update, updateErr := updates.finish(result)
+		if update != nil {
+			// A revoked/stale live response may have arrived while the worker
+			// finished. Process it before committing any executable replacement.
+			select {
+			case liveErr := <-liveErrCh:
+				if isEdgeAgentRevoked(liveErr) {
+					updates.invalidate()
+					update.discard()
+					return liveErr
+				}
+				if isEdgeAgentStale(liveErr) {
+					handleStale()
+				}
+			default:
+			}
+			applied, revision, _, _, _, _ := runtime.status()
+			leaseID, epoch := runtime.reportIdentity()
+			if runtime.isQuiesced() || !updateConfigValid || !updates.allowed || updates.target.configHash != applied || updates.target.configRevision != revision || updates.target.nodeGUID != strings.TrimSpace(state.NodeGUID) || updates.target.leaseID != leaseID || updates.target.sessionEpoch != epoch {
+				update.discard()
+				return nil
+			}
+			updateErr = update.commit(ctx)
+		}
+		if isEdgeAgentRevoked(updateErr) {
+			updates.invalidate()
+			return updateErr
+		}
+		if isEdgeAgentStale(updateErr) {
+			handleStale()
+			return nil
+		}
+		if errors.Is(updateErr, errEdgeAgentUpdated) {
+			return updateErr
+		}
+		if updateErr != nil && !errors.Is(updateErr, context.Canceled) {
+			fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
+		}
+		return nil
+	}
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		select {
 		case liveErr := <-liveErrCh:
 			if isEdgeAgentRevoked(liveErr) {
+				updates.invalidate()
 				return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 			}
 			if isEdgeAgentStale(liveErr) {
 				handleStale()
+			}
+		default:
+		}
+		select {
+		case result := <-updates.results:
+			if updateErr := handleUpdateResult(result); updateErr != nil {
+				if isEdgeAgentRevoked(updateErr) {
+					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+				}
+				return updateErr
 			}
 		default:
 		}
@@ -3101,6 +3053,14 @@ func runEdgeAgent() (runErr error) {
 				case <-ctx.Done():
 					timer.Stop()
 					return nil
+				case result := <-updates.results:
+					timer.Stop()
+					if updateErr := handleUpdateResult(result); updateErr != nil {
+						if isEdgeAgentRevoked(updateErr) {
+							return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+						}
+						return updateErr
+					}
 				case <-timer.C:
 				}
 				continue
@@ -3120,6 +3080,8 @@ func runEdgeAgent() (runErr error) {
 				agentSessionHeader:  []string{bootID},
 				agentEpochHeader:    []string{strconv.FormatInt(sessionEpoch, 10)},
 			}); err != nil {
+				updateConfigValid = false
+				updates.invalidate()
 				if isEdgeAgentRevoked(err) {
 					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 				}
@@ -3129,8 +3091,15 @@ func runEdgeAgent() (runErr error) {
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
+				updateConfigValid = false
+				updates.invalidate()
 				fmt.Fprintf(os.Stderr, "Meridian Agent rejected config: %v\n", configErr)
 			} else {
+				approvedUpdateTarget = agentUpdateTarget(config, sessionEpoch)
+				updateConfigValid = true
+				if !updates.matches(config, sessionEpoch) {
+					updates.invalidate()
+				}
 				runtime.setLeaseID(config.AgentLeaseID)
 				// A new identity must be applied atomically. Updating the old
 				// bundle before apply would leak a failed candidate's quota into
@@ -3150,28 +3119,20 @@ func runEdgeAgent() (runErr error) {
 				} else {
 					pendingConfig = &config
 				}
-				// Applying a valid runtime configuration must not depend on the
-				// availability of the optional Agent release service. A GitHub
-				// outage should leave the current proxy converged while update
-				// retries happen independently in the background.
-				if lastUpdateAttempt.IsZero() || now.Sub(lastUpdateAttempt) >= agentUpdateRetryInterval {
-					lastUpdateAttempt = now
-					if updateErr := edgeMaybeUpdate(ctx, client, controller, state.Token, config); updateErr != nil {
-						if errors.Is(updateErr, errEdgeAgentUpdated) {
-							return updateErr
-						}
-						fmt.Fprintf(os.Stderr, "Meridian Agent update failed: %v\n", updateErr)
-					}
-				}
 			}
 		}
 		if pendingConfig != nil && (nextApplyAttempt.IsZero() || !now.Before(nextApplyAttempt)) {
+			candidate := *pendingConfig
 			applied, appliedRevision, _, _, _, _ := runtime.status()
 			if !runtime.isQuiesced() && agentConfigIdentityEqual(*pendingConfig, AgentRuntimeConfig{ConfigHash: applied, ConfigRevision: appliedRevision}) {
+				if updateConfigValid && approvedUpdateTarget == agentUpdateTarget(candidate, sessionEpoch) {
+					updates.allow(candidate, sessionEpoch)
+				}
 				pendingConfig = nil
 				applyFailures = 0
 				nextApplyAttempt = time.Time{}
 			} else if err := runtime.apply(*pendingConfig); err != nil {
+				updates.invalidate()
 				fmt.Fprintf(os.Stderr, "Meridian Agent config apply failed: %v\n", err)
 				applyFailures++
 				delay := agentApplyRetryBase
@@ -3184,6 +3145,9 @@ func runEdgeAgent() (runErr error) {
 				}
 				nextApplyAttempt = now.Add(delay)
 			} else {
+				if updateConfigValid && approvedUpdateTarget == agentUpdateTarget(candidate, sessionEpoch) {
+					updates.allow(candidate, sessionEpoch)
+				}
 				pendingConfig = nil
 				applyFailures = 0
 				nextApplyAttempt = time.Time{}
@@ -3205,9 +3169,22 @@ func runEdgeAgent() (runErr error) {
 			case <-ctx.Done():
 				timer.Stop()
 				return nil
+			case result := <-updates.results:
+				timer.Stop()
+				if updateErr := handleUpdateResult(result); updateErr != nil {
+					if isEdgeAgentRevoked(updateErr) {
+						return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+					}
+					return updateErr
+				}
 			case <-timer.C:
 			}
 			continue
+		}
+		// The optional release service never gates configuration application or
+		// complete reporting. It only prepares one cancellable download.
+		if !*once {
+			updates.start(time.Now())
 		}
 		refreshImmediately := false
 		sequence++
@@ -3230,6 +3207,7 @@ func runEdgeAgent() (runErr error) {
 			}
 			if wsErr != nil {
 				if isEdgeAgentRevoked(wsErr) {
+					updates.invalidate()
 					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
 				}
 				if isEdgeAgentStale(wsErr) {
@@ -3277,6 +3255,8 @@ func runEdgeAgent() (runErr error) {
 					runtime.mu.Unlock()
 				}
 				if ack.ConfigChanged {
+					updateConfigValid = false
+					updates.invalidate()
 					lastConfigAt = time.Time{}
 					refreshImmediately = true
 				}
@@ -3294,6 +3274,13 @@ func runEdgeAgent() (runErr error) {
 		select {
 		case <-ctx.Done():
 			return nil
+		case result := <-updates.results:
+			if updateErr := handleUpdateResult(result); updateErr != nil {
+				if isEdgeAgentRevoked(updateErr) {
+					return edgeQuiesceRevoked(ctx, runtime, revokedMarker)
+				}
+				return updateErr
+			}
 		case <-time.After(func() time.Duration {
 			wait := agentFullReportInterval
 			if pendingConfig != nil && !nextApplyAttempt.IsZero() {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,12 +22,27 @@ type nodeLiveTrafficKey struct {
 
 type nodeLiveTrafficState struct {
 	NodeLiveSiteTraffic
-	reportSessionID   string
-	counterEpoch      string
+	reportSessionID      string
+	counterEpoch         string
+	sequence             int64
+	fullSequence         int64
+	telemetrySequence    int64
+	rateFromLive         bool
+	implicitCounterReset bool
+	updatedAt            time.Time
+	lastReportAt         time.Time
+	liveGauge            nodeLiveGaugeIdentity
+}
+
+type nodeLiveGaugeIdentity struct {
+	sampledAtMS       int64
 	sequence          int64
 	telemetrySequence int64
-	updatedAt         time.Time
+	counterEpoch      uint64
+	counterDomain     uint64
 }
+
+var agentCounterDomainSequence atomic.Uint64
 
 func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
 	report.ReportSessionID = strings.TrimSpace(report.ReportSessionID)
@@ -55,14 +71,135 @@ func validateNodeLiveReport(report NodeLiveReport, now time.Time) error {
 	return nil
 }
 
-func telemetrySequenceIsStale(previous nodeLiveTrafficState, sessionID, counterEpoch string, sequence int64) bool {
+func telemetrySequenceIsStale(previous nodeLiveTrafficState, sessionID string, sequence int64) bool {
 	if sequence <= 0 || previous.telemetrySequence <= 0 {
 		return false
 	}
 	// The shared sequence restarts with a new Agent process. Only compare it
-	// inside the same report session/counter epoch; a new session is a fresh
-	// ordering domain and may legitimately begin at sequence 1.
-	return previous.reportSessionID == sessionID && previous.counterEpoch == counterEpoch && sequence <= previous.telemetrySequence
+	// inside the same process session. A NIC epoch can change without restarting
+	// the process or its site counters, and cannot reset this shared sequence.
+	return previous.reportSessionID == sessionID && sequence <= previous.telemetrySequence
+}
+
+func nodeTrafficReportDomainMatches(previous nodeLiveTrafficState, sessionID, counterEpoch string) bool {
+	return previous.reportSessionID == sessionID && previous.counterEpoch == counterEpoch
+}
+
+// mergeNodeTrafficSample orders counters independently from the speed gauge.
+// Full reports must advance the shared watermark even while a lightweight
+// measurement still owns the gauge. Their database receive times cannot be
+// used to decide which counter snapshot was captured last.
+func mergeNodeTrafficSample(previous nodeLiveTrafficState, exists bool, sample NodeLiveSiteTraffic, sessionID, counterEpoch string, sequence, telemetrySequence int64, live bool, now time.Time) nodeLiveTrafficState {
+	reportedCounterEpoch := sample.CounterEpoch
+	sameSiteEpoch := sample.CounterEpoch > 0 && sample.CounterEpoch == previous.CounterEpoch
+	sameReportDomain := exists && previous.reportSessionID == sessionID && (previous.counterEpoch == counterEpoch || sameSiteEpoch)
+	if !sameReportDomain {
+		previous = nodeLiveTrafficState{}
+	}
+	next := previous
+	next.reportSessionID, next.counterEpoch = sessionID, counterEpoch
+	next.lastReportAt = now
+	if telemetrySequence > next.telemetrySequence {
+		next.telemetrySequence = telemetrySequence
+	}
+	if live {
+		next.sequence = sequence
+	} else {
+		next.fullSequence = sequence
+	}
+
+	epochChanged := sameReportDomain && previous.CounterEpoch > 0 && sample.CounterEpoch > 0 && previous.CounterEpoch != sample.CounterEpoch
+	countersDecreased := sameReportDomain && (sample.CumulativeBytesIn < previous.CumulativeBytesIn || sample.CumulativeBytesOut < previous.CumulativeBytesOut || sample.Requests < previous.Requests)
+	// A legacy live sample cannot name its new counter epoch. If its reset was
+	// already observed, the next full report supplies that name rather than
+	// starting a second reset and counting its initial bytes twice.
+	promoteImplicitReset := epochChanged && previous.implicitCounterReset && !countersDecreased
+	if sameReportDomain && sample.CounterEpoch > 0 && previous.CounterEpoch > sample.CounterEpoch && !previous.implicitCounterReset {
+		return next
+	}
+	if countersDecreased && !epochChanged && sample.CounterEpoch > 0 && sample.CounterEpoch == previous.CounterEpoch {
+		// Current Agents never reset counters without changing their epoch.
+		// An older snapshot in the same named epoch must not look like a reset.
+		return next
+	}
+	reset := !sameReportDomain || (epochChanged && !promoteImplicitReset) || countersDecreased
+	if reset {
+		next.CounterDomain = agentCounterDomainSequence.Add(1)
+		next.DownloadBPS, next.UploadBPS, next.RateValid, next.RateReceivedAtMS = 0, 0, false, 0
+		next.rateFromLive = false
+		next.liveGauge = nodeLiveGaugeIdentity{}
+		next.implicitCounterReset = sameReportDomain && countersDecreased && (sample.CounterEpoch == 0 || previous.CounterEpoch == 0)
+	} else if promoteImplicitReset {
+		next.implicitCounterReset = false
+	}
+	if sample.CounterEpoch == 0 && sameReportDomain {
+		sample.CounterEpoch = previous.CounterEpoch
+	}
+	sample.CounterDomain = next.CounterDomain
+	download, upload, rateValid, rateReceived := next.DownloadBPS, next.UploadBPS, next.RateValid, next.RateReceivedAtMS
+	if live && sample.RateValid {
+		download, upload, rateValid, rateReceived = sample.DownloadBPS, sample.UploadBPS, true, now.UnixMilli()
+		next.rateFromLive = true
+	} else {
+		keepLiveRate := !live && !reset && previous.rateFromLive && previous.RateValid &&
+			previous.RateReceivedAtMS > 0 &&
+			now.UnixMilli()-previous.RateReceivedAtMS <= agentLiveFallbackWindow.Milliseconds()
+		if !keepLiveRate {
+			download, upload, rateValid, rateReceived = 0, 0, false, 0
+			// Reports from older Agents lack explicit rates. Full-report
+			// fallback rates use captured timestamps and the same counter domain.
+			if !reset && sample.AgentSampledAtMS > previous.AgentSampledAtMS && previous.AgentSampledAtMS > 0 {
+				seconds := float64(sample.AgentSampledAtMS-previous.AgentSampledAtMS) / 1000
+				download = float64(sample.CumulativeBytesOut-previous.CumulativeBytesOut) / seconds
+				upload = float64(sample.CumulativeBytesIn-previous.CumulativeBytesIn) / seconds
+				rateValid = true
+				rateReceived = now.UnixMilli()
+			}
+			next.rateFromLive = live
+		}
+	}
+	sample.DownloadBPS, sample.UploadBPS, sample.RateValid, sample.RateReceivedAtMS = download, upload, rateValid, rateReceived
+	next.NodeLiveSiteTraffic = sample
+	next.updatedAt = now
+	if live {
+		next.liveGauge = nodeLiveGaugeIdentity{
+			sampledAtMS: sample.AgentSampledAtMS, sequence: sequence, telemetrySequence: telemetrySequence,
+			counterEpoch: reportedCounterEpoch, counterDomain: next.CounterDomain,
+		}
+	}
+	return next
+}
+
+// A full report may capture newer counters before an earlier lightweight
+// measurement is delivered. Gauge ordering follows the live channel separately,
+// but only a measurement from the current site counter domain is eligible.
+func mergeDelayedNodeLiveGauge(previous nodeLiveTrafficState, sample NodeLiveSiteTraffic, report NodeLiveReport, now time.Time) (nodeLiveTrafficState, bool) {
+	if !sample.RateValid || previous.reportSessionID != report.ReportSessionID || previous.CounterDomain == 0 {
+		return previous, false
+	}
+	sameNamedEpoch := sample.CounterEpoch > 0 && sample.CounterEpoch == previous.CounterEpoch
+	sameLegacyEpoch := sample.CounterEpoch == 0 && previous.liveGauge.counterEpoch == 0 &&
+		previous.liveGauge.counterDomain == previous.CounterDomain && previous.counterEpoch == report.CounterEpoch
+	if !sameNamedEpoch && !sameLegacyEpoch {
+		return previous, false
+	}
+	newer := report.TelemetrySequence > previous.liveGauge.telemetrySequence
+	if report.TelemetrySequence <= 0 || previous.liveGauge.telemetrySequence <= 0 {
+		newer = report.SampledAtMS > previous.liveGauge.sampledAtMS && report.Sequence > previous.liveGauge.sequence
+	}
+	if !newer {
+		return previous, false
+	}
+	next := previous
+	next.DownloadBPS, next.UploadBPS, next.RateValid = sample.DownloadBPS, sample.UploadBPS, true
+	next.RateReceivedAtMS = now.UnixMilli()
+	next.rateFromLive = true
+	next.sequence = report.Sequence
+	next.liveGauge = nodeLiveGaugeIdentity{
+		sampledAtMS: report.SampledAtMS, sequence: report.Sequence, telemetrySequence: report.TelemetrySequence,
+		counterEpoch: sample.CounterEpoch, counterDomain: next.CounterDomain,
+	}
+	return next, true
 }
 
 // recordNodeLiveReport validates site ownership in a read transaction and
@@ -107,7 +244,11 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 		d.agentLive = make(map[nodeLiveTrafficKey]nodeLiveTrafficState)
 	}
 	for key, state := range d.agentLive {
-		if now.Sub(state.updatedAt) > 2*nodeOnlineWindow {
+		lastReportAt := state.lastReportAt
+		if lastReportAt.IsZero() {
+			lastReportAt = state.updatedAt
+		}
+		if now.Sub(lastReportAt) > 2*nodeOnlineWindow {
 			delete(d.agentLive, key)
 		}
 	}
@@ -123,31 +264,23 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 		// Full and lightweight reports share TelemetrySequence. A delayed
 		// lightweight report must never overwrite a newer full report (or the
 		// reverse), even though their channel-local sequences are independent.
-		if exists && telemetrySequenceIsStale(previous, report.ReportSessionID, report.CounterEpoch, report.TelemetrySequence) {
+		if exists && telemetrySequenceIsStale(previous, report.ReportSessionID, report.TelemetrySequence) {
+			gauge, applied := mergeDelayedNodeLiveGauge(previous, stat, report, now)
+			previous = gauge
+			previous.lastReportAt = now
+			d.agentLive[key] = previous
+			if applied {
+				accepted = appendUniqueInt64(accepted, stat.SiteID)
+			}
 			continue
 		}
-		if exists && previous.reportSessionID == report.ReportSessionID && report.Sequence <= previous.sequence {
+		if exists && report.TelemetrySequence <= 0 && nodeTrafficReportDomainMatches(previous, report.ReportSessionID, report.CounterEpoch) && report.Sequence <= previous.sequence {
 			continue
 		}
-		d.agentLive[key] = nodeLiveTrafficState{
-			NodeLiveSiteTraffic: NodeLiveSiteTraffic{
-				SiteID: stat.SiteID, Host: host,
-				CumulativeBytesIn:  stat.CumulativeBytesIn,
-				CumulativeBytesOut: stat.CumulativeBytesOut,
-				Requests:           stat.Requests,
-				DownloadBPS:        stat.DownloadBPS,
-				UploadBPS:          stat.UploadBPS,
-				RateValid:          stat.RateValid,
-				SampledAtMS:        serverSampledAt,
-				AgentSampledAtMS:   report.SampledAtMS,
-				ReceivedAtMS:       serverSampledAt,
-			},
-			reportSessionID:   report.ReportSessionID,
-			counterEpoch:      report.CounterEpoch,
-			sequence:          report.Sequence,
-			telemetrySequence: report.TelemetrySequence,
-			updatedAt:         now,
-		}
+		sample := stat
+		sample.Host = host
+		sample.SampledAtMS, sample.AgentSampledAtMS, sample.ReceivedAtMS = serverSampledAt, report.SampledAtMS, serverSampledAt
+		d.agentLive[key] = mergeNodeTrafficSample(previous, exists, sample, report.ReportSessionID, report.CounterEpoch, report.Sequence, report.TelemetrySequence, true, now)
 		accepted = appendUniqueInt64(accepted, stat.SiteID)
 	}
 	d.agentLiveMu.Unlock()
@@ -159,7 +292,7 @@ func (d *DB) recordNodeLiveReport(nodeID int64, report NodeLiveReport, now time.
 // watermark prevents a delayed report from either channel from replacing a
 // newer sample.
 func (d *DB) recordNodeFullTelemetry(nodeID int64, report NodeReport, acceptedSiteIDs []int64, now time.Time) {
-	if d == nil || nodeID <= 0 || report.TelemetrySequence <= 0 || len(acceptedSiteIDs) == 0 {
+	if d == nil || nodeID <= 0 || len(acceptedSiteIDs) == 0 {
 		return
 	}
 	allowed := make(map[int64]struct{}, len(acceptedSiteIDs))
@@ -199,37 +332,20 @@ func (d *DB) recordNodeFullTelemetry(nodeID int64, report NodeReport, acceptedSi
 		}
 		key := nodeLiveTrafficKey{nodeID: nodeID, siteID: stat.SiteID}
 		previous, exists := d.agentLive[key]
-		// The lightweight channel owns the realtime cadence. A healthy live
-		// sample must not be replaced by the five-second persistence report.
-		if exists && previous.sequence > 0 && !previous.updatedAt.IsZero() && now.Sub(previous.updatedAt) <= agentLiveFallbackWindow {
+		if exists && telemetrySequenceIsStale(previous, sessionID, report.TelemetrySequence) {
+			previous.lastReportAt = now
+			d.agentLive[key] = previous
 			continue
 		}
-		if exists && telemetrySequenceIsStale(previous, sessionID, counterEpoch, report.TelemetrySequence) {
+		if exists && report.TelemetrySequence <= 0 && report.Sequence > 0 && previous.fullSequence > 0 && nodeTrafficReportDomainMatches(previous, sessionID, counterEpoch) && report.Sequence <= previous.fullSequence {
 			continue
 		}
-		downloadBPS, uploadBPS := float64(0), float64(0)
-		rateValid := false
-		if exists && previous.AgentSampledAtMS > 0 && agentSampledAtMS > previous.AgentSampledAtMS && currentIn >= previous.CumulativeBytesIn && currentOut >= previous.CumulativeBytesOut {
-			seconds := float64(agentSampledAtMS-previous.AgentSampledAtMS) / 1000
-			if seconds > 0 {
-				downloadBPS = float64(currentOut-previous.CumulativeBytesOut) / seconds
-				uploadBPS = float64(currentIn-previous.CumulativeBytesIn) / seconds
-				rateValid = true
-			}
+		sample := NodeLiveSiteTraffic{
+			SiteID: stat.SiteID, Host: host, CounterEpoch: stat.CounterEpoch,
+			CumulativeBytesIn: currentIn, CumulativeBytesOut: currentOut, Requests: stat.RequestCount,
+			SampledAtMS: now.UnixMilli(), AgentSampledAtMS: agentSampledAtMS, ReceivedAtMS: now.UnixMilli(),
 		}
-		d.agentLive[key] = nodeLiveTrafficState{
-			NodeLiveSiteTraffic: NodeLiveSiteTraffic{
-				SiteID: stat.SiteID, Host: host,
-				CumulativeBytesIn: currentIn, CumulativeBytesOut: currentOut,
-				Requests: stat.RequestCount, DownloadBPS: downloadBPS, UploadBPS: uploadBPS, RateValid: rateValid,
-				SampledAtMS: now.UnixMilli(), AgentSampledAtMS: agentSampledAtMS, ReceivedAtMS: now.UnixMilli(),
-			},
-			reportSessionID:   sessionID,
-			counterEpoch:      counterEpoch,
-			sequence:          0,
-			telemetrySequence: report.TelemetrySequence,
-			updatedAt:         now,
-		}
+		d.agentLive[key] = mergeNodeTrafficSample(previous, exists, sample, sessionID, counterEpoch, report.Sequence, report.TelemetrySequence, false, now)
 	}
 }
 
@@ -253,7 +369,11 @@ func (d *DB) nodeLiveTrafficOverlay(now time.Time) map[nodeLiveTrafficKey]nodeLi
 	d.agentLiveMu.RLock()
 	defer d.agentLiveMu.RUnlock()
 	for key, state := range d.agentLive {
-		if state.updatedAt.IsZero() || now.Sub(state.updatedAt) > nodeOnlineWindow {
+		lastReportAt := state.lastReportAt
+		if lastReportAt.IsZero() {
+			lastReportAt = state.updatedAt
+		}
+		if lastReportAt.IsZero() || now.Sub(lastReportAt) > 2*nodeOnlineWindow {
 			continue
 		}
 		// Keep both node and site in the key: during a scheduler transition two

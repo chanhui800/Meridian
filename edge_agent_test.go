@@ -168,6 +168,31 @@ func TestCaptureLiveTelemetryUsesAgentSampleInterval(t *testing.T) {
 	}
 }
 
+func TestCaptureLiveTelemetryDoesNotReuseRetiredCounterRate(t *testing.T) {
+	runtime := &edgeAgentRuntime{}
+	counter := runtime.trafficCounterFor(42, "epoch.example.test")
+	counter.cumulativeOut.Store(100)
+	startedAt := time.Unix(1_700_000_000, 0)
+	_, _, baseline := runtime.captureLiveTelemetryAt(startedAt)
+	if len(baseline) != 1 || baseline[0].CounterEpoch != 1 {
+		t.Error("live baseline did not advertise the site counter epoch")
+	}
+	runtime.mu.Lock()
+	runtime.trafficCounters = make(map[int64]*edgeSiteTrafficCounter)
+	runtime.mu.Unlock()
+	counter = runtime.trafficCounterFor(42, "epoch.example.test")
+	counter.cumulativeOut.Store(300)
+	_, _, retired := runtime.captureLiveTelemetryAt(startedAt.Add(2 * time.Second))
+	if len(retired) != 1 || retired[0].CounterEpoch != 2 || retired[0].RateValid {
+		t.Errorf("retired counter sample = %+v, want a new epoch without a rate", retired)
+	}
+	counter.cumulativeOut.Store(340)
+	_, _, resumed := runtime.captureLiveTelemetryAt(startedAt.Add(4 * time.Second))
+	if len(resumed) != 1 || !resumed[0].RateValid || resumed[0].DownloadBPS != 20 {
+		t.Fatalf("rate after the new baseline = %+v, want 20", resumed)
+	}
+}
+
 func TestEdgeMetadataIPv4FromResponse(t *testing.T) {
 	for _, test := range []struct {
 		name  string

@@ -1264,3 +1264,211 @@ test('global traffic settings expose reset and no-reset billing cycles', () => {
   assert.match(source, /不重置（累计流量）/);
   assert.match(source, /s\.traffic_reset_day == null \? 1 : s\.traffic_reset_day/);
 });
+
+test('dashboard applies SSE backfill corrections before the next HTTP refresh', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'dashboard_realtime_backfill.json'), 'utf8'));
+  const { sandbox } = makeTrafficHarness();
+  sandbox.Date = { now: () => 106000 };
+  sandbox.fixture = fixture;
+  const totals = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = { range: 'realtime', billing_mode: fixture.billing_mode, live_baselines: {}, points: [] };
+    fixture.points.forEach((point, index) => {
+      updateDashboardLive({
+        generated_at_ms: point.timestamp_ms, billing_mode: fixture.billing_mode, live_sites: [],
+        realtime_epoch: fixture.epoch, realtime_base_revision: index, realtime_revision: index + 1,
+        realtime_trend: point,
+        realtime_updates: index === 3 ? [fixture.correction, point] : [point],
+      });
+    });
+    return dashboardTrendChartPoints().reduce((sum, point) => ({
+      bytesIn: sum.bytesIn + point.bytes_in, bytesOut: sum.bytesOut + point.bytes_out,
+      requests: sum.requests + point.requests, traffic: sum.traffic + point.traffic_bytes,
+    }), { bytesIn: 0, bytesOut: 0, requests: 0, traffic: 0 });
+  })()`, sandbox);
+  assert.deepEqual({ ...totals }, { bytesIn: 80, bytesOut: 150, requests: 3, traffic: 460 });
+});
+
+test('dashboard older HTTP windows cannot undo newer SSE corrections for all or selected sites', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'dashboard_realtime_backfill.json'), 'utf8'));
+  const { sandbox } = makeTrafficHarness();
+  sandbox.Date = { now: () => 106000 };
+  sandbox.fixture = fixture;
+  const result = vm.runInContext(`(() => {
+    const withSite = point => ({ ...point, site_contributions: { '1': { ...point } } });
+    const old = fixture.points.slice(0, 3).map(withSite);
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = { range: 'realtime', billing_mode: fixture.billing_mode, live_baselines: {}, points: [] };
+    dashboardMergeServerRealtimePoints({ site_id: 'all', realtime_epoch: fixture.epoch, realtime_revision: 3, realtime_points: old });
+    const point = withSite(fixture.points[3]);
+    updateDashboardLive({
+      generated_at_ms: point.timestamp_ms, billing_mode: fixture.billing_mode, live_sites: [],
+      realtime_epoch: fixture.epoch, realtime_base_revision: 3, realtime_revision: 4,
+      realtime_trend: point, realtime_updates: [withSite(fixture.correction), point],
+    });
+    dashboardMergeServerRealtimePoints({ site_id: 'all', realtime_epoch: fixture.epoch, realtime_revision: 3, realtime_points: old });
+    const total = () => dashboardTrendChartPoints().reduce((sum, value) => sum + value.bytes_out, 0);
+    const all = total();
+    dashboardTrendState.siteId = '1';
+    dashboardMergeServerRealtimePoints({
+      site_id: '1', realtime_epoch: fixture.epoch, realtime_revision: 3,
+      realtime_points: fixture.points.slice(0, 3),
+    });
+    return { all, selected: total() };
+  })()`, sandbox);
+  assert.deepEqual({ ...result }, { all: 150, selected: 150 });
+});
+
+test('dashboard new epochs clear old counters and reject retired epoch responses', () => {
+  const { sandbox } = makeTrafficHarness();
+  sandbox.Date = { now: () => 110000 };
+  const result = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardTrendData = { range: 'realtime', billing_mode: 'bidirectional', live_baselines: {}, points: [] };
+    updateDashboardLive({
+      generated_at_ms: 100000, billing_mode: 'bidirectional', live_sites: [],
+      realtime_epoch: 'old-process', realtime_base_revision: 0, realtime_revision: 80,
+      realtime_trend: { timestamp_ms: 100000, bytes_in: 0, bytes_out: 1000, requests: 10, traffic_bytes: 2000 },
+    });
+    updateDashboardLive({
+      generated_at_ms: 110000, billing_mode: 'outbound', live_sites: [],
+      realtime_epoch: 'new-process', realtime_base_revision: 0, realtime_revision: 1,
+      realtime_trend: { timestamp_ms: 110000, bytes_in: 0, bytes_out: 20, requests: 1, traffic_bytes: 20 },
+    });
+    dashboardMergeServerRealtimePoints({
+      site_id: 'all', realtime_epoch: 'old-process', realtime_revision: 81,
+      realtime_points: [{ timestamp_ms: 110000, bytes_in: 0, bytes_out: 2000, requests: 20, traffic_bytes: 4000 }],
+    });
+    return dashboardTrendChartPoints().map(point => ({ outbound: point.bytes_out, traffic: point.traffic_bytes }));
+  })()`, sandbox);
+  assert.deepEqual(Array.from(result, point => ({ ...point })), [{ outbound: 20, traffic: 20 }]);
+});
+
+test('dashboard selected HTTP revisions do not suppress aggregate SSE corrections', () => {
+  const { sandbox } = makeTrafficHarness();
+  sandbox.Date = { now: () => 104000 };
+  const result = vm.runInContext(`(() => {
+    const point = (timestamp, first, second) => ({
+      timestamp_ms: timestamp, bytes_in: 0, bytes_out: first + second, traffic_bytes: first + second, requests: 0,
+      site_contributions: {
+        '1': { timestamp_ms: timestamp, bytes_in: 0, bytes_out: first, traffic_bytes: first, requests: 0 },
+        '2': { timestamp_ms: timestamp, bytes_in: 0, bytes_out: second, traffic_bytes: second, requests: 0 },
+      },
+    });
+    const old = point(100000, 10, 10), corrected = point(100000, 15, 15), current = point(102000, 20, 30);
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardMergeServerRealtimePoints({ site_id: 'all', billing_mode: 'outbound', realtime_epoch: 'scope-test', realtime_revision: 1, realtime_points: [old] });
+    dashboardTrendState.siteId = '1';
+    dashboardMergeServerRealtimePoints({
+      site_id: '1', billing_mode: 'outbound', realtime_epoch: 'scope-test', realtime_revision: 3,
+      realtime_points: [
+        { timestamp_ms: 100000, bytes_in: 0, bytes_out: 99, traffic_bytes: 99, requests: 0 },
+        current.site_contributions['1'],
+      ],
+    });
+    updateDashboardLive({
+      generated_at_ms: 102000, billing_mode: 'outbound', live_sites: [],
+      realtime_epoch: 'scope-test', realtime_revision: 2, realtime_base_revision: 1,
+      realtime_trend: current, realtime_updates: [corrected, current],
+    });
+    return {
+      all: dashboardRealtimeTrendSamples.get('all').reduce((sum, value) => sum + value.bytes_out, 0),
+      other: dashboardRealtimeTrendSamples.get('2').reduce((sum, value) => sum + value.bytes_out, 0),
+      selected: dashboardRealtimeTrendSamples.get('1')[0].bytes_out,
+    };
+  })()`, sandbox);
+  assert.deepEqual({ ...result }, { all: 80, other: 45, selected: 99 });
+});
+
+test('dashboard epoch changes cancel obsolete recovery and reset its throttle', () => {
+  const { sandbox } = makeTrafficHarness();
+  let now = 100000;
+  sandbox.Date = { now: () => now };
+  sandbox.Router.current = 'dashboard';
+  const requests = [];
+  sandbox.recoveryFetch = (...args) => new Promise(resolve => requests.push({ args, resolve }));
+  vm.runInContext("API.dashboardTrends = (...args) => recoveryFetch(...args)", sandbox);
+  vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardMergeServerRealtimePoints({ site_id: 'all', realtime_epoch: 'epoch-a', realtime_revision: 1, realtime_points: [] });
+    updateDashboardLive({
+      generated_at_ms: 100000, billing_mode: 'outbound', live_sites: [],
+      realtime_epoch: 'epoch-a', realtime_revision: 3, realtime_base_revision: 2,
+      realtime_trend: { timestamp_ms: 100000, bytes_in: 0, bytes_out: 20, traffic_bytes: 20, requests: 0 },
+    });
+  })()`, sandbox);
+  assert.equal(requests.length, 1);
+  const retiredSignal = requests[0].args[4];
+  now = 101000;
+  vm.runInContext(`updateDashboardLive({
+    generated_at_ms: 101000, billing_mode: 'outbound', live_sites: [],
+    realtime_epoch: 'epoch-b', realtime_revision: 10, realtime_base_revision: 9,
+    realtime_trend: { timestamp_ms: 101000, bytes_in: 0, bytes_out: 30, traffic_bytes: 30, requests: 0 },
+  })`, sandbox);
+  assert.equal(retiredSignal.aborted, true);
+  assert.equal(requests.length, 2, 'a new epoch must recover without waiting for the retired HTTP request');
+  vm.runInContext('stopDashSSE()', sandbox);
+  assert.equal(requests[1].args[4].aborted, true);
+});
+
+test('dashboard observed protocol rejects late legacy live snapshots', () => {
+  const { sandbox } = makeTrafficHarness();
+  sandbox.Date = { now: () => 100000 };
+  vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    updateDashboardLive({
+      generated_at_ms: 100000, billing_mode: 'outbound', live_sites: [],
+      realtime_epoch: 'current-epoch', realtime_revision: 1, realtime_base_revision: 0,
+      realtime_trend: { timestamp_ms: 100000, bytes_in: 0, bytes_out: 30, traffic_bytes: 30, requests: 0 },
+    });
+    updateDashboardLive({
+      generated_at_ms: 100000, billing_mode: 'outbound', live_sites: [],
+      realtime_trend: { timestamp_ms: 100000, bytes_in: 0, bytes_out: 2, traffic_bytes: 2, requests: 0 },
+    });
+  })()`, sandbox);
+  assert.equal(vm.runInContext("dashboardRealtimeTrendSamples.get('all')[0].bytes_out", sandbox), 30);
+});
+
+test('dashboard authoritative realtime summaries ignore durable baseline movement', () => {
+  const { sandbox } = makeTrafficHarness();
+  sandbox.Date = { now: () => 110000 };
+  const total = vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: 'all', range: 'realtime' };
+    dashboardMergeServerRealtimePoints({
+      site_id: 'all', realtime_epoch: 'summary-test', realtime_revision: 2, billing_mode: 'outbound',
+      realtime_points: [
+        { timestamp_ms: 100000, bytes_in: 0, bytes_out: 20, traffic_bytes: 20, requests: 1 },
+        { timestamp_ms: 102000, bytes_in: 0, bytes_out: 50, traffic_bytes: 50, requests: 2 },
+      ],
+    });
+    dashboardTrendData = {
+      range: 'realtime', billing_mode: 'outbound', as_of_ms: 110000,
+      points: [{ timestamp_ms: 100000, bytes_out: 5000, traffic_bytes: 5000, requests: 200 }],
+      live_baselines: { '1': { sampled_at_ms: 110000, bytes_out: 5000, requests: 200 } },
+      site_series: [{ site_id: 1 }],
+    };
+    return dashboardTrendPoints().reduce((sum, point) => sum + point.traffic_bytes, 0);
+  })()`, sandbox);
+  assert.equal(total, 70);
+});
+
+test('dashboard site gauges use Agent rates and their independent freshness', () => {
+  const { sandbox } = makeTrafficHarness();
+  const result = vm.runInContext(`(() => {
+    const site = {
+      id: 1, running: true, sampled_at_ms: 1000, agent_received_at_ms: 1000,
+      cumulative_bytes_in: 100, cumulative_bytes_out: 200, requests: 3,
+      agent_rate_valid: true, agent_rate_received_at_ms: 1000,
+      agent_download_bps: 30, agent_upload_bps: 20,
+    };
+    updateDashboardSiteSpeeds([site], 1000, 'outbound');
+    const first = { ...dashboardLiveSpeeds.get(1) };
+    updateDashboardSiteSpeeds([{ ...site, agent_rate_received_at_ms: 2000, agent_download_bps: 80, agent_upload_bps: 40 }], 2000, 'outbound');
+    const advanced = { ...dashboardLiveSpeeds.get(1) };
+    updateDashboardSiteSpeeds([{ ...site, agent_rate_received_at_ms: 2000, agent_download_bps: 80, agent_upload_bps: 40 }], 9001, 'outbound');
+    return { first, advanced, expired: { ...dashboardLiveSpeeds.get(1) } };
+  })()`, sandbox);
+  assert.deepEqual({ ...result.first }, { down: 30, up: 20 });
+  assert.deepEqual({ ...result.advanced }, { down: 80, up: 40 });
+  assert.deepEqual({ ...result.expired }, { down: 0, up: 0 });
+});
