@@ -18,6 +18,9 @@ func FuzzNormalizeDynamicURL(f *testing.F) {
 		"http://127.0.0.1:8096/Items/1",
 		"https://[::1]/stream",
 		"https://media.example.test/a%2Fb?token=x",
+		"https://media.example.test",
+		"https://media.example.test/video/",
+		"https://media.example.test/video//segment.ts",
 	} {
 		f.Add(seed)
 	}
@@ -26,8 +29,14 @@ func FuzzNormalizeDynamicURL(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.ContainsAny(parsed.Host, "\\\r\n\t") || filepath.Clean(parsed.Path) != parsed.Path {
+		if parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.ContainsAny(parsed.Host, "\\\r\n\t") {
 			t.Fatalf("unsafe dynamic URL accepted: %q", parsed.String())
+		}
+		// URL paths can be empty and may preserve trailing or repeated slashes.
+		// Filesystem cleaning rejects those valid forms and is OS-dependent.
+		paddedPath := "/" + parsed.Path + "/"
+		if strings.Contains(paddedPath, "/./") || strings.Contains(paddedPath, "/../") {
+			t.Fatalf("dynamic URL with dot path segments accepted: %q", parsed.String())
 		}
 	})
 }
