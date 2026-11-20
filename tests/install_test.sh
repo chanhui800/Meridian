@@ -668,6 +668,7 @@ assert_file "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}"
 assert_eq 'v9.9.9' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'first installed Agent version'
 assert_file "${DATA_DIR}/.env"
 assert_eq '0.0.0.0' "$(read_env_value PANEL_BIND_ADDR)" 'fresh IP bind'
+assert_eq '127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'fresh install trusts loopback and private proxy ranges'
 upstream_header_key=$(read_env_value UPSTREAM_HEADER_KEY)
 if [ "${#upstream_header_key}" -lt 32 ]; then
     echo 'FAIL: fresh install must generate UPSTREAM_HEADER_KEY' >&2
@@ -691,6 +692,18 @@ for hidden_secret in "$jwt_secret" "$upstream_header_key" "$dynamic_route_key"; 
         exit 1
     fi
 done
+
+proxy_config_tmp=$(mktemp -d "${TEST_ROOT}/proxy-config.XXXXXX")
+cp "${DATA_DIR}/.env" "${proxy_config_tmp}/original.env"
+awk -F= '$1 == "TRUSTED_PROXY_CIDRS" { print "TRUSTED_PROXY_CIDRS=192.0.2.7/32"; next } { print }' "${DATA_DIR}/.env" > "${proxy_config_tmp}/custom.env"
+mv "${proxy_config_tmp}/custom.env" "${DATA_DIR}/.env"
+prepare_data_and_config "$proxy_config_tmp"
+assert_eq '192.0.2.7/32' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'existing custom trusted proxy range is preserved'
+awk -F= '$1 != "TRUSTED_PROXY_CIDRS" { print }' "${DATA_DIR}/.env" > "${proxy_config_tmp}/missing.env"
+mv "${proxy_config_tmp}/missing.env" "${DATA_DIR}/.env"
+prepare_data_and_config "$proxy_config_tmp"
+assert_eq '127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'missing legacy trusted proxy range gets loopback and private defaults'
+cp "${proxy_config_tmp}/original.env" "${DATA_DIR}/.env"
 
 # Existing valid encryption keys are immutable; an explicitly empty legacy key
 # is repaired, while ambiguous or weak non-empty values fail without rewriting
