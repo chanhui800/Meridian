@@ -7,14 +7,20 @@ import (
 	"testing"
 )
 
-func TestTrustedProxyDefaultsAcceptOnlyExactLoopbackPeers(t *testing.T) {
+func TestTrustedProxyDefaultsAcceptOnlyPrivateAndLoopbackPeers(t *testing.T) {
 	for _, value := range []string{"", " \n\t"} {
 		trusted, err := parseTrustedProxyCIDRs(value)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(trusted) != 2 || trusted[0].String() != "127.0.0.1/32" || trusted[1].String() != "::1/128" {
-			t.Fatalf("default proxy ranges = %v, want exact IPv4 and IPv6 loopback", trusted)
+		expected := []string{"127.0.0.1/32", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"}
+		if len(trusted) != len(expected) {
+			t.Fatalf("default proxy ranges = %v, want loopback and private ranges", trusted)
+		}
+		for index, network := range trusted {
+			if network.String() != expected[index] {
+				t.Fatalf("default proxy range %d = %s, want %s", index, network.String(), expected[index])
+			}
 		}
 		for _, testCase := range []struct {
 			address string
@@ -24,7 +30,20 @@ func TestTrustedProxyDefaultsAcceptOnlyExactLoopbackPeers(t *testing.T) {
 			{address: "::1", trusted: true},
 			{address: "127.0.0.2", trusted: false},
 			{address: "::2", trusted: false},
-			{address: "172.17.0.1", trusted: false},
+			{address: "10.42.0.1", trusted: true},
+			{address: "172.15.255.255", trusted: false},
+			{address: "172.16.0.1", trusted: true},
+			{address: "172.17.0.1", trusted: true},
+			{address: "172.31.255.254", trusted: true},
+			{address: "172.32.0.1", trusted: false},
+			{address: "192.168.1.1", trusted: true},
+			{address: "192.169.1.1", trusted: false},
+			{address: "fd12:3456::1", trusted: true},
+			{address: "fc00::1", trusted: true},
+			{address: "fe80::1", trusted: false},
+			{address: "2001:db8::1", trusted: false},
+			{address: "169.254.169.254", trusted: false},
+			{address: "100.64.0.1", trusted: false},
 			{address: "198.51.100.7", trusted: false},
 		} {
 			if got := isTrustedProxy(net.ParseIP(testCase.address), trusted); got != testCase.trusted {
@@ -47,6 +66,10 @@ func TestTrustedProxyDefaultsForwardClientIdentityAndHTTPS(t *testing.T) {
 	}{
 		{name: "local IPv4 proxy", peer: "127.0.0.1:43210", wantClient: "203.0.113.25", wantHTTPS: true},
 		{name: "local IPv6 proxy", peer: "[::1]:43210", wantClient: "203.0.113.25", wantHTTPS: true},
+		{name: "private 10 proxy", peer: "10.42.0.1:43210", wantClient: "203.0.113.25", wantHTTPS: true},
+		{name: "Docker bridge proxy", peer: "172.17.0.1:43210", wantClient: "203.0.113.25", wantHTTPS: true},
+		{name: "private 192 proxy", peer: "192.168.1.1:43210", wantClient: "203.0.113.25", wantHTTPS: true},
+		{name: "IPv6 private proxy", peer: "[fd12:3456::1]:43210", wantClient: "203.0.113.25", wantHTTPS: true},
 		{name: "other loopback address", peer: "127.0.0.2:43210", wantClient: "127.0.0.2", wantHTTPS: false},
 		{name: "remote client", peer: "198.51.100.7:43210", wantClient: "198.51.100.7", wantHTTPS: false},
 	} {
