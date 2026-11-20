@@ -62,30 +62,29 @@ func nodeTrafficEpochMayBecomeCurrent(current, period nodeTrafficWatermark, epoc
 			previousRuntime, _, _ := strings.Cut(suffix, ":")
 			previousGeneration, previousErr := strconv.ParseUint(previousRuntime, 10, 64)
 			generation, currentErr := strconv.ParseUint(identity.runtimeEpoch, 10, 64)
-			if previousErr == nil && currentErr == nil && previousGeneration > generation {
-				return false
+			if previousErr == nil && currentErr == nil && previousGeneration != generation {
+				return generation > previousGeneration
 			}
 		}
 	}
 	if stat.CounterEpoch > 0 {
-		// A named period is immutable: once another period became current,
-		// returning to a known old period is a drain, even if this report was
-		// captured with a higher process-wide sequence.
+		// Explicit generations order this site's periods independently of the
+		// node-wide sequence. A newer period may already have landed without
+		// becoming current on an older Controller, so compare before treating a
+		// known period as a drain. This also works with migrated sequence-zero rows.
+		if suffix, ok := strings.CutPrefix(current.epoch, identity.source+":"); ok {
+			if previousEpoch, err := strconv.ParseUint(suffix, 10, 64); err == nil && previousEpoch != stat.CounterEpoch {
+				return stat.CounterEpoch > previousEpoch
+			}
+		}
+		// Without comparable generations, retain the conservative tombstone
+		// rule: a known non-current named period cannot replace current state.
 		if period.exists {
 			return false
 		}
-		// A late first report from an older site period can still contain
-		// unaccounted bytes. Compare its explicit generation before deciding
-		// whether it owns the visible row. The source prefix also works with
-		// legacy current rows migrated before per-site ordering was recorded.
-		if suffix, ok := strings.CutPrefix(current.epoch, identity.source+":"); ok {
-			if previousEpoch, err := strconv.ParseUint(suffix, 10, 64); err == nil && previousEpoch > stat.CounterEpoch {
-				return false
-			}
-		}
 	}
-	if current.sessionID == identity.sessionID && current.sequence > 0 && identity.sequence <= current.sequence {
-		return false
+	if current.sessionID == identity.sessionID && current.sequence > 0 {
+		return identity.sequence > current.sequence
 	}
 	// On an upgraded database the old row has no per-site sequence. The full
 	// report's existing process watermark can still fence an older epoch;
@@ -162,9 +161,15 @@ func recordNodeTrafficPeriodTx(tx *sql.Tx, nodeID int64, epoch string, stat *Nod
 		return false, nil
 	}
 	if period.exists && stat.CounterEpoch > 0 && identity.sequence <= period.sequence {
-		// A named cumulative snapshot is already covered when this exact
-		// site's report sequence has landed, regardless of the current period.
-		return false, nil
+		// An exact retry can restore a newer period already accounted by an
+		// older Controller without billing it again. Other covered snapshots
+		// must not replace current metadata or lower a durable watermark.
+		restoreCurrent := applyCurrent && current.exists && current.epoch != epoch &&
+			identity.sequence == period.sequence && currentIn == period.bytesIn &&
+			currentOut == period.bytesOut && stat.RequestCount == period.requests
+		if !restoreCurrent {
+			return false, nil
+		}
 	}
 
 	deltaIn, deltaOut, deltaRequests := stat.BytesIn, stat.BytesOut, stat.RequestCount

@@ -13,7 +13,7 @@ import (
 
 const (
 	maxSiteIconPackBytes = 4 << 20
-	maxSiteIconCount     = 4096
+	maxSiteIconCount     = 16384
 	maxSiteIconNameLen   = 160
 	maxSiteIconURLLen    = 4096
 )
@@ -27,14 +27,33 @@ type SiteIcon struct {
 }
 
 type SiteIconPack struct {
+	ID          int64      `json:"id,omitempty"`
 	Name        string     `json:"name"`
 	Description string     `json:"description"`
 	SourceURL   string     `json:"source_url,omitempty"`
 	Icons       []SiteIcon `json:"icons"`
 	UpdatedAt   string     `json:"updated_at,omitempty"`
+	Active      bool       `json:"active,omitempty"`
+	BuiltIn     bool       `json:"built_in"`
+}
+
+// SiteIconPackSummary is the lightweight list representation of an icon pack.
+// The icon array is intentionally omitted so a long list never forces the
+// controller to marshal megabytes of icon URLs into the management UI.
+type SiteIconPackSummary struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	SourceURL   string `json:"source_url,omitempty"`
+	IconCount   int    `json:"icon_count"`
+	Active      bool   `json:"active"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+	BuiltIn     bool   `json:"built_in"`
 }
 
 var errInvalidSiteIconPack = errors.New("invalid site icon pack")
+var errSiteIconPackNotFound = errors.New("site icon pack not found")
+var errSiteIconPackSourceMissing = errors.New("site icon pack has no source URL")
 
 func normalizeSiteIconURL(value string) (string, error) {
 	value = strings.TrimSpace(value)
@@ -131,15 +150,34 @@ func parseSiteIconPack(raw []byte) (SiteIconPack, error) {
 }
 
 func (d *DB) SiteIconPack() (SiteIconPack, error) {
+	return d.ActiveSiteIconPack()
+}
+
+func (d *DB) ActiveSiteIconPack() (SiteIconPack, error) {
+	pack, err := scanSiteIconPack(d.db.QueryRow("SELECT id, pack_name, description, source_url, icons_json, is_active, updated_at FROM site_icon_packs WHERE is_active=1 ORDER BY id LIMIT 1"))
+	if errors.Is(err, errSiteIconPackNotFound) {
+		return SiteIconPack{Icons: []SiteIcon{}}, nil
+	}
+	return pack, err
+}
+
+func (d *DB) SiteIconPackByID(id int64) (SiteIconPack, error) {
+	return scanSiteIconPack(d.db.QueryRow("SELECT id, pack_name, description, source_url, icons_json, is_active, updated_at FROM site_icon_packs WHERE id=?", id))
+}
+
+func scanSiteIconPack(row *sql.Row) (SiteIconPack, error) {
 	var pack SiteIconPack
 	var iconsJSON string
-	err := d.db.QueryRow("SELECT pack_name, description, source_url, icons_json, updated_at FROM site_icon_pack WHERE id=1").Scan(&pack.Name, &pack.Description, &pack.SourceURL, &iconsJSON, &pack.UpdatedAt)
+	var isActive int
+	err := row.Scan(&pack.ID, &pack.Name, &pack.Description, &pack.SourceURL, &iconsJSON, &isActive, &pack.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return SiteIconPack{Icons: []SiteIcon{}}, nil
+		return SiteIconPack{}, errSiteIconPackNotFound
 	}
 	if err != nil {
 		return SiteIconPack{}, err
 	}
+	pack.Active = isActive != 0
+	pack.BuiltIn = isBuiltinSiteIconPack(pack.SourceURL)
 	if err := json.Unmarshal([]byte(iconsJSON), &pack.Icons); err != nil {
 		return SiteIconPack{}, fmt.Errorf("decode stored site icon pack: %w", err)
 	}
@@ -149,21 +187,50 @@ func (d *DB) SiteIconPack() (SiteIconPack, error) {
 	return pack, nil
 }
 
-func (d *DB) SaveSiteIconPack(pack SiteIconPack) error {
+func (d *DB) SiteIconPacks() ([]SiteIconPackSummary, error) {
+	rows, err := d.db.Query("SELECT id, pack_name, description, source_url, icons_json, is_active, updated_at FROM site_icon_packs ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	packs := make([]SiteIconPackSummary, 0)
+	for rows.Next() {
+		var summary SiteIconPackSummary
+		var iconsJSON string
+		var isActive int
+		if err := rows.Scan(&summary.ID, &summary.Name, &summary.Description, &summary.SourceURL, &iconsJSON, &isActive, &summary.UpdatedAt); err != nil {
+			return nil, err
+		}
+		var icons []SiteIcon
+		if err := json.Unmarshal([]byte(iconsJSON), &icons); err != nil {
+			return nil, fmt.Errorf("decode stored site icon pack: %w", err)
+		}
+		summary.IconCount = len(icons)
+		summary.Active = isActive != 0
+		summary.BuiltIn = isBuiltinSiteIconPack(summary.SourceURL)
+		packs = append(packs, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return packs, nil
+}
+
+func normalizeSiteIconPackForStorage(pack SiteIconPack) (SiteIconPack, error) {
 	if len(pack.Icons) == 0 || len(pack.Icons) > maxSiteIconCount {
-		return errInvalidSiteIconPack
+		return SiteIconPack{}, errInvalidSiteIconPack
 	}
 	pack.Name = strings.TrimSpace(pack.Name)
 	pack.Description = strings.TrimSpace(pack.Description)
 	pack.SourceURL = strings.TrimSpace(pack.SourceURL)
 	if len(pack.Name) > 200 || len(pack.Description) > 1000 {
-		return errInvalidSiteIconPack
+		return SiteIconPack{}, errInvalidSiteIconPack
 	}
 	if pack.SourceURL != "" {
 		var err error
 		pack.SourceURL, err = normalizeSiteIconURL(pack.SourceURL)
 		if err != nil {
-			return err
+			return SiteIconPack{}, err
 		}
 	}
 	normalizedIcons := make([]SiteIcon, 0, len(pack.Icons))
@@ -171,11 +238,11 @@ func (d *DB) SaveSiteIconPack(pack SiteIconPack) error {
 	for _, icon := range pack.Icons {
 		name, err := normalizeSiteIconName(icon.Name)
 		if err != nil || name == "" {
-			return errInvalidSiteIconPack
+			return SiteIconPack{}, errInvalidSiteIconPack
 		}
 		imageURL, err := normalizeSiteIconURL(icon.URL)
 		if err != nil {
-			return errInvalidSiteIconPack
+			return SiteIconPack{}, errInvalidSiteIconPack
 		}
 		key := strings.ToLower(name)
 		if _, exists := seen[key]; exists {
@@ -185,9 +252,17 @@ func (d *DB) SaveSiteIconPack(pack SiteIconPack) error {
 		normalizedIcons = append(normalizedIcons, SiteIcon{Name: name, URL: imageURL})
 	}
 	if len(normalizedIcons) == 0 {
-		return errInvalidSiteIconPack
+		return SiteIconPack{}, errInvalidSiteIconPack
 	}
 	pack.Icons = normalizedIcons
+	return pack, nil
+}
+
+func (d *DB) SaveSiteIconPack(pack SiteIconPack) error {
+	pack, err := normalizeSiteIconPackForStorage(pack)
+	if err != nil {
+		return err
+	}
 	iconsJSON, err := json.Marshal(pack.Icons)
 	if err != nil {
 		return err
@@ -195,12 +270,128 @@ func (d *DB) SaveSiteIconPack(pack SiteIconPack) error {
 	if len(iconsJSON) > maxSiteIconPackBytes {
 		return fmt.Errorf("icon pack is too large")
 	}
-	_, err = d.db.Exec("INSERT INTO site_icon_pack (id, pack_name, description, source_url, icons_json, updated_at) VALUES (1,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET pack_name=excluded.pack_name, description=excluded.description, source_url=excluded.source_url, icons_json=excluded.icons_json, updated_at=CURRENT_TIMESTAMP", pack.Name, pack.Description, pack.SourceURL, string(iconsJSON))
+	var activeID int64
+	err = d.db.QueryRow("SELECT id FROM site_icon_packs WHERE is_active=1 ORDER BY id LIMIT 1").Scan(&activeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = d.db.Exec("INSERT INTO site_icon_packs (pack_name, description, source_url, icons_json, is_active) VALUES (?,?,?,?,1)", pack.Name, pack.Description, pack.SourceURL, string(iconsJSON))
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	_, err = d.db.Exec("UPDATE site_icon_packs SET pack_name=?, description=?, source_url=?, icons_json=?, is_active=1, updated_at=CURRENT_TIMESTAMP WHERE id=?", pack.Name, pack.Description, pack.SourceURL, string(iconsJSON), activeID)
 	return err
 }
 
+func (d *DB) CreateSiteIconPack(pack SiteIconPack) (SiteIconPack, error) {
+	pack, err := normalizeSiteIconPackForStorage(pack)
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	iconsJSON, err := json.Marshal(pack.Icons)
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	if len(iconsJSON) > maxSiteIconPackBytes {
+		return SiteIconPack{}, fmt.Errorf("icon pack is too large")
+	}
+	var activeCount int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM site_icon_packs WHERE is_active=1").Scan(&activeCount); err != nil {
+		return SiteIconPack{}, err
+	}
+	isActive := 0
+	if activeCount == 0 {
+		isActive = 1
+	}
+	result, err := d.db.Exec("INSERT INTO site_icon_packs (pack_name, description, source_url, icons_json, is_active) VALUES (?,?,?,?,?)", pack.Name, pack.Description, pack.SourceURL, string(iconsJSON), isActive)
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	pack.ID = id
+	pack.Active = isActive != 0
+	pack.BuiltIn = isBuiltinSiteIconPack(pack.SourceURL)
+	pack.UpdatedAt = iconPackUpdatedAt()
+	return pack, nil
+}
+
+func (d *DB) UpdateSiteIconPack(id int64, pack SiteIconPack) (SiteIconPack, error) {
+	stored, err := d.SiteIconPackByID(id)
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	if stored.SourceURL == "" {
+		return SiteIconPack{}, errSiteIconPackSourceMissing
+	}
+	pack.SourceURL = stored.SourceURL
+	pack, err = normalizeSiteIconPackForStorage(pack)
+	if err != nil {
+		return SiteIconPack{}, fmt.Errorf("%w: %v", errInvalidSiteIconPack, err)
+	}
+	iconsJSON, err := json.Marshal(pack.Icons)
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	if len(iconsJSON) > maxSiteIconPackBytes {
+		return SiteIconPack{}, fmt.Errorf("%w: icon pack is too large", errInvalidSiteIconPack)
+	}
+	result, err := d.db.Exec("UPDATE site_icon_packs SET pack_name=?, description=?, icons_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", pack.Name, pack.Description, string(iconsJSON), id)
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return SiteIconPack{}, err
+	}
+	if affected == 0 {
+		return SiteIconPack{}, errSiteIconPackNotFound
+	}
+	return d.SiteIconPackByID(id)
+}
+
+func (d *DB) SetActiveSiteIconPack(id int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("UPDATE site_icon_packs SET is_active=0 WHERE is_active=1"); err != nil {
+		return err
+	}
+	result, err := tx.Exec("UPDATE site_icon_packs SET is_active=1 WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errSiteIconPackNotFound
+	}
+	return tx.Commit()
+}
+
+func (d *DB) DeleteSiteIconPack(id int64) error {
+	result, err := d.db.Exec("DELETE FROM site_icon_packs WHERE id=?", id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errSiteIconPackNotFound
+	}
+	return nil
+}
+
 func (d *DB) ClearSiteIconPack() error {
-	_, err := d.db.Exec("UPDATE site_icon_pack SET pack_name='', description='', source_url='', icons_json='[]', updated_at=CURRENT_TIMESTAMP WHERE id=1")
+	_, err := d.db.Exec("DELETE FROM site_icon_packs")
 	return err
 }
 

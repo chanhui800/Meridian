@@ -5,29 +5,29 @@ let tmdbSettingsCacheRefreshTimer = null;
 
 function normalizeTMDBSettings(value) {
   const raw = value && typeof value === 'object' ? value : {};
-  // Accept both the current direct response and the wrapped shape returned by
-  // older panel builds, so a stale API proxy cannot silently turn real cache
-  // statistics into the default 0/0 display.
+  // Accept direct/wrapped API responses and already normalized cache values.
+  // Rendering or refreshing the same settings must retain every saved field.
   const settings = raw.settings && typeof raw.settings === 'object' ? raw.settings : raw;
   const cacheEntriesValue = settings.cache_entries ?? settings.cacheEntries;
   const cacheSizeValue = settings.cache_size_bytes ?? settings.cacheSizeBytes;
   const language = ['zh-CN', 'zh-TW', 'en-US'].includes(settings.language) ? settings.language : 'zh-CN';
-  const retention = Number(settings.history_retention_days);
+  const retention = Number(settings.history_retention_days ?? settings.historyRetentionDays);
   const configured = settings.configured === true || settings.token_configured === true;
-  const credentialState = ['unconfigured', 'ready', 'invalid', 'unknown'].includes(settings.credential_state)
-    ? settings.credential_state
+  const credentialStateValue = settings.credential_state ?? settings.credentialState;
+  const credentialState = ['unconfigured', 'ready', 'invalid', 'unknown'].includes(credentialStateValue)
+    ? credentialStateValue
     : (configured ? 'unknown' : 'unconfigured');
   return {
     enabled: settings.enabled === true,
     configured,
-    secretStable: settings.secret_stable !== false,
+    secretStable: (settings.secret_stable ?? settings.secretStable) !== false,
     language,
     historyRetentionDays: Number.isSafeInteger(retention) && retention >= 1 && retention <= 3650 ? retention : 90,
     cacheEntries: Number.isSafeInteger(Number(cacheEntriesValue)) && Number(cacheEntriesValue) >= 0 ? Number(cacheEntriesValue) : 0,
     cacheSizeBytes: Number.isFinite(Number(cacheSizeValue)) && Number(cacheSizeValue) >= 0 ? Number(cacheSizeValue) : 0,
     credentialState,
-    lastErrorCode: String(settings.last_error_code || ''),
-    lastTestedAtMS: Number(settings.last_tested_at_ms) || 0,
+    lastErrorCode: String(settings.last_error_code ?? settings.lastErrorCode ?? ''),
+    lastTestedAtMS: Number(settings.last_tested_at_ms ?? settings.lastTestedAtMS) || 0,
   };
 }
 

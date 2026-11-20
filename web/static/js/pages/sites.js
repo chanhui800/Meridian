@@ -13,12 +13,21 @@ function normalizeSiteIconPack(value) {
     url: String(icon && icon.url || '').trim(),
   })).filter(icon => icon.name && /^https:\/\//i.test(icon.url)) : [];
   return {
+    id: Number.isSafeInteger(Number(value && value.id)) && Number(value && value.id) > 0 ? Number(value.id) : 0,
     name: String(value && value.name || '').trim(),
     description: String(value && value.description || '').trim(),
     source_url: String(value && value.source_url || '').trim(),
     updated_at: String(value && value.updated_at || '').trim(),
+    active: !!(value && value.active === true),
+    built_in: !!(value && value.built_in === true),
     icons,
   };
+}
+
+function normalizeSiteIconPackSummary(value) {
+  const pack = normalizeSiteIconPack(value);
+  const iconCount = Array.isArray(value && value.icons) ? pack.icons.length : Number(value && value.icon_count);
+  return { ...pack, icons: undefined, icon_count: Number.isSafeInteger(iconCount) && iconCount >= 0 ? iconCount : 0 };
 }
 
 function siteIconFor(site) {
@@ -677,8 +686,8 @@ function canAddPlaybackAddress(currentCount, maxPlaybackAddresses) {
 function renderUpstreamHeaderRows(headers, upstreamHeadersAvailable) {
 	return headers.map((header, idx) => `
 		<div class="upstream-header-row">
-		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" aria-label="请求头名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" aria-label="请求头值" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
 		  <button type="button" class="icon-button danger m-upstream-header-remove" data-idx="${idx}" title="删除请求头" aria-label="删除请求头"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg></button>
 		</div>
 	`).join('');
@@ -877,8 +886,9 @@ function normalizedTargetAuthority(value) {
 }
 
 // When a user finishes typing an origin address, complete the missing scheme and
-// split an explicit port into the dedicated port field. Without a scheme the port
-// decides the protocol: 443 (or no port) defaults to https, any other port to http.
+// split an explicit port into the dedicated port field. Saved or manually entered
+// ports survive address edits; only an untouched automatic default follows a new
+// protocol. Without a scheme, 443 (or no port) uses https, other ports use http.
 function autoFillTargetAddress(addressInput, portInput) {
 	const raw = String(addressInput && addressInput.value || '').trim().replaceAll('：', ':');
 	if (!raw) return;
@@ -890,16 +900,25 @@ function autoFillTargetAddress(addressInput, portInput) {
 	const authority = withoutScheme.split(/[/?#]/, 1)[0];
 	const portMatch = authority.match(/^(?:\[[^\]]*\]|[^:]+):(\d+)$/);
 	const explicitPort = portMatch ? portMatch[1] : '';
+	const currentPort = String(portInput && portInput.value || '').trim();
+	const retainedPort = currentPort !== portInput?.dataset?.autofilledPort ? currentPort : '';
+	const targetPort = explicitPort || retainedPort;
 	try {
 		const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
 		if (!parsed.hostname) return;
 		const scheme = explicitScheme
 			? parsed.protocol
-			: (explicitPort === '443' || !explicitPort ? 'https:' : 'http:');
+			: (targetPort === '443' || !targetPort ? 'https:' : 'http:');
 		const hostname = parsed.hostname;
 		const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
 		addressInput.value = `${scheme}//${hostname}${path}`;
-		if (portInput) portInput.value = explicitPort || (scheme === 'https:' ? '443' : '80');
+		if (portInput) {
+			portInput.value = targetPort || (scheme === 'https:' ? '443' : '80');
+			if (portInput.dataset) {
+				if (targetPort) delete portInput.dataset.autofilledPort;
+				else portInput.dataset.autofilledPort = portInput.value;
+			}
+		}
 	} catch (_) {
 		// Leave partially typed values untouched until they parse as an address.
 	}
@@ -1091,108 +1110,237 @@ async function showPanelCertificateModal() {
 	openModal({ closeOnBackdrop: false });
 }
 
-async function showSiteIconPackModal(returnToSite = null, reopenSiteModal = false) {
-  const existing = siteIconPack && Array.isArray(siteIconPack.icons) ? siteIconPack.icons.length : 0;
-  document.getElementById('modal-title').textContent = '导入站点图标包';
+function siteIconSourceInputToURL(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      throw new Error('图标包地址无效');
+    }
+    if (parsed.protocol !== 'https:') throw new Error('图标包地址仅支持 HTTPS');
+    return parsed.toString();
+  }
+  return 'https://' + raw;
+}
+
+function siteIconPackUpdatedLabel(value) {
+  return String(value || '').replace('T', ' ').slice(0, 19);
+}
+
+async function loadSiteIconPackFromSource(value) {
+  const source = siteIconSourceInputToURL(value);
+  if (!source) throw new Error('请填写图标包链接');
+  let response;
+  try {
+    response = await fetch(source, { credentials: 'omit', redirect: 'error', cache: 'no-store' });
+  } catch (_) {
+    throw new Error('读取图标包失败，请检查链接和网络后重试');
+  }
+  if (!response.ok) throw new Error(`读取图标包失败（HTTP ${response.status}）`);
+  const text = await response.text();
+  if (new TextEncoder().encode(text).length > 4 * 1024 * 1024) throw new Error('图标包不能超过 4 MiB');
+  let pack;
+  try {
+    pack = JSON.parse(text);
+  } catch (_) {
+    throw new Error('图标包内容不是有效的 JSON');
+  }
+  if (!normalizeSiteIconPack(pack).icons.length) throw new Error('图标包中没有可用的 HTTPS 图标');
+  return { source, pack };
+}
+
+async function showSiteIconPackModal() {
+  document.getElementById('modal-title').textContent = '站点图标包';
   document.getElementById('modal-body').innerHTML = `
     <div class="site-icon-pack-modal-copy">
-      <p>上传一个 JSON 图标包，或填写公开的 HTTPS JSON 地址。系统只保存图标名称和 HTTPS 图片地址，不内置任何图标包。</p>
-      <p class="form-help">当前${existing ? `已载入 ${existing} 个图标` : '尚未载入图标包'}。导入后点击站点卡片左侧的圆形图标即可按名称搜索并选择。</p>
+      <p>三个内置图标包开箱即用，也可以通过链接导入其他图标包。点击刷新，读取来源中的最新图标。</p>
     </div>
-    <div class="form-group">
-      <label for="m-icon-pack-file">上传 JSON 文件</label>
-      <input class="form-input site-icon-pack-file" id="m-icon-pack-file" type="file" accept="application/json,.json">
-    </div>
-    <div class="site-icon-pack-divider"><span>或</span></div>
-    <div class="form-group">
-      <label for="m-icon-pack-url">图标包 HTTPS 地址</label>
-      <input class="form-input" id="m-icon-pack-url" type="url" placeholder="https://example.com/icon-pack.json" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false">
-      <div class="form-help">如果浏览器因跨域策略无法读取地址，请先下载 JSON 文件再上传。</div>
-    </div>
-    <div class="site-icon-pack-status" id="m-icon-pack-status" role="status" aria-live="polite"></div>
+    <div class="site-icon-pack-list" id="m-site-icon-pack-list" aria-live="polite"></div>
+    <form class="site-icon-pack-import-card" id="m-icon-pack-import-form">
+      <h3 class="site-icon-pack-import-title">导入新图标包</h3>
+      <div class="form-group">
+        <label for="m-icon-pack-url">图标包链接</label>
+        <div class="site-icon-pack-import-row">
+          <input class="form-input" id="m-icon-pack-url" type="text" placeholder="https://example.com/icon-pack.json" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false">
+          <button class="console-button is-primary" id="m-icon-pack-import" type="submit">导入</button>
+        </div>
+      </div>
+      <div class="site-icon-pack-status" id="m-icon-pack-status" role="status" aria-live="polite"></div>
+    </form>
   `;
   document.getElementById('modal-footer').innerHTML = `
-    <button class="btn-modal secondary" id="m-icon-pack-cancel">取消</button>
-    <button class="btn-modal" id="m-icon-pack-clear" ${existing ? '' : 'disabled'}>清空图标包</button>
-    <button class="btn-modal primary" id="m-icon-pack-import">导入</button>
+    <button class="btn-modal primary" id="m-icon-pack-done">完成</button>
   `;
   openModal({ closeOnBackdrop: false, modalClass: 'site-icon-pack-modal' });
 
-  const fileInput = document.getElementById('m-icon-pack-file');
+  const listEl = document.getElementById('m-site-icon-pack-list');
+  const importForm = document.getElementById('m-icon-pack-import-form');
   const urlInput = document.getElementById('m-icon-pack-url');
   const status = document.getElementById('m-icon-pack-status');
   const importButton = document.getElementById('m-icon-pack-import');
+  let packs = [];
+  let busy = false;
+  const isCurrentModal = () => document.getElementById('m-site-icon-pack-list') === listEl;
+
   const setStatus = (message, error = false) => {
     status.textContent = message || '';
     status.classList.toggle('is-error', !!error);
   };
-  const readFile = file => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('读取图标包文件失败'));
-    reader.readAsText(file);
-  });
-  const loadText = async () => {
-    const file = fileInput.files && fileInput.files[0];
-    if (file) return { text: await readFile(file), source: '' };
-    const source = String(urlInput.value || '').trim();
-    if (!source) throw new Error('请选择 JSON 文件或填写图标包地址');
-    if (!/^https:\/\//i.test(source)) throw new Error('图标包地址必须使用 HTTPS');
-    const response = await fetch(source, { credentials: 'omit', redirect: 'error' });
-    if (!response.ok) throw new Error(`读取图标包失败（HTTP ${response.status}）`);
-    return { text: await response.text(), source };
+
+  const setBusy = value => {
+    busy = value;
+    importButton.disabled = value;
+    urlInput.disabled = value;
+    listEl.querySelectorAll('[data-icon-pack-action]').forEach(button => { button.disabled = value; });
   };
+
+  const rememberPack = saved => {
+    const summary = normalizeSiteIconPackSummary(saved);
+    packs = packs.filter(pack => pack.id !== summary.id).map(pack => summary.active ? { ...pack, active: false } : pack);
+    packs.push(summary);
+    packs.sort((first, second) => first.id - second.id);
+    if (summary.active) siteIconPack = normalizeSiteIconPack(saved);
+  };
+
+  const renderList = () => {
+    if (!packs.length) {
+      listEl.innerHTML = '<div class="site-icon-pack-list-empty">还没有图标包，导入一个开始使用。</div>';
+      return;
+    }
+    listEl.innerHTML = packs.map(pack => `
+      <div class="site-icon-pack-item ${pack.active ? 'is-active' : ''}">
+        <div class="site-icon-pack-item-main">
+          <div class="site-icon-pack-item-title"><strong>${esc(pack.name || '未命名图标包')}</strong>${pack.built_in ? '<span class="site-icon-pack-builtin-badge">内置</span>' : ''}${pack.active ? '<span class="site-icon-pack-active-badge">使用中</span>' : ''}</div>
+          <p>${esc(pack.description || '')}</p>
+          <div class="site-icon-pack-item-meta"><span>${pack.icon_count} 个图标</span>${pack.source_url ? `<span>${esc(pack.source_url)}</span>` : ''}${pack.updated_at ? `<span>更新于 ${esc(siteIconPackUpdatedLabel(pack.updated_at))}</span>` : ''}</div>
+        </div>
+        <div class="site-icon-pack-item-actions">
+          ${pack.active ? '<button class="console-button" disabled>使用中</button>' : `<button class="console-button" data-icon-pack-action="activate" data-icon-pack-id="${pack.id}">使用</button>`}
+          ${pack.source_url ? `<button class="console-button" data-icon-pack-action="refresh" data-icon-pack-id="${pack.id}">刷新</button>` : ''}
+          <button class="console-button is-danger" data-icon-pack-action="delete" data-icon-pack-id="${pack.id}">删除</button>
+        </div>
+      </div>
+    `).join('');
+    listEl.querySelectorAll('[data-icon-pack-action="activate"]').forEach(button => {
+      button.onclick = async () => {
+        if (busy) return;
+        setBusy(true);
+        try {
+          await API.activateSiteIconPack(button.dataset.iconPackId);
+          if (!isCurrentModal()) return;
+          packs = packs.map(pack => ({ ...pack, active: pack.id === Number(button.dataset.iconPackId) }));
+          renderList();
+          const activePack = normalizeSiteIconPack(await API.getSiteIconPack());
+          if (!isCurrentModal()) return;
+          siteIconPack = activePack;
+          packs = packs.map(pack => ({ ...pack, active: pack.id === activePack.id }));
+          renderList();
+          setStatus('');
+          Toast.success('已切换图标包');
+        } catch (error) {
+          if (isCurrentModal()) setStatus(error.message || '切换图标包失败', true);
+        } finally {
+          if (isCurrentModal()) setBusy(false);
+        }
+      };
+    });
+    listEl.querySelectorAll('[data-icon-pack-action="refresh"]').forEach(button => {
+      button.onclick = async () => {
+        if (busy) return;
+        const pack = packs.find(item => item.id === Number(button.dataset.iconPackId));
+        if (!pack) return;
+        setBusy(true);
+        button.textContent = '刷新中…';
+        setStatus(`正在刷新 ${pack.name || '图标包'}…`);
+        try {
+          const loaded = await loadSiteIconPackFromSource(pack.source_url);
+          const saved = await API.refreshSiteIconPack(pack.id, loaded.pack);
+          if (!isCurrentModal()) return;
+          rememberPack(saved);
+          renderList();
+          setStatus('');
+          Toast.success(`图标包已刷新，共 ${normalizeSiteIconPack(saved).icons.length} 个图标`);
+        } catch (error) {
+          if (isCurrentModal()) {
+            button.textContent = '刷新';
+            setStatus(error.message || '刷新失败，原图标包已保留', true);
+          }
+        } finally {
+          if (isCurrentModal()) setBusy(false);
+        }
+      };
+    });
+    listEl.querySelectorAll('[data-icon-pack-action="delete"]').forEach(button => {
+      button.onclick = async () => {
+        if (busy) return;
+        if (!window.confirm('确定删除这个图标包吗？已有站点图标仍会保留。')) return;
+        setBusy(true);
+        try {
+          await API.deleteSiteIconPack(button.dataset.iconPackId);
+          if (!isCurrentModal()) return;
+          const deleted = packs.find(pack => pack.id === Number(button.dataset.iconPackId));
+          if (deleted && deleted.active) siteIconPack = normalizeSiteIconPack({ icons: [] });
+          packs = packs.filter(pack => pack.id !== Number(button.dataset.iconPackId));
+          renderList();
+          setStatus('');
+          Toast.success('图标包已删除');
+        } catch (error) {
+          if (isCurrentModal()) setStatus(error.message || '删除图标包失败', true);
+        } finally {
+          if (isCurrentModal()) setBusy(false);
+        }
+      };
+    });
+    setBusy(busy);
+  };
+
   const importPack = async () => {
-    importButton.disabled = true;
+    if (busy) return;
+    setBusy(true);
     setStatus('正在读取并校验图标包…');
     try {
-      const loaded = await loadText();
-      if (loaded.text.length > 4 * 1024 * 1024) throw new Error('图标包不能超过 4 MiB');
-      const parsed = JSON.parse(loaded.text);
-      const normalized = normalizeSiteIconPack(parsed);
-      if (!normalized.icons.length) throw new Error('图标包中没有可用的 HTTPS 图标');
-      const saved = await API.saveSiteIconPack(parsed, loaded.source);
-      siteIconPack = normalizeSiteIconPack(saved);
-      Toast.success(`已导入 ${siteIconPack.icons.length} 个图标`);
-      closeModal();
-      await loadSites();
-      if (reopenSiteModal) await showSiteModal(returnToSite || undefined);
+      const loaded = await loadSiteIconPackFromSource(urlInput.value);
+      const saved = await API.createSiteIconPack(loaded.pack, loaded.source);
+      if (!isCurrentModal()) return;
+      rememberPack(saved);
+      renderList();
+      Toast.success(`已导入 ${normalizeSiteIconPack(saved).icons.length} 个图标`);
+      urlInput.value = '';
+      setStatus('');
     } catch (error) {
-      importButton.disabled = false;
-      setStatus(error && error.message ? error.message : '图标包导入失败', true);
+      if (isCurrentModal()) setStatus(error && error.message ? error.message : '图标包导入失败', true);
+    } finally {
+      if (isCurrentModal()) setBusy(false);
     }
   };
-  fileInput.addEventListener('change', () => {
-    if (fileInput.files && fileInput.files[0]) urlInput.value = '';
-  });
-  document.getElementById('m-icon-pack-cancel').onclick = closeModal;
-  document.getElementById('m-icon-pack-clear').onclick = async () => {
-    const clearButton = document.getElementById('m-icon-pack-clear');
-    clearButton.disabled = true;
-    try {
-      await API.clearSiteIconPack();
-      siteIconPack = normalizeSiteIconPack({ icons: [] });
-      Toast.success('图标包已清空，已有站点图标仍会保留');
-      closeModal();
-      await loadSites();
-      if (reopenSiteModal) await showSiteModal(returnToSite || undefined);
-    } catch (error) {
-      clearButton.disabled = false;
-      setStatus(error.message || '清空失败', true);
-    }
+
+  importForm.onsubmit = event => {
+    event.preventDefault();
+    void importPack();
   };
-  importButton.onclick = importPack;
+  document.getElementById('m-icon-pack-done').onclick = async () => {
+    closeModal();
+    await loadSites();
+  };
+  listEl.innerHTML = '<div class="site-icon-pack-list-empty">正在读取图标包…</div>';
+  setBusy(true);
+  try {
+    const response = await API.listSiteIconPacks();
+    if (!isCurrentModal()) return;
+    packs = (Array.isArray(response && response.packs) ? response.packs : []).map(normalizeSiteIconPackSummary);
+    renderList();
+  } catch (error) {
+    if (isCurrentModal()) listEl.innerHTML = `<div class="site-icon-pack-list-empty is-error">${esc(error.message || '读取图标包失败')}</div>`;
+  } finally {
+    if (isCurrentModal()) setBusy(false);
+  }
 }
 
 async function showSiteIconManager(site) {
   if (!site || !site.id) return;
-  if (!siteIconPack.icons.length) {
-    try {
-      siteIconPack = normalizeSiteIconPack(await API.getSiteIconPack());
-    } catch (_) {
-      siteIconPack = normalizeSiteIconPack({ icons: [] });
-    }
-  }
   const current = siteIconFor(site);
   document.getElementById('modal-title').textContent = '设置站点图标';
   document.getElementById('modal-body').innerHTML = `
@@ -1203,13 +1351,19 @@ async function showSiteIconManager(site) {
         <p>${current ? `当前图标：${esc(current.name)}` : '当前使用站点首字母'}</p>
       </div>
     </div>
+    <div class="site-icon-manager-pack">
+      <label for="m-site-icon-pack-select">图标包<select class="form-select" id="m-site-icon-pack-select" disabled><option value="">正在读取图标包…</option></select></label>
+      <button class="console-button" id="m-site-icon-pack-refresh" type="button" disabled>刷新图标包</button>
+    </div>
+    <div class="site-icon-manager-pack-meta" id="m-site-icon-pack-meta"></div>
     <div class="site-icon-manager-search">
       <label class="sr-only" for="m-site-icon-search">搜索图标</label>
       <span aria-hidden="true">⌕</span>
-      <input type="search" class="form-input" id="m-site-icon-search" placeholder="按图标包名称搜索" autocomplete="off">
+      <input type="search" class="form-input" id="m-site-icon-search" placeholder="按图标名称搜索" autocomplete="off">
     </div>
     <div class="site-icon-results site-icon-manager-results" id="m-site-icon-manager-results" role="listbox" aria-label="可用站点图标"></div>
-    <p class="form-help site-icon-manager-help">图标来自你上传的 JSON 图标包。需要更换图标包时，请返回站点页点击“图标包”。</p>
+    <p class="site-icon-manager-status" id="m-site-icon-status" role="status" aria-live="polite"></p>
+    <p class="form-help site-icon-manager-help">切换图标包后可直接选择图标；刷新会读取来源中的最新内容。</p>
   `;
   document.getElementById('modal-footer').innerHTML = `
     <button class="btn-modal secondary" id="m-site-icon-clear">使用首字母</button>
@@ -1220,53 +1374,175 @@ async function showSiteIconManager(site) {
 
   const searchInput = document.getElementById('m-site-icon-search');
   const results = document.getElementById('m-site-icon-manager-results');
+  const packSelect = document.getElementById('m-site-icon-pack-select');
+  const refreshButton = document.getElementById('m-site-icon-pack-refresh');
+  const packMeta = document.getElementById('m-site-icon-pack-meta');
+  const status = document.getElementById('m-site-icon-status');
+  const clearButton = document.getElementById('m-site-icon-clear');
+  const manageButton = document.getElementById('m-site-icon-pack');
+  let packs = [];
+  let pickerPack = normalizeSiteIconPack(siteIconPack);
+  let busy = false;
+  let ready = false;
+  const isCurrentModal = () => document.getElementById('m-site-icon-pack-select') === packSelect;
   const close = () => closeModal();
+  const setStatus = (message, error = false) => {
+    status.textContent = message || '';
+    status.classList.toggle('is-error', error);
+  };
+  const setBusy = value => {
+    busy = value;
+    packSelect.disabled = value || packs.length === 0;
+    const selected = packs.find(pack => String(pack.id) === packSelect.value);
+    refreshButton.disabled = value || !selected || !selected.source_url;
+    clearButton.disabled = value;
+    manageButton.disabled = value;
+    results.querySelectorAll('.site-icon-option').forEach(button => { button.disabled = value || !ready; });
+  };
+  const renderPackControls = () => {
+    packSelect.innerHTML = packs.length ? `${!pickerPack.id ? '<option value="">选择图标包</option>' : ''}${packs.map(pack => `<option value="${pack.id}" ${pack.id === pickerPack.id ? 'selected' : ''}>${esc(pack.name || '未命名图标包')}${pack.built_in ? ' · 内置' : ''}（${pack.icon_count}）</option>`).join('')}` : '<option value="">暂无图标包</option>';
+    packSelect.value = pickerPack.id ? String(pickerPack.id) : '';
+    packMeta.innerHTML = pickerPack.id ? `${pickerPack.built_in ? '<span class="site-icon-pack-builtin-badge">内置</span>' : ''}<span>${pickerPack.icons.length} 个图标</span>${pickerPack.updated_at ? `<span>更新于 ${esc(siteIconPackUpdatedLabel(pickerPack.updated_at))}</span>` : ''}` : '';
+    setBusy(busy);
+  };
   const render = () => {
     const query = String(searchInput.value || '').trim().toLowerCase();
-    const icons = (siteIconPack.icons || []).filter(icon => !query || icon.name.toLowerCase().includes(query)).slice(0, 120);
-    results.innerHTML = icons.length ? icons.map(icon => `
+    const icons = pickerPack.icons.filter(icon => !query || icon.name.toLowerCase().includes(query)).slice(0, 120);
+    results.innerHTML = ready && icons.length ? icons.map(icon => `
       <button type="button" class="site-icon-option ${current && icon.name === current.name && icon.url === current.url ? 'is-selected' : ''}" data-icon-name="${esc(icon.name)}" data-icon-url="${esc(icon.url)}" role="option" aria-selected="${current && icon.name === current.name && icon.url === current.url ? 'true' : 'false'}">
         <span class="site-icon-option-preview">${renderSiteIcon({ name: icon.name, icon_name: icon.name, icon_url: icon.url }, 'site-icon-option-icon')}</span>
         <span class="site-icon-option-name">${esc(icon.name)}</span>
-      </button>`).join('') : '<div class="site-icon-empty">暂无可用图标，请先上传图标包</div>';
+      </button>`).join('') : `<div class="site-icon-empty">${!ready ? '正在读取图标…' : pickerPack.icons.length ? '没有匹配的图标' : '暂无可用图标，可在图标包管理中导入'}</div>`;
     results.querySelectorAll('.site-icon-option').forEach(button => {
       button.onclick = async () => {
-        button.disabled = true;
+        if (busy || !ready) return;
+        setBusy(true);
         try {
           const updated = await API.updateSiteIcon(site.id, button.dataset.iconName || '', button.dataset.iconUrl || '');
           site.icon_name = updated.icon_name || '';
           site.icon_url = updated.icon_url || '';
+          if (!isCurrentModal()) return;
           Toast.success('站点图标已更新');
           close();
           await loadSites();
         } catch (error) {
-          button.disabled = false;
-          Toast.error(error.message || '保存站点图标失败');
+          if (isCurrentModal()) setStatus(error.message || '保存站点图标失败', true);
+        } finally {
+          if (isCurrentModal()) setBusy(false);
         }
       };
     });
     bindSiteIconFallbacks(results);
+    setBusy(busy);
   };
   searchInput.oninput = render;
-  document.getElementById('m-site-icon-clear').onclick = async () => {
-    const clearButton = document.getElementById('m-site-icon-clear');
-    clearButton.disabled = true;
+  packSelect.onchange = async () => {
+    if (busy) return;
+    const selected = packs.find(pack => String(pack.id) === packSelect.value);
+    if (!selected || selected.id === pickerPack.id) return;
+    const previousID = pickerPack.id;
+    let activated = false;
+    setBusy(true);
+    setStatus('正在切换图标包…');
+    try {
+      await API.activateSiteIconPack(selected.id);
+      activated = true;
+      const activePack = normalizeSiteIconPack(await API.getSiteIconPack());
+      if (!isCurrentModal()) return;
+      if (activePack.id !== selected.id) throw new Error('图标包已在其他页面切换，请重试');
+      pickerPack = activePack;
+      siteIconPack = activePack;
+      ready = true;
+      packs = packs.map(pack => ({ ...pack, active: pack.id === activePack.id }));
+      searchInput.value = '';
+      renderPackControls();
+      render();
+      setStatus('');
+    } catch (error) {
+      if (isCurrentModal()) {
+        if (activated) {
+          ready = false;
+          pickerPack = normalizeSiteIconPack(selected);
+          renderPackControls();
+          results.innerHTML = '<div class="site-icon-empty">读取图标失败，请刷新图标包重试</div>';
+        } else {
+          packSelect.value = String(previousID || '');
+        }
+        setStatus(error.message || '切换图标包失败', true);
+      }
+    } finally {
+      if (isCurrentModal()) setBusy(false);
+    }
+  };
+  refreshButton.onclick = async () => {
+    if (busy) return;
+    const selected = packs.find(pack => String(pack.id) === packSelect.value);
+    if (!selected || !selected.source_url) return;
+    setBusy(true);
+    refreshButton.textContent = '刷新中…';
+    setStatus('正在读取最新图标…');
+    try {
+      const loaded = await loadSiteIconPackFromSource(selected.source_url);
+      const updated = normalizeSiteIconPack(await API.refreshSiteIconPack(selected.id, loaded.pack));
+      if (!isCurrentModal()) return;
+      if (!updated.active) throw new Error('图标包已在其他页面切换，请重新选择');
+      pickerPack = updated;
+      siteIconPack = updated;
+      ready = true;
+      packs = packs.map(pack => pack.id === updated.id ? normalizeSiteIconPackSummary(updated) : pack);
+      renderPackControls();
+      render();
+      setStatus('');
+      Toast.success(`图标包已刷新，共 ${updated.icons.length} 个图标`);
+    } catch (error) {
+      if (isCurrentModal()) setStatus(error.message || '刷新失败，原图标包已保留', true);
+    } finally {
+      if (isCurrentModal()) {
+        refreshButton.textContent = '刷新图标包';
+        setBusy(false);
+      }
+    }
+  };
+  clearButton.onclick = async () => {
+    if (busy) return;
+    setBusy(true);
     try {
       const updated = await API.updateSiteIcon(site.id, '', '');
       site.icon_name = updated.icon_name || '';
       site.icon_url = updated.icon_url || '';
+      if (!isCurrentModal()) return;
       Toast.success('已恢复站点首字母');
       close();
       await loadSites();
     } catch (error) {
-      clearButton.disabled = false;
-      Toast.error(error.message || '清除站点图标失败');
+      if (isCurrentModal()) setStatus(error.message || '清除站点图标失败', true);
+    } finally {
+      if (isCurrentModal()) setBusy(false);
     }
   };
-  document.getElementById('m-site-icon-pack').onclick = () => showSiteIconPackModal();
+  manageButton.onclick = () => showSiteIconPackModal();
   document.getElementById('m-site-icon-close').onclick = close;
   render();
   searchInput.focus();
+  setBusy(true);
+  try {
+    const [catalog, activePack] = await Promise.all([API.listSiteIconPacks(), API.getSiteIconPack()]);
+    if (!isCurrentModal()) return;
+    packs = (Array.isArray(catalog && catalog.packs) ? catalog.packs : []).map(normalizeSiteIconPackSummary);
+    pickerPack = normalizeSiteIconPack(activePack);
+    siteIconPack = pickerPack;
+    ready = true;
+    renderPackControls();
+    render();
+  } catch (error) {
+    if (isCurrentModal()) {
+      renderPackControls();
+      results.innerHTML = '<div class="site-icon-empty">读取图标包失败，请关闭后重试</div>';
+      setStatus(error.message || '读取图标包失败', true);
+    }
+  } finally {
+    if (isCurrentModal()) setBusy(false);
+  }
 }
 
 async function showSiteModal(site) {
@@ -1299,7 +1575,7 @@ async function showSiteModal(site) {
 		try {
 			const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
 			const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
-			const hostname = parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname;
+			const hostname = parsed.hostname;
 			const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
 			return {
 				address: `${explicitScheme ? `${parsed.protocol}//` : ''}${hostname}${path}`,
@@ -1333,169 +1609,131 @@ async function showSiteModal(site) {
 				: '';
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
-    <div class="form-group">
-      <label>站点名称</label>
-      <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
-    </div>
-	<div class="form-group">
-	  <label>入口模式</label>
-	  <select class="form-select modal-select" id="m-ingress-mode">
-		${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
-		<option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
-		<option value="path">路径</option>
-		<option value="port">独立端口</option>
-	  </select>
-	  <div class="form-help" id="m-ingress-warning"></div>
-	  ${hostIngressBlockedHint ? `<div class="form-help">${hostIngressBlockedHint}</div>` : ''}
-	</div>
-	<div class="form-group" id="m-port-group">
-	  <label id="m-port-label">监听端口</label>
-	  <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
-	  <div class="form-help" id="m-port-help"></div>
-	</div>
-	<div class="form-group" id="m-public-host-group">
-	  <label>域名前缀</label>
-	  <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
-	  <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
-	  <div class="form-help">访问地址为 https://前缀.${esc(siteCapabilities.route_domain || 'example.com')}:${esc(String((typeof window !== 'undefined' && window.location && window.location.port) || '9090'))}，由面板端口统一转发。</div>
-	</div>
-	<div class="form-group" id="m-path-prefix-group" hidden>
-	  <label>路径前缀</label>
-	  <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
-	  <div class="form-help">只填写一段路径，系统会自动补全为 /emby/；不能使用 api、js、css、_meridian 等系统路径。</div>
-	</div>
-	<div class="form-group upstream-lines-card">
-	  <div class="upstream-lines-head">
-	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。</div></div>
-	    <div class="upstream-lines-buttons">
-	      <button type="button" class="btn-ghost upstream-test-all" id="m-test-all-lines">线路测速</button>
-	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
-	    </div>
-	  </div>
-	  <div class="upstream-line-labels" aria-hidden="true"><span>启用</span><span>线路名称</span><span>协议与域名 / 路径</span><span>端口</span><span>延迟</span><span>排序 / 删除</span></div>
-	  <div class="upstream-lines" id="m-upstream-lines">
-	    <div class="upstream-line is-primary" data-line="primary">
-	      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
-	      <input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称">
-	      <input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址">
-	      <input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口">
-	      <span class="upstream-line-latency">--</span>
-	      <div class="upstream-line-actions primary-actions"><span class="upstream-line-primary-note">主线路</span></div>
-	      <input type="hidden" id="m-target">
-	    </div>
-	    <div id="m-failover-lines"></div>
-	  </div>
-	  <div class="form-help">域名栏自动识别协议与端口：直接输入域名会按 https 补全并自动填入端口 443，带其他端口（如 :8096）则按 http 补全；离开输入框后自动拆分端口。域名栏还可包含 Base URL 路径。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
-	</div>
-    <details class="site-advanced-card site-form-wide">
-      <summary class="site-advanced-summary">
-        <span>高级设置</span>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-      </summary>
-      <div class="site-advanced-body">
-      <div class="site-form-columns" id="m-site-form-columns">
-    <div class="site-form-column site-form-column-policy">
-    <div class="form-group site-ua-group site-field-ua">
-      <label for="m-ua">UA 模式</label>
-      <select class="form-select modal-select" id="m-ua">
-        <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
-        <option value="custom" ${isEdit && uaModeIsCustomLike(site.ua_mode) ? 'selected' : ''}>自定义</option>
-      </select>
-      <div class="site-custom-ua-fields" id="m-custom-ua-group" hidden>
-        <label for="m-custom-ua">自定义身份</label>
-        <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
-        <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-        <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-        <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
-      </div>
-    </div>
-    <div class="form-group site-field-client-ip">
-      <label>真实客户端 IP 透传</label>
-      <select class="form-select modal-select" id="m-client-ip-mode">
-        <option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
-        <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
-        <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
-      </select>
-      <div class="form-help">仅控制发送给回源的 X-Real-IP 与 X-Forwarded-For；客户端来源仍按可信代理规则识别，日志中的客户端 IP 不受影响。</div>
-    </div>
-    <div class="form-group site-field-video">
-      <label>主视频流策略</label>
-      <select class="form-select modal-select" id="m-main-video-mode">
-        <option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option>
-        <option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option>
-      </select>
-      <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
-      <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
-    </div>
-    <div class="form-group site-field-history">
-      <label for="m-watch-history">观看历史记录</label>
-      <select class="form-select modal-select" id="m-watch-history">
-        <option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option>
-        <option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option>
-      </select>
-      <div class="form-help">仅记录后续成功的播放状态同步；保存用户名、设备与原始 PlaySessionId 供管理员排查，令牌仅加密保存且绝不显示或回传。不会保存客户端 IP 或原始请求正文。关闭后不会删除已有历史。</div>
-    </div>
-    </div>
-    <div class="site-form-column-secondary">
-    <div class="site-form-column site-form-column-cache">
-    <div class="form-group site-field-cache-toggle">
-      <label for="m-asset-cache">缓存图片与静态资源</label>
-      <select class="form-select modal-select" id="m-asset-cache">
-        <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
-        <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
-      </select>
-      <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
-    </div>
-    <div class="form-group site-field-cache-rules">
-      <label>缓存规则（每行一条，支持 * 通配）</label>
-      <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
-    </div>
-    <div class="form-group cache-limit-group site-field-cache-limits">
-      <div class="cache-limit-grid">
-        <div>
-          <label for="m-cache-ttl">缓存时间（小时）</label>
-          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+    <div class="site-config-form">
+      <p class="site-config-intro">${isEdit ? '调整站点的回源、访问入口与使用策略。' : '连接一个媒体服务，再为它设置访问入口。'}</p>
+      <section class="site-config-section" aria-labelledby="site-section-basics">
+        <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">01</span><div><h4 id="site-section-basics">基本资料</h4><p>为站点取一个容易辨认的名称</p></div></header>
+        <div class="form-group">
+          <label for="m-name">站点名称</label>
+          <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
         </div>
-        <div>
-          <label for="m-cache-max">容量上限（MB）</label>
-          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
+      </section>
+      <section class="site-config-section" aria-labelledby="site-section-origins">
+        <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">02</span><div><h4 id="site-section-origins">回源线路</h4><p>优先使用主线路，失败时依次切换备用线路</p></div><div class="upstream-lines-buttons"><button type="button" class="console-button upstream-test-all" id="m-test-all-lines">线路测速</button><button type="button" class="console-button upstream-add-line" id="m-add-failover-line"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加线路</button></div></header>
+        <div class="upstream-lines" id="m-upstream-lines">
+          <div class="upstream-line is-primary" data-line="primary">
+            <div class="site-origin-meta"><span class="site-origin-role">主线路</span><label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>始终启用</span></label><span class="upstream-line-latency">未测试</span></div>
+            <div class="site-origin-fields">
+              <label>线路名称<input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称"></label>
+              <label>协议、域名与路径<input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址"></label>
+              <label>端口<input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口"></label>
+            </div>
+            <input type="hidden" id="m-target">
+          </div>
+          <div id="m-failover-lines"></div>
         </div>
-      </div>
+        <details class="site-field-help"><summary>地址自动补全与备用线路</summary><p>地址离开输入框时自动拆分端口。直接输入域名默认为 https / 443；带 :8096 等其他端口时使用 http，已填写的独立端口会保留。支持 Base URL 路径。最多 7 条备用线路，停用后保留配置；主线路恢复后自动回切。</p></details>
+      </section>
+      <section class="site-config-section" aria-labelledby="site-section-ingress">
+        <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">03</span><div><h4 id="site-section-ingress">访问入口</h4><p>选择客户端访问这个站点的方式</p></div></header>
+        <div class="site-config-fields">
+          <div class="form-group">
+            <label for="m-ingress-mode">入口模式</label>
+            <select class="form-select modal-select" id="m-ingress-mode">
+              ${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
+              <option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
+              <option value="path">路径</option><option value="port">独立端口</option>
+            </select>
+            <div class="form-help" id="m-ingress-warning"></div>
+            ${hostIngressBlockedHint ? `<details class="site-field-help"><summary>域名前缀的使用条件</summary><p>${hostIngressBlockedHint}</p></details>` : ''}
+          </div>
+          <div class="form-group" id="m-port-group">
+            <label for="m-port" id="m-port-label">监听端口</label>
+            <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
+            <div class="form-help" id="m-port-help"></div>
+          </div>
+          <div class="form-group" id="m-public-host-group">
+            <label for="m-route-prefix">域名前缀</label>
+            <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
+            <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
+            <div class="form-help">https://前缀.${esc(siteCapabilities.route_domain || 'example.com')}:${esc(String((typeof window !== 'undefined' && window.location && window.location.port) || '9090'))}，通过面板端口访问。</div>
+          </div>
+          <div class="form-group" id="m-path-prefix-group" hidden>
+            <label for="m-path-prefix">路径前缀</label>
+            <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+            <div class="form-help">填写一段路径，自动补全为 /emby/。不能使用 api、js、css、_meridian 等系统路径。</div>
+          </div>
+        </div>
+      </section>
+      <details class="site-advanced-card site-form-wide">
+        <summary class="site-advanced-summary"><span><strong>高级策略</strong><small>客户端身份、播放、缓存与使用限制</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>
+        <div class="site-advanced-body">
+          <div class="site-form-columns" id="m-site-form-columns">
+            <div class="site-form-column site-form-column-policy">
+              <h4 class="site-policy-heading">请求与播放</h4>
+              <div class="site-config-fields">
+                <div class="form-group site-ua-group site-field-ua">
+                  <label for="m-ua">UA 模式</label>
+                  <select class="form-select modal-select" id="m-ua"><option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option><option value="custom" ${isEdit && uaModeIsCustomLike(site.ua_mode) ? 'selected' : ''}>自定义</option></select>
+                  <div class="site-custom-ua-fields" id="m-custom-ua-group" hidden>
+                    <label for="m-custom-ua">User-Agent</label><input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
+                    <div class="site-config-fields"><div><label for="m-custom-client">Emby Client</label><input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false"></div><div><label for="m-custom-version">Emby Version</label><input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false"></div></div>
+                    <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
+                  </div>
+                </div>
+                <div class="form-group site-field-client-ip">
+                  <label for="m-client-ip-mode">客户端 IP 透传</label>
+                  <select class="form-select modal-select" id="m-client-ip-mode"><option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>X-Real-IP 与 X-Forwarded-For</option><option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option><option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>不透传</option></select>
+                  <div class="form-help">控制发送给回源的来源字段，不影响日志识别客户端 IP。</div>
+                </div>
+                <div class="form-group site-field-video">
+                  <label for="m-main-video-mode">主视频流策略</label>
+                  <select class="form-select modal-select" id="m-main-video-mode"><option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option><option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option></select>
+                  <details class="site-field-help"><summary>直连范围与限制</summary><p>直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</p></details>
+                </div>
+                <div class="form-group site-field-history">
+                  <label for="m-watch-history">观看历史记录</label>
+                  <select class="form-select modal-select" id="m-watch-history"><option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option><option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option></select>
+                  <div class="form-help">记录后续成功播放，关闭后保留已有历史。</div>
+                  <details class="site-field-help"><summary>记录哪些信息</summary><p>保存用户名、设备与原始 PlaySessionId 供管理员排查；令牌仅加密保存且绝不显示或回传。不会保存客户端 IP 或原始请求正文。</p></details>
+                </div>
+              </div>
+            </div>
+            <div class="site-form-column-secondary">
+              <div class="site-form-column site-form-column-cache">
+                <h4 class="site-policy-heading">资源缓存</h4>
+                <div class="site-config-fields">
+                  <div class="form-group site-field-cache-toggle"><label for="m-asset-cache">缓存图片与静态资源</label><select class="form-select modal-select" id="m-asset-cache"><option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option><option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option></select><details class="site-field-help"><summary>缓存范围</summary><p>仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</p></details></div>
+                  <div class="form-group cache-limit-group site-field-cache-limits"><div class="cache-limit-grid"><div><label for="m-cache-ttl">缓存时间（小时）</label><input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}"></div><div><label for="m-cache-max">容量上限（MB）</label><input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}"></div></div></div>
+                  <div class="form-group site-field-cache-rules"><label for="m-cache-rules">缓存规则</label><textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea><div class="form-help">每行一条，支持 * 通配符。</div></div>
+                </div>
+              </div>
+              <div class="site-form-column site-form-column-limits">
+                <h4 class="site-policy-heading">额度与保号</h4>
+                <div class="site-config-fields">
+                  <div class="form-group site-field-quota"><label for="m-quota">流量额度（GB）</label><input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric"><div class="form-help">0 为不限。达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div></div>
+                  <div class="form-group site-field-speed"><label for="m-speed">单连接限速（Mbps）</label><input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric"><div class="form-help">0 为不限。仅限制 HTTP 响应与 WebSocket 下行，上传不受影响。</div></div>
+                  <div class="form-group site-field-retention"><label for="m-account-retention-days">保号周期（天）</label><input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="留空关闭，如：30" min="1" max="3650" step="1" inputmode="numeric"><div class="form-help">1–3650 天，留空关闭。同一播放身份完成 5 次有效播放状态同步后重置倒计时；剩余不多于 7 天显示提醒，Telegram 日报同步结果。</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="site-advanced-subsection">
+            <div class="site-policy-head"><h4 class="site-policy-heading">主回源固定请求头</h4><button type="button" class="console-button upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>添加请求头</button></div>
+            <div id="m-upstream-headers"></div>
+            <div class="form-help">已有值留空会保持不变；仅发送给主回源，不能与备用线路同时使用。</div>
+            <details class="site-field-help"><summary>加密保存与地址变更</summary><p>值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</p></details>
+            ${upstreamHeadersAvailable ? '' : '<div class="form-help site-field-warning">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
+          </div>
+        </div>
+      </details>
     </div>
-    </div>
-    <div class="site-form-column site-form-column-limits">
-    <div class="form-group site-field-quota">
-      <label>流量额度 (GB, 0=不限)</label>
-      <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
-      <div class="form-help">达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div>
-    </div>
-    <div class="form-group site-field-speed">
-      <label>单连接限速 (Mbps, 0=不限)</label>
-      <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
-      <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
-    </div>
-    <div class="form-group site-field-retention">
-      <label for="m-account-retention-days">保号周期（天，留空=关闭）</label>
-      <input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="如：30" min="1" max="3650" step="1" inputmode="numeric">
-      <div class="form-help">填写 1–3650 天即开启，留空即关闭。同一播放身份完成 5 次有效播放状态同步后，自动完成保号并重置倒计时。剩余不多于 7 天时卡片显示红色提醒；Telegram 日报会同步结果。</div>
-    </div>
-    </div>
-    </div>
-      </div>
-    <div class="form-group site-advanced-subsection">
-      <label>主回源固定请求头（可选）</label>
-      <div id="m-upstream-headers"></div>
-      <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
-      <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
-      ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
-    </div>
-      </div>
-    </details>
   `;
 
   document.getElementById('modal-footer').innerHTML = `
-    <button class="btn-modal secondary" id="m-cancel">取消</button>
-    <button class="btn-modal primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
+    <span class="site-config-save-note">地址、入口与策略会一并保存</span>
+    <button type="button" class="console-button" id="m-cancel">取消</button>
+    <button type="button" class="console-button is-primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
   `;
 	document.getElementById('m-cancel').addEventListener('click', closeModal);
 
@@ -1516,16 +1754,8 @@ async function showSiteModal(site) {
 	function renderFailoverLines() {
 		failoverLinesContainer.innerHTML = failoverLines.map((line, index) => `
 		  <div class="upstream-line" data-line-index="${index}">
-		    <label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '开' : '关'}</span></label>
-		    <input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称">
-		    <input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址">
-		    <input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口">
-		    <span class="upstream-line-latency">--</span>
-		    <div class="upstream-line-actions">
-		      <button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button>
-		      <button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button>
-		      <button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button>
-		    </div>
+		    <div class="site-origin-meta"><span class="site-origin-role">备用 ${index + 1}</span><label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '已启用' : '已停用'}</span></label><span class="upstream-line-latency">未测试</span><div class="upstream-line-actions"><button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button><button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button><button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button></div></div>
+		    <div class="site-origin-fields"><label>线路名称<input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称"></label><label>协议、域名与路径<input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址"></label><label>端口<input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" data-autofilled-port="${esc(line.autofilledPort || '')}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口"></label></div>
 		  </div>`).join('');
 
 		failoverLinesContainer.querySelectorAll('.upstream-line').forEach(row => {
@@ -1541,8 +1771,13 @@ async function showSiteModal(site) {
 				autoFillTargetAddress(event.target, portInput);
 				failoverLines[index].address = event.target.value;
 				failoverLines[index].port = portInput.value;
+				failoverLines[index].autofilledPort = portInput.dataset.autofilledPort || '';
 			};
-			row.querySelector('.upstream-line-port').oninput = event => { failoverLines[index].port = event.target.value; };
+			row.querySelector('.upstream-line-port').oninput = event => {
+				delete event.target.dataset.autofilledPort;
+				failoverLines[index].port = event.target.value;
+				failoverLines[index].autofilledPort = '';
+			};
 			row.querySelector('.upstream-line-move-up').onclick = () => {
 				[failoverLines[index - 1], failoverLines[index]] = [failoverLines[index], failoverLines[index - 1]];
 				renderFailoverLines();
@@ -1586,6 +1821,9 @@ async function showSiteModal(site) {
 	renderFailoverLines();
 	document.getElementById('m-target-address').onchange = event => {
 		autoFillTargetAddress(event.target, document.getElementById('m-target-port'));
+	};
+	document.getElementById('m-target-port').oninput = event => {
+		delete event.target.dataset.autofilledPort;
 	};
 	document.getElementById('m-add-failover-line').onclick = () => {
 		if (failoverLines.length >= 7) {

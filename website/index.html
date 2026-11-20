@@ -34,7 +34,7 @@
   <main id="top">
     <section class="hero">
       <div class="hero-inner">
-        <p class="hero-badge"><span class="dot"></span>v1.11.4 已发布</p>
+        <p class="hero-badge"><span class="dot"></span>v1.11.5 已发布</p>
         <h1>Emby / Jellyfin 多站点反向代理<br>与节点调度面板</h1>
         <p class="hero-sub">站点入口、备用线路、播放改写、流量统计、请求日志、观看历史、TLS 证书和边缘 Agent，一个面板全部接管。</p>
         <div class="hero-actions">
@@ -123,6 +123,7 @@
       <div class="gallery">
         <figure><button class="shot" data-full="images/dashboard.png" aria-label="放大查看仪表盘"><img src="images/dashboard.png" alt="仪表盘" loading="lazy" width="1440" height="900"></button><figcaption>仪表盘</figcaption></figure>
         <figure><button class="shot" data-full="images/sites.png" aria-label="放大查看站点管理"><img src="images/sites.png" alt="站点管理" loading="lazy" width="1440" height="900"></button><figcaption>站点管理</figcaption></figure>
+        <figure><button class="shot" data-full="images/site-form.png" aria-label="放大查看添加站点"><img src="images/site-form.png" alt="添加站点弹窗" loading="lazy" width="1440" height="1000"></button><figcaption>添加站点</figcaption></figure>
         <figure><button class="shot" data-full="images/node-scheduling.png" aria-label="放大查看节点调度"><img src="images/node-scheduling.png" alt="节点调度" loading="lazy" width="1440" height="900"></button><figcaption>节点调度</figcaption></figure>
         <figure><button class="shot" data-full="images/request-logs.png" aria-label="放大查看请求日志"><img src="images/request-logs.png" alt="请求日志" loading="lazy" width="1440" height="900"></button><figcaption>请求日志</figcaption></figure>
         <figure><button class="shot" data-full="images/watch-history.png" aria-label="放大查看观看历史"><img src="images/watch-history.png" alt="观看历史" loading="lazy" width="1440" height="900"></button><figcaption>观看历史</figcaption></figure>
@@ -140,7 +141,7 @@
           <span>docker-compose.yml</span>
           <button class="copy-btn" id="copyBtn">复制</button>
         </div>
-        <pre><code id="installCode">services:
+        <pre><code id="installCode" tabindex="-1" aria-label="Docker Compose 安装配置">services:
   meridian:
     image: ghcr.io/chanhui800/meridian:latest
     container_name: meridian
@@ -151,6 +152,7 @@
     environment:
       PORT: "9090"
       DB_PATH: /app/data/meridian.db</code></pre>
+        <p class="copy-feedback" id="copyFeedback" role="status" aria-live="polite" hidden></p>
       </div>
       <div class="install-actions">
         <a class="btn btn-primary" href="https://github.com/chanhui800/Meridian#readme" target="_blank" rel="noopener">阅读完整文档</a>

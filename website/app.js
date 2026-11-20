@@ -3,17 +3,40 @@
 document.addEventListener('DOMContentLoaded', function () {
   var copyBtn = document.getElementById('copyBtn');
   var installCode = document.getElementById('installCode');
+  var copyFeedback = document.getElementById('copyFeedback');
+  var copyResetTimer;
   if (copyBtn && installCode) {
-    copyBtn.addEventListener('click', function () {
-      var text = installCode.textContent;
-      function done() {
+    copyBtn.addEventListener('click', async function () {
+      if (copyBtn.disabled) return;
+      clearTimeout(copyResetTimer);
+      copyBtn.disabled = true;
+      copyBtn.textContent = '正在复制…';
+      if (copyFeedback) copyFeedback.hidden = true;
+      try {
+        if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('Clipboard unavailable');
+        await navigator.clipboard.writeText(installCode.textContent);
         copyBtn.textContent = '已复制';
-        setTimeout(function () { copyBtn.textContent = '复制'; }, 1600);
-      }
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, done);
-      } else {
-        done();
+        copyResetTimer = setTimeout(function () { copyBtn.textContent = '复制'; }, 1600);
+      } catch (_) {
+        copyBtn.textContent = '手动复制';
+        if (copyFeedback) {
+          copyFeedback.textContent = '无法自动复制，请选中下方安装配置并手动复制。';
+          copyFeedback.hidden = false;
+        }
+        try {
+          installCode.focus({ preventScroll: true });
+          var range = document.createRange();
+          range.selectNodeContents(installCode);
+          var selection = window.getSelection();
+          if (selection) {
+            selection.removeAllRanges();
+            selection.addRange(range);
+          }
+        } catch (_) {
+          // Keep the manual-copy instructions visible if selection is blocked.
+        }
+      } finally {
+        copyBtn.disabled = false;
       }
     });
   }
