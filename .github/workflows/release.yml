@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
+      security-events: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
@@ -66,6 +68,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.16.0
+
+      - name: Require the exact release commit to pass CodeQL policy
+        run: |
+          node scripts/codeql-policy.mjs release \
+            --repo "$GITHUB_REPOSITORY" --sha "$(git rev-parse HEAD)" \
+            --policy .github/codeql-reviewed-alerts.json
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "hashAlgorithm": "sha256-lf",
+  "reviews": [
+    {
+      "id": "admin-diagnostic-egress",
+      "ruleId": "go/request-forgery",
+      "path": "diagnostics.go",
+      "partialFingerprints": {
+        "primaryLocationLineHash": "c943ee1e56e53bcb:1"
+      },
+      "reason": "Authenticated administrator diagnostics intentionally support local and private origins. Diagnostic HTTP and TLS connections now reject cloud metadata and other special destinations, validate every DNS answer before dialing checked numeric addresses, disable environment proxies, and retain credential, redirect and response isolation. The arbitrary URL endpoint also has independent concurrency and rate limits; this review accepts only that constrained administrator capability.",
+      "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
+      "reviewedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-02-18T00:00:00Z",
+      "evidence": "docs/code-scanning-review.md",
+      "files": [
+        {
+          "path": "main.go",
+          "sha256": "87eee1027232b00c3102f695d6d63715dcae8c6b74e6936bb655f7232d780dc9"
+        },
+        {
+          "path": "app_http.go",
+          "sha256": "0b6927cf3b9a0e69c04749c5873c0c84402716e15363774295386fcf535fde9f"
+        },
+        {
+          "path": "trusted_proxy.go",
+          "sha256": "0fe635df52bcdf730fab5dac48b2c056ed4fc8708fdadbe0da3a2c167c542d45"
+        },
+        {
+          "path": "diagnostics.go",
+          "sha256": "3c2a4e528515b5ef16a011235c7fd0a64e2685c814dbb810bc0f3f6de8adc051"
+        },
+        {
+          "path": "diagnostics_security.go",
+          "sha256": "3434e6f553170fcdd5f847455dbb42d3fa757728779785188dcf458342bea500"
+        },
+        {
+          "path": "app_sites.go",
+          "sha256": "38b23714c578c2a5a5d2b01dc68612692310819a74bb2dd0592b0a1065fce23c"
+        },
+        {
+          "path": "app_core.go",
+          "sha256": "b5b2d2f4369358fa9ba04585dbf24a0b2ea7ec416fa04a67527fe144faa42559"
+        },
+        {
+          "path": "diagnostics_security_test.go",
+          "sha256": "6e646ca8487c44ea634f1f78d0f43ae223c97979f8bc0dc8893c09cbca717aba"
+        },
+        {
+          "path": "docs/code-scanning-review.md",
+          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+        }
+      ]
+    },
+    {
+      "id": "isolated-dynamic-media-response",
+      "ruleId": "go/reflected-xss",
+      "path": "dynamic_capability_service.go",
+      "partialFingerprints": {
+        "primaryLocationLineHash": "b62a3d30847d4376:1"
+      },
+      "reason": "The flagged copy serves authorized media capabilities rather than panel HTML. It always rebuilds headers with a restrictive CSP sandbox, default-src none, nosniff and DENY; upstream CSP and cookies cannot relax the boundary. Resource paths reject active MIME types. Regression tests confirm opaque media bytes and restrictive headers remain intact, so escaping the media body would break supported content without fixing an established XSS.",
+      "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
+      "reviewedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-02-18T00:00:00Z",
+      "evidence": "docs/code-scanning-review.md",
+      "files": [
+        {
+          "path": "dynamic_capability_service.go",
+          "sha256": "d5897b91d4738e6286f91fc2294c978b38443dad9abd99a6a7dafaa93b7bb42e"
+        },
+        {
+          "path": "dynamic_rewrite_core.go",
+          "sha256": "53c7d3f93d69137c3ea724a2388438fe4767741a73c1f664114bad4f9306e59d"
+        },
+        {
+          "path": "dynamic_runtime_state.go",
+          "sha256": "bd1cd2bd69a0cadf6e643708455072d83c70eb942e8a1b0323f5017c39b4ed99"
+        },
+        {
+          "path": "dynamic_capability_issuer.go",
+          "sha256": "7f1d24e96ccd61f30d150f1c982e787a939a2a08705b6fc49058376139a24b27"
+        },
+        {
+          "path": "dynamic_security_boundary_test.go",
+          "sha256": "a381745e107b32ac7f2b25c502926a45715a774dfbafbb36e88a1dd39e8b184e"
+        },
+        {
+          "path": "docs/code-scanning-review.md",
+          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+        }
+      ]
+    },
+    {
+      "id": "fixed-loopback-healthcheck-tls",
+      "ruleId": "go/disabled-certificate-check",
+      "path": "command_line.go",
+      "partialFingerprints": {
+        "primaryLocationLineHash": "6d632b862fb273c2:1"
+      },
+      "reason": "The verification exception is restricted to the separate local healthcheck client, fixed 127.0.0.1 and ::1 targets, a range-validated panel-port marker and a constant unauthenticated path. Redirects are disabled, no credentials are sent, and upstream business clients retain certificate verification. Public-domain panel certificates do not normally name loopback, so this narrowly scoped liveness probe is an intentional exception.",
+      "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
+      "reviewedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-02-18T00:00:00Z",
+      "evidence": "docs/code-scanning-review.md",
+      "files": [
+        {
+          "path": "command_line.go",
+          "sha256": "db8ca77654befddc04503e21becf50d7f9606528773122e354c26592bde842cd"
+        },
+        {
+          "path": "app_core.go",
+          "sha256": "b5b2d2f4369358fa9ba04585dbf24a0b2ea7ec416fa04a67527fe144faa42559"
+        },
+        {
+          "path": "main_test.go",
+          "sha256": "1ce6daac73fe7cf92dec4fff2c89ed3a6474a32b3e77cf05152221f62aa681b7"
+        },
+        {
+          "path": "docs/code-scanning-review.md",
+          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+        }
+      ]
+    },
+    {
+      "id": "transient-retention-identity-digest",
+      "ruleId": "go/weak-sensitive-data-hashing",
+      "path": "account_retention.go",
+      "partialFingerprints": {
+        "primaryLocationLineHash": "e96ef967fbc65152:1"
+      },
+      "reason": "The input is an API token or transient viewer identity used only as a bounded in-memory retention counter key, not a stored administrator password or an authentication verifier. Retention sessions expire and only site-level completion events are persisted. Administrator password storage and verification use bcrypt. The review does not claim that an unkeyed digest provides anonymization of low-entropy credentials.",
+      "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
+      "reviewedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-02-18T00:00:00Z",
+      "evidence": "docs/code-scanning-review.md",
+      "files": [
+        {
+          "path": "account_retention.go",
+          "sha256": "5d6c43755a6d59983ba63677efdd9df6e403f0f94b4c2b4d5ea6802a15a6bb71"
+        },
+        {
+          "path": "account_repository.go",
+          "sha256": "4a9afade731735dab3082200d0045c3f6a9da345c9f8bb36db418606425e3b1d"
+        },
+        {
+          "path": "account_retention_test.go",
+          "sha256": "78e45c917dc9ed3753ba24040a3343e1227a385e55c2662324995c62c7fb5693"
+        },
+        {
+          "path": "main_test.go",
+          "sha256": "1ce6daac73fe7cf92dec4fff2c89ed3a6474a32b3e77cf05152221f62aa681b7"
+        },
+        {
+          "path": "docs/code-scanning-review.md",
+          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+        }
+      ]
+    }
+  ]
+}

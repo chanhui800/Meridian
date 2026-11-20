@@ -33,3 +33,30 @@ We will acknowledge a private report, reproduce it in an isolated environment,
 assess severity, prepare a fix, and publish release notes after a fix is
 available. Please allow reasonable time for remediation before public
 disclosure.
+
+## Diagnostic network access
+
+Upstream tests and saved-site diagnostics are administrator features. They
+retain support for loopback and private Emby/Jellyfin origins, while diagnostic
+connections reject metadata and other special destinations, validate DNS
+answers before dialing their numeric addresses, and do not inherit environment
+HTTP proxies. HTTP redirects must keep the same authority and protocol; normal
+upstream certificate verification remains enabled. Diagnostic requests do not
+forward management credentials or expose raw upstream response bodies.
+
+The arbitrary-URL test endpoint also limits concurrent requests and request
+rate. These checks protect this diagnostic feature; they do not turn the
+administrator's general reverse-proxy configuration into an untrusted sandbox.
+Keep management sessions and server egress protected, and use HTTPS for the
+production panel. Direct HTTP is a compatibility mode and cannot protect a
+session from network interception.
+
+## Code-scanning findings
+
+A successful CodeQL workflow means the analysis ran and uploaded its results.
+It does not mean there are no findings. Review the actual data flow and safety
+boundary before changing behavior or treating a result as a false positive.
+The [finding review](docs/code-scanning-review.md) records the current
+diagnostic, media-response, local healthcheck, identity-hashing, redirect, and
+transport-dependent cookie boundaries. Changes to those boundaries require a
+new review; suppressing an entire rule is not a substitute for verification.
