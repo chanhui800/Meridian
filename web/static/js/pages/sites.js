@@ -13,12 +13,21 @@ function normalizeSiteIconPack(value) {
     url: String(icon && icon.url || '').trim(),
   })).filter(icon => icon.name && /^https:\/\//i.test(icon.url)) : [];
   return {
+    id: Number.isSafeInteger(Number(value && value.id)) && Number(value && value.id) > 0 ? Number(value.id) : 0,
     name: String(value && value.name || '').trim(),
     description: String(value && value.description || '').trim(),
     source_url: String(value && value.source_url || '').trim(),
     updated_at: String(value && value.updated_at || '').trim(),
+    active: !!(value && value.active === true),
+    built_in: !!(value && value.built_in === true),
     icons,
   };
+}
+
+function normalizeSiteIconPackSummary(value) {
+  const pack = normalizeSiteIconPack(value);
+  const iconCount = Array.isArray(value && value.icons) ? pack.icons.length : Number(value && value.icon_count);
+  return { ...pack, icons: undefined, icon_count: Number.isSafeInteger(iconCount) && iconCount >= 0 ? iconCount : 0 };
 }
 
 function siteIconFor(site) {
@@ -1101,108 +1110,237 @@ async function showPanelCertificateModal() {
 	openModal({ closeOnBackdrop: false });
 }
 
-async function showSiteIconPackModal(returnToSite = null, reopenSiteModal = false) {
-  const existing = siteIconPack && Array.isArray(siteIconPack.icons) ? siteIconPack.icons.length : 0;
-  document.getElementById('modal-title').textContent = '导入站点图标包';
+function siteIconSourceInputToURL(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      throw new Error('图标包地址无效');
+    }
+    if (parsed.protocol !== 'https:') throw new Error('图标包地址仅支持 HTTPS');
+    return parsed.toString();
+  }
+  return 'https://' + raw;
+}
+
+function siteIconPackUpdatedLabel(value) {
+  return String(value || '').replace('T', ' ').slice(0, 19);
+}
+
+async function loadSiteIconPackFromSource(value) {
+  const source = siteIconSourceInputToURL(value);
+  if (!source) throw new Error('请填写图标包链接');
+  let response;
+  try {
+    response = await fetch(source, { credentials: 'omit', redirect: 'error', cache: 'no-store' });
+  } catch (_) {
+    throw new Error('读取图标包失败，请检查链接和网络后重试');
+  }
+  if (!response.ok) throw new Error(`读取图标包失败（HTTP ${response.status}）`);
+  const text = await response.text();
+  if (new TextEncoder().encode(text).length > 4 * 1024 * 1024) throw new Error('图标包不能超过 4 MiB');
+  let pack;
+  try {
+    pack = JSON.parse(text);
+  } catch (_) {
+    throw new Error('图标包内容不是有效的 JSON');
+  }
+  if (!normalizeSiteIconPack(pack).icons.length) throw new Error('图标包中没有可用的 HTTPS 图标');
+  return { source, pack };
+}
+
+async function showSiteIconPackModal() {
+  document.getElementById('modal-title').textContent = '站点图标包';
   document.getElementById('modal-body').innerHTML = `
     <div class="site-icon-pack-modal-copy">
-      <p>上传一个 JSON 图标包，或填写公开的 HTTPS JSON 地址。系统只保存图标名称和 HTTPS 图片地址，不内置任何图标包。</p>
-      <p class="form-help">当前${existing ? `已载入 ${existing} 个图标` : '尚未载入图标包'}。导入后点击站点卡片左侧的圆形图标即可按名称搜索并选择。</p>
+      <p>三个内置图标包开箱即用，也可以通过链接导入其他图标包。点击刷新，读取来源中的最新图标。</p>
     </div>
-    <div class="form-group">
-      <label for="m-icon-pack-file">上传 JSON 文件</label>
-      <input class="form-input site-icon-pack-file" id="m-icon-pack-file" type="file" accept="application/json,.json">
-    </div>
-    <div class="site-icon-pack-divider"><span>或</span></div>
-    <div class="form-group">
-      <label for="m-icon-pack-url">图标包 HTTPS 地址</label>
-      <input class="form-input" id="m-icon-pack-url" type="url" placeholder="https://example.com/icon-pack.json" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false">
-      <div class="form-help">如果浏览器因跨域策略无法读取地址，请先下载 JSON 文件再上传。</div>
-    </div>
-    <div class="site-icon-pack-status" id="m-icon-pack-status" role="status" aria-live="polite"></div>
+    <div class="site-icon-pack-list" id="m-site-icon-pack-list" aria-live="polite"></div>
+    <form class="site-icon-pack-import-card" id="m-icon-pack-import-form">
+      <h3 class="site-icon-pack-import-title">导入新图标包</h3>
+      <div class="form-group">
+        <label for="m-icon-pack-url">图标包链接</label>
+        <div class="site-icon-pack-import-row">
+          <input class="form-input" id="m-icon-pack-url" type="text" placeholder="https://example.com/icon-pack.json" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false">
+          <button class="console-button is-primary" id="m-icon-pack-import" type="submit">导入</button>
+        </div>
+      </div>
+      <div class="site-icon-pack-status" id="m-icon-pack-status" role="status" aria-live="polite"></div>
+    </form>
   `;
   document.getElementById('modal-footer').innerHTML = `
-    <button class="btn-modal secondary" id="m-icon-pack-cancel">取消</button>
-    <button class="btn-modal" id="m-icon-pack-clear" ${existing ? '' : 'disabled'}>清空图标包</button>
-    <button class="btn-modal primary" id="m-icon-pack-import">导入</button>
+    <button class="btn-modal primary" id="m-icon-pack-done">完成</button>
   `;
   openModal({ closeOnBackdrop: false, modalClass: 'site-icon-pack-modal' });
 
-  const fileInput = document.getElementById('m-icon-pack-file');
+  const listEl = document.getElementById('m-site-icon-pack-list');
+  const importForm = document.getElementById('m-icon-pack-import-form');
   const urlInput = document.getElementById('m-icon-pack-url');
   const status = document.getElementById('m-icon-pack-status');
   const importButton = document.getElementById('m-icon-pack-import');
+  let packs = [];
+  let busy = false;
+  const isCurrentModal = () => document.getElementById('m-site-icon-pack-list') === listEl;
+
   const setStatus = (message, error = false) => {
     status.textContent = message || '';
     status.classList.toggle('is-error', !!error);
   };
-  const readFile = file => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('读取图标包文件失败'));
-    reader.readAsText(file);
-  });
-  const loadText = async () => {
-    const file = fileInput.files && fileInput.files[0];
-    if (file) return { text: await readFile(file), source: '' };
-    const source = String(urlInput.value || '').trim();
-    if (!source) throw new Error('请选择 JSON 文件或填写图标包地址');
-    if (!/^https:\/\//i.test(source)) throw new Error('图标包地址必须使用 HTTPS');
-    const response = await fetch(source, { credentials: 'omit', redirect: 'error' });
-    if (!response.ok) throw new Error(`读取图标包失败（HTTP ${response.status}）`);
-    return { text: await response.text(), source };
+
+  const setBusy = value => {
+    busy = value;
+    importButton.disabled = value;
+    urlInput.disabled = value;
+    listEl.querySelectorAll('[data-icon-pack-action]').forEach(button => { button.disabled = value; });
   };
+
+  const rememberPack = saved => {
+    const summary = normalizeSiteIconPackSummary(saved);
+    packs = packs.filter(pack => pack.id !== summary.id).map(pack => summary.active ? { ...pack, active: false } : pack);
+    packs.push(summary);
+    packs.sort((first, second) => first.id - second.id);
+    if (summary.active) siteIconPack = normalizeSiteIconPack(saved);
+  };
+
+  const renderList = () => {
+    if (!packs.length) {
+      listEl.innerHTML = '<div class="site-icon-pack-list-empty">还没有图标包，导入一个开始使用。</div>';
+      return;
+    }
+    listEl.innerHTML = packs.map(pack => `
+      <div class="site-icon-pack-item ${pack.active ? 'is-active' : ''}">
+        <div class="site-icon-pack-item-main">
+          <div class="site-icon-pack-item-title"><strong>${esc(pack.name || '未命名图标包')}</strong>${pack.built_in ? '<span class="site-icon-pack-builtin-badge">内置</span>' : ''}${pack.active ? '<span class="site-icon-pack-active-badge">使用中</span>' : ''}</div>
+          <p>${esc(pack.description || '')}</p>
+          <div class="site-icon-pack-item-meta"><span>${pack.icon_count} 个图标</span>${pack.source_url ? `<span>${esc(pack.source_url)}</span>` : ''}${pack.updated_at ? `<span>更新于 ${esc(siteIconPackUpdatedLabel(pack.updated_at))}</span>` : ''}</div>
+        </div>
+        <div class="site-icon-pack-item-actions">
+          ${pack.active ? '<button class="console-button" disabled>使用中</button>' : `<button class="console-button" data-icon-pack-action="activate" data-icon-pack-id="${pack.id}">使用</button>`}
+          ${pack.source_url ? `<button class="console-button" data-icon-pack-action="refresh" data-icon-pack-id="${pack.id}">刷新</button>` : ''}
+          <button class="console-button is-danger" data-icon-pack-action="delete" data-icon-pack-id="${pack.id}">删除</button>
+        </div>
+      </div>
+    `).join('');
+    listEl.querySelectorAll('[data-icon-pack-action="activate"]').forEach(button => {
+      button.onclick = async () => {
+        if (busy) return;
+        setBusy(true);
+        try {
+          await API.activateSiteIconPack(button.dataset.iconPackId);
+          if (!isCurrentModal()) return;
+          packs = packs.map(pack => ({ ...pack, active: pack.id === Number(button.dataset.iconPackId) }));
+          renderList();
+          const activePack = normalizeSiteIconPack(await API.getSiteIconPack());
+          if (!isCurrentModal()) return;
+          siteIconPack = activePack;
+          packs = packs.map(pack => ({ ...pack, active: pack.id === activePack.id }));
+          renderList();
+          setStatus('');
+          Toast.success('已切换图标包');
+        } catch (error) {
+          if (isCurrentModal()) setStatus(error.message || '切换图标包失败', true);
+        } finally {
+          if (isCurrentModal()) setBusy(false);
+        }
+      };
+    });
+    listEl.querySelectorAll('[data-icon-pack-action="refresh"]').forEach(button => {
+      button.onclick = async () => {
+        if (busy) return;
+        const pack = packs.find(item => item.id === Number(button.dataset.iconPackId));
+        if (!pack) return;
+        setBusy(true);
+        button.textContent = '刷新中…';
+        setStatus(`正在刷新 ${pack.name || '图标包'}…`);
+        try {
+          const loaded = await loadSiteIconPackFromSource(pack.source_url);
+          const saved = await API.refreshSiteIconPack(pack.id, loaded.pack);
+          if (!isCurrentModal()) return;
+          rememberPack(saved);
+          renderList();
+          setStatus('');
+          Toast.success(`图标包已刷新，共 ${normalizeSiteIconPack(saved).icons.length} 个图标`);
+        } catch (error) {
+          if (isCurrentModal()) {
+            button.textContent = '刷新';
+            setStatus(error.message || '刷新失败，原图标包已保留', true);
+          }
+        } finally {
+          if (isCurrentModal()) setBusy(false);
+        }
+      };
+    });
+    listEl.querySelectorAll('[data-icon-pack-action="delete"]').forEach(button => {
+      button.onclick = async () => {
+        if (busy) return;
+        if (!window.confirm('确定删除这个图标包吗？已有站点图标仍会保留。')) return;
+        setBusy(true);
+        try {
+          await API.deleteSiteIconPack(button.dataset.iconPackId);
+          if (!isCurrentModal()) return;
+          const deleted = packs.find(pack => pack.id === Number(button.dataset.iconPackId));
+          if (deleted && deleted.active) siteIconPack = normalizeSiteIconPack({ icons: [] });
+          packs = packs.filter(pack => pack.id !== Number(button.dataset.iconPackId));
+          renderList();
+          setStatus('');
+          Toast.success('图标包已删除');
+        } catch (error) {
+          if (isCurrentModal()) setStatus(error.message || '删除图标包失败', true);
+        } finally {
+          if (isCurrentModal()) setBusy(false);
+        }
+      };
+    });
+    setBusy(busy);
+  };
+
   const importPack = async () => {
-    importButton.disabled = true;
+    if (busy) return;
+    setBusy(true);
     setStatus('正在读取并校验图标包…');
     try {
-      const loaded = await loadText();
-      if (loaded.text.length > 4 * 1024 * 1024) throw new Error('图标包不能超过 4 MiB');
-      const parsed = JSON.parse(loaded.text);
-      const normalized = normalizeSiteIconPack(parsed);
-      if (!normalized.icons.length) throw new Error('图标包中没有可用的 HTTPS 图标');
-      const saved = await API.saveSiteIconPack(parsed, loaded.source);
-      siteIconPack = normalizeSiteIconPack(saved);
-      Toast.success(`已导入 ${siteIconPack.icons.length} 个图标`);
-      closeModal();
-      await loadSites();
-      if (reopenSiteModal) await showSiteModal(returnToSite || undefined);
+      const loaded = await loadSiteIconPackFromSource(urlInput.value);
+      const saved = await API.createSiteIconPack(loaded.pack, loaded.source);
+      if (!isCurrentModal()) return;
+      rememberPack(saved);
+      renderList();
+      Toast.success(`已导入 ${normalizeSiteIconPack(saved).icons.length} 个图标`);
+      urlInput.value = '';
+      setStatus('');
     } catch (error) {
-      importButton.disabled = false;
-      setStatus(error && error.message ? error.message : '图标包导入失败', true);
+      if (isCurrentModal()) setStatus(error && error.message ? error.message : '图标包导入失败', true);
+    } finally {
+      if (isCurrentModal()) setBusy(false);
     }
   };
-  fileInput.addEventListener('change', () => {
-    if (fileInput.files && fileInput.files[0]) urlInput.value = '';
-  });
-  document.getElementById('m-icon-pack-cancel').onclick = closeModal;
-  document.getElementById('m-icon-pack-clear').onclick = async () => {
-    const clearButton = document.getElementById('m-icon-pack-clear');
-    clearButton.disabled = true;
-    try {
-      await API.clearSiteIconPack();
-      siteIconPack = normalizeSiteIconPack({ icons: [] });
-      Toast.success('图标包已清空，已有站点图标仍会保留');
-      closeModal();
-      await loadSites();
-      if (reopenSiteModal) await showSiteModal(returnToSite || undefined);
-    } catch (error) {
-      clearButton.disabled = false;
-      setStatus(error.message || '清空失败', true);
-    }
+
+  importForm.onsubmit = event => {
+    event.preventDefault();
+    void importPack();
   };
-  importButton.onclick = importPack;
+  document.getElementById('m-icon-pack-done').onclick = async () => {
+    closeModal();
+    await loadSites();
+  };
+  listEl.innerHTML = '<div class="site-icon-pack-list-empty">正在读取图标包…</div>';
+  setBusy(true);
+  try {
+    const response = await API.listSiteIconPacks();
+    if (!isCurrentModal()) return;
+    packs = (Array.isArray(response && response.packs) ? response.packs : []).map(normalizeSiteIconPackSummary);
+    renderList();
+  } catch (error) {
+    if (isCurrentModal()) listEl.innerHTML = `<div class="site-icon-pack-list-empty is-error">${esc(error.message || '读取图标包失败')}</div>`;
+  } finally {
+    if (isCurrentModal()) setBusy(false);
+  }
 }
 
 async function showSiteIconManager(site) {
   if (!site || !site.id) return;
-  if (!siteIconPack.icons.length) {
-    try {
-      siteIconPack = normalizeSiteIconPack(await API.getSiteIconPack());
-    } catch (_) {
-      siteIconPack = normalizeSiteIconPack({ icons: [] });
-    }
-  }
   const current = siteIconFor(site);
   document.getElementById('modal-title').textContent = '设置站点图标';
   document.getElementById('modal-body').innerHTML = `
@@ -1213,13 +1351,19 @@ async function showSiteIconManager(site) {
         <p>${current ? `当前图标：${esc(current.name)}` : '当前使用站点首字母'}</p>
       </div>
     </div>
+    <div class="site-icon-manager-pack">
+      <label for="m-site-icon-pack-select">图标包<select class="form-select" id="m-site-icon-pack-select" disabled><option value="">正在读取图标包…</option></select></label>
+      <button class="console-button" id="m-site-icon-pack-refresh" type="button" disabled>刷新图标包</button>
+    </div>
+    <div class="site-icon-manager-pack-meta" id="m-site-icon-pack-meta"></div>
     <div class="site-icon-manager-search">
       <label class="sr-only" for="m-site-icon-search">搜索图标</label>
       <span aria-hidden="true">⌕</span>
-      <input type="search" class="form-input" id="m-site-icon-search" placeholder="按图标包名称搜索" autocomplete="off">
+      <input type="search" class="form-input" id="m-site-icon-search" placeholder="按图标名称搜索" autocomplete="off">
     </div>
     <div class="site-icon-results site-icon-manager-results" id="m-site-icon-manager-results" role="listbox" aria-label="可用站点图标"></div>
-    <p class="form-help site-icon-manager-help">图标来自你上传的 JSON 图标包。需要更换图标包时，请返回站点页点击“图标包”。</p>
+    <p class="site-icon-manager-status" id="m-site-icon-status" role="status" aria-live="polite"></p>
+    <p class="form-help site-icon-manager-help">切换图标包后可直接选择图标；刷新会读取来源中的最新内容。</p>
   `;
   document.getElementById('modal-footer').innerHTML = `
     <button class="btn-modal secondary" id="m-site-icon-clear">使用首字母</button>
@@ -1230,53 +1374,175 @@ async function showSiteIconManager(site) {
 
   const searchInput = document.getElementById('m-site-icon-search');
   const results = document.getElementById('m-site-icon-manager-results');
+  const packSelect = document.getElementById('m-site-icon-pack-select');
+  const refreshButton = document.getElementById('m-site-icon-pack-refresh');
+  const packMeta = document.getElementById('m-site-icon-pack-meta');
+  const status = document.getElementById('m-site-icon-status');
+  const clearButton = document.getElementById('m-site-icon-clear');
+  const manageButton = document.getElementById('m-site-icon-pack');
+  let packs = [];
+  let pickerPack = normalizeSiteIconPack(siteIconPack);
+  let busy = false;
+  let ready = false;
+  const isCurrentModal = () => document.getElementById('m-site-icon-pack-select') === packSelect;
   const close = () => closeModal();
+  const setStatus = (message, error = false) => {
+    status.textContent = message || '';
+    status.classList.toggle('is-error', error);
+  };
+  const setBusy = value => {
+    busy = value;
+    packSelect.disabled = value || packs.length === 0;
+    const selected = packs.find(pack => String(pack.id) === packSelect.value);
+    refreshButton.disabled = value || !selected || !selected.source_url;
+    clearButton.disabled = value;
+    manageButton.disabled = value;
+    results.querySelectorAll('.site-icon-option').forEach(button => { button.disabled = value || !ready; });
+  };
+  const renderPackControls = () => {
+    packSelect.innerHTML = packs.length ? `${!pickerPack.id ? '<option value="">选择图标包</option>' : ''}${packs.map(pack => `<option value="${pack.id}" ${pack.id === pickerPack.id ? 'selected' : ''}>${esc(pack.name || '未命名图标包')}${pack.built_in ? ' · 内置' : ''}（${pack.icon_count}）</option>`).join('')}` : '<option value="">暂无图标包</option>';
+    packSelect.value = pickerPack.id ? String(pickerPack.id) : '';
+    packMeta.innerHTML = pickerPack.id ? `${pickerPack.built_in ? '<span class="site-icon-pack-builtin-badge">内置</span>' : ''}<span>${pickerPack.icons.length} 个图标</span>${pickerPack.updated_at ? `<span>更新于 ${esc(siteIconPackUpdatedLabel(pickerPack.updated_at))}</span>` : ''}` : '';
+    setBusy(busy);
+  };
   const render = () => {
     const query = String(searchInput.value || '').trim().toLowerCase();
-    const icons = (siteIconPack.icons || []).filter(icon => !query || icon.name.toLowerCase().includes(query)).slice(0, 120);
-    results.innerHTML = icons.length ? icons.map(icon => `
+    const icons = pickerPack.icons.filter(icon => !query || icon.name.toLowerCase().includes(query)).slice(0, 120);
+    results.innerHTML = ready && icons.length ? icons.map(icon => `
       <button type="button" class="site-icon-option ${current && icon.name === current.name && icon.url === current.url ? 'is-selected' : ''}" data-icon-name="${esc(icon.name)}" data-icon-url="${esc(icon.url)}" role="option" aria-selected="${current && icon.name === current.name && icon.url === current.url ? 'true' : 'false'}">
         <span class="site-icon-option-preview">${renderSiteIcon({ name: icon.name, icon_name: icon.name, icon_url: icon.url }, 'site-icon-option-icon')}</span>
         <span class="site-icon-option-name">${esc(icon.name)}</span>
-      </button>`).join('') : '<div class="site-icon-empty">暂无可用图标，请先上传图标包</div>';
+      </button>`).join('') : `<div class="site-icon-empty">${!ready ? '正在读取图标…' : pickerPack.icons.length ? '没有匹配的图标' : '暂无可用图标，可在图标包管理中导入'}</div>`;
     results.querySelectorAll('.site-icon-option').forEach(button => {
       button.onclick = async () => {
-        button.disabled = true;
+        if (busy || !ready) return;
+        setBusy(true);
         try {
           const updated = await API.updateSiteIcon(site.id, button.dataset.iconName || '', button.dataset.iconUrl || '');
           site.icon_name = updated.icon_name || '';
           site.icon_url = updated.icon_url || '';
+          if (!isCurrentModal()) return;
           Toast.success('站点图标已更新');
           close();
           await loadSites();
         } catch (error) {
-          button.disabled = false;
-          Toast.error(error.message || '保存站点图标失败');
+          if (isCurrentModal()) setStatus(error.message || '保存站点图标失败', true);
+        } finally {
+          if (isCurrentModal()) setBusy(false);
         }
       };
     });
     bindSiteIconFallbacks(results);
+    setBusy(busy);
   };
   searchInput.oninput = render;
-  document.getElementById('m-site-icon-clear').onclick = async () => {
-    const clearButton = document.getElementById('m-site-icon-clear');
-    clearButton.disabled = true;
+  packSelect.onchange = async () => {
+    if (busy) return;
+    const selected = packs.find(pack => String(pack.id) === packSelect.value);
+    if (!selected || selected.id === pickerPack.id) return;
+    const previousID = pickerPack.id;
+    let activated = false;
+    setBusy(true);
+    setStatus('正在切换图标包…');
+    try {
+      await API.activateSiteIconPack(selected.id);
+      activated = true;
+      const activePack = normalizeSiteIconPack(await API.getSiteIconPack());
+      if (!isCurrentModal()) return;
+      if (activePack.id !== selected.id) throw new Error('图标包已在其他页面切换，请重试');
+      pickerPack = activePack;
+      siteIconPack = activePack;
+      ready = true;
+      packs = packs.map(pack => ({ ...pack, active: pack.id === activePack.id }));
+      searchInput.value = '';
+      renderPackControls();
+      render();
+      setStatus('');
+    } catch (error) {
+      if (isCurrentModal()) {
+        if (activated) {
+          ready = false;
+          pickerPack = normalizeSiteIconPack(selected);
+          renderPackControls();
+          results.innerHTML = '<div class="site-icon-empty">读取图标失败，请刷新图标包重试</div>';
+        } else {
+          packSelect.value = String(previousID || '');
+        }
+        setStatus(error.message || '切换图标包失败', true);
+      }
+    } finally {
+      if (isCurrentModal()) setBusy(false);
+    }
+  };
+  refreshButton.onclick = async () => {
+    if (busy) return;
+    const selected = packs.find(pack => String(pack.id) === packSelect.value);
+    if (!selected || !selected.source_url) return;
+    setBusy(true);
+    refreshButton.textContent = '刷新中…';
+    setStatus('正在读取最新图标…');
+    try {
+      const loaded = await loadSiteIconPackFromSource(selected.source_url);
+      const updated = normalizeSiteIconPack(await API.refreshSiteIconPack(selected.id, loaded.pack));
+      if (!isCurrentModal()) return;
+      if (!updated.active) throw new Error('图标包已在其他页面切换，请重新选择');
+      pickerPack = updated;
+      siteIconPack = updated;
+      ready = true;
+      packs = packs.map(pack => pack.id === updated.id ? normalizeSiteIconPackSummary(updated) : pack);
+      renderPackControls();
+      render();
+      setStatus('');
+      Toast.success(`图标包已刷新，共 ${updated.icons.length} 个图标`);
+    } catch (error) {
+      if (isCurrentModal()) setStatus(error.message || '刷新失败，原图标包已保留', true);
+    } finally {
+      if (isCurrentModal()) {
+        refreshButton.textContent = '刷新图标包';
+        setBusy(false);
+      }
+    }
+  };
+  clearButton.onclick = async () => {
+    if (busy) return;
+    setBusy(true);
     try {
       const updated = await API.updateSiteIcon(site.id, '', '');
       site.icon_name = updated.icon_name || '';
       site.icon_url = updated.icon_url || '';
+      if (!isCurrentModal()) return;
       Toast.success('已恢复站点首字母');
       close();
       await loadSites();
     } catch (error) {
-      clearButton.disabled = false;
-      Toast.error(error.message || '清除站点图标失败');
+      if (isCurrentModal()) setStatus(error.message || '清除站点图标失败', true);
+    } finally {
+      if (isCurrentModal()) setBusy(false);
     }
   };
-  document.getElementById('m-site-icon-pack').onclick = () => showSiteIconPackModal();
+  manageButton.onclick = () => showSiteIconPackModal();
   document.getElementById('m-site-icon-close').onclick = close;
   render();
   searchInput.focus();
+  setBusy(true);
+  try {
+    const [catalog, activePack] = await Promise.all([API.listSiteIconPacks(), API.getSiteIconPack()]);
+    if (!isCurrentModal()) return;
+    packs = (Array.isArray(catalog && catalog.packs) ? catalog.packs : []).map(normalizeSiteIconPackSummary);
+    pickerPack = normalizeSiteIconPack(activePack);
+    siteIconPack = pickerPack;
+    ready = true;
+    renderPackControls();
+    render();
+  } catch (error) {
+    if (isCurrentModal()) {
+      renderPackControls();
+      results.innerHTML = '<div class="site-icon-empty">读取图标包失败，请关闭后重试</div>';
+      setStatus(error.message || '读取图标包失败', true);
+    }
+  } finally {
+    if (isCurrentModal()) setBusy(false);
+  }
 }
 
 async function showSiteModal(site) {

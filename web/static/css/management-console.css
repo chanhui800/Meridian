@@ -216,6 +216,39 @@ html .console-shell .site-config-modal :is(.form-input,.form-select) { display: 
 .console-shell :is(.site-icon-pack-modal,.site-icon-manager-modal) :is(.form-input,.form-select) { color: var(--console-ink); background: var(--console-bg); border-color: var(--console-line); box-shadow: none; }
 .console-shell :is(.site-icon-pack-modal,.site-icon-manager-modal) :is(.btn-ghost,.btn-add,.btn-modal) { background: var(--console-surface); color: var(--console-ink); border: 1px solid var(--console-line); border-radius: 7px; box-shadow: none; }
 .console-shell :is(.site-icon-pack-modal,.site-icon-manager-modal) :is(.btn-modal.primary,.btn-add) { background: var(--console-accent); border-color: var(--console-accent); color: var(--console-surface); }
+.console-shell .site-icon-pack-modal .modal-body { display: block; padding: 0 24px 4px; color: var(--console-ink); }
+.site-icon-pack-list { display: flex; flex-direction: column; gap: 10px; margin: 0 0 18px; max-height: min(36vh, 300px); overflow: auto; }
+.site-icon-pack-list-empty { padding: 18px 12px; color: var(--console-muted); font-size: 13px; text-align: center; border: 1px dashed var(--console-line); border-radius: 9px; }
+.site-icon-pack-list-empty.is-error { color: var(--console-danger, #d64545); border-color: var(--console-danger, #d64545); }
+.site-icon-pack-item { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 15px; border: 1px solid var(--console-line); border-radius: 10px; background: var(--console-surface); }
+.site-icon-pack-item.is-active { border-color: color-mix(in srgb, var(--console-accent) 55%, var(--console-line)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--console-accent) 35%, transparent); }
+.site-icon-pack-item-main { min-width: 0; }
+.site-icon-pack-item-title { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; min-width: 0; }
+.site-icon-pack-item-title strong { color: var(--console-ink); font-size: 14px; overflow-wrap: anywhere; }
+.site-icon-pack-active-badge { flex: 0 0 auto; padding: 2px 7px; border-radius: 999px; background: color-mix(in srgb, var(--console-accent) 16%, transparent); color: var(--console-accent); font-size: 11px; }
+.site-icon-pack-builtin-badge { flex: 0 0 auto; padding: 2px 7px; border: 1px solid var(--console-line); border-radius: 5px; color: var(--console-muted); background: var(--console-bg); font-size: 11px; line-height: 1.5; }
+.site-icon-pack-item-main p { margin: 4px 0 0; color: var(--console-muted); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.site-icon-pack-item-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; color: var(--console-muted); font-size: 11px; }
+.site-icon-pack-item-meta span { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.site-icon-pack-item-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.site-icon-pack-item-actions .console-button { padding: 6px 10px; min-height: 32px; font-size: 12px; }
+.site-icon-pack-import-card { padding: 15px; border: 1px solid var(--console-line); border-radius: 10px; background: var(--console-bg); }
+.site-icon-pack-import-title { margin: 0 0 12px; color: var(--console-ink); font-size: 14px; font-weight: 650; }
+.site-icon-pack-import-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 10px; }
+.site-icon-pack-import-row .form-input { min-width: 0; }
+.site-icon-pack-import-row .console-button { min-width: 72px; }
+.site-icon-pack-import-card .form-group { margin-bottom: 0; }
+.site-icon-pack-import-card .site-icon-pack-status { margin: 10px 0 0; }
+.site-icon-pack-import-card .site-icon-pack-status:empty { display: none; }
+.site-icon-manager-pack { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; }
+.site-icon-manager-pack > label { min-width: 0; color: var(--console-muted); font-size: 12px; }
+.site-icon-manager-pack .form-select { display: block; width: 100%; min-width: 0; margin-top: 7px; text-overflow: ellipsis; }
+.site-icon-manager-pack .console-button { min-height: 42px; padding: 0 12px; white-space: nowrap; }
+.site-icon-manager-pack-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-height: 20px; margin: 8px 0 15px; color: var(--console-muted); font-size: 11px; }
+.site-icon-manager-status { margin: 12px 0 0; color: var(--console-muted); font-size: 12px; line-height: 1.6; }
+.site-icon-manager-status:empty { display: none; }
+.site-icon-manager-status.is-error { color: var(--console-danger); }
+.console-shell .site-icon-manager-modal .site-icon-option:is(:hover,:focus-visible,.is-selected) { border-color: var(--console-accent); background: var(--console-accent-soft); color: var(--console-ink); }
 
 @media (max-width: 1120px) {
   .management-toolbar { flex-wrap: wrap; }
@@ -236,6 +269,12 @@ html .console-shell .site-config-modal :is(.form-input,.form-select) { display: 
   }
 }
 @media (max-width: 768px) {
+  .console-shell .site-icon-pack-modal .modal-body { padding-inline: 16px; }
+  .site-icon-pack-item { flex-direction: column; gap: 12px; }
+  .site-icon-pack-item-actions { width: 100%; justify-content: flex-end; }
+  .site-icon-pack-item-actions .console-button { min-height: 40px; }
+  .site-icon-manager-pack .form-select { min-height: 44px; font-size: 14px; }
+  .site-icon-manager-pack .console-button { min-height: 44px; padding-inline: 10px; }
   .management-page .console-heading { margin-bottom: 22px; }
   .management-toolbar { padding: 18px; gap: 12px; }
   .management-search { width: 100%; max-width: none; flex-basis: 100%; }

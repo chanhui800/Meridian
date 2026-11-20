@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 51
+	databaseSchemaVersion = 53
 )
 
 func (d *DB) migrate() error {
@@ -367,15 +367,6 @@ func (d *DB) migrateOnce() error {
 		log_search_mode TEXT NOT NULL DEFAULT 'like', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO system_settings (id) VALUES (1);
-	CREATE TABLE IF NOT EXISTS site_icon_pack (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		pack_name TEXT NOT NULL DEFAULT '',
-		description TEXT NOT NULL DEFAULT '',
-		source_url TEXT NOT NULL DEFAULT '',
-		icons_json TEXT NOT NULL DEFAULT '[]',
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	INSERT OR IGNORE INTO site_icon_pack (id) VALUES (1);
 	CREATE TABLE IF NOT EXISTS control_nodes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		guid TEXT NOT NULL UNIQUE,
@@ -648,15 +639,13 @@ func (d *DB) migrateOnce() error {
 			}
 		}
 	}
-	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS site_icon_pack (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		pack_name TEXT NOT NULL DEFAULT '',
-		description TEXT NOT NULL DEFAULT '',
-		source_url TEXT NOT NULL DEFAULT '',
-		icons_json TEXT NOT NULL DEFAULT '[]',
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	); INSERT OR IGNORE INTO site_icon_pack (id) VALUES (1);`); err != nil {
+	if err := ensureSiteIconPacksSchema(ctx, conn); err != nil {
 		return err
+	}
+	if previousSchemaVersion < 53 {
+		if err := seedBuiltinSiteIconPacks(ctx, conn); err != nil {
+			return err
+		}
 	}
 	// Probe secrets were introduced after the original control node table. Keep
 	// existing databases upgradeable without exposing the plaintext secret.
@@ -1629,6 +1618,57 @@ func dynamicObservationSchemaState(tableSQL string) string {
 		return dynamicObservationSchemaLegacy
 	}
 	return dynamicObservationSchemaInvalid
+}
+
+func ensureSiteIconPacksSchema(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS site_icon_packs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		pack_name TEXT NOT NULL DEFAULT '',
+		description TEXT NOT NULL DEFAULT '',
+		source_url TEXT NOT NULL DEFAULT '',
+		icons_json TEXT NOT NULL DEFAULT '[]',
+		is_active INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_site_icon_packs_single_active ON site_icon_packs(is_active) WHERE is_active=1;`); err != nil {
+		return err
+	}
+	var legacyTableCount int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='site_icon_pack'").Scan(&legacyTableCount); err != nil {
+		return err
+	}
+	if legacyTableCount == 0 {
+		return nil
+	}
+	var packName, description, sourceURL, iconsJSON, updatedAt string
+	err := conn.QueryRowContext(ctx, "SELECT pack_name, description, source_url, icons_json, updated_at FROM site_icon_pack WHERE id=1").Scan(&packName, &description, &sourceURL, &iconsJSON, &updatedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		trimmedIcons := strings.TrimSpace(iconsJSON)
+		nonEmpty := strings.TrimSpace(packName) != "" || strings.TrimSpace(description) != "" || strings.TrimSpace(sourceURL) != "" || (trimmedIcons != "" && trimmedIcons != "[]")
+		if nonEmpty {
+			var activeCount int
+			if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM site_icon_packs WHERE is_active=1").Scan(&activeCount); err != nil {
+				return err
+			}
+			isActive := 0
+			if activeCount == 0 {
+				isActive = 1
+			}
+			if _, err := conn.ExecContext(ctx, "INSERT INTO site_icon_packs (pack_name, description, source_url, icons_json, is_active, updated_at) VALUES (?,?,?,?,?,?)", packName, description, sourceURL, iconsJSON, isActive, updatedAt); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "DROP TABLE site_icon_pack"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func ensureDynamicObservationSchema(ctx context.Context, conn *sql.Conn) error {
