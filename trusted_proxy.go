@@ -8,6 +8,9 @@ import (
 )
 
 func parseTrustedProxyCIDRs(value string) ([]*net.IPNet, error) {
+	if strings.TrimSpace(value) == "" {
+		value = "127.0.0.1/32,::1/128"
+	}
 	var networks []*net.IPNet
 	for _, raw := range strings.Split(value, ",") {
 		raw = strings.TrimSpace(raw)

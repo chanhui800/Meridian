@@ -834,7 +834,7 @@ prepare_data_and_config() {
         dynamic_route_key=$(generate_distinct_secret "$secret" "$upstream_header_key") || return 1
         INITIAL_SETUP_TOKEN=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key") || return 1
         env_tmp="${tmp_dir}/meridian.env"
-        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nTLS_STATE_DIR=\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nEDGE_TLS_CERT_FILE=\nEDGE_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=\n' \
+        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nTLS_STATE_DIR=\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nEDGE_TLS_CERT_FILE=\nEDGE_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128\n' \
             "$secret" "$upstream_header_key" "$dynamic_route_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
         chmod 0600 "$env_tmp" || return 1
         install_env_file "$env_tmp" || return 1
@@ -850,7 +850,7 @@ prepare_data_and_config() {
         append_env_default PANEL_TLS_KEY_FILE "" "$tmp_dir" || return 1
         append_env_default EDGE_TLS_CERT_FILE "" "$tmp_dir" || return 1
         append_env_default EDGE_TLS_KEY_FILE "" "$tmp_dir" || return 1
-        append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir" || return 1
+        append_env_default TRUSTED_PROXY_CIDRS "127.0.0.1/32,::1/128" "$tmp_dir" || return 1
         ensure_upstream_header_key "$tmp_dir" || return 1
         ensure_setup_token "$tmp_dir" || return 1
         if is_systemd; then

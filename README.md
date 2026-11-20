@@ -216,13 +216,15 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 | `JWT_SECRET` | 自动生成 | 登录和敏感配置加密密钥 |
 | `UPSTREAM_HEADER_KEY` | 自动生成 | 上游请求头密钥 |
 | `DYNAMIC_ROUTE_KEY` | 自动生成 | 动态路由密钥 |
-| `TRUSTED_PROXY_CIDRS` | 空 | 可信前置代理网段 |
+| `TRUSTED_PROXY_CIDRS` | `127.0.0.1/32,::1/128` | 可信前置代理网段，默认仅本机回环地址 |
 | `ASSET_CACHE_DIR` | 数据库目录下 `asset-cache` | 图片缓存目录 |
 | `TLS_STATE_DIR` | 数据库目录下 `tls` | Meridian 管理的 TLS 状态目录，必须使用绝对路径，并与数据库、恢复目录分开 |
 | `PANEL_TLS_CERT_FILE` / `PANEL_TLS_KEY_FILE` | TLS 状态目录中的面板证书 | 可指定外部文件；恢复流程不会删除或替换 |
 | `EDGE_TLS_CERT_FILE` / `EDGE_TLS_KEY_FILE` | TLS 状态目录中的边缘证书 | 可指定外部文件；节点证书状态仍保存在 `TLS_STATE_DIR` |
 | `DNS_PROPAGATION_RESOLVERS` | 系统默认 resolver | 逗号分隔的 IPv4/IPv6 DNS resolver |
 | `DNS_PROPAGATION_TIMEOUT` | `120s` | DNS-01 传播检查超时时间 |
+
+`TRUSTED_PROXY_CIDRS` 未配置或留空时使用上述回环地址，非空自定义值会替换默认范围；只配置实际前置代理的来源网段，Meridian 只接受这些可信来源归一化后的单值 `X-Real-IP` 和 `X-Forwarded-Proto`，不要信任全网地址。
 
 ## 升级和发布
 
