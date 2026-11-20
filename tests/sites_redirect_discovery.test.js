@@ -361,15 +361,15 @@ test('main video strategy uses a compact selector and defaults to proxy', () => 
   assert.match(source, /main_video_stream_mode: mainVideoModeSelect\.value/);
 });
 
-test('advanced settings use independent policy, cache, and limits columns', () => {
+test('advanced policies remain grouped with responsive console fields', () => {
   const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
-  const style = fs.readFileSync(path.join(STATIC_JS, '..', 'css', 'style.css'), 'utf8');
+  const style = fs.readFileSync(path.join(STATIC_JS, '..', 'css', 'management-console.css'), 'utf8');
   assert.match(source, /class="site-form-column site-form-column-policy"/);
   assert.match(source, /class="site-form-column site-form-column-cache"/);
   assert.match(source, /class="site-form-column site-form-column-limits"/);
   assert.match(source, /class="form-group cache-limit-group site-field-cache-limits"/);
   assert.match(source, /class="cache-limit-grid"/);
-  assert.match(style, /\.site-form-columns\s*\{[\s\S]*?grid-template-columns:\s*repeat\(3,/);
-  assert.match(style, /\.site-form-column\s*\{[\s\S]*?flex-direction:\s*column/);
+  assert.match(style, /\.site-form-columns\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(style, /\.site-config-fields\s*\{[^}]*grid-template-columns:\s*repeat\(2,/);
   assert.doesNotMatch(style, /\.cache-limit-group\s*\{\s*grid-area:/);
 });

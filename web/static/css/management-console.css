@@ -1,5 +1,6 @@
 /* Site and request management: rows first, details on demand. */
 .management-page { min-width: 0; }
+.management-sites { container: management-sites / inline-size; }
 .management-page .console-heading { margin-bottom: 28px; }
 .management-page svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .management-page .console-button svg { width: 17px; height: 17px; }
@@ -139,28 +140,100 @@
 .console-shell .management-log-detail dd { margin: 0; color: var(--console-ink); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; white-space: pre-wrap; }
 .console-shell .management-log-modal { max-width: 760px; }
 
-.console-shell .site-config-modal .modal-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px 24px; color: var(--console-ink); }
-.console-shell .site-config-modal .modal-body > .form-group { margin: 0; }
-.console-shell .site-config-modal .upstream-lines-card,
-.console-shell .site-config-modal .site-form-wide,
-.console-shell .site-config-modal .modal-body > .form-group:has(#m-name) { grid-column: 1 / -1; }
-.console-shell .site-config-modal .upstream-lines-card { padding: 20px 0; border: 0; border-top: 1px solid var(--console-line); border-bottom: 1px solid var(--console-line); background: none; border-radius: 0; }
-.console-shell .site-config-modal .site-advanced-card { border: 1px solid var(--console-line); background: none; border-radius: 8px; margin: 0; overflow: hidden; box-shadow: none; }
-.console-shell .site-config-modal .site-advanced-summary { padding: 16px 20px; color: var(--console-ink); background: var(--console-bg); font-size: 13px; }
-.console-shell .site-config-modal .site-advanced-body { padding: 22px 20px; }
-.console-shell .site-config-modal .site-form-columns { gap: 28px; }
-.console-shell .site-config-modal .site-advanced-subsection { margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--console-line); }
-.console-shell .site-config-modal .site-advanced-subsection .form-help { margin-top: 8px; }
-.console-shell .site-config-modal .site-form-column { background: none; padding: 0; border: 0; gap: 20px; box-shadow: none; }
-.console-shell .site-config-modal .form-help { color: var(--console-muted); font-size: 11px; line-height: 1.7; }
-.console-shell :is(.site-config-modal,.site-icon-pack-modal,.site-icon-manager-modal) :is(.form-input,.form-select) { color: var(--console-ink); background: var(--console-bg); border-color: var(--console-line); box-shadow: none; }
-.console-shell :is(.site-config-modal,.site-icon-pack-modal,.site-icon-manager-modal) :is(.btn-ghost,.btn-add,.btn-modal) { background: var(--console-surface); color: var(--console-ink); border: 1px solid var(--console-line); border-radius: 7px; box-shadow: none; }
-.console-shell :is(.site-config-modal,.site-icon-pack-modal,.site-icon-manager-modal) :is(.btn-modal.primary,.btn-add) { background: var(--console-accent); border-color: var(--console-accent); color: var(--console-surface); }
+html .console-shell .modal.site-config-modal { width: min(1040px, calc(100vw - 48px)); max-height: calc(100dvh - 48px); border: 1px solid var(--console-line); border-radius: var(--console-radius); background: var(--console-surface); color: var(--console-ink); font-family: var(--console-font); }
+.console-shell .site-config-modal .modal-header { padding: 24px 28px 12px; }
+.console-shell .site-config-modal .modal-header h3 { font-size: 23px; font-weight: 600; letter-spacing: -.5px; }
+.console-shell .site-config-modal .modal-close { width: 36px; height: 36px; border-radius: 7px; background: var(--console-bg); color: var(--console-muted); }
+.console-shell .site-config-modal .modal-body { display: block; padding: 0 28px; color: var(--console-ink); overflow-x: hidden; }
+.site-config-form { min-width: 0; }
+.site-config-form [hidden] { display: none !important; }
+.site-config-intro { color: var(--console-muted); font-size: 13px; line-height: 1.65; margin: 0; padding-bottom: 4px; }
+.site-config-section { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 24px; padding: 24px 0; border-bottom: 1px solid var(--console-line); }
+.site-config-section:has(#m-upstream-lines) { display: block; }
+.site-section-heading { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+.site-section-heading > div:first-of-type { min-width: 0; }
+.site-section-heading h4 { color: var(--console-ink); font-size: 14px; font-weight: 600; line-height: 1.5; margin: 0; }
+.site-section-heading p { color: var(--console-muted); font-size: 12px; line-height: 1.6; margin: 5px 0 0; }
+.site-section-index { color: var(--console-accent); font-size: 11px; font-weight: 600; padding-top: 3px; font-variant-numeric: tabular-nums; }
+.site-section-heading .upstream-lines-buttons { margin-left: auto; align-self: center; }
+.site-config-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 24px; min-width: 0; align-items: start; }
+.console-shell .site-config-modal .form-group { min-width: 0; margin: 0; }
+.console-shell .site-config-modal .site-config-fields > .form-group { grid-area: auto; }
+.console-shell .site-config-modal label { display: block; margin: 0 0 8px; font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--console-ink); }
+html .console-shell .site-config-modal :is(.form-input,.form-select) { display: block; width: 100%; min-width: 0; max-width: 100%; min-height: 42px; padding: 10px 12px; border: 1px solid var(--console-line); border-radius: 7px; color: var(--console-ink); background-color: var(--console-surface); font: 14px/1.5 var(--console-font); box-shadow: none; color-scheme: inherit; }
+.console-shell .site-config-modal .form-select { padding-right: 36px; }
+.console-shell .site-config-modal .form-select option { background: var(--console-surface); color: var(--console-ink); }
+.console-shell .site-config-modal :is(.form-input,.form-select):focus { border-color: var(--console-accent); outline: 2px solid var(--console-accent-soft); outline-offset: 0; }
+.console-shell .site-config-modal textarea.form-input { resize: vertical; font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px; }
+.console-shell .site-config-modal .form-help { color: var(--console-muted); font-size: 12px; line-height: 1.65; margin-top: 8px; }
+.console-shell .site-config-modal .site-field-warning { color: var(--console-warning); }
+.site-field-help { margin-top: 10px; font-size: 12px; color: var(--console-muted); }
+.site-field-help > summary { width: fit-content; cursor: pointer; min-height: 24px; line-height: 1.6; }
+.site-field-help p { margin: 8px 0 0; line-height: 1.75; color: var(--console-muted); }
+.console-shell .site-config-modal .upstream-lines { margin-top: 18px; }
+.console-shell .site-config-modal .upstream-line { display: block; padding: 16px 0; margin: 0; border: 0; border-top: 1px solid var(--console-line); border-radius: 0; background: none; }
+.console-shell .site-config-modal .upstream-line.is-primary { padding-top: 0; border-top: 0; }
+.console-shell .site-config-modal #m-failover-lines .upstream-line { margin-top: 0; }
+.site-origin-meta { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.site-origin-role { color: var(--console-accent); background: var(--console-accent-soft); padding: 3px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; white-space: nowrap; }
+.console-shell .site-config-modal .upstream-line-enabled { display: flex; gap: 7px; align-items: center; min-height: 28px; font-size: 12px; font-weight: 400; color: var(--console-muted); margin: 0; }
+.console-shell .site-config-modal .upstream-line-enabled input { accent-color: var(--console-accent); }
+.console-shell .site-config-modal .upstream-line-latency { margin-left: auto; min-width: 0; font-size: 12px; color: var(--console-muted); }
+.console-shell .site-config-modal .upstream-line-latency.good { color: var(--console-accent); }
+.console-shell .site-config-modal .upstream-line-latency.warn { color: var(--console-warning); }
+.console-shell .site-config-modal .upstream-line-latency.bad { color: var(--console-danger); }
+.site-origin-fields { display: grid; grid-template-columns: minmax(120px, .8fr) minmax(0, 2fr) 90px; gap: 14px; align-items: start; }
+.console-shell .site-config-modal .site-origin-fields > label { margin: 0; }
+.console-shell .site-config-modal .site-origin-fields .form-input { margin-top: 8px; }
+.console-shell .site-config-modal .icon-button { display: inline-flex; justify-content: center; align-items: center; width: 34px; height: 34px; border: 1px solid var(--console-line); border-radius: 6px; color: var(--console-muted); background: var(--console-surface); }
+.console-shell .site-config-modal .icon-button:hover { color: var(--console-accent); background: var(--console-accent-soft); }
+.console-shell .site-config-modal .icon-button:disabled { opacity: .4; cursor: default; }
+.console-shell .site-config-modal .icon-button.danger { color: var(--console-danger); }
+.console-shell .site-config-modal .site-advanced-card { border: 0; border-radius: 0; background: none; margin: 0; overflow: visible; box-shadow: none; }
+.console-shell .site-config-modal .site-advanced-summary { padding: 22px 0; color: var(--console-ink); background: none; }
+.site-advanced-summary > span { display: grid; gap: 5px; }
+.site-advanced-summary strong { font-size: 14px; font-weight: 600; }
+.site-advanced-summary small { color: var(--console-muted); font-size: 12px; font-weight: 400; }
+.console-shell .site-config-modal .site-advanced-body { padding: 0 0 28px; border: 0; }
+.console-shell .site-config-modal .site-form-columns { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: none; gap: 28px; }
+.console-shell .site-config-modal .site-form-columns > .site-form-column-policy,
+.console-shell .site-config-modal .site-form-column-secondary > .site-form-column { display: block; background: none; padding: 0; border: 0; box-shadow: none; }
+.console-shell .site-config-modal .site-form-column-secondary { display: contents; }
+.site-policy-heading { color: var(--console-ink); font-size: 13px; font-weight: 600; margin: 0 0 16px; }
+.site-config-form .site-custom-ua-fields { display: grid; gap: 8px; margin-top: 16px; }
+.site-config-form .site-custom-ua-fields > label { margin-bottom: 0; }
+.site-config-form .site-custom-ua-fields .site-config-fields { gap: 12px; }
+.site-config-form .site-custom-ua-fields .form-help { margin-top: 0; }
+.site-config-form .site-field-cache-rules { grid-column: 1 / -1; }
+.console-shell .site-config-modal .site-advanced-subsection { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--console-line); }
+.site-policy-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.site-policy-head .site-policy-heading { margin: 0; }
+.site-policy-head .upstream-header-add { margin: 0; }
+.console-shell .site-config-modal .modal-footer { align-items: center; border-top: 1px solid var(--console-line); padding: 16px 28px; background: var(--console-surface); }
+.site-config-save-note { margin-right: auto; color: var(--console-muted); font-size: 12px; }
+.console-shell .site-config-modal .modal-footer .console-button { min-width: 100px; }
+.console-shell .site-config-modal :is(button,summary):focus-visible { outline: 2px solid var(--console-accent); outline-offset: 3px; }
+.console-shell :is(.site-icon-pack-modal,.site-icon-manager-modal) :is(.form-input,.form-select) { color: var(--console-ink); background: var(--console-bg); border-color: var(--console-line); box-shadow: none; }
+.console-shell :is(.site-icon-pack-modal,.site-icon-manager-modal) :is(.btn-ghost,.btn-add,.btn-modal) { background: var(--console-surface); color: var(--console-ink); border: 1px solid var(--console-line); border-radius: 7px; box-shadow: none; }
+.console-shell :is(.site-icon-pack-modal,.site-icon-manager-modal) :is(.btn-modal.primary,.btn-add) { background: var(--console-accent); border-color: var(--console-accent); color: var(--console-surface); }
 
 @media (max-width: 1120px) {
-  .management-site-columns, .management-site-summary { grid-template-columns: minmax(180px, 1fr) 100px 115px 100px 130px; gap: 12px; }
   .management-toolbar { flex-wrap: wrap; }
   .management-log-search-row { grid-template-columns: minmax(180px, 1fr) 140px 140px; gap: 12px; }
+}
+@container management-sites (max-width: 920px) {
+  .management-site-columns, .management-site-summary { grid-template-columns: minmax(180px, 1fr) 100px 115px 100px 130px; gap: 12px; }
+}
+@media (min-width: 769px) {
+  @container management-sites (max-width: 760px) {
+    .management-site-columns { display: none; }
+    .management-site-summary { grid-template-columns: minmax(0, 1fr) 100px 130px; gap: 16px 12px; }
+    .management-site-identity { grid-column: 1 / 3; }
+    .management-page .site-card-state { grid-column: 3; align-items: flex-end; }
+    .management-site-usage { grid-column: 1; }
+    .management-site-latency { grid-column: 2; }
+    .management-site-primary-actions { grid-column: 3; }
+  }
 }
 @media (max-width: 768px) {
   .management-page .console-heading { margin-bottom: 22px; }
@@ -200,9 +273,29 @@
   .management-page .request-log-table { min-width: 1390px; }
   .console-shell .management-log-detail { grid-template-columns: minmax(0, 1fr); }
   .console-shell .management-log-detail > div { grid-column: 1; }
-  .console-shell .site-config-modal .modal-body { grid-template-columns: minmax(0, 1fr); gap: 18px; }
-  .console-shell .site-config-modal .modal-body > * { grid-column: 1 !important; }
-  .console-shell .site-config-modal .site-advanced-body { padding: 20px 16px; }
+  html .console-shell .modal.site-config-modal { width: 100%; max-height: calc(100dvh - 16px); }
+  .console-shell .site-config-modal .modal-header { padding: 20px 18px 12px; }
+  .console-shell .site-config-modal .modal-header h3 { font-size: 21px; }
+  .console-shell .site-config-modal .modal-close { width: 40px; height: 40px; }
+  .console-shell .site-config-modal .modal-body { padding: 0 18px; }
+  .site-config-section { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 22px 0; }
+  .site-section-heading { flex-wrap: wrap; }
+  .site-section-heading .upstream-lines-buttons { flex-basis: 100%; margin-left: 0; }
+  .site-config-fields { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  html .console-shell .site-config-modal :is(.form-input,.form-select) { min-height: 44px; font-size: 16px; }
+  .site-origin-fields { grid-template-columns: minmax(0, 1fr) 80px; gap: 16px 12px; }
+  .site-origin-fields > label:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+  .site-origin-fields > label:nth-child(3) { grid-column: 2; grid-row: 1; }
+  .site-origin-meta { gap: 8px; flex-wrap: wrap; }
+  .site-origin-meta .upstream-line-actions { width: 100%; justify-content: flex-end; }
+  .console-shell .site-config-modal .icon-button { width: 40px; height: 40px; }
+  .console-shell .site-config-modal .site-custom-ua-fields .site-config-fields { grid-template-columns: minmax(0, 1fr); }
+  .console-shell .site-config-modal .modal-footer { padding: 14px 18px; }
+  .site-config-save-note { display: none; }
+  .console-shell .site-config-modal .modal-footer .console-button { min-height: 44px; flex: 1; }
+  .console-shell .site-config-modal .upstream-header-row { grid-template-columns: minmax(0, 1fr) 40px; gap: 10px; }
+  .console-shell .site-config-modal .upstream-header-row > .m-upstream-header-value { grid-column: 1; }
+  .console-shell .site-config-modal .upstream-header-row > .m-upstream-header-remove { grid-column: 2; grid-row: 1 / span 2; }
 }
 @media (prefers-reduced-motion: reduce) {
   .management-page *, .management-page *::before, .management-page *::after { animation: none !important; transition: none !important; }

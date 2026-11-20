@@ -253,6 +253,11 @@ function renderRequestLogs() {
 }
 
 function stopRequestLogRefresh() {
+  const overlay = document.getElementById('modal-overlay');
+  const modal = document.getElementById('modal');
+  if (overlay?.classList.contains('active') && modal?.classList.contains('management-log-modal')) {
+    closeModal({ restoreFocus: false });
+  }
   requestLogLoadGeneration += 1;
   if (requestLogRefreshTimer) {
     clearInterval(requestLogRefreshTimer);

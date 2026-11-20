@@ -677,8 +677,8 @@ function canAddPlaybackAddress(currentCount, maxPlaybackAddresses) {
 function renderUpstreamHeaderRows(headers, upstreamHeadersAvailable) {
 	return headers.map((header, idx) => `
 		<div class="upstream-header-row">
-		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
-		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <input type="text" class="form-input m-upstream-header-name" data-idx="${idx}" value="${esc(header.name)}" placeholder="Header 名称" aria-label="请求头名称" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" ${upstreamHeadersAvailable ? '' : 'disabled'}>
+		  <input type="password" class="form-input m-upstream-header-value" data-idx="${idx}" value="" placeholder="${header.configured ? '已配置；留空保持不变' : 'Header 值'}" aria-label="请求头值" maxlength="1024" autocomplete="new-password" ${upstreamHeadersAvailable ? '' : 'disabled'}>
 		  <button type="button" class="icon-button danger m-upstream-header-remove" data-idx="${idx}" title="删除请求头" aria-label="删除请求头"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 10v6m4-6v6"/></svg></button>
 		</div>
 	`).join('');
@@ -877,8 +877,9 @@ function normalizedTargetAuthority(value) {
 }
 
 // When a user finishes typing an origin address, complete the missing scheme and
-// split an explicit port into the dedicated port field. Without a scheme the port
-// decides the protocol: 443 (or no port) defaults to https, any other port to http.
+// split an explicit port into the dedicated port field. Saved or manually entered
+// ports survive address edits; only an untouched automatic default follows a new
+// protocol. Without a scheme, 443 (or no port) uses https, other ports use http.
 function autoFillTargetAddress(addressInput, portInput) {
 	const raw = String(addressInput && addressInput.value || '').trim().replaceAll('：', ':');
 	if (!raw) return;
@@ -890,16 +891,25 @@ function autoFillTargetAddress(addressInput, portInput) {
 	const authority = withoutScheme.split(/[/?#]/, 1)[0];
 	const portMatch = authority.match(/^(?:\[[^\]]*\]|[^:]+):(\d+)$/);
 	const explicitPort = portMatch ? portMatch[1] : '';
+	const currentPort = String(portInput && portInput.value || '').trim();
+	const retainedPort = currentPort !== portInput?.dataset?.autofilledPort ? currentPort : '';
+	const targetPort = explicitPort || retainedPort;
 	try {
 		const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
 		if (!parsed.hostname) return;
 		const scheme = explicitScheme
 			? parsed.protocol
-			: (explicitPort === '443' || !explicitPort ? 'https:' : 'http:');
+			: (targetPort === '443' || !targetPort ? 'https:' : 'http:');
 		const hostname = parsed.hostname;
 		const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
 		addressInput.value = `${scheme}//${hostname}${path}`;
-		if (portInput) portInput.value = explicitPort || (scheme === 'https:' ? '443' : '80');
+		if (portInput) {
+			portInput.value = targetPort || (scheme === 'https:' ? '443' : '80');
+			if (portInput.dataset) {
+				if (targetPort) delete portInput.dataset.autofilledPort;
+				else portInput.dataset.autofilledPort = portInput.value;
+			}
+		}
 	} catch (_) {
 		// Leave partially typed values untouched until they parse as an address.
 	}
@@ -1299,7 +1309,7 @@ async function showSiteModal(site) {
 		try {
 			const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
 			const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
-			const hostname = parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname;
+			const hostname = parsed.hostname;
 			const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
 			return {
 				address: `${explicitScheme ? `${parsed.protocol}//` : ''}${hostname}${path}`,
@@ -1333,169 +1343,131 @@ async function showSiteModal(site) {
 				: '';
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
-    <div class="form-group">
-      <label>站点名称</label>
-      <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
-    </div>
-	<div class="form-group">
-	  <label>入口模式</label>
-	  <select class="form-select modal-select" id="m-ingress-mode">
-		${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
-		<option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
-		<option value="path">路径</option>
-		<option value="port">独立端口</option>
-	  </select>
-	  <div class="form-help" id="m-ingress-warning"></div>
-	  ${hostIngressBlockedHint ? `<div class="form-help">${hostIngressBlockedHint}</div>` : ''}
-	</div>
-	<div class="form-group" id="m-port-group">
-	  <label id="m-port-label">监听端口</label>
-	  <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
-	  <div class="form-help" id="m-port-help"></div>
-	</div>
-	<div class="form-group" id="m-public-host-group">
-	  <label>域名前缀</label>
-	  <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
-	  <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
-	  <div class="form-help">访问地址为 https://前缀.${esc(siteCapabilities.route_domain || 'example.com')}:${esc(String((typeof window !== 'undefined' && window.location && window.location.port) || '9090'))}，由面板端口统一转发。</div>
-	</div>
-	<div class="form-group" id="m-path-prefix-group" hidden>
-	  <label>路径前缀</label>
-	  <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
-	  <div class="form-help">只填写一段路径，系统会自动补全为 /emby/；不能使用 api、js、css、_meridian 等系统路径。</div>
-	</div>
-	<div class="form-group upstream-lines-card">
-	  <div class="upstream-lines-head">
-	    <div><label>线路列表</label><div class="form-help">主线路失败时按顺序切换，恢复后自动回切。</div></div>
-	    <div class="upstream-lines-buttons">
-	      <button type="button" class="btn-ghost upstream-test-all" id="m-test-all-lines">线路测速</button>
-	      <button type="button" class="btn-add upstream-add-line" id="m-add-failover-line">+ 添加线路</button>
-	    </div>
-	  </div>
-	  <div class="upstream-line-labels" aria-hidden="true"><span>启用</span><span>线路名称</span><span>协议与域名 / 路径</span><span>端口</span><span>延迟</span><span>排序 / 删除</span></div>
-	  <div class="upstream-lines" id="m-upstream-lines">
-	    <div class="upstream-line is-primary" data-line="primary">
-	      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
-	      <input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称">
-	      <input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址">
-	      <input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口">
-	      <span class="upstream-line-latency">--</span>
-	      <div class="upstream-line-actions primary-actions"><span class="upstream-line-primary-note">主线路</span></div>
-	      <input type="hidden" id="m-target">
-	    </div>
-	    <div id="m-failover-lines"></div>
-	  </div>
-	  <div class="form-help">域名栏自动识别协议与端口：直接输入域名会按 https 补全并自动填入端口 443，带其他端口（如 :8096）则按 http 补全；离开输入框后自动拆分端口。域名栏还可包含 Base URL 路径。最多添加 7 条备用线路；禁用线路会保留配置但不参与故障转移。</div>
-	</div>
-    <details class="site-advanced-card site-form-wide">
-      <summary class="site-advanced-summary">
-        <span>高级设置</span>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-      </summary>
-      <div class="site-advanced-body">
-      <div class="site-form-columns" id="m-site-form-columns">
-    <div class="site-form-column site-form-column-policy">
-    <div class="form-group site-ua-group site-field-ua">
-      <label for="m-ua">UA 模式</label>
-      <select class="form-select modal-select" id="m-ua">
-        <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
-        <option value="custom" ${isEdit && uaModeIsCustomLike(site.ua_mode) ? 'selected' : ''}>自定义</option>
-      </select>
-      <div class="site-custom-ua-fields" id="m-custom-ua-group" hidden>
-        <label for="m-custom-ua">自定义身份</label>
-        <input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
-        <input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-        <input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false" style="margin-top:8px">
-        <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
-      </div>
-    </div>
-    <div class="form-group site-field-client-ip">
-      <label>真实客户端 IP 透传</label>
-      <select class="form-select modal-select" id="m-client-ip-mode">
-        <option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
-        <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
-        <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
-      </select>
-      <div class="form-help">仅控制发送给回源的 X-Real-IP 与 X-Forwarded-For；客户端来源仍按可信代理规则识别，日志中的客户端 IP 不受影响。</div>
-    </div>
-    <div class="form-group site-field-video">
-      <label>主视频流策略</label>
-      <select class="form-select modal-select" id="m-main-video-mode">
-        <option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option>
-        <option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option>
-      </select>
-      <div class="form-help">反代沿用当前策略。直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。</div>
-      <div class="form-help">自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</div>
-    </div>
-    <div class="form-group site-field-history">
-      <label for="m-watch-history">观看历史记录</label>
-      <select class="form-select modal-select" id="m-watch-history">
-        <option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option>
-        <option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option>
-      </select>
-      <div class="form-help">仅记录后续成功的播放状态同步；保存用户名、设备与原始 PlaySessionId 供管理员排查，令牌仅加密保存且绝不显示或回传。不会保存客户端 IP 或原始请求正文。关闭后不会删除已有历史。</div>
-    </div>
-    </div>
-    <div class="site-form-column-secondary">
-    <div class="site-form-column site-form-column-cache">
-    <div class="form-group site-field-cache-toggle">
-      <label for="m-asset-cache">缓存图片与静态资源</label>
-      <select class="form-select modal-select" id="m-asset-cache">
-        <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
-        <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
-      </select>
-      <div class="form-help">仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</div>
-    </div>
-    <div class="form-group site-field-cache-rules">
-      <label>缓存规则（每行一条，支持 * 通配）</label>
-      <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
-    </div>
-    <div class="form-group cache-limit-group site-field-cache-limits">
-      <div class="cache-limit-grid">
-        <div>
-          <label for="m-cache-ttl">缓存时间（小时）</label>
-          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+    <div class="site-config-form">
+      <p class="site-config-intro">${isEdit ? '调整站点的回源、访问入口与使用策略。' : '连接一个媒体服务，再为它设置访问入口。'}</p>
+      <section class="site-config-section" aria-labelledby="site-section-basics">
+        <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">01</span><div><h4 id="site-section-basics">基本资料</h4><p>为站点取一个容易辨认的名称</p></div></header>
+        <div class="form-group">
+          <label for="m-name">站点名称</label>
+          <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
         </div>
-        <div>
-          <label for="m-cache-max">容量上限（MB）</label>
-          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
+      </section>
+      <section class="site-config-section" aria-labelledby="site-section-origins">
+        <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">02</span><div><h4 id="site-section-origins">回源线路</h4><p>优先使用主线路，失败时依次切换备用线路</p></div><div class="upstream-lines-buttons"><button type="button" class="console-button upstream-test-all" id="m-test-all-lines">线路测速</button><button type="button" class="console-button upstream-add-line" id="m-add-failover-line"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加线路</button></div></header>
+        <div class="upstream-lines" id="m-upstream-lines">
+          <div class="upstream-line is-primary" data-line="primary">
+            <div class="site-origin-meta"><span class="site-origin-role">主线路</span><label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>始终启用</span></label><span class="upstream-line-latency">未测试</span></div>
+            <div class="site-origin-fields">
+              <label>线路名称<input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称"></label>
+              <label>协议、域名与路径<input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址"></label>
+              <label>端口<input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口"></label>
+            </div>
+            <input type="hidden" id="m-target">
+          </div>
+          <div id="m-failover-lines"></div>
         </div>
-      </div>
+        <details class="site-field-help"><summary>地址自动补全与备用线路</summary><p>地址离开输入框时自动拆分端口。直接输入域名默认为 https / 443；带 :8096 等其他端口时使用 http，已填写的独立端口会保留。支持 Base URL 路径。最多 7 条备用线路，停用后保留配置；主线路恢复后自动回切。</p></details>
+      </section>
+      <section class="site-config-section" aria-labelledby="site-section-ingress">
+        <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">03</span><div><h4 id="site-section-ingress">访问入口</h4><p>选择客户端访问这个站点的方式</p></div></header>
+        <div class="site-config-fields">
+          <div class="form-group">
+            <label for="m-ingress-mode">入口模式</label>
+            <select class="form-select modal-select" id="m-ingress-mode">
+              ${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
+              <option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
+              <option value="path">路径</option><option value="port">独立端口</option>
+            </select>
+            <div class="form-help" id="m-ingress-warning"></div>
+            ${hostIngressBlockedHint ? `<details class="site-field-help"><summary>域名前缀的使用条件</summary><p>${hostIngressBlockedHint}</p></details>` : ''}
+          </div>
+          <div class="form-group" id="m-port-group">
+            <label for="m-port" id="m-port-label">监听端口</label>
+            <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" inputmode="numeric">
+            <div class="form-help" id="m-port-help"></div>
+          </div>
+          <div class="form-group" id="m-public-host-group">
+            <label for="m-route-prefix">域名前缀</label>
+            <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
+            <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
+            <div class="form-help">https://前缀.${esc(siteCapabilities.route_domain || 'example.com')}:${esc(String((typeof window !== 'undefined' && window.location && window.location.port) || '9090'))}，通过面板端口访问。</div>
+          </div>
+          <div class="form-group" id="m-path-prefix-group" hidden>
+            <label for="m-path-prefix">路径前缀</label>
+            <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+            <div class="form-help">填写一段路径，自动补全为 /emby/。不能使用 api、js、css、_meridian 等系统路径。</div>
+          </div>
+        </div>
+      </section>
+      <details class="site-advanced-card site-form-wide">
+        <summary class="site-advanced-summary"><span><strong>高级策略</strong><small>客户端身份、播放、缓存与使用限制</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>
+        <div class="site-advanced-body">
+          <div class="site-form-columns" id="m-site-form-columns">
+            <div class="site-form-column site-form-column-policy">
+              <h4 class="site-policy-heading">请求与播放</h4>
+              <div class="site-config-fields">
+                <div class="form-group site-ua-group site-field-ua">
+                  <label for="m-ua">UA 模式</label>
+                  <select class="form-select modal-select" id="m-ua"><option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option><option value="custom" ${isEdit && uaModeIsCustomLike(site.ua_mode) ? 'selected' : ''}>自定义</option></select>
+                  <div class="site-custom-ua-fields" id="m-custom-ua-group" hidden>
+                    <label for="m-custom-ua">User-Agent</label><input type="text" class="form-input" id="m-custom-ua" placeholder="User-Agent" maxlength="1024" autocapitalize="none" autocorrect="off" spellcheck="false">
+                    <div class="site-config-fields"><div><label for="m-custom-client">Emby Client</label><input type="text" class="form-input" id="m-custom-client" placeholder="Emby Client" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false"></div><div><label for="m-custom-version">Emby Version</label><input type="text" class="form-input" id="m-custom-version" placeholder="Emby Version" maxlength="64" autocapitalize="none" autocorrect="off" spellcheck="false"></div></div>
+                    <div class="form-help">仅改写 User-Agent、Client 和 Version；Device 与 DeviceId 保持原样。</div>
+                  </div>
+                </div>
+                <div class="form-group site-field-client-ip">
+                  <label for="m-client-ip-mode">客户端 IP 透传</label>
+                  <select class="form-select modal-select" id="m-client-ip-mode"><option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>X-Real-IP 与 X-Forwarded-For</option><option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option><option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>不透传</option></select>
+                  <div class="form-help">控制发送给回源的来源字段，不影响日志识别客户端 IP。</div>
+                </div>
+                <div class="form-group site-field-video">
+                  <label for="m-main-video-mode">主视频流策略</label>
+                  <select class="form-select modal-select" id="m-main-video-mode"><option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option><option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option></select>
+                  <details class="site-field-help"><summary>直连范围与限制</summary><p>直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</p></details>
+                </div>
+                <div class="form-group site-field-history">
+                  <label for="m-watch-history">观看历史记录</label>
+                  <select class="form-select modal-select" id="m-watch-history"><option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option><option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option></select>
+                  <div class="form-help">记录后续成功播放，关闭后保留已有历史。</div>
+                  <details class="site-field-help"><summary>记录哪些信息</summary><p>保存用户名、设备与原始 PlaySessionId 供管理员排查；令牌仅加密保存且绝不显示或回传。不会保存客户端 IP 或原始请求正文。</p></details>
+                </div>
+              </div>
+            </div>
+            <div class="site-form-column-secondary">
+              <div class="site-form-column site-form-column-cache">
+                <h4 class="site-policy-heading">资源缓存</h4>
+                <div class="site-config-fields">
+                  <div class="form-group site-field-cache-toggle"><label for="m-asset-cache">缓存图片与静态资源</label><select class="form-select modal-select" id="m-asset-cache"><option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option><option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option></select><details class="site-field-help"><summary>缓存范围</summary><p>仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</p></details></div>
+                  <div class="form-group cache-limit-group site-field-cache-limits"><div class="cache-limit-grid"><div><label for="m-cache-ttl">缓存时间（小时）</label><input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}"></div><div><label for="m-cache-max">容量上限（MB）</label><input type="number" class="form-input" id="m-cache-max" min="1" max="20480" value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}"></div></div></div>
+                  <div class="form-group site-field-cache-rules"><label for="m-cache-rules">缓存规则</label><textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea><div class="form-help">每行一条，支持 * 通配符。</div></div>
+                </div>
+              </div>
+              <div class="site-form-column site-form-column-limits">
+                <h4 class="site-policy-heading">额度与保号</h4>
+                <div class="site-config-fields">
+                  <div class="form-group site-field-quota"><label for="m-quota">流量额度（GB）</label><input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric"><div class="form-help">0 为不限。达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div></div>
+                  <div class="form-group site-field-speed"><label for="m-speed">单连接限速（Mbps）</label><input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric"><div class="form-help">0 为不限。仅限制 HTTP 响应与 WebSocket 下行，上传不受影响。</div></div>
+                  <div class="form-group site-field-retention"><label for="m-account-retention-days">保号周期（天）</label><input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="留空关闭，如：30" min="1" max="3650" step="1" inputmode="numeric"><div class="form-help">1–3650 天，留空关闭。同一播放身份完成 5 次有效播放状态同步后重置倒计时；剩余不多于 7 天显示提醒，Telegram 日报同步结果。</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="site-advanced-subsection">
+            <div class="site-policy-head"><h4 class="site-policy-heading">主回源固定请求头</h4><button type="button" class="console-button upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>添加请求头</button></div>
+            <div id="m-upstream-headers"></div>
+            <div class="form-help">已有值留空会保持不变；仅发送给主回源，不能与备用线路同时使用。</div>
+            <details class="site-field-help"><summary>加密保存与地址变更</summary><p>值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</p></details>
+            ${upstreamHeadersAvailable ? '' : '<div class="form-help site-field-warning">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
+          </div>
+        </div>
+      </details>
     </div>
-    </div>
-    <div class="site-form-column site-form-column-limits">
-    <div class="form-group site-field-quota">
-      <label>流量额度 (GB, 0=不限)</label>
-      <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric">
-      <div class="form-help">达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div>
-    </div>
-    <div class="form-group site-field-speed">
-      <label>单连接限速 (Mbps, 0=不限)</label>
-      <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
-      <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
-    </div>
-    <div class="form-group site-field-retention">
-      <label for="m-account-retention-days">保号周期（天，留空=关闭）</label>
-      <input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="如：30" min="1" max="3650" step="1" inputmode="numeric">
-      <div class="form-help">填写 1–3650 天即开启，留空即关闭。同一播放身份完成 5 次有效播放状态同步后，自动完成保号并重置倒计时。剩余不多于 7 天时卡片显示红色提醒；Telegram 日报会同步结果。</div>
-    </div>
-    </div>
-    </div>
-      </div>
-    <div class="form-group site-advanced-subsection">
-      <label>主回源固定请求头（可选）</label>
-      <div id="m-upstream-headers"></div>
-      <button type="button" class="btn-ghost upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>+ 添加请求头</button>
-      <div class="form-help">值使用 UPSTREAM_HEADER_KEY 加密保存且不会回显，只发送给主回源的精确协议、域名和端口；更换主回源的协议、域名或端口后必须重新输入这些值。</div>
-      ${upstreamHeadersAvailable ? '' : '<div class="form-help" style="color:var(--orange)">当前部署未配置 UPSTREAM_HEADER_KEY，不能新增、重命名或修改 Header 值；仍可删除旧配置。配置密钥并重启后可恢复编辑。</div>'}
-    </div>
-      </div>
-    </details>
   `;
 
   document.getElementById('modal-footer').innerHTML = `
-    <button class="btn-modal secondary" id="m-cancel">取消</button>
-    <button class="btn-modal primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
+    <span class="site-config-save-note">地址、入口与策略会一并保存</span>
+    <button type="button" class="console-button" id="m-cancel">取消</button>
+    <button type="button" class="console-button is-primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
   `;
 	document.getElementById('m-cancel').addEventListener('click', closeModal);
 
@@ -1516,16 +1488,8 @@ async function showSiteModal(site) {
 	function renderFailoverLines() {
 		failoverLinesContainer.innerHTML = failoverLines.map((line, index) => `
 		  <div class="upstream-line" data-line-index="${index}">
-		    <label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '开' : '关'}</span></label>
-		    <input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称">
-		    <input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址">
-		    <input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口">
-		    <span class="upstream-line-latency">--</span>
-		    <div class="upstream-line-actions">
-		      <button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button>
-		      <button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button>
-		      <button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button>
-		    </div>
+		    <div class="site-origin-meta"><span class="site-origin-role">备用 ${index + 1}</span><label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '已启用' : '已停用'}</span></label><span class="upstream-line-latency">未测试</span><div class="upstream-line-actions"><button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button><button type="button" class="icon-button upstream-line-move-down" title="下移" aria-label="下移" ${index === failoverLines.length - 1 ? 'disabled' : ''}>${lineActionIcon('down')}</button><button type="button" class="icon-button upstream-line-remove" title="删除线路" aria-label="删除线路">${lineActionIcon('remove')}</button></div></div>
+		    <div class="site-origin-fields"><label>线路名称<input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称"></label><label>协议、域名与路径<input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址"></label><label>端口<input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" data-autofilled-port="${esc(line.autofilledPort || '')}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口"></label></div>
 		  </div>`).join('');
 
 		failoverLinesContainer.querySelectorAll('.upstream-line').forEach(row => {
@@ -1541,8 +1505,13 @@ async function showSiteModal(site) {
 				autoFillTargetAddress(event.target, portInput);
 				failoverLines[index].address = event.target.value;
 				failoverLines[index].port = portInput.value;
+				failoverLines[index].autofilledPort = portInput.dataset.autofilledPort || '';
 			};
-			row.querySelector('.upstream-line-port').oninput = event => { failoverLines[index].port = event.target.value; };
+			row.querySelector('.upstream-line-port').oninput = event => {
+				delete event.target.dataset.autofilledPort;
+				failoverLines[index].port = event.target.value;
+				failoverLines[index].autofilledPort = '';
+			};
 			row.querySelector('.upstream-line-move-up').onclick = () => {
 				[failoverLines[index - 1], failoverLines[index]] = [failoverLines[index], failoverLines[index - 1]];
 				renderFailoverLines();
@@ -1586,6 +1555,9 @@ async function showSiteModal(site) {
 	renderFailoverLines();
 	document.getElementById('m-target-address').onchange = event => {
 		autoFillTargetAddress(event.target, document.getElementById('m-target-port'));
+	};
+	document.getElementById('m-target-port').oninput = event => {
+		delete event.target.dataset.autofilledPort;
 	};
 	document.getElementById('m-add-failover-line').onclick = () => {
 		if (failoverLines.length >= 7) {

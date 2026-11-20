@@ -107,13 +107,17 @@
     else focusForm();
   };
 
-  window.closeModal = function() {
+  window.closeModal = function(options) {
     modalBackdropClosable = false;
     const overlay = document.getElementById('modal-overlay');
     overlay.classList.remove('active');
     overlay.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('modal-open');
-    if (modalPreviousFocus && modalPreviousFocus.isConnected) modalPreviousFocus.focus();
+    if (options?.restoreFocus !== false && modalPreviousFocus && modalPreviousFocus.isConnected) {
+      modalPreviousFocus.focus();
+    } else if (overlay.contains(document.activeElement)) {
+      document.activeElement?.blur();
+    }
     modalPreviousFocus = null;
   };
 

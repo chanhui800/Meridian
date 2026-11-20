@@ -201,9 +201,9 @@ test('site identity icons remain supported in site cards and console rows', () =
   assert.match(dashboard, /bindDashboardSiteIconFallbacks\(tbody\)/);
 });
 
-test('advanced settings keep cache and account limits in separate vertical columns', () => {
+test('site configuration groups origins, ingress and advanced policies in the console layout', () => {
   const source = loadSitesSource();
-  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'management-console.css'), 'utf8');
   const policyColumn = source.indexOf('site-form-column-policy');
   const secondaryColumn = source.indexOf('site-form-column-secondary');
   const cacheColumn = source.indexOf('site-form-column-cache');
@@ -216,15 +216,14 @@ test('advanced settings keep cache and account limits in separate vertical colum
   const speed = source.indexOf('id="m-speed"');
 
   assert.ok(policyColumn < secondaryColumn && secondaryColumn < cacheColumn && cacheColumn < limitsColumn);
-  assert.ok(cacheColumn < cacheToggle && cacheToggle < cacheRules && cacheRules < cacheLimits && cacheLimits < limitsColumn);
+  assert.ok(cacheColumn < cacheToggle && cacheToggle < cacheLimits && cacheLimits < cacheRules && cacheRules < limitsColumn);
   assert.ok(limitsColumn < quota && quota < speed && speed < retention);
-  assert.match(css, /\.site-form-columns\s*\{[\s\S]*?grid-template-columns:\s*repeat\(3,/);
-  assert.match(css, /\.site-config-modal \.site-form-column > \.form-group\s*\{[\s\S]*?margin-bottom:\s*0/);
-  assert.match(css, /\.site-form-column-secondary\s*\{\s*display:\s*contents/);
-  assert.match(css, /@media \(max-width: 1100px\)[\s\S]*?\.site-form-column-secondary\s*\{[\s\S]*?display:\s*flex;[\s\S]*?flex-direction:\s*column;[\s\S]*?gap:\s*16px/);
-  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.site-form-columns\s*\{[\s\S]*?display:\s*flex;[\s\S]*?\.site-form-column-secondary\s*\{\s*display:\s*contents/);
-  assert.match(css, /@media \(min-width: 1101px\)[\s\S]*?\.site-form-columns:not\(\.site-form-columns-custom-ua\)[\s\S]*?grid-template-areas:[\s\S]*?"ua cache-toggle quota"[\s\S]*?"client-ip cache-rules speed"[\s\S]*?"video cache-limits retention"/);
-  assert.match(source, /advancedColumns\.classList\?\.toggle\('site-form-columns-custom-ua', state\.visible\)/);
+  for (const section of ['site-section-basics', 'site-section-origins', 'site-section-ingress']) {
+    assert.match(source, new RegExp(`aria-labelledby="${section}"`));
+  }
+  assert.match(css, /\.site-config-fields\s*\{[^}]*grid-template-columns:\s*repeat\(2,/);
+  assert.match(css, /\.site-form-columns\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.site-config-fields\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
 });
 
 test('access addresses use the full card width without ellipsis wrapping', () => {

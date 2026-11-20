@@ -309,3 +309,97 @@ test('request details escape values and respect hidden display fields', () => {
   assert.doesNotMatch(elements['modal-body'].innerHTML, /<img|<script>|operator-hidden-UA/);
   assert.match(elements['modal-body'].innerHTML, /upstream-demo/);
 });
+
+function requestDetailsHarness() {
+  const elements = new Map();
+  let document;
+  function element(id) {
+    if (elements.has(id)) return elements.get(id);
+    const classes = new Set();
+    const item = {
+      id, parentElement: null, dataset: {}, style: {}, attributes: {},
+      isConnected: true, disabled: false, tabIndex: 0,
+      classList: {
+        add(...values) { values.forEach(value => classes.add(value)); },
+        remove(...values) { values.forEach(value => classes.delete(value)); },
+        contains(value) { return classes.has(value); },
+        toggle(value, active) { if (active) classes.add(value); else classes.delete(value); },
+      },
+      get className() { return [...classes].join(' '); },
+      set className(value) { classes.clear(); String(value).split(/\s+/).filter(Boolean).forEach(value => classes.add(value)); },
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      removeAttribute(name) { delete this.attributes[name]; },
+      addEventListener() {},
+      getClientRects() { return [{}]; },
+      matches() { return false; },
+      focus() { document.activeElement = this; },
+      blur() { if (document.activeElement === this) document.activeElement = document.body; },
+      contains(other) { for (; other; other = other.parentElement) if (other === this) return true; return false; },
+      querySelectorAll() { return this.id === 'modal' ? [element('modal-close'), element('request-log-detail-close')] : []; },
+    };
+    elements.set(id, item);
+    return item;
+  }
+  document = {
+    getElementById: element,
+    querySelector: element,
+    querySelectorAll(selector) { return selector === '.page' ? [element('page-request-logs'), element('page-account')] : []; },
+    addEventListener() {},
+    body: element('body'),
+  };
+  document.activeElement = document.body;
+  element('modal').parentElement = element('modal-overlay');
+  element('modal-close').parentElement = element('modal');
+  element('request-log-detail-close').parentElement = element('modal');
+  element('log-detail-trigger').parentElement = element('page-request-logs');
+  const sandbox = {
+    document, console, location: { hash: '#request-logs' },
+    matchMedia() { return { matches: false }; },
+    addEventListener() {}, scrollTo() {},
+    requestAnimationFrame(callback) { callback(); },
+    fetch() { return new Promise(() => {}); },
+    clearInterval() {}, clearTimeout() {},
+  };
+  sandbox.window = sandbox;
+  vm.createContext(sandbox);
+  for (const relative of ['api.js', 'app.js', 'router.js', 'pages/request-logs.js']) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js', relative), 'utf8'), sandbox, { filename: relative });
+  }
+  vm.runInContext('Router.resolve()', sandbox);
+  element('log-detail-trigger').focus();
+  sandbox.showRequestLogDetails({ id: 1, site_name: 'Home', method: 'GET', path: '/emby/Items', status_code: 200 });
+  return {
+    element, document, sandbox,
+    navigate(route) { sandbox.location.hash = '#' + route; vm.runInContext('Router.resolve()', sandbox); },
+  };
+}
+
+test('leaving request logs dismisses its details and releases scrolling without focusing the departed row', () => {
+  const h = requestDetailsHarness();
+  assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+  h.navigate('account');
+  assert.equal(h.element('modal-overlay').classList.contains('active'), false);
+  assert.equal(h.document.body.classList.contains('modal-open'), false);
+  assert.equal(h.element('page-account').classList.contains('active'), true);
+  assert.equal(h.element('page-request-logs').contains(h.document.activeElement), false);
+  assert.equal(h.element('modal-overlay').contains(h.document.activeElement), false);
+});
+
+test('request-log cleanup leaves another owner of the shared modal open', () => {
+  const h = requestDetailsHarness();
+  h.sandbox.openModal({ modalClass: 'site-config-modal' });
+  const focused = h.document.activeElement;
+  h.navigate('account');
+  assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+  assert.equal(h.document.body.classList.contains('modal-open'), true);
+  assert.equal(h.element('modal').classList.contains('site-config-modal'), true);
+  assert.equal(h.document.activeElement, focused);
+});
+
+test('manual request-details close restores focus when invoked as a click handler', () => {
+  const h = requestDetailsHarness();
+  h.element('request-log-detail-close').onclick({ type: 'click' });
+  assert.equal(h.element('modal-overlay').classList.contains('active'), false);
+  assert.equal(h.document.body.classList.contains('modal-open'), false);
+  assert.equal(h.document.activeElement, h.element('log-detail-trigger'));
+});
