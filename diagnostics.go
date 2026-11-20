@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -218,6 +219,11 @@ var probeClientMu sync.RWMutex
 
 func newProbeClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Environment proxies can resolve or redirect a target outside the checked
+	// dialer. Diagnostics always connect directly to the validated destination.
+	transport.Proxy = nil
+	transport.DialContext = newDiagnosticDialer(timeout).DialContext
+	transport.DialTLSContext = nil
 	transport.TLSClientConfig = secureTLSConfig("")
 	return &http.Client{
 		Timeout:   timeout,
@@ -388,6 +394,10 @@ func probePlaybackHealth(targetURL string) DiagHealth {
 }
 
 func probeSiteTLS(target *url.URL) DiagTLS {
+	return probeSiteTLSWithDialer(target, newDiagnosticDialer(5*time.Second))
+}
+
+func probeSiteTLSWithDialer(target *url.URL, dialer *diagnosticDialer) DiagTLS {
 	var result DiagTLS
 	if target == nil || !strings.EqualFold(target.Scheme, "https") {
 		return result
@@ -400,17 +410,19 @@ func probeSiteTLS(target *url.URL) DiagTLS {
 		port = "443"
 	}
 
-	conn, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: 5 * time.Second},
-		"tcp",
-		net.JoinHostPort(host, port),
-		secureTLSConfig(host),
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
+	conn := tls.Client(connection, secureTLSConfig(host))
 	defer conn.Close()
+	if err := conn.HandshakeContext(ctx); err != nil {
+		result.Error = err.Error()
+		return result
+	}
 
 	certs := conn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {

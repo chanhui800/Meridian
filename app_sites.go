@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func (a *App) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
@@ -27,11 +28,23 @@ func (a *App) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, "target_url is required")
 		return
 	}
-	if _, err := normalizeTargetURL(req.TargetURL); err != nil {
+	target, err := normalizeTargetURL(req.TargetURL)
+	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	release, admitted := a.upstreamTestAdmission.acquire(time.Now())
+	if !admitted {
+		log.Printf("upstream-test host=%q result=limited", target.Hostname())
+		w.Header().Set("Retry-After", "1")
+		a.jsonErr(w, http.StatusTooManyRequests, "too many upstream tests; retry shortly")
+		return
+	}
+	defer release()
 	health := probeSiteHealth(req.TargetURL)
+	// Only the host and bounded result are audited; target paths, query strings,
+	// authorization values and upstream response bodies are never logged here.
+	log.Printf("upstream-test host=%q result=%s http_status=%d", target.Hostname(), health.Status, health.Probe.HTTPStatus)
 	a.jsonOK(w, map[string]interface{}{
 		"status":        health.Status,
 		"http_status":   health.Probe.HTTPStatus,
@@ -89,36 +102,36 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 
 	case "POST":
 		var req struct {
-			Name                       string                `json:"name"`
-			IconName                   string                `json:"icon_name"`
-			IconURL                    string                `json:"icon_url"`
-			ListenPort                 int                   `json:"listen_port"`
-			PublicHost                 string                `json:"public_host"`
-			RoutePrefix                string                `json:"route_prefix"`
-			PathPrefix                 string                `json:"path_prefix"`
-			IngressMode                string                `json:"ingress_mode"`
-			TargetURL                  string                `json:"target_url"`
-			PrimaryLineName            string                `json:"primary_line_name"`
-			PlaybackTargetURL          string                `json:"playback_target_url"`
-			PlaybackMode               string                `json:"playback_mode"`
-			MainVideoStreamMode        string                `json:"main_video_stream_mode"`
-			FailoverTargets            []string              `json:"failover_targets"`
-			FailoverLines              []FailoverLine        `json:"failover_lines"`
-			StreamHosts                []string              `json:"stream_hosts"`
-			UAMode                     string                `json:"ua_mode"`
-			CustomUserAgent            string                `json:"custom_user_agent"`
-			CustomClient               string                `json:"custom_client"`
-			CustomVersion              string                `json:"custom_version"`
-			ClientIPMode               string                `json:"client_ip_mode"`
-			UpstreamHeaders            []UpstreamHeaderInput `json:"upstream_headers"`
-			AssetCacheEnabled          bool                  `json:"asset_cache_enabled"`
-			AssetCacheTTLSec           int                   `json:"asset_cache_ttl_sec"`
-			AssetCacheMaxBytes         int64                 `json:"asset_cache_max_bytes"`
-			AssetCacheRules            string                `json:"asset_cache_rules"`
-			WatchHistoryEnabled        bool                  `json:"watch_history_enabled"`
-			AccountRetentionDays       int                   `json:"account_retention_days"`
-			Quota                      int64                 `json:"traffic_quota"`
-			SpeedLimit                 int                   `json:"speed_limit"`
+			Name                 string                `json:"name"`
+			IconName             string                `json:"icon_name"`
+			IconURL              string                `json:"icon_url"`
+			ListenPort           int                   `json:"listen_port"`
+			PublicHost           string                `json:"public_host"`
+			RoutePrefix          string                `json:"route_prefix"`
+			PathPrefix           string                `json:"path_prefix"`
+			IngressMode          string                `json:"ingress_mode"`
+			TargetURL            string                `json:"target_url"`
+			PrimaryLineName      string                `json:"primary_line_name"`
+			PlaybackTargetURL    string                `json:"playback_target_url"`
+			PlaybackMode         string                `json:"playback_mode"`
+			MainVideoStreamMode  string                `json:"main_video_stream_mode"`
+			FailoverTargets      []string              `json:"failover_targets"`
+			FailoverLines        []FailoverLine        `json:"failover_lines"`
+			StreamHosts          []string              `json:"stream_hosts"`
+			UAMode               string                `json:"ua_mode"`
+			CustomUserAgent      string                `json:"custom_user_agent"`
+			CustomClient         string                `json:"custom_client"`
+			CustomVersion        string                `json:"custom_version"`
+			ClientIPMode         string                `json:"client_ip_mode"`
+			UpstreamHeaders      []UpstreamHeaderInput `json:"upstream_headers"`
+			AssetCacheEnabled    bool                  `json:"asset_cache_enabled"`
+			AssetCacheTTLSec     int                   `json:"asset_cache_ttl_sec"`
+			AssetCacheMaxBytes   int64                 `json:"asset_cache_max_bytes"`
+			AssetCacheRules      string                `json:"asset_cache_rules"`
+			WatchHistoryEnabled  bool                  `json:"watch_history_enabled"`
+			AccountRetentionDays int                   `json:"account_retention_days"`
+			Quota                int64                 `json:"traffic_quota"`
+			SpeedLimit           int                   `json:"speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
@@ -298,35 +311,35 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		site, err := a.db.CreateSiteRecord(Site{
-			Name:                          req.Name,
-			IconName:                      req.IconName,
-			IconURL:                       req.IconURL,
-			ListenPort:                    req.ListenPort,
-			PublicHost:                    req.PublicHost,
-			PathPrefix:                    req.PathPrefix,
-			IngressMode:                   req.IngressMode,
-			TargetURL:                     req.TargetURL,
-			PrimaryLineName:               req.PrimaryLineName,
-			PlaybackTargetURL:             req.PlaybackTargetURL,
-			PlaybackMode:                  req.PlaybackMode,
-			MainVideoStreamMode:           req.MainVideoStreamMode,
-			FailoverTargets:               string(failoverTargetsJSON),
-			StoredFailoverLines:           string(failoverLinesJSON),
-			StreamHosts:                   string(streamHostsJSON),
-			UAMode:                        req.UAMode,
-			CustomUserAgent:               req.CustomUserAgent,
-			CustomClient:                  req.CustomClient,
-			CustomVersion:                 req.CustomVersion,
-			ClientIPMode:                  req.ClientIPMode,
-			StoredUpstreamHeaders:         storedHeaders,
-			AssetCacheEnabled:             assetCacheConfig.AssetCacheEnabled,
-			AssetCacheTTLSec:              assetCacheConfig.AssetCacheTTLSec,
-			AssetCacheMaxBytes:            assetCacheConfig.AssetCacheMaxBytes,
-			AssetCacheRules:               assetCacheConfig.AssetCacheRules,
-			WatchHistoryEnabled:           req.WatchHistoryEnabled,
-			AccountRetentionDays:          accountRetentionDays,
-			TrafficQuota:                  req.Quota,
-			SpeedLimit:                    req.SpeedLimit,
+			Name:                  req.Name,
+			IconName:              req.IconName,
+			IconURL:               req.IconURL,
+			ListenPort:            req.ListenPort,
+			PublicHost:            req.PublicHost,
+			PathPrefix:            req.PathPrefix,
+			IngressMode:           req.IngressMode,
+			TargetURL:             req.TargetURL,
+			PrimaryLineName:       req.PrimaryLineName,
+			PlaybackTargetURL:     req.PlaybackTargetURL,
+			PlaybackMode:          req.PlaybackMode,
+			MainVideoStreamMode:   req.MainVideoStreamMode,
+			FailoverTargets:       string(failoverTargetsJSON),
+			StoredFailoverLines:   string(failoverLinesJSON),
+			StreamHosts:           string(streamHostsJSON),
+			UAMode:                req.UAMode,
+			CustomUserAgent:       req.CustomUserAgent,
+			CustomClient:          req.CustomClient,
+			CustomVersion:         req.CustomVersion,
+			ClientIPMode:          req.ClientIPMode,
+			StoredUpstreamHeaders: storedHeaders,
+			AssetCacheEnabled:     assetCacheConfig.AssetCacheEnabled,
+			AssetCacheTTLSec:      assetCacheConfig.AssetCacheTTLSec,
+			AssetCacheMaxBytes:    assetCacheConfig.AssetCacheMaxBytes,
+			AssetCacheRules:       assetCacheConfig.AssetCacheRules,
+			WatchHistoryEnabled:   req.WatchHistoryEnabled,
+			AccountRetentionDays:  accountRetentionDays,
+			TrafficQuota:          req.Quota,
+			SpeedLimit:            req.SpeedLimit,
 		})
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
@@ -551,36 +564,36 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Name                       string                 `json:"name"`
-			IconName                   *string                `json:"icon_name"`
-			IconURL                    *string                `json:"icon_url"`
-			ListenPort                 int                    `json:"listen_port"`
-			PublicHost                 *string                `json:"public_host"`
-			RoutePrefix                *string                `json:"route_prefix"`
-			PathPrefix                 *string                `json:"path_prefix"`
-			IngressMode                *string                `json:"ingress_mode"`
-			TargetURL                  string                 `json:"target_url"`
-			PrimaryLineName            *string                `json:"primary_line_name"`
-			PlaybackTargetURL          *string                `json:"playback_target_url"`
-			PlaybackMode               *string                `json:"playback_mode"`
-			MainVideoStreamMode        *string                `json:"main_video_stream_mode"`
-			FailoverTargets            *[]string              `json:"failover_targets"`
-			FailoverLines              *[]FailoverLine        `json:"failover_lines"`
-			StreamHosts                *[]string              `json:"stream_hosts"`
-			UAMode                     *string                `json:"ua_mode"`
-			CustomUserAgent            *string                `json:"custom_user_agent"`
-			CustomClient               *string                `json:"custom_client"`
-			CustomVersion              *string                `json:"custom_version"`
-			ClientIPMode               *string                `json:"client_ip_mode"`
-			UpstreamHeaders            *[]UpstreamHeaderInput `json:"upstream_headers"`
-			AssetCacheEnabled          *bool                  `json:"asset_cache_enabled"`
-			AssetCacheTTLSec           *int                   `json:"asset_cache_ttl_sec"`
-			AssetCacheMaxBytes         *int64                 `json:"asset_cache_max_bytes"`
-			AssetCacheRules            *string                `json:"asset_cache_rules"`
-			WatchHistoryEnabled        *bool                  `json:"watch_history_enabled"`
-			AccountRetentionDays       *int                   `json:"account_retention_days"`
-			Quota                      *int64                 `json:"traffic_quota"`
-			SpeedLimit                 *int                   `json:"speed_limit"`
+			Name                 string                 `json:"name"`
+			IconName             *string                `json:"icon_name"`
+			IconURL              *string                `json:"icon_url"`
+			ListenPort           int                    `json:"listen_port"`
+			PublicHost           *string                `json:"public_host"`
+			RoutePrefix          *string                `json:"route_prefix"`
+			PathPrefix           *string                `json:"path_prefix"`
+			IngressMode          *string                `json:"ingress_mode"`
+			TargetURL            string                 `json:"target_url"`
+			PrimaryLineName      *string                `json:"primary_line_name"`
+			PlaybackTargetURL    *string                `json:"playback_target_url"`
+			PlaybackMode         *string                `json:"playback_mode"`
+			MainVideoStreamMode  *string                `json:"main_video_stream_mode"`
+			FailoverTargets      *[]string              `json:"failover_targets"`
+			FailoverLines        *[]FailoverLine        `json:"failover_lines"`
+			StreamHosts          *[]string              `json:"stream_hosts"`
+			UAMode               *string                `json:"ua_mode"`
+			CustomUserAgent      *string                `json:"custom_user_agent"`
+			CustomClient         *string                `json:"custom_client"`
+			CustomVersion        *string                `json:"custom_version"`
+			ClientIPMode         *string                `json:"client_ip_mode"`
+			UpstreamHeaders      *[]UpstreamHeaderInput `json:"upstream_headers"`
+			AssetCacheEnabled    *bool                  `json:"asset_cache_enabled"`
+			AssetCacheTTLSec     *int                   `json:"asset_cache_ttl_sec"`
+			AssetCacheMaxBytes   *int64                 `json:"asset_cache_max_bytes"`
+			AssetCacheRules      *string                `json:"asset_cache_rules"`
+			WatchHistoryEnabled  *bool                  `json:"watch_history_enabled"`
+			AccountRetentionDays *int                   `json:"account_retention_days"`
+			Quota                *int64                 `json:"traffic_quota"`
+			SpeedLimit           *int                   `json:"speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
@@ -839,10 +852,6 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		candidate.StoredUpstreamHeaders = storedHeaders
-
-
-
-
 
 		if req.AssetCacheEnabled != nil {
 			candidate.AssetCacheEnabled = *req.AssetCacheEnabled

@@ -12,40 +12,41 @@ import (
 )
 
 type App struct {
-	db                   *DB
-	dbPath               string
-	pm                   *ProxyManager
-	backupMu             sync.Mutex
-	sseConnections       atomic.Int64
-	siteLifecycleMu      sync.Mutex
-	setupTokenMu         sync.Mutex
-	setupToken           string
-	loginLimiter         *loginRateLimiter
-	loginLimiterOnce     sync.Once
-	trustedProxies       []*net.IPNet
-	clientIPRegions      *clientIPRegionResolver
-	panelHost            string
-	routeDomain          string
-	panelTLSEnabled      bool
-	panelCertificates    *panelCertificateManager
-	certificateWorker    *certificateWorker
-	panelBindLoopback    bool
-	panelListenPort      int
-	dynamicRouteKey      []byte
-	restartCh            chan struct{}
-	restartOnce          sync.Once
-	tmdb                 *tmdbService
-	tmdbOnce             sync.Once
-	agentReportMu        sync.Mutex
-	agentReportLimiter   *nodeReportAdmission
-	agentLiveReportMu    sync.Mutex
-	agentLiveLimiter     *nodeReportAdmission
-	agentPreAuthMu       sync.Mutex
-	agentPreAuth         *agentPreAuthAdmission
-	siteScheduleLocksMu  sync.Mutex
-	siteScheduleLocks    map[int64]*siteScheduleLock
-	nodeSchedulerQueueMu sync.Mutex
-	nodeSchedulerQueue   *nodeSchedulerQueue
+	db                    *DB
+	dbPath                string
+	pm                    *ProxyManager
+	backupMu              sync.Mutex
+	sseConnections        atomic.Int64
+	siteLifecycleMu       sync.Mutex
+	setupTokenMu          sync.Mutex
+	setupToken            string
+	loginLimiter          *loginRateLimiter
+	loginLimiterOnce      sync.Once
+	upstreamTestAdmission upstreamTestAdmission
+	trustedProxies        []*net.IPNet
+	clientIPRegions       *clientIPRegionResolver
+	panelHost             string
+	routeDomain           string
+	panelTLSEnabled       bool
+	panelCertificates     *panelCertificateManager
+	certificateWorker     *certificateWorker
+	panelBindLoopback     bool
+	panelListenPort       int
+	dynamicRouteKey       []byte
+	restartCh             chan struct{}
+	restartOnce           sync.Once
+	tmdb                  *tmdbService
+	tmdbOnce              sync.Once
+	agentReportMu         sync.Mutex
+	agentReportLimiter    *nodeReportAdmission
+	agentLiveReportMu     sync.Mutex
+	agentLiveLimiter      *nodeReportAdmission
+	agentPreAuthMu        sync.Mutex
+	agentPreAuth          *agentPreAuthAdmission
+	siteScheduleLocksMu   sync.Mutex
+	siteScheduleLocks     map[int64]*siteScheduleLock
+	nodeSchedulerQueueMu  sync.Mutex
+	nodeSchedulerQueue    *nodeSchedulerQueue
 }
 
 // siteScheduleLock serializes every local/remote mutation for one site. A

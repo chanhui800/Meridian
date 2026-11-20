@@ -226,6 +226,8 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 `TRUSTED_PROXY_CIDRS` 未配置或留空时使用上述回环和私网范围，这些来源直达后端时可通过规范化的单值 `X-Real-IP` 和 `X-Forwarded-Proto` 提供真实客户端 IP 与 HTTPS 状态；非空自定义值会替换整个默认范围。实际前置代理应覆盖这两个请求头。公网、链路本地地址（`169.254.0.0/16`、`fe80::/10`）和 CGNAT（`100.64.0.0/10`）不在默认范围内，不要信任全网地址。
 
+故障诊断、站点列表延迟和添加站点的线路测速均保留。诊断允许正常的本机、局域网与公网回源，拒绝云元数据和链路本地等特殊目标；DNS 解析结果校验后直接连接，不使用环境 HTTP 代理。添加站点的任意地址测试最多同时执行 4 个请求，允许 24 次突发、每秒恢复 1 次额度，超过限制时稍后重试。诊断不会转发管理登录凭据，日志只记录目标主机和测试结果。详细边界见[代码扫描复核](docs/code-scanning-review.md)。
+
 ## 升级和发布
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
@@ -256,7 +258,11 @@ bash -n scripts/agent-install.sh
 bash -n docker-entrypoint.sh
 ```
 
-CI 另执行漏洞扫描、静态安全检查、安装器回归和 Docker 构建。Fuzz 每次针对根包中的单个目标运行，例如：
+CI 另执行漏洞扫描、静态安全检查、安装器回归和 Docker 构建。
+
+CodeQL 在上传结果后检查未经审阅的严重和高危告警；正式发布还会核对当前精确提交的主分支扫描结果。已验证的误报和范围明确的例外按具体指纹、保护代码摘要和有效期记录，不能按整条规则忽略。修改相关保护措施后需要重新复核，扫描任务执行成功不等于零告警。
+
+Fuzz 每次针对根包中的单个目标运行，例如：
 
 ```bash
 go test -run '^$' -fuzz '^FuzzNormalizeDynamicURL$' -fuzztime 60s .
