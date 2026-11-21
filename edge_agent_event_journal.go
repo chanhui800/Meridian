@@ -373,11 +373,10 @@ func writeEdgeJournalFrame(file *os.File, key []byte, op *edgeJournalOperation, 
 	if err != nil {
 		return edgeJournalReference{}, chain, err
 	}
-	sealedLength := len(sealed)
-	if sealedLength < 0 || sealedLength > edgeJournalFrameBytes {
+	if len(sealed) > edgeJournalFrameBytes {
 		return edgeJournalReference{}, chain, errors.New("event journal frame too large")
 	}
-	frameLength := uint32(sealedLength)
+	frameLength := uint32(len(sealed)) // #nosec G115 -- len is nonnegative and the preceding guard caps it at 1 MiB, safely within uint32.
 	frame := make([]byte, 8+len(sealed))
 	binary.BigEndian.PutUint32(frame, frameLength)
 	binary.BigEndian.PutUint32(frame[4:], ^frameLength)
