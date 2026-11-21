@@ -20,7 +20,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 53
+	databaseSchemaVersion = 56
 )
 
 func (d *DB) migrate() error {
@@ -169,6 +169,7 @@ func (d *DB) migrateOnce() error {
 		outbound_colo TEXT NOT NULL DEFAULT '',
 		method TEXT NOT NULL,
 		path TEXT NOT NULL,
+		diagnostics_json TEXT NOT NULL DEFAULT '',
 		recorded_at_ms INTEGER NOT NULL,
 		timeline_at_ms INTEGER NOT NULL
 	);
@@ -214,6 +215,7 @@ func (d *DB) migrateOnce() error {
 		UNIQUE(site_id, upstream_item_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_media_items_site_updated ON media_items(site_id, updated_at_ms DESC, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_media_items_tmdb ON media_items(tmdb_type, tmdb_id);
 	CREATE TABLE IF NOT EXISTS watch_sessions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -698,6 +700,8 @@ func (d *DB) migrateOnce() error {
 		{"watch_sessions", "client_name", "ALTER TABLE watch_sessions ADD COLUMN client_name TEXT NOT NULL DEFAULT ''"},
 		{"watch_sessions", "play_session_id", "ALTER TABLE watch_sessions ADD COLUMN play_session_id TEXT NOT NULL DEFAULT ''"},
 		{"watch_sessions", "token_ciphertext", "ALTER TABLE watch_sessions ADD COLUMN token_ciphertext TEXT NOT NULL DEFAULT ''"},
+		{"watch_sessions", "client_stop_requested_at_ms", "ALTER TABLE watch_sessions ADD COLUMN client_stop_requested_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"watch_sessions", "client_stop_outcome", "ALTER TABLE watch_sessions ADD COLUMN client_stop_outcome TEXT NOT NULL DEFAULT ''"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", migration.table, migration.column).Scan(&found); err != nil {
@@ -954,6 +958,13 @@ func (d *DB) migrateOnce() error {
 			return err
 		}
 	}
+	// Completed Agent identities remain in the replay ledger for its retention
+	// window. Pending-cap checks must not walk those acknowledged rows on every
+	// local request-log batch, especially when there are no pending events.
+	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_node_request_events_pending
+		ON node_request_events(received_at_ms DESC,node_id,agent_boot_id,event_id) WHERE processed_at_ms=0`); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_site_counters (
 		node_id INTEGER NOT NULL REFERENCES control_nodes(id) ON DELETE CASCADE,
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -1136,6 +1147,7 @@ func (d *DB) migrateOnce() error {
 		{"upstream_user_agent", "ALTER TABLE request_logs ADD COLUMN upstream_user_agent TEXT NOT NULL DEFAULT ''"},
 		{"backend_address", "ALTER TABLE request_logs ADD COLUMN backend_address TEXT NOT NULL DEFAULT ''"},
 		{"final_node", "ALTER TABLE request_logs ADD COLUMN final_node TEXT NOT NULL DEFAULT ''"},
+		{"diagnostics_json", "ALTER TABLE request_logs ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT ''"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name=?", migration.column).Scan(&exists); err != nil {

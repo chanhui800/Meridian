@@ -233,6 +233,157 @@ test('watch history details show the playback client without exposing session cr
   assert.doesNotMatch(html, new RegExp(token));
 });
 
+test('client stop intent stays separate from upstream confirmation in cards and details', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const requested = Date.parse('2026-11-21T03:04:05Z');
+  const item = { id: 1, title: '停止测试', client_stop_requested_at_ms: requested, stopped_at_ms: 0 };
+  for (const outcome of ['pending', 'unconfirmed']) {
+    const current = { ...item, client_stop_outcome: outcome };
+    const html = sandbox.watchHistoryDetailsHTML(current);
+    assert.match(html, /客户端已发起停止，源站未确认/);
+    assert.match(html, /客户端停止请求/);
+    assert.doesNotMatch(html, /源站确认停止<\/dt>|源站已确认|已退出|已经停止/);
+    assert.match(sandbox.watchHistoryCardHTML(current, 0), /客户端已发起停止，源站未确认/);
+    assert.equal(sandbox.watchHistoryItemIsActive(current), false);
+  }
+  const confirmed = { ...item, client_stop_outcome: 'confirmed', stopped_at_ms: requested + 10 };
+  assert.match(sandbox.watchHistoryDetailsHTML(confirmed), /源站已确认/);
+  assert.match(sandbox.watchHistoryDetailsHTML(confirmed), /源站确认停止<\/dt>/);
+  assert.match(sandbox.watchHistoryCardHTML(confirmed, 0), /源站已确认/);
+  assert.equal(sandbox.watchHistoryItemIsActive(confirmed), false);
+  const unknown = sandbox.watchHistoryDetailsHTML({ ...item, client_stop_requested_at_ms: 0 });
+  assert.match(unknown, /停止确认<\/dt><dd>未报告/);
+  assert.doesNotMatch(unknown, /客户端停止请求|源站已确认|源站未确认/);
+  const legacy = sandbox.watchHistoryDetailsHTML({ title: '历史停止', stopped_at_ms: requested });
+  assert.match(legacy, /记录停止时间/);
+  assert.doesNotMatch(legacy, /源站已确认|源站确认停止/);
+});
+
+test('denied stops remain active and a later successful progress can clear the stop intent', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const denied = { id: 1, title: '继续播放', client_stop_requested_at_ms: 1795212345000, client_stop_outcome: 'denied', stopped_at_ms: 0 };
+  assert.equal(sandbox.watchHistoryItemIsActive(denied), true);
+  const deniedCard = sandbox.watchHistoryCardHTML(denied, 0, { live: true, source: 'live' });
+  assert.match(deniedCard, /正在观看/);
+  assert.match(deniedCard, /源站拒绝停止/);
+  const stopped = { ...denied, client_stop_outcome: 'unconfirmed' };
+  assert.equal(sandbox.watchHistoryItemIsActive(stopped), false);
+  assert.doesNotMatch(sandbox.watchHistoryCardHTML(stopped, 0, { live: true, source: 'live' }), /watch-history-live-badge/);
+  const resumed = { ...stopped, client_stop_requested_at_ms: 0, client_stop_outcome: '', last_seen_at_ms: 1795212346000 };
+  assert.equal(sandbox.watchHistoryItemIsActive(resumed), true);
+  const resumedCard = sandbox.watchHistoryCardHTML(resumed, 0, { live: true, source: 'live' });
+  assert.match(resumedCard, /watch-history-live-badge/);
+  assert.doesNotMatch(resumedCard, /源站未确认|watch-history-stop-note/);
+});
+
+test('stop schema rejects invalid timestamps and unsupported outcome values without rendering executable data', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const attack = '\"><img src=x onerror=alert(1)>';
+  for (const value of [undefined, null, false, '', '1795212345000', -1, Infinity, 1.5, attack]) {
+    assert.equal(sandbox.watchHistoryStopTimestamp(value), 0);
+    const html = sandbox.watchHistoryDetailsHTML({ title: 'Safe', client_stop_requested_at_ms: value, client_stop_outcome: attack, stopped_at_ms: value });
+    assert.match(html, /停止确认<\/dt><dd>未报告/);
+    assert.doesNotMatch(html, /<img|onerror|alert\(1\)|源站已确认/);
+  }
+  for (const outcome of [attack, '__proto__', 'toString', {}, null]) {
+    const html = sandbox.watchHistoryCardHTML({ title: 'Safe', client_stop_requested_at_ms: 1795212345000, client_stop_outcome: outcome }, 0);
+    assert.doesNotMatch(html, /watch-history-stop-note|onerror|alert\(1\)/);
+  }
+});
+
+function historyDetailsHarness() {
+  const sandbox = loadWatchHistoryHelpers();
+  const writes = [], focuses = [];
+  let document, controls = [];
+  const close = { isConnected: true, focus() { document.activeElement = close; focuses.push(close); } };
+  const trigger = { isConnected: true, focus() { document.activeElement = trigger; focuses.push(trigger); } };
+  const content = {
+    scrollTop: 0,
+    contains(control) { return controls.includes(control); },
+    querySelectorAll(selector) { return selector === '[data-watch-history-image]' ? controls : []; },
+  };
+  let markup = '';
+  Object.defineProperty(content, 'innerHTML', {
+    get: () => markup,
+    set(value) {
+      writes.push(String(value));
+      controls.forEach(control => { control.isConnected = false; });
+      if (controls.includes(document.activeElement)) document.activeElement = document.body;
+      markup = String(value);
+      controls = [...markup.matchAll(/data-watch-history-image="([^"]+)" data-watch-history-image-alt="([^"]+)"/g)].map(([, image, alt]) => {
+        const control = {
+          isConnected: true, addEventListener() {},
+          getAttribute(name) { return name === 'data-watch-history-image' ? image : alt; },
+          focus() { document.activeElement = control; focuses.push(control); },
+        };
+        return control;
+      });
+    },
+  });
+  const modal = { hidden: true, querySelector() { return close; } };
+  const imageModal = { hidden: true };
+  const elements = { 'watch-history-detail-modal': modal, 'watch-history-detail-content': content, 'watch-history-image-modal': imageModal };
+  document = { activeElement: trigger, getElementById: id => elements[id] || null, body: { classList: { add() {}, remove() {} } } };
+  sandbox.document = document;
+  sandbox.Router = { current: 'watch-history' };
+  return {
+    sandbox, content, modal, close, trigger, writes, focuses, document,
+    controls: () => controls,
+    setItems(history, live = []) {
+      sandbox.historyFixture = history;
+      sandbox.liveFixture = live;
+      vm.runInContext('watchHistoryState.items = historyFixture; watchHistoryState.liveItems = liveFixture;', sandbox);
+    },
+  };
+}
+
+test('a live detail remains open on its historical stop record without stealing focus or fabricating a stop time', () => {
+  const h = historyDetailsHarness();
+  const item = { id: 1, title: 'Active', media_item_id: 7, poster_available: true };
+  h.setItems([item], [item]);
+  h.sandbox.watchHistoryOpenDetails(0, 'live');
+  h.content.scrollTop = 85;
+  const focused = h.document.activeElement;
+  h.setItems([{ ...item, client_stop_requested_at_ms: 1795212345000, client_stop_outcome: 'unconfirmed', stopped_at_ms: 0 }]);
+  h.sandbox.watchHistoryRefreshOpenDetails();
+  assert.equal(h.modal.hidden, false);
+  assert.match(h.content.innerHTML, /客户端已发起停止，源站未确认/);
+  assert.doesNotMatch(h.content.innerHTML, /源站确认停止|源站已确认/);
+  assert.equal(h.document.activeElement, focused);
+  assert.equal(h.content.scrollTop, 85);
+  const writes = h.writes.length;
+  h.sandbox.watchHistoryRefreshOpenDetails();
+  assert.equal(h.writes.length, writes, 'an unchanged snapshot must preserve its DOM');
+});
+
+test('a changing detail restores an equivalent image control and a missing record closes the old detail', () => {
+  const h = historyDetailsHarness();
+  const item = { id: 1, title: 'Old title', media_item_id: 7, poster_available: true };
+  h.setItems([item]);
+  h.sandbox.watchHistoryOpenDetails(0);
+  const oldControl = h.controls()[0];
+  oldControl.focus();
+  h.setItems([{ ...item, title: 'Updated title', client_stop_requested_at_ms: 1795212345000, client_stop_outcome: 'pending' }]);
+  h.sandbox.watchHistoryRefreshOpenDetails();
+  assert.equal(oldControl.isConnected, false);
+  assert.equal(h.document.activeElement, h.controls()[0]);
+  assert.match(h.content.innerHTML, /Updated title/);
+  h.setItems([]);
+  h.sandbox.watchHistoryRefreshOpenDetails();
+  assert.equal(h.modal.hidden, true);
+  assert.equal(h.document.activeElement, h.trigger);
+});
+
+test('stop-only state changes invalidate the visible history card signature', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const item = { id: 1, title: 'Fixed progress', last_seen_at_ms: 1795212345000, position_ticks: 100 };
+  const active = sandbox.watchHistoryItemsRenderSignature([item]);
+  const intent = sandbox.watchHistoryItemsRenderSignature([{ ...item, client_stop_requested_at_ms: 1795212346000, client_stop_outcome: 'pending' }]);
+  const confirmation = sandbox.watchHistoryItemsRenderSignature([{ ...item, client_stop_requested_at_ms: 1795212346000, client_stop_outcome: 'confirmed', stopped_at_ms: 1795212346100 }]);
+  assert.notEqual(active, intent);
+  assert.notEqual(intent, confirmation);
+});
+
 test('watch history details expose bounded TMDB media facts and same-origin gallery URLs', () => {
   const sandbox = loadWatchHistoryHelpers();
   const html = sandbox.watchHistoryDetailsHTML({
@@ -598,6 +749,4 @@ test('watch history async loads are scoped to the active route and generation', 
   assert.match(history, /event\.key === 'Escape'/);
   assert.match(history, /watchHistoryRefreshOpenDetails\(\)/);
   assert.match(history, /watchHistoryDetailItemID/);
-  assert.match(history, /function watchHistoryRefreshOpenDetails\(\)[\s\S]*?if \(!item\) \{[\s\S]*?watchHistoryCloseImageViewer\(\);[\s\S]*?watchHistoryCloseDetails\(\);[\s\S]*?\}[\s\S]*?content\.innerHTML = watchHistoryDetailsHTML\(item\);/s);
-  assert.doesNotMatch(history.match(/function watchHistoryRefreshOpenDetails\(\)[\s\S]*?\n\}/)?.[0] || '', /content\.innerHTML[\s\S]*?watchHistoryCloseImageViewer\(\)/);
 });

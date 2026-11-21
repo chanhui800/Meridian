@@ -44,6 +44,8 @@ esac
 ROOT_GROUP="${MERIDIAN_ROOT_GROUP:-$(id -gn 0 2>/dev/null || printf 'root')}"
 NGINX_MARKER="# Managed by Meridian installer - panel only"
 NGINX_REDACTION_MARKER="# Meridian redacted URI access log"
+NGINX_UPLOAD_START_MARKER="    # Meridian bounded panel uploads"
+NGINX_UPLOAD_END_MARKER="    # End Meridian bounded panel uploads"
 
 while [ "$INSTALL_DIR" != "/" ] && [[ "$INSTALL_DIR" == */ ]]; do INSTALL_DIR="${INSTALL_DIR%/}"; done
 case "$INSTALL_DIR" in
@@ -737,14 +739,14 @@ ensure_dynamic_route_key() {
 
 
 set_panel_env() {
-    local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" env_file tmp_file
+    local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" external_proxy_enabled="$5" env_file tmp_file
     env_file=$(env_file_path) || return 1
     tmp_file="${tmp_dir}/panel.env"
     # $1 is an awk field reference, not a shell variable.
     # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "PANEL_BIND_ADDR" && $1 != "PANEL_DOMAIN" && $1 != "TRUSTED_PROXY_CIDRS" { print }' "$env_file" > "$tmp_file" || return 1
-    printf 'PANEL_BIND_ADDR=%s\nPANEL_DOMAIN=%s\nTRUSTED_PROXY_CIDRS=%s\n' \
-        "$bind_addr" "$domain" "$proxies" >> "$tmp_file" || return 1
+    as_root awk -F= '$1 != "PANEL_BIND_ADDR" && $1 != "PANEL_DOMAIN" && $1 != "TRUSTED_PROXY_CIDRS" && $1 != "PANEL_EXTERNAL_PROXY_ENABLED" { print }' "$env_file" > "$tmp_file" || return 1
+    printf 'PANEL_BIND_ADDR=%s\nPANEL_DOMAIN=%s\nTRUSTED_PROXY_CIDRS=%s\nPANEL_EXTERNAL_PROXY_ENABLED=%s\n' \
+        "$bind_addr" "$domain" "$proxies" "$external_proxy_enabled" >> "$tmp_file" || return 1
     chmod 0600 "$tmp_file" || return 1
     install_env_file "$tmp_file" || return 1
 }
@@ -834,7 +836,7 @@ prepare_data_and_config() {
         dynamic_route_key=$(generate_distinct_secret "$secret" "$upstream_header_key") || return 1
         INITIAL_SETUP_TOKEN=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key") || return 1
         env_tmp="${tmp_dir}/meridian.env"
-        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nTLS_STATE_DIR=\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nEDGE_TLS_CERT_FILE=\nEDGE_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7\n' \
+        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nPANEL_EXTERNAL_PROXY_ENABLED=false\nTLS_STATE_DIR=\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nEDGE_TLS_CERT_FILE=\nEDGE_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7\n' \
             "$secret" "$upstream_header_key" "$dynamic_route_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
         chmod 0600 "$env_tmp" || return 1
         install_env_file "$env_tmp" || return 1
@@ -845,6 +847,8 @@ prepare_data_and_config() {
         append_env_default PANEL_DOMAIN "" "$tmp_dir" || return 1
         append_env_default PANEL_ROUTE_DOMAIN "" "$tmp_dir" || return 1
         append_env_default PANEL_TLS_ENABLED false "$tmp_dir" || return 1
+        # An empty flag keeps compatibility with legacy exact proxy peers.
+        append_env_default PANEL_EXTERNAL_PROXY_ENABLED "" "$tmp_dir" || return 1
         append_env_default TLS_STATE_DIR "" "$tmp_dir" || return 1
         append_env_default PANEL_TLS_CERT_FILE "" "$tmp_dir" || return 1
         append_env_default PANEL_TLS_KEY_FILE "" "$tmp_dir" || return 1
@@ -1318,6 +1322,211 @@ validate_managed_nginx_redaction_components() {
     ' "$NGINX_CONFIG" 2>/dev/null
 }
 
+write_panel_nginx_upload_locations() {
+    local port="$1" connection_variable="${2:-meridian_connection_upgrade}" location body_limit
+    printf '%s\n' "$NGINX_UPLOAD_START_MARKER"
+    # The dollar sign is the literal Nginx regular-expression end anchor.
+    # shellcheck disable=SC2016
+    for location in '= /api/backup/restore' '= /api/site-icon-pack' '= /api/site-icon-packs' \
+        '~ ^/api/site-icon-packs/[0-9]+$'; do
+        body_limit=4160k
+        [ "$location" != '= /api/backup/restore' ] || body_limit=260m
+        cat <<NGINXUPLOAD
+    location ${location} {
+        client_max_body_size ${body_limit};
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$${connection_variable};
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        send_timeout 3600s;
+    }
+
+NGINXUPLOAD
+    done
+    printf '%s\n' "$NGINX_UPLOAD_END_MARKER"
+}
+
+migrate_managed_nginx_upload_limits() {
+    local source="$1" destination="$2" work_dir="$3" port connection_variable canonical
+    # Require the recognizable loopback backend throughout the managed vhost.
+    # A marker alone never authorizes replacing user-defined upstream routes.
+    # The dollar signs in this validator are literal awk/Nginx syntax.
+    # shellcheck disable=SC2016
+    port=$(LC_ALL=C as_root awk '
+        /^[[:space:]]*proxy_pass[[:space:]]/ {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line !~ /^proxy_pass http:\/\/127[.]0[.]0[.]1:[0-9]+;$/) {
+                invalid=1
+                next
+            }
+            sub(/^proxy_pass http:\/\/127[.]0[.]0[.]1:/, "", line)
+            sub(/;$/, "", line)
+            if (line + 0 < 1 || line + 0 > 65535 || (port != "" && port != line)) invalid=1
+            port=line
+        }
+        END {
+            if (invalid || port == "") exit 1
+            print port
+        }
+    ' "$source") || {
+        warn "Nginx 配置含自定义或不一致的代理目标，无法安全迁移上传限额，已原样保留"
+        return 1
+    }
+    # v1.7 used either of these map names. Preserve the active name so adding
+    # upload routes does not introduce an undefined Nginx variable.
+    # shellcheck disable=SC2016
+    connection_variable=$(LC_ALL=C as_root awk '
+        /^[[:space:]]*map[[:space:]]+\$http_upgrade[[:space:]]/ {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line == "map $http_upgrade $meridian_connection_upgrade {") name="meridian_connection_upgrade"
+            else if (line == "map $http_upgrade $connection_upgrade {") name="connection_upgrade"
+            else invalid=1
+            maps++
+        }
+        END {
+            if (invalid || maps != 1 || name == "") exit 1
+            print name
+        }
+    ' "$source") || {
+        warn "Nginx WebSocket 升级映射含自定义或冲突配置，已原样保留"
+        return 1
+    }
+    canonical="${work_dir}/nginx-upload-locations"
+    write_panel_nginx_upload_locations "$port" "$connection_variable" > "$canonical" || return 1
+    # Compare every pre-existing upload block in full before replacing it.
+    # Unknown locations could override these routes through Nginx precedence.
+    # Local controls in location / are not inherited by the upload siblings,
+    # so accept only the original/current template proxy directives there.
+    # Reject modified templates instead of bypassing their access policy.
+    # shellcheck disable=SC2016
+    if ! LC_ALL=C as_root awk -v canonical="$canonical" \
+        -v start_marker="$NGINX_UPLOAD_START_MARKER" -v end_marker="$NGINX_UPLOAD_END_MARKER" \
+        -v port="$port" -v connection_variable="$connection_variable" '
+        function trim(value) {
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        # Nginx accepts several directives on one line and quoted/escaped
+        # tokens. Inspect active words throughout the line instead of trusting
+        # a line-start match; comments and quoted values stay lexical tokens.
+        function contains_nginx_keyword(value, keyword,    offset, character, quote, word) {
+            for (offset=1; offset <= length(value); offset++) {
+                character=substr(value, offset, 1)
+                if (character == "\\") {
+                    if (offset == length(value)) return 1
+                    word=word substr(value, ++offset, 1)
+                } else if (quote != "") {
+                    if (character == quote) quote=""
+                    else word=word character
+                } else if (character == "\"" || character == single_quote) {
+                    quote=character
+                } else if (character == "#" && word == "") {
+                    break
+                } else if (character ~ /[[:space:];{}]/) {
+                    if (word == keyword) return 1
+                    word=""
+                } else word=word character
+            }
+            return word == keyword
+        }
+        function canonical_generic_directive(value) {
+            return value == canonical_pass \
+                || value == "proxy_http_version 1.1;" \
+                || value == "proxy_set_header Host $host;" \
+                || value == "proxy_set_header X-Real-IP $remote_addr;" \
+                || value == "proxy_set_header X-Forwarded-For $remote_addr;" \
+                || value == "proxy_set_header X-Forwarded-Proto $scheme;" \
+                || value == "proxy_set_header Upgrade $http_upgrade;" \
+                || value == canonical_connection \
+                || value == "proxy_buffering off;" \
+                || value == "proxy_request_buffering off;" \
+                || value == "proxy_cache off;" \
+                || value == "proxy_read_timeout 3600s;" \
+                || value == "proxy_send_timeout 3600s;" \
+                || value == "send_timeout 3600s;" \
+                || value == "client_max_body_size 1m;"
+        }
+        BEGIN {
+            single_quote=sprintf("%c", 39)
+            canonical_pass="proxy_pass http://127.0.0.1:" port ";"
+            canonical_connection="proxy_set_header Connection $" connection_variable ";"
+            while ((read_status=(getline line < canonical)) > 0) canonical_block=canonical_block line "\n"
+            close(canonical)
+            if (read_status < 0 || canonical_block == "") invalid=1
+        }
+        {
+            line=trim($0)
+            if (in_generic) {
+                if (line == "}") {
+                    if (generic_passes != 1 || generic_hosts != 1) invalid=1
+                    in_generic=0
+                } else if (line != "" && line !~ /^#/) {
+                    if (!canonical_generic_directive(line) || generic_seen[line]++) invalid=1
+                    if (line == canonical_pass) generic_passes++
+                    if (line == "proxy_set_header Host $host;") generic_hosts++
+                }
+                print
+                next
+            }
+            if (line == trim(start_marker)) {
+                if (in_block || awaiting_location) invalid=1
+                in_block=1
+                block=$0 "\n"
+                next
+            }
+            if (line == trim(end_marker)) {
+                block=block $0 "\n"
+                if (!in_block || block != canonical_block) invalid=1
+                in_block=0
+                awaiting_location=1
+                next
+            }
+            if (in_block) {
+                block=block $0 "\n"
+                next
+            }
+            if (index(line, "Meridian bounded panel uploads")) invalid=1
+            if (awaiting_location && line != "" && line != "location / {") invalid=1
+            # Only Certbot ordinary TLS settings may come from another file.
+            # Unknown includes can hide regex routes whose restrictions would
+            # otherwise be bypassed by the new higher-priority exact routes.
+            if (contains_nginx_keyword(line, "include") \
+                    && line != "include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot") invalid=1
+            if (line ~ /^client_max_body_size[[:space:]]/ && line != "client_max_body_size 1m;") invalid=1
+            if (contains_nginx_keyword(line, "location")) {
+                if (line == "location / {") {
+                    printf "%s", canonical_block
+                    generic_locations++
+                    awaiting_location=0
+                    in_generic=1
+                    generic_passes=0
+                    generic_hosts=0
+                    for (seen_line in generic_seen) delete generic_seen[seen_line]
+                } else if (line != "location = /api/events {") invalid=1
+            }
+            print
+        }
+        END { if (invalid || in_block || in_generic || awaiting_location || generic_locations == 0) exit 1 }
+    ' "$source" > "$destination"; then
+        warn "Nginx 上传路由或限额含自定义、冲突或不完整配置，已原样保留"
+        return 1
+    fi
+}
+
 write_panel_nginx_config() {
     local domain="$1" port="$2" output="$3" log_line
     log_line=$(canonical_nginx_redacted_log_format)
@@ -1362,6 +1571,9 @@ server {
         add_header X-Accel-Buffering no always;
     }
 
+NGINXEOF
+    write_panel_nginx_upload_locations "$port" >> "$output" || return 1
+    cat >> "$output" <<NGINXEOF
     location / {
         proxy_pass http://127.0.0.1:${port};
         proxy_http_version 1.1;
@@ -1382,7 +1594,7 @@ NGINXEOF
 }
 
 migrate_managed_nginx_redaction() {
-    local work_dir backup migrated log_line redaction_state insert_definitions=0 preserve_backup=0
+    local work_dir backup migrated redacted log_line redaction_state insert_definitions=0 preserve_backup=0
     log_line=$(canonical_nginx_redacted_log_format)
     validate_nginx_config_path
     as_root test -e "$NGINX_CONFIG" || return 0
@@ -1451,6 +1663,7 @@ migrate_managed_nginx_redaction() {
     chmod 0700 "$work_dir"
     backup="${work_dir}/nginx.before"
     migrated="${work_dir}/nginx.migrated"
+    redacted="${work_dir}/nginx.redacted"
     # log_line was also used for exact validation above; migration and trust
     # therefore share a single canonical definition.
     # shellcheck disable=SC2016
@@ -1461,6 +1674,7 @@ migrate_managed_nginx_redaction() {
             BEGIN {
                 access_line="access_log /var/log/nginx/meridian_access.log meridian_redacted;"
                 capability_line="large_client_header_buffers 4 32k;"
+                body_line="client_max_body_size 1m;"
             }
             {
                 trimmed=$0
@@ -1468,6 +1682,7 @@ migrate_managed_nginx_redaction() {
                 sub(/[[:space:]]*$/, "", trimmed)
                 if (trimmed == access_line) next
                 if (trimmed == capability_line) next
+                if (trimmed == body_line) next
                 if ($0 == redaction_marker) next
 
                 print
@@ -1489,11 +1704,13 @@ migrate_managed_nginx_redaction() {
                     indent=substr($0, RSTART, RLENGTH) "    "
                     print indent access_line
                     print indent capability_line
+                    print indent body_line
                     servers++
                 }
             }
             END { if (!saw_marker || servers == 0) exit 42 }
-        ' "$NGINX_CONFIG" > "$migrated"; then
+        ' "$NGINX_CONFIG" > "$redacted" \
+        || ! migrate_managed_nginx_upload_limits "$redacted" "$migrated" "$work_dir"; then
         as_root rm -rf -- "$work_dir"
         warn "Nginx 配置不是可识别的 Meridian v1.7 面板模板，已原样保留"
         return 1
@@ -1530,7 +1747,7 @@ migrate_managed_nginx_redaction() {
     fi
 
     as_root rm -rf -- "$work_dir"
-    ok "已将安装器管理的 Nginx 配置迁移为 URI 脱敏日志格式"
+    ok "已更新安装器管理的 Nginx URI 脱敏日志与上传限额"
 }
 
 snapshot_panel_state() {
@@ -1676,7 +1893,7 @@ configure_panel_domain() {
     fi
 
     proxies="127.0.0.1/32,::1/128"
-    if ! set_panel_env "127.0.0.1" "$domain" "$proxies" "$work_dir" \
+    if ! set_panel_env "127.0.0.1" "$domain" "$proxies" "$work_dir" true \
         || ! restart_meridian_and_health; then
         warn "面板切换到回环地址后健康检查失败，正在恢复原配置"
         rollback_panel_transaction
@@ -1711,7 +1928,7 @@ disable_panel_domain() {
         fi
     fi
     proxies=$(remove_loopback_proxies "$(read_env_value TRUSTED_PROXY_CIDRS)")
-    if ! set_panel_env "0.0.0.0" "" "$proxies" "$work_dir" || ! restart_meridian_and_health; then
+    if ! set_panel_env "0.0.0.0" "" "$proxies" "$work_dir" false || ! restart_meridian_and_health; then
         warn "恢复 IP 访问时健康检查失败，正在恢复原配置"
         rollback_panel_transaction
         return 1

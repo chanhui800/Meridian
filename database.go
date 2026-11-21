@@ -44,11 +44,17 @@ type DB struct {
 	agentSecurityMu             sync.Mutex
 	agentSecurityLastLog        map[string]time.Time
 	lastTrafficPruneMS          atomic.Int64
+	trafficTotalsMu             sync.Mutex
+	trafficTotals               *trafficTotalsCacheEntry
+	trafficTotalsEpoch          string
+	trafficTotalsSchema         int64
 	installUUID                 string
 	systemSettings              atomic.Pointer[SystemSettings]
 	nodeTLSMutationMu           sync.Mutex
 	watchHistoryMetadataMu      sync.Mutex
 	watchHistoryMetadata        map[watchHistoryMetadataKey]watchHistoryMetadataEntry
+	watchHistoryStops           *watchHistoryStopState
+	watchHistoryWriteMu         sync.Mutex
 	agentLiveMu                 sync.RWMutex
 	agentLive                   map[nodeLiveTrafficKey]nodeLiveTrafficState
 }
@@ -83,6 +89,7 @@ func openDB(path string) (*DB, error) {
 	d.dynamicObservationQueue = make(chan dynamicObservationCommand, dynamicObservationQueueCapacity+requestLogQueueCapacity+watchHistoryQueueCapacity)
 	d.dynamicObservationDone = make(chan struct{})
 	d.watchHistoryInboxWake = make(chan struct{}, 1)
+	d.watchHistoryStops = newWatchHistoryStopState(d)
 	go d.runDynamicObservationWriter()
 	return d, nil
 }
@@ -117,6 +124,9 @@ func (d *DB) Close() {
 		return
 	}
 	d.dynamicObservationCloseOnce.Do(func() {
+		if d.watchHistoryStops != nil {
+			d.watchHistoryStops.close()
+		}
 		d.agentLiveMu.Lock()
 		d.agentLive = nil
 		d.agentLiveMu.Unlock()

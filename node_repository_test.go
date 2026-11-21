@@ -730,6 +730,11 @@ func TestNodeMetadataEventResponseLimit(t *testing.T) {
 
 func TestControlNodeManualTrafficOffsetAndSiteStats(t *testing.T) {
 	app := newTestApp(t)
+	settings := app.db.currentSystemSettings()
+	settings.LogWriteMetadata = true
+	if err := app.db.saveSystemSettings(settings); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
 	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "stats", Address: "203.0.113.20", ResetDay: 1}, now)
 	if err != nil {

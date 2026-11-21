@@ -7,6 +7,7 @@ let watchHistoryRefreshTimer = 0;
 let watchHistoryKeydownHandler = null;
 let watchHistoryDetailItemID = '';
 let watchHistoryDetailSource = 'history';
+let watchHistoryDetailMarkup = '';
 let watchHistoryDetailPreviousFocus = null;
 let watchHistoryImagePreviousFocus = null;
 let watchHistorySitesCache = [];
@@ -183,6 +184,33 @@ function watchHistoryIdentityLabel(item) {
   return [user, client].filter(Boolean).join(' · ');
 }
 
+function watchHistoryStopTimestamp(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : 0;
+}
+
+function watchHistoryClientStopInfo(item) {
+  const requestedAt = watchHistoryStopTimestamp(item && item.client_stop_requested_at_ms);
+  const stoppedAt = watchHistoryStopTimestamp(item && item.stopped_at_ms);
+  const outcome = item && item.client_stop_outcome;
+  if (outcome === 'confirmed' && stoppedAt) return { state: 'confirmed', label: '源站已确认', requestedAt, stoppedAt };
+  if (requestedAt && (outcome === 'pending' || outcome === 'unconfirmed')) {
+    return { state: outcome, label: '客户端已发起停止，源站未确认', requestedAt, stoppedAt: 0 };
+  }
+  if (requestedAt && outcome === 'denied') return { state: 'denied', label: '源站拒绝停止', requestedAt, stoppedAt: 0 };
+  return { state: 'unknown', label: '未报告', requestedAt, stoppedAt };
+}
+
+function watchHistoryItemIsActive(item) {
+  const stop = watchHistoryClientStopInfo(item);
+  return !!item && !stop.stoppedAt && stop.state !== 'pending' && stop.state !== 'unconfirmed';
+}
+
+function watchHistoryClientStopDetailsHTML(item) {
+  const stop = watchHistoryClientStopInfo(item);
+  const timestamp = (label, value) => `<div><dt>${esc(label)}</dt><dd>${esc(watchHistoryFormatTime(value))}</dd></div>`;
+  return `<div><dt>停止确认</dt><dd>${esc(stop.label)}</dd></div>${stop.requestedAt ? timestamp('客户端停止请求', stop.requestedAt) : ''}${stop.stoppedAt ? timestamp(stop.state === 'confirmed' ? '源站确认停止' : '记录停止时间', stop.stoppedAt) : ''}`;
+}
+
 function watchHistoryCardHTML(item, index, context = {}) {
   const title = String((item && (item.title || item.name)) || '').trim() || '未知媒体';
   const mediaType = String((item && (item.media_type || item.item_type)) || '').toLowerCase();
@@ -198,7 +226,8 @@ function watchHistoryCardHTML(item, index, context = {}) {
   const elapsedLabel = watchHistoryElapsedLabel(item);
   const playCount = Number(item && item.play_count);
   const source = context && context.source === 'live' ? 'live' : 'history';
-  const live = context && context.live === true;
+  const live = context && context.live === true && watchHistoryItemIsActive(item);
+  const clientStop = watchHistoryClientStopInfo(item);
   const imageURLs = live ? watchHistoryLiveCardImageURLs(item) : [watchHistoryCardImageURL(item)].filter(Boolean);
   const posterURL = imageURLs[0] || '';
   const imageFallbacks = imageURLs.slice(1);
@@ -222,6 +251,7 @@ function watchHistoryCardHTML(item, index, context = {}) {
       ${secondary ? `<p class="watch-history-secondary">${esc(secondary)}</p>` : ''}
       <p class="watch-history-site"><span>${esc(siteName)}</span></p>
       ${identity ? `<p class="watch-history-identity">${esc(identity)}</p>` : ''}
+      ${clientStop.state !== 'unknown' ? `<p class="watch-history-stop-note${clientStop.state === 'confirmed' ? ' is-confirmed' : ''}" data-client-stop-outcome="${esc(clientStop.state)}">${esc(clientStop.label)}</p>` : ''}
       ${progress > 0 ? `<div class="history-progress-line"><div class="watch-history-progress" role="progressbar" aria-label="观看进度 ${progressRounded}%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressRounded}"><span style="width:${progress}%"></span></div><span>${progressRounded}%</span>${elapsedLabel ? `<span class="watch-history-progress-time">${esc(elapsedLabel)}</span>` : ''}</div>` : ''}
     </div>
     <div class="history-record-meta"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><time class="watch-history-time" ${isoTime ? `datetime="${isoTime}"` : ''}>${live ? `同步于 ${esc(timeText)}` : esc(timeText)}</time>${Number.isInteger(playCount) && playCount > 1 ? `<span class="history-play-count">播放 ${playCount} 次</span>` : ''}</div>
@@ -337,7 +367,7 @@ function watchHistoryDetailsHTML(item) {
       <div class="watch-history-detail-main">
       <div class="watch-history-detail-heading"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><h2 id="watch-history-detail-title">${esc(title)}</h2></div>
       ${secondary ? `<p class="watch-history-detail-secondary">${esc(secondary)}</p>` : ''}
-      <dl class="watch-history-detail-meta"><div><dt>站点</dt><dd>${esc(siteName)}</dd></div><div><dt>观看时间</dt><dd>${esc(watchHistoryFormatTime(item && (item.last_seen_at_ms || item.started_at_ms)))}</dd></div>${viewerName ? `<div><dt>观看用户</dt><dd>${esc(viewerName)}</dd></div>` : ''}${clientName ? `<div><dt>播放客户端</dt><dd>${esc(clientName)}</dd></div>` : ''}${releaseDate ? `<div><dt>上映时间</dt><dd>${esc(releaseDate)}</dd></div>` : ''}${genres.length ? `<div><dt>影片类型</dt><dd>${esc(genres.join(' · '))}</dd></div>` : ''}${ratingText ? `<div><dt>评分</dt><dd class="watch-history-detail-rating">★ ${esc(ratingText)}</dd></div>` : ''}${episodeInfo ? `<div><dt>集数信息</dt><dd>${esc(episodeInfo)}</dd></div>` : ''}<div><dt>观看进度</dt><dd>${timeProgress ? `${esc(timeProgress)} · ` : ''}${progress}%</dd></div>${playMethod ? `<div><dt>播放方式</dt><dd>${esc(playMethod)}</dd></div>` : ''}</dl>
+      <dl class="watch-history-detail-meta"><div><dt>站点</dt><dd>${esc(siteName)}</dd></div><div><dt>观看时间</dt><dd>${esc(watchHistoryFormatTime(item && (item.last_seen_at_ms || item.started_at_ms)))}</dd></div>${viewerName ? `<div><dt>观看用户</dt><dd>${esc(viewerName)}</dd></div>` : ''}${clientName ? `<div><dt>播放客户端</dt><dd>${esc(clientName)}</dd></div>` : ''}${watchHistoryClientStopDetailsHTML(item)}${releaseDate ? `<div><dt>上映时间</dt><dd>${esc(releaseDate)}</dd></div>` : ''}${genres.length ? `<div><dt>影片类型</dt><dd>${esc(genres.join(' · '))}</dd></div>` : ''}${ratingText ? `<div><dt>评分</dt><dd class="watch-history-detail-rating">★ ${esc(ratingText)}</dd></div>` : ''}${episodeInfo ? `<div><dt>集数信息</dt><dd>${esc(episodeInfo)}</dd></div>` : ''}<div><dt>观看进度</dt><dd>${timeProgress ? `${esc(timeProgress)} · ` : ''}${progress}%</dd></div>${playMethod ? `<div><dt>播放方式</dt><dd>${esc(playMethod)}</dd></div>` : ''}</dl>
       ${updateInfo ? `<section class="watch-history-detail-section watch-history-detail-update"><h3>更新信息</h3><p>${esc(updateInfo)}</p></section>` : ''}
       <section class="watch-history-detail-section"><h3>简介</h3><p>${overview ? esc(overview) : '暂无简介，等待 TMDB 资料补全。'}</p></section>
       <section class="watch-history-detail-section"><h3>演员表</h3>${castHTML}</section>
@@ -361,7 +391,8 @@ function watchHistoryOpenDetails(index, source = 'history') {
   watchHistoryCloseImageViewer();
   watchHistoryDetailItemID = String(item && item.id || '');
   watchHistoryDetailSource = normalizedSource;
-  content.innerHTML = watchHistoryDetailsHTML(item);
+  watchHistoryDetailMarkup = watchHistoryDetailsHTML(item);
+  content.innerHTML = watchHistoryDetailMarkup;
   watchHistoryBindDetailImages(content);
   modal.hidden = false;
   document.body.classList.add('watch-history-dialog-open');
@@ -378,6 +409,7 @@ function watchHistoryCloseDetails() {
   document.body.classList.remove('watch-history-dialog-open');
   watchHistoryDetailItemID = '';
   watchHistoryDetailSource = 'history';
+  watchHistoryDetailMarkup = '';
   if (wasOpen && typeof Router !== 'undefined' && Router.current === 'watch-history' && watchHistoryDetailPreviousFocus?.isConnected) {
     watchHistoryDetailPreviousFocus.focus({ preventScroll: true });
   }
@@ -437,14 +469,35 @@ function watchHistoryRefreshOpenDetails() {
   const modal = document.getElementById('watch-history-detail-modal');
   const content = document.getElementById('watch-history-detail-content');
   if (!modal || modal.hidden || !content || !watchHistoryDetailItemID) return;
-  const item = watchHistoryItemsForSource(watchHistoryDetailSource).find(candidate => String(candidate && candidate.id || '') === watchHistoryDetailItemID);
+  let item = watchHistoryItemsForSource(watchHistoryDetailSource).find(candidate => String(candidate && candidate.id || '') === watchHistoryDetailItemID);
+  if (!item && watchHistoryDetailSource === 'live') {
+    item = watchHistoryState.items.find(candidate => String(candidate && candidate.id || '') === watchHistoryDetailItemID);
+    if (item) watchHistoryDetailSource = 'history';
+  }
   if (!item) {
     watchHistoryCloseImageViewer();
     watchHistoryCloseDetails();
     return;
   }
-  content.innerHTML = watchHistoryDetailsHTML(item);
+  const markup = watchHistoryDetailsHTML(item);
+  if (markup === watchHistoryDetailMarkup) return;
+  watchHistoryDetailMarkup = markup;
+  watchHistoryReplaceDetailContent(content, markup);
+}
+
+function watchHistoryReplaceDetailContent(content, markup) {
+  const focused = document.activeElement;
+  const focusedImage = content.contains?.(focused) ? focused?.getAttribute?.('data-watch-history-image') : '';
+  const focusedAlt = focusedImage ? focused.getAttribute('data-watch-history-image-alt') : '';
+  const scrollTop = content.scrollTop;
+  content.innerHTML = markup;
   watchHistoryBindDetailImages(content);
+  if (typeof scrollTop === 'number') content.scrollTop = scrollTop;
+  if (focusedImage) {
+    const replacement = Array.from(content.querySelectorAll('[data-watch-history-image]')).find(control => control.getAttribute('data-watch-history-image') === focusedImage && control.getAttribute('data-watch-history-image-alt') === focusedAlt);
+    const fallback = content.closest?.('[role="dialog"], .modal')?.querySelector('[data-watch-history-close], .modal-close');
+    (replacement || fallback)?.focus({ preventScroll: true });
+  }
 }
 
 function watchHistoryBindDetailImages(root) {
@@ -716,6 +769,7 @@ function watchHistoryItemsRenderSignature(items, context = '') {
     item && item.last_seen_at_ms, item && item.position_ticks, item && item.runtime_ticks,
     item && item.completed, item && item.poster_path, item && item.backdrop_path,
     item && item.match_status, item && item.user_name, item && item.client_name,
+    item && item.stopped_at_ms, item && item.client_stop_requested_at_ms, item && item.client_stop_outcome,
   ])]);
 }
 
@@ -725,7 +779,8 @@ function watchHistoryRenderLive() {
   const count = document.getElementById('watch-history-live-count');
   const description = document.getElementById('watch-history-live-description');
   if (!section || !grid || !count || !description) return;
-  const items = Array.isArray(watchHistoryState.liveItems) ? watchHistoryState.liveItems : [];
+  const items = Array.isArray(watchHistoryState.liveItems) ? watchHistoryState.liveItems.filter(watchHistoryItemIsActive) : [];
+  watchHistoryState.liveItems = items;
   count.textContent = String(items.length);
   if (watchHistoryState.liveLoadError) {
     section.hidden = false;
@@ -909,7 +964,7 @@ async function loadWatchHistory(reset, options = {}) {
     watchHistoryState.tmdbInvalid = tmdbResult.invalid === true;
     watchHistoryState.tmdbLoadError = tmdbResult.error;
     watchHistoryState.liveLoadError = liveResult.error;
-    if (liveResult.response) watchHistoryState.liveItems = watchHistoryNormalizeItems(liveResult.response);
+    if (liveResult.response) watchHistoryState.liveItems = watchHistoryNormalizeItems(liveResult.response).filter(watchHistoryItemIsActive);
     watchHistoryState.loading = false;
     watchHistoryRenderLive();
     watchHistoryRenderItems();

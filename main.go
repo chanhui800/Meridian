@@ -179,6 +179,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid trusted proxy configuration: %v", err)
 	}
+	panelExternalProxyEnabled, err := parsePanelExternalProxyEnabled(os.Getenv("PANEL_EXTERNAL_PROXY_ENABLED"), trustedProxies)
+	if err != nil {
+		log.Fatalf("invalid panel external proxy configuration: %v", err)
+	}
+	panelBindLoopback := panelBindIP != nil && panelBindIP.IsLoopback()
 	clientIPRegions, err := newClientIPRegionResolver(os.Getenv("CLIENT_IP_REGION_ENDPOINT"), nil)
 	if err != nil {
 		log.Fatalf("invalid client IP region configuration: %v", err)
@@ -199,7 +204,7 @@ func main() {
 		}
 	}
 	pm.SetTrustedProxies(trustedProxies)
-	pm.SetHostOnlyIngressSafe(panelTLSEnabled || (panelBindIP != nil && panelBindIP.IsLoopback()) || len(trustedProxies) > 0)
+	pm.SetHostOnlyIngressSafe(hostOnlyIngressAvailable(panelBindLoopback, panelTLSEnabled, panelExternalProxyEnabled, trustedProxies))
 	if err := pm.ConfigureDynamicDiscovery(dynamicRouteKey, panelHost, port, nil); err != nil {
 		log.Fatalf("initialize dynamic discovery: %v", err)
 	}
@@ -250,11 +255,13 @@ func main() {
 		routeDomain:       routeDomain,
 		panelTLSEnabled:   panelTLSEnabled,
 		panelCertificates: panelCertificates,
-		panelBindLoopback: panelBindIP != nil && panelBindIP.IsLoopback(),
+		panelBindLoopback: panelBindLoopback,
 		panelListenPort:   port,
 		dynamicRouteKey:   dynamicRouteKey,
 		restartCh:         make(chan struct{}),
 		tmdb:              tmdb,
+
+		panelExternalProxyEnabled: panelExternalProxyEnabled,
 	}
 	app.certificateWorker = newCertificateWorker(ctx, db, panelCertificates)
 	defer app.certificateWorker.close()

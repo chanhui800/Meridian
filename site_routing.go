@@ -88,6 +88,30 @@ func sameRedirectAuthority(from, to *url.URL) bool {
 	return redirectHostKey(from) == redirectHostKey(to)
 }
 
+// sameConfiguredUpstreamURL compares complete configured routes, rather than
+// their authority or failover health key. Query bytes and escaped paths can
+// select a different playback backend even when the decoded path is identical.
+// One trailing base slash is immaterial when joinURLPath appends a request.
+func sameConfiguredUpstreamURL(first, second *url.URL) bool {
+	if first == nil || second == nil || first.User != nil || second.User != nil ||
+		first.Opaque != "" || second.Opaque != "" || first.Fragment != "" || second.Fragment != "" {
+		return false
+	}
+	authority := redirectHostKey(first)
+	return authority != "" && authority == redirectHostKey(second) &&
+		strings.TrimSuffix(first.EscapedPath(), "/") == strings.TrimSuffix(second.EscapedPath(), "/") &&
+		first.RawQuery == second.RawQuery && first.ForceQuery == second.ForceQuery
+}
+
+func configuredUpstreamPathMatches(upstream, target *url.URL) bool {
+	if upstream == nil || target == nil || !sameRedirectAuthority(upstream, target) {
+		return false
+	}
+	basePath := strings.TrimSuffix(upstream.EscapedPath(), "/")
+	targetPath := target.EscapedPath()
+	return basePath == "" || targetPath == basePath || strings.HasPrefix(targetPath, basePath+"/")
+}
+
 func singleJoiningSlash(a, b string) string {
 	aSlash := strings.HasSuffix(a, "/")
 	bSlash := strings.HasPrefix(b, "/")

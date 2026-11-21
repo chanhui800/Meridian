@@ -657,13 +657,18 @@ func TestEdgeEventSpoolUsesIndependentKeyAcrossReenrollment(t *testing.T) {
 	if err := first.initWithRawKey(dir, key, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.add(NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: "GET", Path: "/Sessions/Playing", StatusCode: 200, RecordedAtMS: time.Now().UnixMilli()}); err != nil {
+	t.Cleanup(func() { _ = first.close() })
+	if err := first.add(NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: "GET", Path: "/Sessions/Playing", Priority: nodeEventPriorityCritical, StatusCode: 200, RecordedAtMS: time.Now().UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.close(); err != nil {
 		t.Fatal(err)
 	}
 	var restored edgeEventStore
 	if err := restored.initWithRawKey(dir, key, nil); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = restored.close() })
 	if len(restored.snapshot()) != 1 {
 		t.Fatal("event spool did not survive an agent token change")
 	}
@@ -703,6 +708,7 @@ func TestEdgeObserverMarksReplayEventsCritical(t *testing.T) {
 	if err := runtime.events.initWithRawKey(dir, key, nil); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = runtime.close() })
 	handler := runtime.observe(map[string]int64{"media.example.test": 7}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNoContent)
@@ -727,6 +733,7 @@ func TestEdgeObserverDoesNotReplayStructuredPlaybackSync(t *testing.T) {
 	if err := runtime.events.initWithRawKey(dir, key, nil); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = runtime.events.close() })
 	runtime.structuredPlaybackEvents.Store(true)
 	const body = `{"ItemId":"item-1","PlaySessionId":"session-1"}`
 	var upstreamBody string
@@ -867,6 +874,7 @@ func TestEdgeEventSpoolCorruptionCanBeQuarantined(t *testing.T) {
 	if err := store.initWithRawKey(spoolDir, key, nil); err != nil {
 		t.Fatalf("reinitialize after quarantine: %v", err)
 	}
+	t.Cleanup(func() { _ = store.close() })
 }
 
 func TestBuildNodeInstallCommandUsesControllerInstaller(t *testing.T) {

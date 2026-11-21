@@ -122,11 +122,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		writeWebSocketGatewayError(clientConn)
 		return
 	}
-	defer resp.Body.Close()
-	if err := upstreamConn.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("[WS] clear handshake read deadline: %v", err)
-		return
-	}
 	if resp.StatusCode != http.StatusSwitchingProtocols ||
 		!strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
 		!headerHasToken(resp.Header, "Connection", "upgrade") {
@@ -135,6 +130,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		// unmetered, unthrottled transfer channel.
 		log.Printf("[WS] upstream refused upgrade: status %d", resp.StatusCode)
 		writeWebSocketGatewayError(clientConn)
+		return
+	}
+	// The raw connection owns the response stream. Closing it directly avoids
+	// draining an ordinary HTTP body when an upstream declines the upgrade.
+	if err := upstreamConn.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("[WS] clear handshake read deadline: %v", err)
 		return
 	}
 	stripPanelSessionSetCookies(resp.Header)

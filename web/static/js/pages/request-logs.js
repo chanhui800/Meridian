@@ -7,9 +7,11 @@ let requestLogLoading = false;
 let requestLogReloadQueued = false;
 let requestLogLatestID = 0;
 let requestLogLatestCursor = '';
+let requestLogAppliedFilters = '';
 let requestLogDisplaySettings = { node: true, category: true, status: true, client_ip: true, ua: true, upstream_ua: true, backend_address: true, timeline: true };
 let requestLogLastDisplaySettings = null;
 let requestLogEntries = new Map();
+let requestLogDetailEntry = null;
 const requestLogUAWidthStorageKey = 'meridian-request-log-ua-width';
 
 function requestLogDateOnlyValue(value) {
@@ -88,6 +90,7 @@ function requestLogApplyDisplaySettings(settings) {
   document.querySelectorAll('[data-log-field="upstream-ua"]').forEach(node => { node.hidden = !requestLogDisplaySettings.upstream_ua; });
   document.querySelectorAll('[data-log-field="backend-address"]').forEach(node => { node.hidden = !requestLogDisplaySettings.backend_address; });
   document.querySelectorAll('[data-log-field="timeline"]').forEach(node => { node.hidden = !requestLogDisplaySettings.timeline; });
+  requestLogRefreshOpenDetails();
 }
 
 function requestLogDateInputValue(date) {
@@ -142,11 +145,129 @@ function requestLogStatusClass(status) {
   return 'request-log-status-server';
 }
 
+function requestLogHasDiagnostics(entry) {
+  return Number(entry?.diagnostics_version) === 1;
+}
+
+function requestLogDiagnosticEnum(value, labels) {
+  return Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : '未报告';
+}
+
+function requestLogTerminationLabel(value) {
+  return requestLogDiagnosticEnum(value, {
+    completed: '已完成', client_canceled: '客户端已取消', client_deadline: '客户端超时',
+    upstream_error: '上游处理失败', downstream_error: '正文写入失败',
+    proxy_aborted: '传输中断', site_stopping: '站点停止',
+  });
+}
+
+function requestLogStatusLabel(entry) {
+  const status = Number(entry.status_code || 0);
+  const actual = Number(entry.response_status_code || 0);
+  if (requestLogHasDiagnostics(entry) && status && actual >= 100 && actual <= 599 && actual !== status) {
+    if (entry.termination_reason === 'client_canceled') return `${actual}·已取消`;
+    if (entry.termination_reason === 'client_deadline') return `${actual}·已超时`;
+    return `${actual}·${status}`;
+  }
+  return String(status || '—');
+}
+
+function requestLogDiagnosticMilliseconds(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 604800000 ? `${value} ms` : '未报告';
+}
+
+function requestLogDiagnosticBytes(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toLocaleString('zh-CN')} B` : '未报告';
+}
+
+function requestLogDiagnosticCount(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? `${value} 次` : '未报告';
+}
+
+function requestLogConnectionLabel(value) {
+  return requestLogDiagnosticEnum(value, { new: '新建连接', reused: '复用连接', mixed: '新建与复用均有' });
+}
+
+function requestLogDiagnosticAuthority(value) {
+  return typeof value === 'string' && value.length <= 1024 && /^https?:\/\/[^/?#@\s"'<>\\]+$/i.test(value)
+    ? value : '未报告';
+}
+
+function requestLogOriginProcessHTML(entry) {
+  const settings = requestLogDisplaySettings;
+  if (!settings.backend_address && !settings.timeline && !settings.status && !settings.category) return '';
+  if (!requestLogHasDiagnostics(entry)) {
+    return '<section class="management-log-origin"><h4>回源过程</h4><p class="management-log-origin-empty">未报告（旧 Agent 或历史记录）</p></section>';
+  }
+  const summary = settings.backend_address ? `<dl class="management-log-origin-summary"><div><dt>跳转次数</dt><dd>${esc(requestLogDiagnosticCount(entry.redirect_count))}</dd></div><div><dt>重试次数</dt><dd>${esc(requestLogDiagnosticCount(entry.retry_count))}</dd></div><div><dt>最后连接</dt><dd>${esc(requestLogConnectionLabel(entry.final_connection_state))}</dd></div></dl>` : '';
+  const reported = Array.isArray(entry.upstream_attempts) ? entry.upstream_attempts.filter(attempt => attempt && typeof attempt === 'object' && !Array.isArray(attempt)) : [];
+  const attempts = reported.length > 8 ? reported.slice(0, 7).concat(reported.at(-1)) : reported;
+  let previousIndex = 0;
+  const steps = attempts.map(attempt => {
+    const index = typeof attempt.attempt_index === 'number' && Number.isSafeInteger(attempt.attempt_index) && attempt.attempt_index > 0 ? attempt.attempt_index : 0;
+    const gap = index && previousIndex && index > previousIndex + 1 ? `<li class="management-log-origin-gap">${settings.backend_address ? `中间 ${esc(index - previousIndex - 1)} 次回源未展开` : '部分回源步骤未展开'}</li>` : '';
+    previousIndex = index;
+    const role = settings.category ? `<span class="management-log-origin-role">${esc(requestLogDiagnosticEnum(attempt.source_role, { configured: '配置上游', dynamic: '动态回源' }))}</span>` : '';
+    const status = typeof attempt.response_status_code === 'number' && Number.isInteger(attempt.response_status_code) && attempt.response_status_code >= 100 && attempt.response_status_code <= 599 ? String(attempt.response_status_code) : '未报告';
+    const outcome = requestLogDiagnosticEnum(attempt.outcome, { response: '已收到响应', error: '回源失败', canceled: '已取消', deadline: '回源超时' });
+    const result = settings.status ? `<span class="management-log-origin-result">响应 ${esc(status)} · ${esc(outcome)}</span>` : '';
+    const duration = settings.timeline ? `<span class="management-log-origin-duration">回源耗时 ${esc(requestLogDiagnosticMilliseconds(attempt.duration_ms))}</span>` : '';
+    const address = settings.backend_address ? `<div class="management-log-origin-address"><span>${esc(requestLogDiagnosticAuthority(attempt.authority))}</span><small>${esc(requestLogConnectionLabel(attempt.connection_state))}</small></div>` : '';
+    const stages = settings.timeline ? [
+      ['请求内起点', attempt.started_ms], ['首个响应字节', attempt.first_byte_ms], ['最终响应头', attempt.response_headers_ms],
+      ...(settings.backend_address ? [['DNS', attempt.dns_duration_ms], ['TCP', attempt.tcp_duration_ms], ['TLS', attempt.tls_duration_ms]] : []),
+    ] : [];
+    return `${gap}<li class="management-log-origin-step"${index ? ` value="${esc(index)}"` : ''}><div class="management-log-origin-step-heading"><strong>${index ? `第 ${esc(index)} 次回源` : '回源次序未报告'}</strong>${role}${result}${duration}</div>${address}${stages.length ? `<dl class="management-log-origin-stages">${stages.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(requestLogDiagnosticMilliseconds(value))}</dd></div>`).join('')}</dl>` : ''}</li>`;
+  }).join('');
+  const note = settings.timeline && attempts.length ? '<p class="management-log-origin-note">起点相对请求接入；首个响应字节与最终响应头相对本次回源。回源耗时截至响应头或失败返回。首个响应字节可能是信息响应，正文写入时间属于代理侧记录。</p>' : '';
+  return `<section class="management-log-origin"><h4>回源过程</h4>${summary}${attempts.length ? `<ol class="management-log-origin-steps">${steps}</ol>` : '<p class="management-log-origin-empty">逐次回源未报告</p>'}${note}</section>`;
+}
+
+function requestLogCacheReasonLabel(value) {
+  return requestLogDiagnosticEnum(value, {
+    disabled: '缓存已关闭', method: '请求方法不适用', rule_no_match: '未匹配规则', range: 'Range 请求',
+    dynamic: '动态回源', head_no_fill: 'HEAD 请求不填充', response_status: '响应状态不适用',
+    set_cookie: '响应携带 Cookie', no_store: '禁止存储', no_cache: '需要重新验证', private: '私有响应',
+    vary: '存在未支持的响应变体', mime: '响应类型不适用', too_large: '超过大小限制', empty_body: '正文为空',
+    permission: '缓存权限不足', no_space: '缓存空间不足', readonly: '缓存目录只读', io: '读取或写入失败',
+    expired: '缓存已过期', invalid_entry: '缓存记录无效', evicted: '已按容量限制淘汰',
+    canceled: '请求已取消', incomplete: '正文未完整读取', length_mismatch: '正文长度不符', generation_changed: '缓存配置已更新',
+  });
+}
+
+function requestLogDiagnosticFields(entry) {
+  const settings = requestLogDisplaySettings;
+  if (!requestLogHasDiagnostics(entry)) return [['诊断信息', '未报告（旧 Agent 或历史记录）', settings.status || settings.timeline || settings.category || settings.backend_address]];
+  const actual = Number(entry.response_status_code || 0);
+  return [
+    ['实际响应状态', actual >= 100 && actual <= 599 ? actual : '未报告', settings.status],
+    ['结束原因', requestLogTerminationLabel(entry.termination_reason), settings.status],
+    ['请求总耗时', requestLogDiagnosticMilliseconds(entry.duration_ms), settings.timeline],
+    ['末次上游首字节', requestLogDiagnosticMilliseconds(entry.upstream_first_byte_ms), settings.timeline],
+    ['首个正文写入', requestLogDiagnosticMilliseconds(entry.body_first_byte_ms), settings.timeline],
+    ['正文已写入', requestLogDiagnosticBytes(entry.body_bytes_written), settings.timeline],
+    ['Range 请求', requestLogDiagnosticEnum(String(entry.range_mode), { 1: '无 Range', 2: '有 Range' }), settings.category],
+    ['连接使用', requestLogConnectionLabel(entry.connection_state), settings.backend_address],
+    ['DNS 等待累计', requestLogDiagnosticMilliseconds(entry.dns_duration_ms), settings.timeline && settings.backend_address],
+    ['TCP 连接累计', requestLogDiagnosticMilliseconds(entry.tcp_duration_ms), settings.timeline && settings.backend_address],
+    ['TLS 握手累计', requestLogDiagnosticMilliseconds(entry.tls_duration_ms), settings.timeline && settings.backend_address],
+    ['缓存查找', requestLogDiagnosticEnum(entry.cache_lookup, { disabled: '已关闭', bypass: '已绕过', hit: '命中', miss: '未命中', read_error: '读取失败' }), settings.category],
+    ['查找原因', requestLogCacheReasonLabel(entry.cache_lookup_reason || entry.cache_reason), settings.category],
+    ['缓存写入', requestLogDiagnosticEnum(entry.cache_write, { not_attempted: '未尝试', stored: '已存储', skipped: '已跳过', write_error: '写入失败' }), settings.category],
+    ['写入原因', requestLogCacheReasonLabel(entry.cache_write_reason), settings.category],
+    ['响应内容类型', requestLogDiagnosticEnum(entry.response_type, {
+      json: 'JSON', manifest: '播放清单', subtitle: '字幕', image: '图片', video: '视频', audio: '音频', font: '字体',
+      script: '脚本', style: '样式', html: 'HTML', text: '文本', binary: '二进制', other: '其他',
+    }), settings.category],
+  ];
+}
+
 function renderRequestLogs() {
   const page = document.getElementById('page-request-logs');
   requestLogApplyUAWidth();
   requestLogLatestID = 0;
   requestLogLatestCursor = '';
+  requestLogAppliedFilters = '';
   requestLogEntries = new Map();
   const today = Date.now();
   const yesterday = today - 24 * 60 * 60 * 1000;
@@ -268,6 +389,7 @@ function stopRequestLogRefresh() {
     requestLogSearchTimer = null;
   }
   requestLogReloadQueued = false;
+  requestLogDetailEntry = null;
 }
 
 function setRequestLogActivePill(containerId, activeButton) {
@@ -289,6 +411,7 @@ async function loadRequestLogs(options = {}) {
   if (!body) return;
   if (requestLogLoading) {
     requestLogReloadQueued = true;
+    if (options.incremental !== true) requestLogLoadGeneration += 1;
     return;
   }
   requestLogReloadQueued = false;
@@ -299,13 +422,20 @@ async function loadRequestLogs(options = {}) {
     Toast.error('请选择有效的日志日期范围');
     return;
   }
-  const incremental = options.incremental === true && requestLogLatestID > 0;
-  if (!incremental) requestLogLatestID = 0;
+  const category = requestLogCategoryFilter;
+  const status = requestLogStatusFilter;
+  const query = document.getElementById('request-log-search').value.trim();
+  const filterKey = JSON.stringify([from, to, category, status, query]);
+  const incremental = options.incremental === true && requestLogLatestID > 0 && requestLogAppliedFilters === filterKey;
+  if (!incremental) {
+    requestLogLatestID = 0;
+    requestLogLatestCursor = '';
+  }
+  const filtersUnchanged = () => from === document.getElementById('request-log-from')?.value
+    && to === document.getElementById('request-log-to')?.value
+    && category === requestLogCategoryFilter && status === requestLogStatusFilter
+    && query === document.getElementById('request-log-search')?.value.trim();
   const generation = ++requestLogLoadGeneration;
-  const scroller = document.scrollingElement || body.closest('.request-log-table-scroll');
-  const previousScrollTop = scroller ? scroller.scrollTop : 0;
-  const previousScrollHeight = scroller ? scroller.scrollHeight : 0;
-  const preserveViewport = previousScrollTop > 0;
   requestLogLoading = true;
   if (options.showLoading === true && !body.querySelector('tr[data-log-id]')) {
     body.innerHTML = '<tr><td colspan="9" class="request-log-empty">正在加载…</td></tr>';
@@ -313,13 +443,19 @@ async function loadRequestLogs(options = {}) {
   try {
     const response = await API.getRequestLogs({
       ...range,
-      category: requestLogCategoryFilter,
-      status: requestLogStatusFilter,
-      q: document.getElementById('request-log-search').value.trim(),
-      limit: incremental ? 100 : 500,
+      category,
+      status,
+      q: query,
+      // DESC polling must cover the entire retained window before advancing
+      // to its newest cursor, including bursts larger than the old 100-row page.
+      limit: 500,
       ...(incremental ? (requestLogLatestCursor ? { after_cursor: requestLogLatestCursor } : { after_id: requestLogLatestID }) : {}),
     });
     if (generation !== requestLogLoadGeneration || Router.current !== 'request-logs' || !response) return;
+    if (!filtersUnchanged()) {
+      requestLogReloadQueued = true;
+      return;
+    }
     const incoming = response.logs || [];
     if (incremental) {
       if (incoming.length) {
@@ -333,6 +469,7 @@ async function loadRequestLogs(options = {}) {
       }
     } else {
       renderRequestLogRows(incoming);
+      requestLogAppliedFilters = filterKey;
     }
     for (const entry of incoming) requestLogLatestID = Math.max(requestLogLatestID, Number(entry.id || 0));
     const newest = incoming[0];
@@ -340,17 +477,17 @@ async function loadRequestLogs(options = {}) {
     if (newestCursorAt > 0 && Number(newest?.id || 0) > 0) {
       requestLogLatestCursor = btoa(`${newestCursorAt}:${Number(newest.id)}`).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
-    if (scroller && preserveViewport) {
-      const addedHeight = Math.max(0, scroller.scrollHeight - previousScrollHeight);
-      scroller.scrollTop = previousScrollTop + addedHeight;
-    }
     const dropped = Number(response.dropped_logs || 0);
     const visibleCount = body.querySelectorAll('tr[data-log-id]').length;
     document.getElementById('request-log-summary').textContent = dropped > 0
       ? `显示 ${visibleCount} 条，繁忙时已丢弃 ${dropped} 条`
       : `显示 ${visibleCount} 条（最多 500 条）`;
   } catch (error) {
-    if (generation !== requestLogLoadGeneration) return;
+    if (generation !== requestLogLoadGeneration || Router.current !== 'request-logs') return;
+    if (!filtersUnchanged()) {
+      requestLogReloadQueued = true;
+      return;
+    }
     if (!body.querySelector('tr[data-log-id]')) {
       body.innerHTML = '<tr><td colspan="9" class="request-log-empty request-log-error">日志读取失败</td></tr>';
     }
@@ -384,15 +521,16 @@ function renderRequestLogRows(logs) {
 function requestLogRowHTML(entry) {
     if (Number(entry.id) > 0) requestLogEntries.set(Number(entry.id), entry);
     const status = Number(entry.status_code || 0);
+    const statusLabel = requestLogStatusLabel(entry);
     const recordedAtMS = Number(entry.recorded_at_ms || 0);
     const exactTime = recordedAtMS ? requestLogFormatDateTime(recordedAtMS) : '未写入时间线';
     const requestTitle = `${String(entry.method || 'GET')} ${String(entry.path || '/')}`;
     return `
       <tr data-log-id="${esc(entry.id || '')}" title="${esc(requestTitle)}">
-        <td data-log-field="site"><button type="button" class="management-log-open" data-log-detail-id="${esc(entry.id || '')}" aria-label="查看 ${esc(entry.site_name || '站点')} 请求详情"><strong>${esc(entry.site_name || '—')}</strong><span class="management-log-path">${esc(requestTitle)}</span></button></td>
+        <td data-log-field="site"><button type="button" class="management-log-open" data-log-detail-id="${esc(entry.id || '')}" aria-label="查看 ${esc(entry.site_name || '站点')} 请求详情${requestLogDisplaySettings.status ? ` · ${esc(statusLabel)}` : ''}"><strong>${esc(entry.site_name || '—')}</strong><span class="management-log-path">${esc(requestTitle)}</span></button></td>
         <td data-log-field="node"><span class="request-log-node">${esc(entry.final_node || '—')}</span></td>
         <td data-log-field="category"><span class="request-log-category">${esc(requestLogCategoryLabel(entry.resource_category))}</span></td>
-        <td data-log-field="status"><span class="request-log-status ${requestLogStatusClass(status)}">${status || '—'}</span></td>
+        <td data-log-field="status"><span class="request-log-status ${requestLogStatusClass(status)}" title="${esc(statusLabel)}">${esc(statusLabel)}</span></td>
         <td data-log-field="ip"><span class="request-log-ip mono">${esc(entry.client_ip || '—')}</span><small class="request-log-region">${esc(entry.client_region || '')}</small></td>
         <td data-log-field="ua"><span class="request-log-ua">${esc(entry.user_agent || '—')}</span></td>
         <td data-log-field="upstream-ua"><span class="request-log-ua">${esc(entry.upstream_user_agent || '—')}</span></td>
@@ -402,21 +540,40 @@ function requestLogRowHTML(entry) {
     `;
 }
 
-function showRequestLogDetails(entry) {
+function requestLogDetailsHTML(entry) {
   const time = Number(entry.recorded_at_ms || 0);
   const fields = [
     ['站点', entry.site_name], ['请求', `${entry.method || 'GET'} ${entry.path || '/'}`],
     ['节点', entry.final_node, requestLogDisplaySettings.node],
     ['资源类型', requestLogCategoryLabel(entry.resource_category), requestLogDisplaySettings.category],
-    ['响应状态', entry.status_code, requestLogDisplaySettings.status],
+    ['日志状态', entry.status_code, requestLogDisplaySettings.status],
     ['记录时间', time ? requestLogFormatDateTime(time) : '未写入时间线', requestLogDisplaySettings.timeline],
     ['客户端 IP', `${entry.client_ip || '—'}${entry.client_region ? ` · ${entry.client_region}` : ''}`, requestLogDisplaySettings.client_ip],
     ['客户端 UA', entry.user_agent, requestLogDisplaySettings.ua],
     ['上游 UA', entry.upstream_user_agent, requestLogDisplaySettings.upstream_ua],
     ['后端地址', entry.backend_address, requestLogDisplaySettings.backend_address],
   ].filter(([, , visible]) => visible !== false);
+  const diagnostics = requestLogDiagnosticFields(entry).filter(([, , visible]) => visible !== false);
+  const timingNote = requestLogHasDiagnostics(entry) && requestLogDisplaySettings.timeline
+    ? `<p class="management-footnote">请求总耗时、末次上游首字节与首个正文写入从请求接入起计算${requestLogDisplaySettings.backend_address ? '；DNS、TCP、TLS 为整条请求的累计耗时' : ''}。未观测到的阶段显示“未报告”。</p>` : '';
+  const fieldHTML = values => values.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value == null || value === '' ? '—' : value)}</dd></div>`).join('');
+  return `<dl class="management-log-detail">${fieldHTML(fields)}</dl>${requestLogOriginProcessHTML(entry)}${diagnostics.length ? `<section class="management-log-diagnostics"><h4>请求与缓存</h4><dl class="management-log-detail is-diagnostics">${fieldHTML(diagnostics)}</dl>${timingNote}</section>` : ''}`;
+}
+
+function requestLogRefreshOpenDetails() {
+  if (!requestLogDetailEntry) return;
+  const modal = document.getElementById('modal');
+  const overlay = document.getElementById('modal-overlay');
+  if (!modal?.classList?.contains('management-log-modal') || !overlay?.classList?.contains('active')) return;
+  if (typeof Router !== 'undefined' && Router.current !== 'request-logs') return;
+  const body = document.getElementById('modal-body');
+  if (body) body.innerHTML = requestLogDetailsHTML(requestLogDetailEntry);
+}
+
+function showRequestLogDetails(entry) {
+  requestLogDetailEntry = entry;
   document.getElementById('modal-title').textContent = '请求详情';
-  document.getElementById('modal-body').innerHTML = `<dl class="management-log-detail">${fields.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value == null || value === '' ? '—' : value)}</dd></div>`).join('')}</dl>`;
+  document.getElementById('modal-body').innerHTML = requestLogDetailsHTML(entry);
   document.getElementById('modal-footer').innerHTML = '<button type="button" class="console-button" id="request-log-detail-close">关闭</button>';
   openModal({ closeOnBackdrop: true, modalClass: 'management-log-modal' });
   document.getElementById('request-log-detail-close').onclick = closeModal;

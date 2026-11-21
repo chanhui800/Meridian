@@ -1300,8 +1300,17 @@ func TestReviewEventSpoolEncryptsAndReportsPersistenceFailure(t *testing.T) {
 	if err := store.initWithKey(dir, []byte("agent-token")); err != nil {
 		t.Fatal(err)
 	}
-	event := NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: http.MethodGet, Path: "/api", StatusCode: 200, Authorization: "Bearer secret", RecordedAtMS: time.Now().UnixMilli()}
+	t.Cleanup(func() {
+		store.journal.ioMu.Lock()
+		store.journal.syncFile = nil
+		store.journal.ioMu.Unlock()
+		_ = store.close()
+	})
+	event := NodeRequestEvent{SiteID: 1, Host: "media.example.test", Method: http.MethodGet, Path: "/api", Priority: nodeEventPriorityCritical, StatusCode: 200, Authorization: "Bearer secret", RecordedAtMS: time.Now().UnixMilli()}
 	if err := store.add(event); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.exportLegacy(); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "events.json"))
@@ -1318,14 +1327,12 @@ func TestReviewEventSpoolEncryptsAndReportsPersistenceFailure(t *testing.T) {
 	if len(restored.snapshot()) != 1 || restored.snapshot()[0].EventUID == "" {
 		t.Fatal("encrypted event spool could not be restored")
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	if err := restored.close(); err != nil {
 		t.Fatal(err)
 	}
-	// Persistence is debounced on the hot path; age the debounce window out
-	// so this add reaches the disk write and must surface its failure.
-	store.mu.Lock()
-	store.lastPersist = time.Now().Add(-edgeEventPersistInterval - time.Second)
-	store.mu.Unlock()
+	store.journal.ioMu.Lock()
+	store.journal.syncFile = func(*os.File) error { return errors.New("injected durable sync failure") }
+	store.journal.ioMu.Unlock()
 	if err := store.add(event); err == nil {
 		t.Fatal("event spool persistence failure was silently ignored")
 	}

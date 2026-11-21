@@ -10,7 +10,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
 
 cleanup() {
-    if [ "${EUID}" -eq 0 ] || [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = bundled-update ]; then
+    if [ "${EUID}" -eq 0 ] || [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = bundled-update ] \
+        || [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = nginx ]; then
         rm -rf -- "$TEST_ROOT"
     else
         sudo rm -rf -- "$TEST_ROOT"
@@ -211,7 +212,9 @@ FAULT
     done
 }
 
-run_bundled_update_failure_tests
+if [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" != nginx ]; then
+    run_bundled_update_failure_tests
+fi
 if [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = bundled-update ]; then
     echo 'bundled update fault tests passed'
     exit 0
@@ -295,6 +298,40 @@ assert_contains "$generated_nginx" 'proxy_pass http://127.0.0.1:19090;'
 # shellcheck disable=SC2016
 assert_contains "$generated_nginx" 'proxy_set_header Upgrade $http_upgrade;'
 assert_contains "$generated_nginx" 'proxy_buffering off;'
+assert_contains "$generated_nginx" 'client_max_body_size 1m;'
+assert_contains "$generated_nginx" 'location = /api/backup/restore {'
+assert_contains "$generated_nginx" 'client_max_body_size 260m;'
+assert_contains "$generated_nginx" 'location = /api/site-icon-pack {'
+assert_contains "$generated_nginx" 'location = /api/site-icon-packs {'
+# The dollar sign anchors the numeric item route in literal Nginx syntax.
+# shellcheck disable=SC2016
+assert_contains "$generated_nginx" 'location ~ ^/api/site-icon-packs/[0-9]+$ {'
+assert_eq '3' "$(grep -Fc 'client_max_body_size 4160k;' "$generated_nginx")" 'bounded icon upload routes'
+# Every upload route keeps the normalized proxy identity and streaming policy.
+# shellcheck disable=SC2016
+awk '
+    /^[[:space:]]*location (= \/api\/(backup\/restore|site-icon-pack|site-icon-packs)|~ \^\/api\/site-icon-packs\/\[0-9\]\+\$) \{/ {
+        upload=1
+        routes++
+        request_streaming=0
+        response_streaming=0
+        real_ip=0
+        forwarded_for=0
+        forwarded_proto=0
+        backend=0
+    }
+    upload && $0 == "        proxy_request_buffering off;" { request_streaming++ }
+    upload && $0 == "        proxy_buffering off;" { response_streaming++ }
+    upload && $0 == "        proxy_set_header X-Real-IP $remote_addr;" { real_ip++ }
+    upload && $0 == "        proxy_set_header X-Forwarded-For $remote_addr;" { forwarded_for++ }
+    upload && $0 == "        proxy_set_header X-Forwarded-Proto $scheme;" { forwarded_proto++ }
+    upload && $0 == "        proxy_pass http://127.0.0.1:19090;" { backend++ }
+    upload && $0 == "    }" {
+        if (request_streaming != 1 || response_streaming != 1 || real_ip != 1 || forwarded_for != 1 || forwarded_proto != 1 || backend != 1) invalid=1
+        upload=0
+    }
+    END { if (routes != 4 || upload || invalid) exit 1 }
+' "$generated_nginx" || { echo 'FAIL: upload route lost proxy identity or streaming policy' >&2; exit 1; }
 # shellcheck disable=SC2016
 assert_contains "$generated_nginx" 'map $uri $meridian_log_path {'
 assert_contains "$generated_nginx" '~^/_meridian/d/ /_meridian/d/[REDACTED];'
@@ -367,6 +404,8 @@ assert_contains "$NGINX_CONFIG" '~^/_meridian/d/ /_meridian/d/[REDACTED];'
 # shellcheck disable=SC2016
 assert_contains "$NGINX_CONFIG" '"$request_method $meridian_log_path $server_protocol"'
 assert_contains "$NGINX_CONFIG" 'large_client_header_buffers 4 32k;'
+assert_contains "$NGINX_CONFIG" 'client_max_body_size 260m;'
+assert_eq '3' "$(grep -Fc 'client_max_body_size 4160k;' "$NGINX_CONFIG")" 'migrated icon upload routes'
 assert_eq '2' "$(grep -Fc 'access_log /var/log/nginx/meridian_access.log meridian_redacted;' "$NGINX_CONFIG")" \
     'redacted access log count'
 assert_contains "$NGINX_CONFIG" 'ssl_certificate /etc/letsencrypt/live/panel.example.com/fullchain.pem; # managed by Certbot'
@@ -402,7 +441,7 @@ assert_nginx_migration_rejected_unchanged() {
         nginx_test_and_reload() { printf 'unexpected\n' >> "$reload_log"; }
         migrate_managed_nginx_redaction
     ); then
-        printf 'FAIL: unsafe Nginx redaction fixture was accepted: %s\n' "$label" >&2
+        printf 'FAIL: unsafe Nginx fixture was accepted: %s\n' "$label" >&2
         exit 1
     fi
     cmp -s "$NGINX_CONFIG" "$expected" \
@@ -414,6 +453,155 @@ assert_nginx_migration_rejected_unchanged() {
         exit 1
     fi
 }
+
+# Already-redacted configurations from the preceding installer receive the
+# bounded upload routes too, without changing their TLS or redaction state.
+awk -v start="$NGINX_UPLOAD_START_MARKER" -v end="$NGINX_UPLOAD_END_MARKER" '
+    $0 == start { skipping=1; next }
+    $0 == end { skipping=0; next }
+    !skipping { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+(
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() { return 0; }
+    migrate_managed_nginx_redaction
+)
+cmp -s "$canonical_redacted_nginx" "$NGINX_CONFIG" \
+    || { echo 'FAIL: redacted legacy vhost did not receive the canonical upload migration' >&2; exit 1; }
+
+awk '
+    /client_max_body_size 260m;/ { sub(/260m/, "0") }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged unbounded-upload-limit
+
+# shellcheck disable=SC2016
+awk '
+    $0 == "    location ~ ^/api/site-icon-packs/[0-9]+$ {" { print "    location ~ ^/api/site-icon-packs/.* {"; next }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged widened-icon-route
+
+# shellcheck disable=SC2016
+awk '
+    /# Meridian bounded panel uploads/ { upload=1 }
+    /# End Meridian bounded panel uploads/ { upload=0 }
+    upload && /proxy_set_header X-Real-IP / { print "        proxy_set_header X-Real-IP $http_x_real_ip;"; next }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged client-controlled-proxy-identity
+
+awk '
+    $0 == "    location / {" { print "    location ^~ /api/ { client_max_body_size 0; }" }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged custom-api-location
+
+awk '
+    $0 == "    location / {" { generic=1 }
+    generic && /proxy_pass / { sub(/:9090;/, ":9091;") }
+    { print }
+' "$canonical_redacted_nginx" > "$NGINX_CONFIG"
+assert_nginx_migration_rejected_unchanged inconsistent-proxy-target
+
+# The older connection_upgrade map name remains usable by all inserted routes.
+write_legacy_managed_nginx
+sed 's/meridian_connection_upgrade/connection_upgrade/g' "$NGINX_CONFIG" > "${TEST_ROOT}/nginx-old-upgrade-map.conf"
+cp "${TEST_ROOT}/nginx-old-upgrade-map.conf" "$NGINX_CONFIG"
+(
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() { return 0; }
+    migrate_managed_nginx_redaction
+)
+# shellcheck disable=SC2016
+assert_contains "$NGINX_CONFIG" 'proxy_set_header Connection $connection_upgrade;'
+# shellcheck disable=SC2016
+assert_not_contains "$NGINX_CONFIG" 'proxy_set_header Connection $meridian_connection_upgrade;'
+old_map_hash=$(sha256_file "$NGINX_CONFIG")
+(
+    as_root() { run_test_root_command "$@"; }
+    nginx_test_and_reload() { return 0; }
+    migrate_managed_nginx_redaction
+)
+assert_eq "$old_map_hash" "$(sha256_file "$NGINX_CONFIG")" 'legacy map upload migration remains idempotent'
+
+# Higher-priority upload siblings must never bypass controls attached only to
+# a user-modified generic location. Reject every non-template directive before
+# replacing the file or asking Nginx to validate/reload it.
+# The dollar signs below are literal Nginx variables in the fixtures.
+# shellcheck disable=SC2016
+for generic_control in \
+    'auth_basic "Restricted panel";' \
+    'auth_basic_user_file /etc/nginx/panel.htpasswd;' \
+    'allow 192.0.2.7;' \
+    'deny all;' \
+    'auth_request /authenticate;' \
+    'satisfy any;' \
+    'limit_except GET { deny all; }' \
+    'if ($request_method = POST) { return 403; }' \
+    'return 403;' \
+    'rewrite ^ /authenticate last;' \
+    'include /etc/nginx/panel-access.conf;' \
+    'limit_req zone=panel burst=1;' \
+    'proxy_set_header Authorization "";' \
+    'proxy_set_header X-Real-IP $http_x_real_ip;'; do
+    write_legacy_managed_nginx
+    generic_control_name=${generic_control%% *}
+    awk -v control="$generic_control" '
+        { print }
+        $0 == "    location / {" { print "        " control }
+    ' "$NGINX_CONFIG" > "${TEST_ROOT}/nginx-custom-generic.conf"
+    cp "${TEST_ROOT}/nginx-custom-generic.conf" "$NGINX_CONFIG"
+    assert_nginx_migration_rejected_unchanged "generic-${generic_control_name}"
+done
+
+server_control_index=0
+for server_control in \
+    'include /etc/nginx/panel-routes.conf;' \
+    'ssl_protocols TLSv1.2 TLSv1.3; include /etc/nginx/panel-routes.conf;' \
+    'add_header X-Panel managed; location ~ ^/api/backup/ { deny all; }' \
+    'add_header X-Panel managed#custom; location ~ ^/api/backup/ { deny all; }' \
+    'add_header X-Panel "managed#custom"; location ~ ^/api/backup/ { deny all; }' \
+    '"include" /etc/nginx/panel-routes.conf;' \
+    'inc\lude /etc/nginx/panel-routes.conf;' \
+    '"location" ~ ^/api/backup/ { deny all; }' \
+    'lo\cation ~ ^/api/backup/ { deny all; }'; do
+    write_legacy_managed_nginx
+    server_control_index=$((server_control_index + 1))
+    # Read fixture contents from a file, so awk -v does not reinterpret their
+    # intentional backslash escapes before the Nginx validator sees them.
+    server_control_file="${TEST_ROOT}/nginx-server-control"
+    printf '%s\n' "$server_control" > "$server_control_file"
+    awk -v control_file="$server_control_file" '
+        BEGIN { getline control < control_file; close(control_file) }
+        { print }
+        $0 == "    server_name panel.example.com;" { print "    " control }
+    ' "$NGINX_CONFIG" > "${TEST_ROOT}/nginx-custom-server.conf"
+    cp "${TEST_ROOT}/nginx-custom-server.conf" "$NGINX_CONFIG"
+    assert_nginx_migration_rejected_unchanged "server-hidden-route-${server_control_index}"
+done
+
+# A hash inside a value is not a comment. Quoted text and a comment after an
+# actual token boundary must not be mistaken for active include/location rules.
+for server_comment in \
+    'add_header X-Panel "managed#custom; location hidden; include hidden";' \
+    'add_header X-Panel managed; # location ~ ^/api/backup/ { deny all; }'; do
+    write_legacy_managed_nginx
+    server_control_file="${TEST_ROOT}/nginx-server-comment"
+    printf '%s\n' "$server_comment" > "$server_control_file"
+    awk -v control_file="$server_control_file" '
+        BEGIN { getline control < control_file; close(control_file) }
+        { print }
+        $0 == "    server_name panel.example.com;" { print "    " control }
+    ' "$NGINX_CONFIG" > "${TEST_ROOT}/nginx-comment-server.conf"
+    cp "${TEST_ROOT}/nginx-comment-server.conf" "$NGINX_CONFIG"
+    (
+        as_root() { run_test_root_command "$@"; }
+        nginx_test_and_reload() { return 0; }
+        migrate_managed_nginx_redaction
+    )
+    assert_contains "$NGINX_CONFIG" "$server_comment"
+done
 
 unsafe_log_format="log_format meridian_redacted '\$remote_addr \"\$request_uri\"';"
 awk -v unsafe="$unsafe_log_format" '
@@ -588,7 +776,64 @@ fi
 assert_eq '127.0.0.1' "$(read_env_value PANEL_BIND_ADDR)" 'panel bind address'
 assert_eq 'panel.example.com' "$(read_env_value PANEL_DOMAIN)" 'panel domain'
 assert_eq '127.0.0.1/32,::1/128' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'trusted proxies'
+assert_eq true "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'installed proxy deployment is explicit'
 assert_not_contains "$NGINX_CONFIG" 50001
+
+disable_nginx_log="${TEST_ROOT}/disable-nginx-validation.log"
+disable_env_before="${TEST_ROOT}/disable-env-before"
+disable_nginx_before="${TEST_ROOT}/disable-nginx-before"
+cp "$(env_file_path)" "$disable_env_before"
+cp "$NGINX_CONFIG" "$disable_nginx_before"
+: > "$disable_nginx_log"
+if (
+    # Force the availability branch on every host; all validation below is
+    # controlled by the helper mock, never the installed Nginx command.
+    nginx() { return 1; }
+    nginx_test_and_reload() {
+        if [ -e "$NGINX_CONFIG" ]; then
+            printf 'restored\n' >> "$disable_nginx_log"
+        else
+            printf 'removed\n' >> "$disable_nginx_log"
+        fi
+        return 1
+    }
+    as_root() { run_test_root_command "$@"; }
+    is_systemd() { return 0; }
+    restart_meridian_and_health() { return 0; }
+    install_env_file() { cp "$1" "$(env_file_path)"; }
+    disable_panel_domain
+) >"${TEST_ROOT}/disable-nginx-failure.log" 2>&1; then
+    echo 'FAIL: failed Nginx validation did not reject domain removal' >&2
+    exit 1
+fi
+cmp -s "$(env_file_path)" "$disable_env_before" \
+    || { echo 'FAIL: domain removal failure changed the environment' >&2; exit 1; }
+cmp -s "$NGINX_CONFIG" "$disable_nginx_before" \
+    || { echo 'FAIL: domain removal failure did not restore the Nginx config' >&2; exit 1; }
+assert_eq '1' "$(grep -c '^removed$' "$disable_nginx_log")" 'failed domain removal validates after deletion'
+assert_eq '1' "$(grep -c '^restored$' "$disable_nginx_log")" 'failed domain removal validates restored config'
+
+: > "$disable_nginx_log"
+(
+    nginx() { return 1; }
+    nginx_test_and_reload() {
+        [ ! -e "$NGINX_CONFIG" ] || return 1
+        printf 'removed\n' >> "$disable_nginx_log"
+    }
+    as_root() { run_test_root_command "$@"; }
+    is_systemd() { return 0; }
+    restart_meridian_and_health() { return 0; }
+    install_env_file() { cp "$1" "$(env_file_path)"; }
+    disable_panel_domain
+)
+assert_eq '1' "$(grep -c '^removed$' "$disable_nginx_log")" 'successful domain removal validates exactly once'
+[ ! -e "$NGINX_CONFIG" ] || { echo 'FAIL: domain removal kept the managed Nginx config' >&2; exit 1; }
+assert_eq false "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'removed proxy deployment is explicit'
+
+if [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = nginx ]; then
+    echo 'Nginx installer tests passed'
+    exit 0
+fi
 
 # Mock release downloads so install/update behavior can be tested without network.
 MOCK_LATEST='v9.9.9'
@@ -668,6 +913,7 @@ assert_file "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}"
 assert_eq 'v9.9.9' "$("${INSTALL_DIR}/${AGENT_BIN_NAME}" --version)" 'first installed Agent version'
 assert_file "${DATA_DIR}/.env"
 assert_eq '0.0.0.0' "$(read_env_value PANEL_BIND_ADDR)" 'fresh IP bind'
+assert_eq false "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'fresh install has no external proxy deployment'
 assert_eq '127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'fresh install trusts loopback and private proxy ranges'
 upstream_header_key=$(read_env_value UPSTREAM_HEADER_KEY)
 if [ "${#upstream_header_key}" -lt 32 ]; then
@@ -699,6 +945,14 @@ awk -F= '$1 == "TRUSTED_PROXY_CIDRS" { print "TRUSTED_PROXY_CIDRS=192.0.2.7/32";
 mv "${proxy_config_tmp}/custom.env" "${DATA_DIR}/.env"
 prepare_data_and_config "$proxy_config_tmp"
 assert_eq '192.0.2.7/32' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'existing custom trusted proxy range is preserved'
+awk -F= '$1 == "PANEL_EXTERNAL_PROXY_ENABLED" { print "PANEL_EXTERNAL_PROXY_ENABLED=true"; next } { print }' "${DATA_DIR}/.env" > "${proxy_config_tmp}/external.env"
+mv "${proxy_config_tmp}/external.env" "${DATA_DIR}/.env"
+prepare_data_and_config "$proxy_config_tmp"
+assert_eq true "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'existing external proxy deployment is preserved'
+awk -F= '$1 != "PANEL_EXTERNAL_PROXY_ENABLED" { print }' "${DATA_DIR}/.env" > "${proxy_config_tmp}/legacy.env"
+mv "${proxy_config_tmp}/legacy.env" "${DATA_DIR}/.env"
+prepare_data_and_config "$proxy_config_tmp"
+assert_eq '' "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'legacy deployment keeps exact-peer compatibility'
 awk -F= '$1 != "TRUSTED_PROXY_CIDRS" { print }' "${DATA_DIR}/.env" > "${proxy_config_tmp}/missing.env"
 mv "${proxy_config_tmp}/missing.env" "${DATA_DIR}/.env"
 prepare_data_and_config "$proxy_config_tmp"

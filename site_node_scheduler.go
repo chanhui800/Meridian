@@ -42,6 +42,80 @@ const (
 	nodeSchedulerWorkers = 4
 )
 
+// Health checks retain the scheduler's short cadence. Only successful DNS
+// maintenance may be reused while its complete assignment generation matches.
+const siteNodeDNSMaintenanceInterval = 5 * time.Minute
+
+type nodeSchedulerMaintenanceState struct {
+	fingerprint string
+	checkedAt   time.Time
+}
+
+func (a *App) forgetSiteDNSMaintenance(siteID int64) {
+	a.nodeSchedulerMaintenanceMu.Lock()
+	delete(a.nodeSchedulerMaintenance, siteID)
+	a.nodeSchedulerMaintenanceMu.Unlock()
+}
+
+func (a *App) siteDNSMaintenanceFingerprint(schedule SiteNodeSchedule, site Site, node ControlNode, addresses []nodeDNSAddress) (string, error) {
+	settings, err := a.db.PanelSettings()
+	if err != nil {
+		return "", err
+	}
+	// Include local tracking and credentials, not just the destination IP. A
+	// config/host/target/credential change must never reuse an older generation.
+	rows, err := a.db.db.Query(`SELECT family,zone_id,record_id,record_type,address FROM site_node_dns_records WHERE site_id=? ORDER BY family`, schedule.SiteID)
+	if err != nil {
+		return "", err
+	}
+	var additional [][5]string
+	for rows.Next() {
+		var record [5]string
+		if err := rows.Scan(&record[0], &record[1], &record[2], &record[3], &record[4]); err != nil {
+			rows.Close()
+			return "", err
+		}
+		additional = append(additional, record)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return "", err
+	}
+	addressValues := make([][3]string, 0, len(addresses))
+	for _, address := range addresses {
+		addressValues = append(addressValues, [3]string{address.family, address.recordType, address.address})
+	}
+	payload, err := json.Marshal([]any{
+		schedule.SiteID, schedule.ScheduleRevision, schedule.PublicHost, schedule.DesiredNodeID, schedule.AppliedNodeID,
+		schedule.ConfigHash, schedule.cfZoneID, schedule.cfRecordID, schedule.cfRecordType, schedule.AppliedAddress, schedule.DNSStatus,
+		node.GUID, node.Port, node.Address, node.AddressV4, node.AddressV6, node.DNSPublish, node.ConfigRevision, node.DesiredConfigRevision, node.AppliedConfigRevision, node.DesiredConfigHash, node.AppliedConfigHash,
+		site.TargetURL, site.PlaybackTargetURL, site.FailoverTargets, site.StoredFailoverLines, site.StoredUpstreamHeaders,
+		settings.ACMEDNSProvider, settings.ACMETokenCiphertext, settings.RouteDomain, a.db.installUUID, addressValues, additional,
+	})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (a *App) siteDNSMaintenanceCurrent(siteID int64, fingerprint string, now time.Time) bool {
+	a.nodeSchedulerMaintenanceMu.Lock()
+	defer a.nodeSchedulerMaintenanceMu.Unlock()
+	state, ok := a.nodeSchedulerMaintenance[siteID]
+	return ok && state.fingerprint == fingerprint && !now.Before(state.checkedAt) && now.Sub(state.checkedAt) < siteNodeDNSMaintenanceInterval
+}
+
+func (a *App) rememberSiteDNSMaintenance(siteID int64, fingerprint string, now time.Time) {
+	a.nodeSchedulerMaintenanceMu.Lock()
+	defer a.nodeSchedulerMaintenanceMu.Unlock()
+	if a.nodeSchedulerMaintenance == nil {
+		a.nodeSchedulerMaintenance = make(map[int64]nodeSchedulerMaintenanceState)
+	}
+	a.nodeSchedulerMaintenance[siteID] = nodeSchedulerMaintenanceState{fingerprint: fingerprint, checkedAt: now}
+}
+
 type nodeSchedulerJob struct {
 	value   SiteNodeSchedule
 	cleanup bool
@@ -211,24 +285,27 @@ type AgentSiteRoute struct {
 }
 
 type AgentRuntimeConfig struct {
-	SchemaVersion        int              `json:"schema_version"`
-	ConfigHash           string           `json:"config_hash"`
-	ConfigRevision       int64            `json:"config_revision,omitempty"`
-	NodeGUID             string           `json:"node_guid"`
-	EntryMode            string           `json:"entry_mode"`
-	HTTPPort             int              `json:"http_port"`
-	HTTPSPort            int              `json:"https_port"`
-	CertificatePEM       string           `json:"certificate_pem,omitempty"`
-	PrivateKeyPEM        string           `json:"private_key_pem,omitempty"`
-	DynamicKey           string           `json:"dynamic_key,omitempty"`
-	ProbeSecret          string           `json:"probe_secret,omitempty"`
-	AgentLeaseID         string           `json:"agent_lease_id,omitempty"`
-	AgentVersion         string           `json:"agent_version,omitempty"`
-	AgentSHA256          string           `json:"agent_sha256,omitempty"`
-	AgentDownloadURL     string           `json:"agent_download_url,omitempty"`
-	CacheClearGeneration int64            `json:"cache_clear_generation,omitempty"`
-	ForceStopSiteIDs     []int64          `json:"force_stop_site_ids,omitempty"`
-	Routes               []AgentSiteRoute `json:"routes"`
+	SchemaVersion        int     `json:"schema_version"`
+	ConfigHash           string  `json:"config_hash"`
+	ConfigRevision       int64   `json:"config_revision,omitempty"`
+	NodeGUID             string  `json:"node_guid"`
+	EntryMode            string  `json:"entry_mode"`
+	HTTPPort             int     `json:"http_port"`
+	HTTPSPort            int     `json:"https_port"`
+	CertificatePEM       string  `json:"certificate_pem,omitempty"`
+	PrivateKeyPEM        string  `json:"private_key_pem,omitempty"`
+	DynamicKey           string  `json:"dynamic_key,omitempty"`
+	ProbeSecret          string  `json:"probe_secret,omitempty"`
+	AgentLeaseID         string  `json:"agent_lease_id,omitempty"`
+	AgentVersion         string  `json:"agent_version,omitempty"`
+	AgentSHA256          string  `json:"agent_sha256,omitempty"`
+	AgentDownloadURL     string  `json:"agent_download_url,omitempty"`
+	CacheClearGeneration int64   `json:"cache_clear_generation,omitempty"`
+	ForceStopSiteIDs     []int64 `json:"force_stop_site_ids,omitempty"`
+	// Log settings are refreshed with every config response without rebuilding
+	// routes or disrupting admitted playback. Older Agents ignore this field.
+	RequestLogPolicy *AgentRequestLogPolicy `json:"request_log_policy,omitempty"`
+	Routes           []AgentSiteRoute       `json:"routes"`
 }
 
 func deriveNodeRuntimeKey(master []byte, nodeGUID, purpose string) []byte {
@@ -1352,7 +1429,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	// upgrades. Their values now describe one HTTPS-only listener.
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigRevision: node.ConfigRevision, NodeGUID: node.GUID, EntryMode: "direct",
 		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText, AgentLeaseID: leaseID,
-		CacheClearGeneration: node.CacheClearGeneration, Routes: routes}
+		CacheClearGeneration: node.CacheClearGeneration, RequestLogPolicy: newAgentRequestLogPolicy(settings), Routes: routes}
 	forceRows, forceErr := tx.Query("SELECT site_id FROM agent_route_revocations WHERE node_id=? ORDER BY site_id", node.ID)
 	if forceErr != nil {
 		return AgentRuntimeConfig{}, forceErr
@@ -1736,6 +1813,7 @@ func (a *App) deleteTrackedSiteDNS(ctx context.Context, schedule SiteNodeSchedul
 }
 
 func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeSchedule) error {
+	a.forgetSiteDNSMaintenance(schedule.SiteID)
 	if schedule.cfRecordID != "" {
 		cf, err := a.cloudflareForScheduling()
 		if err != nil {
@@ -1756,6 +1834,7 @@ func (a *App) deleteTrackedSiteDNSLocked(ctx context.Context, schedule SiteNodeS
 // operator's scheduling preference (enabled, mode and fixed_node_id). A site
 // can therefore be re-enabled without silently losing its selected node.
 func (a *App) deleteTrackedSiteDNSForSiteDisable(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
+	a.forgetSiteDNSMaintenance(schedule.SiteID)
 	if schedule.cfRecordID != "" {
 		cf, err := a.cloudflareForScheduling()
 		if err != nil {
@@ -2153,13 +2232,16 @@ func (a *App) syncAdditionalSiteDNS(ctx context.Context, schedule SiteNodeSchedu
 		return err
 	}
 	marker := siteDNSOwnershipMarker(schedule.SiteID, a.db.installUUID)
+	var previous *cloudflareAddressRecord
 	if oldID != "" {
 		tracked := schedule
 		tracked.cfZoneID, tracked.cfRecordID, tracked.cfRecordType = oldZone, oldID, oldType
-		if _, readErr, owned := readOwnedTrackedSiteDNSRecord(ctx, cf, tracked); readErr != nil {
+		if record, readErr, owned := readOwnedTrackedSiteDNSRecord(ctx, cf, tracked); readErr != nil {
 			return readErr
 		} else if !owned {
 			oldID = ""
+		} else {
+			previous = &record
 		}
 	}
 	if oldID == "" {
@@ -2176,11 +2258,15 @@ func (a *App) syncAdditionalSiteDNS(ctx context.Context, schedule SiteNodeSchedu
 		}
 		if ok {
 			oldID = owned.ID
+			previous = &owned
 		}
 	}
-	recordID, err := cf.writeAddressRecord(ctx, zoneID, oldID, secondary.recordType, schedule.PublicHost, secondary.address, marker)
-	if err != nil {
-		return err
+	recordID := oldID
+	if !siteDNSRecordMatches(previous, secondary.recordType, schedule.PublicHost, secondary.address, marker) {
+		recordID, err = cf.writeAddressRecord(ctx, zoneID, oldID, secondary.recordType, schedule.PublicHost, secondary.address, marker)
+		if err != nil {
+			return err
+		}
 	}
 	_, err = a.db.db.Exec(`INSERT INTO site_node_dns_records(site_id,family,zone_id,record_id,record_type,address,updated_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id,family) DO UPDATE SET zone_id=excluded.zone_id,record_id=excluded.record_id,record_type=excluded.record_type,address=excluded.address,updated_at_ms=excluded.updated_at_ms`, schedule.SiteID, secondary.family, zoneID, recordID, secondary.recordType, secondary.address, now.UnixMilli())
 	return err
@@ -2246,7 +2332,21 @@ func (a *App) deleteAdditionalSiteDNS(ctx context.Context, siteID int64) error {
 }
 
 func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteNodeSchedule, now time.Time) error {
+	return a.reconcileOneSiteScheduleWithProbeLocked(ctx, schedule, now, probeScheduledNode)
+}
+
+func siteDNSRecordMatches(record *cloudflareAddressRecord, recordType, host, address, marker string) bool {
+	return record != nil && record.ID != "" && record.Type == recordType && strings.EqualFold(record.Name, host) && record.Content == address && record.Comment == marker
+}
+
+func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, schedule SiteNodeSchedule, now time.Time, probe func(context.Context, ControlNode, string, []byte) error) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			a.forgetSiteDNSMaintenance(schedule.SiteID)
+		}
+	}()
 	if !schedule.Enabled {
+		a.forgetSiteDNSMaintenance(schedule.SiteID)
 		return nil
 	}
 	site, err := a.db.GetSite(schedule.SiteID)
@@ -2300,15 +2400,21 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	for _, candidate := range desiredAddresses {
 		probeNode := node
 		probeNode.Address = candidate.address
-		if err := probeScheduledNode(ctx, probeNode, schedule.PublicHost, probeSecret); err != nil {
+		if err := probe(ctx, probeNode, schedule.PublicHost, probeSecret); err != nil {
 			return readinessError(readinessProbe, fmt.Errorf("%s entry health check: %w", candidate.recordType, err))
 		}
 	}
 	if err := a.db.clearSiteNodeProbeFailure(schedule.SiteID, node.ID); err != nil {
 		return fmt.Errorf("clear entry health cooldown: %w", err)
 	}
-	node.Address = desiredAddresses[0].address
-	ip := net.ParseIP(strings.TrimSpace(node.Address))
+	fingerprint, err := a.siteDNSMaintenanceFingerprint(schedule, *site, node, desiredAddresses)
+	if err != nil {
+		return err
+	}
+	if a.siteDNSMaintenanceCurrent(schedule.SiteID, fingerprint, now) {
+		return nil
+	}
+	ip := net.ParseIP(strings.TrimSpace(desiredAddresses[0].address))
 	if ip == nil {
 		return errors.New("node address must be an IP address for DNS scheduling")
 	}
@@ -2395,7 +2501,9 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 		}
 	}
 	creatingRecord := strings.TrimSpace(recordID) == ""
-	recordID, err = cf.writeAddressRecord(ctx, zoneID, recordID, recordType, schedule.PublicHost, ip.String(), marker)
+	if !siteDNSRecordMatches(previousRecord, recordType, schedule.PublicHost, ip.String(), marker) {
+		recordID, err = cf.writeAddressRecord(ctx, zoneID, recordID, recordType, schedule.PublicHost, ip.String(), marker)
+	}
 	if err == nil {
 		dnsRecordCreated = creatingRecord
 	}
@@ -2520,7 +2628,19 @@ func (a *App) reconcileOneSiteScheduleLocked(ctx context.Context, schedule SiteN
 	if err = tx.Commit(); err != nil {
 		return cleanupTransaction(err)
 	}
-	return a.syncAdditionalSiteDNS(ctx, schedule, zoneID, desiredAddresses, now)
+	if err := a.syncAdditionalSiteDNS(ctx, schedule, zoneID, desiredAddresses, now); err != nil {
+		return err
+	}
+	current, err := a.db.siteNodeSchedule(schedule.SiteID)
+	if err != nil {
+		return err
+	}
+	fingerprint, err = a.siteDNSMaintenanceFingerprint(current, *site, node, desiredAddresses)
+	if err != nil {
+		return err
+	}
+	a.rememberSiteDNSMaintenance(schedule.SiteID, fingerprint, now)
+	return nil
 }
 
 // upsertSiteNodeDrainTx starts a fresh lifecycle whenever a site returns to a

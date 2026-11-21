@@ -87,7 +87,7 @@ func TestAssetCacheRejectsPrivateCookieAndMediaResponses(t *testing.T) {
 
 func TestAssetCacheEvictsLeastRecentlyUsedEntryPerSite(t *testing.T) {
 	cache := newAssetCache(t.TempDir())
-	site := Site{ID: 9, AssetCacheEnabled: true, AssetCacheTTLSec: 3600, AssetCacheMaxBytes: 7, AssetCacheRules: "*/web/*"}
+	site := Site{ID: 9, AssetCacheEnabled: true, AssetCacheTTLSec: 3600, AssetCacheMaxBytes: 6, AssetCacheRules: "*/web/*"}
 	response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/css"}}}
 	now := time.Now()
 
@@ -96,16 +96,26 @@ func TestAssetCacheEvictsLeastRecentlyUsedEntryPerSite(t *testing.T) {
 		request := httptest.NewRequest(http.MethodGet, "https://proxy.example/web/"+name+".css", nil)
 		return cache.request(site, request, target)
 	}
-	oldest := makeRequest("oldest")
+	frequentlyRead := makeRequest("frequently-read")
+	lessRecent := makeRequest("less-recent")
 	newest := makeRequest("newest")
-	if err := cache.write(site, oldest, response, []byte("old"), now); err != nil {
+	if err := cache.write(site, frequentlyRead, response, []byte("css"), now); err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.write(site, newest, response, []byte("newer"), now.Add(time.Second)); err != nil {
+	if err := cache.write(site, lessRecent, response, []byte("css"), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(oldest.bodyPath); !os.IsNotExist(err) {
-		t.Fatalf("oldest body should be evicted, stat err=%v", err)
+	if hit, err := cache.read(frequentlyRead, now.Add(2*time.Second)); err != nil || hit == nil {
+		t.Fatalf("expected repeated access to hit the cache: %v", err)
+	}
+	if err := cache.write(site, newest, response, []byte("css"), now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(lessRecent.bodyPath); !os.IsNotExist(err) {
+		t.Fatalf("least recently accessed body should be evicted, stat err=%v", err)
+	}
+	if _, err := os.Stat(frequentlyRead.bodyPath); err != nil {
+		t.Fatalf("recently accessed body should remain: %v", err)
 	}
 	if _, err := os.Stat(newest.bodyPath); err != nil {
 		t.Fatalf("newest body should remain: %v", err)
@@ -326,11 +336,12 @@ func TestPrepareAssetCacheResponseSupportsChunkedBodies(t *testing.T) {
 	if err := prepareAssetCacheResponse(response, cache, site); err != nil {
 		t.Fatal(err)
 	}
+	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "chunked-image" || response.Header.Get("X-Meridian-Cache") != "MISS" || response.ContentLength != int64(len(body)) {
+	if string(body) != "chunked-image" || response.Header.Get("X-Meridian-Cache") != "MISS" || response.ContentLength != -1 {
 		t.Fatalf("body=%q cache=%q content_length=%d", body, response.Header.Get("X-Meridian-Cache"), response.ContentLength)
 	}
 	hit, err := cache.read(cacheReq, time.Now())

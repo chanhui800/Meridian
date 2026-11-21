@@ -753,6 +753,7 @@ test('dashboard realtime trend persists recent points across a page refresh', ()
       { timestamp_ms: ${now - 4000}, download_bps: 120, upload_bps: 30, bytes_in: 4, bytes_out: 8, requests: 1, traffic_bytes: 24 },
     ]]]);
     persistDashboardRealtimeSamples();
+    flushDashboardRealtimeSamples();
     dashboardRealtimeTrendSamples = new Map();
     dashboardRealtimeTrendSiteSamples = new Map();
     dashboardBillingMode = null;

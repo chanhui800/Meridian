@@ -71,6 +71,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return fmt.Errorf("invalid upstream headers: %w", err)
 		}
 	}
+	if site.AssetCacheEnabled {
+		// Each running site has an immutable cache generation until its configuration is reloaded.
+		site.AssetCacheNamespace = assetCacheNamespace(site)
+	}
 	redirectPolicy, err := newDynamicRedirectPolicy(pm.DynamicDiscoveryAvailable())
 	if err != nil {
 		return err
@@ -147,17 +151,44 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	}
 
 	isRedirectMode := playbackTarget != nil && site.PlaybackMode == "redirect"
+	routedUpstream := func(r *http.Request) *url.URL {
+		if isRedirectMode {
+			return target
+		}
+		return upstreamTargetForRequest(r, target, playbackTarget)
+	}
+	allowsFailover := func(r *http.Request, upstream *url.URL) bool {
+		if len(failoverTargets) < 2 || !sameConfiguredUpstreamURL(upstream, target) || len(configuredHeaders.values) != 0 ||
+			mainVideoDirectFallbackTarget(r.Context()) != nil {
+			return false
+		}
+		if !isRedirectMode {
+			return true
+		}
+		// Legacy media still uses the configured main line to discover its
+		// playback destination. Ordinary APIs, including replayable PlaybackInfo,
+		// can use the backup lines.
+		path := r.URL.Path
+		source := dynamicStructuredRequestSource(path)
+		if isPlaybackRequest(path) || isPlaybackRedirectEndpoint(path) ||
+			source == dynamicDiscoverySourceHLS || source == dynamicDiscoverySourceDASH || isMainVideoStreamRequest(r) {
+			return false
+		}
+		return dynamicState == nil || !dynamicState.hasLearnedPlaybackPath(path, time.Now())
+	}
 	proxyTransport := http.DefaultTransport.(*http.Transport).Clone()
 	proxyTransport.TLSClientConfig = secureTLSConfig("")
 	proxyTransport.ResponseHeaderTimeout = 30 * time.Second
 	proxyTransport.MaxIdleConnsPerHost = 32
 	inst.transport = proxyTransport
+	configuredTransport := &requestDiagnosticsTransport{base: proxyTransport, sourceRole: "configured"}
 	if dynamicIssuer != nil {
-		dynamicIssuer.configuredTransport = proxyTransport
+		dynamicIssuer.configuredTransport = configuredTransport
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Transport: proxyTransport,
+		Transport:  configuredTransport,
+		BufferPool: sharedProxyBufferPool,
 		Rewrite: func(proxyReq *httputil.ProxyRequest) {
 			ingressPrefix, _ := proxyReq.In.Context().Value(pathIngressContextKey{}).(string)
 			if redirectPolicy.configured {
@@ -166,12 +197,8 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					proxyReq.Out = proxyReq.Out.WithContext(ctx)
 				}
 			}
-			var upstream *url.URL
-			if isRedirectMode {
-				upstream = target
-			} else {
-				upstream = upstreamTargetForRequest(proxyReq.In, target, playbackTarget)
-			}
+			upstream := routedUpstream(proxyReq.In)
+			proxyReq.Out = proxyReq.Out.WithContext(context.WithValue(proxyReq.Out.Context(), configuredUpstreamContextKey{}, upstream))
 			if tracker := backendAddressTrackerFromContext(proxyReq.Out.Context()); tracker != nil {
 				tracker.SetURL(upstream)
 			}
@@ -197,11 +224,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				// the original response while making the bounded observer reliable.
 				proxyReq.Out.Header.Set("Accept-Encoding", "identity")
 			}
-			// Backup lines apply to the configured main upstream, including proxied
-			// playback reads and replayable PlaybackInfo requests. Separate playback
-			// targets, direct video, redirects and WebSockets keep their own routes.
-			if len(failoverTargets) > 1 && upstreamTargetKey(upstream) == upstreamTargetKey(target) &&
-				!isRedirectMode && site.MainVideoStreamMode != mainVideoStreamModeDirect && len(configuredHeaders.values) == 0 {
+			if allowsFailover(proxyReq.In, upstream) {
 				proxyReq.Out = withFailoverRequestPlan(proxyReq.Out, &originalURL, failoverTargets, target, redirectPolicy.limits.MaxBodyBytes)
 			}
 			if source := dynamicStructuredRequestIdentity(proxyReq.In); source != "" {
@@ -229,8 +252,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					}
 				}
 			}
+			proxyReq.Out = ownConfiguredRequestDiagnosticsContext(proxyReq.Out)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			observeRequestDiagnosticsResponse(resp)
 			if err := captureMediaLibraryCounts(resp, pm.database, site.ID); err != nil {
 				return err
 			}
@@ -256,18 +281,27 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			if dynamicResponse {
 				rebuildDynamicResponseHeaders(resp)
-				stripPanelSessionSetCookies(resp.Header)
-				prefixPathIngressResponse(resp, site.PathPrefix, target.Path)
-				return nil
 			}
 			stripPanelSessionSetCookies(resp.Header)
-			prefixPathIngressResponse(resp, site.PathPrefix, target.Path)
+			upstreamBasePath := target.Path
+			if resp.Request != nil {
+				if upstream, _ := resp.Request.Context().Value(configuredUpstreamContextKey{}).(*url.URL); upstream != nil {
+					upstreamBasePath = upstream.Path
+				}
+			}
+			prefixPathIngressResponse(resp, site.PathPrefix, upstreamBasePath)
+			if dynamicResponse {
+				return nil
+			}
 			if err := prepareAssetCacheResponse(resp, pm.assetCache, site); err != nil {
 				return err
 			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if !isClientRequestCancellation(originalRequestContext(r.Context()), err) {
+				requestDiagnosticsFromContext(r.Context()).markUpstreamError()
+			}
 			var discoveryErr *dynamicProxyError
 			if errors.As(err, &discoveryErr) {
 				log.Printf("[%s] dynamic discovery denied: %s", site.Name, discoveryErr.reasonCode)
@@ -285,21 +319,23 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	}
 	if isRedirectMode || redirectPolicy.configured {
 		proxy.Transport = &redirectFollowTransport{
-			base:                    proxy.Transport,
-			playbackHosts:           playbackHostsSet,
-			configuredAuthorities:   configuredAuthorities,
-			disableLegacyRedirects:  !isRedirectMode,
-			followUnknownRedirects:  redirectPolicy.configured,
-			policy:                  policy,
-			clientIPMode:            site.ClientIPMode,
-			upstreamHeaderPolicy:    configuredHeaders,
-			dynamicPolicy:           redirectPolicy,
-			dynamicTransportFactory: pm.dynamicTransportFactory,
-			dynamicState:            dynamicState,
-			capabilityIssuer:        dynamicIssuer,
-			mainVideoDirect:         site.MainVideoStreamMode == mainVideoStreamModeDirect,
-			database:                pm.database,
-			siteID:                  site.ID,
+			base:                     proxy.Transport,
+			playbackHosts:            playbackHostsSet,
+			configuredPlaybackTarget: playbackTarget,
+			configuredUpstreams:      failoverTargets,
+			configuredAuthorities:    configuredAuthorities,
+			disableLegacyRedirects:   !isRedirectMode,
+			followUnknownRedirects:   redirectPolicy.configured,
+			policy:                   policy,
+			clientIPMode:             site.ClientIPMode,
+			upstreamHeaderPolicy:     configuredHeaders,
+			dynamicPolicy:            redirectPolicy,
+			dynamicTransportFactory:  pm.dynamicTransportFactory,
+			dynamicState:             dynamicState,
+			capabilityIssuer:         dynamicIssuer,
+			mainVideoDirect:          site.MainVideoStreamMode == mainVideoStreamModeDirect,
+			database:                 pm.database,
+			siteID:                   site.ID,
 		}
 	}
 	if len(failoverTargets) > 1 {
@@ -324,10 +360,28 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 		requestStartedAt := time.Now()
 		clientRequestContext := r.Context()
-		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
+		requestCtx, requestCancel := context.WithCancel(r.Context())
+		requestCtx = context.WithValue(requestCtx, originalRequestContextKey{}, clientRequestContext)
+		backendTracker := &backendAddressTracker{}
+		backendTracker.SetURL(routedUpstream(r))
+		requestCtx = context.WithValue(requestCtx, backendAddressContextKey{}, backendTracker)
+		diagnostics := newRequestDiagnosticsTracker(requestStartedAt, r)
+		requestCtx = context.WithValue(requestCtx, requestDiagnosticsContextKey{}, diagnostics)
+		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
+		defer func() {
+			stopInstanceCancel()
+			requestCancel()
+		}()
+		r = r.WithContext(requestCtx)
+		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w, diagnostics: diagnostics}
 		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies, policy)
 		watchHistoryCapture := startWatchHistoryCapture(site, r, requestLogEntry.ResourceCategory, pm.database)
+		attachWatchHistoryStopIntentCapture(watchHistoryCapture, pm.database, site, r, inst.trustedProxies, requestStartedAt)
 		defer func() {
+			panicValue := recover()
+			if panicValue != nil {
+				diagnostics.markAborted()
+			}
 			requestEndedAt := time.Now()
 			requestLogEntry.StatusCode = requestLogWriter.StatusCode()
 			if errors.Is(clientRequestContext.Err(), context.Canceled) {
@@ -337,30 +391,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
 				requestLogEntry.BackendAddress = tracker.Get()
 			}
-			if event, ok := watchHistoryEventFromCapture(watchHistoryCapture, pm.database, site, r, inst.trustedProxies, requestLogEntry.StatusCode, requestEndedAt); ok {
-				if !pm.database.EnqueueWatchHistory(event) {
-					log.Printf("[watch-history] event could not be queued site=%d", event.SiteID)
-				}
-			}
+			requestLogEntry.RequestDiagnostics = diagnostics.snapshot(requestEndedAt, requestLogWriter.ResponseStatusCode(), clientRequestContext.Err(), inst.ctx.Err())
+			finishWatchHistoryCapture(watchHistoryCapture, pm.database, site, r, inst.trustedProxies, diagnostics.upstreamResponseStatusCode(), requestStartedAt)
 			pm.accountRetention.Observe(site, r, inst.trustedProxies, requestLogEntry.ResourceCategory, requestLogEntry.StatusCode, requestStartedAt, requestEndedAt)
 			pm.database.EnqueueRequestLog(requestLogEntry)
+			if panicValue != nil {
+				panic(panicValue)
+			}
 		}()
 		w = requestLogWriter
-		requestCtx, requestCancel := context.WithCancel(r.Context())
-		requestCtx = context.WithValue(requestCtx, originalRequestContextKey{}, clientRequestContext)
-		backendTracker := &backendAddressTracker{}
-		initialBackend := target
-		if !isRedirectMode {
-			initialBackend = upstreamTargetForRequest(r, target, playbackTarget)
-		}
-		backendTracker.SetURL(initialBackend)
-		requestCtx = context.WithValue(requestCtx, backendAddressContextKey{}, backendTracker)
-		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
-		defer func() {
-			stopInstanceCancel()
-			requestCancel()
-		}()
-		r = r.WithContext(requestCtx)
 		inst.trafficRequests().Add(1)
 		inst.trafficPendingRequests().Add(1)
 
@@ -419,11 +458,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 
 		if site.MainVideoStreamMode == mainVideoStreamModeDirect && isMainVideoStreamRequest(r) {
-			directUpstream := target
-			if !isRedirectMode {
-				directUpstream = upstreamTargetForRequest(r, target, playbackTarget)
-			}
-			directTarget := mainVideoDirectTarget(r, directUpstream)
+			directTarget := mainVideoDirectTarget(r, routedUpstream(r))
 			if tracker := backendAddressTrackerFromContext(r.Context()); tracker != nil {
 				tracker.SetURL(directTarget)
 			}
@@ -437,35 +472,27 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				_, _ = w.Write([]byte(`{"error":"invalid websocket upgrade"}`))
 				return
 			}
-			wsTarget := upstreamTargetForRequest(r, target, playbackTarget)
-			if isRedirectMode {
-				wsTarget = target
-			}
-			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, pm, trafficQuota, configuredHeaders)
+			handleWebSocket(w, r, routedUpstream(r), target, policy, inst, speedLimitBytes, pm, trafficQuota, configuredHeaders)
 			return
 		}
 
-		cacheTarget := upstreamTargetForRequest(r, target, playbackTarget)
-		if isRedirectMode {
-			cacheTarget = target
-		}
-		if cacheReq := pm.assetCache.request(site, r, assetCacheTargetURL(r, cacheTarget)); cacheReq != nil {
-			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
-				var cacheWriter http.ResponseWriter
-				if speedLimitBytes > 0 {
-					limited := &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut(), start: time.Now(), ctx: r.Context()}
-					if trafficQuota > 0 {
-						cacheWriter = &quotaLimitedWriter{meteredWriter: meteredWriter{ResponseWriter: limited}, pm: pm, inst: inst, quota: trafficQuota}
-					} else {
-						cacheWriter = limited
-					}
+		cacheTarget := routedUpstream(r)
+		var cacheHit *assetCacheHit
+		r, cacheHit = prepareAssetCacheRequest(pm.assetCache, site, r, assetCacheTargetURL(r, cacheTarget))
+		if cacheHit != nil {
+			var cacheWriter http.ResponseWriter
+			if speedLimitBytes > 0 {
+				limited := &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: inst.trafficBytesOut(), cumulative: inst.trafficCumulativeOut(), start: time.Now(), ctx: r.Context()}
+				if trafficQuota > 0 {
+					cacheWriter = &quotaLimitedWriter{meteredWriter: meteredWriter{ResponseWriter: limited}, pm: pm, inst: inst, quota: trafficQuota}
 				} else {
-					cacheWriter = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
+					cacheWriter = limited
 				}
-				serveAssetCacheHit(cacheWriter, r, hit)
-				return
+			} else {
+				cacheWriter = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
 			}
-			r = r.WithContext(context.WithValue(r.Context(), assetCacheContextKey{}, cacheReq))
+			serveAssetCacheHit(cacheWriter, r, cacheHit)
+			return
 		}
 
 		if r.Body != nil {
@@ -475,7 +502,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				r.Body = &meteredReader{ReadCloser: r.Body, read: inst.trafficBytesIn(), cumulative: inst.trafficCumulativeIn()}
 			}
 		}
-		if len(failoverTargets) > 1 {
+		if r.Method == http.MethodPost && allowsFailover(r, cacheTarget) {
 			if err := prepareFailoverPlaybackInfoBody(r, redirectPolicy.limits.MaxBodyBytes); err != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
@@ -654,7 +681,6 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	return nil
 }
-
 
 // meteredOrQuotaWriter returns the response writer that meters site traffic,
 // wrapped with mid-stream quota enforcement when the site has a quota.

@@ -130,6 +130,25 @@ func (update *edgeAgentUpdate) commit(ctx context.Context) error {
 	return errEdgeAgentUpdated
 }
 
+// The supervisor has already authenticated and fenced the update generation.
+// Stop every event producer and durably export the rollback-compatible queue
+// before an older executable can become the next process.
+func commitEdgeAgentRuntimeUpdate(ctx context.Context, runtime *edgeAgentRuntime, update *edgeAgentUpdate) error {
+	if err := ctx.Err(); err != nil {
+		update.discard()
+		return err
+	}
+	if err := runtime.close(); err != nil {
+		update.discard()
+		return fmt.Errorf("prepare backward-compatible event spool before Agent update: %w", err)
+	}
+	err := update.commit(ctx)
+	if !errors.Is(err, errEdgeAgentUpdated) {
+		return fmt.Errorf("Agent stopped for update but replacement failed: %w", err)
+	}
+	return err
+}
+
 func edgePrepareAgentUpdate(ctx context.Context, client *http.Client, controller, token string, config AgentRuntimeConfig) (*edgeAgentUpdate, error) {
 	if len(config.AgentSHA256) != sha256.Size*2 {
 		return nil, nil

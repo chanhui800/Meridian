@@ -3143,7 +3143,7 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	targetHostIngressWithoutTLS := a.panelBindLoopback || len(a.trustedProxies) > 0
+	targetHostIngressWithoutTLS := hostOnlyIngressAvailable(a.panelBindLoopback, false, a.panelExternalProxyEnabled, a.trustedProxies)
 	resetIngressCount, err := writeRestorePendingFromPaths(a.dbPath, manifest, entries, jwtSecret, targetHeaderKey, preservedPanelSettings, targetHostIngressWithoutTLS)
 	if err != nil {
 		a.jsonErr(w, http.StatusBadRequest, "恢复校验失败："+err.Error())

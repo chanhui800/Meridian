@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -588,14 +589,21 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		previous = &url.URL{Scheme: claims.PreviousScheme}
 	}
 	authority := dynamicCanonicalAuthority(target)
+	sourceRole := "configured"
+	if !claims.Trusted {
+		sourceRole = "dynamic"
+	}
+	upstreamCtx := prepareRequestDiagnosticsAttempt(r.Context(), target, sourceRole)
 	var transport http.RoundTripper
-	var dynamicTransport *http.Transport
+	var dynamicTransport *dynamicTransportLease
+	var selfTargets *dynamicSelfTargetPolicy
+	var pinnedIPs []net.IP
 	rollback := func() {}
 	commit := func() {}
 	if claims.Trusted {
 		transport = i.configuredTransport
 	} else {
-		selfTargets := i.state.runtime.selfTargets.Load()
+		selfTargets = i.state.runtime.selfTargets.Load()
 		if reasonCode := i.policy.validateTarget(previous, target, selfTargets); reasonCode != "" {
 			i.observe(claims.Source, dynamicObservationDecisionDenied, reasonCode, authority)
 			newDynamicProxyError(reasonCode).writeResponse(w)
@@ -609,26 +617,13 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		}
 		rollback = reservation.rollback
 		commit = reservation.commit
-		pinnedIPs, reasonCode := reservation.resolve(r.Context(), target, selfTargets)
+		pinnedIPs, reasonCode = reservation.resolve(upstreamCtx, target, selfTargets)
 		if reasonCode != "" {
 			rollback()
 			i.observe(claims.Source, dynamicObservationDecisionDenied, reasonCode, authority)
 			newDynamicProxyError(reasonCode).writeResponse(w)
 			return
 		}
-		dynamicTransport, err = i.newTransport(target, pinnedIPs, selfTargets)
-		if err != nil {
-			rollback()
-			reasonCode = dynamicObservationReasonAddressDenied
-			if errors.Is(err, errDynamicSelfTarget) {
-				reasonCode = dynamicObservationReasonSelfTarget
-			}
-			i.observe(claims.Source, dynamicObservationDecisionDenied, reasonCode, authority)
-			newDynamicProxyError(reasonCode).writeResponse(w)
-			return
-		}
-		defer dynamicTransport.CloseIdleConnections()
-		transport = dynamicTransport
 	}
 	defer rollback()
 	mainVideoDirect := i.site.MainVideoStreamMode == mainVideoStreamModeDirect && claims.Kind == dynamicCapabilityKindResource && claims.Source != dynamicDiscoverySourceHLS && claims.Source != dynamicDiscoverySourceDASH && len(claims.RequiredHeaders) == 0 && isMainVideoStreamURL(target)
@@ -650,16 +645,28 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer releaseStream()
+	if !claims.Trusted {
+		dynamicTransport, err = borrowDynamicTransport(upstreamCtx, i.state, target, pinnedIPs, selfTargets, i.transportFactory)
+		if err != nil {
+			rollback()
+			reasonCode := dynamicTransportConstructionFailureReason(err)
+			i.observe(claims.Source, dynamicObservationDecisionDenied, reasonCode, authority)
+			newDynamicProxyError(reasonCode).writeResponse(w)
+			return
+		}
+		defer dynamicTransport.Close()
+		transport = dynamicTransport
+	}
 
 	// #nosec G704 -- the target is either administrator-configured or normalized, policy-checked, DNS-pinned, and sent through a proxy-free transport.
-	outbound, err := http.NewRequestWithContext(isolateDynamicOutboundContext(r.Context()), r.Method, target.String(), nil)
+	outbound, err := http.NewRequestWithContext(isolateDynamicRequestDiagnosticsContext(upstreamCtx), r.Method, target.String(), nil)
 	if err != nil {
 		rollback()
 		writeDynamicCapabilityUnavailable(w)
 		return
 	}
 	outbound.Host = target.Host
-	outbound.Close = !claims.Trusted
+	outbound.Close = dynamicTransport != nil && !dynamicTransport.pooled()
 	if claims.Trusted {
 		outbound.Header = r.Header.Clone()
 		prepareUpstreamHeadersWithClientIPMode(outbound.Header, r, i.uaPolicy, i.site.ClientIPMode, i.trustedProxies)
@@ -683,8 +690,11 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		redirectHeaders = outbound.Header.Clone()
 		applyDynamicCapabilityRequiredHeaders(outbound.Header, claims)
 	}
-	resp, roundTripErr := transport.RoundTrip(outbound)
+	resp, roundTripErr := roundTripWithRequestDiagnostics(transport, outbound, sourceRole)
 	if roundTripErr != nil || resp == nil {
+		if !isClientRequestCancellation(originalRequestContext(r.Context()), roundTripErr) {
+			requestDiagnosticsFromContext(r.Context()).markUpstreamError()
+		}
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
@@ -727,6 +737,8 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			dynamicState:            i.state,
 			capabilityIssuer:        i,
 			streamLeaseHeld:         true,
+			initialDynamicTransport: dynamicTransport,
+			capabilityRequest:       true,
 			mainVideoDirect:         i.site.MainVideoStreamMode == mainVideoStreamModeDirect,
 			database:                i.database,
 			siteID:                  i.siteID,
@@ -796,8 +808,13 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 	} else {
 		rollbackDynamicResponseAuthorities(resp)
 	}
+	observeRequestDiagnosticsResponse(resp)
 	if resp.Body != nil {
 		defer resp.Body.Close()
 	}
-	_ = copyDynamicResponse(w, resp, r.Method)
+	if err := copyDynamicResponse(w, resp, r.Method); err != nil {
+		// The response has started. Let net/http abort the transfer so a partial
+		// media body cannot end with a successful HTTP framing terminator.
+		panic(http.ErrAbortHandler)
+	}
 }

@@ -1,3 +1,28 @@
+let modalIntentGeneration = 0;
+let modalCurrentIntent = null;
+
+function beginModalIntent(owner) {
+  const intent = {
+    generation: ++modalIntentGeneration,
+    owner: owner || '',
+    route: typeof Router === 'undefined' ? null : Router.current,
+  };
+  modalCurrentIntent = intent;
+  return intent;
+}
+
+function isModalIntentCurrent(intent) {
+  return !!intent && intent === modalCurrentIntent && intent.generation === modalIntentGeneration
+    && (typeof Router === 'undefined' || Router.current === intent.route);
+}
+
+function invalidateModalIntent(owner) {
+  if (owner && modalCurrentIntent?.owner !== owner) return false;
+  modalCurrentIntent = null;
+  modalIntentGeneration += 1;
+  return true;
+}
+
 (function() {
   'use strict';
 
@@ -85,6 +110,8 @@
   });
 
   window.openModal = function(options) {
+    const intent = options?.intent || beginModalIntent();
+    if (!isModalIntentCurrent(intent)) return;
     modalBackdropClosable = !!(options && options.closeOnBackdrop);
     modalPreviousFocus = document.activeElement;
     const overlay = document.getElementById('modal-overlay');
@@ -97,7 +124,7 @@
     overlay.setAttribute('aria-hidden', 'false');
     document.body.classList.add('modal-open');
     const focusForm = () => {
-      if (!overlay.classList.contains('active') || typeof modal.querySelectorAll !== 'function') return;
+      if (!isModalIntentCurrent(intent) || !overlay.classList.contains('active') || typeof modal.querySelectorAll !== 'function') return;
       const fields = Array.from(modal.querySelectorAll('input, select, textarea, button, a[href], [tabindex]'))
         .filter(element => !element.disabled && element.tabIndex >= 0 && element.getClientRects().length > 0);
       const preferred = fields.find(element => element.matches('input:not([type="hidden"]), select, textarea')) || fields[0];
@@ -108,6 +135,8 @@
   };
 
   window.closeModal = function(options) {
+    if (options?.intent && !isModalIntentCurrent(options.intent)) return;
+    invalidateModalIntent();
     modalBackdropClosable = false;
     const overlay = document.getElementById('modal-overlay');
     overlay.classList.remove('active');

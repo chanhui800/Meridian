@@ -81,6 +81,14 @@ type watchHistoryEvent struct {
 	DeviceName      string
 	PlaySessionID   string
 	TokenCiphertext string
+	// ClientIdentityHash is a keyed, process-local proof of the credential
+	// observed on a successful playback request. It never reaches the UI.
+	ClientIdentityHash      string `json:"client_identity_hash,omitempty"`
+	ClientStopRequestedAtMS int64  `json:"client_stop_requested_at_ms,omitempty"`
+	ClientStopOutcome       string `json:"client_stop_outcome,omitempty"`
+	ResponseStatusCode      int    `json:"response_status_code,omitempty"`
+	StopResponseAtMS        int64  `json:"stop_response_at_ms,omitempty"`
+	sourceNodeID            int64
 }
 
 type WatchHistoryFilter struct {
@@ -95,51 +103,54 @@ type WatchHistoryFilter struct {
 }
 
 type WatchHistoryEntry struct {
-	ID                int64                    `json:"id"`
-	SiteID            int64                    `json:"site_id"`
-	SiteName          string                   `json:"site_name"`
-	MediaItemID       int64                    `json:"media_item_id"`
-	UpstreamItemID    string                   `json:"upstream_item_id"`
-	MediaType         string                   `json:"media_type"`
-	Title             string                   `json:"title"`
-	OriginalTitle     string                   `json:"original_title"`
-	ProductionYear    int                      `json:"production_year"`
-	SeriesName        string                   `json:"series_name"`
-	SeasonNumber      int                      `json:"season_number"`
-	EpisodeNumber     int                      `json:"episode_number"`
-	TMDBType          string                   `json:"tmdb_type"`
-	TMDBID            int64                    `json:"tmdb_id"`
-	Overview          string                   `json:"overview"`
-	PosterPath        string                   `json:"poster_path"`
-	BackdropPath      string                   `json:"backdrop_path"`
-	ReleaseDate       string                   `json:"release_date"`
-	VoteAverage       float64                  `json:"vote_average"`
-	Genres            []string                 `json:"genres"`
-	Status            string                   `json:"status"`
-	LastAirDate       string                   `json:"last_air_date"`
-	NextAirDate       string                   `json:"next_air_date"`
-	NextSeasonNumber  int                      `json:"next_season_number"`
-	NextEpisodeNumber int                      `json:"next_episode_number"`
-	NextEpisodeName   string                   `json:"next_episode_name"`
-	SeasonCount       int                      `json:"season_count"`
-	EpisodeCount      int                      `json:"episode_count"`
-	Stills            []string                 `json:"stills"`
-	Cast              []WatchHistoryCastMember `json:"cast"`
-	MatchStatus       string                   `json:"match_status"`
-	StartedAtMS       int64                    `json:"started_at_ms"`
-	LastSeenAtMS      int64                    `json:"last_seen_at_ms"`
-	StoppedAtMS       int64                    `json:"stopped_at_ms"`
-	PositionTicks     int64                    `json:"position_ticks"`
-	RunTimeTicks      int64                    `json:"runtime_ticks"`
-	PlayMethod        string                   `json:"play_method"`
-	Completed         bool                     `json:"completed"`
-	UserName          string                   `json:"user_name"`
-	UserID            string                   `json:"user_id"`
-	ClientName        string                   `json:"client_name"`
-	DeviceID          string                   `json:"device_id"`
-	DeviceName        string                   `json:"device_name"`
-	PlaySessionID     string                   `json:"play_session_id"`
-	TokenStored       bool                     `json:"token_stored"`
+	ID                      int64                    `json:"id"`
+	SiteID                  int64                    `json:"site_id"`
+	SiteName                string                   `json:"site_name"`
+	MediaItemID             int64                    `json:"media_item_id"`
+	UpstreamItemID          string                   `json:"upstream_item_id"`
+	MediaType               string                   `json:"media_type"`
+	Title                   string                   `json:"title"`
+	OriginalTitle           string                   `json:"original_title"`
+	ProductionYear          int                      `json:"production_year"`
+	SeriesName              string                   `json:"series_name"`
+	SeasonNumber            int                      `json:"season_number"`
+	EpisodeNumber           int                      `json:"episode_number"`
+	TMDBType                string                   `json:"tmdb_type"`
+	TMDBID                  int64                    `json:"tmdb_id"`
+	Overview                string                   `json:"overview"`
+	PosterPath              string                   `json:"poster_path"`
+	BackdropPath            string                   `json:"backdrop_path"`
+	ReleaseDate             string                   `json:"release_date"`
+	VoteAverage             float64                  `json:"vote_average"`
+	Genres                  []string                 `json:"genres"`
+	Status                  string                   `json:"status"`
+	LastAirDate             string                   `json:"last_air_date"`
+	NextAirDate             string                   `json:"next_air_date"`
+	NextSeasonNumber        int                      `json:"next_season_number"`
+	NextEpisodeNumber       int                      `json:"next_episode_number"`
+	NextEpisodeName         string                   `json:"next_episode_name"`
+	SeasonCount             int                      `json:"season_count"`
+	EpisodeCount            int                      `json:"episode_count"`
+	Stills                  []string                 `json:"stills"`
+	Cast                    []WatchHistoryCastMember `json:"cast"`
+	MatchStatus             string                   `json:"match_status"`
+	StartedAtMS             int64                    `json:"started_at_ms"`
+	LastSeenAtMS            int64                    `json:"last_seen_at_ms"`
+	StoppedAtMS             int64                    `json:"stopped_at_ms"`
+	PositionTicks           int64                    `json:"position_ticks"`
+	RunTimeTicks            int64                    `json:"runtime_ticks"`
+	PlayMethod              string                   `json:"play_method"`
+	Completed               bool                     `json:"completed"`
+	UserName                string                   `json:"user_name"`
+	UserID                  string                   `json:"user_id"`
+	ClientName              string                   `json:"client_name"`
+	DeviceID                string                   `json:"device_id"`
+	DeviceName              string                   `json:"device_name"`
+	PlaySessionID           string                   `json:"play_session_id"`
+	TokenStored             bool                     `json:"token_stored"`
+	ClientStopRequestedAtMS int64                    `json:"client_stop_requested_at_ms"`
+	ClientStopOutcome       string                   `json:"client_stop_outcome"`
+	sessionHash             string
 }
 
 func watchHistoryTokenKeyForSecret(secret []byte) []byte {
@@ -308,6 +319,8 @@ type watchHistoryBodyCapture struct {
 	overflow        bool
 	complete        bool
 	metadataDB      *DB
+	stopObserved    sync.Once
+	onComplete      func()
 }
 
 func (c *watchHistoryBodyCapture) Read(buffer []byte) (int, error) {
@@ -333,7 +346,11 @@ func (c *watchHistoryBodyCapture) Read(buffer []byte) (int, error) {
 	if err == io.EOF {
 		c.complete = true
 	}
+	complete, onComplete := c.complete, c.onComplete
 	c.mu.Unlock()
+	if complete && onComplete != nil {
+		c.stopObserved.Do(onComplete)
+	}
 	return n, err
 }
 
@@ -344,6 +361,9 @@ func (c *watchHistoryBodyCapture) snapshot() ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.overflow || !c.complete || len(c.payload) == 0 || c.contentLength >= 0 && c.totalRead != c.contentLength {
+		return nil, false
+	}
+	if c.contentEncoding != "" && c.contentEncoding != "identity" && c.contentEncoding != "gzip" && c.contentEncoding != "deflate" {
 		return nil, false
 	}
 	payload := append([]byte(nil), c.payload...)
@@ -946,6 +966,7 @@ func watchHistoryPlaybackEventFromCapture(capture *watchHistoryBodyCapture, site
 	event.DeviceID = identity.deviceID
 	event.DeviceName = identity.deviceName
 	event.PlaySessionID = requestLogSafeText(payload.PlaySessionID, watchHistoryMaxIdentityBytes)
+	event.ClientIdentityHash = watchHistoryRequestIdentityHash(site.ID, identity.token, identity.deviceID, identity.clientName)
 	if identity.token != "" {
 		event.TokenCiphertext, _ = encryptWatchHistoryToken(identity.token)
 	}
@@ -996,6 +1017,12 @@ func decodeWatchHistoryPlaybackPayload(payloadBytes []byte) (watchHistoryPlaybac
 			return payload, true
 		}
 	}
+	trimmed := bytes.TrimSpace(payloadBytes)
+	if len(trimmed) == 0 || trimmed[0] == '{' || trimmed[0] == '[' {
+		// Malformed JSON must not be reinterpreted as a form containing an
+		// otherwise valid ItemId/session fragment.
+		return watchHistoryPlaybackPayload{}, false
+	}
 	values, err := url.ParseQuery(string(payloadBytes))
 	if err != nil {
 		return watchHistoryPlaybackPayload{}, false
@@ -1010,9 +1037,13 @@ func decodeWatchHistoryPlaybackPayload(payloadBytes []byte) (watchHistoryPlaybac
 		}
 		return ""
 	}
-	parseTicks := func(names ...string) int64 {
-		parsed, _ := strconv.ParseInt(value(names...), 10, 64)
-		return parsed
+	parseTicks := func(names ...string) (int64, bool) {
+		raw := value(names...)
+		if raw == "" {
+			return 0, true
+		}
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		return parsed, err == nil && parsed >= 0
 	}
 	payload.ItemID = value("ItemId", "ItemID")
 	payload.PlaySessionID = value("PlaySessionId", "PlaySessionID")
@@ -1021,10 +1052,11 @@ func decodeWatchHistoryPlaybackPayload(payloadBytes []byte) (watchHistoryPlaybac
 	payload.DeviceID = value("DeviceId", "DeviceID")
 	payload.DeviceName = value("DeviceName")
 	payload.MediaSourceID = value("MediaSourceId", "MediaSourceID")
-	payload.PositionTicks = parseTicks("PositionTicks")
-	payload.RunTimeTicks = parseTicks("RunTimeTicks")
+	var positionOK, runtimeOK bool
+	payload.PositionTicks, positionOK = parseTicks("PositionTicks")
+	payload.RunTimeTicks, runtimeOK = parseTicks("RunTimeTicks")
 	payload.PlayMethod = value("PlayMethod")
-	return payload, payload.ItemID != ""
+	return payload, payload.ItemID != "" && positionOK && runtimeOK
 }
 
 func mergeWatchHistoryPlaybackItems(primary, secondary *watchHistoryPlaybackItem) *watchHistoryPlaybackItem {
@@ -1130,6 +1162,7 @@ func watchHistoryLegacyProgressEvent(site Site, request *http.Request, trustedPr
 	event.ClientName = identity.clientName
 	event.DeviceID = identity.deviceID
 	event.DeviceName = identity.deviceName
+	event.ClientIdentityHash = watchHistoryRequestIdentityHash(site.ID, identity.token, identity.deviceID, identity.clientName)
 	event.PlaySessionID = requestLogSafeText(playSessionID, watchHistoryMaxIdentityBytes)
 	if identity.token != "" {
 		event.TokenCiphertext, _ = encryptWatchHistoryToken(identity.token)
@@ -1142,7 +1175,7 @@ func validWatchHistoryEvent(event watchHistoryEvent) bool {
 		len(event.UpstreamItemID) <= watchHistoryMaxIDBytes && event.ObservedAtMS > 0 && event.PositionTicks >= 0 && event.RunTimeTicks >= 0 &&
 		len(event.Title) <= watchHistoryMaxTitleBytes && len(event.OriginalTitle) <= watchHistoryMaxTitleBytes &&
 		len(event.SeriesName) <= watchHistoryMaxTitleBytes && len(event.IMDBID) <= watchHistoryMaxIDBytes && len(event.TVDBID) <= watchHistoryMaxIDBytes &&
-		len(event.UserName) <= watchHistoryMaxIdentityBytes && len(event.UserID) <= watchHistoryMaxIdentityBytes && len(event.DeviceID) <= watchHistoryMaxIdentityBytes && len(event.DeviceName) <= watchHistoryMaxIdentityBytes && len(event.PlaySessionID) <= watchHistoryMaxIdentityBytes && len(event.TokenCiphertext) <= watchHistoryMaxTokenBytes
+		len(event.UserName) <= watchHistoryMaxIdentityBytes && len(event.UserID) <= watchHistoryMaxIdentityBytes && len(event.ClientName) <= watchHistoryMaxIdentityBytes && len(event.DeviceID) <= watchHistoryMaxIdentityBytes && len(event.DeviceName) <= watchHistoryMaxIdentityBytes && len(event.PlaySessionID) <= watchHistoryMaxIdentityBytes && len(event.TokenCiphertext) <= watchHistoryMaxTokenBytes && validWatchHistoryStopEvent(event)
 }
 
 func (d *DB) EnqueueWatchHistory(event watchHistoryEvent) bool {
@@ -1151,7 +1184,11 @@ func (d *DB) EnqueueWatchHistory(event watchHistoryEvent) bool {
 	}
 	if d.edgeEphemeral {
 		if d.edgeWatchHistorySink != nil {
-			return d.edgeWatchHistorySink(event)
+			accepted := d.edgeWatchHistorySink(event)
+			if accepted && d.watchHistoryStops != nil {
+				d.watchHistoryStops.rememberPlayback(event)
+			}
+			return accepted
 		}
 		return false
 	}
@@ -1325,6 +1362,7 @@ func (d *DB) DroppedWatchHistory() uint64 {
 
 func mergeWatchHistoryEvents(current, candidate watchHistoryEvent) watchHistoryEvent {
 	newer := candidate.ObservedAtMS > current.ObservedAtMS
+	identityNewer := candidate.ObservedAtMS >= current.ObservedAtMS
 	if newer {
 		current.EventType = candidate.EventType
 		current.ObservedAtMS = candidate.ObservedAtMS
@@ -1383,22 +1421,32 @@ func mergeWatchHistoryEvents(current, candidate watchHistoryEvent) watchHistoryE
 		current.TVDBID = candidate.TVDBID
 	}
 	if candidate.UserName != "" {
-		current.UserName = candidate.UserName
+		if identityNewer {
+			current.UserName = candidate.UserName
+		}
 	}
-	if candidate.UserID != "" {
+	if identityNewer && candidate.UserID != "" {
 		current.UserID = candidate.UserID
 	}
-	if candidate.DeviceID != "" {
+	if identityNewer && candidate.DeviceID != "" {
 		current.DeviceID = candidate.DeviceID
 	}
-	if candidate.DeviceName != "" {
+	if identityNewer && candidate.DeviceName != "" {
 		current.DeviceName = candidate.DeviceName
 	}
-	if candidate.PlaySessionID != "" {
+	if identityNewer && candidate.PlaySessionID != "" {
 		current.PlaySessionID = candidate.PlaySessionID
 	}
-	if candidate.TokenCiphertext != "" {
+	if identityNewer && candidate.TokenCiphertext != "" {
 		current.TokenCiphertext = candidate.TokenCiphertext
+	}
+	if identityNewer {
+		current.ClientIdentityHash = candidate.ClientIdentityHash
+		current.sourceNodeID = candidate.sourceNodeID
+		current.ResponseStatusCode = candidate.ResponseStatusCode
+		if candidate.ClientName != "" {
+			current.ClientName = candidate.ClientName
+		}
 	}
 	return current
 }
@@ -1411,11 +1459,20 @@ func watchHistoryCompleted(positionTicks, runtimeTicks int64) bool {
 }
 
 func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
+	// Publish committed session identity proofs before another watch write or
+	// overlay read can observe the new row with the previous client's proof.
+	d.watchHistoryWriteMu.Lock()
+	defer d.watchHistoryWriteMu.Unlock()
 	merged := make(map[string]watchHistoryEvent, len(batch))
+	stops := make([]watchHistoryEvent, 0)
 	skipped := 0
 	for _, event := range batch {
 		if !validWatchHistoryEvent(event) {
 			skipped++
+			continue
+		}
+		if event.ClientStopOutcome != "" {
+			stops = append(stops, event)
 			continue
 		}
 		key := strconv.FormatInt(event.SiteID, 10) + "\x00" + event.SessionHash
@@ -1425,7 +1482,7 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 			merged[key] = event
 		}
 	}
-	if len(merged) == 0 {
+	if len(merged) == 0 && len(stops) == 0 {
 		return skipped, nil
 	}
 	tx, err := d.db.Begin()
@@ -1514,22 +1571,32 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 			media_item_id=excluded.media_item_id,
 			started_at_ms=MIN(watch_sessions.started_at_ms, excluded.started_at_ms),
 			last_seen_at_ms=MAX(watch_sessions.last_seen_at_ms, excluded.last_seen_at_ms),
-			stopped_at_ms=MAX(watch_sessions.stopped_at_ms, excluded.stopped_at_ms),
+			stopped_at_ms=CASE WHEN excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms AND excluded.last_seen_at_ms>watch_sessions.client_stop_requested_at_ms THEN excluded.stopped_at_ms WHEN excluded.stopped_at_ms>0 AND excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.last_seen_at_ms>=watch_sessions.client_stop_requested_at_ms THEN MAX(watch_sessions.stopped_at_ms, excluded.stopped_at_ms) ELSE watch_sessions.stopped_at_ms END,
+			client_stop_requested_at_ms=CASE WHEN excluded.stopped_at_ms=0 AND excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms AND excluded.last_seen_at_ms>watch_sessions.client_stop_requested_at_ms THEN 0 ELSE watch_sessions.client_stop_requested_at_ms END,
+			client_stop_outcome=CASE WHEN excluded.stopped_at_ms=0 AND excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms AND excluded.last_seen_at_ms>watch_sessions.client_stop_requested_at_ms THEN '' ELSE watch_sessions.client_stop_outcome END,
 			position_ticks=CASE WHEN excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms OR (excluded.last_seen_at_ms=watch_sessions.last_seen_at_ms AND excluded.position_ticks>=watch_sessions.position_ticks) THEN excluded.position_ticks ELSE watch_sessions.position_ticks END,
 			runtime_ticks=CASE WHEN excluded.runtime_ticks>0 AND (excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms OR watch_sessions.runtime_ticks=0 OR (excluded.last_seen_at_ms=watch_sessions.last_seen_at_ms AND excluded.position_ticks>=watch_sessions.position_ticks)) THEN excluded.runtime_ticks ELSE watch_sessions.runtime_ticks END,
 			play_method=CASE WHEN excluded.play_method<>'' AND (excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms OR watch_sessions.play_method='' OR (excluded.last_seen_at_ms=watch_sessions.last_seen_at_ms AND excluded.position_ticks>=watch_sessions.position_ticks)) THEN excluded.play_method ELSE watch_sessions.play_method END,
-			completed=MAX(watch_sessions.completed, excluded.completed),
-			user_name=CASE WHEN excluded.user_name<>'' THEN excluded.user_name ELSE watch_sessions.user_name END,
-			user_id=CASE WHEN excluded.user_id<>'' THEN excluded.user_id ELSE watch_sessions.user_id END,
-			client_name=CASE WHEN excluded.client_name<>'' THEN excluded.client_name ELSE watch_sessions.client_name END,
-			device_id=CASE WHEN excluded.device_id<>'' THEN excluded.device_id ELSE watch_sessions.device_id END,
-			device_name=CASE WHEN excluded.device_name<>'' THEN excluded.device_name ELSE watch_sessions.device_name END,
-			play_session_id=CASE WHEN excluded.play_session_id<>'' THEN excluded.play_session_id ELSE watch_sessions.play_session_id END,
-			token_ciphertext=CASE WHEN excluded.token_ciphertext<>'' THEN excluded.token_ciphertext ELSE watch_sessions.token_ciphertext END`,
+			completed=CASE WHEN excluded.stopped_at_ms=0 AND excluded.last_seen_at_ms>watch_sessions.last_seen_at_ms AND excluded.last_seen_at_ms>watch_sessions.client_stop_requested_at_ms AND (watch_sessions.stopped_at_ms>0 OR watch_sessions.client_stop_requested_at_ms>0) THEN excluded.completed ELSE MAX(watch_sessions.completed, excluded.completed) END,
+			user_name=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.user_name<>'' THEN excluded.user_name ELSE watch_sessions.user_name END,
+			user_id=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.user_id<>'' THEN excluded.user_id ELSE watch_sessions.user_id END,
+			client_name=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.client_name<>'' THEN excluded.client_name ELSE watch_sessions.client_name END,
+			device_id=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.device_id<>'' THEN excluded.device_id ELSE watch_sessions.device_id END,
+			device_name=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.device_name<>'' THEN excluded.device_name ELSE watch_sessions.device_name END,
+			play_session_id=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.play_session_id<>'' THEN excluded.play_session_id ELSE watch_sessions.play_session_id END,
+			token_ciphertext=CASE WHEN excluded.last_seen_at_ms>=watch_sessions.last_seen_at_ms AND excluded.token_ciphertext<>'' THEN excluded.token_ciphertext ELSE watch_sessions.token_ciphertext END`,
 			event.SiteID, mediaItemID, event.SessionHash, event.ObservedAtMS, event.ObservedAtMS, stoppedAtMS,
 			event.PositionTicks, event.RunTimeTicks, event.PlayMethod, completed, event.UserName, event.UserID, event.ClientName, event.DeviceID, event.DeviceName, event.PlaySessionID, event.TokenCiphertext)
 		if err != nil {
 			return 0, err
+		}
+		if d.watchHistoryStops != nil && d.watchHistoryStops.playbackChangesClient(event) {
+			// A successful request from a different observed client/source must
+			// never inherit a pending stop belonging to the previous identity.
+			if _, err := tx.Exec(`UPDATE watch_sessions SET client_stop_requested_at_ms=0,client_stop_outcome='',stopped_at_ms=0
+				WHERE site_id=? AND session_hash=? AND last_seen_at_ms<=?`, event.SiteID, event.SessionHash, event.ObservedAtMS); err != nil {
+				return 0, err
+			}
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO tmdb_jobs (
 			media_item_id, state, attempts, next_attempt_at_ms, lease_until_ms, last_error_code, updated_at_ms
@@ -1550,8 +1617,30 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 			}
 		}
 	}
+	committedStops := make([]watchHistoryEvent, 0, len(stops))
+	for _, event := range stops {
+		resolved, updated, err := d.writeWatchHistoryStopTx(tx, event, merged)
+		if err != nil {
+			return 0, err
+		}
+		if updated {
+			committedStops = append(committedStops, resolved)
+		} else {
+			skipped++
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	if d.watchHistoryStops != nil {
+		for _, event := range merged {
+			if siteExists[event.SiteID] {
+				d.watchHistoryStops.rememberPlayback(event)
+			}
+		}
+		for _, event := range committedStops {
+			d.watchHistoryStops.committed(event)
+		}
 	}
 	return skipped, nil
 }
@@ -1576,6 +1665,8 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 	if err := d.flushDynamicObservationsIfSmall(); err != nil {
 		return nil, err
 	}
+	d.watchHistoryWriteMu.Lock()
+	defer d.watchHistoryWriteMu.Unlock()
 	conditions := []string{"1=1"}
 	outerConditions := []string{"series_rank=1"}
 	args := make([]any, 0, 12)
@@ -1609,15 +1700,11 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 	args = append(args, filter.Limit)
 	// #nosec G202 -- conditions contains only fixed SQL fragments selected by
 	// validated filters; every caller-supplied value remains a bound parameter.
+	// Rank only the page identity and ordering fields. Large overview/cast/image
+	// payloads are joined after LIMIT, while the representative and cursor keep
+	// exactly the same ordering over the full filtered history.
 	rows, err := d.db.Query(`WITH ranked_history AS (
-		SELECT ws.id AS history_id, ws.site_id AS history_site_id, s.name AS site_name,
-		mi.id AS media_item_id, mi.upstream_item_id, mi.media_type,
-		mi.title, mi.original_title, mi.production_year, mi.series_name, mi.season_number, mi.episode_number,
-		mi.tmdb_type, mi.tmdb_id, mi.overview, mi.poster_path, mi.backdrop_path, mi.release_date, mi.vote_average,
-		mi.genres_json, mi.status, mi.last_air_date, mi.next_air_date, mi.next_season_number, mi.next_episode_number,
-		mi.next_episode_name, mi.season_count, mi.episode_count, mi.stills_json, mi.cast_json, mi.match_status,
-		ws.started_at_ms, ws.last_seen_at_ms, ws.stopped_at_ms, ws.position_ticks, ws.runtime_ticks, ws.play_method, ws.completed,
-		ws.user_name, ws.user_id, ws.client_name, ws.device_id, ws.device_name, ws.play_session_id, CASE WHEN ws.token_ciphertext<>'' THEN 1 ELSE 0 END AS token_stored,
+		SELECT ws.id AS history_id, ws.last_seen_at_ms,
 		ROW_NUMBER() OVER (
 			PARTITION BY ws.site_id, CASE
 				WHEN mi.media_type='episode' AND trim(mi.series_name)<>'' THEN 'series-name:'||lower(trim(mi.series_name))
@@ -1635,17 +1722,21 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 		JOIN media_items mi ON mi.id=ws.media_item_id
 		JOIN sites s ON s.id=ws.site_id
 		WHERE `+strings.Join(conditions, " AND ")+`
+	), selected_page AS (
+		SELECT history_id FROM ranked_history
+		WHERE `+strings.Join(outerConditions, " AND ")+`
+		ORDER BY last_seen_at_ms DESC, history_id DESC LIMIT ?
 	)
-	SELECT history_id, history_site_id, site_name, media_item_id, upstream_item_id, media_type,
-		title, original_title, production_year, series_name, season_number, episode_number,
-		tmdb_type, tmdb_id, overview, poster_path, backdrop_path, release_date, vote_average,
-		genres_json, status, last_air_date, next_air_date, next_season_number, next_episode_number,
-		next_episode_name, season_count, episode_count, stills_json, cast_json, match_status,
-		started_at_ms, last_seen_at_ms, stopped_at_ms, position_ticks, runtime_ticks, play_method, completed,
-		user_name, user_id, client_name, device_id, device_name, play_session_id, token_stored
-	FROM ranked_history
-	WHERE `+strings.Join(outerConditions, " AND ")+`
-	ORDER BY last_seen_at_ms DESC, history_id DESC LIMIT ?`, args...)
+	SELECT ws.id, ws.site_id, s.name, mi.id, mi.upstream_item_id, mi.media_type,
+		mi.title, mi.original_title, mi.production_year, mi.series_name, mi.season_number, mi.episode_number,
+		mi.tmdb_type, mi.tmdb_id, mi.overview, mi.poster_path, mi.backdrop_path, mi.release_date, mi.vote_average,
+		mi.genres_json, mi.status, mi.last_air_date, mi.next_air_date, mi.next_season_number, mi.next_episode_number,
+		mi.next_episode_name, mi.season_count, mi.episode_count, mi.stills_json, mi.cast_json, mi.match_status,
+		ws.started_at_ms, ws.last_seen_at_ms, ws.stopped_at_ms, ws.position_ticks, ws.runtime_ticks, ws.play_method, ws.completed, ws.session_hash, ws.client_stop_requested_at_ms, ws.client_stop_outcome,
+		ws.user_name, ws.user_id, ws.client_name, ws.device_id, ws.device_name, ws.play_session_id, CASE WHEN ws.token_ciphertext<>'' THEN 1 ELSE 0 END
+	FROM selected_page p JOIN watch_sessions ws ON ws.id=p.history_id
+	JOIN media_items mi ON mi.id=ws.media_item_id JOIN sites s ON s.id=ws.site_id
+	ORDER BY ws.last_seen_at_ms DESC, ws.id DESC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1660,7 +1751,7 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 			&entry.TMDBType, &entry.TMDBID, &entry.Overview, &entry.PosterPath, &entry.BackdropPath, &entry.ReleaseDate, &entry.VoteAverage,
 			&genresJSON, &entry.Status, &entry.LastAirDate, &entry.NextAirDate, &entry.NextSeasonNumber, &entry.NextEpisodeNumber,
 			&entry.NextEpisodeName, &entry.SeasonCount, &entry.EpisodeCount, &stillsJSON, &castJSON, &entry.MatchStatus,
-			&entry.StartedAtMS, &entry.LastSeenAtMS, &entry.StoppedAtMS, &entry.PositionTicks, &entry.RunTimeTicks, &entry.PlayMethod, &completed,
+			&entry.StartedAtMS, &entry.LastSeenAtMS, &entry.StoppedAtMS, &entry.PositionTicks, &entry.RunTimeTicks, &entry.PlayMethod, &completed, &entry.sessionHash, &entry.ClientStopRequestedAtMS, &entry.ClientStopOutcome,
 			&entry.UserName, &entry.UserID, &entry.ClientName, &entry.DeviceID, &entry.DeviceName, &entry.PlaySessionID, &tokenStored); err != nil {
 			return nil, err
 		}
@@ -1669,6 +1760,7 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 		entry.Cast = decodeWatchHistoryCast(castJSON)
 		entry.Completed = completed == 1
 		entry.TokenStored = tokenStored == 1
+		d.watchHistoryStops.overlay(&entry)
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
@@ -1679,6 +1771,8 @@ func (d *DB) ListActiveWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEn
 }
 
 func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) ([]WatchHistoryEntry, error) {
+	d.watchHistoryWriteMu.Lock()
+	defer d.watchHistoryWriteMu.Unlock()
 	if filter.SiteID < 0 {
 		return nil, fmt.Errorf("invalid watch history filter")
 	}
@@ -1702,7 +1796,9 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 		conditions = append(conditions, "(mi.title LIKE '%'||?||'%' OR mi.original_title LIKE '%'||?||'%' OR mi.series_name LIKE '%'||?||'%')")
 		args = append(args, filter.Query, filter.Query, filter.Query)
 	}
-	args = append(args, watchHistoryActiveLimit)
+	// Read a bounded superset so pending stops can be overlaid immediately and
+	// a denied result can restore activity before its asynchronous write lands.
+	args = append(args, watchHistoryGlobalRowLimit)
 	// #nosec G202 -- conditions contains only fixed SQL fragments selected by
 	// validated filters; every caller-supplied value remains a bound parameter.
 	rows, err := d.db.Query(`SELECT ws.id, ws.site_id, s.name, mi.id, mi.upstream_item_id, mi.media_type,
@@ -1710,7 +1806,7 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 		mi.tmdb_type, mi.tmdb_id, mi.overview, mi.poster_path, mi.backdrop_path, mi.release_date, mi.vote_average,
 		mi.genres_json, mi.status, mi.last_air_date, mi.next_air_date, mi.next_season_number, mi.next_episode_number,
 		mi.next_episode_name, mi.season_count, mi.episode_count, mi.stills_json, mi.cast_json, mi.match_status,
-		ws.started_at_ms, ws.last_seen_at_ms, ws.stopped_at_ms, ws.position_ticks, ws.runtime_ticks, ws.play_method, ws.completed,
+		ws.started_at_ms, ws.last_seen_at_ms, ws.stopped_at_ms, ws.position_ticks, ws.runtime_ticks, ws.play_method, ws.completed, ws.session_hash, ws.client_stop_requested_at_ms, ws.client_stop_outcome,
 		ws.user_name, ws.user_id, ws.client_name, ws.device_id, ws.device_name, ws.play_session_id, CASE WHEN ws.token_ciphertext<>'' THEN 1 ELSE 0 END
 		FROM watch_sessions ws
 		JOIN media_items mi ON mi.id=ws.media_item_id
@@ -1731,16 +1827,23 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 			&entry.TMDBType, &entry.TMDBID, &entry.Overview, &entry.PosterPath, &entry.BackdropPath, &entry.ReleaseDate, &entry.VoteAverage,
 			&genresJSON, &entry.Status, &entry.LastAirDate, &entry.NextAirDate, &entry.NextSeasonNumber, &entry.NextEpisodeNumber,
 			&entry.NextEpisodeName, &entry.SeasonCount, &entry.EpisodeCount, &stillsJSON, &castJSON, &entry.MatchStatus,
-			&entry.StartedAtMS, &entry.LastSeenAtMS, &entry.StoppedAtMS, &entry.PositionTicks, &entry.RunTimeTicks, &entry.PlayMethod, &completed,
+			&entry.StartedAtMS, &entry.LastSeenAtMS, &entry.StoppedAtMS, &entry.PositionTicks, &entry.RunTimeTicks, &entry.PlayMethod, &completed, &entry.sessionHash, &entry.ClientStopRequestedAtMS, &entry.ClientStopOutcome,
 			&entry.UserName, &entry.UserID, &entry.ClientName, &entry.DeviceID, &entry.DeviceName, &entry.PlaySessionID, &tokenStored); err != nil {
 			return nil, err
+		}
+		entry.Completed = completed == 1
+		entry.TokenStored = tokenStored == 1
+		d.watchHistoryStops.overlay(&entry)
+		if watchHistoryEntryHasStopIntent(entry) {
+			continue
 		}
 		entry.Genres = decodeWatchHistoryGenres(genresJSON)
 		entry.Stills = decodeWatchHistoryStills(stillsJSON)
 		entry.Cast = decodeWatchHistoryCast(castJSON)
-		entry.Completed = completed == 1
-		entry.TokenStored = tokenStored == 1
 		entries = append(entries, entry)
+		if len(entries) == watchHistoryActiveLimit {
+			break
+		}
 	}
 	return entries, rows.Err()
 }

@@ -35,6 +35,16 @@ type dynamicRewriteSession struct {
 	minted               []string
 	urlCount             int
 	learnedPlaybackPaths []string
+	validation           *dynamicRewriteValidation
+}
+
+// A document's URLs share only its own authority validation. The marker is
+// passed to token minting, never to an eventual capability resource request.
+func (s *dynamicRewriteSession) validationContext() context.Context {
+	if s.validation == nil {
+		s.validation = &dynamicRewriteValidation{state: s.issuer.state, authorities: make(map[string]dynamicRewriteAuthorityValidation)}
+	}
+	return context.WithValue(s.ctx, dynamicRewriteValidationContextKey{}, s.validation)
 }
 
 func (s *dynamicRewriteSession) rememberRelativePlaybackPath(value string) {
@@ -124,7 +134,7 @@ func (s *dynamicRewriteSession) reuseShallowDynamicManifest(base, target *url.UR
 			s.issuer.observe(source, dynamicObservationDecisionDenied, reasonCode, authority)
 			return "", false, newDynamicProxyError(reasonCode)
 		}
-		if _, reasonCode = reservation.resolve(s.ctx, target, selfTargets); reasonCode != "" {
+		if _, reasonCode = reservation.resolve(s.validationContext(), target, selfTargets); reasonCode != "" {
 			reservation.rollback()
 			undo()
 			s.issuer.observe(source, dynamicObservationDecisionDenied, reasonCode, authority)
@@ -876,7 +886,7 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 	if !resourceDepthValid {
 		return "", fmt.Errorf("manifest nesting exceeds its depth limit")
 	}
-	route, acquired, discoveryErr := s.issuer.mintValidatedResourceWithRequiredHeadersTracked(s.ctx, base, target, source, target.String(), nil, nil, requiredHeaders, kind, depth)
+	route, acquired, discoveryErr := s.issuer.mintValidatedResourceWithRequiredHeadersTracked(s.validationContext(), base, target, source, target.String(), nil, nil, requiredHeaders, kind, depth)
 	if discoveryErr != nil {
 		return "", discoveryErr
 	}

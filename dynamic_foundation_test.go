@@ -326,8 +326,8 @@ func TestNewDynamicTransportUsesOneTotalPinnedDialDeadline(t *testing.T) {
 		t.Fatalf("bounded pinned dial error=%v, want deadline exceeded", err)
 	}
 	elapsed := time.Since(started)
-	if calls != 1 {
-		t.Fatalf("bounded pinned dial made %d sequential attempts after total deadline, want 1", calls)
+	if calls < 2 || calls > len(pins) {
+		t.Fatalf("bounded pinned dial made %d attempts, want bounded alternate attempts within the shared deadline", calls)
 	}
 	if elapsed < totalTimeout/2 || elapsed > time.Second {
 		t.Fatalf("bounded pinned dial elapsed=%s, want one %s total window", elapsed, totalTimeout)

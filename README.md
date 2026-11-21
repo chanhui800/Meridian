@@ -41,15 +41,18 @@ Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面�
 - 改写 PlaybackInfo、HLS、DASH、HTTP 重定向、字幕、图片和 WebSocket 地址。
 - 主视频流可以反代，也可以在上游返回合法公网 30x 时让客户端直连 CDN。
 - 记录请求、最终后端、客户端信息、收发字节和趋势。
+- 请求详情显示每次回源的连接、响应头与首字节耗时，以及缓存命中或跳过原因；实时日志更新保留当前阅读位置。
 - 实时趋势由 Controller 统一采样，支持缺报区间回填和历史点修订；速度保留真实峰值，流量与请求保持累计口径。
 - 可选观看历史、媒体库数量、保号提醒、TMDB 补全和 Telegram 日报。
 - 站点列表直接显示回源延迟，点击延迟结果即可重新测速，无需单独的测速按钮。
+- 点击站点行展开或收起详情，拖拽手柄在鼠标悬浮时显示；添加站点与故障诊断沿用统一布局。
 - 客户端 UA 默认透传，不内置伪装 UA；需要时可给站点指定自定义 UA。
 - 添加站点时自动识别 `https` 和端口，地址不完整时自动补全。
 - 支持 ACME DNS-01、自动续签、加密备份与恢复。
 - 可选节点调度：一个 Controller 管理多台 Linux Agent，DNS 只切换新连接。
 - 主控模式按站点启用：关闭时保留原面板入口；启用时可跟随全局调度或固定到指定节点。
 - Agent 地址族可按节点能力发布：V4 节点发布 A，V6 节点发布 AAAA，双栈节点默认同时发布 A/AAAA，也可在节点级手动只发布其中一个。
+- 注册和完整上报会自动填入可确认的公网 IPv4/IPv6，兼容已有节点的空地址字段，并保留已填写的手工地址；没有可用 IPv6 时保持为空。
 - Agent 支持 Linux amd64/arm64，安装器从当前主控获取并校验匹配版本的二进制；Controller 不需要把 Agent 打进镜像。
 - 默认内置离歌、Sakura、良友三个图标包，支持从来源链接刷新、自定义包导入，以及在站点图标选择弹窗内直接切换图标包。
 
@@ -206,6 +209,8 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 备份页面生成带密码的 `.mrbak` 文件。新备份使用 `MRDBKP02` 分块加密格式，旧的 `MRDBKP01` 备份仍可读取。备份恢复会校验文件数量、展开大小、数据库 schema 版本、路径和证书密钥对；恢复失败时原数据库和 TLS 状态不会被部分覆盖。默认不包含 TLS，迁移面板域名或节点证书时再显式勾选。
 
+安装器管理的 Nginx 为备份恢复请求设置 260 MiB 上限，为图标包导入和刷新请求设置 4160 KiB 上限，包含上传表单或 JSON 的额外空间；应用仍分别限制备份文件为 256 MiB、图标包为 4 MiB。普通请求保留 1 MiB 上限。更新时会迁移可识别的托管配置，保留 Certbot 的证书与 HTTPS 跳转；配置检查或重载失败会恢复原文件。
+
 ## 常用环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -217,6 +222,7 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 | `UPSTREAM_HEADER_KEY` | 自动生成 | 上游请求头密钥 |
 | `DYNAMIC_ROUTE_KEY` | 自动生成 | 动态路由密钥 |
 | `TRUSTED_PROXY_CIDRS` | `127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7` | 可信前置代理网段，默认包含回环、RFC1918 IPv4 私网和 IPv6 ULA |
+| `PANEL_EXTERNAL_PROXY_ENABLED` | `false` | 外部反代是否已部署；已有反代承载 Host 入口时设置 `true`，并配置可信来源 |
 | `ASSET_CACHE_DIR` | 数据库目录下 `asset-cache` | 图片缓存目录 |
 | `TLS_STATE_DIR` | 数据库目录下 `tls` | Meridian 管理的 TLS 状态目录，必须使用绝对路径，并与数据库、恢复目录分开 |
 | `PANEL_TLS_CERT_FILE` / `PANEL_TLS_KEY_FILE` | TLS 状态目录中的面板证书 | 可指定外部文件；恢复流程不会删除或替换 |
@@ -226,15 +232,21 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 `TRUSTED_PROXY_CIDRS` 未配置或留空时使用上述回环和私网范围，这些来源直达后端时可通过规范化的单值 `X-Real-IP` 和 `X-Forwarded-Proto` 提供真实客户端 IP 与 HTTPS 状态；非空自定义值会替换整个默认范围。实际前置代理应覆盖这两个请求头。公网、链路本地地址（`169.254.0.0/16`、`fe80::/10`）和 CGNAT（`100.64.0.0/10`）不在默认范围内，不要信任全网地址。
 
+默认转发头信任范围不会启用 Host 入口。公网 HTTP 面板需要通过 `PANEL_EXTERNAL_PROXY_ENABLED=true` 明确声明已有反代，并在 `TRUSTED_PROXY_CIDRS` 中限制实际代理来源；请求仍会检查连接来源是否可信。回环监听和内置面板 TLS 也支持 Host 入口。新安装写入 `false`，安装器配置或取消面板反代时分别写入 `true` 或 `false`。旧配置未设置此变量时，仅全部由 `/32` 或 `/128` 单地址组成的可信列表保留原有反代判定；使用私网网段的已有反代需要显式设为 `true`。备份恢复使用同一部署状态判断，当前服务器不支持的 Host 入口会被清空并停用，站点数据仍会保留。
+
 故障诊断、站点列表延迟和添加站点的线路测速均保留。诊断允许正常的本机、局域网与公网回源，拒绝云元数据和链路本地等特殊目标；DNS 解析结果校验后直接连接，不使用环境 HTTP 代理。添加站点的任意地址测试最多同时执行 4 个请求，允许 24 次突发、每秒恢复 1 次额度，超过限制时稍后重试。诊断不会转发管理登录凭据，日志只记录目标主机和测试结果。详细边界见[代码扫描复核](docs/code-scanning-review.md)。
 
 ## 升级和发布
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
 
+v1.11.7 汇总了反代可靠性、缓存、观看记录、站点交互与性能优化，具体变化和升级说明见 [v1.11.7 发布说明](docs/releases/v1.11.7.md)。
+
 升级 Controller 后，已注册 Agent 会通过受认证的配置和清单接口获取匹配版本的下载信息。正式版从固定 GitHub Release 下载，下载请求不携带 Controller 令牌；开发构建使用需要认证的 Controller 二进制接口。
 
 Agent 在后台下载、校验平台和 SHA-256，期间继续应用配置和上报完整心跳。下载完成后确认目标版本和配置仍有效，再原子替换并由服务管理器重启。普通升级保留节点令牌和状态，不需要重新注册。只有节点令牌被主动刷新、状态文件丢失或节点更换 Controller 时，才需要运行面板生成的 `--reenroll` 安装命令。
+
+Agent 事件队列使用有界的加密追加日志，必要的观看事件接收和 ACK 仍需持久化；普通事件批量写入以减少请求路径的磁盘开销。正常停止和自动更新会等待写入完成，并导出兼容旧版的队列。降级时应先正常停止 Agent；队列导出失败会阻止程序替换，积压超过旧格式上限时需先恢复上报并等待队列消化。
 
 原生 Controller 安装器会保留更新前的程序和数据，用于失败回滚。启用捆绑 Agent 二进制时，部分替换失败也会恢复已替换的程序，避免留下混合版本。
 
@@ -247,7 +259,7 @@ Windows 和 macOS 构建产物目前用于开发和测试；生产部署支持 L
 ```bash
 go mod verify
 go test ./...
-go test -race ./...
+go test -race -timeout=20m ./...
 go vet ./...
 GOOS=windows GOARCH=amd64 go vet ./...
 GOOS=darwin GOARCH=arm64 go vet ./...

@@ -353,24 +353,7 @@ func panelBodyReadTimeout(r *http.Request) time.Duration {
 }
 
 func staticHandler(staticFS fs.FS) http.Handler {
-	fileServer := http.FileServer(http.FS(staticFS))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
-		path := r.URL.Path
-		if path == "/" {
-			path = "/index.html"
-		}
-		f, err := staticFS.Open(strings.TrimPrefix(path, "/"))
-		if err == nil {
-			_ = f.Close()
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-		r.URL.Path = "/"
-		fileServer.ServeHTTP(w, r)
-	})
+	return newPanelStaticHandler(staticFS)
 }
 
 func (a *App) jsonResponse(w http.ResponseWriter, status int, data interface{}) {
