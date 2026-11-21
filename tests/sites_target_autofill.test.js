@@ -84,6 +84,7 @@ function siteModalHarness() {
     },
   };
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/app.js'), 'utf8').split('(function()')[0], sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'sites.js'), 'utf8'), sandbox);
   const emit = (control, name, value) => {
     control.value = value;
@@ -93,6 +94,21 @@ function siteModalHarness() {
   };
   return { sandbox, element, saved, emit };
 }
+
+test('create and edit forms open without reading optional icon pack contents', async () => {
+  const { sandbox, element } = siteModalHarness();
+  let reads = 0;
+  sandbox.API.getSiteIconPack = async () => {
+    reads++;
+    throw new Error('optional icon pack endpoint unavailable');
+  };
+  await sandbox.showSiteModal();
+  assert.equal(element('modal-title').textContent, '添加站点');
+  await sandbox.showSiteModal({ id: 9, name: 'Existing site', ingress_mode: 'port', listen_port: 8096, target_url: 'http://origin.example.test:8096', ua_mode: 'passthrough' });
+  assert.equal(element('modal-title').textContent, '编辑站点');
+  assert.equal(element('m-name').value, 'Existing site');
+  assert.equal(reads, 0);
+});
 
 test('site address autofill completes scheme and splits the port', () => {
   const { autoFillTargetAddress } = loadHelpers();

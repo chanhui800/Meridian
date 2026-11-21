@@ -255,7 +255,7 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	if configured {
 		route, acquired, discoveryErr = session.issuer.mintTrustedValidatedTracked(validationTarget, claimTarget, expressions, fixedValues, session.source, dynamicCapabilityKindResource, 0)
 	} else {
-		route, acquired, discoveryErr = session.issuer.mintValidatedDASHTemplateTracked(session.ctx, base, validationTarget, session.source, claimTarget, expressions, fixedValues)
+		route, acquired, discoveryErr = session.issuer.mintValidatedDASHTemplateTracked(session.validationContext(), base, validationTarget, session.source, claimTarget, expressions, fixedValues)
 	}
 	if discoveryErr != nil {
 		return "", discoveryErr

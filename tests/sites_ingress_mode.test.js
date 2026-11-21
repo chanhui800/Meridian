@@ -72,6 +72,46 @@ test('ingress mode labels remain concise for the site card', () => {
   assert.equal(siteIngressModeLabel({ ingress_mode: 'unset' }), '入口未配置');
 });
 
+test('path access addresses use the current external origin behind a reverse proxy', () => {
+  const sandbox = loadHelpers();
+  const site = { ingress_mode: 'path', path_prefix: ' /emby/ ' };
+  const capabilities = sandbox.normalizeSiteCapabilities({
+    panel_tls_enabled: false,
+    panel_access_url: 'http://internal.example.test:9090',
+  });
+  for (const origin of ['https://media.example.test', 'https://media.example.test:8443', 'https://[2001:db8::8]:8443']) {
+    sandbox.window.location = new URL(`${origin}/#sites`);
+    assert.equal(sandbox.siteAccessAddress(site, capabilities), `${origin}/emby/`);
+  }
+  assert.equal(sandbox.siteAccessAddress({ ...site, path_prefix: '' }, capabilities), '');
+});
+
+test('dedicated port addresses use the actual listener TLS state and bracket IPv6', () => {
+  const sandbox = loadHelpers();
+  const site = { ingress_mode: 'port', listen_port: 8096 };
+  sandbox.window.location = new URL('https://panel.example.test/#sites');
+  assert.equal(sandbox.siteAccessAddress(site, sandbox.normalizeSiteCapabilities({ panel_tls_enabled: false })), 'http://panel.example.test:8096');
+  assert.equal(sandbox.siteAccessAddress(site, sandbox.normalizeSiteCapabilities({ panel_tls_enabled: true })), 'https://panel.example.test:8096');
+
+  sandbox.window.location = { protocol: 'https:', hostname: '2001:db8::8', port: '8443', origin: 'https://[2001:db8::8]:8443' };
+  assert.equal(sandbox.siteAccessAddress(site, sandbox.normalizeSiteCapabilities({ panel_tls_enabled: false })), 'http://[2001:db8::8]:8096');
+  sandbox.window.location = new URL('http://[::1]:9090/#sites');
+  assert.equal(sandbox.siteAccessAddress(site, sandbox.normalizeSiteCapabilities({ panel_tls_enabled: true })), 'https://[::1]:8096');
+});
+
+test('legacy ingress capabilities retain the browser protocol without changing domain mapping', () => {
+  const sandbox = loadHelpers();
+  sandbox.window.location = new URL('https://panel.example.test:8443/#sites');
+  const legacy = sandbox.normalizeSiteCapabilities({});
+  assert.equal(sandbox.siteAccessAddress({ ingress_mode: 'port', listen_port: 8096 }, legacy), 'https://panel.example.test:8096');
+  for (const mode of ['host', 'both']) {
+    assert.equal(sandbox.siteAccessAddress({ ingress_mode: mode, public_host: 'emby.example.test', listen_port: 8096 }, legacy), 'https://emby.example.test:8443');
+    assert.equal(sandbox.siteAccessAddress({ ingress_mode: mode, public_host: 'emby.example.test', listen_port: 8096 }, sandbox.normalizeSiteCapabilities({ panel_tls_enabled: false })), 'https://emby.example.test:8443');
+  }
+  sandbox.window.location = new URL('http://panel.example.test:9090/#sites');
+  assert.equal(sandbox.siteAccessAddress({ ingress_mode: 'port', listen_port: 8096 }, legacy), 'http://panel.example.test:8096');
+});
+
 test('site rows retain ingress status, concealed access and secondary actions', () => {
   const sandbox = loadHelpers();
   sandbox.formatBytes = value => `${value} B`;
@@ -86,9 +126,11 @@ test('site rows retain ingress status, concealed access and secondary actions', 
   assert.match(row, /id="site-details-1" hidden/);
   assert.match(row, /data-access-address="[^" ]+"/);
   assert.match(row, /aria-label="显示访问地址" aria-pressed="false"/);
-  for (const action of ['access', 'copy', 'latency', 'toggle', 'edit', 'delete', 'details']) {
+  for (const action of ['access', 'copy', 'latency', 'toggle', 'edit', 'delete']) {
     assert.match(row, new RegExp(`data-site-action="${action}"`));
   }
+  assert.match(row, /data-site-row-toggle[^>]*aria-expanded="false"[^>]*aria-controls="site-details-1"/);
+  assert.doesNotMatch(row, /data-site-action="details"/);
   assert.match(row, /媒体库数量/);
   assert.doesNotMatch(row, /播放回源/);
   const unset = sandbox.siteManagementRowHTML({ id: 2, name: 'unset', ingress_mode: 'unset', ua_mode: 'passthrough' }, new Set());
@@ -186,6 +228,29 @@ test('site management uses responsive rows with touch-capable reorder controls',
   assert.match(css, /\.site-drag-handle[^}]*touch-action:\s*none/s);
   assert.match(css, /@media \(max-width: 768px\)/);
   assert.doesNotMatch(css, /(?:height|max-height):\s*100(?:vh|dvh)/);
+});
+
+test('site management exposes touch reorder targets before the first input event', () => {
+  for (const { maxTouchPoints, coarse, touch } of [
+    { maxTouchPoints: 0, coarse: false, touch: false },
+    { maxTouchPoints: 5, coarse: false, touch: true },
+    { maxTouchPoints: 0, coarse: true, touch: true },
+  ]) {
+    const sandbox = loadHelpers();
+    const elements = new Map();
+    const element = id => {
+      if (!elements.has(id)) elements.set(id, { innerHTML: '', addEventListener() {} });
+      return elements.get(id);
+    };
+    sandbox.document = { getElementById: element };
+    sandbox.navigator = { maxTouchPoints };
+    sandbox.window.matchMedia = query => ({ matches: query === '(any-pointer: coarse)' && coarse });
+    sandbox.loadSites = async () => {};
+    sandbox.renderSites();
+    const page = element('page-sites').innerHTML;
+    assert.equal(/class="console-page management-page[^\"]*\bis-touch-capable\b/.test(page), touch);
+    assert.match(page, /class="sites-grid management-site-list"/);
+  }
 });
 
 test('site identity icons remain supported in site cards and console rows', () => {

@@ -57,118 +57,9 @@ type edgeSiteIdentity struct {
 	host      string
 }
 
-// edgeEventPersistInterval bounds how often the encrypted event spool is
-// rewritten to disk. Persisting on every add serialized each proxied request
-// on a whole-file fsync and stalled the data plane exactly when the queue was
-// largest; a short debounce keeps at most this window of events at risk on a
-// hard crash while acks and shutdown still persist synchronously.
+// Best-effort journal writes are coalesced; critical acceptance and ACKs
+// always wait for the single writer's durable barrier.
 const edgeEventPersistInterval = 2 * time.Second
-
-type edgeEventStore struct {
-	mu          sync.Mutex
-	next        int64
-	items       []NodeRequestEvent
-	path        string
-	key         []byte
-	legacyKey   []byte
-	dropped     int64
-	lastPersist time.Time
-}
-
-func (s *edgeEventStore) init(dir string) error {
-	return s.initWithKey(dir, nil)
-}
-
-func (s *edgeEventStore) initWithKey(dir string, secret []byte) error {
-	var key []byte
-	if len(secret) > 0 {
-		digest := sha256.Sum256(secret)
-		key = append([]byte(nil), digest[:]...)
-	}
-	return s.initWithRawKey(dir, key, nil)
-}
-
-func (s *edgeEventStore) initWithRawKey(dir string, key, legacyKey []byte) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.path = filepath.Join(dir, "events.json")
-	s.key = append([]byte(nil), key...)
-	s.legacyKey = append([]byte(nil), legacyKey...)
-	data, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var stored struct {
-		Next    int64              `json:"next"`
-		Items   []NodeRequestEvent `json:"items"`
-		Dropped int64              `json:"dropped"`
-	}
-	plaintext := true
-	plainErr := json.Unmarshal(data, &stored)
-	var envelope struct {
-		Version    int    `json:"version"`
-		Nonce      string `json:"nonce"`
-		Ciphertext string `json:"ciphertext"`
-	}
-	_ = json.Unmarshal(data, &envelope)
-	if plainErr != nil || (envelope.Version == 1 && envelope.Ciphertext != "") {
-		plaintext = false
-		if len(s.key) == 0 {
-			return fmt.Errorf("load event queue: %w", plainErr)
-		}
-		if envelope.Version != 1 {
-			return fmt.Errorf("load event queue: invalid encrypted spool")
-		}
-		opened, decryptErr := decryptEventSpoolEnvelope(envelope.Version, envelope.Nonce, envelope.Ciphertext, s.key)
-		if decryptErr != nil && len(s.legacyKey) > 0 {
-			opened, decryptErr = decryptEventSpoolEnvelope(envelope.Version, envelope.Nonce, envelope.Ciphertext, s.legacyKey)
-			if decryptErr == nil {
-				plaintext = true // migration below rewrites using the independent key.
-			}
-		}
-		if decryptErr != nil {
-			return fmt.Errorf("load event queue: decrypt: %w", decryptErr)
-		}
-		if err := json.Unmarshal(opened, &stored); err != nil {
-			return fmt.Errorf("load event queue: decrypt: %w", err)
-		}
-	}
-	if len(stored.Items) > edgeEventQueueLimit {
-		stored.Dropped += int64(len(stored.Items) - edgeEventQueueLimit)
-		stored.Items = stored.Items[len(stored.Items)-edgeEventQueueLimit:]
-	}
-	s.next, s.items, s.dropped = stored.Next, append([]NodeRequestEvent(nil), stored.Items...), stored.Dropped
-	changed := false
-	for _, item := range s.items {
-		if item.EventID > s.next {
-			s.next = item.EventID
-		}
-		if item.EventUID == "" {
-			changed = true
-		}
-	}
-	if changed || (len(s.key) > 0 && plaintext) {
-		for i := range s.items {
-			if s.items[i].EventUID == "" {
-				uid, err := newEdgeEventUID()
-				if err != nil {
-					return err
-				}
-				s.items[i].EventUID = uid
-			}
-		}
-		if err := s.persistLocked(); err != nil {
-			return fmt.Errorf("migrate event queue identities: %w", err)
-		}
-	}
-	return nil
-}
 
 func decryptEventSpoolEnvelope(version int, nonceText, ciphertextText string, key []byte) ([]byte, error) {
 	if version != 1 || len(key) == 0 {
@@ -191,65 +82,6 @@ func decryptEventSpoolEnvelope(version int, nonceText, ciphertextText string, ke
 		return nil, errors.New("invalid ciphertext")
 	}
 	return gcm.Open(nil, nonce, ciphertext, nil)
-}
-
-func (s *edgeEventStore) persistLocked() error {
-	if s.path == "" {
-		return nil
-	}
-	data, err := json.Marshal(struct {
-		Next    int64              `json:"next"`
-		Items   []NodeRequestEvent `json:"items"`
-		Dropped int64              `json:"dropped"`
-	}{s.next, s.items, s.dropped})
-	if err != nil {
-		return err
-	}
-	if len(s.key) > 0 {
-		block, err := aes.NewCipher(s.key)
-		if err != nil {
-			return err
-		}
-		gcm, err := cipher.NewGCM(block)
-		if err != nil {
-			return err
-		}
-		nonce := make([]byte, gcm.NonceSize())
-		if _, err := rand.Read(nonce); err != nil {
-			return err
-		}
-		sealed := gcm.Seal(nil, nonce, data, nil)
-		data, err = json.Marshal(struct {
-			Version    int    `json:"version"`
-			Nonce      string `json:"nonce"`
-			Ciphertext string `json:"ciphertext"`
-		}{1, base64.RawStdEncoding.EncodeToString(nonce), base64.RawStdEncoding.EncodeToString(sealed)})
-		if err != nil {
-			return err
-		}
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".events-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	_ = tmp.Chmod(0o600)
-	if _, err = tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return err
-	}
-	return syncDirectory(filepath.Dir(s.path))
 }
 
 func newEdgeEventUID() (string, error) {
@@ -306,130 +138,6 @@ func nodeEventPriority(event NodeRequestEvent) string {
 	}
 }
 
-func (s *edgeEventStore) add(event NodeRequestEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.next++
-	event.EventID = s.next
-	if event.EventUID == "" {
-		uid, err := newEdgeEventUID()
-		if err != nil {
-			return err
-		}
-		event.EventUID = uid
-	}
-	event.Priority = nodeEventPriority(event)
-	if len(s.items) >= edgeEventQueueLimit {
-		if event.Priority == nodeEventPriorityCritical {
-			removed := -1
-			for i, existing := range s.items {
-				if nodeEventPriority(existing) == nodeEventPriorityBestEffort {
-					removed = i
-					break
-				}
-			}
-			if removed >= 0 {
-				s.items = append(s.items[:removed], s.items[removed+1:]...)
-				s.dropped++
-			} else {
-				// If the queue is entirely critical, keep the newest critical
-				// event and discard the oldest one.
-				s.items = append([]NodeRequestEvent(nil), s.items[1:]...)
-				s.dropped++
-			}
-		} else {
-			// A dropped event does not change the queue contents, so it must
-			// not pay a synchronous whole-file rewrite: persisting the counter
-			// on the same debounce cadence keeps a full queue from degrading
-			// into per-event fsyncs under controller-outage load.
-			s.dropped++
-			return s.persistDebouncedLocked()
-		}
-	}
-	s.items = append(s.items, event)
-	if len(s.items) > edgeEventQueueLimit {
-		s.items = append([]NodeRequestEvent(nil), s.items[len(s.items)-edgeEventQueueLimit:]...)
-	}
-	return s.persistDebouncedLocked()
-}
-
-// persistDebouncedLocked rewrites the spool at most once per
-// edgeEventPersistInterval. Requests only need the in-memory queue to make
-// progress; the durable copy exists for crash recovery and agent restarts, so
-// a short window of at-risk events is the accepted trade for not serializing
-// every proxied request behind a whole-file fsync.
-func (s *edgeEventStore) persistDebouncedLocked() error {
-	now := time.Now()
-	if !s.lastPersist.IsZero() && now.Sub(s.lastPersist) < edgeEventPersistInterval {
-		return nil
-	}
-	// Stamp only after a successful write: a failed persist must not push the
-	// next retry two seconds out, and the error stays visible to add/ack.
-	if err := s.persistLocked(); err != nil {
-		return err
-	}
-	s.lastPersist = now
-	return nil
-}
-
-// flush performs a synchronous persist for shutdown paths where the
-// debounce window may still hold unpersisted, unacknowledged events.
-func (s *edgeEventStore) flush() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.persistLocked(); err != nil {
-		return err
-	}
-	s.lastPersist = time.Now()
-	return nil
-}
-
-func (s *edgeEventStore) snapshot() []NodeRequestEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	end := len(s.items)
-	if end > edgeReportEventLimit {
-		end = edgeReportEventLimit
-	}
-	return append([]NodeRequestEvent(nil), s.items[:end]...)
-}
-
-func (s *edgeEventStore) depth() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.items)
-}
-
-func (s *edgeEventStore) droppedCount() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.dropped
-}
-
-func (s *edgeEventStore) ack(events []NodeRequestEvent) error {
-	if len(events) == 0 {
-		return nil
-	}
-	accepted := make(map[int64]struct{}, len(events))
-	for _, event := range events {
-		accepted[event.EventID] = struct{}{}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	kept := s.items[:0]
-	for _, item := range s.items {
-		if _, ok := accepted[item.EventID]; !ok {
-			kept = append(kept, item)
-		}
-	}
-	s.items = kept
-	if err := s.persistLocked(); err != nil {
-		return err
-	}
-	s.lastPersist = time.Now()
-	return nil
-}
-
 type edgeSiteStats struct {
 	mu    sync.Mutex
 	items map[string]NodeSiteStat
@@ -474,7 +182,7 @@ type edgeStatusWriter struct {
 }
 
 func (w *edgeStatusWriter) WriteHeader(status int) {
-	if w.status == 0 {
+	if w.status == 0 && (status >= http.StatusOK || status == http.StatusSwitchingProtocols) {
 		w.status = status
 	}
 	w.ResponseWriter.WriteHeader(status)
@@ -554,6 +262,8 @@ func (b *edgeProxyBundle) drain(ctx context.Context) {
 
 type edgeAgentRuntime struct {
 	mu                   sync.RWMutex
+	lifecycleMu          sync.Mutex
+	drainWG              sync.WaitGroup
 	stateDir             string
 	nodeGUID             string
 	sessionEpoch         int64
@@ -625,6 +335,7 @@ func (runtime *edgeAgentRuntime) beginBundleDrain(bundle *edgeProxyBundle) {
 		runtime.drainingBundles = make(map[*edgeProxyBundle]struct{})
 	}
 	runtime.drainingBundles[bundle] = struct{}{}
+	runtime.drainWG.Add(1)
 	parent := runtime.drainContext
 	runtime.mu.Unlock()
 	// Normal drains finish when admitted handlers and final counters are
@@ -632,6 +343,7 @@ func (runtime *edgeAgentRuntime) beginBundleDrain(bundle *edgeProxyBundle) {
 	// complete old generation forever or outlive the Controller drain window.
 	ctx, cancel := context.WithTimeout(parent, siteNodeDrainWindow)
 	go func() {
+		defer runtime.drainWG.Done()
 		defer cancel()
 		bundle.drain(ctx)
 		runtime.mu.Lock()
@@ -753,6 +465,9 @@ func (runtime *edgeAgentRuntime) eventSpoolStatus() (string, int) {
 	runtime.mu.RLock()
 	errText := runtime.eventSpoolError
 	runtime.mu.RUnlock()
+	if persistErr := runtime.events.persistenceError(); persistErr != nil {
+		errText = persistErr.Error()
+	}
 	return errText, runtime.events.depth()
 }
 
@@ -1331,6 +1046,7 @@ func (runtime *edgeAgentRuntime) syncSiteTrafficLimits(config AgentRuntimeConfig
 	if bundle == nil || bundle.manager == nil || bundle.database == nil {
 		return
 	}
+	applyAgentRequestLogPolicy(bundle.database, config.RequestLogPolicy)
 	runtime.mu.RLock()
 	ackedReports := make(map[int64]ProxyRuntimeStat, len(runtime.siteReported))
 	for siteID, stat := range runtime.siteReported {
@@ -1551,6 +1267,7 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		return nil, err
 	}
 	database.edgeEphemeral = true
+	applyAgentRequestLogPolicy(database, config.RequestLogPolicy)
 	bundle := &edgeProxyBundle{database: database, localSites: make(map[int64]edgeSiteIdentity), centralSites: make(map[int64]struct{})}
 	database.edgeTelemetrySink = func(event edgeTelemetryEvent) {
 		mapped, ok := edgeTelemetryEventSiteID(event, bundle.localSites)
@@ -1637,9 +1354,10 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 			return
 		}
 		runtime.queueEvent(NodeRequestEvent{
-			SiteID: identity.centralID, Host: identity.host, Method: event.Method, Path: event.Path,
+			RequestDiagnostics: event.RequestDiagnostics,
+			SiteID:             identity.centralID, Host: identity.host, Method: event.Method, Path: event.Path,
 			StatusCode: event.StatusCode, ClientIP: event.ClientIP, UserAgent: event.UserAgent,
-			RecordedAtMS: time.Now().UnixMilli(), ResourceCategory: event.ResourceCategory,
+			RecordedAtMS: time.Now().UnixMilli(), TimelineAtMS: event.timelineAtMS, ResourceCategory: event.ResourceCategory,
 			UpstreamUserAgent: event.UpstreamUserAgent, BackendAddress: event.BackendAddress,
 			InboundColo: event.InboundColo, OutboundColo: event.OutboundColo,
 		})
@@ -1655,9 +1373,19 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 		mapped := event
 		mapped.SiteID = identity.centralID
 		mapped.TokenCiphertext = ""
+		path := "/Sessions/Playing/Progress"
+		if mapped.EventType == "stopped" {
+			path = "/Sessions/Playing/Stopped"
+		} else if mapped.EventType == "started" {
+			path = "/Sessions/Playing"
+		}
+		statusCode := mapped.ResponseStatusCode
+		if statusCode == 0 && mapped.ClientStopOutcome == "" {
+			statusCode = http.StatusNoContent
+		}
 		return runtime.queueEvent(NodeRequestEvent{
 			SiteID: identity.centralID, Host: identity.host, Method: http.MethodPost,
-			Path: "/Sessions/Playing/Progress", StatusCode: http.StatusNoContent,
+			Path: path, StatusCode: statusCode,
 			RecordedAtMS: mapped.ObservedAtMS, ResourceCategory: requestLogCategoryPlaybackSync,
 			Priority: nodeEventPriorityCritical, SkipRequestLog: true, WatchHistory: &mapped,
 		})
@@ -1828,6 +1556,14 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 }
 
 func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error) {
+	runtime.lifecycleMu.Lock()
+	defer runtime.lifecycleMu.Unlock()
+	runtime.events.mu.Lock()
+	closed := runtime.events.closed
+	runtime.events.mu.Unlock()
+	if closed {
+		return errEdgeEventStoreClosed
+	}
 	defer func() {
 		runtime.mu.Lock()
 		if retErr != nil {
@@ -2026,9 +1762,15 @@ var edgeEventSpoolFlushError = errors.New("event spool persistence failed during
 // exit. Closing itself is always complete: the data plane is stopped and the
 // bundle released before the flush is attempted.
 func (runtime *edgeAgentRuntime) close() error {
+	return runtime.quiesce(true)
+}
+
+func (runtime *edgeAgentRuntime) quiesce(closeWriter bool) error {
 	if runtime == nil {
 		return nil
 	}
+	runtime.lifecycleMu.Lock()
+	defer runtime.lifecycleMu.Unlock()
 	runtime.quiesced.Store(true)
 	runtime.stopServer()
 	runtime.mu.Lock()
@@ -2044,13 +1786,26 @@ func (runtime *edgeAgentRuntime) close() error {
 	if bundle != nil {
 		bundle.close()
 	}
+	// Old hot-apply generations can still emit final critical events while
+	// cancellation drains them. Join those owners before exporting/stopping the
+	// runtime's one spool writer.
+	runtime.drainWG.Wait()
 	// The debounced spool may still hold <2s of unpersisted events; a
 	// graceful stop (self-update, systemd) must not lose them. Retry briefly
 	// because the usual cause is a transient write error. Each attempt is a
 	// synchronous fsync with no deadline, so a device that never returns will
 	// still block shutdown; the bounded retry limits the number of attempts,
 	// not the time a single attempt may take.
-	return flushEdgeEventStoreOnShutdown(&runtime.events)
+	if err := flushEdgeEventStoreOnShutdown(&runtime.events); err != nil {
+		if closeWriter {
+			_ = runtime.events.close()
+		}
+		return err
+	}
+	if closeWriter {
+		return runtime.events.close()
+	}
+	return nil
 }
 
 // flushEdgeEventStoreOnShutdown persists the event spool with a bounded retry
@@ -2204,7 +1959,7 @@ func edgeQuiesceStale(runtime *edgeAgentRuntime) {
 	if runtime == nil {
 		return
 	}
-	if err := runtime.close(); err != nil {
+	if err := runtime.quiesce(false); err != nil {
 		fmt.Fprintf(os.Stderr, "Meridian Agent lost its Controller lease; %v\n", err)
 	}
 	runtime.setLeaseID("")
@@ -2728,27 +2483,36 @@ func edgeReportEventsByBudget(report NodeReport, events []NodeRequestEvent) []No
 	if len(events) > maxNodeRequestEventsPerReport {
 		events = events[:maxNodeRequestEventsPerReport]
 	}
-	selected := make([]NodeRequestEvent, 0, len(events))
+	// Events is omitted for both nil and empty slices. Adding the first event
+	// therefore replaces the envelope's closing brace with ,"events":[...]}.
+	// Marshal each value once: strings' escapes and optional/null fields then
+	// have exactly the same byte cost as the eventual whole-report encoding.
+	report.Events = nil
+	envelope, err := json.Marshal(report)
+	if err != nil {
+		return nil
+	}
+	size := len(envelope) + len(`,"events":[]`)
+	selected := 0
 	for _, event := range events {
-		candidate := append(append([]NodeRequestEvent(nil), selected...), event)
-		report.Events = candidate
-		encoded, err := json.Marshal(report)
+		encoded, err := json.Marshal(event)
 		if err != nil {
 			break
 		}
-		if len(encoded) > targetAgentReportBytes {
-			// A single event is bounded well below the report limit. If the
-			// non-event payload itself ever grows beyond the target, retain no
-			// event in this report so the queue can still make progress after
-			// the base payload is reduced by a later protocol change.
-			if len(selected) == 0 {
-				return nil
-			}
+		extra := len(encoded)
+		if selected > 0 {
+			extra++ // comma between array elements
+		}
+		if size+extra > targetAgentReportBytes {
 			break
 		}
-		selected = candidate
+		size += extra
+		selected++
 	}
-	return selected
+	if selected == 0 {
+		return nil
+	}
+	return events[:selected]
 }
 
 func edgeExecutableDigest() (string, string, error) {
@@ -2879,17 +2643,9 @@ func runEdgeAgent() (runErr error) {
 	}
 	legacyDigest := sha256.Sum256([]byte(state.Token))
 	if err := runtime.events.initWithRawKey(spoolDir, spoolKey, legacyDigest[:]); err != nil {
-		// Re-enrollment, interrupted upgrades, or manual edits must never trap
-		// systemd in a restart loop. Preserve the corrupt spool for inspection
-		// and continue with an empty queue encrypted by the independent key.
-		if quarantineErr := quarantineEventSpool(filepath.Join(spoolDir, "events.json")); quarantineErr == nil {
-			runtime.eventSpoolError = "event spool quarantined after load failure: " + err.Error()
-			if resetErr := runtime.events.initWithRawKey(spoolDir, spoolKey, nil); resetErr != nil {
-				return fmt.Errorf("reset event spool: %w", resetErr)
-			}
-		} else {
-			return fmt.Errorf("load event spool: %w (quarantine failed: %v)", err, quarantineErr)
-		}
+		// A bounded-read or journal integrity failure must preserve the queue.
+		// Silently replacing it would lose previously accepted critical events.
+		return fmt.Errorf("load event spool (original files preserved): %w", err)
 	}
 	defer func() {
 		// Surface a failed final spool flush as a failed exit instead of
@@ -3002,7 +2758,10 @@ func runEdgeAgent() (runErr error) {
 				update.discard()
 				return nil
 			}
-			updateErr = update.commit(ctx)
+			updateErr = commitEdgeAgentRuntimeUpdate(ctx, runtime, update)
+			if !errors.Is(updateErr, errEdgeAgentUpdated) {
+				return updateErr
+			}
 		}
 		if isEdgeAgentRevoked(updateErr) {
 			updates.invalidate()

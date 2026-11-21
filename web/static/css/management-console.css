@@ -1,5 +1,6 @@
 /* Site and request management: rows first, details on demand. */
 .management-page { min-width: 0; }
+#page-request-logs { overflow-anchor: none; }
 .management-sites { container: management-sites / inline-size; }
 .management-page .console-heading { margin-bottom: 28px; }
 .management-page svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
@@ -13,7 +14,7 @@
 .management-list-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 12px 24px; color: var(--console-muted); font-size: 12px; border-bottom: 1px solid var(--console-line); }
 .management-list-meta strong { color: var(--console-ink); font-weight: 600; }
 .management-list-meta .is-error { color: var(--console-danger); }
-.management-site-columns, .management-site-summary { display: grid; grid-template-columns: minmax(220px, 1fr) 130px 165px 110px 150px; gap: 20px; align-items: center; }
+.management-site-columns, .management-site-summary { display: grid; grid-template-columns: minmax(220px, 1fr) 130px 165px 110px 100px; gap: 20px; align-items: center; }
 .management-site-columns { padding: 14px 24px; color: var(--console-muted); font-size: 11px; border-bottom: 1px solid var(--console-line); background: var(--console-bg); }
 .console-shell .management-site-list.sites-grid { display: block; width: 100%; min-width: 0; gap: 0; }
 .console-shell .management-site-list > .site-card { display: block; padding: 0; margin: 0; min-height: 0; border: 0; border-bottom: 1px solid var(--console-line); border-radius: 0; background: transparent; box-shadow: none; transition: background-color 150ms; overflow: visible; }
@@ -22,7 +23,16 @@
 .console-shell .management-site-list > .site-card::before,
 .console-shell .management-site-list > .site-card::after { display: none; }
 .console-shell .management-site-list > .site-card:hover { transform: none; box-shadow: none; }
-.management-site-summary { padding: 20px 24px; }
+/* The shared card hover lift would move rows while the handle appears. */
+.console-shell #page-sites .management-page .management-site-list > .site-card:hover { transform: none; }
+.management-site-summary { position: relative; padding: 20px 24px; }
+.management-site-row-toggle { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 44px; padding: 0; margin: 0; border: 0; border-radius: 0; background: transparent; cursor: pointer; }
+.management-site-summary > :not(.management-site-row-toggle) { position: relative; pointer-events: none; }
+.management-site-summary :is(.site-drag-handle,.site-icon-button,.site-live-link,.site-latency-button,.console-button) { pointer-events: auto; }
+.management-site-row-toggle:focus-visible { outline: 2px solid var(--console-accent); outline-offset: -3px; }
+.management-site-chevron { display: flex; align-items: center; justify-content: center; width: 20px; color: var(--console-muted); }
+.management-site-chevron svg { width: 17px; height: 17px; transition: transform 150ms; }
+.management-site-row.is-expanded .management-site-chevron svg { transform: rotate(180deg); }
 .management-site-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .management-site-identity > div { min-width: 0; }
 .management-page .site-name { margin: 0; font-size: 15px; font-weight: 620; line-height: 1.5; color: var(--console-ink); overflow-wrap: anywhere; }
@@ -31,6 +41,17 @@
 .management-page .site-drag-handle svg { width: 18px; height: 18px; fill: currentColor; stroke: none; }
 .management-page .site-drag-handle:hover { background: var(--console-bg); color: var(--console-ink); }
 .management-page .site-drag-handle:active { cursor: grabbing; }
+/* Mouse users reveal the reserved handle on hover, including hybrid devices. */
+@media (any-hover: hover) and (any-pointer: fine) {
+  .management-page .site-drag-handle { opacity: 0; pointer-events: none; }
+  .management-page :where(.site-card:hover:not(.is-dragging)) .site-drag-handle { opacity: 1; pointer-events: auto; }
+  .management-page .site-drag-handle:focus-visible,
+  .management-page .site-card.is-dragging .site-drag-handle { opacity: 1; pointer-events: auto; }
+  .management-page :where(.site-card:hover) .site-drag-handle:disabled { opacity: .28; }
+}
+@media (any-hover: hover) and (any-pointer: fine) and (any-pointer: coarse) {
+  .management-page .site-drag-handle { pointer-events: auto; }
+}
 .management-page .site-icon-button { flex: 0 0 38px; width: 38px; height: 38px; min-width: 38px; min-height: 38px; margin: 0; border-radius: 50%; border: 0; background: transparent; }
 .management-page .site-icon { flex: 0 0 36px; width: 36px; height: 36px; min-width: 0; min-height: 0; border: 0; background: transparent; box-shadow: none; color: var(--console-accent); border-radius: 50%; }
 .management-page .site-icon-option-preview .site-icon { flex: 0 0 36px; }
@@ -46,8 +67,6 @@
 .management-quota-track.is-warning i { background: var(--console-warning); }
 .management-site-primary-actions, .management-site-secondary-actions { display: flex; align-items: center; gap: 8px; }
 .management-site-primary-actions { justify-content: flex-end; }
-.management-detail-toggle { min-width: 70px; padding: 0 10px; }
-.management-detail-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
 .management-site-details { padding: 0 24px 22px 70px; }
 .management-site-details[hidden] { display: none; }
 .management-site-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px 28px; padding: 20px; background: var(--console-bg); border: 1px solid var(--console-line); border-radius: 8px; }
@@ -106,7 +125,7 @@
 .management-log-storage-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .management-log-results { margin-top: 20px; min-width: 0; overflow: hidden; }
 .management-page .request-log-table-scroll { overflow-x: auto; overflow-y: visible; height: auto; max-height: none; border-radius: 0 0 12px 12px; overscroll-behavior: auto; scrollbar-width: auto; }
-.management-page .request-log-table { table-layout: fixed; min-width: 1390px; width: 100%; margin: 0; border-collapse: collapse; background: var(--console-surface); }
+.management-page .request-log-table { table-layout: fixed; min-width: 1424px; width: 100%; margin: 0; border-collapse: collapse; background: var(--console-surface); }
 .management-page .request-log-table th { padding: 13px 16px; background: var(--console-bg); color: var(--console-muted); border-bottom: 1px solid var(--console-line); text-align: left; font-size: 11px; font-weight: 500; position: static; box-shadow: none; }
 .management-page .request-log-table td { padding: 14px 16px; border-bottom: 1px solid var(--console-line); color: var(--console-ink); font-size: 12px; vertical-align: top; overflow-wrap: anywhere; }
 .management-page .request-log-table tbody tr:last-child td { border-bottom: 0; }
@@ -114,7 +133,8 @@
 .management-page .request-log-col-site { width: 186px; }
 .management-page .request-log-col-node { width: 100px; }
 .management-page .request-log-col-category { width: 112px; }
-.management-page .request-log-col-status { width: 78px; }
+.management-page .request-log-table col.request-log-col-status,
+.management-page .request-log-table th[data-log-field="status"] { width: 112px !important; }
 .management-page .request-log-col-ip { width: 160px; }
 .management-page .request-log-col-ua, .management-page .request-log-col-upstream-ua { width: var(--request-log-ua-width, 240px); }
 .management-page .request-log-col-backend { width: 160px; }
@@ -139,6 +159,32 @@
 .console-shell .management-log-detail dt { color: var(--console-muted); margin-bottom: 8px; font-size: 11px; }
 .console-shell .management-log-detail dd { margin: 0; color: var(--console-ink); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; white-space: pre-wrap; }
 .console-shell .management-log-modal { max-width: 760px; }
+.management-log-origin, .management-log-diagnostics { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--console-line, var(--border)); }
+.management-log-origin h4, .management-log-diagnostics h4 { margin: 0 0 14px; font-size: 13px; font-weight: 600; color: inherit; }
+.management-log-origin-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 16px; margin: 0 0 14px; }
+.management-log-origin-summary > div, .management-log-origin-stages > div { min-width: 0; }
+.management-log-origin-summary dt, .management-log-origin-stages dt { font-size: 11px; line-height: 1.5; color: var(--console-muted, var(--white-60)); }
+.management-log-origin-summary dd { margin: 4px 0 0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.management-log-origin-steps { display: grid; gap: 12px; list-style: none; padding: 0; margin: 0; }
+.management-log-origin-step { min-width: 0; padding: 12px 14px; border: 1px solid var(--console-line, var(--border)); border-radius: 6px; }
+.management-log-origin-step-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 11px; line-height: 1.6; }
+.management-log-origin-step-heading strong { font-size: 12px; font-weight: 600; }
+.management-log-origin-role { color: var(--console-accent, var(--white-87)); }
+.management-log-origin-result, .management-log-origin-duration { color: var(--console-muted, var(--white-60)); }
+.management-log-origin-duration { margin-left: auto; font-variant-numeric: tabular-nums; }
+.management-log-origin-address { display: flex; align-items: start; flex-wrap: wrap; gap: 4px 12px; margin-top: 7px; font-size: 12px; line-height: 1.6; }
+.management-log-origin-address > span { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; font-family: "Cascadia Code", "Consolas", monospace; }
+.management-log-origin-address small { font-size: 11px; color: var(--console-muted, var(--white-60)); }
+.management-log-origin-stages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px 14px; margin: 10px 0 0; }
+.management-log-origin-stages > div { display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; }
+.management-log-origin-stages dd { margin: 0; font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.6; }
+.management-log-origin-empty, .management-log-origin-note, .management-log-origin-gap { margin: 10px 0 0; font-size: 11px; line-height: 1.7; color: var(--console-muted, var(--white-60)); overflow-wrap: anywhere; }
+.management-log-origin-gap { margin: 0; padding-inline: 14px; }
+.console-shell .management-log-detail.is-diagnostics { gap: 13px 24px; }
+.console-shell .management-log-detail.is-diagnostics > div { grid-column: auto; }
+.console-shell .management-log-detail.is-diagnostics dt { margin-bottom: 4px; }
+.console-shell .management-log-detail.is-diagnostics dd { font-size: 12px; }
+.site-live-modal .site-live-state-note { margin: 0; padding: 46px 24px 0; color: var(--console-muted, var(--white-60)); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 
 html .console-shell .modal.site-config-modal { width: min(1040px, calc(100vw - 48px)); max-height: calc(100dvh - 48px); border: 1px solid var(--console-line); border-radius: var(--console-radius); background: var(--console-surface); color: var(--console-ink); font-family: var(--console-font); }
 .console-shell .site-config-modal .modal-header { padding: 24px 28px 12px; }
@@ -255,7 +301,7 @@ html .console-shell .site-config-modal :is(.form-input,.form-select) { display: 
   .management-log-search-row { grid-template-columns: minmax(180px, 1fr) 140px 140px; gap: 12px; }
 }
 @container management-sites (max-width: 920px) {
-  .management-site-columns, .management-site-summary { grid-template-columns: minmax(180px, 1fr) 100px 115px 100px 130px; gap: 12px; }
+  .management-site-columns, .management-site-summary { grid-template-columns: minmax(180px, 1fr) 100px 115px 100px 90px; gap: 12px; }
 }
 @media (min-width: 769px) {
   @container management-sites (max-width: 760px) {
@@ -309,9 +355,14 @@ html .console-shell .site-config-modal :is(.form-input,.form-select) { display: 
   .management-log-storage-actions .console-button { min-height: 44px; }
   .management-log-storage { gap: 18px; }
   .management-log-results { margin-top: 16px; }
-  .management-page .request-log-table { min-width: 1390px; }
+  .management-page .request-log-table { min-width: 1424px; }
   .console-shell .management-log-detail { grid-template-columns: minmax(0, 1fr); }
   .console-shell .management-log-detail > div { grid-column: 1; }
+  .management-log-origin-summary, .management-log-origin-stages { grid-template-columns: minmax(0, 1fr); }
+  .management-log-origin-summary > div { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+  .management-log-origin-summary dd { margin: 0; }
+  .management-log-origin-step { padding: 12px; }
+  .management-log-origin-duration { margin-left: 0; }
   html .console-shell .modal.site-config-modal { width: 100%; max-height: calc(100dvh - 16px); }
   .console-shell .site-config-modal .modal-header { padding: 20px 18px 12px; }
   .console-shell .site-config-modal .modal-header h3 { font-size: 21px; }
@@ -335,6 +386,16 @@ html .console-shell .site-config-modal :is(.form-input,.form-select) { display: 
   .console-shell .site-config-modal .upstream-header-row { grid-template-columns: minmax(0, 1fr) 40px; gap: 10px; }
   .console-shell .site-config-modal .upstream-header-row > .m-upstream-header-value { grid-column: 1; }
   .console-shell .site-config-modal .upstream-header-row > .m-upstream-header-remove { grid-column: 2; grid-row: 1 / span 2; }
+}
+.management-page.is-touch-capable .site-drag-handle { flex-basis: 44px; width: 44px; height: 44px; }
+@media (any-pointer: coarse) {
+  .management-page .site-drag-handle { flex-basis: 44px; width: 44px; height: 44px; }
+}
+@media (max-width: 768px) {
+  .management-page.is-touch-capable .management-site-usage { padding-left: 52px; }
+}
+@media (max-width: 768px) and (any-pointer: coarse) {
+  .management-site-usage { padding-left: 52px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .management-page *, .management-page *::before, .management-page *::after { animation: none !important; transition: none !important; }

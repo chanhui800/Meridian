@@ -143,15 +143,100 @@ func TestDisabledTrafficResetUsesAllPersistedUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
-	if err := app.db.addTrafficWithRequestsAt(site.ID, 120, 280, 1, time.Date(2024, time.January, 1, 0, 0, 0, 0, time.Local)); err != nil {
+	legacy, err := app.db.CreateSite("legacy-total", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite legacy: %v", err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE sites SET traffic_used=81 WHERE id=?`, legacy.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Minute)
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 120, 280, 1, now.Add(-trafficLogRetention-time.Hour)); err != nil {
 		t.Fatalf("add historical traffic: %v", err)
 	}
-	usage, err := app.db.SumTrafficSinceForSite(site.ID, trafficCycleStart(time.Now(), 0, time.UTC), trafficBillingModeBidirectional)
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 5, 15, 1, now); err != nil {
+		t.Fatalf("add recent traffic: %v", err)
+	}
+	if err := app.db.pruneTrafficLogs(now); err != nil {
+		t.Fatalf("prune history: %v", err)
+	}
+	cycle := trafficCycleStart(now, 0, time.UTC)
+	usage, err := app.db.SumTrafficSinceForSite(site.ID, cycle, trafficBillingModeBidirectional)
 	if err != nil {
 		t.Fatalf("sum no-reset usage: %v", err)
 	}
-	if usage != 800 {
-		t.Fatalf("no-reset usage = %d, want all-time 800", usage)
+	if usage != 840 {
+		t.Fatalf("no-reset usage = %d, want all-time 840", usage)
+	}
+	if got, err := app.db.SumTrafficSinceForSite(site.ID, now.AddDate(0, 0, -1), trafficBillingModeBidirectional); err != nil || got != 40 {
+		t.Fatalf("bounded cycle = %d, %v; want recent traffic 40", got, err)
+	}
+	if got, err := app.db.SumTrafficSinceBySite(cycle, trafficBillingModeOutbound); err != nil || got[site.ID] != 295 || got[legacy.ID] != 41 {
+		t.Fatalf("outbound by site = %v, %v; want 295 and 41", got, err)
+	}
+	if got, err := app.db.SumTrafficSince(cycle, trafficBillingModeOutbound); err != nil || got != 336 {
+		t.Fatalf("outbound total = %d, %v; want 336", got, err)
+	}
+	tx, err := app.db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if got, err := sumTrafficSinceForSiteTx(tx, legacy.ID, cycle, trafficBillingModeOutbound); err != nil || got != 41 {
+		t.Fatalf("Agent route snapshot for legacy site = %d, %v; want 41", got, err)
+	}
+}
+
+func TestDisabledTrafficResetKeepsAgentAndPendingUsageAfterHistoryPruning(t *testing.T) {
+	fixture := newTelemetryFixture(t)
+	settings := fixture.app.db.currentSystemSettings()
+	settings.TrafficResetDay = 0
+	settings.TrafficBillingMode = trafficBillingModeOutbound
+	if err := fixture.app.db.saveSystemSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.app.db.addTrafficWithRequestsAt(fixture.site.ID, 30, 50, 1, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	first := ledgerFrame{sequence: 1, bytesIn: 70, bytesOut: 110, totalIn: 70, totalOut: 110, requests: 1, epoch: 1}
+	recordLedgerFrame(t, fixture, first, time.Second)
+	// Put both already-accounted sources outside the detail-retention window.
+	old := fixture.now.Add(-trafficLogRetention - time.Hour)
+	for _, table := range []string{"traffic_logs", "node_site_traffic_logs"} {
+		if _, err := fixture.app.db.db.Exec("UPDATE "+table+" SET recorded_at_ms=? WHERE site_id=?", old.UnixMilli(), fixture.site.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture.app.db.lastTrafficPruneMS.Store(0)
+	if err := fixture.app.db.pruneTrafficLogs(fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	second := ledgerFrame{sequence: 2, bytesIn: 7, bytesOut: 9, totalIn: 77, totalOut: 119, requests: 2, epoch: 1}
+	recordLedgerFrame(t, fixture, second, 2*time.Second)
+	// Pruning detail must not remove the Agent watermark or bill this retry twice.
+	recordLedgerFrame(t, fixture, second, 3*time.Second)
+	if err := fixture.app.db.addTrafficWithRequestsAt(fixture.site.ID, 3, 5, 1, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fixture.app.db.SumTrafficSinceForSite(fixture.site.ID, time.Time{}, trafficBillingModeBidirectional); err != nil || got != 568 {
+		t.Fatalf("lifetime mixed-source usage = %d, %v; want 568", got, err)
+	}
+	if got, err := fixture.app.db.SumTrafficSinceForSite(fixture.site.ID, fixture.now.Add(-time.Minute), trafficBillingModeOutbound); err != nil || got != 14 {
+		t.Fatalf("recent outbound usage = %d, %v; want only new 14", got, err)
+	}
+	inst := &ProxyInstance{Site: fixture.site}
+	inst.trafficBytesOut().Add(6)
+	if got, err := fixture.app.pm.currentTrafficCycleUsage(inst, fixture.now); err != nil || got != 180 {
+		t.Fatalf("quota with pending bytes = %d, %v; want lifetime 174 plus pending 6", got, err)
+	}
+	if err := fixture.app.pm.flushProxyTraffic(inst); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fixture.app.pm.currentTrafficCycleUsage(inst, fixture.now); err != nil || got != 180 {
+		t.Fatalf("quota after flush = %d, %v; pending bytes counted twice or lost", got, err)
+	}
+	if got, err := fixture.app.db.SumTrafficSince(time.Time{}, trafficBillingModeOutbound); err != nil || got != 180 {
+		t.Fatalf("durable lifetime total after flush = %d, %v; want 180", got, err)
 	}
 }
 

@@ -3,9 +3,9 @@ const SITE_REFRESH_INTERVAL_MS = 5000;
 let siteSortingCleanup = null;
 let siteRefreshTimer = 0;
 let siteLoadGeneration = 0;
-let siteIconPack = { name: '', description: '', source_url: '', icons: [] };
 let siteManagementExpanded = new Set();
 let siteManagementLatency = new Map();
+let siteLiveDetail = null;
 
 function normalizeSiteIconPack(value) {
   const icons = Array.isArray(value && value.icons) ? value.icons.map(icon => ({
@@ -146,12 +146,17 @@ function siteCardsRenderSignature(sites, activeSiteIDs) {
   }));
 }
 
+function siteTouchInputAvailable() {
+  return (typeof navigator !== 'undefined' && Number(navigator.maxTouchPoints) > 0)
+    || (typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(any-pointer: coarse)').matches);
+}
+
 function renderSites() {
   const page = document.getElementById('page-sites');
   stopSitesRefresh();
   siteManagementExpanded = new Set();
   page.innerHTML = `
-    <div class="console-page management-page">
+    <div class="console-page management-page${siteTouchInputAvailable() ? ' is-touch-capable' : ''}">
       <header class="console-heading">
         <div><p class="console-eyebrow">站点与入口</p><h1>站点管理</h1><p class="console-lead">集中管理访问入口、回源线路与站点策略。</p></div>
         <button type="button" class="console-button is-primary" id="btn-add-site"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加站点</button>
@@ -188,13 +193,14 @@ function siteManagementRowHTML(s, activeSiteIDs) {
   const expanded = siteManagementExpanded.has(Number(s.id));
   const ingressReady = normalizedIngressMode(s) !== 'unset';
   const latency = siteManagementLatency.get(Number(s.id)) || { text: '未测试', className: 'site-latency', title: '' };
-  return `<article class="site-card management-site-row" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.icon_name || ''} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
+  return `<article class="site-card management-site-row${expanded ? ' is-expanded' : ''}" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.icon_name || ''} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
     <div class="management-site-summary">
+      <button type="button" class="management-site-row-toggle" data-site-row-toggle data-site-id="${s.id}" aria-expanded="${expanded}" aria-controls="site-details-${s.id}" aria-label="${expanded ? '收起' : '展开'} ${esc(s.name)} 的站点详情"></button>
       <div class="management-site-identity"><button type="button" class="site-drag-handle" data-site-drag-handle aria-label="调整 ${esc(s.name)} 的顺序" title="拖动或使用上下方向键调整顺序"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"/><circle cx="13" cy="5" r="1.25"/><circle cx="7" cy="10" r="1.25"/><circle cx="13" cy="10" r="1.25"/><circle cx="7" cy="15" r="1.25"/><circle cx="13" cy="15" r="1.25"/></svg></button>${renderSiteIconButton(s)}<div><h2 class="site-name">${esc(s.name)}</h2><p>${esc(siteIngressModeLabel(s))} · ${esc(uaNameMap[s.ua_mode] || s.ua_mode || '透传')}</p></div></div>
       <div class="site-card-state"><span class="console-status ${s.running ? 'is-online' : 'is-muted'}">${!ingressReady ? '待配置' : s.running ? '运行中' : s.enabled ? '启动异常' : '已停用'}</span>${hasActivePlayback ? `<button type="button" class="site-live-link" data-site-action="live" data-site-id="${s.id}"><i class="site-live-pulse" aria-hidden="true"></i>正在播放</button>` : ''}</div>
       <div class="management-site-usage"><strong>${formatBytes(used)}</strong><small>${quota ? `额度 ${formatBytes(quota)}` : '未设额度'}</small>${quota ? `<div class="management-quota-track ${percent >= 85 ? 'is-warning' : ''}" role="meter" aria-label="${esc(s.name)}流量额度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(percent)}"><i style="width:${percent.toFixed(2)}%"></i></div>` : ''}</div>
       <div class="management-site-latency"><button type="button" class="site-latency-button" data-site-action="latency" data-site-id="${s.id}" aria-label="点击重新测速" title="点击重新测速"><strong class="${latency.className}" id="site-latency-${s.id}" title="${esc(latency.title)}">${esc(latency.text)}</strong></button></div>
-      <div class="management-site-primary-actions"><button type="button" class="console-button" data-site-action="edit" data-site-id="${s.id}">编辑</button><button type="button" class="console-button management-detail-toggle" data-site-action="details" data-site-id="${s.id}" aria-expanded="${expanded}" aria-controls="site-details-${s.id}">${expanded ? '收起' : '详情'}<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button></div>
+      <div class="management-site-primary-actions"><button type="button" class="console-button" data-site-action="edit" data-site-id="${s.id}">编辑</button><span class="management-site-chevron" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span></div>
     </div>
     <div class="management-site-details" id="site-details-${s.id}" ${expanded ? '' : 'hidden'}>
       <div class="management-site-detail-grid">
@@ -215,7 +221,24 @@ function toggleSiteManagementDetails(button) {
   const details = document.getElementById(`site-details-${id}`);
   if (details) details.hidden = !expanded;
   button.setAttribute('aria-expanded', String(expanded));
-  button.innerHTML = `${expanded ? '收起' : '详情'}<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
+  const card = button.closest('.site-card');
+  card?.classList.toggle('is-expanded', expanded);
+  const name = card?.querySelector('.site-name')?.textContent || '当前站点';
+  button.setAttribute('aria-label', `${expanded ? '收起' : '展开'} ${name} 的站点详情`);
+}
+
+function bindSiteRowDisclosure(card) {
+  const trigger = card.querySelector('[data-site-row-toggle]');
+  if (!trigger) return;
+  trigger.addEventListener('click', event => {
+    event.stopPropagation();
+    toggleSiteManagementDetails(trigger);
+  });
+  card.addEventListener('click', event => {
+    if (event.defaultPrevented || event.target.closest?.('button, a, input, select, textarea, label, summary, [role="button"], [contenteditable="true"]')) return;
+    if (typeof window.getSelection === 'function' && String(window.getSelection()).trim()) return;
+    toggleSiteManagementDetails(trigger);
+  });
 }
 
 function scheduleSitesRefresh() {
@@ -233,6 +256,14 @@ function stopSitesRefresh() {
   if (siteRefreshTimer) window.clearTimeout(siteRefreshTimer);
   siteRefreshTimer = 0;
   siteLoadGeneration += 1;
+  siteLiveDetail = null;
+  if (typeof invalidateModalIntent === 'function' && invalidateModalIntent('sites')) {
+    const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    if (overlay?.classList.contains('active') && ['site-live-modal', 'site-config-modal', 'site-icon-manager-modal', 'site-icon-pack-modal'].some(name => modal?.classList.contains(name))) {
+      closeModal({ restoreFocus: false });
+    }
+  }
   if (typeof siteSortingCleanup === 'function') siteSortingCleanup();
 }
 
@@ -248,20 +279,15 @@ async function loadSites() {
 	// The active-history read establishes the latest playback snapshot. Read
 	// the site list afterwards: its server-side queue barrier then includes
 	// media totals observed just before this page was opened.
-	const [capabilities, activeResponse, iconPackResponse] = await Promise.all([
+	const [capabilities, activeResponse] = await Promise.all([
 		API.ingressCapabilities(),
-		API.getActiveWatchHistory({}).catch(() => ({ items: [] })),
-		typeof API.getSiteIconPack === 'function'
-			? API.getSiteIconPack().catch(() => ({ icons: [] }))
-			: Promise.resolve({ icons: [] }),
+		API.getActiveWatchHistory({}).catch(() => ({ items: [], active_read_failed: true })),
 	]);
-	siteIconPack = normalizeSiteIconPack(iconPackResponse);
 	const sites = await API.listSites();
 	if (generation !== siteLoadGeneration || Router.current !== 'sites' || !page.isConnected) return;
 	siteIngressCapabilities = normalizeSiteCapabilities(capabilities);
-    const activeItems = Array.isArray(activeResponse && activeResponse.items)
-      ? activeResponse.items
-      : (Array.isArray(activeResponse && activeResponse.sessions) ? activeResponse.sessions : []);
+    const activeItems = siteActivePlaybackItems(activeResponse);
+	if (!activeResponse?.active_read_failed) void refreshSiteLiveDetails(activeItems);
 	const activeSiteIDs = new Set(activeItems
 		.map(item => String(item && item.site_id || '').trim())
 		.filter(Boolean));
@@ -289,10 +315,12 @@ async function loadSites() {
     const focusedSiteID = Number(focusedCard?.dataset?.siteId || 0);
     const focusSelector = focused?.dataset?.siteAction ? `[data-site-action="${focused.dataset.siteAction}"]`
       : focused?.dataset?.siteIconId ? '[data-site-icon-id]'
-      : focused?.matches?.('[data-site-drag-handle]') ? '[data-site-drag-handle]' : '';
+      : focused?.matches?.('[data-site-drag-handle]') ? '[data-site-drag-handle]'
+      : focused?.matches?.('[data-site-row-toggle]') ? '[data-site-row-toggle]' : '';
 	grid.innerHTML = sites.map(site => siteManagementRowHTML(site, activeSiteIDs)).join('');
     grid.dataset.siteRenderSignature = renderSignature;
     bindSiteIconFallbacks(grid);
+    grid.querySelectorAll('.site-card').forEach(bindSiteRowDisclosure);
 
     const sitesById = new Map(sites.map(site => [site.id, site]));
     grid.querySelectorAll('.site-icon-button[data-site-icon-id]').forEach(button => {
@@ -308,7 +336,6 @@ async function loadSites() {
         const id = Number(button.dataset.siteId);
         const site = sitesById.get(id);
         if (!site) return;
-		if (button.dataset.siteAction === 'details') toggleSiteManagementDetails(button);
 		if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
 		if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
 		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
@@ -669,7 +696,7 @@ function normalizeSiteCapabilities(value) {
 	Object.defineProperties(normalized, {
 		domain_prefix_available: { value: capabilities.domain_prefix_available === undefined ? undefined : capabilities.domain_prefix_available === true, enumerable: false },
 		route_domain: { value: String(capabilities.route_domain || '').trim().toLowerCase(), enumerable: false },
-		panel_tls_enabled: { value: capabilities.panel_tls_enabled === true, enumerable: false },
+		panel_tls_enabled: { value: capabilities.panel_tls_enabled === undefined ? undefined : capabilities.panel_tls_enabled === true, enumerable: false },
 		path_ingress_available: { value: capabilities.path_ingress_available !== false, enumerable: false },
 		panel_access_url: { value: String(capabilities.panel_access_url || '').replace(/\/$/, ''), enumerable: false },
 	});
@@ -760,13 +787,24 @@ function siteAccessAddress(site, capabilities) {
 	const locationObject = typeof window !== 'undefined' && window.location
 		? window.location
 		: { protocol: 'http:', hostname: '127.0.0.1', port: '' };
-	const protocol = capabilities && capabilities.panel_tls_enabled ? 'https' : locationObject.protocol.replace(':', '') || 'http';
+	const browserProtocol = String(locationObject.protocol || '').replace(':', '') || 'http';
+	const protocol = capabilities && capabilities.panel_tls_enabled ? 'https' : browserProtocol;
+	const hostname = locationObject.hostname || '127.0.0.1';
+	const addressHost = hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
 	if (mode === 'port') {
-		const host = locationObject.hostname || '127.0.0.1';
-		return `${protocol}://${host}:${Number(site.listen_port) || ''}`;
+		// A reverse proxy's HTTPS does not enable TLS on dedicated listeners.
+		// Older backends omit this capability, so retain their browser fallback.
+		const listenerProtocol = capabilities && typeof capabilities.panel_tls_enabled === 'boolean'
+			? capabilities.panel_tls_enabled ? 'https' : 'http'
+			: browserProtocol;
+		return `${listenerProtocol}://${addressHost}:${Number(site.listen_port) || ''}`;
 	}
 	if (mode === 'path') {
-		const base = String(capabilities && capabilities.panel_access_url || '').replace(/\/$/, '') || `${protocol}://${locationObject.host || locationObject.hostname || '127.0.0.1'}`;
+		// Path ingress shares the origin the operator actually opened, including
+		// external TLS and ports supplied by Nginx or Caddy.
+		const origin = String(locationObject.origin || '').replace(/\/$/, '');
+		const browserHost = locationObject.host || `${addressHost}${locationObject.port ? `:${locationObject.port}` : ''}`;
+		const base = origin && origin !== 'null' ? origin : `${browserProtocol}://${browserHost}`;
 		const prefix = String(site.path_prefix || '').trim().replace(/^\/+|\/+$/g, '');
 		return prefix ? `${base}/${prefix}/` : '';
 	}
@@ -818,17 +856,78 @@ async function copySiteAccessAddress(button) {
 	}
 }
 
+function siteActivePlaybackItems(response) {
+	const items = Array.isArray(response && response.items) ? response.items
+		: (Array.isArray(response && response.sessions) ? response.sessions : []);
+	return typeof watchHistoryItemIsActive === 'function' ? items.filter(watchHistoryItemIsActive) : items;
+}
+
+function siteLiveDetailsAreCurrent(detail) {
+	const modal = document.getElementById('modal');
+	const overlay = document.getElementById('modal-overlay');
+	return !!detail && detail === siteLiveDetail && isModalIntentCurrent(detail.intent)
+		&& modal?.classList?.contains('site-live-modal') && overlay?.classList?.contains('active');
+}
+
+function paintSiteLiveDetails(detail, item, active) {
+	if (!siteLiveDetailsAreCurrent(detail)) return;
+	const stop = typeof watchHistoryClientStopInfo === 'function' ? watchHistoryClientStopInfo(item) : { state: 'unknown' };
+	const note = !active && stop.state === 'unknown' ? '<p class="site-live-state-note">当前会话已不在正在观看列表，源站停止状态未报告。</p>' : '';
+	const markup = `${note}${watchHistoryDetailsHTML(item)}`;
+	document.getElementById('modal-title').textContent = `${detail.siteName} · ${active ? '正在播放' : '播放详情'}`;
+	detail.item = item;
+	detail.active = active;
+	if (markup === detail.markup) return;
+	detail.markup = markup;
+	const body = document.getElementById('modal-body');
+	if (typeof watchHistoryReplaceDetailContent === 'function') watchHistoryReplaceDetailContent(body, markup);
+	else {
+		body.innerHTML = markup;
+		watchHistoryBindDetailImages(body);
+	}
+}
+
+async function refreshSiteLiveDetails(activeItems) {
+	const detail = siteLiveDetail;
+	if (!siteLiveDetailsAreCurrent(detail)) return;
+	const item = activeItems.find(candidate => Number(candidate && candidate.site_id) === detail.siteID && String(candidate && candidate.id || '') === detail.itemID);
+	if (item) {
+		detail.readGeneration += 1;
+		paintSiteLiveDetails(detail, item, true);
+		return;
+	}
+	paintSiteLiveDetails(detail, detail.item, false);
+	const stop = typeof watchHistoryClientStopInfo === 'function' ? watchHistoryClientStopInfo(detail.item) : { state: 'unknown' };
+	if (stop.state === 'confirmed' || detail.historyReadPending || typeof API.getWatchHistory !== 'function') return;
+	const readGeneration = ++detail.readGeneration;
+	detail.historyReadPending = true;
+	try {
+		const response = await API.getWatchHistory({ site_id: detail.siteID, limit: 24 });
+		if (!siteLiveDetailsAreCurrent(detail) || readGeneration !== detail.readGeneration) return;
+    const historyItem = watchHistoryNormalizeItems(response).find(candidate => Number(candidate && candidate.site_id) === detail.siteID && String(candidate && candidate.id || '') === detail.itemID);
+		if (historyItem) paintSiteLiveDetails(detail, historyItem, false);
+	} catch (_) {
+		// The active snapshot remains usable when the optional history read fails.
+	} finally {
+		detail.historyReadPending = false;
+	}
+}
+
 async function showSiteLiveDetails(site, button) {
 	const siteID = Number(site && site.id);
 	if (!Number.isSafeInteger(siteID) || siteID <= 0) return;
-	const previousText = button && button.textContent;
+	const modalIntent = beginModalIntent('sites');
+	const previousText = button && (button.dataset.siteLiveIntent ? button.dataset.siteLivePreviousText : button.textContent);
 	if (button) {
+		button.dataset.siteLivePreviousText = previousText || '正在播放';
+		button.dataset.siteLiveIntent = String(modalIntent.generation);
 		button.disabled = true;
 		button.textContent = '…';
 	}
 	try {
 		const response = await API.getActiveWatchHistory({ site_id: siteID });
-		const items = typeof watchHistoryNormalizeItems === 'function' ? watchHistoryNormalizeItems(response) : [];
+		if (!isModalIntentCurrent(modalIntent)) return;
+		const items = siteActivePlaybackItems(response);
 		if (!items.length) {
 			Toast.info('该站点当前没有正在播放的媒体');
 			return;
@@ -837,14 +936,18 @@ async function showSiteLiveDetails(site, button) {
 			throw new Error('播放详情组件尚未就绪');
 		}
 		document.getElementById('modal-title').textContent = `${site.name} · 正在播放`;
-		document.getElementById('modal-body').innerHTML = watchHistoryDetailsHTML(items[0]);
+		const markup = watchHistoryDetailsHTML(items[0]);
+		document.getElementById('modal-body').innerHTML = markup;
 		document.getElementById('modal-footer').innerHTML = '';
-		openModal({ closeOnBackdrop: true, modalClass: 'site-live-modal' });
+		openModal({ closeOnBackdrop: true, modalClass: 'site-live-modal', intent: modalIntent });
+		siteLiveDetail = { siteID, siteName: site.name, itemID: String(items[0].id || ''), item: items[0], intent: modalIntent, markup, active: true, readGeneration: 0, historyReadPending: false };
 		watchHistoryBindDetailImages(document.getElementById('modal-body'));
 	} catch (error) {
-		Toast.error(error && error.message ? error.message : '读取正在播放失败');
+		if (isModalIntentCurrent(modalIntent)) Toast.error(error && error.message ? error.message : '读取正在播放失败');
 	} finally {
-		if (button && button.isConnected) {
+		if (button && button.isConnected && button.dataset.siteLiveIntent === String(modalIntent.generation)) {
+			delete button.dataset.siteLiveIntent;
+			delete button.dataset.siteLivePreviousText;
 			button.disabled = false;
 			button.textContent = previousText || 'live';
 		}
@@ -1153,6 +1256,7 @@ async function loadSiteIconPackFromSource(value) {
 }
 
 async function showSiteIconPackModal() {
+  const modalIntent = beginModalIntent('sites');
   document.getElementById('modal-title').textContent = '站点图标包';
   document.getElementById('modal-body').innerHTML = `
     <div class="site-icon-pack-modal-copy">
@@ -1174,7 +1278,7 @@ async function showSiteIconPackModal() {
   document.getElementById('modal-footer').innerHTML = `
     <button class="btn-modal primary" id="m-icon-pack-done">完成</button>
   `;
-  openModal({ closeOnBackdrop: false, modalClass: 'site-icon-pack-modal' });
+  openModal({ closeOnBackdrop: false, modalClass: 'site-icon-pack-modal', intent: modalIntent });
 
   const listEl = document.getElementById('m-site-icon-pack-list');
   const importForm = document.getElementById('m-icon-pack-import-form');
@@ -1183,7 +1287,7 @@ async function showSiteIconPackModal() {
   const importButton = document.getElementById('m-icon-pack-import');
   let packs = [];
   let busy = false;
-  const isCurrentModal = () => document.getElementById('m-site-icon-pack-list') === listEl;
+  const isCurrentModal = () => isModalIntentCurrent(modalIntent) && document.getElementById('m-site-icon-pack-list') === listEl;
 
   const setStatus = (message, error = false) => {
     status.textContent = message || '';
@@ -1202,7 +1306,6 @@ async function showSiteIconPackModal() {
     packs = packs.filter(pack => pack.id !== summary.id).map(pack => summary.active ? { ...pack, active: false } : pack);
     packs.push(summary);
     packs.sort((first, second) => first.id - second.id);
-    if (summary.active) siteIconPack = normalizeSiteIconPack(saved);
   };
 
   const renderList = () => {
@@ -1232,11 +1335,6 @@ async function showSiteIconPackModal() {
           await API.activateSiteIconPack(button.dataset.iconPackId);
           if (!isCurrentModal()) return;
           packs = packs.map(pack => ({ ...pack, active: pack.id === Number(button.dataset.iconPackId) }));
-          renderList();
-          const activePack = normalizeSiteIconPack(await API.getSiteIconPack());
-          if (!isCurrentModal()) return;
-          siteIconPack = activePack;
-          packs = packs.map(pack => ({ ...pack, active: pack.id === activePack.id }));
           renderList();
           setStatus('');
           Toast.success('已切换图标包');
@@ -1281,8 +1379,6 @@ async function showSiteIconPackModal() {
         try {
           await API.deleteSiteIconPack(button.dataset.iconPackId);
           if (!isCurrentModal()) return;
-          const deleted = packs.find(pack => pack.id === Number(button.dataset.iconPackId));
-          if (deleted && deleted.active) siteIconPack = normalizeSiteIconPack({ icons: [] });
           packs = packs.filter(pack => pack.id !== Number(button.dataset.iconPackId));
           renderList();
           setStatus('');
@@ -1321,10 +1417,7 @@ async function showSiteIconPackModal() {
     event.preventDefault();
     void importPack();
   };
-  document.getElementById('m-icon-pack-done').onclick = async () => {
-    closeModal();
-    await loadSites();
-  };
+  document.getElementById('m-icon-pack-done').onclick = () => closeModal();
   listEl.innerHTML = '<div class="site-icon-pack-list-empty">正在读取图标包…</div>';
   setBusy(true);
   try {
@@ -1341,6 +1434,7 @@ async function showSiteIconPackModal() {
 
 async function showSiteIconManager(site) {
   if (!site || !site.id) return;
+  const modalIntent = beginModalIntent('sites');
   const current = siteIconFor(site);
   document.getElementById('modal-title').textContent = '设置站点图标';
   document.getElementById('modal-body').innerHTML = `
@@ -1370,7 +1464,7 @@ async function showSiteIconManager(site) {
     <button class="btn-modal secondary" id="m-site-icon-pack">图标包管理</button>
     <button class="btn-modal primary" id="m-site-icon-close">完成</button>
   `;
-  openModal({ closeOnBackdrop: true, modalClass: 'site-icon-manager-modal' });
+  openModal({ closeOnBackdrop: true, modalClass: 'site-icon-manager-modal', intent: modalIntent });
 
   const searchInput = document.getElementById('m-site-icon-search');
   const results = document.getElementById('m-site-icon-manager-results');
@@ -1381,10 +1475,12 @@ async function showSiteIconManager(site) {
   const clearButton = document.getElementById('m-site-icon-clear');
   const manageButton = document.getElementById('m-site-icon-pack');
   let packs = [];
-  let pickerPack = normalizeSiteIconPack(siteIconPack);
+  // Only the picker needs full pack contents. Read them when it opens so it
+  // sees the latest active pack and imports without keeping a page-wide cache.
+  let pickerPack = normalizeSiteIconPack();
   let busy = false;
   let ready = false;
-  const isCurrentModal = () => document.getElementById('m-site-icon-pack-select') === packSelect;
+  const isCurrentModal = () => isModalIntentCurrent(modalIntent) && document.getElementById('m-site-icon-pack-select') === packSelect;
   const close = () => closeModal();
   const setStatus = (message, error = false) => {
     status.textContent = message || '';
@@ -1451,7 +1547,6 @@ async function showSiteIconManager(site) {
       if (!isCurrentModal()) return;
       if (activePack.id !== selected.id) throw new Error('图标包已在其他页面切换，请重试');
       pickerPack = activePack;
-      siteIconPack = activePack;
       ready = true;
       packs = packs.map(pack => ({ ...pack, active: pack.id === activePack.id }));
       searchInput.value = '';
@@ -1487,7 +1582,6 @@ async function showSiteIconManager(site) {
       if (!isCurrentModal()) return;
       if (!updated.active) throw new Error('图标包已在其他页面切换，请重新选择');
       pickerPack = updated;
-      siteIconPack = updated;
       ready = true;
       packs = packs.map(pack => pack.id === updated.id ? normalizeSiteIconPackSummary(updated) : pack);
       renderPackControls();
@@ -1530,7 +1624,6 @@ async function showSiteIconManager(site) {
     if (!isCurrentModal()) return;
     packs = (Array.isArray(catalog && catalog.packs) ? catalog.packs : []).map(normalizeSiteIconPackSummary);
     pickerPack = normalizeSiteIconPack(activePack);
-    siteIconPack = pickerPack;
     ready = true;
     renderPackControls();
     render();
@@ -1546,23 +1639,17 @@ async function showSiteIconManager(site) {
 }
 
 async function showSiteModal(site) {
+  const modalIntent = beginModalIntent('sites');
   const isEdit = !!site;
   const title = isEdit ? '编辑站点' : '添加站点';
 	let siteCapabilities;
 	try {
 		siteCapabilities = normalizeSiteCapabilities(await API.ingressCapabilities());
 	} catch (error) {
-		Toast.error(`无法读取站点能力：${error.message}`);
+		if (isModalIntentCurrent(modalIntent)) Toast.error(`无法读取站点能力：${error.message}`);
 		return;
 	}
-	if (!siteIconPack.icons.length) {
-		try {
-			siteIconPack = normalizeSiteIconPack(await API.getSiteIconPack());
-		} catch (_) {
-			// The picker remains usable as an empty state when the optional icon
-			// package endpoint is temporarily unavailable.
-		}
-	}
+	if (!isModalIntentCurrent(modalIntent)) return;
 	const hostOnlyAvailable = siteCapabilities.host_only_available;
 	const upstreamHeadersAvailable = siteCapabilities.upstream_headers_available;
 	const domainPrefixAvailable = siteCapabilities.domain_prefix_available === true;
@@ -2052,19 +2139,21 @@ async function showSiteModal(site) {
     try {
       if (isEdit) {
         await API.updateSite(site.id, data);
+        if (!isModalIntentCurrent(modalIntent)) return;
         Toast.success('站点已更新');
       } else {
         await API.createSite(data);
+        if (!isModalIntentCurrent(modalIntent)) return;
         Toast.success('站点已创建');
       }
-      closeModal();
+      closeModal({ intent: modalIntent });
       loadSites();
     } catch (e) {
-      Toast.error(e.message);
+      if (isModalIntentCurrent(modalIntent)) Toast.error(e.message);
     }
   };
 
-  openModal({ closeOnBackdrop: false, modalClass: 'site-config-modal' });
+  openModal({ closeOnBackdrop: false, modalClass: 'site-config-modal', intent: modalIntent });
 }
 
 // Global actions
@@ -2079,12 +2168,14 @@ window.toggleSiteAction = async function(id) {
 };
 
 window.editSiteAction = async function(id) {
+  const modalIntent = beginModalIntent('sites');
   try {
     const sites = await API.listSites();
+    if (!isModalIntentCurrent(modalIntent)) return;
     const site = sites.find(s => s.id === id);
-    if (site) showSiteModal(site);
+    if (site) await showSiteModal(site);
   } catch (e) {
-    Toast.error(e.message);
+    if (isModalIntentCurrent(modalIntent)) Toast.error(e.message);
   }
 };
 

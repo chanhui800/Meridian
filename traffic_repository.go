@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log"
@@ -237,11 +238,22 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 	return logs, nil
 }
 
-// SumTrafficSince returns persisted bidirectional traffic from the supplied
-// local wall-clock boundary. The traffic log table intentionally stores local
-// wall-clock buckets for backwards compatibility, so the comparison uses the
+// SumTrafficSince returns persisted billable traffic. A zero boundary uses
+// lifetime counters, which remain intact after old history is pruned. The log
+// table stores local wall-clock buckets for backwards compatibility. Use the
 // same text format as trafficMinuteBucket instead of UTC serialization.
 func (d *DB) SumTrafficSince(start time.Time, billingMode string) (int64, error) {
+	if start.IsZero() {
+		bySite, err := d.SumTrafficSinceBySite(start, billingMode)
+		if err != nil {
+			return 0, err
+		}
+		var total int64
+		for _, used := range bySite {
+			total = saturatingAddInt64(total, used)
+		}
+		return total, nil
+	}
 	var bytesIn, bytesOut int64
 	startMS := start.UnixMilli()
 	startText := start.In(time.Local).Format("2006-01-02 15:04:05")
@@ -265,9 +277,20 @@ func (d *DB) SumTrafficSince(start time.Time, billingMode string) (int64, error)
 // SumTrafficSince, grouped by site so dashboards can show each node's current
 // month usage without issuing one query per site.
 func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int64]int64, error) {
+	return d.cachedTrafficSinceBySite(start, billingMode)
+}
+
+type trafficTotalsQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func queryTrafficSinceBySite(ctx context.Context, queryer trafficTotalsQueryer, start time.Time, billingMode string) (map[int64]int64, error) {
+	if start.IsZero() {
+		return queryLifetimeTrafficBySite(ctx, queryer, billingMode)
+	}
 	startMS := start.UnixMilli()
 	startText := start.In(time.Local).Format("2006-01-02 15:04:05")
-	rows, err := d.db.Query(`
+	rows, err := queryer.QueryContext(ctx, `
 		WITH source AS (
 			SELECT site_id, bytes_in, bytes_out
 			FROM traffic_logs
@@ -299,6 +322,27 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 	return result, nil
 }
 
+func queryLifetimeTrafficBySite(ctx context.Context, queryer trafficTotalsQueryer, billingMode string) (map[int64]int64, error) {
+	rows, err := queryer.QueryContext(ctx, "SELECT id, traffic_used, traffic_used_in, traffic_used_out FROM sites")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int64]int64)
+	for rows.Next() {
+		var site Site
+		if err := rows.Scan(&site.ID, &site.TrafficUsed, &site.TrafficUsedIn, &site.TrafficUsedOut); err != nil {
+			return nil, err
+		}
+		bytesIn, bytesOut := siteTrafficDirections(site)
+		result[site.ID] = trafficBillableBytes(billingMode, bytesIn, bytesOut)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // SumTrafficSinceForSite returns the billable bytes for one site and cycle.
 // Directional columns remain raw so changing the billing mode never destroys
 // the information needed to recalculate the current cycle.
@@ -322,6 +366,19 @@ type trafficQueryer interface {
 }
 
 func sumTrafficSinceForSiteQuery(queryer trafficQueryer, siteID int64, start time.Time, billingMode string) (int64, error) {
+	if start.IsZero() {
+		var site Site
+		err := queryer.QueryRow("SELECT traffic_used, traffic_used_in, traffic_used_out FROM sites WHERE id=?", siteID).
+			Scan(&site.TrafficUsed, &site.TrafficUsedIn, &site.TrafficUsedOut)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		bytesIn, bytesOut := siteTrafficDirections(site)
+		return trafficBillableBytes(billingMode, bytesIn, bytesOut), nil
+	}
 	var bytesIn, bytesOut int64
 	startMS := start.UnixMilli()
 	startText := start.In(time.Local).Format("2006-01-02 15:04:05")

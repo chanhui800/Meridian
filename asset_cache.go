@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -16,10 +15,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -64,32 +65,53 @@ type assetCacheHit struct {
 }
 
 type assetCache struct {
-	dir           string
-	mu            sync.Mutex
-	sizeBySiteMap map[int64]int64
-	totalBytes    int64
-	sizeLoaded    bool
-	entries       map[string]assetCacheIndexedEntry
+	dir                string
+	mu                 sync.Mutex
+	maintenanceMu      sync.Mutex
+	sizeBySiteMap      map[int64]int64
+	sizeByNamespace    map[string]int64
+	entriesByNamespace map[string]map[string]struct{}
+	epoch              uint64
+	activeNamespaces   map[string]string
+	fills              map[*assetCacheFillBody]struct{}
+	clearing           bool
+	totalBytes         int64
+	sizeLoaded         bool
+	entries            map[string]assetCacheIndexedEntry
 }
 
 type assetCacheIndexedEntry struct {
-	siteID    int64
-	namespace string
-	metaName  string
-	bodyName  string
-	accessed  int64
-	size      int64
+	siteID            int64
+	namespace         string
+	metaName          string
+	bodyName          string
+	accessed          int64
+	persistedAccessed int64
+	size              int64
+	bodyInfo          os.FileInfo
+}
+
+const assetCacheAccessPersistInterval = 30 * time.Second
+
+var errAssetCacheInvalidEntry = errors.New("invalid cache entry")
+
+type assetCacheReadSnapshot struct {
+	meta     assetCacheMeta
+	body     *os.File
+	bodyInfo os.FileInfo
 }
 
 type assetCacheContextKey struct{}
 
 type assetCacheRequest struct {
-	key      string
-	metaName string
-	bodyName string
-	metaPath string
-	bodyPath string
-	method   string
+	key       string
+	metaName  string
+	bodyName  string
+	metaPath  string
+	bodyPath  string
+	method    string
+	epoch     uint64
+	namespace string
 }
 
 func newAssetCache(dir string) *assetCache {
@@ -97,7 +119,7 @@ func newAssetCache(dir string) *assetCache {
 	if dir == "" {
 		return nil
 	}
-	return &assetCache{dir: dir, sizeBySiteMap: make(map[int64]int64), entries: make(map[string]assetCacheIndexedEntry)}
+	return &assetCache{dir: dir, sizeBySiteMap: make(map[int64]int64), sizeByNamespace: make(map[string]int64), entriesByNamespace: make(map[string]map[string]struct{}), activeNamespaces: make(map[string]string), fills: make(map[*assetCacheFillBody]struct{}), entries: make(map[string]assetCacheIndexedEntry)}
 }
 
 func assetCacheTargetURL(r *http.Request, upstream *url.URL) *url.URL {
@@ -112,14 +134,33 @@ func assetCacheTargetURL(r *http.Request, upstream *url.URL) *url.URL {
 }
 
 func assetCacheRequestEligible(site Site, r *http.Request, target *url.URL) bool {
-	if !site.AssetCacheEnabled || r == nil || target == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
-		return false
+	return assetCacheRequestReason(site, r, target) == ""
+}
+
+func assetCacheRequestReason(site Site, r *http.Request, target *url.URL) string {
+	if !site.AssetCacheEnabled {
+		return "disabled"
 	}
-	if r.Header.Get("Range") != "" || hasUpgradeIntent(r) || isReservedDynamicRoute(r.URL.Path) || isPlaybackRedirectEndpoint(r.URL.Path) || isPlaybackInfoRequest(r.URL.Path) || dynamicStructuredRequestSource(r.URL.Path) != "" {
-		return false
+	if r == nil || r.URL == nil || target == nil {
+		return "rule_no_match"
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return "method"
+	}
+	if r.Header.Get("Range") != "" {
+		return "range"
+	}
+	if hasUpgradeIntent(r) || isReservedDynamicRoute(r.URL.Path) || isPlaybackRedirectEndpoint(r.URL.Path) || isPlaybackInfoRequest(r.URL.Path) || dynamicStructuredRequestSource(r.URL.Path) != "" {
+		return "dynamic"
 	}
 	ext := strings.ToLower(filepath.Ext(target.Path))
-	return !assetCacheBlockedExtensions[ext] && assetCacheRuleMatches(site.AssetCacheRules, target)
+	if assetCacheBlockedExtensions[ext] {
+		return "dynamic"
+	}
+	if !assetCacheRuleMatches(site.AssetCacheRules, target) {
+		return "rule_no_match"
+	}
+	return ""
 }
 
 func assetCacheIdentity(r *http.Request) string {
@@ -140,15 +181,38 @@ func assetCacheIdentity(r *http.Request) string {
 	return fmt.Sprintf("%x", digest[:])
 }
 
-// Agent runtimes rebuild their in-memory SQLite database, so the local row ID
-// is not a durable identity across configuration refreshes. Keep the stable
-// controller-provided namespace path-safe and human-readable for diagnostics.
+// Agent runtimes supply a stable central-site generation rather than their
+// ephemeral SQLite row ID. Controller runtimes derive a generation from the
+// upstream/content and cache settings so edits cannot reuse prior content.
+// Hash encrypted fixed headers along with the settings; never put their values
+// or ciphertext directly in a filesystem path.
 func assetCacheNamespace(site Site) string {
 	namespace := strings.TrimSpace(site.AssetCacheNamespace)
-	if namespace == "" {
-		return fmt.Sprintf("site-%d", site.ID)
+	if namespace != "" {
+		return namespace
 	}
-	return namespace
+	payload := struct {
+		TargetURL, PlaybackTargetURL, PlaybackMode, MainVideoStreamMode string
+		IngressMode, PublicHost, PathPrefix, StreamHosts                string
+		FailoverTargets                                                 []string
+		UAMode, CustomUserAgent, CustomClient, CustomVersion            string
+		ClientIPMode, StoredUpstreamHeaders                             string
+		RuntimeUpstreamHeaders                                          map[string][]string
+		CacheEnabled                                                    bool
+		CacheTTLSec                                                     int
+		CacheMaxBytes                                                   int64
+		CacheRules                                                      string
+	}{
+		TargetURL: site.TargetURL, PlaybackTargetURL: site.PlaybackTargetURL, PlaybackMode: site.PlaybackMode, MainVideoStreamMode: site.MainVideoStreamMode,
+		IngressMode: site.IngressMode, PublicHost: site.PublicHost, PathPrefix: site.PathPrefix,
+		FailoverTargets: site.FailoverTargetList, StreamHosts: site.StreamHosts,
+		UAMode: site.UAMode, CustomUserAgent: site.CustomUserAgent, CustomClient: site.CustomClient, CustomVersion: site.CustomVersion,
+		ClientIPMode: site.ClientIPMode, StoredUpstreamHeaders: site.StoredUpstreamHeaders, RuntimeUpstreamHeaders: site.RuntimeUpstreamHeaders,
+		CacheEnabled: site.AssetCacheEnabled, CacheTTLSec: site.AssetCacheTTLSec, CacheMaxBytes: site.AssetCacheMaxBytes, CacheRules: site.AssetCacheRules,
+	}
+	data, _ := json.Marshal(payload)
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("site-%d-config-%x", site.ID, digest[:16])
 }
 
 func assetCacheNamespacePrefix(namespace string) string {
@@ -169,12 +233,13 @@ func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *asset
 	if c == nil || !assetCacheRequestEligible(site, r, target) {
 		return nil
 	}
+	namespace := assetCacheNamespace(site)
 	raw := strings.Join([]string{
 		// The cache namespace is supplied by the Controller and remains stable
 		// across the Agent's in-memory SQLite rebuilds. Do not include the local
 		// SQLite row ID in the cache key: it is ephemeral and can change when a
 		// route is added, removed, or reordered.
-		assetCacheNamespace(site),
+		namespace,
 		target.String(),
 		r.Header.Get("Accept"),
 		r.Header.Get("Accept-Encoding"),
@@ -182,17 +247,55 @@ func (c *assetCache) request(site Site, r *http.Request, target *url.URL) *asset
 	}, "\n")
 	digest := sha256.Sum256([]byte(raw))
 	key := fmt.Sprintf("%x", digest[:])
-	relDir := filepath.Join(assetCacheNamespace(site), key[:2])
+	relDir := filepath.Join(namespace, key[:2])
 	metaName := filepath.Join(relDir, key+".json")
 	bodyName := filepath.Join(relDir, key+".body")
+	c.mu.Lock()
+	epoch := c.epoch
+	c.mu.Unlock()
 	return &assetCacheRequest{
-		key:      key,
-		method:   r.Method,
-		metaName: metaName,
-		bodyName: bodyName,
-		metaPath: filepath.Join(c.dir, metaName),
-		bodyPath: filepath.Join(c.dir, bodyName),
+		key:       key,
+		method:    r.Method,
+		metaName:  metaName,
+		bodyName:  bodyName,
+		metaPath:  filepath.Join(c.dir, metaName),
+		bodyPath:  filepath.Join(c.dir, bodyName),
+		epoch:     epoch,
+		namespace: namespace,
 	}
+}
+
+func prepareAssetCacheRequest(cache *assetCache, site Site, r *http.Request, target *url.URL) (*http.Request, *assetCacheHit) {
+	if r == nil {
+		return r, nil
+	}
+	tracker := requestDiagnosticsFromContext(r.Context())
+	tracker.SetCacheWrite("not_attempted", "")
+	if cache == nil || !site.AssetCacheEnabled {
+		tracker.SetCacheLookup("disabled", "disabled")
+		tracker.SetCacheWrite("not_attempted", "disabled")
+		return r, nil
+	}
+	if reason := assetCacheRequestReason(site, r, target); reason != "" {
+		tracker.SetCacheLookup("bypass", reason)
+		tracker.SetCacheWrite("not_attempted", reason)
+		return r, nil
+	}
+	cacheReq := cache.request(site, r, target)
+	hit, err := cache.read(cacheReq, time.Now())
+	if err != nil {
+		tracker.SetCacheLookup("read_error", assetCacheErrorReason(err))
+	} else if hit != nil {
+		tracker.SetCacheLookup("hit", "")
+		tracker.SetResponseType(http.Header(hit.meta.Headers).Get("Content-Type"))
+		return r, hit
+	} else {
+		tracker.SetCacheLookup("miss", "")
+	}
+	if cacheReq.method == http.MethodHead {
+		tracker.SetCacheWrite("not_attempted", "head_no_fill")
+	}
+	return r.WithContext(context.WithValue(r.Context(), assetCacheContextKey{}, cacheReq)), nil
 }
 
 func (c *assetCache) openRoot(create bool) (*os.Root, error) {
@@ -252,11 +355,14 @@ func (c *assetCache) rebuildSizeIndexLocked() error {
 		return nil
 	}
 	sizes := make(map[int64]int64)
+	namespaceSizes := make(map[string]int64)
+	namespaceEntries := make(map[string]map[string]struct{})
 	entries := make(map[string]assetCacheIndexedEntry)
 	root, err := c.openRoot(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.sizeBySiteMap, c.entries, c.totalBytes, c.sizeLoaded = sizes, entries, 0, true
+			c.sizeByNamespace, c.entriesByNamespace = namespaceSizes, namespaceEntries
 			return nil
 		}
 		return err
@@ -278,16 +384,22 @@ func (c *assetCache) rebuildSizeIndexLocked() error {
 		if !ok {
 			return nil
 		}
-		info, err := entry.Info()
+		bodyName := filepath.FromSlash(path)
+		// Root.Stat captures the identity while the file still occupies this
+		// path, including on platforms whose directory entries defer that work.
+		info, err := root.Stat(bodyName)
 		if err != nil {
 			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
 		}
 		if info.Size() < 0 {
 			return fmt.Errorf("cache file %q has an invalid size", path)
 		}
 		sizes[siteID] += info.Size()
 		total += info.Size()
-		metaName := strings.TrimSuffix(path, ".body") + ".json"
+		metaName := strings.TrimSuffix(bodyName, ".body") + ".json"
 		accessed := int64(0)
 		if data, readErr := root.ReadFile(metaName); readErr == nil {
 			var meta assetCacheMeta
@@ -295,13 +407,26 @@ func (c *assetCache) rebuildSizeIndexLocked() error {
 				accessed = meta.AccessedAtMS
 			}
 		}
-		entries[path] = assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(path), metaName: metaName, bodyName: path, accessed: accessed, size: info.Size()}
+		indexed := assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(path), metaName: metaName, bodyName: bodyName, accessed: accessed, persistedAccessed: accessed, size: info.Size(), bodyInfo: info}
+		if previous, ok := c.entries[bodyName]; ok && previous.bodyInfo != nil && os.SameFile(previous.bodyInfo, info) {
+			// Hits update RAM on every access, but the metadata is persisted less
+			// often. A periodic disk reconciliation must keep that newer recency
+			// only while this is still the same body file.
+			indexed.accessed = max(indexed.accessed, previous.accessed)
+		}
+		entries[bodyName] = indexed
+		namespaceSizes[indexed.namespace] += indexed.size
+		if namespaceEntries[indexed.namespace] == nil {
+			namespaceEntries[indexed.namespace] = make(map[string]struct{})
+		}
+		namespaceEntries[indexed.namespace][bodyName] = struct{}{}
 		return nil
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	c.sizeBySiteMap, c.entries, c.totalBytes, c.sizeLoaded = sizes, entries, total, true
+	c.sizeByNamespace, c.entriesByNamespace = namespaceSizes, namespaceEntries
 	return nil
 }
 
@@ -351,7 +476,7 @@ func (c *assetCache) startReconcile(ctx context.Context) {
 			select {
 			case <-ticker.C:
 				if err := c.reconcileSizeIndex(); err != nil {
-					log.Printf("[asset-cache] reconcile failed: %v", err)
+					log.Printf("[asset-cache] reconcile failed: %s", assetCacheErrorReason(err))
 				}
 			case <-ctx.Done():
 				return
@@ -366,8 +491,22 @@ func (c *assetCache) clear() error {
 	if c == nil {
 		return nil
 	}
+	c.maintenanceMu.Lock()
+	defer c.maintenanceMu.Unlock()
+	c.mu.Lock()
+	c.epoch++
+	c.clearing = true
+	fills := make([]*assetCacheFillBody, 0, len(c.fills))
+	for fill := range c.fills {
+		fills = append(fills, fill)
+	}
+	c.mu.Unlock()
+	for _, fill := range fills {
+		fill.abort("generation_changed")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer func() { c.clearing = false }()
 	root, err := c.openRoot(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -389,6 +528,8 @@ func (c *assetCache) clear() error {
 		}
 	}
 	c.sizeBySiteMap = make(map[int64]int64)
+	c.sizeByNamespace = make(map[string]int64)
+	c.entriesByNamespace = make(map[string]map[string]struct{})
 	c.entries = make(map[string]assetCacheIndexedEntry)
 	c.totalBytes = 0
 	c.sizeLoaded = true
@@ -402,6 +543,20 @@ func (c *assetCache) clear() error {
 func (c *assetCache) gcSiteGenerations(sitePrefix, keepNamespace string) error {
 	if c == nil || strings.TrimSpace(sitePrefix) == "" {
 		return nil
+	}
+	c.maintenanceMu.Lock()
+	defer c.maintenanceMu.Unlock()
+	c.mu.Lock()
+	c.activeNamespaces[sitePrefix] = keepNamespace
+	fills := make([]*assetCacheFillBody, 0)
+	for fill := range c.fills {
+		if assetCacheNamespacePrefix(fill.request.namespace) == sitePrefix && fill.request.namespace != keepNamespace {
+			fills = append(fills, fill)
+		}
+	}
+	c.mu.Unlock()
+	for _, fill := range fills {
+		fill.abort("generation_changed")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -434,17 +589,15 @@ func (c *assetCache) gcSiteGenerations(sitePrefix, keepNamespace string) error {
 
 func (c *assetCache) addIndexedEntryLocked(entry assetCacheIndexedEntry) {
 	if old, ok := c.entries[entry.bodyName]; ok {
-		c.sizeBySiteMap[old.siteID] -= old.size
-		if c.sizeBySiteMap[old.siteID] < 0 {
-			c.sizeBySiteMap[old.siteID] = 0
-		}
-		c.totalBytes -= old.size
-		if c.totalBytes < 0 {
-			c.totalBytes = 0
-		}
+		c.removeIndexedEntryLocked(old.bodyName)
 	}
 	c.entries[entry.bodyName] = entry
 	c.sizeBySiteMap[entry.siteID] += entry.size
+	c.sizeByNamespace[entry.namespace] += entry.size
+	if c.entriesByNamespace[entry.namespace] == nil {
+		c.entriesByNamespace[entry.namespace] = make(map[string]struct{})
+	}
+	c.entriesByNamespace[entry.namespace][entry.bodyName] = struct{}{}
 	c.totalBytes += entry.size
 }
 
@@ -454,6 +607,12 @@ func (c *assetCache) removeIndexedEntryLocked(bodyName string) {
 		return
 	}
 	delete(c.entries, bodyName)
+	c.sizeByNamespace[entry.namespace] -= entry.size
+	delete(c.entriesByNamespace[entry.namespace], bodyName)
+	if len(c.entriesByNamespace[entry.namespace]) == 0 {
+		delete(c.entriesByNamespace, entry.namespace)
+		delete(c.sizeByNamespace, entry.namespace)
+	}
 	c.sizeBySiteMap[entry.siteID] -= entry.size
 	if c.sizeBySiteMap[entry.siteID] <= 0 {
 		delete(c.sizeBySiteMap, entry.siteID)
@@ -464,16 +623,49 @@ func (c *assetCache) removeIndexedEntryLocked(bodyName string) {
 	}
 }
 
-func (c *assetCache) removeEntryLocked(root *os.Root, metaName, bodyName string) {
-	_ = root.Remove(metaName)
-	_ = root.Remove(bodyName)
-	c.removeIndexedEntryLocked(bodyName)
+func (c *assetCache) removeEntryLocked(root *os.Root, metaName, bodyName string) error {
+	metaErr := root.Remove(metaName)
+	bodyErr := root.Remove(bodyName)
+	if bodyErr == nil || errors.Is(bodyErr, os.ErrNotExist) {
+		c.removeIndexedEntryLocked(bodyName)
+	}
+	if errors.Is(metaErr, os.ErrNotExist) {
+		metaErr = nil
+	}
+	if errors.Is(bodyErr, os.ErrNotExist) {
+		bodyErr = nil
+	}
+	return errors.Join(metaErr, bodyErr)
 }
 
 func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit, error) {
 	if c == nil || req == nil {
 		return nil, nil
 	}
+	snapshot, err := c.openReadSnapshot(req, now)
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	if snapshot.body == nil {
+		return &assetCacheHit{meta: snapshot.meta}, nil
+	}
+	defer snapshot.body.Close()
+	// The descriptor and metadata were paired under the lock. Writers replace
+	// body files atomically, so an in-flight reader can finish its own snapshot
+	// without serializing every site's disk read behind the global cache lock.
+	body, err := io.ReadAll(io.LimitReader(snapshot.body, snapshot.meta.Size+1))
+	if err != nil {
+		c.removeReadEntryIfCurrent(req, snapshot.bodyInfo)
+		return nil, err
+	}
+	if int64(len(body)) != snapshot.meta.Size {
+		c.removeReadEntryIfCurrent(req, snapshot.bodyInfo)
+		return nil, errAssetCacheInvalidEntry
+	}
+	return &assetCacheHit{meta: snapshot.meta, body: body}, nil
+}
+
+func (c *assetCache) openReadSnapshot(req *assetCacheRequest, now time.Time) (*assetCacheReadSnapshot, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := c.ensureSizeIndexLocked(); err != nil {
@@ -495,46 +687,132 @@ func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit
 		return nil, err
 	}
 	var meta assetCacheMeta
-	if json.Unmarshal(metaBytes, &meta) != nil || meta.ExpiresAtMS <= now.UnixMilli() || meta.Size < 0 || meta.Size > maxAssetCacheObject {
+	if json.Unmarshal(metaBytes, &meta) != nil {
+		c.removeEntryLocked(root, req.metaName, req.bodyName)
+		return nil, errAssetCacheInvalidEntry
+	}
+	if meta.ExpiresAtMS <= now.UnixMilli() {
 		c.removeEntryLocked(root, req.metaName, req.bodyName)
 		return nil, nil
 	}
-	body, err := root.ReadFile(req.bodyName)
-	if err != nil || int64(len(body)) != meta.Size {
+	if meta.Size <= 0 || meta.Size > maxAssetCacheObject || !assetCacheResponseHeadersEligible(&http.Response{StatusCode: meta.Status, Header: http.Header(meta.Headers)}) {
 		c.removeEntryLocked(root, req.metaName, req.bodyName)
-		return nil, nil
+		return nil, errAssetCacheInvalidEntry
 	}
-	meta.AccessedAtMS = now.UnixMilli()
-	if updated, err := json.Marshal(meta); err == nil {
-		_ = root.WriteFile(req.metaName, updated, 0600)
+	snapshot := &assetCacheReadSnapshot{meta: meta}
+	if req.method == http.MethodHead {
+		snapshot.bodyInfo, err = root.Stat(req.bodyName)
+	} else {
+		snapshot.body, err = root.Open(req.bodyName)
+		if err == nil {
+			snapshot.bodyInfo, err = snapshot.body.Stat()
+		}
 	}
-	return &assetCacheHit{meta: meta, body: body}, nil
+	if err != nil {
+		if snapshot.body != nil {
+			_ = snapshot.body.Close()
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			c.removeEntryLocked(root, req.metaName, req.bodyName)
+			return nil, errAssetCacheInvalidEntry
+		}
+		return nil, err
+	}
+	if !snapshot.bodyInfo.Mode().IsRegular() || snapshot.bodyInfo.Size() != meta.Size {
+		if snapshot.body != nil {
+			_ = snapshot.body.Close()
+		}
+		c.removeEntryLocked(root, req.metaName, req.bodyName)
+		return nil, errAssetCacheInvalidEntry
+	}
+	c.recordAccessLocked(root, req, &snapshot.meta, snapshot.bodyInfo, now)
+	return snapshot, nil
 }
 
-func assetCacheResponseEligible(resp *http.Response, body []byte) bool {
-	if resp == nil || resp.StatusCode != http.StatusOK || len(body) == 0 || int64(len(body)) > maxAssetCacheObject || len(resp.Header.Values("Set-Cookie")) > 0 {
-		return false
+func (c *assetCache) recordAccessLocked(root *os.Root, req *assetCacheRequest, meta *assetCacheMeta, info os.FileInfo, now time.Time) {
+	entry, ok := c.entries[req.bodyName]
+	if !ok || entry.bodyInfo == nil || !os.SameFile(entry.bodyInfo, info) {
+		siteID, valid := assetCacheSiteIDFromPath(req.bodyName)
+		if !valid {
+			return
+		}
+		entry = assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(req.bodyName), metaName: req.metaName, bodyName: req.bodyName, accessed: meta.AccessedAtMS, persistedAccessed: meta.AccessedAtMS, size: meta.Size, bodyInfo: info}
+		c.addIndexedEntryLocked(entry)
+	}
+	entry.accessed = max(entry.accessed, now.UnixMilli())
+	meta.AccessedAtMS = entry.accessed
+	if entry.accessed-entry.persistedAccessed >= assetCacheAccessPersistInterval.Milliseconds() {
+		if updated, err := json.Marshal(meta); err == nil {
+			if err := root.WriteFile(req.metaName, updated, 0600); err == nil {
+				entry.persistedAccessed = entry.accessed
+			}
+		}
+	}
+	c.entries[req.bodyName] = entry
+}
+
+func (c *assetCache) removeReadEntryIfCurrent(req *assetCacheRequest, original os.FileInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	root, err := c.openRoot(false)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	current, err := root.Stat(req.bodyName)
+	if err == nil && os.SameFile(original, current) {
+		// A failed old read must not remove a replacement written after its
+		// descriptor was opened, even when that replacement has the same size.
+		c.removeEntryLocked(root, req.metaName, req.bodyName)
+	}
+}
+
+func assetCacheResponseHeadersEligible(resp *http.Response) bool {
+	return assetCacheResponseHeadersReason(resp) == ""
+}
+
+func assetCacheResponseHeadersReason(resp *http.Response) string {
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		return "response_status"
+	}
+	if len(resp.Header.Values("Set-Cookie")) > 0 {
+		return "set_cookie"
 	}
 	cacheControl := strings.ToLower(strings.Join(resp.Header.Values("Cache-Control"), ","))
 	for _, directive := range strings.Split(cacheControl, ",") {
 		name := strings.TrimSpace(strings.SplitN(directive, "=", 2)[0])
-		if name == "no-store" || name == "no-cache" || name == "private" {
-			return false
+		switch name {
+		case "no-store":
+			return "no_store"
+		case "no-cache":
+			return "no_cache"
+		case "private":
+			return "private"
 		}
 	}
 	vary := strings.ToLower(strings.Join(resp.Header.Values("Vary"), ","))
 	for _, name := range strings.Split(vary, ",") {
 		name = strings.TrimSpace(name)
 		if name == "*" || name != "" && name != "accept" && name != "accept-encoding" {
-			return false
+			return "vary"
 		}
 	}
-	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return "mime"
+	}
 	mediaType = strings.ToLower(mediaType)
 	if strings.HasPrefix(mediaType, "video/") || strings.HasPrefix(mediaType, "audio/") || strings.Contains(mediaType, "mpegurl") || mediaType == "application/dash+xml" {
-		return false
+		return "mime"
 	}
-	return strings.HasPrefix(mediaType, "image/") || strings.HasPrefix(mediaType, "font/") || mediaType == "text/css" || strings.Contains(mediaType, "javascript") || mediaType == "application/wasm" || mediaType == "application/font-woff"
+	if strings.HasPrefix(mediaType, "image/") || strings.HasPrefix(mediaType, "font/") || mediaType == "text/css" || strings.Contains(mediaType, "javascript") || mediaType == "application/wasm" || mediaType == "application/font-woff" {
+		return ""
+	}
+	return "mime"
+}
+
+func assetCacheResponseEligible(resp *http.Response, body []byte) bool {
+	return len(body) > 0 && int64(len(body)) <= maxAssetCacheObject && assetCacheResponseHeadersEligible(resp)
 }
 
 func cacheableResponseHeaders(header http.Header) map[string][]string {
@@ -548,8 +826,13 @@ func cacheableResponseHeaders(header http.Header) map[string][]string {
 }
 
 func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Response, body []byte, now time.Time) error {
+	_, err := c.writeStored(site, req, resp, body, now)
+	return err
+}
+
+func (c *assetCache) writeStored(site Site, req *assetCacheRequest, resp *http.Response, body []byte, now time.Time) (bool, error) {
 	if c == nil || req == nil || !assetCacheResponseEligible(resp, body) {
-		return nil
+		return false, nil
 	}
 	meta := assetCacheMeta{
 		Status:       resp.StatusCode,
@@ -561,45 +844,64 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
-		return err
+		return false, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := c.ensureSizeIndexLocked(); err != nil {
-		return err
+		return false, err
 	}
 	root, err := c.openRoot(true)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer root.Close()
 	if err := root.MkdirAll(filepath.Dir(req.bodyName), 0700); err != nil {
-		return err
+		return false, err
 	}
 	bodyTmp := req.bodyName + ".tmp"
 	metaTmp := req.metaName + ".tmp"
 	if err := root.WriteFile(bodyTmp, body, 0600); err != nil {
-		return err
+		return false, err
 	}
 	if err := root.WriteFile(metaTmp, metaBytes, 0600); err != nil {
 		_ = root.Remove(bodyTmp)
-		return err
+		return false, err
 	}
 	if err := root.Rename(bodyTmp, req.bodyName); err != nil {
 		_ = root.Remove(bodyTmp)
 		_ = root.Remove(metaTmp)
-		return err
+		return false, err
 	}
 	if err := root.Rename(metaTmp, req.metaName); err != nil {
 		_ = root.Remove(req.bodyName)
 		_ = root.Remove(metaTmp)
 		c.removeIndexedEntryLocked(req.bodyName)
-		return err
+		return false, err
+	}
+	bodyInfo, err := root.Stat(req.bodyName)
+	if err != nil {
+		c.removeEntryLocked(root, req.metaName, req.bodyName)
+		return false, err
 	}
 	if siteID, ok := assetCacheSiteIDFromPath(req.bodyName); ok {
-		c.addIndexedEntryLocked(assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(req.bodyName), metaName: req.metaName, bodyName: req.bodyName, accessed: meta.AccessedAtMS, size: meta.Size})
+		c.addIndexedEntryLocked(assetCacheIndexedEntry{siteID: siteID, namespace: assetCacheNamespaceFromPath(req.bodyName), metaName: req.metaName, bodyName: req.bodyName, accessed: meta.AccessedAtMS, persistedAccessed: meta.AccessedAtMS, size: meta.Size, bodyInfo: bodyInfo})
 	}
-	return c.enforceBudgetLocked(root, site)
+	if err := c.enforceBudgetLocked(root, site); err != nil {
+		return false, err
+	}
+	current, err := root.Stat(req.bodyName)
+	if errors.Is(err, os.ErrNotExist) {
+		c.removeIndexedEntryLocked(req.bodyName)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !os.SameFile(bodyInfo, current) || current.Size() != meta.Size {
+		return false, errors.New("cache body changed during write")
+	}
+	return true, nil
 }
 
 type assetCacheFile struct {
@@ -610,59 +912,107 @@ type assetCacheFile struct {
 }
 
 func (c *assetCache) enforceBudgetLocked(root *os.Root, site Site) error {
-	files := make([]assetCacheFile, 0)
-	var total int64
 	targetNamespace := assetCacheNamespacePrefix(assetCacheNamespace(site))
-	for _, entry := range c.entries {
-		if entry.namespace != targetNamespace {
-			continue
-		}
+	total := c.sizeByNamespace[targetNamespace]
+	if total <= site.AssetCacheMaxBytes {
+		return nil
+	}
+	files := make([]assetCacheFile, 0, len(c.entriesByNamespace[targetNamespace]))
+	for bodyName := range c.entriesByNamespace[targetNamespace] {
+		entry := c.entries[bodyName]
 		files = append(files, assetCacheFile{metaName: entry.metaName, bodyName: entry.bodyName, accessed: entry.accessed, size: entry.size})
-		total += entry.size
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].accessed < files[j].accessed })
 	for _, file := range files {
 		if total <= site.AssetCacheMaxBytes {
 			break
 		}
-		c.removeEntryLocked(root, file.metaName, file.bodyName)
+		if err := c.removeEntryLocked(root, file.metaName, file.bodyName); err != nil {
+			return err
+		}
 		total -= file.size
 	}
 	return nil
 }
 
+func assetCacheErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, errAssetCacheInvalidEntry) {
+		return "invalid_entry"
+	}
+	if errors.Is(err, syscall.EROFS) {
+		return "readonly"
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return "no_space"
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return "permission"
+	}
+	if runtime.GOOS == "windows" {
+		// Windows reports native error codes instead of the portable syscall
+		// errno values for write-protected volumes and exhausted disks.
+		if errors.Is(err, syscall.Errno(19)) {
+			return "readonly" // ERROR_WRITE_PROTECT
+		}
+		if errors.Is(err, syscall.Errno(39)) || errors.Is(err, syscall.Errno(112)) {
+			return "no_space" // ERROR_HANDLE_DISK_FULL / ERROR_DISK_FULL
+		}
+	}
+	return "io"
+}
+
 func prepareAssetCacheResponse(resp *http.Response, cache *assetCache, site Site) error {
+	if resp == nil || resp.Request == nil {
+		return nil
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	tracker := requestDiagnosticsFromContext(resp.Request.Context())
+	tracker.SetResponseType(resp.Header.Get("Content-Type"))
+	if cache == nil {
+		return nil
+	}
 	cacheReq, _ := resp.Request.Context().Value(assetCacheContextKey{}).(*assetCacheRequest)
-	if cacheReq == nil || resp.Body == nil {
+	if cacheReq == nil {
 		return nil
 	}
 	if cacheReq.method == http.MethodHead {
+		tracker.SetCacheWrite("not_attempted", "head_no_fill")
+		return nil
+	}
+	if reason := assetCacheResponseHeadersReason(resp); reason != "" {
+		tracker.SetCacheWrite("skipped", reason)
+		resp.Header.Set("X-Meridian-Cache", "BYPASS")
+		return nil
+	}
+	if resp.Body == nil || resp.Body == http.NoBody || resp.ContentLength == 0 {
+		tracker.SetCacheWrite("skipped", "empty_body")
+		resp.Header.Set("X-Meridian-Cache", "BYPASS")
 		return nil
 	}
 	if resp.ContentLength > maxAssetCacheObject {
+		tracker.SetCacheWrite("skipped", "too_large")
 		resp.Header.Set("X-Meridian-Cache", "BYPASS")
 		return nil
 	}
-	originalBody := resp.Body
-	body, err := io.ReadAll(io.LimitReader(originalBody, maxAssetCacheObject+1))
+	body, reason, err := cache.newFillBody(site, cacheReq, resp, tracker)
 	if err != nil {
-		return err
-	}
-	if int64(len(body)) > maxAssetCacheObject {
-		// Unknown-length/chunked responses may still be cacheable. If the body is
-		// larger than the object limit, put the bytes already read back in front
-		// of the unread stream so the proxy never truncates the upstream response.
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), originalBody))
+		tracker.SetCacheWrite("write_error", assetCacheErrorReason(err))
 		resp.Header.Set("X-Meridian-Cache", "BYPASS")
 		return nil
 	}
-	_ = originalBody.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	if int64(len(body)) <= maxAssetCacheObject {
-		_ = cache.write(site, cacheReq, resp, body, time.Now())
+	if body == nil {
+		tracker.SetCacheWrite("skipped", reason)
+		resp.Header.Set("X-Meridian-Cache", "BYPASS")
+		return nil
 	}
+	resp.Body = body
+	// Headers describe the lookup. The body records the final cache write
+	// outcome before the request handler takes its completion snapshot.
 	resp.Header.Set("X-Meridian-Cache", "MISS")
 	return nil
 }
@@ -675,7 +1025,7 @@ func serveAssetCacheHit(w http.ResponseWriter, r *http.Request, hit *assetCacheH
 	}
 	w.Header().Set("X-Meridian-Cache", "HIT")
 	w.Header().Set("Age", strconv.FormatInt(max(0, (time.Now().UnixMilli()-hit.meta.CreatedAtMS)/1000), 10))
-	w.Header().Set("Content-Length", strconv.Itoa(len(hit.body)))
+	w.Header().Set("Content-Length", strconv.FormatInt(hit.meta.Size, 10))
 	w.WriteHeader(hit.meta.Status)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(hit.body) // #nosec G705 -- bytes are served only after cache metadata/content-type eligibility checks.

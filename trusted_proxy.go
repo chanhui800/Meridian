@@ -28,6 +28,42 @@ func parseTrustedProxyCIDRs(value string) ([]*net.IPNet, error) {
 	return networks, nil
 }
 
+// Forwarded-header trust describes which transport peers may provide client
+// identity; it does not establish that a reverse proxy is deployed. Older
+// installations used exact /32 and /128 peers as that deployment signal, so
+// retain only that narrow compatibility case when the explicit flag is absent.
+func parsePanelExternalProxyEnabled(value string, networks []*net.IPNet) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true":
+		if len(networks) == 0 {
+			return false, fmt.Errorf("PANEL_EXTERNAL_PROXY_ENABLED=true requires a non-empty TRUSTED_PROXY_CIDRS source allowlist")
+		}
+		return true, nil
+	case "false":
+		return false, nil
+	case "":
+		if len(networks) == 0 {
+			return false, nil
+		}
+		for _, network := range networks {
+			if network == nil {
+				return false, nil
+			}
+			prefix, bits := network.Mask.Size()
+			if (bits != 32 && bits != 128) || prefix != bits {
+				return false, nil
+			}
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("PANEL_EXTERNAL_PROXY_ENABLED must be true or false")
+	}
+}
+
+func hostOnlyIngressAvailable(panelBindLoopback, panelTLSEnabled, externalProxyEnabled bool, trustedProxies []*net.IPNet) bool {
+	return panelBindLoopback || panelTLSEnabled || (externalProxyEnabled && len(trustedProxies) > 0)
+}
+
 func remoteAddressIP(remoteAddr string) net.IP {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err == nil {

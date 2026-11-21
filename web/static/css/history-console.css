@@ -77,6 +77,8 @@ body.console-shell #page-watch-history .history-console .watch-history-site span
 body.console-shell #page-watch-history .history-console .watch-history-live-badge,
 body.console-shell #page-watch-history .history-console .watch-history-pending { position: static; min-height: 20px; padding: 1px 7px; color: var(--console-accent); background: var(--console-accent-soft); border: 0; border-radius: 4px; font-size: 10px; font-weight: 500; }
 body.console-shell #page-watch-history .history-console .watch-history-live-badge i { background: currentColor; animation: none; }
+.watch-history-stop-note { margin: 6px 0 0; font-size: 12px; line-height: 1.6; color: var(--console-muted, var(--white-60)); overflow-wrap: anywhere; }
+.watch-history-stop-note.is-confirmed { color: var(--console-accent, var(--white-87)); }
 body.console-shell #page-watch-history .history-console .history-record-meta { display: grid; justify-items: start; gap: 7px; min-width: 0; }
 body.console-shell #page-watch-history .history-console .watch-history-type { position: static; inset: auto; display: inline-flex; width: auto; padding: 2px 7px; color: var(--console-muted); background: var(--console-bg); border: 0; border-radius: 4px; font-size: 10px; font-weight: 500; letter-spacing: 0; box-shadow: none; }
 body.console-shell #page-watch-history .history-console .watch-history-time,

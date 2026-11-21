@@ -47,6 +47,7 @@ const (
 // Query strings, request/response headers other than the sanitized User-Agent,
 // cookies, tokens and bodies are deliberately excluded.
 type requestLogEvent struct {
+	RequestDiagnostics
 	SiteID            int64
 	SiteName          string
 	FinalNode         string
@@ -60,9 +61,11 @@ type requestLogEvent struct {
 	BackendAddress    string
 	Method            string
 	Path              string
+	timelineAtMS      *int64
 }
 
 type RequestLog struct {
+	RequestDiagnostics
 	ID                int64  `json:"id"`
 	SiteID            int64  `json:"site_id"`
 	SiteName          string `json:"site_name"`
@@ -80,6 +83,74 @@ type RequestLog struct {
 	Path              string `json:"path"`
 	RecordedAtMS      int64  `json:"recorded_at_ms"`
 	CursorAtMS        int64  `json:"cursor_at_ms,omitempty"`
+}
+
+// AgentRequestLogPolicy is an additive wire snapshot of the Controller's
+// write policy. It refreshes without changing the proxy route config hash.
+type AgentRequestLogPolicy struct {
+	Version                int    `json:"version"`
+	LogEnabled             bool   `json:"log_enabled"`
+	LogLevel               string `json:"log_level"`
+	LogWriteImage          bool   `json:"log_write_image"`
+	LogWritePlayback       bool   `json:"log_write_playback"`
+	LogWriteMetadata       bool   `json:"log_write_metadata"`
+	LogWriteVideo          bool   `json:"log_write_video"`
+	LogWriteSubtitle       bool   `json:"log_write_subtitle"`
+	LogWriteAsset          bool   `json:"log_write_asset"`
+	LogWriteWebSocket      bool   `json:"log_write_websocket"`
+	LogWriteAPI            bool   `json:"log_write_api"`
+	LogWriteAuth           bool   `json:"log_write_auth"`
+	LogWriteNode           bool   `json:"log_write_node"`
+	LogWriteCategory       bool   `json:"log_write_category"`
+	LogWriteStatus         bool   `json:"log_write_status"`
+	LogWriteClientIP       bool   `json:"log_write_client_ip"`
+	LogWriteColo           bool   `json:"log_write_colo"`
+	LogWriteUA             bool   `json:"log_write_ua"`
+	LogWriteUpstreamUA     bool   `json:"log_write_upstream_ua"`
+	LogWriteBackendAddress bool   `json:"log_write_backend_address"`
+	LogWriteTimeline       bool   `json:"log_write_timeline"`
+}
+
+func newAgentRequestLogPolicy(settings SystemSettings) *AgentRequestLogPolicy {
+	return &AgentRequestLogPolicy{
+		Version: 1, LogEnabled: settings.LogEnabled, LogLevel: settings.LogLevel,
+		LogWriteImage: settings.LogWriteImage, LogWritePlayback: settings.LogWritePlayback,
+		LogWriteMetadata: settings.LogWriteMetadata, LogWriteVideo: settings.LogWriteVideo,
+		LogWriteSubtitle: settings.LogWriteSubtitle, LogWriteAsset: settings.LogWriteAsset,
+		LogWriteWebSocket: settings.LogWriteWebSocket, LogWriteAPI: settings.LogWriteAPI, LogWriteAuth: settings.LogWriteAuth,
+		LogWriteNode: settings.LogWriteNode, LogWriteCategory: settings.LogWriteCategory, LogWriteStatus: settings.LogWriteStatus,
+		LogWriteClientIP: settings.LogWriteClientIP, LogWriteColo: settings.LogWriteColo, LogWriteUA: settings.LogWriteUA,
+		LogWriteUpstreamUA: settings.LogWriteUpstreamUA, LogWriteBackendAddress: settings.LogWriteBackendAddress,
+		LogWriteTimeline: settings.LogWriteTimeline,
+	}
+}
+
+func applyAgentRequestLogPolicy(database *DB, policy *AgentRequestLogPolicy) {
+	if database == nil {
+		return
+	}
+	settings := database.currentSystemSettings()
+	if policy == nil || policy.Version != 1 || policy.LogLevel != "info" && policy.LogLevel != "error" {
+		// Legacy Controllers did not transmit a policy. Forward all categories
+		// to their authoritative write gate instead of losing images/metadata
+		// under the ephemeral database's unrelated default settings.
+		settings.LogEnabled, settings.LogLevel = true, "info"
+		settings.LogWriteImage, settings.LogWriteMetadata = true, true
+		settings.LogWritePlayback, settings.LogWriteVideo, settings.LogWriteSubtitle, settings.LogWriteAsset = true, true, true, true
+		settings.LogWriteWebSocket, settings.LogWriteAPI, settings.LogWriteAuth = true, true, true
+		settings.LogWriteNode, settings.LogWriteCategory, settings.LogWriteStatus = true, true, true
+		settings.LogWriteClientIP, settings.LogWriteColo, settings.LogWriteUA, settings.LogWriteUpstreamUA = true, true, true, true
+		settings.LogWriteBackendAddress, settings.LogWriteTimeline = true, true
+	} else {
+		settings.LogEnabled, settings.LogLevel = policy.LogEnabled, policy.LogLevel
+		settings.LogWriteImage, settings.LogWritePlayback, settings.LogWriteMetadata = policy.LogWriteImage, policy.LogWritePlayback, policy.LogWriteMetadata
+		settings.LogWriteVideo, settings.LogWriteSubtitle, settings.LogWriteAsset = policy.LogWriteVideo, policy.LogWriteSubtitle, policy.LogWriteAsset
+		settings.LogWriteWebSocket, settings.LogWriteAPI, settings.LogWriteAuth = policy.LogWriteWebSocket, policy.LogWriteAPI, policy.LogWriteAuth
+		settings.LogWriteNode, settings.LogWriteCategory, settings.LogWriteStatus = policy.LogWriteNode, policy.LogWriteCategory, policy.LogWriteStatus
+		settings.LogWriteClientIP, settings.LogWriteColo, settings.LogWriteUA = policy.LogWriteClientIP, policy.LogWriteColo, policy.LogWriteUA
+		settings.LogWriteUpstreamUA, settings.LogWriteBackendAddress, settings.LogWriteTimeline = policy.LogWriteUpstreamUA, policy.LogWriteBackendAddress, policy.LogWriteTimeline
+	}
+	database.systemSettings.Store(&settings)
 }
 
 type RequestLogFilter struct {
@@ -150,20 +221,11 @@ func validRequestLogCategory(category string) bool {
 	}
 }
 
-// EnqueueRequestLog never waits for SQLite. Request logging is optional
-// operator telemetry and must not add latency or backpressure to media traffic.
-func (d *DB) EnqueueRequestLog(event requestLogEvent) {
-	if d == nil {
-		return
-	}
-	if d.edgeEphemeral {
-		if d.edgeRequestLogSink != nil {
-			d.edgeRequestLogSink(event)
-		}
-		return
-	}
-	settings := d.currentSystemSettings()
-	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode < 400) ||
+// filterAndSanitizeRequestLogEvent is the common write policy for Controller
+// proxies, Agent sinks and report transactions. Suppression affects only the
+// optional log row, never the report ledger, traffic or derived watch effects.
+func filterAndSanitizeRequestLogEvent(settings SystemSettings, event requestLogEvent) (requestLogEvent, bool, error) {
+	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode > 0 && event.StatusCode < 400 && !requestDiagnosticsFailed(event.RequestDiagnostics)) ||
 		(!settings.LogWriteImage && event.ResourceCategory == requestLogCategoryImage) ||
 		(!settings.LogWritePlayback && (event.ResourceCategory == requestLogCategoryPlayback || event.ResourceCategory == requestLogCategoryPlaybackSync)) ||
 		(!settings.LogWriteMetadata && event.ResourceCategory == requestLogCategoryMetadata) ||
@@ -173,7 +235,7 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 		(!settings.LogWriteWebSocket && event.ResourceCategory == requestLogCategoryWebSocket) ||
 		(!settings.LogWriteAPI && event.ResourceCategory == requestLogCategoryAPI) ||
 		(!settings.LogWriteAuth && event.ResourceCategory == requestLogCategoryAuth) {
-		return
+		return requestLogEvent{}, false, nil
 	}
 	if !settings.LogWriteClientIP {
 		event.ClientIP = ""
@@ -200,17 +262,136 @@ func (d *DB) EnqueueRequestLog(event requestLogEvent) {
 	if !settings.LogWriteColo {
 		event.InboundColo, event.OutboundColo = "", ""
 	}
+	event.RequestDiagnostics = filterRequestDiagnosticsFields(event.RequestDiagnostics, settings.LogWriteStatus, settings.LogWriteTimeline, settings.LogWriteCategory, settings.LogWriteBackendAddress)
+	event.SiteName = requestLogSafeText(event.SiteName, requestLogMaxSiteNameBytes)
+	event.FinalNode = requestLogSafeText(event.FinalNode, requestLogMaxSiteNameBytes)
+	event.UserAgent = requestLogSafeText(event.UserAgent, requestLogMaxUserAgentBytes)
+	event.UpstreamUserAgent = requestLogSafeText(event.UpstreamUserAgent, requestLogMaxUserAgentBytes)
+	event.BackendAddress = requestLogSafeBackendAddress(event.BackendAddress)
+	event.ClientIP = requestLogSafeText(event.ClientIP, requestLogMaxClientIPBytes)
+	event.InboundColo = requestLogSafeColo(event.InboundColo)
+	event.OutboundColo = requestLogSafeColo(event.OutboundColo)
+	event.Method = requestLogSafeText(strings.ToUpper(event.Method), 16)
+	event.Path, _, _ = strings.Cut(event.Path, "?")
+	event.Path, _, _ = strings.Cut(event.Path, "#")
+	event.Path = requestLogSafeText(event.Path, requestLogMaxPathBytes)
 	if event.SiteID <= 0 || event.ResourceCategory != "" && !validRequestLogCategory(event.ResourceCategory) ||
 		event.StatusCode != 0 && (event.StatusCode < 100 || event.StatusCode > 599) ||
 		len(event.SiteName) > requestLogMaxSiteNameBytes || len(event.FinalNode) > requestLogMaxSiteNameBytes || len(event.ClientIP) > requestLogMaxClientIPBytes ||
 		len(event.UserAgent) > requestLogMaxUserAgentBytes || len(event.UpstreamUserAgent) > requestLogMaxUserAgentBytes || len(event.BackendAddress) > maxDynamicTargetURLBytes || event.Method == "" || len(event.Method) > 16 || event.Path == "" || len(event.Path) > requestLogMaxPathBytes {
+		return requestLogEvent{}, false, fmt.Errorf("invalid request log event")
+	}
+	return event, true, nil
+}
+
+func requestDiagnosticsFailed(value RequestDiagnostics) bool {
+	if value.DiagnosticsVersion != requestDiagnosticsVersion {
+		return false
+	}
+	return requestDiagnosticsEnum(value.TerminationReason, "client_canceled", "client_deadline", "upstream_error", "downstream_error", "proxy_aborted", "site_stopping") != ""
+}
+
+func filterRequestDiagnosticsFields(value RequestDiagnostics, status, timeline, category, backend bool) RequestDiagnostics {
+	value = sanitizeRequestDiagnostics(value)
+	if !status {
+		value.ResponseStatusCode, value.TerminationReason = 0, ""
+	}
+	if !timeline {
+		value.DurationMS, value.UpstreamFirstByteMS, value.BodyFirstByteMS, value.BodyBytesWritten = nil, nil, nil, nil
+		value.DNSDurationMS, value.TCPDurationMS, value.TLSDurationMS = nil, nil, nil
+	}
+	if !category {
+		value.RangeMode = 0
+		value.CacheLookup, value.CacheWrite, value.CacheReason, value.ResponseType = "", "", "", ""
+		value.CacheLookupReason, value.CacheWriteReason = "", ""
+	}
+	if !backend {
+		value.ConnectionState, value.FinalConnectionState = "", ""
+		value.RedirectCount, value.RetryCount = nil, nil
+		value.UpstreamAttemptsTruncated = false
+		value.DNSDurationMS, value.TCPDurationMS, value.TLSDurationMS = nil, nil, nil
+	}
+	if !status && !timeline && !category && !backend {
+		value.UpstreamAttempts = nil
+		return value
+	}
+	for index := range value.UpstreamAttempts {
+		attempt := &value.UpstreamAttempts[index]
+		if !status {
+			attempt.ResponseStatusCode, attempt.Outcome = 0, ""
+		}
+		if !timeline {
+			attempt.StartedMS, attempt.FirstByteMS, attempt.ResponseHeadersMS, attempt.DurationMS = nil, nil, nil, nil
+			attempt.DNSDurationMS, attempt.TCPDurationMS, attempt.TLSDurationMS = nil, nil, nil
+		}
+		if !category {
+			attempt.SourceRole = ""
+		}
+		if !backend {
+			attempt.Authority, attempt.ConnectionState = "", ""
+			attempt.DNSDurationMS, attempt.TCPDurationMS, attempt.TLSDurationMS = nil, nil, nil
+		}
+	}
+	return value
+}
+
+func requestLogSafeBackendAddress(value string) string {
+	value = requestLogSafeText(value, maxDynamicTargetURLBytes)
+	if strings.HasPrefix(value, "node:") {
+		if id, err := strconv.ParseInt(strings.TrimPrefix(value, "node:"), 10, 64); err == nil && id > 0 {
+			return fmt.Sprintf("node:%d", id)
+		}
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return ""
+	}
+	if authority := dynamicCanonicalAuthority(parsed); authority != "" {
+		return authority
+	}
+	return redactUpstreamURL(parsed)
+}
+
+func requestLogSafeColo(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if len(value) < 3 || len(value) > 8 {
+		return ""
+	}
+	for _, letter := range value {
+		if letter < 'A' || letter > 'Z' {
+			return ""
+		}
+	}
+	return value
+}
+
+// EnqueueRequestLog never waits for SQLite. Request logging is optional
+// operator telemetry and must not add latency or backpressure to media traffic.
+func (d *DB) EnqueueRequestLog(event requestLogEvent) {
+	if d == nil {
+		return
+	}
+	settings := d.currentSystemSettings()
+	event, accepted, err := filterAndSanitizeRequestLogEvent(settings, event)
+	if err != nil {
 		d.droppedRequestLogs.Add(1)
+		return
+	}
+	if !accepted {
 		return
 	}
 	nowMS := time.Now().UnixMilli()
 	timelineAtMS := int64(0)
 	if settings.LogWriteTimeline {
 		timelineAtMS = nowMS
+	}
+	event.timelineAtMS = &timelineAtMS
+	if d.edgeEphemeral {
+		if d.edgeRequestLogSink != nil {
+			d.edgeRequestLogSink(event)
+		}
+		return
 	}
 	command := dynamicObservationCommand{
 		kind: dynamicObservationCommandRequestLogWrite,
@@ -324,7 +505,7 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 			args = append(args, filter.Query)
 		}
 	}
-	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.final_node, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.upstream_user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.recorded_at_ms, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
+	query := `SELECT request_logs.id, request_logs.site_id, request_logs.site_name, request_logs.final_node, request_logs.resource_category, request_logs.status_code, request_logs.client_ip, request_logs.user_agent, request_logs.upstream_user_agent, request_logs.backend_address, request_logs.method, request_logs.path, request_logs.recorded_at_ms, request_logs.timeline_at_ms, request_logs.inbound_colo, request_logs.outbound_colo, request_logs.diagnostics_json FROM request_logs LEFT JOIN sites ON sites.id=request_logs.site_id`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- conditions are fixed SQL fragments selected from validated filters; values remain parameters.
 	}
@@ -339,10 +520,12 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	for rows.Next() {
 		var entry RequestLog
 		var timelineAtMS int64
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.FinalNode, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.UpstreamUserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.CursorAtMS, &timelineAtMS, &entry.InboundColo, &entry.OutboundColo); err != nil {
+		var diagnosticsJSON string
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.FinalNode, &entry.ResourceCategory, &entry.StatusCode, &entry.ClientIP, &entry.UserAgent, &entry.UpstreamUserAgent, &entry.BackendAddress, &entry.Method, &entry.Path, &entry.CursorAtMS, &timelineAtMS, &entry.InboundColo, &entry.OutboundColo, &diagnosticsJSON); err != nil {
 			return nil, err
 		}
 		entry.RecordedAtMS = timelineAtMS
+		entry.RequestDiagnostics = parseRequestDiagnosticsJSON(diagnosticsJSON)
 		if entry.ResourceCategory == requestLogCategoryPlayback && isRequestLogPlaybackActivityPath(entry.Path) {
 			entry.ResourceCategory = requestLogCategoryPlaybackSync
 		}
@@ -350,6 +533,16 @@ func (d *DB) ListRequestLogs(filter RequestLogFilter) ([]RequestLog, error) {
 	}
 	settings := d.currentSystemSettings()
 	for i := range logs {
+		logs[i].RequestDiagnostics = filterRequestDiagnosticsFields(logs[i].RequestDiagnostics, settings.LogDisplayStatus, settings.LogDisplayTimeline, settings.LogDisplayCategory, settings.LogDisplayBackendAddress)
+		if !settings.LogDisplayStatus {
+			logs[i].StatusCode = 0
+		}
+		if !settings.LogDisplayCategory {
+			logs[i].ResourceCategory = ""
+		}
+		if !settings.LogDisplayTimeline {
+			logs[i].RecordedAtMS = 0
+		}
 		if !settings.LogDisplayClientIP {
 			logs[i].ClientIP = "hidden"
 		}
@@ -383,8 +576,8 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 	defer tx.Rollback()
 	statement, err := tx.Prepare(`
 		INSERT INTO request_logs
-			(site_id, site_name, final_node, resource_category, status_code, client_ip, user_agent, upstream_user_agent, backend_address, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			(site_id, site_name, final_node, resource_category, status_code, client_ip, user_agent, upstream_user_agent, backend_address, inbound_colo, outbound_colo, method, path, recorded_at_ms, timeline_at_ms, diagnostics_json)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM sites WHERE id=?)`)
 	if err != nil {
 		return 0, err
@@ -409,6 +602,7 @@ func (d *DB) writeRequestLogBatch(batch []queuedRequestLog) (int, error) {
 			event.Path,
 			queued.recordedAtMS,
 			queued.timelineAtMS,
+			requestDiagnosticsJSON(event.RequestDiagnostics),
 			event.SiteID,
 		)
 		if err != nil {
@@ -638,7 +832,8 @@ func requestLogColo(cfRay string) string {
 
 type requestLogResponseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	diagnostics *requestDiagnosticsTracker
 }
 
 type backendAddressContextKey struct{}
@@ -682,7 +877,10 @@ func (w *requestLogResponseWriter) WriteHeader(statusCode int) {
 	if w.statusCode != 0 {
 		return
 	}
-	w.statusCode = statusCode
+	if statusCode >= http.StatusOK || statusCode == http.StatusSwitchingProtocols {
+		w.statusCode = statusCode
+		w.diagnostics.SetResponseType(w.Header().Get("Content-Type"))
+	}
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
@@ -690,7 +888,10 @@ func (w *requestLogResponseWriter) Write(payload []byte) (int, error) {
 	if w.statusCode == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
-	return w.ResponseWriter.Write(payload)
+	writtenAt := time.Now()
+	n, err := w.ResponseWriter.Write(payload)
+	w.diagnostics.observeBodyWrite(n, writtenAt, err != nil)
+	return n, err
 }
 
 func (w *requestLogResponseWriter) StatusCode() int {
@@ -700,13 +901,23 @@ func (w *requestLogResponseWriter) StatusCode() int {
 	return w.statusCode
 }
 
+func (w *requestLogResponseWriter) ResponseStatusCode() int {
+	return w.statusCode
+}
+
 func (w *requestLogResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *requestLogResponseWriter) FlushError() error {
 	if w.statusCode == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if err != nil && err != http.ErrNotSupported {
+		w.diagnostics.observeBodyWrite(0, time.Now(), true)
 	}
+	return err
 }
 
 func (w *requestLogResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {

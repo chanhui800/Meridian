@@ -250,6 +250,7 @@ function loadModalHarness() {
     uaNameMap: {},
   };
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(STATIC_JS, 'app.js'), 'utf8').split('(function()')[0], sandbox);
   vm.runInContext(
     fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8'),
     sandbox,

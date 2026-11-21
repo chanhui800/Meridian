@@ -55,6 +55,9 @@ func (outbound dynamicOutboundContext) Value(key any) any {
 	if _, ok := key.(backendAddressContextKey); ok {
 		return outbound.Context.Value(key)
 	}
+	if _, ok := key.(requestDiagnosticsContextKey); ok {
+		return outbound.Context.Value(key)
+	}
 	return nil
 }
 
@@ -166,12 +169,14 @@ func (p dynamicRedirectPolicy) validateTarget(previous, target *url.URL, selfTar
 }
 
 type dynamicAuthorityResolution struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	start      sync.Once
-	ips        []net.IP
-	reasonCode string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	start       sync.Once
+	ips         []net.IP
+	reasonCode  string
+	dnsDuration time.Duration
+	dnsObserved bool
 }
 
 func newDynamicAuthorityResolution() *dynamicAuthorityResolution {
@@ -208,11 +213,12 @@ type dynamicLearnedPlaybackPath struct {
 }
 
 type dynamicRuntime struct {
-	dnsWorkers  chan struct{}
-	streams     chan struct{}
-	parses      chan struct{}
-	resolver    dynamicIPResolver
-	selfTargets atomic.Pointer[dynamicSelfTargetPolicy]
+	dnsWorkers           chan struct{}
+	streams              chan struct{}
+	parses               chan struct{}
+	resolver             dynamicIPResolver
+	selfTargets          dynamicSelfTargetPolicyState
+	transportPoolEntries atomic.Int64
 
 	mu                  sync.Mutex
 	authorities         map[string]int
@@ -225,7 +231,7 @@ type dynamicRuntime struct {
 }
 
 func newDynamicRuntime() *dynamicRuntime {
-	return &dynamicRuntime{
+	runtime := &dynamicRuntime{
 		dnsWorkers:  make(chan struct{}, globalDynamicMaxDNSWorkers),
 		streams:     make(chan struct{}, globalDynamicMaxStreams),
 		parses:      make(chan struct{}, globalDynamicMaxConcurrentParses),
@@ -233,13 +239,57 @@ func newDynamicRuntime() *dynamicRuntime {
 		authorities: make(map[string]int),
 		states:      make(map[*dynamicSiteState]struct{}),
 	}
+	runtime.selfTargets.runtime = runtime
+	return runtime
+}
+
+// Store keeps the existing runtime API while retiring every old idle transport
+// immediately when a configuration/self-target snapshot is replaced.
+type dynamicSelfTargetPolicyState struct {
+	mu         sync.RWMutex
+	policy     *dynamicSelfTargetPolicy
+	generation uint64
+	runtime    *dynamicRuntime
+}
+
+func (s *dynamicSelfTargetPolicyState) Load() *dynamicSelfTargetPolicy {
+	policy, _ := s.snapshot()
+	return policy
+}
+
+func (s *dynamicSelfTargetPolicyState) snapshot() (*dynamicSelfTargetPolicy, uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.policy, s.generation
+}
+
+func (s *dynamicSelfTargetPolicyState) Store(policy *dynamicSelfTargetPolicy) {
+	s.mu.Lock()
+	s.policy = policy
+	s.generation++
+	generation := s.generation
+	s.mu.Unlock()
+	if s.runtime == nil {
+		return
+	}
+	s.runtime.mu.Lock()
+	pools := make([]*dynamicTransportPool, 0, len(s.runtime.states))
+	for state := range s.runtime.states {
+		pools = append(pools, state.transports)
+	}
+	s.runtime.mu.Unlock()
+	for _, pool := range pools {
+		pool.invalidatePolicy(generation)
+	}
 }
 
 type dynamicSiteState struct {
-	runtime *dynamicRuntime
-	limits  DynamicProfileLimits
-	streams chan struct{}
-	parses  chan struct{}
+	runtime    *dynamicRuntime
+	limits     DynamicProfileLimits
+	streams    chan struct{}
+	parses     chan struct{}
+	transports *dynamicTransportPool
+	closed     atomic.Bool
 
 	mu                   sync.Mutex
 	authorities          map[string]*dynamicAuthorityEntry
@@ -265,6 +315,7 @@ func newDynamicSiteState(runtime *dynamicRuntime, limits DynamicProfileLimits) *
 		capabilities:         make(map[[sha256.Size]byte]dynamicCapabilityEntry),
 		capabilityByTarget:   make(map[string]string),
 		learnedPlaybackPaths: make(map[string]dynamicLearnedPlaybackPath),
+		transports:           newDynamicTransportPool(runtime, limits),
 	}
 	runtime.mu.Lock()
 	runtime.states[state] = struct{}{}

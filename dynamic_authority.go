@@ -136,9 +136,21 @@ func (s *dynamicSiteState) reserveAuthority(authority string, now time.Time) (*d
 	defer runtime.mu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return nil, dynamicObservationReasonRuntimeUnavailable
+	}
 	if entry := s.authorities[authority]; entry != nil {
 		entry.inFlight++
 		entry.lastUsed = now.UnixNano()
+		// Only a lookup still in progress may be shared. A completed DNS
+		// result must not remain authorized for the lifetime of a long stream.
+		if entry.resolution != nil {
+			select {
+			case <-entry.resolution.done:
+				entry.resolution = nil
+			default:
+			}
+		}
 		if entry.resolution == nil {
 			entry.resolution = newDynamicAuthorityResolution()
 		}
@@ -183,17 +195,56 @@ func (s *dynamicSiteState) reserveAuthority(authority string, now time.Time) (*d
 	}, ""
 }
 
+type dynamicRewriteValidationContextKey struct{}
+
+type dynamicRewriteAuthorityValidation struct {
+	policy     *dynamicSelfTargetPolicy
+	generation uint64
+	ips        []net.IP
+}
+
+type dynamicRewriteValidation struct {
+	state       *dynamicSiteState
+	authorities map[string]dynamicRewriteAuthorityValidation
+}
+
 func (r *dynamicAuthorityReservation) resolve(ctx context.Context, target *url.URL, selfTargets *dynamicSelfTargetPolicy) ([]net.IP, string) {
 	if r == nil || r.state == nil || r.resolution == nil || ctx == nil || target == nil || selfTargets == nil {
 		return nil, dynamicObservationReasonRuntimeUnavailable
 	}
+	if ctx.Err() != nil {
+		return nil, dynamicObservationReasonDNSFailure
+	}
+	validation, _ := ctx.Value(dynamicRewriteValidationContextKey{}).(*dynamicRewriteValidation)
+	policy, generation := r.state.runtime.selfTargets.snapshot()
+	if validation != nil && validation.state == r.state && policy == selfTargets {
+		if previous, exists := validation.authorities[r.authority]; exists && previous.policy == policy && previous.generation == generation {
+			// Local interfaces can change during a document rewrite. Check the
+			// complete public pin set against the live policy on every URL.
+			ips, err := validateDynamicResolvedIPsWithPolicy(previous.ips, selfTargets)
+			if err != nil {
+				r.state.transports.invalidateAuthority(r.authority)
+				if errors.Is(err, errDynamicSelfTarget) {
+					return nil, dynamicObservationReasonSelfTarget
+				}
+				return nil, dynamicObservationReasonAddressDenied
+			}
+			return ips, ""
+		}
+	}
 	resolution := r.resolution
 	resolution.start.Do(func() {
 		go func() {
-			ips, reasonCode := r.state.resolve(resolution.ctx, target, selfTargets)
+			ips, reasonCode, duration, observed := r.state.resolveWithDNSDuration(resolution.ctx, target, selfTargets)
 			resolution.ips = ips
 			resolution.reasonCode = reasonCode
+			resolution.dnsDuration = duration
+			resolution.dnsObserved = observed
 			close(resolution.done)
+			// This resolution may have been replaced while older stream leases
+			// are still held. Cancel only its own timer after publishing results;
+			// completed waiters use done/results rather than the DNS context.
+			resolution.cancel()
 		}()
 	})
 	select {
@@ -201,15 +252,26 @@ func (r *dynamicAuthorityReservation) resolve(ctx context.Context, target *url.U
 		return nil, dynamicObservationReasonDNSFailure
 	case <-resolution.done:
 	}
+	if resolution.dnsObserved {
+		observeDynamicDNSDuration(ctx, resolution.dnsDuration)
+	}
 	if resolution.reasonCode != "" {
+		r.state.transports.invalidateAuthority(r.authority)
 		return nil, resolution.reasonCode
 	}
 	validated, err := validateDynamicResolvedIPsWithPolicy(resolution.ips, selfTargets)
 	if err != nil {
+		r.state.transports.invalidateAuthority(r.authority)
 		if errors.Is(err, errDynamicSelfTarget) {
 			return nil, dynamicObservationReasonSelfTarget
 		}
 		return nil, dynamicObservationReasonAddressDenied
+	}
+	if validation != nil && validation.state == r.state && policy == selfTargets {
+		current, currentGeneration := r.state.runtime.selfTargets.snapshot()
+		if current == policy && currentGeneration == generation {
+			validation.authorities[r.authority] = dynamicRewriteAuthorityValidation{policy: policy, generation: generation, ips: validated}
+		}
 	}
 	return validated, ""
 }
@@ -268,7 +330,7 @@ func (r *dynamicAuthorityReservation) rollback() {
 }
 
 func (s *dynamicSiteState) acquireStream() (func(), bool) {
-	if s == nil || s.runtime == nil {
+	if s == nil || s.runtime == nil || s.closed.Load() {
 		return nil, false
 	}
 	select {
@@ -282,6 +344,11 @@ func (s *dynamicSiteState) acquireStream() (func(), bool) {
 		<-s.runtime.streams
 		return nil, false
 	}
+	if s.closed.Load() {
+		<-s.streams
+		<-s.runtime.streams
+		return nil, false
+	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -292,57 +359,67 @@ func (s *dynamicSiteState) acquireStream() (func(), bool) {
 }
 
 func (s *dynamicSiteState) resolve(ctx context.Context, target *url.URL, selfTargets *dynamicSelfTargetPolicy) ([]net.IP, string) {
-	if s == nil || s.runtime == nil || selfTargets == nil {
-		return nil, dynamicObservationReasonRuntimeUnavailable
+	ips, reason, duration, observed := s.resolveWithDNSDuration(ctx, target, selfTargets)
+	if observed {
+		observeDynamicDNSDuration(ctx, duration)
+	}
+	return ips, reason
+}
+
+func (s *dynamicSiteState) resolveWithDNSDuration(ctx context.Context, target *url.URL, selfTargets *dynamicSelfTargetPolicy) ([]net.IP, string, time.Duration, bool) {
+	if s == nil || s.runtime == nil || selfTargets == nil || target == nil || ctx == nil || s.closed.Load() {
+		return nil, dynamicObservationReasonRuntimeUnavailable, 0, false
 	}
 	if err := selfTargets.validateNormalizedTarget(target); err != nil {
-		return nil, dynamicObservationReasonSelfTarget
+		return nil, dynamicObservationReasonSelfTarget, 0, false
 	}
 	if ip := net.ParseIP(target.Hostname()); ip != nil {
 		validated, err := validateDynamicResolvedIPsWithPolicy([]net.IP{ip}, selfTargets)
 		if err != nil {
 			if errors.Is(err, errDynamicSelfTarget) {
-				return nil, dynamicObservationReasonSelfTarget
+				return nil, dynamicObservationReasonSelfTarget, 0, false
 			}
-			return nil, dynamicObservationReasonAddressDenied
+			return nil, dynamicObservationReasonAddressDenied, 0, false
 		}
-		return validated, ""
+		return validated, "", 0, false
 	}
 	select {
 	case s.runtime.dnsWorkers <- struct{}{}:
 		defer func() { <-s.runtime.dnsWorkers }()
 	default:
-		return nil, dynamicObservationReasonCapacityLimit
+		return nil, dynamicObservationReasonCapacityLimit, 0, false
 	}
 	resolver := s.runtime.resolver
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
+	started := time.Now()
 	answers, err := resolver.LookupIPAddr(ctx, target.Hostname())
+	duration := time.Since(started)
 	if err != nil {
-		return nil, dynamicObservationReasonDNSFailure
+		return nil, dynamicObservationReasonDNSFailure, duration, true
 	}
 	if len(answers) == 0 {
-		return nil, dynamicObservationReasonDNSFailure
+		return nil, dynamicObservationReasonDNSFailure, duration, true
 	}
 	if len(answers) > s.limits.MaxDNSIPs {
-		return nil, dynamicObservationReasonCapacityLimit
+		return nil, dynamicObservationReasonCapacityLimit, duration, true
 	}
 	ips := make([]net.IP, 0, len(answers))
 	for _, answer := range answers {
 		if answer.Zone != "" {
-			return nil, dynamicObservationReasonAddressDenied
+			return nil, dynamicObservationReasonAddressDenied, duration, true
 		}
 		ips = append(ips, answer.IP)
 	}
 	validated, err := validateDynamicResolvedIPsWithPolicy(ips, selfTargets)
 	if err != nil {
 		if errors.Is(err, errDynamicSelfTarget) {
-			return nil, dynamicObservationReasonSelfTarget
+			return nil, dynamicObservationReasonSelfTarget, duration, true
 		}
-		return nil, dynamicObservationReasonAddressDenied
+		return nil, dynamicObservationReasonAddressDenied, duration, true
 	}
-	return validated, ""
+	return validated, "", duration, true
 }
 
 func (s *dynamicSiteState) close() {
@@ -350,13 +427,18 @@ func (s *dynamicSiteState) close() {
 		return
 	}
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.transports.close()
 		runtime := s.runtime
 		runtime.mu.Lock()
 		defer runtime.mu.Unlock()
 		delete(runtime.states, s)
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		for authority := range s.authorities {
+		for authority, entry := range s.authorities {
+			if entry.resolution != nil {
+				entry.resolution.cancel()
+			}
 			if runtime.authorities[authority] <= 1 {
 				delete(runtime.authorities, authority)
 			} else {

@@ -26,6 +26,15 @@ type upstreamFailoverState struct {
 	preferredUntil time.Time
 	failedUntil    map[string]time.Time
 	primaryProbeAt time.Time
+	primaryProbe   bool
+	generation     uint64
+}
+
+type failoverSelection struct {
+	targets    []*url.URL
+	generation uint64
+	primaryKey string
+	probe      bool
 }
 
 func newUpstreamFailoverState() *upstreamFailoverState {
@@ -39,9 +48,9 @@ func upstreamTargetKey(target *url.URL) string {
 	return canonicalTargetKey(target) + target.EscapedPath()
 }
 
-func (s *upstreamFailoverState) ordered(targets []*url.URL, now time.Time) []*url.URL {
+func (s *upstreamFailoverState) ordered(targets []*url.URL, now time.Time) failoverSelection {
 	if len(targets) < 2 || s == nil {
-		return append([]*url.URL(nil), targets...)
+		return failoverSelection{targets: append([]*url.URL(nil), targets...)}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -50,20 +59,24 @@ func (s *upstreamFailoverState) ordered(targets []*url.URL, now time.Time) []*ur
 			delete(s.failedUntil, key)
 		}
 	}
-	if !s.preferredUntil.After(now) {
-		s.preferred = ""
-	}
+	s.expirePreference(now)
 	primaryKey := upstreamTargetKey(targets[0])
-	probePrimary := s.preferred != "" && s.preferred != primaryKey && !s.failedUntil[primaryKey].After(now) && !s.primaryProbeAt.After(now)
-	if probePrimary {
+	selection := failoverSelection{generation: s.generation, primaryKey: primaryKey}
+	if s.preferred != "" && s.preferred != primaryKey && !s.primaryProbe && !s.failedUntil[primaryKey].After(now) && !s.primaryProbeAt.After(now) {
 		// Reserve one request as the recovery probe. Concurrent requests keep
-		// using the active backup until this attempt succeeds or cools down.
+		// using the active backup until this attempt actually finishes, even if
+		// the cooldown elapses or a backup response succeeds in the meantime.
+		s.primaryProbe = true
+		selection.probe = true
 		s.primaryProbeAt = now.Add(failoverCooldown)
 	}
 	preferred, healthy, cooling := make([]*url.URL, 0, 1), make([]*url.URL, 0, len(targets)), make([]*url.URL, 0, len(targets))
 	for _, target := range targets {
 		key := upstreamTargetKey(target)
-		if probePrimary && key == primaryKey {
+		if key == primaryKey && s.primaryProbe && !selection.probe && s.preferred != primaryKey {
+			continue
+		}
+		if selection.probe && key == primaryKey {
 			preferred = append(preferred, target)
 		} else if key == s.preferred && !s.failedUntil[key].After(now) {
 			preferred = append(preferred, target)
@@ -73,62 +86,101 @@ func (s *upstreamFailoverState) ordered(targets []*url.URL, now time.Time) []*ur
 			healthy = append(healthy, target)
 		}
 	}
-	return append(append(preferred, healthy...), cooling...)
+	selection.targets = append(append(preferred, healthy...), cooling...)
+	return selection
 }
 
-func (s *upstreamFailoverState) markFailure(target *url.URL, now time.Time) {
-	if s == nil || target == nil {
-		return
-	}
-	key := upstreamTargetKey(target)
-	if key == "" {
+func (s *upstreamFailoverState) releaseProbe(selection failoverSelection) {
+	if !selection.probe {
 		return
 	}
 	s.mu.Lock()
-	s.failedUntil[key] = now.Add(failoverCooldown)
-	s.primaryProbeAt = now.Add(failoverCooldown)
-	if s.preferred == key {
+	s.primaryProbe = false
+	s.mu.Unlock()
+}
+
+// expirePreference must be called with the state locked.
+func (s *upstreamFailoverState) expirePreference(now time.Time) {
+	if s.preferred != "" && !s.preferredUntil.After(now) {
 		s.preferred = ""
 		s.preferredUntil = time.Time{}
+		s.generation++
 	}
-	s.mu.Unlock()
 }
 
-func (s *upstreamFailoverState) markSuccess(target *url.URL, now time.Time) {
+// A primary probe can finish while another request reports a backup failure.
+// Other results must belong to the current preference to change it.
+func (s *upstreamFailoverState) acceptsResult(key string, selection failoverSelection) bool {
+	return selection.generation == s.generation || (selection.probe && key == selection.primaryKey)
+}
+
+func (s *upstreamFailoverState) markFailure(target *url.URL, now time.Time, selection *failoverSelection) {
 	if s == nil || target == nil {
 		return
 	}
 	key := upstreamTargetKey(target)
 	if key == "" {
 		return
-	}
-	s.mu.Lock()
-	delete(s.failedUntil, key)
-	s.preferred = key
-	s.preferredUntil = now.Add(failoverPreferredLifetime)
-	s.primaryProbeAt = time.Time{}
-	s.mu.Unlock()
-}
-
-func (s *upstreamFailoverState) preferredTarget(targets []*url.URL, now time.Time) *url.URL {
-	if s == nil || len(targets) < 2 {
-		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.preferred == "" || !s.preferredUntil.After(now) || s.failedUntil[s.preferred].After(now) {
-		if !s.preferredUntil.After(now) {
-			s.preferred = ""
-			s.preferredUntil = time.Time{}
-		}
-		return nil
+	if !s.acceptsResult(key, *selection) {
+		return
 	}
-	for _, target := range targets {
-		if upstreamTargetKey(target) == s.preferred {
-			return target
+	s.failedUntil[key] = now.Add(failoverCooldown)
+	if key == selection.primaryKey {
+		s.primaryProbeAt = now.Add(failoverCooldown)
+	}
+	if s.preferred == key {
+		s.preferred = ""
+		s.preferredUntil = time.Time{}
+		s.generation++
+		selection.generation = s.generation
+	}
+}
+
+func (s *upstreamFailoverState) markSuccess(target *url.URL, now time.Time, selection failoverSelection) {
+	if s == nil || target == nil {
+		return
+	}
+	key := upstreamTargetKey(target)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A request which started before a successful switch cannot undo that
+	// choice merely because its old line returned later.
+	if !s.acceptsResult(key, selection) {
+		return
+	}
+	delete(s.failedUntil, key)
+	if s.preferred != key {
+		s.generation++
+	}
+	s.preferred = key
+	s.preferredUntil = now.Add(failoverPreferredLifetime)
+	if key == selection.primaryKey {
+		s.primaryProbeAt = time.Time{}
+	}
+}
+
+func (s *upstreamFailoverState) preferredTarget(targets []*url.URL, now time.Time) (*url.URL, failoverSelection) {
+	if s == nil || len(targets) < 2 {
+		return nil, failoverSelection{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expirePreference(now)
+	selection := failoverSelection{generation: s.generation, primaryKey: upstreamTargetKey(targets[0])}
+	if s.preferred != "" && !s.failedUntil[s.preferred].After(now) {
+		for _, target := range targets {
+			if upstreamTargetKey(target) == s.preferred {
+				return target, selection
+			}
 		}
 	}
-	return nil
+	return nil, selection
 }
 
 func isRetryableUpstreamStatus(status int) bool {
@@ -136,6 +188,7 @@ func isRetryableUpstreamStatus(status int) bool {
 }
 
 type failoverRequestContextKey struct{}
+type configuredUpstreamContextKey struct{}
 
 type failoverRequestPlan struct {
 	originalURL      *url.URL
@@ -164,10 +217,7 @@ func isFailoverRequestEligible(req *http.Request, plan failoverRequestPlan) bool
 	if req == nil || hasUpgradeIntent(req) {
 		return false
 	}
-	if req.Method == http.MethodGet || req.Method == http.MethodHead {
-		return true
-	}
-	if req.Method != http.MethodPost || !plan.playbackInfoPost {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead && (req.Method != http.MethodPost || !plan.playbackInfoPost) {
 		return false
 	}
 	hasBody := req.Body != nil && req.Body != http.NoBody || req.ContentLength != 0 || len(req.TransferEncoding) != 0 || len(req.Trailer) != 0
@@ -191,35 +241,39 @@ type failoverTransport struct {
 	state *upstreamFailoverState
 }
 
+func (*failoverTransport) requestDiagnosticsOwnsRoundTrip() {}
+
 func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	plan, enabled := failoverPlanFromRequest(req)
 	if !enabled {
-		return t.base.RoundTrip(req)
+		return roundTripWithRequestDiagnostics(t.base, req, "configured")
 	}
 	if !isFailoverRequestEligible(req, plan) {
-		preferred := t.state.preferredTarget(plan.targets, time.Now())
-		if preferred == nil || upstreamTargetKey(preferred) == upstreamTargetKey(plan.active) {
-			return t.base.RoundTrip(req)
+		target, selection := t.state.preferredTarget(plan.targets, time.Now())
+		if target == nil || upstreamTargetKey(target) == upstreamTargetKey(plan.active) {
+			return roundTripWithRequestDiagnostics(t.base, req, "configured")
 		}
-		attempt := cloneFailoverInitialAttempt(req, plan, preferred)
+		attempt := cloneFailoverInitialAttempt(req, plan, target)
 		if tracker := backendAddressTrackerFromContext(attempt.Context()); tracker != nil {
-			tracker.SetURL(preferred)
+			tracker.SetURL(target)
 		}
-		resp, err := t.base.RoundTrip(attempt)
+		resp, err := roundTripWithRequestDiagnostics(t.base, attempt, "configured")
 		if err != nil {
 			if !isClientRequestCancellation(originalRequestContext(req.Context()), err) {
-				t.state.markFailure(preferred, time.Now())
+				t.state.markFailure(target, time.Now(), &selection)
 			}
 			return nil, err
 		}
 		if isRetryableUpstreamStatus(resp.StatusCode) {
-			t.state.markFailure(preferred, time.Now())
+			t.state.markFailure(target, time.Now(), &selection)
 		} else if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
-			t.state.markSuccess(preferred, time.Now())
+			t.state.markSuccess(target, time.Now(), selection)
 		}
 		return resp, nil
 	}
-	targets := t.state.ordered(plan.targets, time.Now())
+	selection := t.state.ordered(plan.targets, time.Now())
+	defer t.state.releaseProbe(selection)
+	targets := selection.targets
 	var lastErr error
 	for index, target := range targets {
 		attempt := req
@@ -233,24 +287,27 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if tracker := backendAddressTrackerFromContext(attempt.Context()); tracker != nil {
 			tracker.SetURL(target)
 		}
-		resp, err := t.base.RoundTrip(attempt)
+		if index > 0 {
+			recordRequestDiagnosticsRetry(attempt.Context())
+		}
+		resp, err := roundTripWithRequestDiagnostics(t.base, attempt, "configured")
 		if err != nil {
 			if isClientRequestCancellation(originalRequestContext(req.Context()), err) {
 				return nil, err
 			}
-			t.state.markFailure(target, time.Now())
+			t.state.markFailure(target, time.Now(), &selection)
 			lastErr = err
 			continue
 		}
 		if isRetryableUpstreamStatus(resp.StatusCode) {
-			t.state.markFailure(target, time.Now())
+			t.state.markFailure(target, time.Now(), &selection)
 			if index+1 < len(targets) {
 				resp.Body.Close()
 				continue
 			}
 		}
 		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
-			t.state.markSuccess(target, time.Now())
+			t.state.markSuccess(target, time.Now(), selection)
 		}
 		return resp, nil
 	}
@@ -261,7 +318,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 func cloneFailoverInitialAttempt(req *http.Request, plan failoverRequestPlan, target *url.URL) *http.Request {
-	clone := req.Clone(req.Context())
+	clone := req.Clone(context.WithValue(req.Context(), configuredUpstreamContextKey{}, target))
 	clone.Header = req.Header.Clone()
 	// This request has not been sent yet, so its original body can move to the
 	// selected active line without requiring a replay contract.
@@ -274,7 +331,7 @@ func cloneFailoverInitialAttempt(req *http.Request, plan failoverRequestPlan, ta
 }
 
 func cloneFailoverAttempt(req *http.Request, plan failoverRequestPlan, target *url.URL) (*http.Request, error) {
-	clone := req.Clone(req.Context())
+	clone := req.Clone(context.WithValue(req.Context(), configuredUpstreamContextKey{}, target))
 	clone.Header = req.Header.Clone()
 	if req.Body != nil && req.Body != http.NoBody {
 		if req.GetBody == nil {

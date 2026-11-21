@@ -34,6 +34,14 @@ let dashboardRealtimeNeedsRecovery = false;
 let dashboardRealtimeRecoveryAbortController = null;
 let dashboardRealtimeLastRecoveryMS = 0;
 const dashboardRealtimeStorageKey = 'meridian.dashboard.realtime-trends.v1';
+const dashboardRealtimePersistIntervalMS = 15000;
+const dashboardRealtimeStorageMaxChars = 1024 * 1024;
+let dashboardRealtimePersistTimer = 0;
+let dashboardRealtimePersistDirty = false;
+let dashboardRealtimePersistRetryAt = 0;
+let dashboardRealtimePersistFailures = 0;
+let dashboardRealtimePersistLimit = dashboardRealtimeStorageMaxChars;
+let dashboardRealtimePagehideBound = false;
 let dashboardLastSnapshotMS = 0;
 let dashboardLastObservedSiteCount = -1;
 let dashboardConsoleMetric = 'speed';
@@ -612,29 +620,95 @@ function dashboardPersistableRealtimeSamples(samples) {
 }
 
 function persistDashboardRealtimeSamples() {
-  const storage = dashboardRealtimeStorage();
-  if (!storage) return;
-  try {
-    const sites = {};
-    dashboardRealtimeTrendSiteSamples.forEach((samples, siteID) => {
-      const persistable = dashboardPersistableRealtimeSamples(samples);
-      if (persistable.length) sites[String(siteID)] = persistable;
+  dashboardRealtimePersistDirty = true;
+  if (dashboardRealtimePersistTimer || typeof setTimeout !== 'function') return;
+  if (!dashboardRealtimePagehideBound && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', flushDashboardRealtimeSamples);
+    dashboardRealtimePagehideBound = true;
+  }
+  const delay = Math.max(dashboardRealtimePersistIntervalMS, dashboardRealtimePersistRetryAt - Date.now());
+  dashboardRealtimePersistTimer = setTimeout(() => {
+    dashboardRealtimePersistTimer = 0;
+    flushDashboardRealtimeSamples();
+  }, delay);
+}
+
+function dashboardRealtimeCompactStoragePayload() {
+  const all = dashboardPersistableRealtimeSamples(dashboardRealtimeTrendSamples.get('all') || []);
+  const byTimestamp = new Map(all.map(point => [point.timestamp_ms, point]));
+  const sites = {};
+  dashboardRealtimeTrendSiteSamples.forEach((samples, siteID) => {
+    const distinct = dashboardPersistableRealtimeSamples(samples).filter(point => {
+      const aggregate = byTimestamp.get(point.timestamp_ms);
+      const contribution = aggregate?.site_contributions?.[String(siteID)];
+      if (!contribution) return true;
+      const equivalent = { ...contribution, timestamp_ms: point.timestamp_ms };
+      if (aggregate.realtime_revision && !equivalent.realtime_revision) equivalent.realtime_revision = aggregate.realtime_revision;
+      const keys = new Set([...Object.keys(point), ...Object.keys(equivalent)]);
+      return [...keys].some(key => point[key] !== equivalent[key]);
     });
-    storage.setItem(dashboardRealtimeStorageKey, JSON.stringify({
-      version: 1,
-      saved_at_ms: Date.now(),
-      billing_mode: dashboardBillingMode || dashboardRealtimePersistedBillingMode || null,
-      realtime_epoch: dashboardRealtimeEpoch || undefined,
-      realtime_revision: dashboardRealtimeRevision || undefined,
-      all: dashboardPersistableRealtimeSamples(dashboardRealtimeTrendSamples.get('all') || []),
-      sites,
-    }));
+    if (distinct.length) sites[String(siteID)] = distinct;
+  });
+  return {
+    version: 2,
+    saved_at_ms: Date.now(),
+    billing_mode: dashboardBillingMode || dashboardRealtimePersistedBillingMode || null,
+    realtime_epoch: dashboardRealtimeEpoch || undefined,
+    realtime_revision: dashboardRealtimeRevision || undefined,
+    all, sites,
+  };
+}
+
+function flushDashboardRealtimeSamples() {
+  if (dashboardRealtimePersistTimer && typeof clearTimeout === 'function') clearTimeout(dashboardRealtimePersistTimer);
+  dashboardRealtimePersistTimer = 0;
+  if (!dashboardRealtimePersistDirty || Date.now() < dashboardRealtimePersistRetryAt) return false;
+  const storage = dashboardRealtimeStorage();
+  if (!storage) return false;
+  try {
+    const payload = dashboardRealtimeCompactStoragePayload();
+    let encoded = JSON.stringify(payload);
+    // This is a recovery enhancement; the Controller owns the full window.
+    // Keep the newest tail within a conservative UTF-16 storage byte budget.
+    while (encoded.length > dashboardRealtimePersistLimit) {
+      let removed = false;
+      if (payload.all.length > 1) {
+        payload.all.splice(0, Math.ceil(payload.all.length / 2));
+        removed = true;
+      }
+      for (const siteID of Object.keys(payload.sites)) {
+        const samples = payload.sites[siteID];
+        if (samples.length > 1) {
+          samples.splice(0, Math.ceil(samples.length / 2));
+          removed = true;
+        }
+      }
+      if (!removed) {
+        // An extreme one-point/site map can itself exceed the cap. Retain
+        // the aggregate numeric baseline and let server recovery fill sites.
+        payload.sites = {};
+        payload.all = payload.all.map(({ site_contributions, ...point }) => point);
+      }
+      encoded = JSON.stringify(payload);
+      if (!removed && encoded.length > dashboardRealtimePersistLimit) return false;
+    }
+    storage.setItem(dashboardRealtimeStorageKey, encoded);
+    dashboardRealtimePersistDirty = false;
+    dashboardRealtimePersistFailures = 0;
+    dashboardRealtimePersistRetryAt = 0;
+    return true;
   } catch (_) {
-    // Quota errors and disabled storage must never interrupt live updates.
+    dashboardRealtimePersistFailures += 1;
+    dashboardRealtimePersistRetryAt = Date.now() + Math.min(300000, 60000 * 2 ** Math.min(3, dashboardRealtimePersistFailures - 1));
+    dashboardRealtimePersistLimit = Math.max(64 * 1024, Math.floor(dashboardRealtimePersistLimit / 2));
+    return false;
   }
 }
 
 function clearDashboardRealtimeSamplesStorage() {
+  if (dashboardRealtimePersistTimer && typeof clearTimeout === 'function') clearTimeout(dashboardRealtimePersistTimer);
+  dashboardRealtimePersistTimer = 0;
+  dashboardRealtimePersistDirty = false;
   const storage = dashboardRealtimeStorage();
   if (!storage) return;
   try {
@@ -650,19 +724,33 @@ function restoreDashboardRealtimeSamples(now = Date.now()) {
   let payload;
   try {
     const raw = storage.getItem(dashboardRealtimeStorageKey);
-    if (!raw) return false;
+    if (!raw || raw.length > 5 * dashboardRealtimeStorageMaxChars) return false;
     payload = JSON.parse(raw);
   } catch (_) {
     return false;
   }
-  if (!payload || typeof payload !== 'object' || Number(payload.version || 1) !== 1) return false;
+  const version = Number(payload?.version || 1);
+  if (!payload || typeof payload !== 'object' || (version !== 1 && version !== 2)) return false;
   const all = dashboardNormalizeRealtimeSamples(payload.all, now);
   const sites = new Map();
+  if (version === 2) {
+    for (const point of all) {
+      for (const [siteID, contribution] of Object.entries(point.site_contributions || {})) {
+        const samples = sites.get(siteID) || [];
+        upsertDashboardRealtimeSample(samples, dashboardNormalizeRealtimePoint({ ...contribution, timestamp_ms: point.timestamp_ms, realtime_revision: contribution.realtime_revision || point.realtime_revision }));
+        sites.set(siteID, samples);
+      }
+    }
+  }
   if (payload.sites && typeof payload.sites === 'object' && !Array.isArray(payload.sites)) {
     Object.keys(payload.sites).forEach(siteID => {
       if (!/^\d+$/.test(siteID)) return;
       const samples = dashboardNormalizeRealtimeSamples(payload.sites[siteID], now);
-      if (samples.length) sites.set(siteID, samples);
+      if (samples.length) {
+        const merged = sites.get(siteID) || [];
+        samples.forEach(point => upsertDashboardRealtimeSample(merged, point));
+        sites.set(siteID, pruneDashboardRealtimeSamples(merged, now));
+      }
     });
   }
   dashboardRealtimeTrendSamples = new Map();
@@ -2273,6 +2361,8 @@ function animateValue(id, newVal) {
 }
 
 function stopDashSSE() {
+  flushDashboardRealtimeSamples();
+  dashboardRealtimePersistDirty = false;
   dashboardSpeedSamples = new Map();
   dashboardLiveSpeeds = new Map();
   dashboardLatestRatesBySite = new Map();

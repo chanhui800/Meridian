@@ -50,6 +50,7 @@ const Router = {
       stopNodesRefresh();
     }
 
+    if (previous !== hash && typeof invalidateModalIntent === 'function') invalidateModalIntent();
     this.current = hash;
     document.body?.classList?.add('console-shell');
     if (previous !== hash) {

@@ -81,6 +81,29 @@ func TestIngressCapabilitiesReflectHostOnlySafety(t *testing.T) {
 	}
 }
 
+func TestIngressCapabilitiesDoNotTreatDefaultTrustedRangesAsExternalProxy(t *testing.T) {
+	app := newTestApp(t)
+	app.panelBindLoopback = false
+	var err error
+	app.trustedProxies, err = parseTrustedProxyCIDRs("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.pm.SetHostOnlyIngressSafe(false)
+
+	response := httptest.NewRecorder()
+	app.handleIngressCapabilities(response, httptest.NewRequest(http.MethodGet, "/api/ingress-capabilities", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := decodeBody(t, response)
+	for _, field := range []string{"host_only_available", "trusted_proxy_configured"} {
+		if value, ok := body[field].(bool); !ok || value {
+			t.Fatalf("%s=%#v, want false without an external proxy", field, body[field])
+		}
+	}
+}
+
 func TestSitesAPIRoundTripsOneHundredPlaybackAddressesAsArray(t *testing.T) {
 	app := newTestApp(t)
 	addresses := make([]string, 100)

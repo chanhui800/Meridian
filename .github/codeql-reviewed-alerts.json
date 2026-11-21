@@ -11,21 +11,21 @@
       },
       "reason": "Authenticated administrator diagnostics intentionally support local and private origins. Diagnostic HTTP and TLS connections now reject cloud metadata and other special destinations, validate every DNS answer before dialing checked numeric addresses, disable environment proxies, and retain credential, redirect and response isolation. The arbitrary URL endpoint also has independent concurrency and rate limits; this review accepts only that constrained administrator capability.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-20T00:00:00Z",
-      "expiresAt": "2027-02-18T00:00:00Z",
+      "reviewedAt": "2026-11-21T00:00:00Z",
+      "expiresAt": "2027-02-19T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
           "path": "main.go",
-          "sha256": "87eee1027232b00c3102f695d6d63715dcae8c6b74e6936bb655f7232d780dc9"
+          "sha256": "262dacee634683c0c7e3622d8925047c3575e8d16a8d21b83c10f361bb8ad1c6"
         },
         {
           "path": "app_http.go",
-          "sha256": "0b6927cf3b9a0e69c04749c5873c0c84402716e15363774295386fcf535fde9f"
+          "sha256": "ce8c1d5a05406f1af3b62ed30d6e9f25d9ac9a35324885010da4dd611f7d2764"
         },
         {
           "path": "trusted_proxy.go",
-          "sha256": "0fe635df52bcdf730fab5dac48b2c056ed4fc8708fdadbe0da3a2c167c542d45"
+          "sha256": "6038640e637f848f60cf47eb4ce120dda37b69f947d94235ce714c09e4460a91"
         },
         {
           "path": "diagnostics.go",
@@ -41,7 +41,7 @@
         },
         {
           "path": "app_core.go",
-          "sha256": "b5b2d2f4369358fa9ba04585dbf24a0b2ea7ec416fa04a67527fe144faa42559"
+          "sha256": "fc9bfa538122fe3e15ee16065667d1b24fa6abd58146e00a61b031022eaecd22"
         },
         {
           "path": "diagnostics_security_test.go",
@@ -49,7 +49,11 @@
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+          "sha256": "4d16fbd3711c96e55a2ad014c71eb7ec34e6d032090a9af09c6af329c2a03197"
+        },
+        {
+          "path": "panel_ingress_configuration_test.go",
+          "sha256": "466d4424d32de0eb4a261866e94d8a0e39b42dab544d201342d9d7b446ea61b7"
         }
       ]
     },
@@ -62,21 +66,21 @@
       },
       "reason": "The flagged copy serves authorized media capabilities rather than panel HTML. It always rebuilds headers with a restrictive CSP sandbox, default-src none, nosniff and DENY; upstream CSP and cookies cannot relax the boundary. Resource paths reject active MIME types. Regression tests confirm opaque media bytes and restrictive headers remain intact, so escaping the media body would break supported content without fixing an established XSS.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-20T00:00:00Z",
-      "expiresAt": "2027-02-18T00:00:00Z",
+      "reviewedAt": "2026-11-21T00:00:00Z",
+      "expiresAt": "2027-02-19T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
           "path": "dynamic_capability_service.go",
-          "sha256": "d5897b91d4738e6286f91fc2294c978b38443dad9abd99a6a7dafaa93b7bb42e"
+          "sha256": "af30a20ea13db2dcaf6a7747ecc0a016913cebf2c0993c811b2821cda72d8bdc"
         },
         {
           "path": "dynamic_rewrite_core.go",
-          "sha256": "53c7d3f93d69137c3ea724a2388438fe4767741a73c1f664114bad4f9306e59d"
+          "sha256": "62fc1e312e601f1661a5ff488c70823279b31e5d80afe3260eda5aeb63a6abbe"
         },
         {
           "path": "dynamic_runtime_state.go",
-          "sha256": "bd1cd2bd69a0cadf6e643708455072d83c70eb942e8a1b0323f5017c39b4ed99"
+          "sha256": "499672e474dfb2005a9eefbdb8d8f69cd220cefcbb9bf23c49801943d4d6efcc"
         },
         {
           "path": "dynamic_capability_issuer.go",
@@ -88,7 +92,47 @@
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+          "sha256": "4d16fbd3711c96e55a2ad014c71eb7ec34e6d032090a9af09c6af329c2a03197"
+        },
+        {
+          "path": "proxy_response_reliability_test.go",
+          "sha256": "fb0dfb435f1fe0d47ec9984f3ce64a300b985f0fb150feba405ab9cd388e8099"
+        },
+        {
+          "path": "dynamic_transport_pool.go",
+          "sha256": "579ffb35684622887fb4ae49309acb99d29a0feed30d54c42c3402f075fcd523"
+        },
+        {
+          "path": "dynamic_transport_pool_test.go",
+          "sha256": "832b60f877abc40d02e1416e76a95bcda0f1bc5723f00abe9ea2d9c1160575b4"
+        },
+        {
+          "path": "dynamic_authority.go",
+          "sha256": "0539b25150d280080c06f9ed0fab26cf2e3f1fb00ac951f5b907ad2b0b44fec1"
+        },
+        {
+          "path": "dynamic_network.go",
+          "sha256": "eba5fad5a872df60c6525231e3a8091f7d04790a334b2dd522bb7e40593332b5"
+        },
+        {
+          "path": "request_diagnostics.go",
+          "sha256": "07b580d7c44a1f000ab0cafe6d3eb4d919f1a2f73b69c259588af2b766fddb6c"
+        },
+        {
+          "path": "request_diagnostics_test.go",
+          "sha256": "88fdf0fa9c7d414e561c378040089347d51725f58851ba04560763a8589c8073"
+        },
+        {
+          "path": "request_upstream_attempts_test.go",
+          "sha256": "dbbf545965ae0706a89c606d250a43b2dd6b71008a224b25228ee9101b2fa186"
+        },
+        {
+          "path": "dynamic_rewrite_validation_test.go",
+          "sha256": "de892315f0c2ec6ff8cb3cc4234c577f7713db499312fbe641f82d487a8bc519"
+        },
+        {
+          "path": "dynamic_pinned_fallback_test.go",
+          "sha256": "521246d081b856b3e46cf46dd67841b709d12f54b9fcdc0efb3dbdc0b1d692f5"
         }
       ]
     },
@@ -101,8 +145,8 @@
       },
       "reason": "The verification exception is restricted to the separate local healthcheck client, fixed 127.0.0.1 and ::1 targets, a range-validated panel-port marker and a constant unauthenticated path. Redirects are disabled, no credentials are sent, and upstream business clients retain certificate verification. Public-domain panel certificates do not normally name loopback, so this narrowly scoped liveness probe is an intentional exception.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-20T00:00:00Z",
-      "expiresAt": "2027-02-18T00:00:00Z",
+      "reviewedAt": "2026-11-21T00:00:00Z",
+      "expiresAt": "2027-02-19T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
@@ -111,7 +155,7 @@
         },
         {
           "path": "app_core.go",
-          "sha256": "b5b2d2f4369358fa9ba04585dbf24a0b2ea7ec416fa04a67527fe144faa42559"
+          "sha256": "fc9bfa538122fe3e15ee16065667d1b24fa6abd58146e00a61b031022eaecd22"
         },
         {
           "path": "main_test.go",
@@ -119,7 +163,7 @@
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+          "sha256": "4d16fbd3711c96e55a2ad014c71eb7ec34e6d032090a9af09c6af329c2a03197"
         }
       ]
     },
@@ -132,8 +176,8 @@
       },
       "reason": "The input is an API token or transient viewer identity used only as a bounded in-memory retention counter key, not a stored administrator password or an authentication verifier. Retention sessions expire and only site-level completion events are persisted. Administrator password storage and verification use bcrypt. The review does not claim that an unkeyed digest provides anonymization of low-entropy credentials.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-20T00:00:00Z",
-      "expiresAt": "2027-02-18T00:00:00Z",
+      "reviewedAt": "2026-11-21T00:00:00Z",
+      "expiresAt": "2027-02-19T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
@@ -154,7 +198,7 @@
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "929244bf2d7cae587f16c27e13b8c4b802245139994ff65e49be1cd45de008a5"
+          "sha256": "4d16fbd3711c96e55a2ad014c71eb7ec34e6d032090a9af09c6af329c2a03197"
         }
       ]
     }

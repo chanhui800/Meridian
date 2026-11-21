@@ -285,6 +285,7 @@ type NodeDynamicObservation struct {
 }
 
 type NodeRequestEvent struct {
+	RequestDiagnostics
 	EventUID                string `json:"event_uid,omitempty"`
 	EventID                 int64  `json:"event_id"`
 	SiteID                  int64  `json:"site_id"`
@@ -303,6 +304,7 @@ type NodeRequestEvent struct {
 	ResponseContentType     string `json:"response_content_type,omitempty"`
 	ResponseContentEncoding string `json:"response_content_encoding,omitempty"`
 	RecordedAtMS            int64  `json:"recorded_at_ms"`
+	TimelineAtMS            *int64 `json:"timeline_at_ms,omitempty"`
 	ResourceCategory        string `json:"resource_category,omitempty"`
 	UpstreamUserAgent       string `json:"upstream_user_agent,omitempty"`
 	BackendAddress          string `json:"backend_address,omitempty"`
@@ -1128,6 +1130,17 @@ func nodeAddressIsGlobalUnicast(ip net.IP) bool {
 	return true
 }
 
+func publicNodeAddressFamilies(value string) (v4, v6 string) {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if !nodeAddressIsGlobalUnicast(ip) {
+		return "", ""
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4.String(), ""
+	}
+	return "", ip.String()
+}
+
 func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string, error) {
 	return d.EnrollControlNodeFromSource(token, now, "")
 }
@@ -1175,9 +1188,15 @@ func (d *DB) EnrollControlNodeFromSource(token string, now time.Time, sourceIP s
 		return ControlNode{}, "", errInvalidNodeToken
 	}
 	if inferred, ok := enrollSourceAddressAnswer(sourceIP); ok {
-		// Only fills a blank: an operator-entered address is never overwritten.
-		if _, err := tx.Exec(`UPDATE control_nodes SET address=?,address_source=? WHERE id=? AND TRIM(address)=''`,
-			inferred, nodeAddressSourceEnrollment, id); err != nil {
+		// Persist the observed family as well as the legacy dial address. NAT
+		// Agents may have no public interface address to report afterwards.
+		v4, v6 := publicNodeAddressFamilies(inferred)
+		if _, err := tx.Exec(`UPDATE control_nodes SET address=?,address_source=?,
+			address_v4=CASE WHEN TRIM(address_v4)='' THEN ? ELSE address_v4 END,
+			address_v6_source=CASE WHEN TRIM(address_v6)='' AND ?<>'' THEN ? ELSE address_v6_source END,
+			address_v6=CASE WHEN TRIM(address_v6)='' THEN ? ELSE address_v6 END
+			WHERE id=? AND TRIM(address)=''`,
+			inferred, nodeAddressSourceEnrollment, v4, v6, nodeAddressSourceEnrollment, v6, id); err != nil {
 			return ControlNode{}, "", err
 		}
 	}
@@ -1252,9 +1271,15 @@ func validateNodeRequestEvent(event NodeRequestEvent) error {
 	if event.EventID <= 0 || (event.EventUID != "" && (len(event.EventUID) != 32 || !isHexString(event.EventUID))) || event.SiteID <= 0 || len(event.Host) > 255 || len(event.Method) > 16 || len(event.Path) > 2048 || len(event.Query) > 4096 || event.StatusCode < 0 || event.StatusCode > 999 || len(event.ClientIP) > 64 || len(event.UserAgent) > 512 || len(event.Authorization) > 8192 || len(event.Body) > maxNodeRequestEventBodyBytes || len(event.ContentType) > 128 || len(event.ContentEncoding) > 64 || len(event.ResponseBody) > maxNodeRequestEventResponseBodyBytes || len(event.ResponseContentType) > 128 || len(event.ResponseContentEncoding) > 64 || len(event.ResourceCategory) > 32 || len(event.UpstreamUserAgent) > 512 || len(event.BackendAddress) > 2048 || len(event.InboundColo) > 64 || len(event.OutboundColo) > 64 || event.RecordedAtMS <= 0 || (event.Priority != "" && event.Priority != nodeEventPriorityCritical && event.Priority != nodeEventPriorityBestEffort) {
 		return errors.New("invalid request event")
 	}
+	if !validRequestDiagnosticsWire(event.RequestDiagnostics) {
+		return errors.New("invalid request diagnostics")
+	}
 	if event.WatchHistory != nil {
 		if event.WatchHistory.SiteID != event.SiteID || !validWatchHistoryEvent(*event.WatchHistory) {
 			return errors.New("invalid watch history event")
+		}
+		if event.WatchHistory.ClientStopOutcome != "" && event.WatchHistory.ResponseStatusCode != event.StatusCode {
+			return errors.New("watch history response status mismatch")
 		}
 	}
 	return nil
@@ -1539,47 +1564,42 @@ func (d *DB) recordNodeRequestEventTx(tx *sql.Tx, nodeID int64, event NodeReques
 	if err := tx.QueryRow("SELECT name FROM sites WHERE id=?", event.SiteID).Scan(&siteName); err != nil {
 		return nil
 	}
-	rawPath := event.Path
-	if event.Query != "" {
-		rawPath += "?" + event.Query
-	}
 	category := event.ResourceCategory
-	if !validRequestLogCategory(category) {
-		category = requestLogCategoryAPI
-		switch {
-		case strings.Contains(strings.ToLower(rawPath), "/sessions/playing"):
-			category = requestLogCategoryPlaybackSync
-		case strings.Contains(strings.ToLower(rawPath), "/playbackinfo"):
-			category = requestLogCategoryPlayback
-		case strings.Contains(strings.ToLower(rawPath), "/videos/"):
-			category = requestLogCategoryStream
-		}
-	}
-	if !validRequestLogCategory(category) {
-		category = requestLogCategoryAPI
+	if !validRequestLogCategory(category) && !(category == "" && event.DiagnosticsVersion == requestDiagnosticsVersion) {
+		path, _, _ := strings.Cut(event.Path, "?")
+		category = classifyRequestLogResource(&http.Request{Method: event.Method, URL: &url.URL{Path: path}})
 	}
 	var finalNode string
 	if err := tx.QueryRow("SELECT name FROM control_nodes WHERE id=?", nodeID).Scan(&finalNode); err != nil {
 		finalNode = fmt.Sprintf("节点 #%d", nodeID)
 	}
 	backendAddress := event.BackendAddress
-	if backendAddress == "" {
+	if backendAddress == "" && event.DiagnosticsVersion == 0 {
 		backendAddress = fmt.Sprintf("node:%d", nodeID)
 	}
-	// Agent-reported events must honor the same operator privacy switches as
-	// locally captured logs: the ledger identity is still recorded so replay
-	// dedup and ACKs keep working, but the log row is suppressed or has its
-	// client IP blanked per the settings.
 	settings := d.currentSystemSettings()
-	if !settings.LogEnabled || (settings.LogLevel == "error" && event.StatusCode < 400) {
+	entry, accepted, filterErr := filterAndSanitizeRequestLogEvent(settings, requestLogEvent{
+		RequestDiagnostics: event.RequestDiagnostics,
+		SiteID:             event.SiteID, SiteName: siteName, FinalNode: finalNode, ResourceCategory: category,
+		StatusCode: event.StatusCode, ClientIP: event.ClientIP, UserAgent: event.UserAgent,
+		UpstreamUserAgent: event.UpstreamUserAgent, BackendAddress: backendAddress,
+		InboundColo: event.InboundColo, OutboundColo: event.OutboundColo, Method: event.Method, Path: event.Path,
+	})
+	if filterErr != nil {
+		d.droppedRequestLogs.Add(1)
+	}
+	if !accepted {
 		return nil
 	}
-	clientIP := event.ClientIP
-	if !settings.LogWriteClientIP {
-		clientIP = ""
+	timelineAtMS := int64(0)
+	if settings.LogWriteTimeline {
+		timelineAtMS = event.RecordedAtMS
+		if event.TimelineAtMS != nil && *event.TimelineAtMS >= 0 && *event.TimelineAtMS <= event.RecordedAtMS {
+			timelineAtMS = *event.TimelineAtMS
+		}
 	}
-	_, err := tx.Exec(`INSERT INTO request_logs(site_id,site_name,final_node,resource_category,status_code,client_ip,user_agent,upstream_user_agent,backend_address,inbound_colo,outbound_colo,method,path,recorded_at_ms,timeline_at_ms)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, event.SiteID, siteName, finalNode, category, event.StatusCode, clientIP, event.UserAgent, event.UpstreamUserAgent, backendAddress, event.InboundColo, event.OutboundColo, event.Method, requestLogSafeText(event.Path, requestLogMaxPathBytes), event.RecordedAtMS, event.RecordedAtMS)
+	_, err := tx.Exec(`INSERT INTO request_logs(site_id,site_name,final_node,resource_category,status_code,client_ip,user_agent,upstream_user_agent,backend_address,inbound_colo,outbound_colo,method,path,recorded_at_ms,timeline_at_ms,diagnostics_json)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, entry.SiteID, entry.SiteName, entry.FinalNode, entry.ResourceCategory, entry.StatusCode, entry.ClientIP, entry.UserAgent, entry.UpstreamUserAgent, entry.BackendAddress, entry.InboundColo, entry.OutboundColo, entry.Method, entry.Path, event.RecordedAtMS, timelineAtMS, requestDiagnosticsJSON(entry.RequestDiagnostics))
 	return err
 }
 
@@ -1723,10 +1743,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
 	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID string
+	var legacyAddress, addressSource string
 	var activeSessionEpoch int64
 	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1866,22 +1887,36 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		return nodeReportCommitResult{}, err
 	}
 	// Adopt only empty address slots from Agent hints. Manual values are never
-	// overwritten; DNS publication remains controlled by dns_publish.
+	// overwritten; DNS publication remains controlled by dns_publish. Older NAT
+	// enrollments stored only the observed legacy address, so repair that family
+	// even when the Agent legitimately reports no public interface addresses.
 	var hintedV4, hintedV6 string
 	for _, candidate := range report.NetAddresses {
-		ip := net.ParseIP(strings.TrimSpace(candidate.Address))
-		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
-			continue
+		v4, v6 := publicNodeAddressFamilies(candidate.Address)
+		if hintedV4 == "" {
+			hintedV4 = v4
 		}
-		if ip.To4() != nil && hintedV4 == "" {
-			hintedV4 = ip.To4().String()
+		if hintedV6 == "" {
+			hintedV6 = v6
 		}
-		if ip.To4() == nil && hintedV6 == "" {
-			hintedV6 = ip.String()
+	}
+	// A real public interface hint takes precedence over an old observed
+	// enrollment address. The legacy value is only a fallback for NAT-only
+	// reports, not a replacement for newly observed public-family telemetry.
+	var inferredV6 string
+	if addressSource == nodeAddressSourceEnrollment {
+		v4, v6 := publicNodeAddressFamilies(legacyAddress)
+		if hintedV4 == "" {
+			hintedV4 = v4
+		}
+		if hintedV6 == "" {
+			hintedV6, inferredV6 = v6, v6
 		}
 	}
 	if hintedV4 != "" || hintedV6 != "" {
-		if _, err := tx.Exec(`UPDATE control_nodes SET address_v4=CASE WHEN TRIM(address_v4)='' THEN ? ELSE address_v4 END,address_v6=CASE WHEN TRIM(address_v6)='' THEN ? ELSE address_v6 END,updated_at_ms=? WHERE id=?`, hintedV4, hintedV6, now.UnixMilli(), id); err != nil {
+		if _, err := tx.Exec(`UPDATE control_nodes SET address_v4=CASE WHEN TRIM(address_v4)='' THEN ? ELSE address_v4 END,
+			address_v6_source=CASE WHEN TRIM(address_v6)='' AND ?<>'' THEN ? ELSE address_v6_source END,
+			address_v6=CASE WHEN TRIM(address_v6)='' THEN ? ELSE address_v6 END,updated_at_ms=? WHERE id=?`, hintedV4, inferredV6, nodeAddressSourceEnrollment, hintedV6, now.UnixMilli(), id); err != nil {
 			return nodeReportCommitResult{}, err
 		}
 	}
@@ -2076,7 +2111,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	// their bounded queue/observer. If an effect fails, leave processed_at_ms at
 	// zero so the Agent retries the event instead of deleting it permanently.
 	for _, event := range result.pendingEffects {
-		if err := d.processNodeEvent(event); err != nil {
+		if err := d.processNodeEventFromSource(event, id); err != nil {
 			log.Printf("[node-event] deferred event node=%d site=%d: %v", id, event.SiteID, err)
 			continue
 		}
@@ -2127,11 +2162,15 @@ func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now ti
 }
 
 func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) error {
-	if d == nil || event.Body == "" || event.StatusCode < 200 || event.StatusCode >= 300 {
+	return d.recordNodeWatchHistoryEventFromSource(event, 0)
+}
+
+func (d *DB) recordNodeWatchHistoryEventFromSource(event NodeRequestEvent, sourceNodeID int64) error {
+	if d == nil || event.Body == "" || !isRequestLogPlaybackActivityPath(event.Path) {
 		return nil
 	}
 	site, err := d.GetSite(event.SiteID)
-	if err != nil || !site.WatchHistoryEnabled {
+	if err != nil || !site.Enabled || !site.WatchHistoryEnabled {
 		return nil
 	}
 	parsed, err := url.Parse("https://" + event.Host + event.Path)
@@ -2159,7 +2198,27 @@ func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) error {
 		return nil
 	}
 	_, _ = io.Copy(io.Discard, capture)
-	if history, ok := watchHistoryEventFromCapture(capture, d, *site, req, nil, event.StatusCode, time.UnixMilli(event.RecordedAtMS)); ok {
+	var history watchHistoryEvent
+	var ok bool
+	if watchHistoryEventType(req.URL.Path) == "stopped" {
+		history, ok = watchHistoryStopEventFromCapture(capture, *site, req, nil, time.UnixMilli(event.RecordedAtMS))
+		if ok {
+			history.ResponseStatusCode = event.StatusCode
+			switch event.StatusCode {
+			case http.StatusNoContent:
+				history.ClientStopOutcome = "confirmed"
+				history.StopResponseAtMS = event.RecordedAtMS
+			case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusUnprocessableEntity:
+				history.ClientStopOutcome = "denied"
+			default:
+				history.ClientStopOutcome = "unconfirmed"
+			}
+		}
+	} else {
+		history, ok = watchHistoryEventFromCapture(capture, d, *site, req, nil, event.StatusCode, time.UnixMilli(event.RecordedAtMS))
+	}
+	if ok {
+		history.sourceNodeID = sourceNodeID
 		// Agent events are acknowledged only after the derived watch history is
 		// committed. The proxy hot path may remain asynchronous, but replayed
 		// control-plane events must not be ACKed while they only exist in memory.
@@ -2211,6 +2270,10 @@ func (d *DB) recordNodeMetadataEvent(event NodeRequestEvent) error {
 }
 
 func (d *DB) processNodeEvent(event NodeRequestEvent) error {
+	return d.processNodeEventFromSource(event, 0)
+}
+
+func (d *DB) processNodeEventFromSource(event NodeRequestEvent, sourceNodeID int64) error {
 	if event.ResponseBody != "" {
 		if err := d.recordNodeMetadataEvent(event); err != nil {
 			return err
@@ -2221,7 +2284,7 @@ func (d *DB) processNodeEvent(event NodeRequestEvent) error {
 			return errors.New("watch history event site/host mismatch")
 		}
 		site, err := d.GetSite(event.SiteID)
-		if err != nil || !site.WatchHistoryEnabled {
+		if err != nil || !site.Enabled || !site.WatchHistoryEnabled {
 			return nil
 		}
 		// Token ciphertext is encrypted with the Controller's private JWT key
@@ -2229,12 +2292,22 @@ func (d *DB) processNodeEvent(event NodeRequestEvent) error {
 		// so never persist attacker-supplied ciphertext from the wire event.
 		history := *event.WatchHistory
 		history.TokenCiphertext = ""
+		history.sourceNodeID = sourceNodeID
+		if history.ClientStopOutcome == "" {
+			// Legacy successful progress remains compatible, but an unbound
+			// structured Stopped event cannot hide another viewer's session.
+			if history.EventType == "stopped" || event.StatusCode < 200 || event.StatusCode >= 300 {
+				return nil
+			}
+		} else if history.ResponseStatusCode != event.StatusCode {
+			return errors.New("watch history response status mismatch")
+		}
 		if _, err := d.writeWatchHistoryBatch([]watchHistoryEvent{history}); err != nil {
 			return fmt.Errorf("persist watch history: %w", err)
 		}
 		return nil
 	}
-	return d.recordNodeWatchHistoryEvent(event)
+	return d.recordNodeWatchHistoryEventFromSource(event, sourceNodeID)
 }
 
 func (node ControlNode) String() string {

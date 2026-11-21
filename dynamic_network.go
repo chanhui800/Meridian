@@ -479,7 +479,9 @@ func resolveDynamicURLIPs(ctx context.Context, resolver dynamicIPResolver, targe
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
+	started := time.Now()
 	answers, err := resolver.LookupIPAddr(ctx, normalized.Hostname())
+	observeDynamicDNSDuration(ctx, time.Since(started))
 	if err != nil {
 		return nil, fmt.Errorf("resolve dynamic target: %w", err)
 	}
@@ -497,6 +499,8 @@ func resolveDynamicURLIPs(ctx context.Context, resolver dynamicIPResolver, targe
 }
 
 type dynamicDialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+const dynamicPinnedFallbackAttemptTimeout = 2 * time.Second
 
 func newDynamicTransport(target *url.URL, pinnedIPs []net.IP, policy *dynamicSelfTargetPolicy) (*http.Transport, error) {
 	if policy == nil {
@@ -576,21 +580,46 @@ func newDynamicTransportWithDialerTimeout(target *url.URL, pinnedIPs []net.IP, d
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, totalDialTimeout)
 		defer cancel()
-		var lastErr error
+		candidates := make([]net.IP, 0, len(pins))
 		for _, ip := range pins {
+			if (network == "tcp4" && ip.To4() == nil) || (network == "tcp6" && ip.To4() != nil) {
+				continue
+			}
+			candidates = append(candidates, ip)
+		}
+		var lastErr error
+		for index, ip := range candidates {
 			if err := dialCtx.Err(); err != nil {
 				lastErr = err
 				break
 			}
-			if (network == "tcp4" && ip.To4() == nil) || (network == "tcp6" && ip.To4() != nil) {
-				continue
-			}
 			if err := policy.validateIP(ip); err != nil {
 				return nil, err
 			}
-			conn, dialErr := dial(dialCtx, network, net.JoinHostPort(ip.String(), expectedPort))
-			if dialErr == nil {
+			// Keep one total deadline, but reserve a share of the remaining
+			// window for every eligible pin. A blackholed first IP must not
+			// consume the opportunity to try a healthy alternate. Sequential
+			// attempts also keep connect tracing and socket ownership unambiguous.
+			deadline, _ := dialCtx.Deadline()
+			attemptTimeout := time.Until(deadline) / time.Duration(len(candidates)-index)
+			if index+1 < len(candidates) {
+				attemptTimeout = min(attemptTimeout, dynamicPinnedFallbackAttemptTimeout)
+			}
+			attemptCtx, stopAttempt := context.WithTimeout(dialCtx, attemptTimeout)
+			conn, dialErr := dial(attemptCtx, network, net.JoinHostPort(ip.String(), expectedPort))
+			attemptErr := attemptCtx.Err()
+			stopAttempt()
+			if dialErr == nil && attemptErr == nil && dialCtx.Err() == nil {
 				return conn, nil
+			}
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if dialErr == nil {
+				dialErr = attemptErr
+				if dialErr == nil {
+					dialErr = dialCtx.Err()
+				}
 			}
 			lastErr = dialErr
 		}

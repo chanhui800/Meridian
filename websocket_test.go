@@ -185,6 +185,27 @@ func TestHandleWebSocketRefusesTunnelWhenUpstreamDoesNotSwitchProtocols(t *testi
 	}
 }
 
+func TestHandleWebSocketClosesRefusalWithoutWaitingForBody(t *testing.T) {
+	upstream := startFakeWSUpstream(t, "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\n")
+	inst := &ProxyInstance{server: &http.Server{}}
+	srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0, UAHeaderPolicy{})
+	conn, err := net.DialTimeout("tcp", srv.Listener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, wsClientHandshake); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(conn)
+	if err != nil || !strings.HasPrefix(string(response), "HTTP/1.1 502 Bad Gateway\r\n") {
+		t.Fatalf("expected complete gateway response without waiting for the refused body: %q, %v", response, err)
+	}
+}
+
 func TestHandleWebSocketRelaysSwitchAndMetersBothDirections(t *testing.T) {
 	const serverPayload = "UPSTREAM-FRAMES"
 	upstream := startFakeWSUpstream(t, "HTTP/1.1 101 Switching Protocols\r\n"+

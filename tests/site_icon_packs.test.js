@@ -17,7 +17,7 @@ function deferred() {
 
 function iconPackHarness() {
   const elements = new Map();
-  const calls = { fetch: [], refresh: [], activate: [], create: [], updateIcon: [], opened: [], closed: 0, success: [] };
+  const calls = { fetch: [], refresh: [], activate: [], create: [], updateIcon: [], opened: [], closed: 0, success: [], readActive: 0, listPacks: 0 };
   const hooks = {};
   const packs = [
     { id: 1, name: '离歌', description: '离歌说明', source_url: 'https://raw.example.test/lige.json', built_in: true, updated_at: '2026-11-20T09:00:00Z', icons: [{ name: 'Existing', url: 'https://cdn.example.test/existing.png' }] },
@@ -32,6 +32,8 @@ function iconPackHarness() {
     const values = new Set(String(names || '').split(' ').filter(Boolean));
     return {
       contains: value => values.has(value),
+      add: value => values.add(value),
+      remove: value => values.delete(value),
       toggle(value, enabled) {
         const next = enabled === undefined ? !values.has(value) : enabled;
         if (next) values.add(value); else values.delete(value);
@@ -101,9 +103,11 @@ function iconPackHarness() {
     },
     API: {
       async listSiteIconPacks() {
+        calls.listPacks++;
         return { packs: state.packs.map(pack => ({ ...fullPack(pack), icons: undefined, icon_count: pack.icons.length })) };
       },
       async getSiteIconPack() {
+        calls.readActive++;
         if (hooks.getActive) return hooks.getActive();
         const active = state.packs.find(pack => pack.id === state.activeID);
         return active ? fullPack(active) : { icons: [] };
@@ -135,11 +139,146 @@ function iconPackHarness() {
     },
   };
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/app.js'), 'utf8').split('(function()')[0], sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'sites.js'), 'utf8'), sandbox);
   const element = id => elements.get(id);
   const packButton = (action, id) => element('m-site-icon-pack-list').querySelectorAll(`[data-icon-pack-action="${action}"]`).find(button => Number(button.dataset.iconPackId) === id);
-  return { sandbox, element, packButton, calls, hooks, state, remote, fullPack };
+  const addElement = id => {
+    const added = createElement({ id });
+    elements.set(id, added);
+    return added;
+  };
+  return { sandbox, element, addElement, packButton, calls, hooks, state, remote, fullPack };
 }
+
+test('site refresh completes without downloading icon contents or their catalog', async () => {
+  const harness = iconPackHarness();
+  const page = harness.addElement('page-sites');
+  page.isConnected = true;
+  harness.addElement('sites-grid');
+  harness.addElement('sites-count');
+  const loadState = harness.addElement('sites-load-state');
+  const events = [];
+  const history = deferred();
+  harness.sandbox.API.ingressCapabilities = async () => ({});
+  harness.sandbox.API.getActiveWatchHistory = () => { events.push('history'); return history.promise; };
+  harness.sandbox.API.listSites = async () => { events.push('sites'); return []; };
+  harness.sandbox.normalizeSiteCapabilities = value => value;
+  harness.sandbox.window.setTimeout = () => 1;
+  harness.sandbox.window.clearTimeout = () => {};
+
+  const load = harness.sandbox.loadSites();
+  assert.deepEqual(events, ['history']);
+  history.resolve({ items: [] });
+  await load;
+  await harness.sandbox.loadSites({ background: true });
+  await harness.sandbox.loadSites();
+  assert.deepEqual(events, ['history', 'sites', 'history', 'sites', 'history', 'sites']);
+  assert.equal(harness.calls.readActive, 0);
+  assert.equal(harness.calls.listPacks, 0);
+  assert.equal(loadState.textContent, '每 5 秒更新');
+  assert.ok(harness.element('sites-grid').innerHTML.includes('还没有站点'));
+});
+
+test('saved site icons survive cold and warm list loads when no icon pack is available', async () => {
+  const harness = iconPackHarness();
+  const page = harness.addElement('page-sites');
+  page.isConnected = true;
+  const grid = harness.addElement('sites-grid');
+  harness.addElement('sites-count');
+  harness.addElement('sites-load-state');
+  harness.sandbox.window.setTimeout = () => 1;
+  harness.sandbox.window.clearTimeout = () => {};
+  harness.sandbox.window.addEventListener = () => {};
+  harness.sandbox.window.removeEventListener = () => {};
+  harness.sandbox.formatBytes = value => `${value} B`;
+  harness.sandbox.uaNameMap = { passthrough: '透传' };
+  harness.state.packs = [];
+  harness.state.activeID = 0;
+  harness.hooks.getActive = async () => { throw new Error('optional pack endpoint unavailable'); };
+  const sites = [
+    { id: 9, name: 'Saved icon', ingress_mode: 'port', listen_port: 8096, ua_mode: 'passthrough', icon_name: 'Existing', icon_url: 'https://cdn.example.test/saved.png' },
+    { id: 10, name: 'Fallback', ingress_mode: 'port', listen_port: 8097, ua_mode: 'passthrough' },
+  ];
+  harness.sandbox.API.ingressCapabilities = async () => ({ panel_tls_enabled: false });
+  harness.sandbox.API.getActiveWatchHistory = async () => ({ items: [] });
+  harness.sandbox.API.listSites = async () => sites.map(site => ({ ...site }));
+
+  await harness.sandbox.loadSites();
+  assert.ok(grid.innerHTML.includes('src="https://cdn.example.test/saved.png"'));
+  assert.ok(grid.innerHTML.includes('<span class="site-icon-fallback">F</span>'));
+  await harness.sandbox.loadSites({ background: true });
+  assert.ok(grid.innerHTML.includes('src="https://cdn.example.test/saved.png"'));
+  sites[0].icon_name = 'Updated';
+  sites[0].icon_url = 'https://cdn.example.test/updated.png';
+  await harness.sandbox.loadSites({ background: true });
+  assert.ok(grid.innerHTML.includes('src="https://cdn.example.test/updated.png"'));
+  assert.equal(grid.innerHTML.includes('src="https://cdn.example.test/saved.png"'), false);
+  assert.equal(harness.calls.readActive, 0);
+  assert.equal(harness.calls.listPacks, 0);
+});
+
+test('an imported and activated pack is available on the next picker open', async () => {
+  const harness = iconPackHarness();
+  const source = 'https://raw.example.test/imported.json';
+  harness.remote.set(source, { name: 'Imported', icons: [{ name: 'Imported icon', url: 'https://cdn.example.test/imported.png' }] });
+  await harness.sandbox.showSiteIconPackModal();
+  harness.element('m-icon-pack-url').value = source;
+  const imported = deferred();
+  const success = harness.sandbox.Toast.success;
+  harness.sandbox.Toast.success = message => {
+    success(message);
+    if (message.startsWith('已导入')) imported.resolve();
+  };
+  harness.element('m-icon-pack-import-form').onsubmit({ preventDefault() {} });
+  await imported.promise;
+  assert.ok(harness.element('m-site-icon-pack-list').innerHTML.includes('Imported'));
+  await harness.packButton('activate', 4).onclick();
+  assert.equal(harness.calls.readActive, 0);
+  harness.element('m-icon-pack-done').onclick();
+  await harness.sandbox.showSiteIconManager({ id: 9, name: '站点' });
+  assert.equal(harness.element('m-site-icon-pack-select').value, '4');
+  assert.ok(harness.element('m-site-icon-manager-results').innerHTML.includes('Imported icon'));
+  assert.equal(harness.calls.readActive, 1);
+});
+
+test('catalog activation avoids a full pack read and the picker reads current contents on each open', async () => {
+  const harness = iconPackHarness();
+  const site = { id: 9, name: '演示站点' };
+  await harness.sandbox.showSiteIconPackModal();
+  await harness.packButton('activate', 2).onclick();
+  assert.equal(harness.calls.readActive, 0);
+  await harness.sandbox.showSiteIconManager(site);
+  assert.equal(harness.calls.readActive, 1);
+  assert.ok(harness.element('m-site-icon-manager-results').innerHTML.includes('Sakura Old'));
+  harness.element('m-site-icon-close').onclick();
+
+  harness.state.activeID = 3;
+  harness.state.packs[2].icons.push({ name: 'New Addition', url: 'https://cdn.example.test/new.png' });
+  await harness.sandbox.showSiteIconManager(site);
+  assert.equal(harness.calls.readActive, 2);
+  assert.equal(harness.element('m-site-icon-pack-select').value, '3');
+  assert.ok(harness.element('m-site-icon-manager-results').innerHTML.includes('New Addition'));
+  assert.equal(harness.element('m-site-icon-manager-results').innerHTML.includes('Sakura Old'), false);
+});
+
+test('opening the picker after refreshing or deleting the active pack never uses stale icons', async () => {
+  const harness = iconPackHarness();
+  const site = { id: 9, name: '演示站点' };
+  await harness.sandbox.showSiteIconManager(site);
+  await harness.element('m-site-icon-pack').onclick();
+  harness.remote.set(harness.state.packs[0].source_url, { name: 'Fresh', icons: [{ name: 'Fresh icon', url: 'https://cdn.example.test/fresh.png' }] });
+  await harness.packButton('refresh', 1).onclick();
+  await harness.sandbox.showSiteIconManager(site);
+  assert.ok(harness.element('m-site-icon-manager-results').innerHTML.includes('Fresh icon'));
+  assert.equal(harness.element('m-site-icon-manager-results').innerHTML.includes('Existing'), false);
+
+  await harness.sandbox.showSiteIconPackModal();
+  await harness.packButton('delete', 1).onclick();
+  await harness.sandbox.showSiteIconManager(site);
+  assert.equal(harness.element('m-site-icon-pack-select').value, '');
+  assert.equal(harness.element('m-site-icon-manager-results').querySelectorAll('.site-icon-option').length, 0);
+});
 
 test('icon pack list refresh reads its complete source and replaces the same inactive pack', async () => {
   const harness = iconPackHarness();
@@ -265,7 +404,7 @@ test('the icon picker can activate the only remaining pack when the previous act
   assert.equal(harness.calls.closed, 0);
 });
 
-test('inline switch locks competing requests and ignores a stale global icon pack during search', async () => {
+test('inline switch locks competing requests and keeps the loaded pack stable during search', async () => {
   const harness = iconPackHarness();
   await harness.sandbox.showSiteIconManager({ id: 9, name: '站点' });
   const activation = deferred();
@@ -281,11 +420,13 @@ test('inline switch locks competing requests and ignores a stale global icon pac
   activation.resolve();
   await operation;
   assert.equal(selector.value, '2');
-  vm.runInContext('siteIconPack = { icons: [{name:"STALE",url:"https://cdn.example.test/stale.png"}] }', harness.sandbox);
+  harness.state.packs[1].icons = [{ name: 'Later update', url: 'https://cdn.example.test/later.png' }];
+  const reads = harness.calls.readActive;
   harness.element('m-site-icon-search').oninput();
   const displayed = harness.element('m-site-icon-manager-results').innerHTML;
   assert.ok(displayed.includes('Sakura Old'));
-  assert.equal(displayed.includes('STALE'), false);
+  assert.equal(displayed.includes('Later update'), false);
+  assert.equal(harness.calls.readActive, reads);
   assert.equal(selector.disabled, false);
 });
 
