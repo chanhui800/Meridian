@@ -779,13 +779,55 @@ assert_eq '127.0.0.1/32,::1/128' "$(read_env_value TRUSTED_PROXY_CIDRS)" 'truste
 assert_eq true "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'installed proxy deployment is explicit'
 assert_not_contains "$NGINX_CONFIG" 50001
 
+disable_nginx_log="${TEST_ROOT}/disable-nginx-validation.log"
+disable_env_before="${TEST_ROOT}/disable-env-before"
+disable_nginx_before="${TEST_ROOT}/disable-nginx-before"
+cp "$(env_file_path)" "$disable_env_before"
+cp "$NGINX_CONFIG" "$disable_nginx_before"
+: > "$disable_nginx_log"
+if (
+    # Force the availability branch on every host; all validation below is
+    # controlled by the helper mock, never the installed Nginx command.
+    nginx() { return 1; }
+    nginx_test_and_reload() {
+        if [ -e "$NGINX_CONFIG" ]; then
+            printf 'restored\n' >> "$disable_nginx_log"
+        else
+            printf 'removed\n' >> "$disable_nginx_log"
+        fi
+        return 1
+    }
+    as_root() { run_test_root_command "$@"; }
+    is_systemd() { return 0; }
+    restart_meridian_and_health() { return 0; }
+    install_env_file() { cp "$1" "$(env_file_path)"; }
+    disable_panel_domain
+) >"${TEST_ROOT}/disable-nginx-failure.log" 2>&1; then
+    echo 'FAIL: failed Nginx validation did not reject domain removal' >&2
+    exit 1
+fi
+cmp -s "$(env_file_path)" "$disable_env_before" \
+    || { echo 'FAIL: domain removal failure changed the environment' >&2; exit 1; }
+cmp -s "$NGINX_CONFIG" "$disable_nginx_before" \
+    || { echo 'FAIL: domain removal failure did not restore the Nginx config' >&2; exit 1; }
+assert_eq '1' "$(grep -c '^removed$' "$disable_nginx_log")" 'failed domain removal validates after deletion'
+assert_eq '1' "$(grep -c '^restored$' "$disable_nginx_log")" 'failed domain removal validates restored config'
+
+: > "$disable_nginx_log"
 (
+    nginx() { return 1; }
+    nginx_test_and_reload() {
+        [ ! -e "$NGINX_CONFIG" ] || return 1
+        printf 'removed\n' >> "$disable_nginx_log"
+    }
     as_root() { run_test_root_command "$@"; }
     is_systemd() { return 0; }
     restart_meridian_and_health() { return 0; }
     install_env_file() { cp "$1" "$(env_file_path)"; }
     disable_panel_domain
 )
+assert_eq '1' "$(grep -c '^removed$' "$disable_nginx_log")" 'successful domain removal validates exactly once'
+[ ! -e "$NGINX_CONFIG" ] || { echo 'FAIL: domain removal kept the managed Nginx config' >&2; exit 1; }
 assert_eq false "$(read_env_value PANEL_EXTERNAL_PROXY_ENABLED)" 'removed proxy deployment is explicit'
 
 if [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = nginx ]; then
