@@ -108,7 +108,7 @@ func (s *edgeEventStore) initWithKey(dir string, secret []byte) error {
 }
 
 func readEdgeSpoolBounded(path string, limit int64) ([]byte, error) {
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- caller supplies events.json under the administrator-selected private Agent state directory; file size and read bytes are bounded below.
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +146,7 @@ func (s *edgeEventStore) initWithRawKey(dir string, key, legacyKey []byte) error
 		return legacyErr
 	}
 	legacyHash := sha256.Sum256(legacy)
-	marker, markerErr := os.ReadFile(filepath.Join(dir, "events.legacy.sha256"))
+	marker, markerErr := os.ReadFile(filepath.Join(dir, "events.legacy.sha256")) // #nosec G304 -- fixed marker name under the administrator-selected private Agent state directory, not a request-controlled path.
 	_, journalErr := os.Stat(j.path)
 	useLegacy := errors.Is(journalErr, os.ErrNotExist) || legacyErr == nil && (markerErr != nil || strings.TrimSpace(string(marker)) != hex.EncodeToString(legacyHash[:]))
 	if journalErr != nil && !errors.Is(journalErr, os.ErrNotExist) {
@@ -373,12 +373,14 @@ func writeEdgeJournalFrame(file *os.File, key []byte, op *edgeJournalOperation, 
 	if err != nil {
 		return edgeJournalReference{}, chain, err
 	}
-	if len(sealed) > edgeJournalFrameBytes {
+	sealedLength := len(sealed)
+	if sealedLength < 0 || sealedLength > edgeJournalFrameBytes {
 		return edgeJournalReference{}, chain, errors.New("event journal frame too large")
 	}
-	frame := make([]byte, 8+len(sealed))
-	binary.BigEndian.PutUint32(frame, uint32(len(sealed)))
-	binary.BigEndian.PutUint32(frame[4:], ^uint32(len(sealed)))
+	frameLength := uint32(sealedLength)
+	frame := make([]byte, 8+sealedLength)
+	binary.BigEndian.PutUint32(frame, frameLength)
+	binary.BigEndian.PutUint32(frame[4:], ^frameLength)
 	copy(frame[8:], sealed)
 	if written, writeErr := file.Write(frame); writeErr != nil || written != len(frame) {
 		if writeErr == nil {
@@ -518,13 +520,14 @@ func (j *edgeEventJournal) replay() error {
 			}
 			return err
 		}
-		length := int(binary.BigEndian.Uint32(header[:]))
-		if binary.BigEndian.Uint32(header[4:]) != ^uint32(length) {
+		frameLength := binary.BigEndian.Uint32(header[:])
+		if binary.BigEndian.Uint32(header[4:]) != ^frameLength {
 			return errors.New("event journal frame header integrity failure")
 		}
-		if length < 1 || length > edgeJournalFrameBytes {
+		if frameLength < 1 || frameLength > edgeJournalFrameBytes {
 			return errors.New("invalid event journal frame length")
 		}
+		length := int(frameLength)
 		if j.offset+8+int64(length) > stat.Size() {
 			break
 		} // only a physically incomplete tail may be truncated

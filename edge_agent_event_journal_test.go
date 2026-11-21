@@ -469,7 +469,7 @@ func TestJournalIntegrityAndIncompleteTailRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"tail", "header", "ciphertext", "reorder"} {
+	for _, mode := range []string{"tail", "header", "zero_length", "oversize_length", "ciphertext", "reorder"} {
 		t.Run(mode, func(t *testing.T) {
 			data := append([]byte(nil), original...)
 			switch mode {
@@ -481,6 +481,12 @@ func TestJournalIntegrityAndIncompleteTailRecovery(t *testing.T) {
 				data = append(data, 1, 2, 3)
 			case "header":
 				data[len(edgeJournalMagic)] ^= 1
+			case "zero_length":
+				binary.BigEndian.PutUint32(data[len(edgeJournalMagic):], 0)
+				binary.BigEndian.PutUint32(data[len(edgeJournalMagic)+4:], ^uint32(0))
+			case "oversize_length":
+				binary.BigEndian.PutUint32(data[len(edgeJournalMagic):], ^uint32(0))
+				binary.BigEndian.PutUint32(data[len(edgeJournalMagic)+4:], 0)
 			case "ciphertext":
 				data[len(edgeJournalMagic)+20] ^= 1
 			case "reorder":
