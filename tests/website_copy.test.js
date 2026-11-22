@@ -6,6 +6,18 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
+test('website uses a versioned script path with the current app source', () => {
+  const websiteRoot = path.join(__dirname, '../website');
+  const html = fs.readFileSync(path.join(websiteRoot, 'index.html'), 'utf8');
+  const script = html.match(/<script src="(app-v[^"]+\.js)"><\/script>/);
+
+  assert.ok(script, 'index.html should use a versioned app script path');
+  assert.equal(
+    fs.readFileSync(path.join(websiteRoot, script[1]), 'utf8'),
+    fs.readFileSync(path.join(websiteRoot, 'app.js'), 'utf8'),
+  );
+});
+
 function copyHarness(writeText) {
   const listeners = new Map();
   const timers = new Map();
