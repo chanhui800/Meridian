@@ -39,6 +39,7 @@ html[data-theme="dark"] .settings-console { --settings-success: #6acbae; }
 .settings-console .settings-field small, .settings-console .settings-panel-help, .settings-console .form-help { color: var(--console-muted); font-size: 12px; font-weight: 400; line-height: 1.65; margin: 0; overflow-wrap: anywhere; }
 .settings-console .settings-panel-help { margin-bottom: 18px; }
 .settings-console .form-input, .settings-console .form-select { width: 100%; max-width: 100%; min-width: 0; min-height: 42px; border: 1px solid var(--console-line); border-radius: 7px; padding: 10px 12px; box-shadow: none; background: var(--console-surface); color: var(--console-ink); font-size: 14px; line-height: 1.5; font-family: inherit; }
+.settings-console .form-select { padding-block: 0; padding-right: 36px; line-height: normal; }
 .settings-console .settings-field:has(em) .form-input { padding-right: 48px; }
 .settings-console .form-input:focus, .settings-console .form-select:focus { border-color: var(--console-accent); outline: 2px solid var(--console-accent-soft); }
 .settings-console .settings-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; }

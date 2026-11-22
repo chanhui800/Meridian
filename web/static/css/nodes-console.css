@@ -103,6 +103,7 @@
 .route-enable input { width: 16px; height: 16px; accent-color: var(--console-accent); margin: 0; }
 .route-field { display: grid; gap: 7px; color: var(--console-muted); font-size: 12px; }
 .fleet-console .route-field .form-input { width: 100%; max-width: 100%; min-width: 0; height: 40px; font-size: 13px; border: 1px solid var(--console-line); border-radius: 6px; background: var(--console-surface); color: var(--console-ink); box-shadow: none; padding: 8px 11px; }
+.fleet-console .route-field select.form-input { height: auto; min-height: 40px; padding-block: 0; line-height: normal; }
 .fleet-console .node-site-status { display: grid; gap: 4px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--console-line); }
 .fleet-console .node-site-status span, .fleet-console .node-site-status small { font-size: 11px; line-height: 1.5; color: var(--console-muted); overflow-wrap: anywhere; }
 .fleet-console .node-site-status .is-error { color: var(--console-danger); }
@@ -117,6 +118,7 @@
 .fleet-modal .fleet-form { display: grid; gap: 22px; }
 .fleet-modal .fleet-form label { display: grid; gap: 8px; font-size: 13px; color: var(--console-ink); }
 .fleet-modal .fleet-form .form-input { background: var(--console-surface); color: var(--console-ink); border: 1px solid var(--console-line); border-radius: 7px; height: 42px; box-shadow: none; }
+.fleet-modal .fleet-form select.form-input { height: auto; min-height: 42px; padding-block: 0; line-height: normal; }
 .fleet-modal .fleet-form .form-input:focus { border-color: var(--console-accent); outline: 2px solid var(--console-accent-soft); }
 .fleet-modal .fleet-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .fleet-modal .fleet-form .form-help { font-size: 12px; color: var(--console-muted); line-height: 1.6; margin: 0; }
@@ -186,10 +188,12 @@
   .route-editor-heading span { display: block; margin-top: 5px; }
   .route-editor-fields { grid-template-columns: minmax(0, 1fr); gap: 14px; }
   .fleet-console .route-field .form-input { width: 100%; max-width: 100%; min-height: 44px; font-size: 16px; }
+  .fleet-console .route-field select.form-input { min-height: 44px; }
   .route-enable { min-height: 44px; }
   .route-editor-actions .console-button { flex: 1; min-height: 44px; }
   .fleet-modal .fleet-form-grid { grid-template-columns: minmax(0, 1fr); }
   .fleet-modal .fleet-form .form-input { min-height: 44px; font-size: 16px; }
+  .fleet-modal .fleet-form select.form-input { min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .fleet-console *, .fleet-modal * { animation: none !important; transition: none !important; }
