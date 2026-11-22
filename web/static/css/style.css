@@ -228,6 +228,11 @@ input, select { font-family: inherit; }
   transition: all .25s cubic-bezier(.16,1,.3,1);
 }
 
+select.form-input {
+  padding-block: 0;
+  line-height: normal;
+}
+
 .form-input:focus {
   background: var(--surface-hover);
   border-color: rgba(10,132,255,.5);
@@ -858,13 +863,14 @@ tr:hover td { background: var(--surface); }
 .controls-row { display: flex; gap: 12px; margin-bottom: 28px; }
 
 .form-select {
-  padding: 10px 40px 10px 16px;
+  padding: 0 40px 0 16px;
   background: var(--surface);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-xs);
   color: var(--white-87);
   font-size: .85rem;
   font-weight: 500;
+  line-height: normal;
   outline: none;
   appearance: none;
   background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23666' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
@@ -5356,6 +5362,7 @@ html { font-size: 15px; }
 .settings-content .form-help { margin-top: 5px; font-size: 12px; line-height: 1.4; }
 .settings-content .form-input,
 .settings-content .form-select { min-height: 38px; padding: 8px 12px; font-size: 14px; }
+.settings-content .form-select { padding-block: 0; line-height: normal; }
 .settings-panel .global-settings-status { padding: 10px 12px; }
 .settings-panel .global-settings-action { margin-top: 12px; }
 .settings-range { display: grid; gap: 7px; color: var(--white-87); font-size: 14px; font-weight: 650; }
@@ -5829,7 +5836,8 @@ body.is-site-dragging * {
 .watch-history-filters .form-select {
   width: 100%;
   min-height: 40px;
-  padding-block: 8px;
+  padding-block: 0;
+  line-height: normal;
 }
 
 .watch-history-toolbar-actions {

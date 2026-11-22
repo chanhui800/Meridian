@@ -240,7 +240,7 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
 
-v1.11.7 汇总了反代可靠性、缓存、观看记录、站点交互与性能优化，具体变化和升级说明见 [v1.11.7 发布说明](docs/releases/v1.11.7.md)。
+v1.11.8 修复控制台下拉选项文字裁切和垂直对齐问题，具体变化和升级说明见 [v1.11.8 发布说明](docs/releases/v1.11.8.md)。
 
 升级 Controller 后，已注册 Agent 会通过受认证的配置和清单接口获取匹配版本的下载信息。正式版从固定 GitHub Release 下载，下载请求不携带 Controller 令牌；开发构建使用需要认证的 Controller 二进制接口。
 

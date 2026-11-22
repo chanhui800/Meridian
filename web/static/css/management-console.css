@@ -208,6 +208,7 @@ html .console-shell .modal.site-config-modal { width: min(1040px, calc(100vw - 4
 .console-shell .site-config-modal label { display: block; margin: 0 0 8px; font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--console-ink); }
 html .console-shell .site-config-modal :is(.form-input,.form-select) { display: block; width: 100%; min-width: 0; max-width: 100%; min-height: 42px; padding: 10px 12px; border: 1px solid var(--console-line); border-radius: 7px; color: var(--console-ink); background-color: var(--console-surface); font: 14px/1.5 var(--console-font); box-shadow: none; color-scheme: inherit; }
 .console-shell .site-config-modal .form-select { padding-right: 36px; }
+.console-shell .site-config-modal select.form-select { padding-block: 0; line-height: normal; }
 .console-shell .site-config-modal .form-select option { background: var(--console-surface); color: var(--console-ink); }
 .console-shell .site-config-modal :is(.form-input,.form-select):focus { border-color: var(--console-accent); outline: 2px solid var(--console-accent-soft); outline-offset: 0; }
 .console-shell .site-config-modal textarea.form-input { resize: vertical; font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px; }
