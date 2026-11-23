@@ -1508,6 +1508,7 @@ run_password_case() {
         if [ "$1" = systemctl ]; then return 0; fi
         command "$@"
     }
+    stop_and_confirm_meridian_service() { return 0; }
     is_systemd() { return 0; }
     wait_for_health() { [ "$health_result" = success ]; }
     fix_database_permissions() { return 0; }
