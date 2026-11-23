@@ -194,6 +194,97 @@ func TestRewritePathTargetResponseKeepsRedirectsAndCookiesInTargetRoute(t *testi
 	}
 }
 
+func TestPathTargetSiteRewritesOrDropsUpstreamRedirectLocation(t *testing.T) {
+	tests := []struct {
+		name         string
+		locations    []string
+		wantLocation string
+	}{
+		{name: "malformed network authority", locations: []string{`//\evil.test/path`}},
+		{name: "userinfo", locations: []string{"https://user@evil.test/path"}},
+		{name: "unsupported scheme", locations: []string{"javascript:alert(1)"}},
+		{name: "empty first location", locations: []string{"", "https://evil.test/path"}},
+		{name: "relative", locations: []string{"../next.m3u8?token=synthetic"}, wantLocation: "/_proxy/v1/http/{upstream}/next.m3u8?token=synthetic"},
+		{name: "protocol relative", locations: []string{"//evil.test/path"}, wantLocation: "/_proxy/v1/http/evil.test/path"},
+		{name: "path backslash", locations: []string{`/\evil.test/path`}, wantLocation: "/_proxy/v1/http/{upstream}/%5Cevil.test/path"},
+		{name: "private target with double slash path", locations: []string{"https://192.168.1.20:8096//media/movie.mkv"}, wantLocation: "/_proxy/v1/https/192.168.1.20:8096//media/movie.mkv"},
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, test := range tests {
+			if r.URL.Query().Get("case") != test.name {
+				continue
+			}
+			for _, location := range test.locations {
+				w.Header().Add("Location", location)
+			}
+			w.WriteHeader(http.StatusFound)
+			_, _ = io.WriteString(w, "upstream redirect")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newTestApp(t)
+	site, err := app.db.CreateSiteRecord(Site{
+		Name: "generic redirect boundary", ListenPort: 8101,
+		PublicHost: "generic-redirect.example.test", IngressMode: ingressModeHost,
+		UpstreamMode: upstreamModePathTarget, PlaybackMode: "direct",
+		StreamHosts: "[]", UAMode: passthroughUAMode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	handler, ok := app.pm.PublicHostHandler(site.PublicHost)
+	if !ok || handler == nil {
+		t.Fatal("generic host route was not registered")
+	}
+	gateway := httptest.NewServer(handler)
+	t.Cleanup(gateway.Close)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	t.Cleanup(transport.CloseIdleConnections)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+				gateway.URL+pathTargetRoutePrefix+"http/"+upstreamURL.Host+"/base/playlist.m3u8?case="+url.QueryEscape(test.name), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// RoundTrip preserves the wire response without interpreting or following Location.
+			response, err := transport.RoundTrip(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusFound || string(body) != "upstream redirect" {
+				t.Fatalf("redirect status/body = %d/%q", response.StatusCode, body)
+			}
+			locations := response.Header.Values("Location")
+			if test.wantLocation == "" {
+				if len(locations) != 0 {
+					t.Fatalf("unsafe upstream Location reached the client: %q", locations)
+				}
+				return
+			}
+			want := strings.ReplaceAll(test.wantLocation, "{upstream}", upstreamURL.Host)
+			if len(locations) != 1 || locations[0] != want {
+				t.Fatalf("Location = %q, want only %q", locations, want)
+			}
+		})
+	}
+}
+
 func TestPathTargetSiteProxiesLocalRangeRequestAndMetersIt(t *testing.T) {
 	app := newTestApp(t)
 	type receivedRequest struct {

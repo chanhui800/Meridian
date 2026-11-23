@@ -137,6 +137,8 @@ func rewritePathTargetResponse(resp *http.Response) {
 	}
 	rewritePathTargetSetCookies(resp.Header, upstream)
 	location := resp.Header.Get("Location")
+	// Only validated gateway routes may survive the upstream redirect boundary.
+	resp.Header.Del("Location")
 	if location == "" {
 		return
 	}
