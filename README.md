@@ -9,7 +9,7 @@
 
 Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板，同时支持在请求路径中指定目标的通用 HTTP(S) 反代。它把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 和可选的边缘 Agent 放在一个控制面板里。
 
-当前正式版为 [v1.11.10](https://github.com/chanhui800/Meridian/releases/tag/v1.11.10)，安装文件和 `SHA256SUMS` 可从 Release 获取，变化见 [v1.11.10 发布说明](docs/releases/v1.11.10.md)。节点调度按站点启用，未启用的站点继续使用原面板入口。
+当前正式版为 [v1.11.11](https://github.com/chanhui800/Meridian/releases/tag/v1.11.11)，安装文件和 `SHA256SUMS` 可从 Release 获取，变化见 [v1.11.11 发布说明](docs/releases/v1.11.11.md)。节点调度按站点启用，未启用的站点继续使用原面板入口。
 
 ## 仓库结构
 
@@ -111,7 +111,7 @@ curl -fsSL https://github.com/chanhui800/Meridian/releases/latest/download/insta
 curl -fsSL https://github.com/chanhui800/Meridian/releases/latest/download/install.sh | sudo bash -s -- uninstall -y --purge
 ```
 
-默认数据库为 `/var/lib/meridian/meridian.db`，服务名为 `meridian`：
+原生安装默认使用 `/opt/meridian/meridian.db`，systemd 服务名为 `meridian`。
 
 ```bash
 sudo systemctl status meridian --no-pager
@@ -299,7 +299,7 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
 
-v1.11.10 修复审查确认的节点端口、流量账本、TLS 备份、证书复用、页面异步保存、安装器生命周期及媒体清单路由问题。固定镜像为 `ghcr.io/chanhui800/meridian:v1.11.10`，数据库自动迁移到 schema 60；降级前请先备份并按发布说明恢复兼容的数据快照。
+v1.11.11 修复审查确认的节点端口、流量账本、TLS 备份、证书复用、页面异步保存、安装器生命周期及媒体清单路由问题。固定镜像为 `ghcr.io/chanhui800/meridian:v1.11.11`，数据库自动迁移到 schema 60。降级前请按发布说明恢复升级前的备份。
 
 升级 Controller 后，已注册 Agent 会通过受认证的配置和清单接口获取匹配版本的下载信息。正式版从固定 GitHub Release 下载，下载请求不携带 Controller 令牌；开发构建使用需要认证的 Controller 二进制接口。
 
@@ -317,6 +317,7 @@ Windows 和 macOS 构建产物目前用于开发和测试；生产部署支持 L
 
 ```bash
 go mod verify
+go build -o meridian ./cmd/meridian
 go test ./...
 go test -race -timeout=20m ./...
 go vet ./...
@@ -333,7 +334,7 @@ CI 另执行漏洞扫描、静态安全检查、安装器回归和 Docker 构建
 
 CodeQL 在上传结果后检查未经审阅的严重和高危告警；正式发布还会核对当前精确提交的主分支扫描结果。已验证的误报和范围明确的例外按具体指纹、保护代码摘要和有效期记录，不能按整条规则忽略。修改相关保护措施后需要重新复核，扫描任务执行成功不等于零告警。
 
-Fuzz 每次针对根包中的单个目标运行，例如：
+Fuzz 每次针对 `cmd/meridian/` 中的单个目标运行。
 
 ```bash
 go test -run '^$' -fuzz '^FuzzNormalizeDynamicURL$' -fuzztime 60s ./cmd/meridian

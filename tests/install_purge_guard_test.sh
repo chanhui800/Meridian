@@ -174,16 +174,20 @@ reset_audit
 DATA_DIR=/srv/meridian-data
 audit_marker_present=1
 do_uninstall >/dev/null
-[ "${#audit_recursive[@]}" -eq 1 ] && [ "${audit_recursive[0]}" = "$DATA_DIR" ] \
-  || { echo 'FAIL: marked dedicated directory was not the sole recursive target' >&2; exit 1; }
+if [ "${#audit_recursive[@]}" -ne 1 ] || [ "${audit_recursive[0]}" != "$DATA_DIR" ]; then
+  echo 'FAIL: marked dedicated directory was not the sole recursive target' >&2
+  exit 1
+fi
 
 reset_audit
 DATA_DIR=/srv/legacy-meridian
 audit_env_present=1
 audit_env_text="JWT_SECRET=synthetic-legacy-jwt-secret-000000000000"$'\n'"PORT=9090"$'\n'"DB_PATH=$DATA_DIR/meridian.db"
 do_uninstall >/dev/null
-[ "${#audit_recursive[@]}" -eq 1 ] && [ "${audit_recursive[0]}" = "$DATA_DIR" ] \
-  || { echo 'FAIL: legitimate legacy native directory was not accepted' >&2; exit 1; }
+if [ "${#audit_recursive[@]}" -ne 1 ] || [ "${audit_recursive[0]}" != "$DATA_DIR" ]; then
+  echo 'FAIL: legitimate legacy native directory was not accepted' >&2
+  exit 1
+fi
 
 reset_audit
 DATA_DIR=/srv/foreign-app
@@ -196,8 +200,10 @@ DATA_DIR=/srv/legacy-external-db
 audit_env_present=1; audit_unit_present=1; audit_systemd=1
 audit_env_text="JWT_SECRET=synthetic-legacy-jwt-secret-000000000000"$'\n'"PORT=9090"$'\n'"DB_PATH=/srv/separate-store/media.sqlite"
 do_uninstall >/dev/null
-[ "${#audit_recursive[@]}" -eq 1 ] && [ "${audit_recursive[0]}" = "$DATA_DIR" ] \
-  || { echo 'FAIL: installer-managed legacy unit did not prove the external-DB data directory' >&2; exit 1; }
+if [ "${#audit_recursive[@]}" -ne 1 ] || [ "${audit_recursive[0]}" != "$DATA_DIR" ]; then
+  echo 'FAIL: installer-managed legacy unit did not prove the external-DB data directory' >&2
+  exit 1
+fi
 [ "$audit_unit_present" -eq 0 ] || { echo 'FAIL: the virtual legacy unit was not removed during uninstall' >&2; exit 1; }
 
 reset_audit
@@ -229,8 +235,10 @@ DATA_DIR=/srv/empty-meridian
 audit_empty_data=1
 validate_data_directory_for_install
 ensure_data_directory_marker
-[ "$audit_marker_creations" -eq 1 ] && [[ "$audit_marker_command" = *'umask 077'* && "$audit_marker_command" = *noclobber* ]] \
-  || { echo 'FAIL: a new data marker was not created exclusively with private permissions' >&2; exit 1; }
+if [ "$audit_marker_creations" -ne 1 ] || [[ "$audit_marker_command" != *'umask 077'* || "$audit_marker_command" != *noclobber* ]]; then
+  echo 'FAIL: a new data marker was not created exclusively with private permissions' >&2
+  exit 1
+fi
 ensure_data_directory_marker
 [ "$audit_marker_creations" -eq 1 ] || { echo 'FAIL: an existing data marker was replaced' >&2; exit 1; }
 
