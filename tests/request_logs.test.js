@@ -43,7 +43,7 @@ test('global log write settings cover every visible request log column', () => {
     ['setting-write-timeline', 'log_write_timeline'],
   ]) {
     assert.match(source, new RegExp(id));
-    assert.match(source, new RegExp(`s\\.${property} = checkedSetting`));
+    assert.match(source, new RegExp(`\\['${property}', '${id}', 'checked'\\]`));
   }
 });
 
@@ -64,7 +64,7 @@ test('global log resource settings cover the complete request taxonomy', () => {
     ['setting-write-auth', 'log_write_auth'],
   ]) {
     assert.match(source, new RegExp(id));
-    assert.match(source, new RegExp(`s\\.${property} = checkedSetting`));
+    assert.match(source, new RegExp(`\\['${property}', '${id}', 'checked'\\]`));
   }
 });
 

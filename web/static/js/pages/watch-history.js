@@ -10,6 +10,8 @@ let watchHistoryDetailSource = 'history';
 let watchHistoryDetailMarkup = '';
 let watchHistoryDetailPreviousFocus = null;
 let watchHistoryImagePreviousFocus = null;
+let watchHistoryImageFocusContext = null;
+let watchHistoryImageViewerState = { items: [], index: 0 };
 let watchHistorySitesCache = [];
 let watchHistoryRenderedItemsSignature = '';
 let watchHistoryRenderedLiveSignature = '';
@@ -140,9 +142,12 @@ function watchHistoryCardImageURL(item) {
   return watchHistoryPosterURL(item) || watchHistoryBackdropURL(item) || watchHistoryStillURLs(item)[0] || '';
 }
 
-// Live playback is presented as a horizontal media moment. Match the detail
-// view's image priority so the card uses a backdrop first, rather than the
-// portrait artwork reserved for library cards.
+function watchHistoryDetailImageURLs(item) {
+  return [...new Set([watchHistoryPosterURL(item), ...watchHistoryBackgroundURLs(item)].filter(Boolean))];
+}
+
+// Live playback keeps horizontal artwork; saved records and details prefer
+// the portrait poster.
 function watchHistoryLiveCardImageURLs(item) {
   return watchHistoryBackgroundURLs(item);
 }
@@ -361,7 +366,8 @@ function watchHistoryDetailsHTML(item) {
   const timeProgress = watchHistoryTimeProgress(item);
   const playMethod = String((item && item.play_method) || '').trim();
   const posterURL = watchHistoryPosterURL(item);
-  const backgroundURLs = watchHistoryBackgroundURLs(item);
+  const backgroundURLs = watchHistoryDetailImageURLs(item);
+  const artworkAlt = posterURL ? '海报' : '背景剧照';
   const genres = watchHistoryGenres(item);
   const releaseDate = watchHistoryDateLabel(item && item.release_date) || (year > 1800 ? String(year) : '');
   const rating = Number(item && item.vote_average);
@@ -380,8 +386,8 @@ function watchHistoryDetailsHTML(item) {
     : posterURL
       ? `<div class="watch-history-detail-stills watch-history-detail-stills-fallback"><button type="button" class="watch-history-detail-still" data-watch-history-image="${esc(posterURL)}" data-watch-history-image-alt="海报" aria-label="放大查看海报"><img src="${esc(posterURL)}" alt="海报" loading="lazy" decoding="async"></button></div>`
       : '<p class="watch-history-detail-muted">暂无剧照或海报，等待 TMDB 资料补全。</p>';
-  return `<div class="watch-history-detail-shell history-detail-shell${backgroundURLs.length ? ' has-art' : ''}">
-    ${backgroundURLs.length ? `<div class="watch-history-detail-background history-detail-art" data-watch-history-image="${esc(backgroundURLs[0])}" data-watch-history-image-alt="背景剧照" role="button" tabindex="0" aria-label="放大查看背景剧照"><img src="${esc(backgroundURLs[0])}" data-watch-history-background-fallbacks="${esc(JSON.stringify(backgroundURLs.slice(1)))}" alt=""><span>查看大图</span></div>` : ''}
+  return `<div class="watch-history-detail-shell history-detail-shell${backgroundURLs.length ? ' has-art' : ''}" data-watch-history-detail-item-id="${esc(String(item && item.id || ''))}" data-watch-history-detail-media-id="${esc(String(item && item.media_item_id || ''))}">
+    ${backgroundURLs.length ? `<div class="watch-history-detail-background history-detail-art${posterURL ? ' is-poster' : ''}" data-watch-history-image="${esc(backgroundURLs[0])}" data-watch-history-image-alt="${artworkAlt}" role="button" tabindex="0" aria-label="放大查看${artworkAlt}"><img src="${esc(backgroundURLs[0])}" data-watch-history-background-fallbacks="${esc(JSON.stringify(backgroundURLs.slice(1)))}" alt=""><span>查看大图</span></div>` : ''}
     <div class="watch-history-detail-layout">
       <div class="watch-history-detail-main">
       <div class="watch-history-detail-heading"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><h2 id="watch-history-detail-title">${esc(title)}</h2></div>
@@ -415,7 +421,7 @@ function watchHistoryOpenDetails(index, source = 'history') {
   watchHistoryBindDetailImages(content);
   modal.hidden = false;
   document.body.classList.add('watch-history-dialog-open');
-  const close = modal.querySelector('[data-watch-history-close]');
+  const close = modal.querySelector('button[data-watch-history-close]') || modal.querySelector('[role="dialog"]');
   if (close) close.focus();
 }
 
@@ -435,22 +441,128 @@ function watchHistoryCloseDetails() {
   watchHistoryDetailPreviousFocus = null;
 }
 
-function watchHistoryOpenImageViewer(source, alt) {
-  const modal = document.getElementById('watch-history-image-modal');
+function watchHistoryEnsureImageViewer() {
+  let modal = document.getElementById('watch-history-image-modal');
+  if (!modal) {
+    document.body.insertAdjacentHTML('beforeend', `<div class="watch-history-image-modal" id="watch-history-image-modal" hidden>
+      <div class="watch-history-image-backdrop" data-watch-history-image-close></div>
+      <div class="watch-history-image-dialog" role="dialog" aria-modal="true" aria-labelledby="watch-history-image-viewer-title" tabindex="-1">
+        <button type="button" class="watch-history-image-close" data-watch-history-image-close aria-label="关闭图片预览">×</button><h2 id="watch-history-image-viewer-title" class="sr-only">图片预览</h2>
+        <div class="watch-history-image-stage">
+          <button type="button" class="watch-history-image-nav watch-history-image-prev" id="watch-history-image-prev" aria-label="上一张剧照" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg></button>
+          <img id="watch-history-image-viewer-image" alt="" decoding="async">
+          <button type="button" class="watch-history-image-nav watch-history-image-next" id="watch-history-image-next" aria-label="下一张剧照" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg></button>
+          <span class="watch-history-image-counter" id="watch-history-image-counter" role="status" aria-live="polite" aria-atomic="true" hidden></span>
+        </div>
+      </div>
+    </div>`);
+    modal = document.getElementById('watch-history-image-modal');
+  }
+  if (!modal) return null;
+  if (modal.parentElement !== document.body) document.body.appendChild(modal);
+  if (!modal.watchHistoryImageBound) {
+    modal.querySelectorAll('[data-watch-history-image-close]').forEach(control => {
+      control.addEventListener('click', watchHistoryCloseImageViewer);
+    });
+    [['watch-history-image-prev', -1], ['watch-history-image-next', 1]].forEach(([id, step]) => {
+      document.getElementById(id)?.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        watchHistoryStepImageViewer(step);
+      });
+    });
+    modal.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        watchHistoryCloseImageViewer();
+      } else if (event.key === 'Tab') {
+        event.stopPropagation();
+        watchHistoryTrapDialogFocus(event);
+      } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        event.stopPropagation();
+        watchHistoryStepImageViewer(event.key === 'ArrowLeft' ? -1 : 1);
+      }
+    });
+    modal.watchHistoryImageBound = true;
+  }
+  return modal;
+}
+
+function watchHistoryImageFocusSnapshot(trigger, root) {
+  const scope = root || trigger?.closest?.('#watch-history-detail-content, #modal-body');
+  if (!scope) return null;
+  const shell = trigger?.closest?.('.watch-history-detail-shell') || scope.querySelector?.('.watch-history-detail-shell');
+  return {
+    root: scope,
+    itemID: shell?.getAttribute?.('data-watch-history-detail-item-id'),
+    mediaID: shell?.getAttribute?.('data-watch-history-detail-media-id'),
+    src: trigger?.getAttribute?.('data-watch-history-image'),
+    alt: trigger?.getAttribute?.('data-watch-history-image-alt'),
+    close: scope.closest?.('[role="dialog"], .modal')?.querySelector?.('[data-watch-history-close], .modal-close'),
+  };
+}
+
+function watchHistoryRenderImageViewer() {
+  const { items, index } = watchHistoryImageViewerState;
   const image = document.getElementById('watch-history-image-viewer-image');
-  if (!modal || !image || !String(source || '').trim()) return;
+  const current = items[index];
+  if (image && current) {
+    image.src = current.src;
+    image.alt = current.alt;
+  }
+  const multiple = items.length > 1;
+  document.getElementById('watch-history-image-modal')?.querySelector?.('.watch-history-image-stage')?.classList?.toggle?.('has-gallery', multiple);
+  ['watch-history-image-prev', 'watch-history-image-next', 'watch-history-image-counter'].forEach(id => {
+    const control = document.getElementById(id);
+    if (control) control.hidden = !multiple;
+  });
+  const counter = document.getElementById('watch-history-image-counter');
+  if (counter) counter.textContent = multiple ? `${index + 1} / ${items.length}` : '';
+}
+
+function watchHistoryStepImageViewer(step) {
+  const modal = document.getElementById('watch-history-image-modal');
+  const delta = Number(step);
+  const count = watchHistoryImageViewerState.items.length;
+  if (!modal || modal.hidden || count < 2 || (delta !== -1 && delta !== 1)) return false;
+  watchHistoryImageViewerState.index = (watchHistoryImageViewerState.index + delta + count) % count;
+  watchHistoryRenderImageViewer();
+  return true;
+}
+
+function watchHistoryOpenImageViewer(source, alt, gallery = []) {
+  const selected = { src: String(source || '').trim(), alt: String(alt || '放大图片') };
+  if (!selected.src) return;
+  const modal = watchHistoryEnsureImageViewer();
+  const image = document.getElementById('watch-history-image-viewer-image');
+  if (!modal || !image) return;
+  const items = Array.isArray(gallery) ? gallery.slice(0, 12).map(item => ({
+    src: String(item && item.src || '').trim(),
+    alt: String(item && item.alt || '放大图片'),
+  })).filter(item => item.src) : [];
+  let index = items.findIndex(item => item.src === selected.src && item.alt === selected.alt);
+  if (index < 0) index = items.findIndex(item => item.src === selected.src);
+  watchHistoryImageViewerState = index < 0 ? { items: [selected], index: 0 } : { items, index };
   watchHistoryImagePreviousFocus = document.activeElement;
-  image.src = String(source);
-  image.alt = String(alt || '放大图片');
+  watchHistoryImageFocusContext = watchHistoryImageFocusSnapshot(watchHistoryImagePreviousFocus);
+  watchHistoryRenderImageViewer();
   modal.hidden = false;
   document.body.classList.add('watch-history-image-open');
-  const close = modal.querySelector('[data-watch-history-image-close]');
+  const close = modal.querySelector('button[data-watch-history-image-close]') || modal.querySelector('[role="dialog"]');
   if (close) close.focus();
 }
 
-function watchHistoryCloseImageViewer() {
+function watchHistoryCloseImageViewer(options = {}) {
   const modal = document.getElementById('watch-history-image-modal');
-  if (!modal || modal.hidden) return false;
+  watchHistoryImageViewerState = { items: [], index: 0 };
+  watchHistoryRenderImageViewer();
+  if (!modal || modal.hidden) {
+    watchHistoryImagePreviousFocus = null;
+    watchHistoryImageFocusContext = null;
+    return false;
+  }
   modal.hidden = true;
   document.body.classList.remove('watch-history-image-open');
   const image = document.getElementById('watch-history-image-viewer-image');
@@ -458,10 +570,24 @@ function watchHistoryCloseImageViewer() {
     image.removeAttribute('src');
     image.alt = '';
   }
-  if (typeof Router !== 'undefined' && Router.current === 'watch-history' && watchHistoryImagePreviousFocus?.isConnected) {
-    watchHistoryImagePreviousFocus.focus({ preventScroll: true });
+  if (options.restoreFocus !== false) {
+    let target = watchHistoryImagePreviousFocus?.isConnected && !watchHistoryImagePreviousFocus.hidden && watchHistoryImagePreviousFocus.offsetParent !== null ? watchHistoryImagePreviousFocus : null;
+    const context = watchHistoryImageFocusContext;
+    if (!target && context?.root?.isConnected !== false) {
+      const shell = context?.root?.querySelector?.('.watch-history-detail-shell');
+      const sameRecord = context && (!context.itemID && !context.mediaID ||
+        shell?.getAttribute?.('data-watch-history-detail-item-id') === context.itemID &&
+        shell?.getAttribute?.('data-watch-history-detail-media-id') === context.mediaID);
+      if (sameRecord) {
+        target = Array.from(context.root.querySelectorAll?.('[data-watch-history-image]') || []).find(control =>
+          !control.hidden && control.offsetParent !== null && control.getAttribute('data-watch-history-image') === context.src && control.getAttribute('data-watch-history-image-alt') === context.alt);
+      }
+    }
+    if (!target && context?.close?.isConnected !== false && !context?.close?.hidden && context?.close?.offsetParent !== null) target = context?.close;
+    target?.focus?.({ preventScroll: true });
   }
   watchHistoryImagePreviousFocus = null;
+  watchHistoryImageFocusContext = null;
   return true;
 }
 
@@ -529,6 +655,13 @@ function watchHistoryBindDetailImages(root) {
       if (next) {
         image.setAttribute('data-watch-history-background-fallbacks', JSON.stringify(fallbacks));
         image.src = next;
+        const trigger = image.closest('[data-watch-history-image]');
+        if (trigger) {
+          trigger.setAttribute('data-watch-history-image', next);
+          trigger.setAttribute('data-watch-history-image-alt', '背景剧照');
+          trigger.setAttribute('aria-label', '放大查看背景剧照');
+          trigger.classList.remove('is-poster');
+        }
       } else {
         image.remove();
       }
@@ -536,14 +669,23 @@ function watchHistoryBindDetailImages(root) {
   });
   root.querySelectorAll('[data-watch-history-image]').forEach(trigger => {
     const open = event => {
-      if (event) event.stopPropagation();
-      watchHistoryOpenImageViewer(trigger.getAttribute('data-watch-history-image'), trigger.getAttribute('data-watch-history-image-alt'));
+      event?.stopPropagation?.();
+      const list = trigger.closest?.('.watch-history-detail-stills:not(.watch-history-detail-stills-fallback)');
+      const gallery = list && root.contains?.(list) !== false
+        ? Array.from(list.querySelectorAll('[data-watch-history-image]')).filter(control => !control.hidden).slice(0, 12).map(control => ({
+          src: control.getAttribute('data-watch-history-image'), alt: control.getAttribute('data-watch-history-image-alt'),
+        })) : [];
+      watchHistoryOpenImageViewer(trigger.getAttribute('data-watch-history-image'), trigger.getAttribute('data-watch-history-image-alt'), gallery);
+      if (watchHistoryImageViewerState.items.length) {
+        watchHistoryImagePreviousFocus = trigger;
+        watchHistoryImageFocusContext = watchHistoryImageFocusSnapshot(trigger, root);
+      }
     };
     trigger.addEventListener('click', open);
     trigger.addEventListener('keydown', event => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
-        open();
+        open(event);
       }
     });
   });
@@ -789,7 +931,7 @@ function watchHistoryItemsRenderSignature(items, context = '') {
     item && item.media_item_id, item && item.upstream_item_id,
     item && item.media_type, item && item.title, item && item.series_name,
     item && item.last_seen_at_ms, item && item.position_ticks, item && item.runtime_ticks,
-    item && item.completed, item && item.poster_path, item && item.backdrop_path,
+    item && item.completed, item && item.poster_available, item && item.poster_path, item && item.backdrop_path, item && item.stills,
     item && item.match_status, item && item.user_name, item && item.client_name,
     item && item.stopped_at_ms, item && item.client_stop_requested_at_ms, item && item.client_stop_outcome,
   ])]);
@@ -1078,14 +1220,9 @@ function renderWatchHistory() {
         <button type="button" class="watch-history-detail-close" data-watch-history-close aria-label="关闭详情">×</button><div id="watch-history-detail-content"></div>
       </div>
     </div>
-    <div class="watch-history-image-modal" id="watch-history-image-modal" hidden>
-      <div class="watch-history-image-backdrop" data-watch-history-image-close></div>
-      <div class="watch-history-image-dialog" role="dialog" aria-modal="true" aria-labelledby="watch-history-image-viewer-title" tabindex="-1">
-        <button type="button" class="watch-history-image-close" data-watch-history-image-close aria-label="关闭图片预览">×</button><h2 id="watch-history-image-viewer-title" class="sr-only">图片预览</h2><img id="watch-history-image-viewer-image" alt="" decoding="async">
-      </div>
-    </div>
     <footer class="watch-history-attribution">This product uses the TMDB API but is not endorsed or certified by TMDB. <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">了解 TMDB</a></footer>
   </div>`;
+  watchHistoryEnsureImageViewer();
 
   const siteSelect = document.getElementById('watch-history-site');
   const typeSelect = document.getElementById('watch-history-type');
@@ -1110,9 +1247,6 @@ function renderWatchHistory() {
   document.getElementById('watch-history-more').onclick = () => loadWatchHistory(false);
   document.querySelectorAll('[data-watch-history-close]').forEach(element => {
     element.addEventListener('click', watchHistoryCloseDetails);
-  });
-  document.querySelectorAll('[data-watch-history-image-close]').forEach(element => {
-    element.addEventListener('click', watchHistoryCloseImageViewer);
   });
   watchHistoryKeydownHandler = event => {
     if (event.key === 'Escape' && !watchHistoryCloseImageViewer()) watchHistoryCloseDetails();

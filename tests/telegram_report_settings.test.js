@@ -86,10 +86,7 @@ test('telegram settings page renders the threshold control and hydrates it', () 
   assert.match(SOURCE, /type="number"[^>]*id="telegram-traffic-warning"/);
   assert.match(SOURCE, /min="0" max="100"/);
   assert.match(SOURCE, /流量预警阈值/);
-  assert.match(
-    SOURCE,
-    /getElementById\('telegram-traffic-warning'\)\.value =\s*Number\.isInteger\(settings\.traffic_warning_percent\) \? String\(settings\.traffic_warning_percent\) : '80'/,
-  );
+  assert.match(SOURCE, /preserveIfEdited\('traffic_warning_percent',[\s\S]*?Number\.isInteger\(settings\.traffic_warning_percent\) \? String\(settings\.traffic_warning_percent\) : '80'/);
   // The field must sit in the same form grid as the schedule controls rather
   // than floating outside it, which would break the two-column rhythm.
   assert.match(SOURCE, /telegram-field[\s\S]*?id="telegram-traffic-warning"[\s\S]*?telegram-report-actions/);

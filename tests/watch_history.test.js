@@ -169,9 +169,9 @@ test('watch history card escapes media data and never interpolates a remote post
   assert.doesNotMatch(html, /12:34 \/ 1:00:00/);
 });
 
-test('live watch cards match the detail view by preferring a horizontal backdrop', () => {
+test('live watch cards keep a horizontal backdrop while details prefer the portrait poster', () => {
   const sandbox = loadWatchHistoryHelpers();
-  const html = sandbox.watchHistoryCardHTML({
+  const item = {
     id: 2,
     media_item_id: 8,
     poster_available: true,
@@ -180,11 +180,260 @@ test('live watch cards match the detail view by preferring a horizontal backdrop
     stills: ['/still.jpg'],
     title: '正在播放',
     media_type: 'movie',
-  }, 0, { source: 'live', live: true });
+  };
+  const html = sandbox.watchHistoryCardHTML(item, 0, { source: 'live', live: true });
 
   assert.match(html, /src="\/api\/watch-history\/backdrops\/8"/);
   assert.match(html, /data-watch-history-card-fallbacks=/);
   assert.match(html, /watch-history-live-badge/);
+  assert.deepEqual(Array.from(sandbox.watchHistoryDetailImageURLs(item)), [
+    '/api/watch-history/posters/8', '/api/watch-history/backdrops/8', '/api/watch-history/stills/8/0',
+  ]);
+  const detail = sandbox.watchHistoryDetailsHTML(item);
+  assert.match(detail, /history-detail-art is-poster" data-watch-history-image="\/api\/watch-history\/posters\/8"/);
+  assert.match(detail, /data-watch-history-image-alt="海报" role="button" tabindex="0" aria-label="放大查看海报"/);
+  assert.doesNotMatch(detail, /(?:src|data-watch-history-image)="(?:\/portrait\.jpg|\/landscape\.jpg|\/still\.jpg)"/);
+});
+
+test('details fall back to a same-origin backdrop or still when no portrait poster exists', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const item = { media_item_id: 8, title: '海报缺失', backdrop_path: '/landscape.jpg', stills: ['/still.jpg'] };
+  assert.deepEqual(Array.from(sandbox.watchHistoryDetailImageURLs(item)), [
+    '/api/watch-history/backdrops/8', '/api/watch-history/stills/8/0',
+  ]);
+  const backdrop = sandbox.watchHistoryDetailsHTML(item);
+  assert.match(backdrop, /history-detail-art" data-watch-history-image="\/api\/watch-history\/backdrops\/8"/);
+  assert.match(backdrop, /data-watch-history-image-alt="背景剧照" role="button" tabindex="0" aria-label="放大查看背景剧照"/);
+  assert.doesNotMatch(backdrop, /history-detail-art is-poster/);
+  const still = sandbox.watchHistoryDetailsHTML({ ...item, backdrop_path: '' });
+  assert.match(still, /history-detail-art" data-watch-history-image="\/api\/watch-history\/stills\/8\/0"/);
+  for (const unavailable of [{ title: '暂无图片' }, { ...item, media_item_id: '../../unsafe', poster_available: true }]) {
+    assert.deepEqual(Array.from(sandbox.watchHistoryDetailImageURLs(unavailable)), []);
+    assert.doesNotMatch(sandbox.watchHistoryDetailsHTML(unavailable), /history-detail-art| has-art/);
+  }
+});
+
+test('a failed detail poster updates its backdrop and still preview targets for mouse and keyboard', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const imageAttributes = new Map([
+    ['data-watch-history-background-fallbacks', JSON.stringify(['/api/watch-history/backdrops/8', '/api/watch-history/stills/8/0'])],
+  ]);
+  const triggerAttributes = new Map([
+    ['data-watch-history-image', '/api/watch-history/posters/8'],
+    ['data-watch-history-image-alt', '海报'],
+    ['aria-label', '放大查看海报'],
+  ]);
+  const classes = new Set(['history-detail-art', 'is-poster']);
+  const events = {};
+  const trigger = {
+    getAttribute: name => triggerAttributes.get(name),
+    setAttribute: (name, value) => triggerAttributes.set(name, value),
+    classList: { remove: name => classes.delete(name) },
+    addEventListener: (name, handler) => { events[name] = handler; },
+  };
+  let onError, removed = false;
+  const image = {
+    src: '/api/watch-history/posters/8',
+    getAttribute: name => imageAttributes.get(name),
+    setAttribute: (name, value) => imageAttributes.set(name, value),
+    closest: selector => selector === '[data-watch-history-image]' ? trigger : null,
+    addEventListener: (name, handler) => { if (name === 'error') onError = handler; },
+    remove: () => { removed = true; },
+  };
+  const root = {
+    querySelectorAll(selector) {
+      if (selector === '[data-watch-history-background-fallbacks]') return [image];
+      if (selector === '[data-watch-history-image]') return [trigger];
+      return [];
+    },
+  };
+  const previews = [];
+  sandbox.watchHistoryOpenImageViewer = (url, alt) => previews.push([url, alt]);
+  sandbox.watchHistoryBindDetailImages(root);
+
+  onError();
+  assert.equal(image.src, '/api/watch-history/backdrops/8');
+  assert.equal(triggerAttributes.get('data-watch-history-image'), image.src);
+  assert.equal(triggerAttributes.get('data-watch-history-image-alt'), '背景剧照');
+  assert.equal(triggerAttributes.get('aria-label'), '放大查看背景剧照');
+  assert.equal(classes.has('is-poster'), false);
+  events.click({ stopPropagation() {} });
+  assert.deepEqual(previews[0], ['/api/watch-history/backdrops/8', '背景剧照']);
+
+  onError();
+  assert.equal(image.src, '/api/watch-history/stills/8/0');
+  assert.equal(triggerAttributes.get('data-watch-history-image'), image.src);
+  let prevented = false;
+  events.keydown({ key: 'Enter', preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.deepEqual(previews[1], ['/api/watch-history/stills/8/0', '背景剧照']);
+  assert.deepEqual(JSON.parse(imageAttributes.get('data-watch-history-background-fallbacks')), []);
+  onError();
+  assert.equal(removed, true);
+});
+
+test('history posters reserve larger portrait dimensions and shared detail artwork has no fading mask', () => {
+  const css = source('web/static/css/history-console.css');
+  assert.match(css, /\.watch-history-card\s*\{[^}]*grid-template-columns:\s*96px minmax\(0, 1fr\)/);
+  assert.match(css, /\.watch-history-poster\s*\{[^}]*width:\s*96px;[^}]*height:\s*144px;[^}]*aspect-ratio:\s*2\s*\/\s*3/);
+  assert.match(css, /\.watch-history-poster img\s*\{[^}]*object-fit:\s*contain/);
+  assert.match(css, /\.watch-history-card\.is-live \.watch-history-poster img\s*\{[^}]*object-fit:\s*cover/);
+  assert.match(css, /@media \(max-width: 1024px\)[\s\S]*?\.watch-history-poster\s*\{[^}]*width:\s*84px;[^}]*height:\s*126px/);
+  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?grid-template-columns:\s*72px minmax\(0, 1fr\) 44px/);
+  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.watch-history-card\.is-live \.watch-history-poster\s*\{[^}]*width:\s*72px;[^}]*height:\s*108px/);
+  assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.watch-history-card\.is-live \.watch-history-poster\s*\{\s*height:\s*48px/);
+  const sharedDetails = /body\.console-shell :is\(#page-watch-history \.history-console, #modal\.site-live-modal\)/;
+  assert.match(css, sharedDetails);
+  assert.match(css, /\.history-detail-art\.is-poster\s*\{[^}]*height:\s*auto;[^}]*aspect-ratio:\s*2\s*\/\s*3/);
+  assert.match(css, /\.history-detail-art::after\s*\{\s*content:\s*none/);
+  assert.match(css, /\.history-detail-art img\s*\{[^}]*object-fit:\s*contain;[^}]*opacity:\s*1;[^}]*-webkit-mask-image:\s*none;[^}]*mask-image:\s*none/);
+  assert.match(css, /#modal\.site-live-modal \.modal-header\s*\{[^}]*position:\s*relative;[^}]*background:\s*var\(--console-surface\)/);
+});
+
+test('details render all returned stills with stable same-origin indices up to twelve', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const item = { media_item_id: 8, title: '多张剧照', stills: Array.from({ length: 6 }, (_, index) => `/still-${index}.jpg`) };
+  const html = sandbox.watchHistoryDetailsHTML(item);
+  const gallery = [...html.matchAll(/class="watch-history-detail-still" data-watch-history-image="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(gallery, Array.from({ length: 6 }, (_, index) => `/api/watch-history/stills/8/${index}`));
+  for (let index = 0; index < 6; index += 1) assert.ok(html.includes(`aria-label="放大查看剧照 ${index + 1}"`));
+  const many = { ...item, stills: Array.from({ length: 14 }, (_, index) => `/still-${index}.jpg`) };
+  assert.equal(sandbox.watchHistoryStillURLs(many).length, 12);
+  assert.equal(sandbox.watchHistoryStillURLs(many)[11], '/api/watch-history/stills/8/11');
+  const missing = { ...item, stills: ['/first.jpg', '', '/third.jpg'] };
+  assert.deepEqual(Array.from(sandbox.watchHistoryStillURLs(missing)), ['/api/watch-history/stills/8/0', '/api/watch-history/stills/8/2']);
+});
+
+test('late poster availability and still enrichment repaint history and live cards without repeating unchanged renders', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  function makeGrid() {
+    let html = '', writes = 0;
+    const grid = { setAttribute() {}, querySelectorAll() { return []; } };
+    Object.defineProperty(grid, 'innerHTML', { get: () => html, set(value) { html = String(value); writes += 1; } });
+    return { grid, writes: () => writes };
+  }
+  const history = makeGrid(), live = makeGrid();
+  const elements = {
+    'watch-history-grid': history.grid, 'watch-history-status': {}, 'watch-history-more': {},
+    'watch-history-live-grid': live.grid, 'watch-history-live-section': {},
+    'watch-history-live-count': {}, 'watch-history-live-description': {},
+  };
+  sandbox.document = { getElementById: id => elements[id] || null };
+  const base = { id: 1, site_id: 2, media_item_id: 8, title: '渐进补图', last_seen_at_ms: 1795212345000 };
+  for (const [index, item] of [base, { ...base, stills: ['/still.jpg'] }, { ...base, stills: ['/still.jpg'], poster_available: true }].entries()) {
+    sandbox.enrichedItem = item;
+    vm.runInContext('watchHistoryState.items = [enrichedItem]; watchHistoryState.liveItems = [enrichedItem];', sandbox);
+    sandbox.watchHistoryRenderItems(undefined, { background: true });
+    sandbox.watchHistoryRenderLive();
+    assert.equal(history.writes(), index + 1);
+    assert.equal(live.writes(), index + 1);
+    if (index === 0) assert.doesNotMatch(history.grid.innerHTML, /<img/);
+    if (index === 1) assert.match(history.grid.innerHTML, /src="\/api\/watch-history\/stills\/8\/0"/);
+    if (index === 2) assert.match(history.grid.innerHTML, /src="\/api\/watch-history\/posters\/8"/);
+    sandbox.watchHistoryRenderItems(undefined, { background: true });
+    sandbox.watchHistoryRenderLive();
+    assert.equal(history.writes(), index + 1, 'an unchanged background response must preserve history DOM');
+    assert.equal(live.writes(), index + 1, 'an unchanged background response must preserve live DOM');
+  }
+});
+
+test('a first site detail opens one body-level image viewer and restores its own focus on close', async () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const bodyClasses = new Set(), overlayClasses = new Set(), modalClasses = new Set();
+  const classList = values => ({ add: value => values.add(value), remove: value => values.delete(value), contains: value => values.has(value) });
+  const elements = {};
+  let document, artwork, creations = 0, moves = 0;
+  const siteClose = { isConnected: true, focus() { document.activeElement = siteClose; } };
+  const siteButton = { isConnected: true, textContent: '正在播放', dataset: {}, focus() { document.activeElement = siteButton; } };
+  const modalBody = {
+    scrollTop: 0,
+    querySelectorAll(selector) { return selector === '[data-watch-history-image]' ? [artwork] : []; },
+  };
+  Object.defineProperty(modalBody, 'innerHTML', { set(markup) {
+    const match = String(markup).match(/data-watch-history-image="([^"]+)" data-watch-history-image-alt="([^"]+)"/);
+    assert.ok(match, 'the real site detail must expose its poster preview control');
+    const events = {};
+    artwork = { isConnected: true, events, getAttribute: name => name === 'data-watch-history-image' ? match[1] : match[2], addEventListener(name, handler) { events[name] = handler; }, focus() { document.activeElement = artwork; } };
+  } });
+  const overlay = { classList: classList(overlayClasses) };
+  const siteModal = { classList: classList(modalClasses) };
+  Object.assign(elements, { 'modal': siteModal, 'modal-overlay': overlay, 'modal-body': modalBody, 'modal-title': {}, 'modal-footer': {} });
+  const body = {
+    classList: classList(bodyClasses),
+    appendChild(node) { moves += 1; node.parentElement = body; },
+    insertAdjacentHTML(position, markup) {
+      assert.equal(position, 'beforeend');
+      assert.match(markup, /id="watch-history-image-modal"/);
+      creations += 1;
+      const closeEvents = [], modalEvents = [];
+      const close = { isConnected: true, hidden: false, offsetParent: {}, addEventListener(name, handler) { closeEvents.push([name, handler]); }, focus() { document.activeElement = close; } };
+      const backdrop = { addEventListener() {} };
+      const dialog = { querySelectorAll() { return [close]; }, contains: target => target === close };
+      const image = { src: '', alt: '', removeAttribute(name) { if (name === 'src') this.src = ''; } };
+      const viewer = {
+        hidden: true, parentElement: body, close, closeEvents, modalEvents,
+        querySelector: selector => selector === '[role="dialog"]' ? dialog : close,
+        querySelectorAll: () => [close, backdrop],
+        addEventListener(name, handler) { modalEvents.push([name, handler]); },
+      };
+      elements['watch-history-image-modal'] = viewer;
+      elements['watch-history-image-viewer-image'] = image;
+    },
+  };
+  document = { body, activeElement: siteButton, getElementById: id => elements[id] || null };
+  sandbox.document = document;
+  sandbox.window = { clearTimeout() {} };
+  sandbox.Router = { current: 'sites' };
+  sandbox.beginModalIntent = () => ({});
+  sandbox.isModalIntentCurrent = () => true;
+  sandbox.invalidateModalIntent = () => true;
+  sandbox.Toast = { error(message) { assert.fail(message); } };
+  sandbox.openModal = options => { modalClasses.add(options.modalClass); overlayClasses.add('active'); siteClose.focus(); };
+  sandbox.closeModal = () => overlayClasses.delete('active');
+  sandbox.API.getActiveWatchHistory = async () => ({ items: [{ id: 1, site_id: 2, media_item_id: 8, title: '站点海报', poster_available: true }] });
+  vm.runInContext(source('web/static/js/pages/sites.js'), sandbox, { filename: 'sites.js' });
+
+  await sandbox.showSiteLiveDetails({ id: 2, name: '测试站点' }, siteButton);
+  assert.equal(elements['watch-history-image-modal'], undefined, 'opening a site detail must not require visiting history');
+  artwork.focus();
+  artwork.events.click({ stopPropagation() {} });
+  const viewer = elements['watch-history-image-modal'];
+  assert.equal(creations, 1);
+  assert.equal(viewer.parentElement, body);
+  assert.equal(viewer.hidden, false);
+  assert.equal(elements['watch-history-image-viewer-image'].src, '/api/watch-history/posters/8');
+  assert.equal(elements['watch-history-image-viewer-image'].alt, '海报');
+  assert.equal(document.activeElement, viewer.close);
+  assert.equal(overlayClasses.has('active'), true);
+  let prevented = 0, stopped = 0;
+  const keydown = viewer.modalEvents.find(([name]) => name === 'keydown')[1];
+  keydown({ key: 'Tab', shiftKey: false, preventDefault() { prevented += 1; }, stopPropagation() { stopped += 1; } });
+  assert.equal(document.activeElement, viewer.close);
+  keydown({ key: 'Escape', preventDefault() { prevented += 1; }, stopPropagation() { stopped += 1; } });
+  assert.equal(prevented, 2);
+  assert.equal(stopped, 2, 'viewer keys must not close or focus the underlying site dialog');
+  assert.equal(viewer.hidden, true);
+  assert.equal(overlayClasses.has('active'), true);
+  assert.equal(document.activeElement, artwork);
+  assert.equal(bodyClasses.has('watch-history-image-open'), false);
+
+  viewer.parentElement = { hidden: true };
+  for (let index = 0; index < 3; index += 1) {
+    artwork.focus(); artwork.events.click({ stopPropagation() {} });
+    assert.equal(viewer.parentElement, body, 'a viewer left in a hidden history page must be moved to the body');
+    viewer.closeEvents[0][1]();
+    assert.equal(document.activeElement, artwork);
+  }
+  assert.equal(creations, 1, 'repeated opens must reuse one viewer ID');
+  assert.equal(moves, 1);
+  assert.equal(viewer.closeEvents.length, 1, 'repeated opens must not add close handlers');
+  assert.equal(viewer.modalEvents.length, 1, 'repeated opens must not add key handlers');
+  artwork.focus(); artwork.events.click({ stopPropagation() {} });
+  document.activeElement = siteButton;
+  sandbox.stopSitesRefresh();
+  assert.equal(viewer.hidden, true);
+  assert.equal(document.activeElement, siteButton, 'route teardown must not restore focus into the old site dialog');
+  assert.equal(bodyClasses.has('watch-history-image-open'), false);
 });
 
 test('generic history and live cards identify server authorities while keeping artwork same-origin', () => {

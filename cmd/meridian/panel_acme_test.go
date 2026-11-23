@@ -1,0 +1,590 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestPanelACMETokenEncryptionRoundTripAndIsolation(t *testing.T) {
+	secret := bytes.Repeat([]byte("a"), 32)
+	otherSecret := bytes.Repeat([]byte("b"), 32)
+	token := "cloudflare-token-for-automatic-renewal"
+	ciphertext, err := encryptPanelACMETokenWithSecret(token, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := decryptPanelACMETokenWithSecret(ciphertext, secret)
+	if err != nil || plain != token {
+		t.Fatalf("round trip = %q, %v", plain, err)
+	}
+	if _, err := decryptPanelACMETokenWithSecret(ciphertext, otherSecret); err == nil {
+		t.Fatal("ciphertext decrypted with a different JWT secret")
+	}
+	tamperIndex := len(panelACMETokenCipherPrefix) + 1
+	replacement := byte('A')
+	if ciphertext[tamperIndex] == replacement {
+		replacement = 'B'
+	}
+	tampered := ciphertext[:tamperIndex] + string(replacement) + ciphertext[tamperIndex+1:]
+	if _, err := decryptPanelACMETokenWithSecret(tampered, secret); err == nil {
+		t.Fatal("tampered ciphertext was accepted")
+	}
+}
+
+func TestCertificateRenewalWindow(t *testing.T) {
+	base := panelCertificateStatus{Configured: true, CertificateCurrent: false, CertificateMatchesConfiguredDomain: true, CertificateMatchesRouteWildcard: true, CertificateValid: true}
+	base.DaysRemaining = 31
+	if certificateNeedsRenewal(base) || !certificateCanBeReused(base) {
+		t.Fatal("certificate with 31 days remaining should be reused")
+	}
+	base.DaysRemaining = 30
+	if !certificateNeedsRenewal(base) || certificateCanBeReused(base) {
+		t.Fatal("certificate with 30 days remaining should be renewed")
+	}
+	base.CertificateValid = false
+	base.DaysRemaining = 90
+	if !certificateNeedsRenewal(base) {
+		t.Fatal("expired certificate should be renewed regardless of days remaining")
+	}
+	base.CertificateValid = true
+	base.CertificateMatchesConfiguredDomain = false
+	base.DaysRemaining = 90
+	if certificateCanBeReused(base) || !certificateNeedsRenewal(base) {
+		t.Fatal("certificate for a different configured domain must not be reused")
+	}
+	base.CertificateMatchesConfiguredDomain = true
+	base.CertificateMatchesRouteWildcard = false
+	if certificateCanBeReused(base) || !certificateNeedsRenewal(base) {
+		t.Fatal("certificate without route wildcard coverage must not be reused")
+	}
+}
+
+func testTrustedPanelCertificateChain(t *testing.T) ([]byte, []byte, *x509.CertPool) {
+	t.Helper()
+	now := time.Now()
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(401), Subject: pkix.Name{CommonName: "Meridian test root"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(48 * time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCert, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(402), Subject: pkix.Name{CommonName: "*.example.test"},
+		DNSNames: []string{"*.example.test"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(365 * 24 * time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, rootCert, &leafKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})...)
+	roots := x509.NewCertPool()
+	roots.AddCert(rootCert)
+	return chain, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), roots
+}
+
+func TestPanelCertificateReuseRequiresTrustedChain(t *testing.T) {
+	certPEM, keyPEM, roots := testTrustedPanelCertificateChain(t)
+	root := t.TempDir()
+	certFile, keyFile := filepath.Join(root, "fullchain.pem"), filepath.Join(root, "privkey.pem")
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &panelCertificateManager{certFile: certFile, keyFile: keyFile}
+	if reused := manager.reusableCertificateForIdentifiers([]string{"*.example.test"}); reused != nil {
+		t.Fatal("a certificate chained to a non-system test root must not be reused as production")
+	}
+	if err := verifyCertificateChainPEMForHost(certPEM, "meridian-edge-check.example.test", roots); err != nil {
+		t.Fatalf("the matching trusted chain should validate: %v", err)
+	}
+	if err := verifyCertificateChainPEMForHost(certPEM, "unrelated.other.test", roots); err == nil {
+		t.Fatal("the chain validator accepted a host outside the certificate SAN")
+	}
+}
+
+func TestPanelCertificateStatusWarnsWhenPanelIsCoveredByEdgeWildcard(t *testing.T) {
+	var manager *panelCertificateManager
+	legacy := manager.status(PanelSettings{
+		PanelDomain: "panel.example.test",
+		RouteDomain: "example.test",
+		Configured:  true,
+	}, "panel.example.test", "example.test", 9090, true)
+	if !legacy.PanelCoveredByEdgeWildcard {
+		t.Fatal("legacy one-label panel domain should be flagged as covered by the edge wildcard")
+	}
+	nested := manager.status(PanelSettings{
+		PanelDomain: "panel.admin.example.test",
+		RouteDomain: "example.test",
+		Configured:  true,
+	}, "panel.admin.example.test", "example.test", 9090, true)
+	if nested.PanelCoveredByEdgeWildcard {
+		t.Fatal("nested panel domain should not be covered by the edge wildcard")
+	}
+}
+
+func TestPanelCertificateStatusSeparatesActiveAndConfiguredDomains(t *testing.T) {
+	tlsDir := t.TempDir()
+	certFile := filepath.Join(tlsDir, "fullchain.pem")
+	keyFile := filepath.Join(tlsDir, "privkey.pem")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "*.example.test"},
+		DNSNames:     []string{"*.example.test"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "*.example.test"},
+		DNSNames:     []string{"*.example.test"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &panelCertificateManager{certFile: certFile, keyFile: keyFile}
+	status := manager.status(PanelSettings{
+		PanelDomain: "panel.admin.example.test",
+		RouteDomain: "example.test",
+		Configured:  true,
+	}, "panel.example.test", "example.test", 9090, true)
+	if !status.CertificateCurrent {
+		t.Fatal("certificate should still match the active legacy panel host")
+	}
+	if status.CertificateMatchesConfiguredDomain {
+		t.Fatal("edge wildcard must not match the nested configured panel host")
+	}
+	if !status.CertificateMatchesRouteWildcard {
+		t.Fatal("edge wildcard should match the route probe host")
+	}
+	if status.CertificateValid {
+		t.Fatal("self-signed certificate must not be considered trusted")
+	}
+}
+
+func TestDisableExpiredPanelTLSIfNeeded(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "meridian.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.BootstrapPanelSettings("panel.example.com", "example.com", true, 9090); err != nil {
+		t.Fatal(err)
+	}
+
+	tlsDir := t.TempDir()
+	certFile := filepath.Join(tlsDir, "fullchain.pem")
+	keyFile := filepath.Join(tlsDir, "privkey.pem")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "*.example.com"},
+		DNSNames:     []string{"*.example.com"},
+		NotBefore:    now.Add(-48 * time.Hour),
+		NotAfter:     now.Add(-time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "*.example.com"},
+		DNSNames:     []string{"*.example.com"},
+		NotBefore:    now.Add(-48 * time.Hour),
+		NotAfter:     now.Add(-time.Hour),
+	}, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(tlsDir, "enabled")
+	if err := os.WriteFile(marker, []byte("enabled\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := &panelCertificateManager{certFile: certFile, keyFile: keyFile, accountDir: tlsDir}
+	disabled, err := disableExpiredPanelTLSIfNeeded(db, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled {
+		t.Fatal("expired certificate was not disabled")
+	}
+	settings, err := db.PanelSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.TLSEnabled {
+		t.Fatal("TLS remained enabled after certificate expiry")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("TLS marker still exists: %v", err)
+	}
+	if _, err := os.Stat(certFile); err != nil {
+		t.Fatalf("certificate files should be preserved: %v", err)
+	}
+}
+
+func TestLoadOrCreateACMEAccountKeyStaysWithinAccountDirectory(t *testing.T) {
+	directory := t.TempDir()
+	first, err := loadOrCreateACMEAccountKey(directory, "acme-account.pem")
+	if err != nil {
+		t.Fatalf("create account key: %v", err)
+	}
+	second, err := loadOrCreateACMEAccountKey(directory, "acme-account.pem")
+	if err != nil {
+		t.Fatalf("reload account key: %v", err)
+	}
+	firstPublic, err := x509.MarshalPKIXPublicKey(first.Public())
+	if err != nil {
+		t.Fatalf("marshal first public key: %v", err)
+	}
+	secondPublic, err := x509.MarshalPKIXPublicKey(second.Public())
+	if err != nil {
+		t.Fatalf("marshal second public key: %v", err)
+	}
+	if string(firstPublic) != string(secondPublic) {
+		t.Fatal("reloaded account key does not match the created key")
+	}
+	if _, err := os.Stat(filepath.Join(directory, "acme-account.pem")); err != nil {
+		t.Fatalf("account key file: %v", err)
+	}
+
+	if _, err := loadOrCreateACMEAccountKey(directory, "../escape.pem"); err == nil || err.Error() != "ACME account key filename must be a base name" {
+		t.Fatalf("directory escape error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(directory), "escape.pem")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("escape path was created: %v", err)
+	}
+}
+
+func TestInstallCertificatePairAtomicKeepsMatchingCurrentPair(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer tlsServer.Close()
+	certificate := tlsServer.TLS.Certificates[0]
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "edge-nodes", "node", "current")
+	certFile, keyFile := filepath.Join(root, "fullchain.pem"), filepath.Join(root, "privkey.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := installCertificatePairAtomic(certFile, keyFile, certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		t.Fatalf("current pair is not loadable: %v", err)
+	}
+}
+
+func TestPanelCertificateManagerInstallUsesAtomicPair(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer tlsServer.Close()
+	certificate := tlsServer.TLS.Certificates[0]
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	issuedPair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manager := &panelCertificateManager{certFile: filepath.Join(root, "fullchain.pem"), keyFile: filepath.Join(root, "privkey.pem"), accountDir: root}
+	if err := manager.install(&issuedPanelCertificate{certPEM: certPEM, keyPEM: keyPEM, certificate: issuedPair}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, enabled, err := manager.tlsConfig(true); err != nil || !enabled {
+		t.Fatalf("installed panel pair could not be activated: enabled=%v err=%v", enabled, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".panel-current")); err != nil {
+		t.Fatalf("atomic panel pointer missing: %v", err)
+	}
+}
+
+func TestPanelTLSDisabledReasonDistinguishesManualAndFallback(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "meridian.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.BootstrapPanelSettings("panel.example.com", "example.com", true, 9090); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPanelTLSEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := db.PanelSettings()
+	if err != nil || settings.TLSDisabledReason != panelTLSDisabledReasonManual {
+		t.Fatalf("manual TLS disable reason=%q err=%v", settings.TLSDisabledReason, err)
+	}
+	if err := db.setPanelTLSExpiredFallback(); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = db.PanelSettings()
+	if err != nil || settings.TLSDisabledReason != panelTLSDisabledReasonExpiredFallback {
+		t.Fatalf("fallback TLS disable reason=%q err=%v", settings.TLSDisabledReason, err)
+	}
+	if err := db.SetPanelTLSEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = db.PanelSettings()
+	if err != nil || settings.TLSDisabledReason != "" || !settings.TLSEnabled {
+		t.Fatalf("TLS re-enable did not clear reason: %+v err=%v", settings, err)
+	}
+}
+
+func TestPanelRenewalSkipsACMEStaging(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "meridian.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.BootstrapPanelSettings("panel.example.com", "example.com", true, 9090); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SavePanelACMECredentials("admin@example.com", "cloudflare", "ciphertext", true); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := renewPanelCertificateIfDue(context.Background(), db, nil)
+	if err != nil {
+		t.Fatalf("staging renewal returned an error: %v", err)
+	}
+	if changed {
+		t.Fatal("staging renewal unexpectedly changed the active certificate")
+	}
+}
+
+func TestEdgeCertificateIdentifiersAreUniquePerNode(t *testing.T) {
+	first := edgeCertificateIdentifiers("example.com", "node-a")
+	second := edgeCertificateIdentifiers("example.com", "node-b")
+	if len(first) != 2 || len(second) != 2 || first[0] != "*.example.com" || second[0] != "*.example.com" {
+		t.Fatalf("unexpected edge identifiers: %#v %#v", first, second)
+	}
+	if first[1] == second[1] || first[1] == first[0] || second[1] == second[0] {
+		t.Fatalf("edge identifiers are not node-unique: %#v %#v", first, second)
+	}
+	if !strings.HasSuffix(first[1], ".edge.example.com") || !strings.HasSuffix(second[1], ".edge.example.com") {
+		t.Fatalf("edge identifiers must live outside the route wildcard: %#v %#v", first, second)
+	}
+}
+
+func TestPanelCertificateIdentifiersKeepHostModeSitesCovered(t *testing.T) {
+	legacy := panelCertificateIdentifiers(PanelSettings{
+		PanelDomain: "panel.example.test",
+		RouteDomain: "example.test",
+	})
+	if len(legacy) != 1 || legacy[0] != "*.example.test" {
+		t.Fatalf("legacy panel identifiers = %#v", legacy)
+	}
+	nested := panelCertificateIdentifiers(PanelSettings{
+		PanelDomain: "panel.admin.example.test",
+		RouteDomain: "example.test",
+	})
+	if len(nested) != 2 || nested[0] != "panel.admin.example.test" || nested[1] != "*.example.test" {
+		t.Fatalf("nested panel identifiers = %#v", nested)
+	}
+}
+
+func TestCertificateWildcardCoverageRequiresExactWildcardSAN(t *testing.T) {
+	probeOnly := &x509.Certificate{DNSNames: []string{"meridian-edge-check.example.test"}}
+	if certificateHasExactDNSName(probeOnly, "*.example.test") {
+		t.Fatal("an exact probe SAN must not be treated as wildcard coverage")
+	}
+	wildcard := &x509.Certificate{DNSNames: []string{"*.example.test"}}
+	if !certificateHasExactDNSName(wildcard, "*.example.test") {
+		t.Fatal("the expected wildcard SAN was not detected")
+	}
+}
+
+func TestStagingEdgeProvisioningIsNeverInstalled(t *testing.T) {
+	changed, err := ensureEdgeCertificateForNode(context.Background(), PanelSettings{ACMEStaging: true, RouteDomain: "example.test"}, "token", &panelCertificateManager{}, ControlNode{
+		GUID: "node", Enabled: true, EnrolledAtMS: 1,
+	})
+	if err != nil {
+		t.Fatalf("staging edge provisioning returned an error: %v", err)
+	}
+	if changed {
+		t.Fatal("staging edge provisioning installed a certificate")
+	}
+}
+
+func TestCloudflareFindZoneUsesLongestMatch(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query().Get("name"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("name") == "edge.example.com" {
+			_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"edge-zone"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result":[]}`))
+	}))
+	defer server.Close()
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	zone, err := client.findZone(context.Background(), "1111.edge.example.com")
+	if err != nil || zone != "edge-zone" {
+		t.Fatalf("zone=%q err=%v", zone, err)
+	}
+	if len(queries) != 2 || queries[0] != "1111.edge.example.com" || queries[1] != "edge.example.com" {
+		t.Fatalf("zone query order=%v", queries)
+	}
+}
+
+func TestCloudflareDeleteRecordIsIdempotentWhenRecordIsMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %s, want DELETE", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":81044,"message":"Record does not exist"}]}`))
+	}))
+	defer server.Close()
+
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	if err := client.deleteRecord(context.Background(), "zone", "record"); err != nil {
+		t.Fatalf("missing record should be treated as an idempotent delete: %v", err)
+	}
+}
+
+func TestCloudflareRequestRetriesTransientIdempotentOperation(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s, want PUT", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"success":false,"errors":[{"message":"temporary gateway failure"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result":{"id":"record"}}`))
+	}))
+	defer server.Close()
+
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	result, err := client.request(context.Background(), http.MethodPut, "/zones/zone/dns_records/record", strings.NewReader(`{"content":"203.0.113.10"}`))
+	if err != nil {
+		t.Fatalf("transient PUT failed: %v", err)
+	}
+	if string(result) != `{"id":"record"}` || attempts != 2 {
+		t.Fatalf("result=%s attempts=%d, want record and two attempts", result, attempts)
+	}
+}
+
+func TestCloudflareRequestDoesNotRetryCreatePOST(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"message":"temporary gateway failure"}]}`))
+	}))
+	defer server.Close()
+
+	client := &cloudflareClient{token: "test", httpClient: server.Client(), apiBase: server.URL}
+	if _, err := client.request(context.Background(), http.MethodPost, "/zones/zone/dns_records", strings.NewReader(`{"type":"TXT"}`)); err == nil {
+		t.Fatal("create POST unexpectedly succeeded")
+	}
+	if attempts != 1 {
+		t.Fatalf("create POST attempts=%d, want one attempt", attempts)
+	}
+}
+
+func TestDNSPropagationResolversIncludeUDPAndTCP(t *testing.T) {
+	t.Setenv("DNS_PROPAGATION_RESOLVERS", "1.1.1.1")
+	resolvers := dnsPropagationResolvers()
+	if len(resolvers) != 3 {
+		t.Fatalf("resolver count=%d, want UDP/TCP/system", len(resolvers))
+	}
+}
+
+func TestCertificateGenerationCleanupKeepsCurrentAndPrevious(t *testing.T) {
+	root := t.TempDir()
+	generations := filepath.Join(root, "generations")
+	current := filepath.Join(root, "current")
+	if err := os.MkdirAll(generations, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"generation-old", "generation-previous", "generation-current"} {
+		if err := os.Mkdir(filepath.Join(generations, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join("generations", "generation-current"), current); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+	if err := cleanupOldCertificateGenerations(generations, current, 2); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(generations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("generation count = %d, want 2", len(entries))
+	}
+}

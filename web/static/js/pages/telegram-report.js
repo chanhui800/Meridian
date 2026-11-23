@@ -5,10 +5,13 @@
 // early click submit those defaults and silently overwrite the saved schedule,
 // the enabled flag and the warning threshold.
 let telegramReportLoaded = false;
+let telegramReportPageGeneration = 0;
+let telegramReportLoadGeneration = 0;
 
 function renderTelegramReport() {
   const page = document.getElementById('page-telegram-report');
   if (!page) return;
+  const pageGeneration = ++telegramReportPageGeneration;
   telegramReportLoaded = false;
   setTelegramReportButtonsPending(true);
   page.innerHTML = settingsPageFrame('telegram', 'Telegram 通知', '配置请求与流量日报，以及额度预警。', `
@@ -34,8 +37,8 @@ function renderTelegramReport() {
   document.getElementById('telegram-frequency').onchange = updateTelegramFrequencyFields;
   document.getElementById('telegram-save').onclick = () => submitTelegramReport(false);
   document.getElementById('telegram-test').onclick = () => submitTelegramReport(true);
-  document.getElementById('telegram-retry').onclick = loadTelegramReportSettings;
-  loadTelegramReportSettings();
+  document.getElementById('telegram-retry').onclick = () => loadTelegramReportSettings(pageGeneration);
+  loadTelegramReportSettings(pageGeneration);
 }
 function updateTelegramFrequencyFields() {
   const weekly = document.getElementById('telegram-frequency').value === 'weekly';
@@ -58,20 +61,28 @@ function setTelegramReportButtonsPending(pending) {
   });
 }
 
-async function loadTelegramReportSettings() {
+async function loadTelegramReportSettings(pageGeneration = telegramReportPageGeneration) {
+  const loadGeneration = ++telegramReportLoadGeneration;
+  const page = document.getElementById('page-telegram-report');
   const errorPanel = document.getElementById('telegram-load-error');
   const errorMessage = document.getElementById('telegram-error-message');
+  const wasLoaded = telegramReportLoaded;
+  const formAtLoad = telegramReportFormSnapshot();
   try {
     const settings = await API.getTelegramReportSettings();
-    if (!settings || Router.current !== 'telegram-report') return;
-    document.getElementById('telegram-report-enabled').checked = !!settings.enabled;
-    document.getElementById('telegram-bot-token').value = settings.bot_token || '';
-    document.getElementById('telegram-chat-id').value = settings.chat_id || '';
-    document.getElementById('telegram-frequency').value = settings.frequency || 'daily';
-    document.getElementById('telegram-weekday').value = String(Number.isInteger(settings.weekday) ? settings.weekday : 1);
-    document.getElementById('telegram-schedule-time').value = settings.schedule_time || '20:00';
-    document.getElementById('telegram-traffic-warning').value =
-      Number.isInteger(settings.traffic_warning_percent) ? String(settings.traffic_warning_percent) : '80';
+    if (!settings || pageGeneration !== telegramReportPageGeneration || loadGeneration !== telegramReportLoadGeneration
+      || Router.current !== 'telegram-report' || !page?.isConnected) return;
+    const currentForm = telegramReportFormSnapshot();
+    const preserveIfEdited = (key, savedValue) => formAtLoad && currentForm[key] !== formAtLoad[key]
+      ? currentForm[key] : savedValue;
+    document.getElementById('telegram-report-enabled').checked = preserveIfEdited('enabled', !!settings.enabled);
+    document.getElementById('telegram-bot-token').value = preserveIfEdited('bot_token', settings.bot_token || '');
+    document.getElementById('telegram-chat-id').value = preserveIfEdited('chat_id', settings.chat_id || '');
+    document.getElementById('telegram-frequency').value = preserveIfEdited('frequency', settings.frequency || 'daily');
+    document.getElementById('telegram-weekday').value = preserveIfEdited('weekday', String(Number.isInteger(settings.weekday) ? settings.weekday : 1));
+    document.getElementById('telegram-schedule-time').value = preserveIfEdited('schedule_time', settings.schedule_time || '20:00');
+    document.getElementById('telegram-traffic-warning').value = preserveIfEdited('traffic_warning_percent',
+      Number.isInteger(settings.traffic_warning_percent) ? String(settings.traffic_warning_percent) : '80');
     document.getElementById('telegram-token-state').textContent = settings.configured
       ? 'Bot Token 已保存并持续显示'
       : '尚未配置 Bot Token';
@@ -82,10 +93,19 @@ async function loadTelegramReportSettings() {
     updateTelegramFrequencyFields();
     setTelegramReportButtonsPending(false);
   } catch (error) {
+    if (pageGeneration !== telegramReportPageGeneration || loadGeneration !== telegramReportLoadGeneration
+      || Router.current !== 'telegram-report' || !page?.isConnected) return;
+    const currentForm = telegramReportFormSnapshot();
+    const hasDraft = formAtLoad && Object.keys(formAtLoad).some(key => currentForm[key] !== formAtLoad[key]);
+    if (hasDraft) {
+      telegramReportLoaded = wasLoaded;
+      if (errorPanel) errorPanel.hidden = true;
+      return;
+    }
     // The form still shows template defaults, so it must stay unsubmittable. The
     // buttons deliberately stay clickable so the operator can retry after the
     // read succeeds; submitTelegramReport explains the refusal.
-    telegramReportLoaded = false;
+    telegramReportLoaded = wasLoaded;
     if (errorPanel) errorPanel.hidden = false;
     if (errorMessage) errorMessage.textContent = '读取失败：' + error.message;
     Toast.error('读取 Telegram 日报设置失败：' + error.message);
@@ -112,6 +132,25 @@ function telegramReportPayload(action) {
   };
 }
 
+function telegramReportFormSnapshot() {
+  const enabled = document.getElementById('telegram-report-enabled');
+  if (!enabled) return null;
+  return {
+    enabled: enabled.checked,
+    bot_token: document.getElementById('telegram-bot-token').value,
+    chat_id: document.getElementById('telegram-chat-id').value,
+    frequency: document.getElementById('telegram-frequency').value,
+    weekday: document.getElementById('telegram-weekday').value,
+    schedule_time: document.getElementById('telegram-schedule-time').value,
+    traffic_warning_percent: document.getElementById('telegram-traffic-warning').value,
+  };
+}
+
+function telegramReportFormMatches(payload) {
+  const current = telegramReportPayload('');
+  return Object.keys(current).every(key => current[key] === payload[key]);
+}
+
 async function submitTelegramReport(testOnly) {
   if (!telegramReportLoaded) {
     // Never submit a form that has not been filled from the server, and never
@@ -120,23 +159,33 @@ async function submitTelegramReport(testOnly) {
     return;
   }
   const button = document.getElementById(testOnly ? 'telegram-test' : 'telegram-save');
+  const pageGeneration = telegramReportPageGeneration;
+  const submitted = telegramReportPayload(testOnly ? 'test' : '');
   const original = button.textContent;
   button.disabled = true;
   button.textContent = testOnly ? '正在发送…' : '正在保存…';
   try {
-    const result = await API.saveTelegramReportSettings(telegramReportPayload(testOnly ? 'test' : ''));
+    const result = await API.saveTelegramReportSettings(submitted);
+    if (pageGeneration !== telegramReportPageGeneration || Router.current !== 'telegram-report') return result;
     if (testOnly) {
       Toast.success('测试日报已发送');
     } else {
-      telegramReportLoaded = false;
       Toast.success('Telegram 日报设置已保存');
-      await loadTelegramReportSettings();
+      // Do not reload a form that has been edited since this save was sent.
+      // That keeps newer chat, schedule, and threshold drafts intact.
+      if (telegramReportFormMatches(submitted)) {
+        await loadTelegramReportSettings(pageGeneration);
+      }
     }
     return result;
   } catch (error) {
-    Toast.error((testOnly ? '测试发送失败：' : '保存失败：') + error.message);
+    if (pageGeneration === telegramReportPageGeneration && Router.current === 'telegram-report') {
+      Toast.error((testOnly ? '测试发送失败：' : '保存失败：') + error.message);
+    }
   } finally {
-    button.disabled = false;
-    button.textContent = original;
+    if (pageGeneration === telegramReportPageGeneration && button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
   }
 }

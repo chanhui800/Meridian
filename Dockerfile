@@ -7,9 +7,9 @@ RUN go mod download
 
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=controller" -o meridian .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-amd64 . && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-arm64 .
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=controller" -o meridian ./cmd/meridian
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-amd64 ./cmd/meridian && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.appVersion=${VERSION} -X main.buildMode=agent" -o meridian-agent-linux-arm64 ./cmd/meridian
 
 # Runtime stage
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
@@ -25,7 +25,7 @@ RUN addgroup -S meridian && \
 COPY --from=builder --chown=root:root --chmod=0555 /app/meridian /app/meridian
 COPY --from=builder --chown=root:root --chmod=0555 /app/meridian-agent-linux-amd64 /app/meridian-agent-linux-amd64
 COPY --from=builder --chown=root:root --chmod=0555 /app/meridian-agent-linux-arm64 /app/meridian-agent-linux-arm64
-COPY --chown=root:root --chmod=0555 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chown=root:root --chmod=0555 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN setcap cap_net_bind_service=+ep /app/meridian && \
     getcap /app/meridian | grep -Fq 'cap_net_bind_service=ep'
 

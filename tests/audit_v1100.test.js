@@ -264,7 +264,7 @@ test('audit: rendering the telegram settings page clears the loaded guard', () =
     'renderTelegramReport must clear the guard when it rebuilds the form',
   );
   assert.ok(
-    renderBody.indexOf('telegramReportLoaded = false;') < renderBody.indexOf('loadTelegramReportSettings()'),
+    renderBody.indexOf('telegramReportLoaded = false;') < renderBody.indexOf('loadTelegramReportSettings('),
     'the guard must be cleared before the settings read is requested',
   );
 });
@@ -289,7 +289,7 @@ test('audit: submitting an unhydrated telegram form refuses and explains why', a
 test('audit: the telegram guard is only raised after the form is hydrated', () => {
   const page = source('web/static/js/pages/telegram-report.js');
   const loader = page.slice(
-    page.indexOf('async function loadTelegramReportSettings()'),
+    page.indexOf('async function loadTelegramReportSettings('),
     page.indexOf('function telegramTrafficWarningPercent()'),
   );
   const guardIndex = loader.indexOf('telegramReportLoaded = true');

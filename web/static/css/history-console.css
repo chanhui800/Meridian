@@ -29,12 +29,12 @@ body.console-shell #page-watch-history .history-console .history-record-list {
 }
 body.console-shell #page-watch-history .history-console .watch-history-card {
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr) 174px 36px;
+  grid-template-columns: 96px minmax(0, 1fr) 174px 36px;
   align-items: center;
   gap: 18px;
   width: 100%;
   min-width: 0;
-  min-height: 122px;
+  min-height: 180px;
   max-height: none;
   padding: 18px 24px;
   margin: 0;
@@ -54,8 +54,8 @@ body.console-shell #page-watch-history .history-console .watch-history-card:focu
 body.console-shell #page-watch-history .history-console .watch-history-card.is-live { grid-template-columns: 96px minmax(0, 1fr) 174px 36px; min-height: 110px; }
 body.console-shell #page-watch-history .history-console .watch-history-poster {
   position: relative;
-  width: 62px;
-  height: 86px;
+  width: 96px;
+  height: 144px;
   min-height: 0;
   aspect-ratio: 2 / 3;
   border-radius: 6px;
@@ -63,7 +63,8 @@ body.console-shell #page-watch-history .history-console .watch-history-poster {
   overflow: hidden;
 }
 body.console-shell #page-watch-history .history-console .watch-history-card.is-live .watch-history-poster { width: 96px; height: 66px; aspect-ratio: auto; }
-body.console-shell #page-watch-history .history-console .watch-history-poster img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 1; transform: none; filter: none; }
+body.console-shell #page-watch-history .history-console .watch-history-poster img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; opacity: 1; transform: none; filter: none; }
+body.console-shell #page-watch-history .history-console .watch-history-card.is-live .watch-history-poster img { object-fit: cover; }
 body.console-shell #page-watch-history .history-console .watch-history-poster-fallback { color: var(--console-muted); background: transparent; }
 body.console-shell #page-watch-history .history-console .watch-history-poster-fallback svg { width: 24px; height: 24px; }
 body.console-shell #page-watch-history .history-console .watch-history-card-body { min-width: 0; padding: 0; color: inherit; background: transparent; }
@@ -104,7 +105,7 @@ body.console-shell #page-watch-history .history-console .watch-history-status { 
 body.console-shell #page-watch-history .history-console .watch-history-notice { padding: 12px 16px; margin: 0; border: 1px solid var(--console-line); border-left: 3px solid var(--console-warning); border-radius: 7px; color: var(--console-muted); background: var(--console-surface); font-size: 12px; line-height: 1.7; }
 body.console-shell #page-watch-history .history-console .watch-history-empty { grid-column: 1 / -1; display: grid; justify-items: center; align-content: center; gap: 8px; min-height: 170px; padding: 36px 24px; border: 0; border-radius: 0; color: var(--console-muted); background: transparent; box-shadow: none; font-size: 13px; }
 body.console-shell #page-watch-history .history-console .watch-history-empty strong { color: var(--console-ink); font-size: 15px; font-weight: 500; }
-body.console-shell #page-watch-history .history-console .watch-history-skeleton { grid-template-columns: 72px minmax(0, 1fr); }
+body.console-shell #page-watch-history .history-console .watch-history-skeleton { grid-template-columns: 96px minmax(0, 1fr); }
 body.console-shell #page-watch-history .history-console .watch-history-skeleton .watch-history-card-body span { background: var(--console-line); }
 body.console-shell #page-watch-history .history-console .watch-history-more-wrap { margin: 0; padding: 18px; text-align: center; border-top: 1px solid var(--console-line); }
 body.console-shell #page-watch-history .history-console .watch-history-more-wrap:has(button[hidden]) { display: none; }
@@ -115,51 +116,72 @@ body.console-shell #page-watch-history .history-console .watch-history-detail-ba
 body.console-shell #page-watch-history .history-console .watch-history-detail-dialog { position: relative; display: flex; flex-direction: column; width: min(980px, calc(100vw - 40px)); height: auto; max-width: none; max-height: calc(100dvh - 40px); padding: 0; overflow: hidden; transform: none; border: 1px solid var(--console-line); border-radius: 12px; color: var(--console-ink); background: var(--console-surface); box-shadow: 0 18px 55px #0003; }
 body.console-shell #page-watch-history .history-console #watch-history-detail-content { overflow: auto; padding: 0; }
 body.console-shell #page-watch-history .history-console .watch-history-detail-close { position: absolute; top: 12px; right: 12px; z-index: 5; display: grid; place-items: center; width: 36px; height: 36px; color: var(--console-ink); background: var(--console-surface); border: 1px solid var(--console-line); border-radius: 6px; font-size: 24px; }
-body.console-shell #page-watch-history .history-console .history-detail-shell { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); padding: 0; background: transparent; }
-body.console-shell #page-watch-history .history-console .history-detail-shell.has-art { grid-template-columns: 224px minmax(0, 1fr); }
-body.console-shell #page-watch-history .history-console .history-detail-art { position: sticky; inset: auto; top: 24px; width: calc(100% - 24px); height: 260px; margin: 24px 0 24px 24px; overflow: hidden; border-radius: 8px; background: var(--console-bg); cursor: zoom-in; }
-body.console-shell #page-watch-history .history-console .history-detail-art::after { content: none; }
-body.console-shell #page-watch-history .history-console .history-detail-art img { position: static; width: 100%; height: 100%; object-fit: cover; opacity: 1; filter: none; transform: none; }
-body.console-shell #page-watch-history .history-console .history-detail-art > span { position: absolute; bottom: 10px; left: 10px; padding: 4px 8px; border-radius: 4px; background: var(--console-surface); color: var(--console-ink); font-size: 11px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-shell > .watch-history-detail-layout { display: block; min-width: 0; padding: 26px 24px 24px; background: transparent; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-main { width: 100%; min-width: 0; padding: 0; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-heading { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding-right: 38px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-heading h2 { color: var(--console-ink); font-size: 25px; font-weight: 600; line-height: 1.4; text-shadow: none; overflow-wrap: anywhere; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-secondary { color: var(--console-muted); margin-top: 6px; font-size: 13px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: row; gap: 15px 22px; padding: 20px 0; border-bottom: 1px solid var(--console-line); margin: 0; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-meta dt { color: var(--console-muted); font-size: 11px; margin: 0 0 5px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-meta dd { color: var(--console-ink); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-source-address { grid-column: 1 / -1; min-width: 0; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-source-address dd { overflow: visible; text-overflow: clip; white-space: normal; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-section { padding: 18px 0 0; margin: 0; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-section h3 { margin: 0 0 10px; color: var(--console-ink); font-size: 13px; font-weight: 600; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-section p, body.console-shell #page-watch-history .history-console .watch-history-detail-muted { color: var(--console-muted); font-size: 12px; line-height: 1.8; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-cast { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-cast li { min-width: 0; display: flex; align-items: center; gap: 9px; border: 0; background: none; padding: 0; }
-body.console-shell #page-watch-history .history-console .watch-history-cast-avatar { flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%; background: var(--console-bg); }
-body.console-shell #page-watch-history .history-console .watch-history-cast-copy strong { color: var(--console-ink); font-size: 12px; }
-body.console-shell #page-watch-history .history-console .watch-history-cast-copy span { color: var(--console-muted); font-size: 11px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-stills { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-body.console-shell #page-watch-history .history-console .watch-history-detail-still { display: block; min-width: 0; width: 100%; height: 125px; padding: 0; border-radius: 6px; overflow: hidden; background: var(--console-bg); }
-body.console-shell #page-watch-history .history-console .watch-history-detail-still img { width: 100%; height: 100%; object-fit: cover; }
-body.console-shell #page-watch-history .history-console .watch-history-image-modal { position: fixed; inset: 0; z-index: 1350; display: grid; place-items: center; padding: 20px; }
-body.console-shell #page-watch-history .history-console .watch-history-image-backdrop { position: absolute; inset: 0; background: #0009; }
-body.console-shell #page-watch-history .history-console .watch-history-image-dialog { position: relative; width: min(960px, calc(100vw - 40px)); max-width: none; max-height: calc(100dvh - 40px); transform: none; background: var(--console-surface); border-radius: 9px; overflow: hidden; }
-body.console-shell #page-watch-history .history-console #watch-history-image-viewer-image { max-width: 100%; max-height: calc(100dvh - 60px); object-fit: contain; }
-body.console-shell #page-watch-history .history-console .watch-history-image-close { width: 38px; height: 38px; border-radius: 6px; color: var(--console-ink); background: var(--console-surface); border-color: var(--console-line); }
+/* The site's live dialog uses the same detail component as viewing history. */
+body.console-shell #modal.site-live-modal { width: min(980px, 100%); max-width: none; height: auto; max-height: calc(100dvh - 48px); color: var(--console-ink); background: var(--console-surface); }
+body.console-shell #modal.site-live-modal .modal-header { position: relative; inset: auto; padding: 16px 60px 16px 24px; border-bottom: 1px solid var(--console-line); background: var(--console-surface); }
+body.console-shell #modal.site-live-modal .modal-header h3 { color: var(--console-ink); }
+body.console-shell #modal.site-live-modal .modal-body { height: auto; min-height: 0; padding: 0; overflow: auto; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-shell { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); padding: 0; background: transparent; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-shell.has-art { grid-template-columns: 224px minmax(0, 1fr); }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art { position: sticky; inset: auto; top: 24px; width: calc(100% - 24px); height: 260px; margin: 24px 0 24px 24px; overflow: hidden; border-radius: 8px; background: var(--console-bg); cursor: zoom-in; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art.is-poster { align-self: start; height: auto; aspect-ratio: 2 / 3; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art::after { content: none; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art img { position: static; width: 100%; height: 100%; object-fit: contain; opacity: 1; filter: none; transform: none; -webkit-mask-image: none; mask-image: none; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art > span { position: absolute; bottom: 10px; left: 10px; padding: 4px 8px; border-radius: 4px; background: var(--console-surface); color: var(--console-ink); font-size: 11px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-shell > .watch-history-detail-layout { display: block; min-width: 0; padding: 26px 24px 24px; background: transparent; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-main { width: 100%; min-width: 0; padding: 0; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-heading { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding-right: 38px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-heading h2 { color: var(--console-ink); font-size: 25px; font-weight: 600; line-height: 1.4; text-shadow: none; overflow-wrap: anywhere; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-secondary { color: var(--console-muted); margin-top: 6px; font-size: 13px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: row; gap: 15px 22px; padding: 20px 0; border-bottom: 1px solid var(--console-line); margin: 0; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-meta dt { color: var(--console-muted); font-size: 11px; margin: 0 0 5px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-meta dd { color: var(--console-ink); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-source-address { grid-column: 1 / -1; min-width: 0; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-source-address dd { overflow: visible; text-overflow: clip; white-space: normal; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-section { padding: 18px 0 0; margin: 0; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-section h3 { margin: 0 0 10px; color: var(--console-ink); font-size: 13px; font-weight: 600; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-section p, body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-muted { color: var(--console-muted); font-size: 12px; line-height: 1.8; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-cast { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-cast li { min-width: 0; display: flex; align-items: center; gap: 9px; border: 0; background: none; padding: 0; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-cast-avatar { flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%; background: var(--console-bg); }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-cast-copy strong { color: var(--console-ink); font-size: 12px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-cast-copy span { color: var(--console-muted); font-size: 11px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-stills { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-still { display: block; min-width: 0; width: 100%; height: 125px; padding: 0; border-radius: 6px; overflow: hidden; background: var(--console-bg); }
+body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-still img { width: 100%; height: 100%; object-fit: cover; }
+body.console-shell #watch-history-image-modal[hidden] { display: none !important; }
+body.console-shell #watch-history-image-modal [hidden] { display: none !important; }
+body.console-shell #watch-history-image-modal { position: fixed; inset: 0; z-index: 2100; display: grid; place-items: center; padding: 20px; }
+body.console-shell #watch-history-image-modal .watch-history-image-backdrop { position: absolute; inset: 0; background: #0009; }
+body.console-shell #watch-history-image-modal .watch-history-image-dialog { position: relative; width: min(960px, calc(100vw - 40px)); max-width: none; max-height: calc(100dvh - 40px); transform: none; background: var(--console-surface); border-radius: 9px; overflow: hidden; }
+body.console-shell #watch-history-image-modal .watch-history-image-stage { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: center; align-items: center; gap: 12px; width: 100%; min-width: 0; }
+body.console-shell #watch-history-image-modal .watch-history-image-stage.has-gallery { grid-template-columns: 44px minmax(0, 1fr) 44px; }
+body.console-shell #watch-history-image-modal #watch-history-image-viewer-image { grid-column: 1; grid-row: 1; min-width: 0; max-width: 100%; max-height: calc(100dvh - 80px); object-fit: contain; }
+body.console-shell #watch-history-image-modal .watch-history-image-stage.has-gallery #watch-history-image-viewer-image { grid-column: 2; max-height: calc(100dvh - 120px); }
+body.console-shell #watch-history-image-modal .watch-history-image-nav { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--console-line); border-radius: 7px; color: var(--console-ink); background: var(--console-bg); cursor: pointer; }
+body.console-shell #watch-history-image-modal .watch-history-image-nav:hover { color: var(--console-accent); background: var(--console-accent-soft); }
+body.console-shell #watch-history-image-modal .watch-history-image-nav svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+body.console-shell #watch-history-image-modal .watch-history-image-prev { grid-column: 1; grid-row: 1; }
+body.console-shell #watch-history-image-modal .watch-history-image-next { grid-column: 3; grid-row: 1; }
+body.console-shell #watch-history-image-modal .watch-history-image-counter { grid-column: 2; grid-row: 2; color: var(--console-muted); font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+body.console-shell #watch-history-image-modal .watch-history-image-close { width: 38px; height: 38px; border-radius: 6px; color: var(--console-ink); background: var(--console-surface); border-color: var(--console-line); }
 @media (max-width: 1024px) {
-  body.console-shell #page-watch-history .history-console .watch-history-card { grid-template-columns: 64px minmax(0, 1fr) 136px 36px; gap: 14px; padding: 17px 20px; }
+  body.console-shell #page-watch-history .history-console .watch-history-card { grid-template-columns: 84px minmax(0, 1fr) 136px 36px; min-height: 160px; gap: 14px; padding: 17px 20px; }
+  body.console-shell #page-watch-history .history-console .watch-history-poster { width: 84px; height: 126px; }
   body.console-shell #page-watch-history .history-console .watch-history-card.is-live { grid-template-columns: 80px minmax(0, 1fr) 136px 36px; }
   body.console-shell #page-watch-history .history-console .watch-history-card.is-live .watch-history-poster { width: 80px; height: 62px; }
+  body.console-shell #page-watch-history .history-console .watch-history-skeleton { grid-template-columns: 84px minmax(0, 1fr); }
   body.console-shell #page-watch-history .history-console .watch-history-filters { gap: 12px; }
 }
 @media (max-width: 768px) {
   body.console-shell #page-watch-history .history-console { gap: 18px; }
   body.console-shell #page-watch-history .history-console .console-heading-actions .console-status { display: none; }
   body.console-shell #page-watch-history .history-console .watch-history-card,
-  body.console-shell #page-watch-history .history-console .watch-history-card.is-live { grid-template-columns: 54px minmax(0, 1fr) 44px; gap: 9px 12px; padding: 16px 18px; }
+  body.console-shell #page-watch-history .history-console .watch-history-card.is-live { grid-template-columns: 72px minmax(0, 1fr) 44px; min-height: 140px; gap: 9px 12px; padding: 16px 18px; }
   body.console-shell #page-watch-history .history-console .watch-history-poster,
-  body.console-shell #page-watch-history .history-console .watch-history-card.is-live .watch-history-poster { grid-column: 1; grid-row: 1 / span 2; width: 54px; height: 78px; }
+  body.console-shell #page-watch-history .history-console .watch-history-card.is-live .watch-history-poster { grid-column: 1; grid-row: 1 / span 2; width: 72px; height: 108px; }
+  body.console-shell #page-watch-history .history-console .watch-history-card.is-live .watch-history-poster { height: 48px; }
+  body.console-shell #page-watch-history .history-console .watch-history-skeleton { grid-template-columns: 72px minmax(0, 1fr); }
   body.console-shell #page-watch-history .history-console .watch-history-card-body { grid-column: 2; grid-row: 1; }
   body.console-shell #page-watch-history .history-console .history-record-meta { grid-column: 2; grid-row: 2; display: flex; flex-wrap: wrap; gap: 5px 9px; }
   body.console-shell #page-watch-history .history-console .watch-history-card-heading h3 { font-size: 14px; }
@@ -172,14 +194,21 @@ body.console-shell #page-watch-history .history-console .watch-history-image-clo
   body.console-shell #page-watch-history .history-console .history-progress-line .watch-history-progress { min-width: 60px; }
   body.console-shell #page-watch-history .history-console .watch-history-detail-modal { padding: 12px; }
   body.console-shell #page-watch-history .history-console .watch-history-detail-dialog { width: 100%; max-height: calc(100dvh - 24px); }
-  body.console-shell #page-watch-history .history-console .history-detail-shell.has-art { grid-template-columns: minmax(0, 1fr); }
-  body.console-shell #page-watch-history .history-console .history-detail-art { position: relative; top: auto; width: calc(100% - 40px); height: 170px; margin: 20px 20px 0; }
-  body.console-shell #page-watch-history .history-console .watch-history-detail-shell > .watch-history-detail-layout { padding: 22px 20px; }
-  body.console-shell #page-watch-history .history-console .watch-history-detail-heading h2 { font-size: 22px; }
-  body.console-shell #page-watch-history .history-console .watch-history-detail-meta { gap: 12px 16px; }
-  body.console-shell #page-watch-history .history-console .watch-history-detail-still { height: 100px; }
-  body.console-shell #page-watch-history .history-console .watch-history-image-modal { padding: 12px; }
-  body.console-shell #page-watch-history .history-console .watch-history-image-dialog { width: 100%; max-height: calc(100dvh - 24px); }
+  body.console-shell #modal.site-live-modal { max-height: calc(100dvh - 32px); }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-shell.has-art { grid-template-columns: minmax(0, 1fr); }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art { position: relative; top: auto; width: calc(100% - 40px); height: 170px; margin: 20px 20px 0; }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .history-detail-art.is-poster { width: min(180px, calc(100% - 40px)); height: auto; }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-shell > .watch-history-detail-layout { padding: 22px 20px; }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-heading h2 { font-size: 22px; }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-meta { gap: 12px 16px; }
+  body.console-shell :is(#page-watch-history .history-console, #modal.site-live-modal) .watch-history-detail-still { height: 100px; }
+  body.console-shell #watch-history-image-modal { padding: 12px; }
+  body.console-shell #watch-history-image-modal .watch-history-image-dialog { width: 100%; max-height: calc(100dvh - 24px); }
+  body.console-shell #watch-history-image-modal #watch-history-image-viewer-image { max-height: calc(100dvh - 72px); }
+  body.console-shell #watch-history-image-modal .watch-history-image-stage.has-gallery #watch-history-image-viewer-image { grid-column: 1 / -1; grid-row: 1; max-height: calc(100dvh - 128px); }
+  body.console-shell #watch-history-image-modal .watch-history-image-stage.has-gallery .watch-history-image-prev,
+  body.console-shell #watch-history-image-modal .watch-history-image-stage.has-gallery .watch-history-image-next,
+  body.console-shell #watch-history-image-modal .watch-history-image-stage.has-gallery .watch-history-image-counter { grid-row: 2; }
 }
 @media (prefers-reduced-motion: reduce) {
   body.console-shell #page-watch-history .history-console * { animation: none !important; transition: none !important; }

@@ -1,0 +1,2037 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/mail"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/acme"
+)
+
+const (
+	letsEncryptProductionDirectory  = "https://acme-v02.api.letsencrypt.org/directory"
+	letsEncryptStagingDirectory     = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	panelCertificateRenewalWindow   = 30 * 24 * time.Hour
+	panelCertificateRenewalInterval = 12 * time.Hour
+	panelACMETokenCipherPrefix      = "v1:"
+)
+
+var errCertificateIssuanceBusy = errors.New("a certificate request is already running")
+
+// Certificate generations are read as one pair by backup export. Serialize
+// their short file-install/cleanup phase with those snapshots, including the
+// pair-wise fallback used on systems without symlink support.
+var certificatePairFilesMu sync.RWMutex
+
+type panelCertificateStatus struct {
+	Available                          bool   `json:"available"`
+	TLSEnabled                         bool   `json:"tls_enabled"`
+	PanelDomain                        string `json:"panel_domain"`
+	PanelPrefix                        string `json:"panel_prefix"`
+	RouteDomain                        string `json:"route_domain"`
+	WildcardDomain                     string `json:"wildcard_domain"`
+	CertificateWildcardDomain          string `json:"certificate_wildcard_domain,omitempty"`
+	PanelCoveredByEdgeWildcard         bool   `json:"panel_covered_by_edge_wildcard"`
+	CertificateCurrent                 bool   `json:"certificate_current"`
+	CertificateMatchesConfiguredDomain bool   `json:"certificate_matches_configured_domain"`
+	CertificateMatchesRouteWildcard    bool   `json:"certificate_matches_route_wildcard"`
+	CertificateValid                   bool   `json:"certificate_valid"`
+	StagingTested                      bool   `json:"staging_tested,omitempty"`
+	CertificateReused                  bool   `json:"certificate_reused,omitempty"`
+	ListenPort                         int    `json:"listen_port"`
+	ActiveListenPort                   int    `json:"active_listen_port"`
+	Configured                         bool   `json:"configured"`
+	SettingsConfigured                 bool   `json:"settings_configured"`
+	Subject                            string `json:"subject,omitempty"`
+	ExpiresAt                          string `json:"expires_at,omitempty"`
+	DaysRemaining                      int    `json:"days_remaining,omitempty"`
+	AutoRenewEnabled                   bool   `json:"auto_renew_enabled"`
+	ACMEEmail                          string `json:"acme_email,omitempty"`
+	ACMEDNSProvider                    string `json:"dns_provider,omitempty"`
+	DNSAPIToken                        string `json:"dns_api_token,omitempty"`
+	ACMEStaging                        bool   `json:"acme_staging"`
+	RestartRequired                    bool   `json:"restart_required"`
+	Issuing                            bool   `json:"issuing"`
+}
+
+type panelCertificateManager struct {
+	certFile      string
+	keyFile       string
+	edgeCertFile  string
+	edgeKeyFile   string
+	stateDir      string
+	edgeStateRoot string
+	accountDir    string
+	httpClient    *http.Client
+	db            *DB
+
+	mu                 sync.Mutex
+	issuing            bool
+	issueGate          chan struct{}
+	currentCertificate *tls.Certificate
+}
+
+// panelPairPaths returns the currently active panel certificate pair.  The
+// legacy fullchain.pem/privkey.pem files remain readable for upgrades, while
+// renewals switch a sibling pointer atomically so cert and key always match.
+func (m *panelCertificateManager) panelPairPaths() (string, string) {
+	if m == nil || strings.TrimSpace(m.certFile) == "" || strings.TrimSpace(m.keyFile) == "" {
+		return "", ""
+	}
+	if m.stateDir != "" {
+		currentDir := filepath.Join(m.stateDir, ".panel-current")
+		if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil { // #nosec G703 -- stateDir is a validated private Meridian directory.
+			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+		}
+	}
+	// Managers created before TLS_STATE_DIR existed may still read the legacy
+	// pointer as a compatibility measure. New managers must never inspect a
+	// sibling of an operator-owned certificate path: that directory is outside
+	// Meridian's namespace and may belong to another service.
+	if m.stateDir == "" {
+		legacyDir := filepath.Join(filepath.Dir(m.certFile), ".panel-current")
+		if _, err := os.Stat(filepath.Join(legacyDir, "fullchain.pem")); err == nil { // #nosec G703 -- legacy path is read-only compatibility for legacy callers.
+			return filepath.Join(legacyDir, "fullchain.pem"), filepath.Join(legacyDir, "privkey.pem")
+		}
+	}
+	return m.certFile, m.keyFile
+}
+
+func (m *panelCertificateManager) panelAtomicPairPaths() (string, string) {
+	if m == nil {
+		return "", ""
+	}
+	stateDir := strings.TrimSpace(m.stateDir)
+	if stateDir == "" && strings.TrimSpace(m.certFile) != "" {
+		// Compatibility for tests and pre-TLS_STATE_DIR managers constructed by
+		// older callers. New managers always set stateDir explicitly.
+		stateDir = filepath.Dir(m.certFile)
+	}
+	if stateDir == "" {
+		return "", ""
+	}
+	currentDir := filepath.Join(stateDir, ".panel-current")
+	return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+}
+
+func (m *panelCertificateManager) acquireIssue(ctx context.Context) error {
+	if m == nil {
+		return errors.New("certificate manager is unavailable")
+	}
+	m.mu.Lock()
+	if m.issueGate == nil {
+		m.issueGate = make(chan struct{}, 1)
+	}
+	gate := m.issueGate
+	m.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		m.mu.Lock()
+		m.issuing = true
+		m.mu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *panelCertificateManager) releaseIssue() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	gate := m.issueGate
+	m.issuing = false
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+}
+
+// nodeEdgeTLSPaths returns an isolated certificate pair for one Agent.  The
+// legacy edgeCertFile/edgeKeyFile pair is retained for migration and CLI
+// compatibility, but runtime Agent configurations must use this per-node
+// directory so compromising one node cannot expose another node's key.
+func (m *panelCertificateManager) nodeEdgeTLSPaths(nodeGUID string) (string, string, error) {
+	if m == nil || strings.TrimSpace(m.edgeCertFile) == "" || strings.TrimSpace(m.edgeKeyFile) == "" {
+		return "", "", errors.New("edge TLS certificate paths are unavailable")
+	}
+	guid := strings.TrimSpace(nodeGUID)
+	if guid == "" || strings.ContainsAny(guid, `/\\`) || guid == "." || guid == ".." {
+		return "", "", errors.New("node GUID is invalid")
+	}
+	for _, r := range guid {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return "", "", errors.New("node GUID is invalid")
+		}
+	}
+	rootBase := m.edgeStateRoot
+	// Older in-process callers and tests may construct a manager directly
+	// without filling edgeStateRoot.  Derive the private state namespace only
+	// from the manager's own state/account directory; never fall back to the
+	// operator-provided EDGE_TLS_CERT_FILE parent.
+	if rootBase == "" && strings.TrimSpace(m.stateDir) != "" {
+		rootBase = filepath.Join(m.stateDir, "edge-nodes")
+	}
+	if rootBase == "" && strings.TrimSpace(m.accountDir) != "" {
+		rootBase = filepath.Join(m.accountDir, "edge-nodes")
+	}
+	if rootBase == "" {
+		return "", "", errors.New("edge TLS state directory is unavailable")
+	}
+	root := filepath.Join(rootBase, guid)
+	current := filepath.Join(root, "current")
+	return filepath.Join(current, "fullchain.pem"), filepath.Join(current, "privkey.pem"), nil
+}
+
+// installCertificatePairAtomic writes both TLS files into an immutable
+// generation and atomically switches one current-directory pointer.  Readers
+// therefore observe a matching certificate/key pair even during renewal.
+func installCertificatePairAtomic(certFile, keyFile string, certPEM, keyPEM []byte) error {
+	if strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" || filepath.Dir(certFile) != filepath.Dir(keyFile) {
+		return errors.New("certificate and key paths must share a directory")
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return fmt.Errorf("certificate/key pair is invalid: %w", err)
+	}
+	certificatePairFilesMu.Lock()
+	defer certificatePairFilesMu.Unlock()
+	currentDir := filepath.Dir(certFile)
+	root := filepath.Dir(currentDir)
+	generations := filepath.Join(root, "generations")
+	if err := os.MkdirAll(generations, 0o700); err != nil { // #nosec G703 -- paths are derived from validated administrator-controlled TLS locations.
+		return err
+	}
+	generation, err := os.MkdirTemp(generations, "generation-")
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.RemoveAll(generation) // #nosec G703 -- generation is created by MkdirTemp beneath the private TLS directory.
+		}
+	}()
+	if err := writePrivateFileAtomic(filepath.Join(generation, "fullchain.pem"), certPEM); err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(filepath.Join(generation, "privkey.pem"), keyPEM); err != nil {
+		return err
+	}
+	// Linux production uses an atomic symlink replacement. Windows test/dev
+	// environments may not permit symlinks, so retain a safe pair-wise fallback.
+	tmpLink := fmt.Sprintf("%s.next.%d.%d", currentDir, os.Getpid(), time.Now().UnixNano())
+	_ = os.Remove(tmpLink)                                                                               // #nosec G703 -- tmpLink is derived from the validated current directory.
+	if err := os.Symlink(filepath.Join("generations", filepath.Base(generation)), tmpLink); err == nil { // #nosec G703 -- link target is generated beneath the private TLS directory.
+		if err := os.Rename(tmpLink, currentDir); err != nil { // #nosec G703 -- both paths are generated within the private TLS directory.
+			// Backups from v1.9.13 may have restored current as a real
+			// directory. Move it aside, switch the pointer, then remove the
+			// legacy directory; readers never observe a partial new pair.
+			legacyDir := fmt.Sprintf("%s.legacy.%d", currentDir, time.Now().UnixNano())
+			if info, statErr := os.Stat(currentDir); statErr == nil && info.IsDir() && os.Rename(currentDir, legacyDir) == nil {
+				if switchErr := os.Rename(tmpLink, currentDir); switchErr == nil {
+					_ = os.RemoveAll(legacyDir) // #nosec G703 -- legacyDir is a private, uniquely named sibling of currentDir.
+					keep = true
+					if cleanupErr := cleanupOldCertificateGenerations(generations, currentDir, 2); cleanupErr != nil {
+						return fmt.Errorf("cleanup old certificate generations: %w", cleanupErr)
+					}
+					return nil
+				}
+				_ = os.Rename(legacyDir, currentDir)
+			}
+			_ = os.Remove(tmpLink) // #nosec G703 -- tmpLink is generated within the private TLS directory.
+			return err
+		}
+		keep = true
+		if err := cleanupOldCertificateGenerations(generations, currentDir, 2); err != nil {
+			return fmt.Errorf("cleanup old certificate generations: %w", err)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(currentDir, 0o700); err != nil { // #nosec G703 -- currentDir is derived from validated TLS paths.
+		return err
+	}
+	if err := writePrivateFileAtomic(certFile, certPEM); err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(keyFile, keyPEM); err != nil {
+		return err
+	}
+	keep = true
+	if err := cleanupOldCertificateGenerations(generations, currentDir, 2); err != nil {
+		return fmt.Errorf("cleanup old certificate generations: %w", err)
+	}
+	return nil
+}
+
+// cleanupOldCertificateGenerations bounds long-running renewal storage while
+// retaining the active generation and one rollback candidate.  It never
+// follows or removes the current pointer itself.
+func cleanupOldCertificateGenerations(generationsDir, currentDir string, keep int) error {
+	if keep < 1 {
+		keep = 1
+	}
+	entries, err := os.ReadDir(generationsDir)
+	if err != nil {
+		return err
+	}
+	currentName := ""
+	if target, readErr := os.Readlink(currentDir); readErr == nil {
+		currentName = filepath.Base(filepath.Clean(target))
+	}
+	type generationEntry struct {
+		name string
+		info os.FileInfo
+	}
+	values := make([]generationEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "generation-") {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		values = append(values, generationEntry{name: entry.Name(), info: info})
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].info.ModTime().After(values[j].info.ModTime()) })
+	retained := make(map[string]bool, keep)
+	if currentName != "" {
+		retained[currentName] = true
+	}
+	for _, entry := range values {
+		if len(retained) >= keep {
+			break
+		}
+		retained[entry.name] = true
+	}
+	for _, entry := range values {
+		if retained[entry.name] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(generationsDir, entry.name)); err != nil { // #nosec G703 -- entry names are returned by ReadDir from the private generations directory.
+			return err
+		}
+	}
+	return nil
+}
+
+// validatePanelEdgeKeySeparation prevents an accidentally reused private key
+// from being accepted at startup. Missing edge files are allowed so automatic
+// provisioning can create the first per-node pair.
+func (m *panelCertificateManager) validatePanelEdgeKeySeparation() error {
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.edgeCertFile == "" || m.edgeKeyFile == "" {
+		return nil
+	}
+	panelCertFile, panelKeyFile := m.panelPairPaths()
+	panelPair, panelErr := tls.LoadX509KeyPair(panelCertFile, panelKeyFile)
+	if errors.Is(panelErr, os.ErrNotExist) {
+		return nil
+	}
+	if panelErr != nil || len(panelPair.Certificate) == 0 {
+		return nil
+	}
+	panelCert, err := x509.ParseCertificate(panelPair.Certificate[0])
+	if err != nil {
+		return nil
+	}
+	panelSPKI, err := x509.MarshalPKIXPublicKey(panelCert.PublicKey)
+	if err != nil {
+		return nil
+	}
+	comparePair := func(certFile, keyFile string) error {
+		edgePair, edgeErr := tls.LoadX509KeyPair(certFile, keyFile)
+		if errors.Is(edgeErr, os.ErrNotExist) || edgeErr != nil || len(edgePair.Certificate) == 0 {
+			return nil
+		}
+		edgeCert, parseErr := x509.ParseCertificate(edgePair.Certificate[0])
+		if parseErr != nil {
+			return nil
+		}
+		edgeSPKI, marshalErr := x509.MarshalPKIXPublicKey(edgeCert.PublicKey)
+		if marshalErr == nil && bytes.Equal(panelSPKI, edgeSPKI) {
+			return errors.New("panel TLS and edge TLS use the same private key; configure a dedicated edge certificate")
+		}
+		return nil
+	}
+	if err := comparePair(m.edgeCertFile, m.edgeKeyFile); err != nil {
+		return err
+	}
+	edgeRoot := m.edgeStateRoot
+	if edgeRoot == "" {
+		return errors.New("edge TLS state directory is unavailable")
+	}
+	entries, readErr := os.ReadDir(edgeRoot)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		certFile := filepath.Join(edgeRoot, entry.Name(), "current", "fullchain.pem")
+		keyFile := filepath.Join(edgeRoot, entry.Name(), "current", "privkey.pem")
+		if err := comparePair(certFile, keyFile); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type issuedPanelCertificate struct {
+	certPEM     []byte
+	keyPEM      []byte
+	certificate tls.Certificate
+}
+
+type installedPanelCertificateBackup struct {
+	certPEM      []byte
+	keyPEM       []byte
+	marker       []byte
+	certExists   bool
+	keyExists    bool
+	markerExists bool
+}
+
+type cloudflareClient struct {
+	token      string
+	httpClient *http.Client
+	apiBase    string
+	// installUUID scopes DNS ownership markers to one Meridian installation;
+	// empty means the pre-scoped legacy marker.
+	installUUID string
+}
+
+type cloudflareResponse struct {
+	Success bool `json:"success"`
+	Errors  []struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"errors"`
+	Result     json.RawMessage      `json:"result"`
+	ResultInfo cloudflareResultInfo `json:"result_info"`
+}
+
+// cloudflareResultInfo carries Cloudflare list pagination metadata so list
+// helpers can follow every page instead of silently truncating at per_page.
+type cloudflareResultInfo struct {
+	Page       int `json:"page"`
+	TotalPages int `json:"total_pages"`
+}
+
+const (
+	cloudflareRequestMaxAttempts = 3
+	cloudflareRequestRetryBase   = 250 * time.Millisecond
+	cloudflareRequestBodyLimit   = 1 << 20
+)
+
+// cleanConfiguredTLSPath normalizes valid administrator paths for consistent
+// comparisons. Validation is performed by validateTLSPathConfiguration before
+// the server starts; retaining the cleaned raw value here keeps legacy callers
+// that only need to display paths deterministic.
+func cleanConfiguredTLSPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if canonical, err := canonicalConfiguredPath(value); err == nil {
+		return canonical
+	}
+	return filepath.Clean(value)
+}
+
+func tlsStateDir(dbPath string) string {
+	configured := strings.TrimSpace(os.Getenv("TLS_STATE_DIR"))
+	if configured != "" {
+		return filepath.Clean(configured)
+	}
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return ""
+	}
+	base, err := filepath.Abs(filepath.Dir(dbPath))
+	if err != nil {
+		base = filepath.Dir(filepath.Clean(dbPath))
+	}
+	return filepath.Join(base, "tls")
+}
+
+// canonicalConfiguredPath requires an absolute path and resolves symlinked
+// ancestors even when the final file has not been created yet. This prevents
+// lexical path checks from mistaking a shared symlinked directory for a safe
+// independent TLS location.
+func canonicalConfiguredPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("path is empty")
+	}
+	if !filepath.IsAbs(value) {
+		return "", errors.New("path must be absolute")
+	}
+	clean := filepath.Clean(value)
+	probe := clean
+	parts := make([]string, 0, 4)
+	for {
+		_, err := os.Lstat(probe)
+		if err == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(probe)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			for index := len(parts) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, parts[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", errors.New("path has no existing ancestor")
+		}
+		parts = append(parts, filepath.Base(probe))
+		probe = parent
+	}
+}
+
+func tlsPathPairError(certName, keyName string) error {
+	cert := strings.TrimSpace(os.Getenv(certName))
+	key := strings.TrimSpace(os.Getenv(keyName))
+	if (cert == "") != (key == "") {
+		return fmt.Errorf("%s and %s must be configured together", certName, keyName)
+	}
+	return nil
+}
+
+func validateTLSPathConfiguration(dbPath string) error {
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	dbAbsolute, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("resolve database path: %w", err)
+	}
+	dbCanonical, err := canonicalConfiguredPath(dbAbsolute)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("resolve database path: %w", err)
+	}
+	if err != nil {
+		dbCanonical = filepath.Clean(dbAbsolute)
+	}
+	stateRaw := tlsStateDir(dbPath)
+	if stateInfo, stateErr := os.Lstat(stateRaw); stateErr == nil && stateInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("TLS_STATE_DIR must not be a symlink")
+	} else if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect TLS_STATE_DIR: %w", stateErr)
+	}
+	stateCanonical, err := canonicalConfiguredPath(stateRaw)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("invalid TLS_STATE_DIR: %w", err)
+	}
+	if err != nil {
+		stateCanonical = filepath.Clean(stateRaw)
+	}
+	if filepath.Clean(stateCanonical) != filepath.Clean(stateRaw) {
+		return errors.New("TLS_STATE_DIR must not use symlinked ancestors")
+	}
+	protected := []string{dbCanonical, dbCanonical + backupPendingSuffix, dbCanonical + backupAppliedSuffix, dbCanonical + backupRollbackSuffix}
+	if stateCanonical == "" {
+		return errors.New("TLS_STATE_DIR must be separate from the database and restore paths")
+	}
+	for _, blocked := range protected {
+		if tlsPathsOverlap(stateCanonical, blocked) {
+			return errors.New("TLS_STATE_DIR must be separate from the database and restore paths")
+		}
+	}
+	if pathWithin(stateCanonical, dbCanonical) || pathWithin(dbCanonical, stateCanonical) {
+		return errors.New("TLS_STATE_DIR must be separate from the database and restore paths")
+	}
+	for _, pair := range [][2]string{{"PANEL_TLS_CERT_FILE", "PANEL_TLS_KEY_FILE"}, {"EDGE_TLS_CERT_FILE", "EDGE_TLS_KEY_FILE"}} {
+		if err := tlsPathPairError(pair[0], pair[1]); err != nil {
+			return err
+		}
+		for _, name := range pair {
+			raw := strings.TrimSpace(os.Getenv(name))
+			if raw == "" {
+				continue
+			}
+			canonical, pathErr := canonicalConfiguredPath(raw)
+			if pathErr != nil {
+				return fmt.Errorf("invalid %s: %w", name, pathErr)
+			}
+			for _, blocked := range protected {
+				if tlsPathsOverlap(canonical, blocked) {
+					return fmt.Errorf("%s must not point to the database or restore marker", name)
+				}
+			}
+			if pathWithin(stateCanonical, canonical) || pathWithin(canonical, stateCanonical) {
+				return fmt.Errorf("%s must be outside TLS_STATE_DIR", name)
+			}
+		}
+	}
+	return nil
+}
+
+func panelTLSPaths(dbPath string) (certFile, keyFile string) {
+	certFile = strings.TrimSpace(os.Getenv("PANEL_TLS_CERT_FILE"))
+	keyFile = strings.TrimSpace(os.Getenv("PANEL_TLS_KEY_FILE"))
+	if certFile != "" || keyFile != "" {
+		return cleanConfiguredTLSPath(certFile), cleanConfiguredTLSPath(keyFile)
+	}
+	base := tlsStateDir(dbPath)
+	if base == "" {
+		return "", ""
+	}
+	return filepath.Join(base, "fullchain.pem"), filepath.Join(base, "privkey.pem")
+}
+
+func panelTLSBackupPaths(dbPath string) (certFile, keyFile string) {
+	certFile, keyFile = panelTLSPaths(dbPath)
+	if certFile == "" {
+		return certFile, keyFile
+	}
+	stateDir := tlsStateDir(dbPath)
+	currentDir := filepath.Join(stateDir, ".panel-current")
+	if stateDir != "" {
+		if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil { // #nosec G703 -- stateDir is a validated private Meridian directory.
+			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+		}
+	}
+	if stateDir == "" {
+		currentDir = filepath.Join(filepath.Dir(certFile), ".panel-current")
+		if _, err := os.Stat(filepath.Join(currentDir, "fullchain.pem")); err == nil {
+			return filepath.Join(currentDir, "fullchain.pem"), filepath.Join(currentDir, "privkey.pem")
+		}
+	}
+	return certFile, keyFile
+}
+
+func edgeNodeTLSRoot(dbPath string) string {
+	stateDir := tlsStateDir(dbPath)
+	if stateDir == "" {
+		return ""
+	}
+	// Meridian-owned Edge state always lives below TLS_STATE_DIR. Legacy
+	// external directories are read only by migrateLegacyEdgeTLSState during
+	// startup and are never selected by the runtime.
+	return filepath.Join(stateDir, "edge-nodes")
+}
+
+func legacyEdgeNodeTLSRoot(dbPath string) string {
+	configured := strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
+	if configured == "" {
+		return ""
+	}
+	// Preserve the operator's lexical path here. Migration must be able to
+	// detect and reject symlinked ancestors rather than canonicalizing them
+	// away before the safety check.
+	certFile, err := filepath.Abs(filepath.Clean(configured))
+	if err != nil || certFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(certFile), "edge-nodes")
+}
+
+func validTLSNodeGUID(guid string) bool {
+	guid = strings.TrimSpace(guid)
+	if guid == "" || guid == "." || guid == ".." || strings.ContainsAny(guid, `/\\`) {
+		return false
+	}
+	for _, r := range guid {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// removeManagedEdgeNodeTLS removes only the Meridian-owned state for one
+// deleted node. External certificate paths and legacy edge-nodes directories
+// are operator-owned and are never touched here.
+func removeManagedEdgeNodeTLS(dbPath, nodeGUID string) error {
+	if strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	if !validTLSNodeGUID(nodeGUID) {
+		return errors.New("node GUID is invalid")
+	}
+	root := edgeNodeTLSRoot(dbPath)
+	if root == "" {
+		return nil
+	}
+	root = filepath.Clean(root)
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("TLS_STATE_DIR edge namespace is not a real directory")
+	}
+	target := filepath.Join(root, nodeGUID)
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return errors.New("edge TLS path escapes TLS_STATE_DIR")
+	}
+	// Refuse to follow an operator-created symlink anywhere in the path. The
+	// target may not exist, so missing ancestors are allowed after the root.
+	for current := target; ; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return errors.New("edge TLS path contains a symlink")
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		if current == root {
+			break
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return errors.New("edge TLS path has no TLS_STATE_DIR ancestor")
+		}
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return os.Remove(target)
+	}
+	return os.RemoveAll(target)
+}
+
+const (
+	legacyEdgeCertificateMaxBytes = 4 << 20
+	legacyEdgePrivateKeyMaxBytes  = 1 << 20
+)
+
+func readLegacyTLSFile(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > maxBytes {
+		return nil, errors.New("legacy TLS file is not a bounded regular file")
+	}
+	file, err := os.Open(path) // #nosec G304 -- path is constructed from an administrator-owned legacy root and validated node GUID.
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || int64(len(data)) > maxBytes {
+		return nil, errors.New("legacy TLS file exceeds size limit")
+	}
+	return data, nil
+}
+
+// validateLegacyTLSPathComponents rejects symlinked ancestors before a legacy
+// certificate is copied into TLS_STATE_DIR. Lexical filepath.Clean checks are
+// insufficient here because an operator-owned legacy directory may contain a
+// link that escapes the allowlisted node namespace.
+func validateLegacyTLSPathComponents(root, path string) error {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	// Inspect ancestors individually. Lstat on a nested path follows a
+	// symlinked parent, so checking only the final path is not sufficient.
+	for ancestor := path; ; ancestor = filepath.Dir(ancestor) {
+		info, statErr := os.Lstat(ancestor)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return errors.New("legacy TLS path contains a symlinked ancestor")
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			break
+		}
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return errors.New("legacy TLS path escapes its root")
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("legacy TLS path contains a symlink")
+		}
+	}
+	return nil
+}
+
+// migrateLegacyEdgeTLSState performs a one-time, allowlisted copy from the
+// pre-TLS_STATE_DIR external edge-nodes directory. It only considers GUIDs
+// present in control_nodes, validates regular files and the key pair, and
+// leaves the legacy directory untouched for operator rollback.
+func migrateLegacyEdgeTLSState(db *DB, dbPath string) error {
+	if db == nil || strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	if err := validateTLSPathConfiguration(dbPath); err != nil {
+		return fmt.Errorf("invalid TLS path configuration: %w", err)
+	}
+	legacyRoot := legacyEdgeNodeTLSRoot(dbPath)
+	stateRoot := edgeNodeTLSRoot(dbPath)
+	if legacyRoot == "" || filepath.Clean(legacyRoot) == filepath.Clean(stateRoot) {
+		return nil
+	}
+	if _, err := os.Stat(legacyRoot); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	rows, err := db.db.Query("SELECT guid FROM control_nodes WHERE TRIM(guid) <> ''")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var guid string
+		if err := rows.Scan(&guid); err != nil {
+			return err
+		}
+		if !validTLSNodeGUID(guid) {
+			continue
+		}
+		sourceDir := filepath.Join(legacyRoot, guid, "current")
+		certSource := filepath.Join(sourceDir, "fullchain.pem")
+		keySource := filepath.Join(sourceDir, "privkey.pem")
+		// Validate every ancestor, including the GUID/current directories, so
+		// the allowlisted copy can never follow an operator-created symlink.
+		if err := validateLegacyTLSPathComponents(legacyRoot, certSource); err != nil {
+			continue
+		}
+		if err := validateLegacyTLSPathComponents(legacyRoot, keySource); err != nil {
+			continue
+		}
+		certPEM, certErr := readLegacyTLSFile(certSource, legacyEdgeCertificateMaxBytes)
+		keyPEM, keyErr := readLegacyTLSFile(keySource, legacyEdgePrivateKeyMaxBytes)
+		if errors.Is(certErr, os.ErrNotExist) || errors.Is(keyErr, os.ErrNotExist) {
+			continue
+		}
+		if certErr != nil || keyErr != nil {
+			// Legacy state is an operator-owned, low-trust input. Ignore
+			// symlinks, special files, oversized material, and unreadable entries;
+			// never activate a partially validated pair.
+			continue
+		}
+		if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+			continue
+		}
+		targetCert := filepath.Join(stateRoot, guid, "current", "fullchain.pem")
+		targetKey := filepath.Join(stateRoot, guid, "current", "privkey.pem")
+		if _, certErr := os.Stat(targetCert); certErr == nil {
+			if _, keyErr := os.Stat(targetKey); keyErr == nil {
+				continue
+			}
+		}
+		if err := installCertificatePairAtomic(targetCert, targetKey, certPEM, keyPEM); err != nil {
+			return fmt.Errorf("migrate edge TLS for node %s: %w", guid, err)
+		}
+	}
+	return rows.Err()
+}
+
+// edgeTLSPaths deliberately has its own certificate and key.  Edge nodes are
+// untrusted execution environments relative to the panel; the panel key must
+// never be included in an Agent runtime configuration.
+func edgeTLSPaths(dbPath string) (certFile, keyFile string) {
+	certFile = strings.TrimSpace(os.Getenv("EDGE_TLS_CERT_FILE"))
+	keyFile = strings.TrimSpace(os.Getenv("EDGE_TLS_KEY_FILE"))
+	if certFile != "" || keyFile != "" {
+		return cleanConfiguredTLSPath(certFile), cleanConfiguredTLSPath(keyFile)
+	}
+	base := tlsStateDir(dbPath)
+	if base == "" {
+		return "", ""
+	}
+	return filepath.Join(base, "edge-fullchain.pem"), filepath.Join(base, "edge-privkey.pem")
+}
+
+func newPanelCertificateManager(dbPath string, httpClient *http.Client) *panelCertificateManager {
+	certFile, keyFile := panelTLSPaths(dbPath)
+	edgeCertFile, edgeKeyFile := edgeTLSPaths(dbPath)
+	stateDir := tlsStateDir(dbPath)
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	accountDir := stateDir
+	return &panelCertificateManager{
+		certFile:      certFile,
+		keyFile:       keyFile,
+		edgeCertFile:  edgeCertFile,
+		edgeKeyFile:   edgeKeyFile,
+		stateDir:      stateDir,
+		edgeStateRoot: edgeNodeTLSRoot(dbPath),
+		accountDir:    accountDir,
+		httpClient:    httpClient,
+		issueGate:     make(chan struct{}, 1),
+	}
+}
+
+func (m *panelCertificateManager) attachDB(db *DB) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.db = db
+	m.mu.Unlock()
+}
+
+func (m *panelCertificateManager) status(settings PanelSettings, activePanelDomain, activeRouteDomain string, activeListenPort int, tlsEnabled bool) panelCertificateStatus {
+	status := panelCertificateStatus{
+		Available:          m != nil && m.certFile != "" && m.keyFile != "",
+		TLSEnabled:         tlsEnabled,
+		PanelDomain:        settings.PanelDomain,
+		PanelPrefix:        panelPrefixForSettings(settings),
+		RouteDomain:        settings.RouteDomain,
+		WildcardDomain:     wildcardDomainForSettings(settings),
+		ListenPort:         settings.ListenPort,
+		ActiveListenPort:   activeListenPort,
+		RestartRequired:    settings.TLSEnabled != tlsEnabled || settings.PanelDomain != activePanelDomain || settings.RouteDomain != activeRouteDomain || settings.ListenPort != activeListenPort,
+		SettingsConfigured: settings.Configured && settings.PanelDomain != "" && settings.RouteDomain != "" && settings.ListenPort != 0,
+	}
+	status.PanelCoveredByEdgeWildcard = settings.PanelDomain != "" && settings.RouteDomain != "" && wildcardDomainCoversHost(settings.RouteDomain, settings.PanelDomain)
+	if m == nil {
+		return status
+	}
+	// Only the in-memory issuing flag and the pair paths need the manager
+	// mutex. File reads, parsing and chain verification run outside it: they
+	// touch disk and the system trust store, and GetCertificate for every TLS
+	// handshake shares this mutex, so holding it across that I/O would stall
+	// panel handshakes whenever a status poll hit a slow disk.
+	m.mu.Lock()
+	status.Issuing = m.issuing
+	certFile, _ := m.panelPairPaths()
+	m.mu.Unlock()
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- certFile is an administrator-configured TLS path captured when the certificate manager is created, never an HTTP request value.
+	if err != nil {
+		return status
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return status
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return status
+	}
+	status.Configured = true
+	for _, name := range certificate.DNSNames {
+		if strings.HasPrefix(name, "*.") {
+			status.CertificateWildcardDomain = strings.ToLower(name)
+			break
+		}
+	}
+	configuredPanelDomain := strings.TrimSpace(settings.PanelDomain)
+	activePanelDomain = strings.TrimSpace(activePanelDomain)
+	status.CertificateCurrent = activePanelDomain != "" && certificate.VerifyHostname(activePanelDomain) == nil
+	status.CertificateMatchesConfiguredDomain = configuredPanelDomain != "" && certificate.VerifyHostname(configuredPanelDomain) == nil
+	wildcardDomain := wildcardDomainForSettings(settings)
+	routeProbeHost := routeWildcardProbeHost(settings.RouteDomain)
+	status.CertificateMatchesRouteWildcard = certificateHasExactDNSName(certificate, wildcardDomain)
+	now := time.Now()
+	timeValid := !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
+	chainValid := configuredPanelDomain != "" && status.CertificateMatchesRouteWildcard &&
+		verifyCertificateChainForHost(certFile, configuredPanelDomain) == nil &&
+		verifyCertificateChainForHost(certFile, routeProbeHost) == nil
+	status.CertificateValid = timeValid && chainValid
+	status.Subject = certificate.Subject.CommonName
+	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
+	days := int(time.Until(certificate.NotAfter).Hours() / 24)
+	if days < 0 {
+		days = 0
+	}
+	status.DaysRemaining = days
+	return status
+}
+
+func certificateNeedsRenewal(status panelCertificateStatus) bool {
+	return !status.Configured || !status.CertificateMatchesConfiguredDomain || !status.CertificateMatchesRouteWildcard || !status.CertificateValid || status.DaysRemaining <= int(panelCertificateRenewalWindow.Hours()/24)
+}
+
+func certificateCanBeReused(status panelCertificateStatus) bool {
+	return status.CertificateMatchesConfiguredDomain && status.CertificateMatchesRouteWildcard && status.CertificateValid && !certificateNeedsRenewal(status)
+}
+
+func certificateStatusForFile(certFile string, expectedWildcard string) panelCertificateStatus {
+	status := panelCertificateStatus{WildcardDomain: expectedWildcard}
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- path is derived from the administrator-controlled TLS directory.
+	if err != nil {
+		return status
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return status
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return status
+	}
+	status.Configured = true
+	now := time.Now()
+	status.CertificateValid = !now.Before(certificate.NotBefore) && now.Before(certificate.NotAfter)
+	for _, name := range certificate.DNSNames {
+		if strings.HasPrefix(name, "*.") {
+			status.CertificateWildcardDomain = strings.ToLower(name)
+			break
+		}
+	}
+	status.CertificateMatchesRouteWildcard = certificateHasExactDNSName(certificate, expectedWildcard)
+	status.CertificateCurrent = expectedWildcard == "" || status.CertificateMatchesRouteWildcard
+	status.ExpiresAt = certificate.NotAfter.UTC().Format(time.RFC3339)
+	status.DaysRemaining = int(time.Until(certificate.NotAfter).Hours() / 24)
+	if status.DaysRemaining < 0 {
+		status.DaysRemaining = 0
+	}
+	return status
+}
+
+func certificateHasExactDNSName(certificate *x509.Certificate, expected string) bool {
+	expected = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(expected)), ".")
+	if certificate == nil || expected == "" {
+		return false
+	}
+	for _, name := range certificate.DNSNames {
+		if strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".") == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func certificateCoversHost(certFile, host string) error {
+	data, err := os.ReadFile(certFile) // #nosec G703 G304 -- path is derived from the administrator-controlled TLS directory.
+	if err != nil {
+		return fmt.Errorf("read edge TLS certificate: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return errors.New("edge TLS certificate is invalid")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse edge TLS certificate: %w", err)
+	}
+	if err := certificate.VerifyHostname(strings.TrimSpace(host)); err != nil {
+		return fmt.Errorf("edge TLS certificate does not cover host %q", host)
+	}
+	return nil
+}
+
+// verifyCertificateChainForHost validates the complete PEM chain against the
+// host's system trust store.  Hostname-only checks are insufficient for edge
+// reuse because a self-signed or not-yet-valid certificate can still contain
+// the expected SAN.
+func verifyCertificateChainForHost(certFile, host string) error {
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- path is derived from administrator-controlled TLS configuration.
+	if err != nil {
+		return fmt.Errorf("read edge TLS certificate: %w", err)
+	}
+	return verifyCertificateChainPEMForHost(data, host, nil)
+}
+
+func verifyCertificateChainPEMForHost(data []byte, host string, trustedRoots *x509.CertPool) error {
+	var chain []*x509.Certificate
+	for rest := data; len(rest) > 0; {
+		block, remaining := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = remaining
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			return fmt.Errorf("parse edge TLS certificate: %w", parseErr)
+		}
+		chain = append(chain, cert)
+	}
+	if len(chain) == 0 {
+		return errors.New("edge TLS certificate chain is empty")
+	}
+	if trustedRoots == nil {
+		var err error
+		trustedRoots, err = x509.SystemCertPool()
+		if err != nil || trustedRoots == nil {
+			return errors.New("system trust store is unavailable")
+		}
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range chain[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := chain[0].Verify(x509.VerifyOptions{DNSName: strings.TrimSpace(host), CurrentTime: time.Now(), Roots: trustedRoots, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		return fmt.Errorf("edge TLS certificate chain is not trusted: %w", err)
+	}
+	return nil
+}
+
+func wildcardDomainCoversHost(routeDomain, host string) bool {
+	route := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+	value := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if route == "" || value == "" {
+		return true
+	}
+	suffix := "." + route
+	if !strings.HasSuffix(value, suffix) {
+		return false
+	}
+	label := strings.TrimSuffix(value, suffix)
+	return label != "" && !strings.Contains(label, ".")
+}
+
+func routeWildcardProbeHost(routeDomain string) string {
+	route := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(routeDomain)), ".")
+	if route == "" {
+		return ""
+	}
+	return "meridian-edge-check." + route
+}
+
+func panelACMETokenKeyForSecret(secret []byte) []byte {
+	h := sha256.New()
+	_, _ = h.Write([]byte("meridian panel acme dns token v1\x00"))
+	_, _ = h.Write(secret)
+	return h.Sum(nil)
+}
+
+func encryptPanelACMEToken(token string) (string, error) {
+	return encryptPanelACMETokenWithSecret(token, jwtSecret)
+}
+
+func encryptPanelACMETokenWithSecret(token string, secret []byte) (string, error) {
+	token = strings.TrimSpace(token)
+	if len(token) < 20 || len(token) > 512 || strings.ContainsAny(token, "\r\n") {
+		return "", errors.New("a valid Cloudflare DNS API token is required")
+	}
+	block, err := aes.NewCipher(panelACMETokenKeyForSecret(secret))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(token), []byte("meridian-panel-acme"))
+	return panelACMETokenCipherPrefix + base64.RawURLEncoding.EncodeToString(append(nonce, sealed...)), nil
+}
+
+func decryptPanelACMEToken(ciphertext string) (string, error) {
+	return decryptPanelACMETokenWithSecret(ciphertext, jwtSecret)
+}
+
+func decryptPanelACMETokenWithSecret(ciphertext string, secret []byte) (string, error) {
+	if !strings.HasPrefix(ciphertext, panelACMETokenCipherPrefix) {
+		return "", errors.New("invalid Cloudflare DNS API token ciphertext")
+	}
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(ciphertext, panelACMETokenCipherPrefix))
+	if err != nil {
+		return "", fmt.Errorf("decode Cloudflare DNS API token: %w", err)
+	}
+	block, err := aes.NewCipher(panelACMETokenKeyForSecret(secret))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil || len(payload) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("invalid Cloudflare DNS API token ciphertext")
+	}
+	plain, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], []byte("meridian-panel-acme"))
+	if err != nil {
+		return "", fmt.Errorf("decrypt Cloudflare DNS API token: %w", err)
+	}
+	return string(plain), nil
+}
+
+func (m *panelCertificateManager) tlsConfig(enabled bool) (*tls.Config, bool, error) {
+	if !enabled {
+		return nil, false, nil
+	}
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return nil, false, errors.New("panel TLS certificate storage is unavailable")
+	}
+	certFile, keyFile := m.panelPairPaths()
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, false, fmt.Errorf("load panel TLS certificate: %w", err)
+	}
+	m.mu.Lock()
+	m.currentCertificate = &certificate
+	m.mu.Unlock()
+	if err := writePrivateFileAtomic(filepath.Join(m.accountDir, "enabled"), []byte("enabled\n")); err != nil {
+		return nil, false, fmt.Errorf("write panel TLS enabled marker: %w", err)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if m.currentCertificate == nil {
+				return nil, errors.New("panel TLS certificate is unavailable")
+			}
+			return m.currentCertificate, nil
+		},
+	}, true, nil
+}
+
+func validatePanelCertificateRequest(email, token string) error {
+	email = strings.TrimSpace(email)
+	address, err := mail.ParseAddress(email)
+	if err != nil || !strings.EqualFold(address.Address, email) || len(email) > 254 {
+		return errors.New("a valid ACME email address is required")
+	}
+	token = strings.TrimSpace(token)
+	if len(token) < 20 || len(token) > 512 || strings.ContainsAny(token, "\r\n") {
+		return errors.New("a valid Cloudflare DNS API token is required")
+	}
+	return nil
+}
+
+func (m *panelCertificateManager) issueCloudflare(ctx context.Context, email, token, panelDomain, routeDomain string, staging bool) (*issuedPanelCertificate, error) {
+	settings, err := normalizeManagedPanelSettings(panelDomain, routeDomain)
+	if err != nil {
+		return nil, err
+	}
+	// The controller listener also terminates TLS for host-mode sites. Keep the
+	// route wildcard on the controller certificate for those sites, and add a
+	// separate exact SAN only when the configured Panel hostname is nested and
+	// therefore outside the wildcard's coverage. Edge nodes obtain their own
+	// per-node certificate through the renewal path and never receive this key.
+	identifiers := panelCertificateIdentifiers(settings)
+	return m.issueCloudflareForIdentifiers(ctx, email, token, settings.RouteDomain, identifiers, staging)
+}
+
+// reusableCertificateForIdentifiers returns the currently installed panel
+// certificate pair when it is time-valid with more than the renewal window
+// remaining and covers every requested identifier (exact SANs or the route
+// wildcard). Callers invoke it after the shared issuance locks are held so a
+// concurrent issuer's fresh certificate is reused instead of re-issued.
+func (m *panelCertificateManager) reusableCertificateForIdentifiers(identifiers []string) *issuedPanelCertificate {
+	if m == nil || m.certFile == "" || m.keyFile == "" || len(identifiers) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	certFile, keyFile := m.panelPairPaths()
+	m.mu.Unlock()
+	data, err := os.ReadFile(certFile) // #nosec G304 G703 -- certFile is the manager-owned TLS path captured at construction.
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	if now.Before(certificate.NotBefore) || !now.Before(certificate.NotAfter) {
+		return nil
+	}
+	if time.Until(certificate.NotAfter) <= panelCertificateRenewalWindow {
+		return nil
+	}
+	for _, identifier := range identifiers {
+		verifyHost := identifier
+		if strings.HasPrefix(identifier, "*.") {
+			if !certificateHasExactDNSName(certificate, identifier) {
+				return nil
+			}
+			verifyHost = "meridian-edge-check." + strings.TrimPrefix(identifier, "*.")
+		} else if certificate.VerifyHostname(identifier) != nil {
+			return nil
+		}
+		if err := verifyCertificateChainPEMForHost(data, verifyHost, nil); err != nil {
+			return nil
+		}
+	}
+	keyPEM, err := os.ReadFile(keyFile) // #nosec G304 G703 -- keyFile is the manager-owned TLS path captured at construction.
+	if err != nil {
+		return nil
+	}
+	pair, err := tls.X509KeyPair(data, keyPEM)
+	if err != nil {
+		return nil
+	}
+	return &issuedPanelCertificate{certPEM: data, keyPEM: keyPEM, certificate: pair}
+}
+
+func panelCertificateIdentifiers(settings PanelSettings) []string {
+	wildcard := wildcardDomainForSettings(settings)
+	if wildcard == "" {
+		return nil
+	}
+	if wildcardDomainCoversHost(settings.RouteDomain, settings.PanelDomain) {
+		return []string{wildcard}
+	}
+	return []string{settings.PanelDomain, wildcard}
+}
+
+// issueCloudflareForIdentifiers issues one certificate for an explicit SAN
+// set. Edge certificates include a node-unique SAN alongside the shared
+// wildcard, so each node uses a distinct ACME identifier set and does not
+// consume the exact-set rate limit shared by every other node.
+func (m *panelCertificateManager) issueCloudflareForIdentifiers(ctx context.Context, email, token, routeDomain string, identifiers []string, staging bool) (*issuedPanelCertificate, error) {
+	normalizedRoute, err := normalizeRouteDomain(routeDomain)
+	if err != nil {
+		return nil, fmt.Errorf("invalid route domain: %w", err)
+	}
+	cleanIdentifiers := make([]string, 0, len(identifiers))
+	seen := make(map[string]bool, len(identifiers))
+	for _, identifier := range identifiers {
+		value := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(identifier), "."))
+		if value == "" || strings.ContainsAny(value, "\r\n") || len(value) > 253 {
+			return nil, errors.New("invalid ACME certificate identifier")
+		}
+		if _, err := normalizePublicHost(strings.TrimPrefix(value, "*.")); err != nil {
+			return nil, fmt.Errorf("invalid ACME certificate identifier %q: %w", value, err)
+		}
+		if strings.HasPrefix(value, "*.") && strings.Count(value, "*") != 1 {
+			return nil, errors.New("invalid wildcard certificate identifier")
+		}
+		if !seen[value] {
+			seen[value] = true
+			cleanIdentifiers = append(cleanIdentifiers, value)
+		}
+	}
+	if len(cleanIdentifiers) == 0 {
+		return nil, errors.New("at least one ACME certificate identifier is required")
+	}
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return nil, errors.New("可写的 TLS 数据目录不可用")
+	}
+	if err := validatePanelCertificateRequest(email, token); err != nil {
+		return nil, err
+	}
+	if err := m.acquireIssue(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseIssue()
+	m.mu.Lock()
+	lockDB := m.db
+	m.mu.Unlock()
+	lockOwner := ""
+	if lockDB != nil {
+		lockOwner = newACMELockOwner()
+		if err := lockDB.acquireACMELock(ctx, lockOwner, acmeIssueLeaseTTL); err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err := lockDB.releaseACMELock(lockOwner); err != nil {
+				// Issuance has completed; surface the release failure in logs while
+				// leaving the lease to expire safely if the database is unavailable.
+				log.Printf("[acme] release shared issuance lock failed: %v", err)
+			}
+		}()
+	}
+
+	// Another issuer (web request, renewal scheduler, or CLI) may have finished
+	// while this request waited for the shared issuance lock. If the currently
+	// installed certificate already covers every requested identifier and is
+	// well inside its renewal window, reuse it instead of burning a duplicate
+	// against the CA's per-week duplicate-certificate quota. Staging requests
+	// are explicit test issuances and always proceed.
+	if !staging {
+		if reused := m.reusableCertificateForIdentifiers(cleanIdentifiers); reused != nil {
+			return reused, nil
+		}
+	}
+
+	if err := os.MkdirAll(m.accountDir, 0o700); err != nil { // #nosec G703 -- accountDir is captured from administrator-configured TLS paths.
+		return nil, fmt.Errorf("create TLS directory: %w", err)
+	}
+	directoryURL := letsEncryptProductionDirectory
+	accountName := "acme-account.pem"
+	if staging {
+		directoryURL = letsEncryptStagingDirectory
+		accountName = "acme-account-staging.pem"
+	}
+	accountKey, err := loadOrCreateACMEAccountKey(m.accountDir, accountName)
+	if err != nil {
+		return nil, err
+	}
+	client := &acme.Client{Key: accountKey, DirectoryURL: directoryURL, UserAgent: "Meridian/" + appVersion}
+	_, err = client.Register(ctx, &acme.Account{Contact: []string{"mailto:" + strings.TrimSpace(email)}}, acme.AcceptTOS)
+	if err != nil && !errors.Is(err, acme.ErrAccountAlreadyExists) {
+		return nil, fmt.Errorf("register ACME account: %w", err)
+	}
+
+	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(cleanIdentifiers...))
+	if err != nil {
+		return nil, fmt.Errorf("create ACME order: %w", err)
+	}
+	cf := &cloudflareClient{token: strings.TrimSpace(token), httpClient: m.httpClient, apiBase: "https://api.cloudflare.com/client/v4"}
+	for _, authorizationURL := range order.AuthzURLs {
+		if err := fulfillCloudflareDNSAuthorization(ctx, client, cf, authorizationURL, normalizedRoute); err != nil {
+			return nil, err
+		}
+	}
+	readyOrder, err := client.WaitOrder(ctx, order.URI)
+	if err != nil {
+		return nil, fmt.Errorf("wait for ACME order: %w", err)
+	}
+	certificateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate certificate key: %w", err)
+	}
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: cleanIdentifiers}, certificateKey)
+	if err != nil {
+		return nil, fmt.Errorf("create certificate request: %w", err)
+	}
+	chain, _, err := client.CreateOrderCert(ctx, readyOrder.FinalizeURL, csr, true)
+	if err != nil {
+		return nil, fmt.Errorf("issue certificate: %w", err)
+	}
+	certPEM := make([]byte, 0, len(chain)*1024)
+	for _, der := range chain {
+		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificateKey)
+	if err != nil {
+		return nil, fmt.Errorf("encode certificate key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("validate issued certificate pair: %w", err)
+	}
+	return &issuedPanelCertificate{certPEM: certPEM, keyPEM: keyPEM, certificate: certificate}, nil
+}
+
+func (m *panelCertificateManager) install(issued *issuedPanelCertificate, activate bool) error {
+	if m == nil || issued == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return errors.New("issued panel certificate is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	certFile, keyFile := m.panelAtomicPairPaths()
+	if certFile == "" || keyFile == "" {
+		return errors.New("panel TLS certificate storage is unavailable")
+	}
+	if err := installCertificatePairAtomic(certFile, keyFile, issued.certPEM, issued.keyPEM); err != nil {
+		return fmt.Errorf("install certificate pair: %w", err)
+	}
+	if err := writePrivateFileAtomic(filepath.Join(m.accountDir, "enabled"), []byte("enabled\n")); err != nil {
+		return fmt.Errorf("write panel TLS enabled marker: %w", err)
+	}
+	if activate {
+		certificate := issued.certificate
+		m.currentCertificate = &certificate
+	}
+	return nil
+}
+
+func (m *panelCertificateManager) activate(issued *issuedPanelCertificate) {
+	if m == nil || issued == nil {
+		return
+	}
+	m.mu.Lock()
+	certificate := issued.certificate
+	m.currentCertificate = &certificate
+	m.mu.Unlock()
+}
+
+// disable clears the active in-memory certificate and marker without deleting
+// the certificate files. Keeping the files allows a later manual issuance or
+// renewal to reuse the existing storage after the panel has fallen back to
+// HTTP.
+func (m *panelCertificateManager) disable() error {
+	if m == nil || m.accountDir == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentCertificate = nil
+	err := os.Remove(filepath.Join(m.accountDir, "enabled")) // #nosec G703 -- accountDir is the managed TLS directory and enabled is a fixed marker basename.
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func readOptionalFile(filename string) ([]byte, bool, error) {
+	if filename == "" || filepath.Base(filename) == "." || filepath.Base(filename) == string(filepath.Separator) {
+		return nil, false, errors.New("invalid TLS file path")
+	}
+	root, err := os.OpenRoot(filepath.Dir(filename))
+	if err != nil {
+		return nil, false, err
+	}
+	file, err := root.Open(filepath.Base(filename))
+	if err != nil {
+		_ = root.Close()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, 1<<20))
+	closeErr := file.Close()
+	rootErr := root.Close()
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	if closeErr != nil {
+		return nil, false, closeErr
+	}
+	if rootErr != nil {
+		return nil, false, rootErr
+	}
+	return data, true, nil
+}
+
+func (m *panelCertificateManager) backupInstalledFiles() (installedPanelCertificateBackup, error) {
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return installedPanelCertificateBackup{}, errors.New("panel TLS certificate storage is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var backup installedPanelCertificateBackup
+	var err error
+	certFile, keyFile := m.panelPairPaths()
+	if backup.certPEM, backup.certExists, err = readOptionalFile(certFile); err != nil {
+		return installedPanelCertificateBackup{}, fmt.Errorf("back up certificate chain: %w", err)
+	}
+	if backup.keyPEM, backup.keyExists, err = readOptionalFile(keyFile); err != nil {
+		return installedPanelCertificateBackup{}, fmt.Errorf("back up certificate key: %w", err)
+	}
+	markerFile := filepath.Join(m.accountDir, "enabled")
+	if backup.marker, backup.markerExists, err = readOptionalFile(markerFile); err != nil {
+		return installedPanelCertificateBackup{}, fmt.Errorf("back up TLS marker: %w", err)
+	}
+	return backup, nil
+}
+
+func restoreOptionalFile(filename string, data []byte, existed bool) error {
+	if existed {
+		return writePrivateFileAtomic(filename, data)
+	}
+	err := os.Remove(filename) // #nosec G703 -- callers pass only the manager's certificate, private-key, or fixed enabled-marker path.
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (m *panelCertificateManager) restoreInstalledFiles(backup installedPanelCertificateBackup) error {
+	if m == nil || m.certFile == "" || m.keyFile == "" || m.accountDir == "" {
+		return errors.New("panel TLS certificate storage is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	certFile, keyFile := m.panelPairPaths()
+	if backup.certExists && backup.keyExists {
+		atomicCert, atomicKey := m.panelAtomicPairPaths()
+		if err := installCertificatePairAtomic(atomicCert, atomicKey, backup.certPEM, backup.keyPEM); err != nil {
+			return fmt.Errorf("restore certificate pair: %w", err)
+		}
+	} else {
+		// No previous pair means this was the first installation. Remove the
+		// newly-created atomic pointer before restoring the legacy paths.
+		atomicCert, _ := m.panelAtomicPairPaths()
+		currentDir := filepath.Dir(atomicCert)
+		if err := os.Remove(currentDir); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 -- currentDir is derived from the manager's validated TLS path.
+			if removeAllErr := os.RemoveAll(currentDir); removeAllErr != nil { // #nosec G703 -- currentDir is derived from the manager's validated TLS path.
+				return fmt.Errorf("remove new certificate pointer: %w", err)
+			}
+		}
+		// New managers keep operator-provided cert/key files outside Meridian's
+		// rollback namespace. Only legacy test/compatibility managers without a
+		// state directory may restore those historical paths.
+		if m.stateDir == "" {
+			if err := restoreOptionalFile(keyFile, backup.keyPEM, backup.keyExists); err != nil {
+				return fmt.Errorf("restore certificate key: %w", err)
+			}
+			if err := restoreOptionalFile(certFile, backup.certPEM, backup.certExists); err != nil {
+				return fmt.Errorf("restore certificate chain: %w", err)
+			}
+		}
+	}
+	if err := restoreOptionalFile(filepath.Join(m.accountDir, "enabled"), backup.marker, backup.markerExists); err != nil {
+		return fmt.Errorf("restore TLS marker: %w", err)
+	}
+	// Reload the restored pair instead of dropping the in-memory certificate.
+	// tlsConfig's GetCertificate fails every handshake while this pointer is nil,
+	// and nothing else repopulates it: status() reads the certificate from disk,
+	// so a restored-on-disk pair looks healthy and no renewal is scheduled. A
+	// rollback that only cleared the pointer therefore took the panel's HTTPS
+	// down until a manual restart.
+	//
+	// The pair paths are re-resolved here on purpose: the ones captured above
+	// describe the state before the rollback, so a manager whose active pair sits
+	// in the atomic generation pointer resolved to the legacy path while the
+	// pointer was absent, and loading from there would read the wrong file (or
+	// nothing at all). panelPairPaths() is also what tlsConfig itself uses, so
+	// resolving it now loads exactly the certificate the listener will serve.
+	m.currentCertificate = nil
+	restoredCert, restoredKey := m.panelPairPaths()
+	if restored, err := tls.LoadX509KeyPair(restoredCert, restoredKey); err == nil {
+		m.currentCertificate = &restored
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reload restored certificate pair: %w", err)
+	}
+	return nil
+}
+
+func loadOrCreateACMEAccountKey(directory, filename string) (crypto.Signer, error) {
+	if filename == "" || filename != filepath.Base(filename) {
+		return nil, errors.New("ACME account key filename must be a base name")
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return nil, fmt.Errorf("open ACME account directory: %w", err)
+	}
+	file, err := root.Open(filename)
+	if err == nil {
+		const maxAccountKeyBytes = 64 << 10
+		data, readErr := io.ReadAll(io.LimitReader(file, maxAccountKeyBytes+1))
+		closeErr := file.Close()
+		rootCloseErr := root.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read ACME account key: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close ACME account key: %w", closeErr)
+		}
+		if rootCloseErr != nil {
+			return nil, fmt.Errorf("close ACME account directory: %w", rootCloseErr)
+		}
+		if len(data) > maxAccountKeyBytes {
+			return nil, errors.New("stored ACME account key is too large")
+		}
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return nil, errors.New("stored ACME account key is invalid")
+		}
+		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse ACME account key: %w", err)
+		}
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, errors.New("stored ACME account key is not a signer")
+		}
+		return signer, nil
+	}
+	if closeErr := root.Close(); closeErr != nil {
+		return nil, fmt.Errorf("close ACME account directory: %w", closeErr)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read ACME account key: %w", err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate ACME account key: %w", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("encode ACME account key: %w", err)
+	}
+	if err := writePrivateFileAtomic(filepath.Join(directory, filename), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})); err != nil {
+		return nil, fmt.Errorf("write ACME account key: %w", err)
+	}
+	return key, nil
+}
+
+func writePrivateFileAtomic(filename string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil { // #nosec G703 G304 -- filename is generated from the configured private TLS directory.
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(filename), ".meridian-tls-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(filename); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G703 G304 -- filename is generated from the configured private TLS directory.
+			return err
+		}
+	}
+	if err := os.Rename(tmpName, filename); err != nil { // #nosec G703 G304 -- both paths are generated within the private TLS directory.
+		return err
+	}
+	return syncDirectory(filepath.Dir(filename))
+}
+
+func fulfillCloudflareDNSAuthorization(ctx context.Context, acmeClient *acme.Client, cf *cloudflareClient, authorizationURL, routeDomain string) error {
+	authorization, err := acmeClient.GetAuthorization(ctx, authorizationURL)
+	if err != nil {
+		return fmt.Errorf("get ACME authorization: %w", err)
+	}
+	if authorization.Status == acme.StatusValid {
+		return nil
+	}
+	var challenge *acme.Challenge
+	for _, candidate := range authorization.Challenges {
+		if candidate.Type == "dns-01" {
+			challenge = candidate
+			break
+		}
+	}
+	if challenge == nil {
+		return errors.New("ACME server did not offer a DNS-01 challenge")
+	}
+	value, err := acmeClient.DNS01ChallengeRecord(challenge.Token)
+	if err != nil {
+		return fmt.Errorf("prepare DNS-01 challenge: %w", err)
+	}
+	zoneLookupName := strings.TrimPrefix(authorization.Identifier.Value, "*.")
+	if _, err := normalizePublicHost(zoneLookupName); err != nil {
+		return fmt.Errorf("resolve DNS zone: %w", err)
+	}
+	zoneID, err := cf.findZone(ctx, zoneLookupName)
+	if err != nil {
+		return err
+	}
+	recordName := "_acme-challenge." + strings.TrimPrefix(authorization.Identifier.Value, "*.")
+	recordID, err := cf.createTXTRecord(ctx, zoneID, recordName, value)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = cf.deleteRecord(cleanupCtx, zoneID, recordID)
+	}()
+	if err := waitForTXTRecord(ctx, recordName, value); err != nil {
+		return err
+	}
+	if _, err := acmeClient.Accept(ctx, challenge); err != nil {
+		return fmt.Errorf("accept DNS-01 challenge: %w", err)
+	}
+	if _, err := acmeClient.WaitAuthorization(ctx, authorization.URI); err != nil {
+		return fmt.Errorf("validate DNS-01 challenge: %w", err)
+	}
+	return nil
+}
+
+func dnsPropagationResolvers() []*net.Resolver {
+	servers := strings.Split(strings.TrimSpace(os.Getenv("DNS_PROPAGATION_RESOLVERS")), ",")
+	if len(servers) == 1 && strings.TrimSpace(servers[0]) == "" {
+		servers = []string{"1.1.1.1", "8.8.8.8"}
+	}
+	resolvers := make([]*net.Resolver, 0, len(servers)*2+1)
+	for _, server := range servers {
+		server = strings.TrimSpace(server)
+		if net.ParseIP(server) == nil {
+			continue
+		}
+		for _, network := range []string{"udp", "tcp"} {
+			resolverIP := server
+			resolverNetwork := network
+			resolvers = append(resolvers, &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, resolverNetwork, net.JoinHostPort(resolverIP, "53"))
+			}})
+		}
+	}
+	// Keep the host resolver as a final fallback for split-horizon DNS and
+	// environments that intentionally block public recursive resolvers.
+	resolvers = append(resolvers, net.DefaultResolver)
+	return resolvers
+}
+
+func dnsPropagationTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("DNS_PROPAGATION_TIMEOUT"))
+	if value == "" {
+		return 2 * time.Minute
+	}
+	if duration, err := time.ParseDuration(value); err == nil && duration >= 10*time.Second && duration <= 15*time.Minute {
+		return duration
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 10 && seconds <= 900 {
+		return time.Duration(seconds) * time.Second
+	}
+	return 2 * time.Minute
+}
+
+func waitForTXTRecord(ctx context.Context, name, value string) error {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	timeout := time.NewTimer(dnsPropagationTimeout())
+	defer timeout.Stop()
+	resolvers := dnsPropagationResolvers()
+	for {
+		for _, resolver := range resolvers {
+			records, err := resolver.LookupTXT(ctx, name)
+			if err == nil {
+				for _, record := range records {
+					if record == value {
+						return nil
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return fmt.Errorf("DNS-01 record %s did not propagate within %s", name, dnsPropagationTimeout())
+		case <-ticker.C:
+		}
+	}
+}
+
+func cloudflareRequestRetryableMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		// Retrying POST could create duplicate DNS records when the first
+		// request succeeded but its response was lost.
+		return false
+	}
+}
+
+func cloudflareRequestRetryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
+}
+
+func waitCloudflareRequestRetry(ctx context.Context, attempt int) error {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := cloudflareRequestRetryBase * time.Duration(1<<(attempt-1))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// request retries only idempotent DNS operations. This covers transient
+// Cloudflare/API gateway failures without risking duplicate records from a
+// retried POST. The caller's context remains the overall retry budget.
+func (c *cloudflareClient) request(ctx context.Context, method, requestPath string, body io.Reader) (json.RawMessage, error) {
+	result, _, err := c.requestWithInfo(ctx, method, requestPath, body)
+	return result, err
+}
+
+// requestWithInfo behaves like request but also returns Cloudflare's
+// result_info block for paginated list endpoints.
+func (c *cloudflareClient) requestWithInfo(ctx context.Context, method, requestPath string, body io.Reader) (json.RawMessage, cloudflareResultInfo, error) {
+	if c == nil {
+		return nil, cloudflareResultInfo{}, errors.New("Cloudflare DNS client is unavailable")
+	}
+	var bodyBytes []byte
+	if body != nil {
+		data, err := io.ReadAll(io.LimitReader(body, cloudflareRequestBodyLimit+1))
+		if err != nil {
+			return nil, cloudflareResultInfo{}, fmt.Errorf("read Cloudflare DNS request: %w", err)
+		}
+		if len(data) > cloudflareRequestBodyLimit {
+			return nil, cloudflareResultInfo{}, errors.New("Cloudflare DNS request body is too large")
+		}
+		bodyBytes = data
+	}
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	maxAttempts := 1
+	if cloudflareRequestRetryableMethod(method) {
+		maxAttempts = cloudflareRequestMaxAttempts
+	}
+	endpoint := strings.TrimRight(c.apiBase, "/") + requestPath
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var requestBody io.Reader
+		if bodyBytes != nil {
+			requestBody = bytes.NewReader(bodyBytes)
+		}
+		request, err := http.NewRequestWithContext(ctx, method, endpoint, requestBody)
+		if err != nil {
+			return nil, cloudflareResultInfo{}, err
+		}
+		request.Header.Set("Authorization", "Bearer "+c.token)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			if attempt < maxAttempts && ctx.Err() == nil {
+				if retryErr := waitCloudflareRequestRetry(ctx, attempt); retryErr == nil {
+					continue
+				}
+			}
+			return nil, cloudflareResultInfo{}, fmt.Errorf("cloudflare DNS request failed: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, cloudflareRequestBodyLimit))
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			if attempt < maxAttempts && ctx.Err() == nil {
+				if retryErr := waitCloudflareRequestRetry(ctx, attempt); retryErr == nil {
+					continue
+				}
+			}
+			return nil, cloudflareResultInfo{}, fmt.Errorf("read Cloudflare DNS response: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, cloudflareResultInfo{}, fmt.Errorf("close Cloudflare DNS response: %w", closeErr)
+		}
+		// Gate retries on the HTTP status before decoding the body. Gateways
+		// often return HTML or an empty body for 429/5xx responses, and those
+		// responses are still safely retryable for idempotent operations.
+		if attempt < maxAttempts && cloudflareRequestRetryableStatus(response.StatusCode) && ctx.Err() == nil {
+			if retryErr := waitCloudflareRequestRetry(ctx, attempt); retryErr == nil {
+				continue
+			}
+		}
+		var envelope cloudflareResponse
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return nil, cloudflareResultInfo{}, errors.New("cloudflare DNS returned an invalid response")
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
+			message := "cloudflare DNS request was rejected"
+			if len(envelope.Errors) > 0 && strings.TrimSpace(envelope.Errors[0].Message) != "" {
+				message += ": " + strings.TrimSpace(envelope.Errors[0].Message)
+			}
+			return nil, cloudflareResultInfo{}, errors.New(message)
+		}
+		return envelope.Result, envelope.ResultInfo, nil
+	}
+	return nil, cloudflareResultInfo{}, errors.New("cloudflare DNS request failed after retries")
+}
+
+func (c *cloudflareClient) findZone(ctx context.Context, zoneName string) (string, error) {
+	value := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zoneName)), ".")
+	if value == "" {
+		return "", errors.New("cloudflare DNS zone name is empty")
+	}
+	labels := strings.Split(value, ".")
+	if len(labels) < 2 {
+		return "", fmt.Errorf("cloudflare DNS zone %s was not found", zoneName)
+	}
+	// Query the most specific candidate first. This supports installations
+	// where edge.example.com is delegated as its own Cloudflare zone while
+	// still falling back to the registrable parent example.com.
+	for start := 0; start <= len(labels)-2; start++ {
+		candidate := strings.Join(labels[start:], ".")
+		result, err := c.request(ctx, http.MethodGet, "/zones?name="+url.QueryEscape(candidate)+"&status=active&per_page=1", nil)
+		if err != nil {
+			return "", err
+		}
+		var zones []struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(result, &zones); err != nil {
+			return "", errors.New("cloudflare DNS returned an invalid zone response")
+		}
+		if len(zones) > 0 && zones[0].ID != "" {
+			return zones[0].ID, nil
+		}
+	}
+	return "", fmt.Errorf("cloudflare DNS zone %s was not found", zoneName)
+}
+
+func (c *cloudflareClient) createTXTRecord(ctx context.Context, zoneID, name, value string) (string, error) {
+	body, err := json.Marshal(map[string]interface{}{"type": "TXT", "name": name, "content": value, "ttl": 60})
+	if err != nil {
+		return "", err
+	}
+	result, err := c.request(ctx, http.MethodPost, "/zones/"+url.PathEscape(zoneID)+"/dns_records", strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	var record struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(result, &record); err != nil || record.ID == "" {
+		return "", errors.New("cloudflare DNS did not return the challenge record ID")
+	}
+	return record.ID, nil
+}
+
+func (c *cloudflareClient) deleteRecord(ctx context.Context, zoneID, recordID string) error {
+	_, err := c.request(ctx, http.MethodDelete, "/zones/"+url.PathEscape(zoneID)+"/dns_records/"+url.PathEscape(recordID), nil)
+	// Deletion is intentionally idempotent.  A record may already have been
+	// removed manually, by a previous retry, or by Cloudflare's reconciliation
+	// of the zone.  In that case there is no remote state left to clean up and
+	// the local schedule can safely be marked disabled.
+	if isCloudflareRecordNotFoundError(err) {
+		return nil
+	}
+	return err
+}
+
+func isCloudflareRecordNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "record does not exist") ||
+		strings.Contains(message, "record not found") ||
+		strings.Contains(message, "81044")
+}

@@ -20,6 +20,7 @@ function modalHarness() {
     .map(([, name, value]) => [name, value === undefined ? true : decode(value)]));
   function createElement(id, attrs = {}) {
     const classes = new Set(String(attrs.class || '').split(/\s+/).filter(Boolean));
+    const listeners = new Map();
     const item = {
       id, parentElement: null, ownedIDs: [], tagName: '', type: attrs.type || '',
       value: attrs.value || '', textContent: '', disabled: attrs.disabled === true,
@@ -32,7 +33,12 @@ function modalHarness() {
       },
       get className() { return [...classes].join(' '); },
       set className(value) { classes.clear(); String(value).split(/\s+/).filter(Boolean).forEach(value => classes.add(value)); },
-      setAttribute() {}, removeAttribute() {}, addEventListener() {},
+      setAttribute() {}, removeAttribute() {},
+      addEventListener(type, listener) { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(listener); },
+      click() { let result; for (const listener of listeners.get('click') || []) result = listener({ target: this }); return result; },
+      replaceChildren() { this.innerHTML = ''; },
+      append(...values) { values.forEach(value => { if (typeof value === 'object') value.parentElement = this; else this.textContent += String(value); }); },
+      appendChild(child) { child.parentElement = this; return child; },
       getClientRects() { return this.isConnected ? [{}] : []; },
       matches() { return ['INPUT', 'SELECT', 'TEXTAREA'].includes(this.tagName) && this.type !== 'hidden'; },
       contains(other) { for (; other; other = other.parentElement) if (other === this) return true; return false; },
@@ -82,6 +88,7 @@ function modalHarness() {
   const element = id => elements.get(id) || createElement(id);
   document = {
     getElementById: element, querySelector: element, addEventListener() {},
+    createElement(tag) { const result = createElement(`fixture-${elements.size}`); result.tagName = tag.toUpperCase(); return result; },
     querySelectorAll(selector) { return selector === '.page' ? [element('page-sites'), element('page-account')] : []; },
     body: element('body'),
   };
@@ -90,7 +97,9 @@ function modalHarness() {
   element('modal-body').parentElement = element('modal');
   element('modal-footer').parentElement = element('modal');
   const sandbox = {
-    document, console, URL, location: { hash: '#sites' },
+    document, console, URL, location: { hash: '#sites', origin: 'https://controller.example.test:9090', port: '9090' },
+    getComputedStyle() { return { visibility: 'visible' }; },
+    confirm() { return true; },
     matchMedia() { return { matches: false }; }, addEventListener() {}, scrollTo() {},
     clearTimeout() {}, clearInterval() {}, setTimeout() { return 1; },
     requestAnimationFrame(callback) { frames.push(callback); },
@@ -349,6 +358,25 @@ test('closing invalidates live and edit intents that are still waiting for netwo
   assert.equal(h.document.body.classList.contains('modal-open'), false);
 });
 
+test('leaving sites closes its shared artwork viewer without restoring focus to the departed route', () => {
+  const h = modalHarness();
+  bindRealHistoryDetails(h);
+  const viewer = h.element('watch-history-image-modal');
+  viewer.hidden = false;
+  h.element('watch-history-image-viewer-image').src = '/api/watch-history/posters/7';
+  h.document.body.classList.add('watch-history-image-open');
+  h.sandbox.departedImageTrigger = h.element('site-artwork-trigger');
+  vm.runInContext('watchHistoryImagePreviousFocus = departedImageTrigger', h.sandbox);
+  const routeFocus = h.element('account-navigation-target');
+  routeFocus.focus();
+
+  h.navigate('account');
+
+  assert.equal(viewer.hidden, true, 'the shared image layer must close when leaving sites');
+  assert.equal(h.document.body.classList.contains('watch-history-image-open'), false);
+  assert.equal(h.document.activeElement, routeFocus, 'cleanup must preserve the newly selected route focus');
+});
+
 test('the legacy edit action owns its intent before reading the site list', async () => {
   const h = modalHarness(), liveRead = deferred(), siteRead = deferred();
   h.sandbox.API.getActiveWatchHistory = () => liveRead.promise;
@@ -409,4 +437,143 @@ test('a generic modal focus callback stays invalid after leaving and returning t
   current.focus();
   oldFocus();
   assert.equal(h.document.activeElement, current);
+});
+
+test('a completed node save leaves a later node draft open while refreshing the list', async () => {
+  const h = modalHarness(), pending = deferred();
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/pages/nodes.js'), 'utf8'), h.sandbox);
+  h.navigate('nodes');
+  let refreshes = 0;
+  h.sandbox.loadNodes = async () => { refreshes += 1; };
+  h.sandbox.API.updateNode = () => pending.promise;
+  h.sandbox.openNodeForm({ id: 1, name: 'First node', address: '', enabled: true, dns_publish: 'auto', port: 9443, reset_day: 1, priority: 100, billing_mode: 'outbound' });
+  const save = h.element('node-form').onsubmit({ preventDefault() {} });
+  h.sandbox.closeModal();
+  h.sandbox.openNodeForm(null);
+  const name = h.element('node-name'), footer = h.element('modal-footer').innerHTML;
+  name.value = 'Unsaved second node';
+  name.focus();
+  pending.resolve({ id: 1 });
+  await save;
+  assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+  assert.equal(h.element('modal-footer').innerHTML, footer);
+  assert.equal(h.element('node-name'), name);
+  assert.equal(name.value, 'Unsaved second node');
+  assert.equal(h.document.activeElement, name);
+  assert.equal(refreshes, 1);
+});
+
+test('a completed site deletion leaves a later site draft open while refreshing the list', async () => {
+  const h = modalHarness(), pending = deferred();
+  let refreshes = 0;
+  h.sandbox.loadSites = async () => { refreshes += 1; };
+  h.sandbox.API.deleteSite = () => pending.promise;
+  h.sandbox.deleteSiteAction(1, 'First site');
+  const deletion = h.element('delete-confirm').click();
+  h.sandbox.closeModal();
+  await h.sandbox.showSiteModal(h.site(2));
+  const name = h.element('m-name'), footer = h.element('modal-footer').innerHTML;
+  name.value = 'Unsaved second site';
+  name.focus();
+  pending.resolve({ status: 'deleted' });
+  await deletion;
+  assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+  assert.equal(h.element('modal-footer').innerHTML, footer);
+  assert.equal(h.element('m-name'), name);
+  assert.equal(name.value, 'Unsaved second site');
+  assert.equal(h.document.activeElement, name);
+  assert.equal(refreshes, 1);
+});
+
+for (const operation of ['create', 'enrollment']) {
+  for (const outcome of ['success', 'error']) {
+    test(`a late node ${operation} ${outcome} cannot replace a newer node form`, async () => {
+      const h = modalHarness(), pending = deferred();
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/pages/nodes.js'), 'utf8'), h.sandbox);
+      h.navigate('nodes');
+      let refreshes = 0;
+      h.sandbox.API.getNodes = async () => ({ nodes: [{ id: 1, name: 'First node', port: 9443 }], scheduler: { mode: 'auto' } });
+      h.sandbox.API.getSiteNodeSchedules = async () => ({ sites: [] });
+      await h.sandbox.loadNodes();
+      h.sandbox.loadNodes = async () => { refreshes += 1; };
+      let request;
+      if (operation === 'create') {
+        h.sandbox.API.createNode = () => pending.promise;
+        h.sandbox.openNodeForm(null);
+        h.element('node-name').value = 'First node';
+        request = h.element('node-form').onsubmit({ preventDefault() {} });
+      } else {
+        h.sandbox.API.refreshNodeEnrollment = () => pending.promise;
+        const button = { dataset: { action: 'enroll', id: '1' }, disabled: false };
+        request = h.sandbox.handleNodeAction({ target: { closest: () => button } });
+      }
+      h.sandbox.closeModal();
+      h.sandbox.openNodeForm(null);
+      const name = h.element('node-name'), footer = h.element('modal-footer').innerHTML;
+      name.value = 'Unsaved second node'; name.focus();
+      if (outcome === 'success') pending.resolve({ install_script: 'SYNTHETIC_SCRIPT', install_command: 'SYNTHETIC_COMMAND' });
+      else pending.reject(new Error('synthetic old request failure'));
+      await request;
+      assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+      assert.equal(h.element('modal-title').textContent, '创建节点');
+      assert.equal(h.element('modal-footer').innerHTML, footer);
+      assert.equal(h.element('node-name'), name);
+      assert.equal(name.value, 'Unsaved second node');
+      assert.equal(h.document.activeElement, name);
+      assert.deepEqual(h.errors, []);
+      assert.equal(refreshes, outcome === 'success' ? 1 : 0);
+    });
+  }
+}
+
+test('a node save failure leaves its own form editable and never reports success', async () => {
+  const h = modalHarness();
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/pages/nodes.js'), 'utf8'), h.sandbox);
+  h.navigate('nodes');
+  let successes = 0;
+  h.sandbox.Toast.success = () => { successes += 1; };
+  h.sandbox.API.createNode = async () => { throw new Error('synthetic failure'); };
+  h.sandbox.openNodeForm(null);
+  h.element('node-name').value = 'Unsaved node';
+  await h.element('node-form').onsubmit({ preventDefault() {} });
+  assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+  assert.equal(h.element('node-name').value, 'Unsaved node');
+  assert.equal(h.element('node-form-save').disabled, false);
+  assert.equal(successes, 0);
+  assert.deepEqual(h.errors, ['synthetic failure']);
+});
+
+test('leaving nodes dismisses its modal and defeats its pending save and focus callbacks', async () => {
+  const h = modalHarness(), pending = deferred();
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/pages/nodes.js'), 'utf8'), h.sandbox);
+  h.navigate('nodes');
+  let refreshes = 0;
+  h.sandbox.API.createNode = () => pending.promise;
+  h.sandbox.loadNodes = async () => { refreshes += 1; };
+  h.sandbox.openNodeForm(null);
+  const save = h.element('node-form').onsubmit({ preventDefault() {} });
+  h.navigate('account');
+  const focus = h.element('account-focus'); focus.focus();
+  pending.resolve({ install_script: 'SYNTHETIC_SCRIPT' });
+  await save;
+  h.frames.forEach(frame => frame());
+  assert.equal(h.element('modal-overlay').classList.contains('active'), false);
+  assert.equal(h.document.body.classList.contains('modal-open'), false);
+  assert.equal(h.document.activeElement, focus);
+  assert.equal(refreshes, 0);
+});
+
+test('a late site delete failure cannot interrupt a newer site draft', async () => {
+  const h = modalHarness(), pending = deferred();
+  h.sandbox.API.deleteSite = () => pending.promise;
+  h.sandbox.deleteSiteAction(1, 'First site');
+  const deletion = h.element('delete-confirm').click();
+  await h.sandbox.showSiteModal(h.site(2));
+  const name = h.element('m-name'); name.value = 'Unsaved second site'; name.focus();
+  pending.reject(new Error('synthetic old delete failure'));
+  await deletion;
+  assert.equal(h.element('modal-overlay').classList.contains('active'), true);
+  assert.equal(h.element('m-name'), name);
+  assert.equal(h.document.activeElement, name);
+  assert.deepEqual(h.errors, []);
 });
