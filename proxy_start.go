@@ -39,20 +39,51 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	if site.IngressMode == ingressModePath && site.PathPrefix == "" {
 		return fmt.Errorf("invalid ingress configuration: path_prefix is required when ingress_mode is path")
 	}
+	upstreamMode, err := normalizeUpstreamMode(site.UpstreamMode)
+	if err != nil {
+		return fmt.Errorf("invalid upstream mode: %w", err)
+	}
+	pathTargetMode := upstreamMode == upstreamModePathTarget
+	if pathTargetMode && site.IngressMode != ingressModeHost && site.IngressMode != ingressModePort {
+		return fmt.Errorf("path-target upstream mode requires host or port ingress")
+	}
+	if pathTargetMode && (strings.TrimSpace(site.TargetURL) != "" || strings.TrimSpace(site.PlaybackTargetURL) != "" || site.AssetCacheEnabled) {
+		return fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+	}
+	if pathTargetMode {
+		site.UpstreamMode = upstreamModePathTarget
+		site.AssetCacheEnabled = false
+		site.AccountRetentionDays = 0
+		site.MainVideoStreamMode = mainVideoStreamModeProxy
+	} else {
+		site.UpstreamMode = ""
+	}
 	if err := pm.validateIngressSafety(site.IngressMode); err != nil {
 		return err
 	}
-	target, err := normalizeTargetURL(site.TargetURL)
-	if err != nil {
-		return fmt.Errorf("invalid target URL: %w", err)
-	}
-	failoverTargets, err := parseFailoverTargets(site.TargetURL, site.FailoverTargetList)
-	if err != nil {
-		return fmt.Errorf("invalid failover targets: %w", err)
-	}
-	playbackTarget, playbackHostsSet, err := resolvePlaybackConfiguration(site.PlaybackTargetURL, site.StreamHosts)
-	if err != nil {
-		return err
+	var target *url.URL
+	var failoverTargets []*url.URL
+	var playbackTarget *url.URL
+	var playbackHostsSet map[string]bool
+	if !pathTargetMode {
+		target, err = normalizeTargetURL(site.TargetURL)
+		if err != nil {
+			return fmt.Errorf("invalid target URL: %w", err)
+		}
+		failoverTargets, err = parseFailoverTargets(site.TargetURL, site.FailoverTargetList)
+		if err != nil {
+			return fmt.Errorf("invalid failover targets: %w", err)
+		}
+		playbackTarget, playbackHostsSet, err = resolvePlaybackConfiguration(site.PlaybackTargetURL, site.StreamHosts)
+		if err != nil {
+			return err
+		}
+	} else {
+		if len(site.FailoverTargetList) != 0 || strings.TrimSpace(site.StoredFailoverLines) != "" && strings.TrimSpace(site.StoredFailoverLines) != "[]" ||
+			strings.TrimSpace(site.StreamHosts) != "" && strings.TrimSpace(site.StreamHosts) != "[]" || site.StoredUpstreamHeaders != "" && site.StoredUpstreamHeaders != "[]" {
+			return fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+		}
+		playbackHostsSet = make(map[string]bool)
 	}
 
 	policy, err := resolveUAHeaderPolicy(site)
@@ -60,7 +91,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		return fmt.Errorf("invalid UA profile: %w", err)
 	}
 	configuredHeaders := upstreamHeaderPolicy{}
-	if site.RuntimeUpstreamHeaders != nil {
+	if pathTargetMode {
+		configuredHeaders = upstreamHeaderPolicy{}
+	} else if site.RuntimeUpstreamHeaders != nil {
 		configuredHeaders = upstreamHeaderPolicy{authority: redirectHostKey(target), values: make(http.Header, len(site.RuntimeUpstreamHeaders))}
 		for name, values := range site.RuntimeUpstreamHeaders {
 			configuredHeaders.values[name] = append([]string(nil), values...)
@@ -75,20 +108,32 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		// Each running site has an immutable cache generation until its configuration is reloaded.
 		site.AssetCacheNamespace = assetCacheNamespace(site)
 	}
-	redirectPolicy, err := newDynamicRedirectPolicy(pm.DynamicDiscoveryAvailable())
-	if err != nil {
-		return err
+	redirectPolicy := dynamicRedirectPolicy{}
+	if !pathTargetMode {
+		redirectPolicy, err = newDynamicRedirectPolicy(pm.DynamicDiscoveryAvailable())
+		if err != nil {
+			return err
+		}
 	}
 	configuredAuthorities := make(map[string]bool, len(playbackHostsSet)+1)
-	configuredAuthorities[redirectHostKey(target)] = true
-	for _, failoverTarget := range failoverTargets[1:] {
-		configuredAuthorities[redirectHostKey(failoverTarget)] = true
+	if target != nil {
+		configuredAuthorities[redirectHostKey(target)] = true
+	}
+	if len(failoverTargets) > 1 {
+		for _, failoverTarget := range failoverTargets[1:] {
+			configuredAuthorities[redirectHostKey(failoverTarget)] = true
+		}
 	}
 	for authority := range playbackHostsSet {
 		configuredAuthorities[authority] = true
 	}
 	var dynamicState *dynamicSiteState
-	if redirectPolicy.configured {
+	if pathTargetMode {
+		// Structured media rewriting still needs bounded per-site parse memory,
+		// but this mode must never mint dynamic capabilities or validate targets
+		// against the fixed-upstream discovery policy.
+		dynamicState = newDynamicSiteState(pm.dynamicRuntime, dynamicDefaultProfileLimits())
+	} else if redirectPolicy.configured {
 		dynamicState = newDynamicSiteState(pm.dynamicRuntime, redirectPolicy.limits)
 	}
 	var dynamicIssuer *dynamicCapabilityIssuer
@@ -152,6 +197,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	isRedirectMode := playbackTarget != nil && site.PlaybackMode == "redirect"
 	routedUpstream := func(r *http.Request) *url.URL {
+		if pathTargetMode {
+			if r == nil {
+				return nil
+			}
+			upstream, _ := r.Context().Value(pathTargetContextKey{}).(*url.URL)
+			return upstream
+		}
 		if isRedirectMode {
 			return target
 		}
@@ -206,7 +258,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			applyUpstreamURL(proxyReq.Out.URL, upstream)
 			proxyReq.Out.Host = upstream.Host
 			prepareUpstreamHeadersWithClientIPMode(proxyReq.Out.Header, proxyReq.In, policy, site.ClientIPMode, inst.trustedProxies)
-			if !sameRedirectAuthority(target, upstream) {
+			if !pathTargetMode && !sameRedirectAuthority(target, upstream) {
 				// Direct playback can target a separate CDN. Treat that authority like
 				// a cross-origin redirect and rebuild from a narrow allowlist so client
 				// cookies, bearer tokens, and arbitrary secret headers cannot follow it.
@@ -283,6 +335,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				rebuildDynamicResponseHeaders(resp)
 			}
 			stripPanelSessionSetCookies(resp.Header)
+			if pathTargetMode {
+				if err := rewritePathTargetStructuredResponse(resp, dynamicState); err != nil {
+					log.Printf("[%s] path-target media rewrite unavailable", site.Name)
+				}
+				rewritePathTargetResponse(resp)
+				return nil
+			}
 			upstreamBasePath := target.Path
 			if resp.Request != nil {
 				if upstream, _ := resp.Request.Context().Value(configuredUpstreamContextKey{}).(*url.URL); upstream != nil {
@@ -311,7 +370,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if isClientRequestCancellation(originalRequestContext(r.Context()), err) {
 				return
 			}
-			log.Printf("[%s] proxy error: %v", site.Name, err)
+			if pathTargetMode {
+				// Transport errors can embed the full target URL, including the
+				// query string. Keep dynamic-target failures free of request data.
+				log.Printf("[%s] request-path upstream unavailable", site.Name)
+			} else {
+				log.Printf("[%s] proxy error: %v", site.Name, err)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
@@ -346,6 +411,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	speedLimitBytes := int64(site.SpeedLimit) * 125000 // Mbps -> bytes/sec
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every ingress, including dedicated ports and WebSocket upgrades, shares
+		// this admission boundary. Reject before parsing bodies, recording watch
+		// activity or contacting upstream; admitted streams retain their context.
+		if pm.database.rejectControllerNodeAdmission(w, site.ID) {
+			return
+		}
 		requestController, accepted := inst.beginHTTPRequest(w)
 		if !accepted {
 			w.Header().Set("Content-Type", "application/json")
@@ -358,10 +429,19 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		if site.PathPrefix != "" && !isReservedDynamicRoute(r.URL.Path) {
 			stripIngressPathPrefix(r.URL, site.PathPrefix)
 		}
+		var requestPathTarget *url.URL
+		var requestPathTargetPath, requestPathTargetRawPath string
+		var requestPathTargetErr error
+		if pathTargetMode {
+			requestPathTarget, requestPathTargetPath, requestPathTargetRawPath, requestPathTargetErr = parsePathTargetRequest(r.URL)
+		}
 		requestStartedAt := time.Now()
 		clientRequestContext := r.Context()
 		requestCtx, requestCancel := context.WithCancel(r.Context())
 		requestCtx = context.WithValue(requestCtx, originalRequestContextKey{}, clientRequestContext)
+		if requestPathTarget != nil {
+			requestCtx = context.WithValue(requestCtx, pathTargetContextKey{}, requestPathTarget)
+		}
 		backendTracker := &backendAddressTracker{}
 		backendTracker.SetURL(routedUpstream(r))
 		requestCtx = context.WithValue(requestCtx, backendAddressContextKey{}, backendTracker)
@@ -374,7 +454,28 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}()
 		r = r.WithContext(requestCtx)
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w, diagnostics: diagnostics}
-		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies, policy)
+		requestLogRequest := r
+		if pathTargetMode {
+			requestLogRequest = r.Clone(r.Context())
+			logURL := *r.URL
+			if requestPathTarget != nil {
+				logURL.Path = requestPathTargetPath
+				logURL.RawPath = requestPathTargetRawPath
+			} else {
+				// Malformed embedded URLs may contain userinfo. Never persist the
+				// original target path when parsing failed.
+				logURL.Path = pathTargetRoutePrefix + "invalid"
+				logURL.RawPath = ""
+			}
+			requestLogRequest.URL = &logURL
+		}
+		requestLogEntry := newRequestLogEvent(site, requestLogRequest, inst.trustedProxies, policy)
+		if pathTargetMode && requestPathTargetErr == nil {
+			// Playback and stop observers use the resolved source API path rather
+			// than the gateway path that embeds a target authority.
+			r.URL.Path = requestPathTargetPath
+			r.URL.RawPath = requestPathTargetRawPath
+		}
 		watchHistoryCapture := startWatchHistoryCapture(site, r, requestLogEntry.ResourceCategory, pm.database)
 		attachWatchHistoryStopIntentCapture(watchHistoryCapture, pm.database, site, r, inst.trustedProxies, requestStartedAt)
 		defer func() {
@@ -430,7 +531,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return
 			}
 		}
-		if isReservedDynamicRoute(r.URL.Path) {
+		if pathTargetMode {
+			if requestPathTargetErr != nil {
+				http.Error(w, "invalid path target", http.StatusBadRequest)
+				return
+			}
+			if r.Method == http.MethodConnect {
+				http.Error(w, "CONNECT tunneling is not supported", http.StatusMethodNotAllowed)
+				return
+			}
+		}
+		if !pathTargetMode && isReservedDynamicRoute(r.URL.Path) {
 			var rw http.ResponseWriter
 			if speedLimitBytes > 0 {
 				limited := &rateLimitedWriter{
@@ -531,7 +642,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		} else {
 			rw = pm.meteredOrQuotaWriter(w, inst, trafficQuota)
 		}
-		proxy.ServeHTTP(rw, r) // #nosec G704 -- forwarding to the administrator-configured, validated upstream is the product's purpose.
+		proxy.ServeHTTP(rw, r) // #nosec G704 -- path-target sites intentionally proxy HTTP(S) destinations named in each request path, including private destinations.
 	})
 
 	inst.handler = handler
@@ -641,6 +752,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	installed = true
 
 	upstreamLogTarget := redactUpstreamURL(target)
+	if pathTargetMode {
+		upstreamLogTarget = "request-path target"
+	}
 	if server == nil {
 		if ingressUsesPath(site.IngressMode) {
 			log.Printf("[%s] shared-path proxy %s -> %s (UA: %s)", site.Name, site.PathPrefix, upstreamLogTarget, site.UAMode)

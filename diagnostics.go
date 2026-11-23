@@ -81,6 +81,7 @@ type DiagHeaders struct {
 type DiagProxy struct {
 	Running       bool   `json:"running"`
 	IngressMode   string `json:"ingress_mode"`
+	UpstreamMode  string `json:"upstream_mode"`
 	PathPrefix    string `json:"path_prefix"`
 	PublicHost    string `json:"public_host,omitempty"`
 	PortListening bool   `json:"port_listening"`
@@ -488,8 +489,14 @@ func displayTargetURL(raw string) string {
 
 func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	policy, profileErr := resolveUAHeaderPolicy(*site)
-	primary, primaryKey := diagnoseUpstreamTarget(site.TargetURL, "metadata_api")
-	primary.Configured = true
+	var primary DiagUpstream
+	primaryKey := ""
+	if siteUsesPathTarget(*site) {
+		primary = DiagUpstream{ShowHealth: true, Health: DiagHealth{Status: "error", Error: "回源目标由每个请求路径指定，此处不执行统一探测"}}
+	} else {
+		primary, primaryKey = diagnoseUpstreamTarget(site.TargetURL, "metadata_api")
+		primary.Configured = true
+	}
 	failovers := make([]DiagUpstream, 0, len(site.FailoverTargetList))
 	if len(site.FailoverTargetList) > 0 {
 		failovers = make([]DiagUpstream, len(site.FailoverTargetList))
@@ -593,6 +600,7 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	result.Proxy = DiagProxy{
 		Running:       running,
 		IngressMode:   site.IngressMode,
+		UpstreamMode:  storedUpstreamMode(site.UpstreamMode),
 		PathPrefix:    site.PathPrefix,
 		PublicHost:    site.PublicHost,
 		PortListening: portListening,

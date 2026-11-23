@@ -184,6 +184,22 @@ function watchHistoryIdentityLabel(item) {
   return [user, client].filter(Boolean).join(' · ');
 }
 
+function watchHistorySourceAddressLabel(item) {
+  const sourceKey = item && item.source_key;
+  if (typeof sourceKey !== 'string' || !/^[a-f0-9]{64}$/i.test(sourceKey)) return '';
+  const pending = '来源地址待更新';
+  const address = typeof item.source_address === 'string' ? item.source_address.trim() : '';
+  if (!/^https?:\/\/[^/?#\\\s]+(?:[/?#]|$)/i.test(address)) return pending;
+  try {
+    const target = new URL(address);
+    const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+    if (!target.hostname || !Number.isInteger(port) || port < 1 || port > 65535) return pending;
+    return `${target.protocol}//${target.hostname}:${port}`;
+  } catch (_) {
+    return pending;
+  }
+}
+
 function watchHistoryStopTimestamp(value) {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : 0;
 }
@@ -218,6 +234,7 @@ function watchHistoryCardHTML(item, index, context = {}) {
   const year = Number(item && (item.production_year || item.year));
   const secondary = episodeLabel || (Number.isInteger(year) && year > 1800 ? String(year) : '');
   const siteName = String((item && item.site_name) || '').trim() || '未知站点';
+  const sourceAddress = watchHistorySourceAddressLabel(item);
   const watchedAt = Number(item && (item.last_watched_at_ms || item.last_seen_at_ms || item.started_at_ms));
   const timeText = watchHistoryFormatTime(watchedAt);
   const isoTime = Number.isFinite(watchedAt) && watchedAt > 0 && watchedAt <= 8640000000000000 ? new Date(watchedAt).toISOString() : '';
@@ -250,6 +267,7 @@ function watchHistoryCardHTML(item, index, context = {}) {
       </div>
       ${secondary ? `<p class="watch-history-secondary">${esc(secondary)}</p>` : ''}
       <p class="watch-history-site"><span>${esc(siteName)}</span></p>
+      ${sourceAddress ? `<p class="watch-history-source-address"><span class="watch-history-source-address-label">服务器地址</span><span class="watch-history-source-address-value">${esc(sourceAddress)}</span></p>` : ''}
       ${identity ? `<p class="watch-history-identity">${esc(identity)}</p>` : ''}
       ${clientStop.state !== 'unknown' ? `<p class="watch-history-stop-note${clientStop.state === 'confirmed' ? ' is-confirmed' : ''}" data-client-stop-outcome="${esc(clientStop.state)}">${esc(clientStop.label)}</p>` : ''}
       ${progress > 0 ? `<div class="history-progress-line"><div class="watch-history-progress" role="progressbar" aria-label="观看进度 ${progressRounded}%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressRounded}"><span style="width:${progress}%"></span></div><span>${progressRounded}%</span>${elapsedLabel ? `<span class="watch-history-progress-time">${esc(elapsedLabel)}</span>` : ''}</div>` : ''}
@@ -337,6 +355,7 @@ function watchHistoryDetailsHTML(item) {
   const year = Number(item && (item.production_year || item.year));
   const secondary = episode || (Number.isInteger(year) && year > 1800 ? String(year) : '');
   const siteName = String((item && item.site_name) || '').trim() || '未知站点';
+  const sourceAddress = watchHistorySourceAddressLabel(item);
   const overview = String((item && item.overview) || '').trim();
   const progress = Math.round(watchHistoryProgress(item));
   const timeProgress = watchHistoryTimeProgress(item);
@@ -367,7 +386,7 @@ function watchHistoryDetailsHTML(item) {
       <div class="watch-history-detail-main">
       <div class="watch-history-detail-heading"><span class="watch-history-type">${esc(watchHistoryTypeLabel(mediaType))}</span><h2 id="watch-history-detail-title">${esc(title)}</h2></div>
       ${secondary ? `<p class="watch-history-detail-secondary">${esc(secondary)}</p>` : ''}
-      <dl class="watch-history-detail-meta"><div><dt>站点</dt><dd>${esc(siteName)}</dd></div><div><dt>观看时间</dt><dd>${esc(watchHistoryFormatTime(item && (item.last_seen_at_ms || item.started_at_ms)))}</dd></div>${viewerName ? `<div><dt>观看用户</dt><dd>${esc(viewerName)}</dd></div>` : ''}${clientName ? `<div><dt>播放客户端</dt><dd>${esc(clientName)}</dd></div>` : ''}${watchHistoryClientStopDetailsHTML(item)}${releaseDate ? `<div><dt>上映时间</dt><dd>${esc(releaseDate)}</dd></div>` : ''}${genres.length ? `<div><dt>影片类型</dt><dd>${esc(genres.join(' · '))}</dd></div>` : ''}${ratingText ? `<div><dt>评分</dt><dd class="watch-history-detail-rating">★ ${esc(ratingText)}</dd></div>` : ''}${episodeInfo ? `<div><dt>集数信息</dt><dd>${esc(episodeInfo)}</dd></div>` : ''}<div><dt>观看进度</dt><dd>${timeProgress ? `${esc(timeProgress)} · ` : ''}${progress}%</dd></div>${playMethod ? `<div><dt>播放方式</dt><dd>${esc(playMethod)}</dd></div>` : ''}</dl>
+      <dl class="watch-history-detail-meta"><div><dt>站点</dt><dd>${esc(siteName)}</dd></div><div><dt>观看时间</dt><dd>${esc(watchHistoryFormatTime(item && (item.last_seen_at_ms || item.started_at_ms)))}</dd></div>${sourceAddress ? `<div class="watch-history-detail-source-address"><dt>服务器地址</dt><dd>${esc(sourceAddress)}</dd></div>` : ''}${viewerName ? `<div><dt>观看用户</dt><dd>${esc(viewerName)}</dd></div>` : ''}${clientName ? `<div><dt>播放客户端</dt><dd>${esc(clientName)}</dd></div>` : ''}${watchHistoryClientStopDetailsHTML(item)}${releaseDate ? `<div><dt>上映时间</dt><dd>${esc(releaseDate)}</dd></div>` : ''}${genres.length ? `<div><dt>影片类型</dt><dd>${esc(genres.join(' · '))}</dd></div>` : ''}${ratingText ? `<div><dt>评分</dt><dd class="watch-history-detail-rating">★ ${esc(ratingText)}</dd></div>` : ''}${episodeInfo ? `<div><dt>集数信息</dt><dd>${esc(episodeInfo)}</dd></div>` : ''}<div><dt>观看进度</dt><dd>${timeProgress ? `${esc(timeProgress)} · ` : ''}${progress}%</dd></div>${playMethod ? `<div><dt>播放方式</dt><dd>${esc(playMethod)}</dd></div>` : ''}</dl>
       ${updateInfo ? `<section class="watch-history-detail-section watch-history-detail-update"><h3>更新信息</h3><p>${esc(updateInfo)}</p></section>` : ''}
       <section class="watch-history-detail-section"><h3>简介</h3><p>${overview ? esc(overview) : '暂无简介，等待 TMDB 资料补全。'}</p></section>
       <section class="watch-history-detail-section"><h3>演员表</h3>${castHTML}</section>
@@ -564,6 +583,7 @@ async function watchHistoryDeleteItem(item) {
     watchHistoryState.items = watchHistoryState.items.filter(candidate => Number(candidate && candidate.id) !== historyID);
     watchHistoryState.liveItems = watchHistoryState.liveItems.filter(candidate => Number(candidate && candidate.id) !== historyID);
     if (watchHistoryDetailItemID === String(historyID)) watchHistoryCloseDetails();
+    watchHistoryRenderLive();
     watchHistoryRenderItems();
     Toast.success('观看记录已删除');
   } catch (error) {
@@ -683,12 +703,13 @@ function watchHistoryItemMergeKey(item, index = 0) {
   const siteID = String((item && item.site_id) || '');
   const mediaType = String((item && item.media_type) || '').trim().toLowerCase();
   if (mediaType === 'episode') {
+    const sourceKey = String((item && item.source_key) || '');
     const seriesName = String((item && item.series_name) || '').trim().toLowerCase();
-    if (seriesName) return `series-name:${siteID}:${seriesName}`;
+    if (seriesName) return `series-name:${siteID}:${sourceKey}:${seriesName}`;
     const tmdbType = String((item && item.tmdb_type) || '').trim().toLowerCase();
     const tmdbID = Number(item && item.tmdb_id);
     if (tmdbType === 'tv' && Number.isSafeInteger(tmdbID) && tmdbID > 0) {
-      return `series-tmdb:${siteID}:${tmdbID}`;
+      return `series-tmdb:${siteID}:${sourceKey}:${tmdbID}`;
     }
   }
   const id = String((item && item.id) || '');
@@ -764,7 +785,8 @@ function watchHistoryRenderNotice() {
 function watchHistoryItemsRenderSignature(items, context = '') {
   const source = Array.isArray(items) ? items : [];
   return JSON.stringify([context, source.map(item => [
-    item && item.id, item && item.site_id, item && item.media_item_id, item && item.upstream_item_id,
+    item && item.id, item && item.site_id, item && item.source_key, item && item.source_address,
+    item && item.media_item_id, item && item.upstream_item_id,
     item && item.media_type, item && item.title, item && item.series_name,
     item && item.last_seen_at_ms, item && item.position_ticks, item && item.runtime_ticks,
     item && item.completed, item && item.poster_path, item && item.backdrop_path,

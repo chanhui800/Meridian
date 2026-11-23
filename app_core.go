@@ -184,6 +184,9 @@ func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 					_, _ = w.Write([]byte(`{"error":"host-only ingress requires a configured proxy source"}`))
 					return
 				}
+				if siteID, ok := a.pm.PublicHostSiteID(host); ok && a.db.rejectControllerNodeAdmission(w, siteID) {
+					return
+				}
 				if handler == nil {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusServiceUnavailable)
@@ -197,6 +200,9 @@ func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 		}
 		if a.panelHost == "" || host == a.panelHost || isLoopbackHealthProbe(r) {
 			if handler, prefix, configured := a.pm.PathRoute(r.URL.Path); configured {
+				if siteID, ok := a.pm.PathPrefixSiteID(prefix); ok && a.db.rejectControllerNodeAdmission(w, siteID) {
+					return
+				}
 				if handler == nil {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusServiceUnavailable)

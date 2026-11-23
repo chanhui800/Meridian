@@ -74,6 +74,9 @@ body.console-shell #page-watch-history .history-console .watch-history-site,
 body.console-shell #page-watch-history .history-console .watch-history-identity { margin: 4px 0 0; color: var(--console-muted); font-size: 12px; line-height: 1.5; }
 body.console-shell #page-watch-history .history-console .watch-history-site { display: block; }
 body.console-shell #page-watch-history .history-console .watch-history-site span { color: inherit; }
+body.console-shell #page-watch-history .history-console .watch-history-source-address { min-width: 0; margin: 4px 0 0; color: var(--console-muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; white-space: normal; }
+body.console-shell #page-watch-history .history-console .watch-history-source-address-label { margin-right: 6px; }
+body.console-shell #page-watch-history .history-console .watch-history-source-address-value { color: var(--console-ink); }
 body.console-shell #page-watch-history .history-console .watch-history-live-badge,
 body.console-shell #page-watch-history .history-console .watch-history-pending { position: static; min-height: 20px; padding: 1px 7px; color: var(--console-accent); background: var(--console-accent-soft); border: 0; border-radius: 4px; font-size: 10px; font-weight: 500; }
 body.console-shell #page-watch-history .history-console .watch-history-live-badge i { background: currentColor; animation: none; }
@@ -126,6 +129,8 @@ body.console-shell #page-watch-history .history-console .watch-history-detail-se
 body.console-shell #page-watch-history .history-console .watch-history-detail-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: row; gap: 15px 22px; padding: 20px 0; border-bottom: 1px solid var(--console-line); margin: 0; }
 body.console-shell #page-watch-history .history-console .watch-history-detail-meta dt { color: var(--console-muted); font-size: 11px; margin: 0 0 5px; }
 body.console-shell #page-watch-history .history-console .watch-history-detail-meta dd { color: var(--console-ink); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+body.console-shell #page-watch-history .history-console .watch-history-detail-source-address { grid-column: 1 / -1; min-width: 0; }
+body.console-shell #page-watch-history .history-console .watch-history-detail-source-address dd { overflow: visible; text-overflow: clip; white-space: normal; }
 body.console-shell #page-watch-history .history-console .watch-history-detail-section { padding: 18px 0 0; margin: 0; }
 body.console-shell #page-watch-history .history-console .watch-history-detail-section h3 { margin: 0 0 10px; color: var(--console-ink); font-size: 13px; font-weight: 600; }
 body.console-shell #page-watch-history .history-console .watch-history-detail-section p, body.console-shell #page-watch-history .history-console .watch-history-detail-muted { color: var(--console-muted); font-size: 12px; line-height: 1.8; }

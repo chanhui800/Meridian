@@ -26,27 +26,33 @@ import (
 )
 
 const (
-	watchHistoryBodyLimit         = 64 << 10
-	watchHistoryMetadataLimit     = 1 << 20
-	watchHistoryQueueCapacity     = 1024
-	watchHistoryBatchSize         = 64
-	watchHistoryGlobalRowLimit    = 50000
-	watchHistoryInboxLimit        = 10000
-	watchHistoryMaxIDBytes        = 256
-	watchHistoryMaxTitleBytes     = 512
-	watchHistoryMaxTextBytes      = 4096
-	watchHistoryMetadataTTL       = 15 * time.Minute
-	watchHistoryMetadataMax       = 4096
-	watchHistoryActiveWindow      = 2 * time.Minute
-	watchHistoryActiveLimit       = 48
-	watchHistoryMaxIdentityBytes  = 512
-	watchHistoryMaxTokenBytes     = 4096
-	watchHistoryTokenCipherPrefix = "wh1:"
+	watchHistoryBodyLimit             = 64 << 10
+	watchHistoryMetadataLimit         = 1 << 20
+	watchHistoryQueueCapacity         = 1024
+	watchHistoryBatchSize             = 64
+	watchHistoryGlobalRowLimit        = 50000
+	watchHistoryInboxLimit            = 10000
+	watchHistoryMaxIDBytes            = 256
+	watchHistoryMaxTitleBytes         = 512
+	watchHistoryMaxTextBytes          = 4096
+	watchHistoryMetadataTTL           = 15 * time.Minute
+	watchHistoryMetadataMax           = 4096
+	watchHistoryActiveWindow          = 2 * time.Minute
+	watchHistoryActiveLimit           = 48
+	watchHistoryMaxIdentityBytes      = 512
+	watchHistoryMaxTokenBytes         = 4096
+	watchHistoryMaxSourceAddressBytes = 4096
+	watchHistoryTokenCipherPrefix     = "wh1:"
+	// Upstream item IDs are stripped of controls before capture. This reserved
+	// separator keeps a generic source namespace distinct from every ordinary
+	// fixed-upstream item ID without changing the existing SQLite schema.
+	watchHistorySourceItemPrefix = "\x1fwhs1:"
 )
 
 type watchHistoryMetadataKey struct {
-	siteID int64
-	itemID string
+	siteID    int64
+	itemID    string
+	sourceKey string
 }
 
 type watchHistoryMetadataEntry struct {
@@ -55,7 +61,13 @@ type watchHistoryMetadataEntry struct {
 }
 
 type watchHistoryEvent struct {
-	SiteID          int64
+	SiteID int64
+	// SourceKey identifies only the authority and API mount of a path-target
+	// source. It contains no URL, query, credential, or playback path.
+	SourceKey string `json:"source_key,omitempty"`
+	// SourceAddress contains only the canonical HTTP(S) authority and API mount.
+	// Its digest must match SourceKey before an Agent event can persist it.
+	SourceAddress   string `json:"source_address,omitempty"`
 	SessionHash     string
 	UpstreamItemID  string
 	EventType       string
@@ -106,6 +118,8 @@ type WatchHistoryEntry struct {
 	ID                      int64                    `json:"id"`
 	SiteID                  int64                    `json:"site_id"`
 	SiteName                string                   `json:"site_name"`
+	SourceKey               string                   `json:"source_key,omitempty"`
+	SourceAddress           string                   `json:"source_address,omitempty"`
 	MediaItemID             int64                    `json:"media_item_id"`
 	UpstreamItemID          string                   `json:"upstream_item_id"`
 	MediaType               string                   `json:"media_type"`
@@ -399,7 +413,7 @@ func watchHistoryPlaybackSyncMethod(method string) bool {
 
 func startWatchHistoryCapture(site Site, request *http.Request, category string, metadataDB *DB) *watchHistoryBodyCapture {
 	if !site.WatchHistoryEnabled || request == nil || !watchHistoryPlaybackSyncMethod(request.Method) || request.URL == nil ||
-		category != requestLogCategoryPlaybackSync || request.Body == nil || request.Body == http.NoBody || request.ContentLength == 0 ||
+		(category != requestLogCategoryPlaybackSync && !(siteUsesPathTarget(site) && watchHistorySourceKeyFromRequest(request) != "" && isRequestLogPlaybackActivityPath(watchHistoryRequestPath(request)))) || request.Body == nil || request.Body == http.NoBody || request.ContentLength == 0 ||
 		request.ContentLength > watchHistoryBodyLimit {
 		return nil
 	}
@@ -546,6 +560,7 @@ type watchHistoryMetadataBodyObserver struct {
 	io.ReadCloser
 	database        *DB
 	siteID          int64
+	sourceKey       string
 	itemHint        string
 	contentEncoding string
 	payload         []byte
@@ -596,7 +611,7 @@ func (observer *watchHistoryMetadataBodyObserver) finish() {
 	}
 	var item watchHistoryPlaybackItem
 	if err := json.Unmarshal(payload, &item); err == nil && strings.TrimSpace(item.ID) != "" {
-		observer.database.rememberWatchHistoryMetadata(observer.siteID, item)
+		observer.database.rememberWatchHistoryMetadata(observer.siteID, item, observer.sourceKey)
 		return
 	}
 	items := make([]watchHistoryPlaybackItem, 0)
@@ -613,14 +628,14 @@ func (observer *watchHistoryMetadataBodyObserver) finish() {
 		if observer.itemHint != "" && candidate.ID != observer.itemHint {
 			continue
 		}
-		observer.database.rememberWatchHistoryMetadata(observer.siteID, candidate)
+		observer.database.rememberWatchHistoryMetadata(observer.siteID, candidate, observer.sourceKey)
 		if observer.itemHint != "" {
 			break
 		}
 	}
 }
 
-func (d *DB) rememberWatchHistoryMetadata(siteID int64, item watchHistoryPlaybackItem) {
+func (d *DB) rememberWatchHistoryMetadata(siteID int64, item watchHistoryPlaybackItem, sourceKeys ...string) {
 	if d == nil || siteID <= 0 || strings.TrimSpace(item.ID) == "" {
 		return
 	}
@@ -642,7 +657,7 @@ func (d *DB) rememberWatchHistoryMetadata(siteID int64, item watchHistoryPlaybac
 			delete(d.watchHistoryMetadata, key)
 		}
 	}
-	key := watchHistoryMetadataKey{siteID: siteID, itemID: item.ID}
+	key := watchHistoryMetadataKey{siteID: siteID, itemID: item.ID, sourceKey: watchHistoryOptionalSourceKey(sourceKeys)}
 	if _, exists := d.watchHistoryMetadata[key]; !exists && len(d.watchHistoryMetadata) >= watchHistoryMetadataMax {
 		var oldestKey watchHistoryMetadataKey
 		var oldest time.Time
@@ -658,14 +673,14 @@ func (d *DB) rememberWatchHistoryMetadata(siteID int64, item watchHistoryPlaybac
 	d.watchHistoryMetadata[key] = watchHistoryMetadataEntry{item: item, updatedAt: now}
 }
 
-func (d *DB) watchHistoryMetadataFor(siteID int64, itemID string) (watchHistoryPlaybackItem, bool) {
+func (d *DB) watchHistoryMetadataFor(siteID int64, itemID string, sourceKeys ...string) (watchHistoryPlaybackItem, bool) {
 	if d == nil || siteID <= 0 || strings.TrimSpace(itemID) == "" {
 		return watchHistoryPlaybackItem{}, false
 	}
 	now := time.Now()
 	d.watchHistoryMetadataMu.Lock()
 	defer d.watchHistoryMetadataMu.Unlock()
-	key := watchHistoryMetadataKey{siteID: siteID, itemID: itemID}
+	key := watchHistoryMetadataKey{siteID: siteID, itemID: itemID, sourceKey: watchHistoryOptionalSourceKey(sourceKeys)}
 	entry, ok := d.watchHistoryMetadata[key]
 	if !ok || now.Sub(entry.updatedAt) > watchHistoryMetadataTTL {
 		if ok {
@@ -761,6 +776,7 @@ func captureWatchHistoryMetadata(response *http.Response, database *DB, siteID i
 		ReadCloser:      response.Body,
 		database:        database,
 		siteID:          siteID,
+		sourceKey:       watchHistorySourceKeyFromRequest(response.Request),
 		itemHint:        watchHistoryMetadataItemHint(response.Request),
 		contentEncoding: encoding,
 		payload:         make([]byte, 0, capacity),
@@ -802,7 +818,194 @@ func normalizeWatchHistoryMediaType(value string) string {
 	}
 }
 
-func watchHistorySessionDigest(siteID int64, playSessionID, fallbackIdentity, itemID string, observedAt time.Time) string {
+func watchHistoryOptionalSourceKey(sourceKeys []string) string {
+	if len(sourceKeys) != 0 {
+		return sourceKeys[0]
+	}
+	return ""
+}
+
+func watchHistorySourceMountAndRoute(path string) (string, string) {
+	mount, route, _ := watchHistorySourceRoute(path)
+	return mount, route
+}
+
+func watchHistorySourceRoute(path string) (string, string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for index, part := range parts {
+		route := parts[index:]
+		matches := false
+		switch strings.ToLower(part) {
+		case "sessions":
+			matches = len(route) >= 2 && strings.EqualFold(route[1], "playing") &&
+				(len(route) == 2 || len(route) == 3 && (strings.EqualFold(route[2], "progress") || strings.EqualFold(route[2], "stopped")))
+		case "users":
+			matches = len(route) >= 3 && route[1] != "" &&
+				(strings.EqualFold(route[2], "items") && (len(route) == 3 || len(route) == 4) ||
+					len(route) == 5 && strings.EqualFold(route[2], "playingitems") && route[3] != "" && strings.EqualFold(route[4], "progress"))
+		case "items":
+			matches = len(route) == 1 || len(route) == 2
+		case "shows":
+			matches = len(route) == 2 && strings.EqualFold(route[1], "nextup") ||
+				len(route) == 3 && (strings.EqualFold(route[2], "episodes") || strings.EqualFold(route[2], "seasons"))
+		}
+		if !matches {
+			continue
+		}
+		// Recognize the complete API route, including Users/{id}/Items. A
+		// resource name inside an arbitrary base path is part of the mount.
+		mount := ""
+		if index > 0 {
+			mount = "/" + strings.Join(parts[:index], "/")
+		}
+		return mount, "/" + strings.Join(route, "/"), true
+	}
+	return "", path, false
+}
+
+func watchHistorySourceKeyFromRequest(request *http.Request) string {
+	if request == nil || request.URL == nil {
+		return ""
+	}
+	target, _ := request.Context().Value(pathTargetContextKey{}).(*url.URL)
+	authority := watchHistorySourceAuthority(target)
+	if authority == "" {
+		return ""
+	}
+	mount, _ := watchHistorySourceMountAndRoute(request.URL.Path)
+	return watchHistorySourceDigest(authority, mount)
+}
+
+// Keep this authority normalization and digest identical to the original
+// namespaced item IDs. Adding a display address must not fork existing sources.
+func watchHistorySourceAuthority(target *url.URL) string {
+	if target == nil || target.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(target.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(target.Hostname(), "."))
+	if host == "" {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port := target.Port()
+	if port == "" {
+		port = "80"
+		if scheme == "https" {
+			port = "443"
+		}
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return ""
+	}
+	return scheme + "://" + net.JoinHostPort(host, strconv.Itoa(portNumber))
+}
+
+func watchHistorySourceDigest(authority, mount string) string {
+	digest := sha256.Sum256([]byte("meridian-watch-history-source-v1\x00" + authority + "\x00" + mount))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func watchHistorySourceAddressFromRequest(request *http.Request) string {
+	if request == nil || request.URL == nil {
+		return ""
+	}
+	target, _ := request.Context().Value(pathTargetContextKey{}).(*url.URL)
+	mount, _ := watchHistorySourceMountAndRoute(request.URL.Path)
+	return watchHistorySourceAddress(target, mount)
+}
+
+func watchHistorySourceAddress(target *url.URL, mount string) string {
+	authority := watchHistorySourceAuthority(target)
+	if authority == "" {
+		return ""
+	}
+	scheme, host, _ := strings.Cut(authority, "://")
+	// Construct a fresh URL so target userinfo, query credentials, fragments
+	// and the playback resource path never enter the persisted address.
+	address := (&url.URL{Scheme: scheme, Host: host, Path: mount}).String()
+	if !validWatchHistorySourceAddress(watchHistorySourceDigest(authority, mount), address) {
+		return ""
+	}
+	return address
+}
+
+func validWatchHistorySourceAddress(sourceKey, address string) bool {
+	if address == "" {
+		// Old Agents send only the digest; the next playback can supply the
+		// address for every historical item from that same source.
+		return true
+	}
+	if sourceKey == "" || len(address) > watchHistoryMaxSourceAddressBytes {
+		return false
+	}
+	parsed, err := url.Parse(address)
+	if err != nil || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return false
+	}
+	for _, char := range parsed.Path {
+		if char < 0x20 || char == 0x7f {
+			return false
+		}
+	}
+	authority := watchHistorySourceAuthority(parsed)
+	if authority == "" || watchHistorySourceDigest(authority, parsed.Path) != sourceKey {
+		return false
+	}
+	scheme, host, _ := strings.Cut(authority, "://")
+	canonical := (&url.URL{Scheme: scheme, Host: host, Path: parsed.Path}).String()
+	return canonical == address
+}
+
+func watchHistoryDisplaySourceAddress(sourceKey, address string) string {
+	if address == "" || !validWatchHistorySourceAddress(sourceKey, address) {
+		return ""
+	}
+	parsed, _ := url.Parse(address)
+	// The full API mount is needed only to verify the source digest. History
+	// responses expose the server authority, never its private mount path.
+	parsed.Path, parsed.RawPath = "", ""
+	parsed.RawQuery, parsed.Fragment, parsed.RawFragment = "", "", ""
+	parsed.ForceQuery = false
+	return parsed.String()
+}
+
+func watchHistoryRequestPath(request *http.Request) string {
+	if request == nil || request.URL == nil {
+		return ""
+	}
+	if target, _ := request.Context().Value(pathTargetContextKey{}).(*url.URL); target != nil {
+		_, route := watchHistorySourceMountAndRoute(request.URL.Path)
+		return route
+	}
+	return request.URL.Path
+}
+
+func watchHistoryStoredItemID(event watchHistoryEvent) string {
+	if event.SourceKey == "" {
+		return event.UpstreamItemID
+	}
+	return watchHistorySourceItemPrefix + event.SourceKey + ":" + event.UpstreamItemID
+}
+
+func splitWatchHistoryStoredItemID(stored string) (string, string) {
+	if !strings.HasPrefix(stored, watchHistorySourceItemPrefix) {
+		return "", stored
+	}
+	tail := strings.TrimPrefix(stored, watchHistorySourceItemPrefix)
+	if len(tail) <= sha256.Size*2 || tail[sha256.Size*2] != ':' || !isHexString(tail[:sha256.Size*2]) {
+		return "", stored
+	}
+	return tail[:sha256.Size*2], tail[sha256.Size*2+1:]
+}
+
+func watchHistorySessionDigest(siteID int64, playSessionID, fallbackIdentity, itemID string, observedAt time.Time, sourceKeys ...string) string {
 	identity := strings.TrimSpace(playSessionID)
 	if identity == "" {
 		bucket := observedAt.Unix() / int64(accountRetentionSessionTTL/time.Second)
@@ -815,6 +1018,9 @@ func watchHistorySessionDigest(siteID int64, playSessionID, fallbackIdentity, it
 	_, _ = mac.Write([]byte(identity))
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write([]byte(itemID))
+	if sourceKey := watchHistoryOptionalSourceKey(sourceKeys); sourceKey != "" {
+		_, _ = mac.Write([]byte("\x00path-target-source-v1\x00" + sourceKey))
+	}
 	return fmt.Sprintf("%x", mac.Sum(nil))
 }
 
@@ -852,12 +1058,13 @@ func enrichWatchHistoryEvent(database *DB, event watchHistoryEvent) watchHistory
 	if database == nil || event.UpstreamItemID == "" {
 		return event
 	}
-	item, ok := database.watchHistoryMetadataFor(event.SiteID, event.UpstreamItemID)
+	item, ok := database.watchHistoryMetadataFor(event.SiteID, event.UpstreamItemID, event.SourceKey)
 	if !ok {
 		return event
 	}
 	metadata := watchHistoryEvent{
 		SiteID:         event.SiteID,
+		SourceKey:      event.SourceKey,
 		UpstreamItemID: event.UpstreamItemID,
 		ObservedAtMS:   event.ObservedAtMS,
 		MediaType:      normalizeWatchHistoryMediaType(item.Type),
@@ -948,8 +1155,14 @@ func watchHistoryPlaybackEventFromCapture(capture *watchHistoryBodyCapture, site
 	if observedAt.IsZero() {
 		observedAt = time.Now()
 	}
+	sourceKey := watchHistorySourceKeyFromRequest(request)
+	if siteUsesPathTarget(site) && sourceKey == "" {
+		return watchHistoryEvent{}, false
+	}
 	event := watchHistoryEvent{
 		SiteID:         site.ID,
+		SourceKey:      sourceKey,
+		SourceAddress:  watchHistorySourceAddressFromRequest(request),
 		UpstreamItemID: itemID,
 		EventType:      watchHistoryEventType(request.URL.Path),
 		ObservedAtMS:   observedAt.UnixMilli(),
@@ -966,7 +1179,7 @@ func watchHistoryPlaybackEventFromCapture(capture *watchHistoryBodyCapture, site
 	event.DeviceID = identity.deviceID
 	event.DeviceName = identity.deviceName
 	event.PlaySessionID = requestLogSafeText(payload.PlaySessionID, watchHistoryMaxIdentityBytes)
-	event.ClientIdentityHash = watchHistoryRequestIdentityHash(site.ID, identity.token, identity.deviceID, identity.clientName)
+	event.ClientIdentityHash = watchHistoryRequestIdentityHash(site.ID, identity.token, identity.deviceID, identity.clientName, sourceKey)
 	if identity.token != "" {
 		event.TokenCiphertext, _ = encryptWatchHistoryToken(identity.token)
 	}
@@ -1006,7 +1219,7 @@ func watchHistoryPlaybackEventFromCapture(capture *watchHistoryBodyCapture, site
 		event.TMDBType = "tv"
 	}
 	fallbackIdentity := accountRetentionViewerKey(site.ID, request, trustedProxies)
-	event.SessionHash = watchHistorySessionDigest(site.ID, payload.PlaySessionID, fallbackIdentity, itemID, observedAt)
+	event.SessionHash = watchHistorySessionDigest(site.ID, payload.PlaySessionID, fallbackIdentity, itemID, observedAt, sourceKey)
 	return event, validWatchHistoryEvent(event)
 }
 
@@ -1128,7 +1341,7 @@ func watchHistoryLegacyProgressEvent(site Site, request *http.Request, trustedPr
 	if request == nil || request.URL == nil || !watchHistoryPlaybackSyncMethod(request.Method) {
 		return watchHistoryEvent{}, false
 	}
-	rawItemID, ok := legacyPlaybackProgressItemID(request.URL.Path)
+	rawItemID, ok := legacyPlaybackProgressItemID(watchHistoryRequestPath(request))
 	if !ok {
 		return watchHistoryEvent{}, false
 	}
@@ -1141,11 +1354,17 @@ func watchHistoryLegacyProgressEvent(site Site, request *http.Request, trustedPr
 	if observedAt.IsZero() {
 		observedAt = time.Now()
 	}
+	sourceKey := watchHistorySourceKeyFromRequest(request)
+	if siteUsesPathTarget(site) && sourceKey == "" {
+		return watchHistoryEvent{}, false
+	}
 	playSessionID := requestLogSafeText(watchHistoryQueryValue(request, "PlaySessionId"), watchHistoryMaxIDBytes)
 	fallbackIdentity := accountRetentionViewerKey(site.ID, request, trustedProxies)
 	event := watchHistoryEvent{
 		SiteID:         site.ID,
-		SessionHash:    watchHistorySessionDigest(site.ID, playSessionID, fallbackIdentity, itemID, observedAt),
+		SourceKey:      sourceKey,
+		SourceAddress:  watchHistorySourceAddressFromRequest(request),
+		SessionHash:    watchHistorySessionDigest(site.ID, playSessionID, fallbackIdentity, itemID, observedAt, sourceKey),
 		UpstreamItemID: itemID,
 		EventType:      "progress",
 		ObservedAtMS:   observedAt.UnixMilli(),
@@ -1162,7 +1381,7 @@ func watchHistoryLegacyProgressEvent(site Site, request *http.Request, trustedPr
 	event.ClientName = identity.clientName
 	event.DeviceID = identity.deviceID
 	event.DeviceName = identity.deviceName
-	event.ClientIdentityHash = watchHistoryRequestIdentityHash(site.ID, identity.token, identity.deviceID, identity.clientName)
+	event.ClientIdentityHash = watchHistoryRequestIdentityHash(site.ID, identity.token, identity.deviceID, identity.clientName, sourceKey)
 	event.PlaySessionID = requestLogSafeText(playSessionID, watchHistoryMaxIdentityBytes)
 	if identity.token != "" {
 		event.TokenCiphertext, _ = encryptWatchHistoryToken(identity.token)
@@ -1172,6 +1391,8 @@ func watchHistoryLegacyProgressEvent(site Site, request *http.Request, trustedPr
 
 func validWatchHistoryEvent(event watchHistoryEvent) bool {
 	return event.SiteID > 0 && len(event.SessionHash) == sha256.Size*2 && event.UpstreamItemID != "" &&
+		(event.SourceKey == "" || len(event.SourceKey) == sha256.Size*2 && isHexString(event.SourceKey)) &&
+		validWatchHistorySourceAddress(event.SourceKey, event.SourceAddress) &&
 		len(event.UpstreamItemID) <= watchHistoryMaxIDBytes && event.ObservedAtMS > 0 && event.PositionTicks >= 0 && event.RunTimeTicks >= 0 &&
 		len(event.Title) <= watchHistoryMaxTitleBytes && len(event.OriginalTitle) <= watchHistoryMaxTitleBytes &&
 		len(event.SeriesName) <= watchHistoryMaxTitleBytes && len(event.IMDBID) <= watchHistoryMaxIDBytes && len(event.TVDBID) <= watchHistoryMaxIDBytes &&
@@ -1363,6 +1584,11 @@ func (d *DB) DroppedWatchHistory() uint64 {
 func mergeWatchHistoryEvents(current, candidate watchHistoryEvent) watchHistoryEvent {
 	newer := candidate.ObservedAtMS > current.ObservedAtMS
 	identityNewer := candidate.ObservedAtMS >= current.ObservedAtMS
+	if candidate.SourceAddress != "" && (identityNewer || candidate.SourceKey == current.SourceKey) {
+		current.SourceAddress = candidate.SourceAddress
+	} else if identityNewer && candidate.SourceKey != current.SourceKey {
+		current.SourceAddress = ""
+	}
 	if newer {
 		current.EventType = candidate.EventType
 		current.ObservedAtMS = candidate.ObservedAtMS
@@ -1441,6 +1667,7 @@ func mergeWatchHistoryEvents(current, candidate watchHistoryEvent) watchHistoryE
 		current.TokenCiphertext = candidate.TokenCiphertext
 	}
 	if identityNewer {
+		current.SourceKey = candidate.SourceKey
 		current.ClientIdentityHash = candidate.ClientIdentityHash
 		current.sourceNodeID = candidate.sourceNodeID
 		current.ResponseStatusCode = candidate.ResponseStatusCode
@@ -1505,6 +1732,10 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 			skipped++
 			continue
 		}
+		if err := persistWatchHistorySourceTx(tx, event); err != nil {
+			return 0, err
+		}
+		storedItemID := watchHistoryStoredItemID(event)
 		var previous struct {
 			mediaType, title, originalTitle, seriesName, imdbID, tvdbID string
 			productionYear, seasonNumber, episodeNumber                 int
@@ -1513,7 +1744,7 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 		previousFound := true
 		previousErr := tx.QueryRow(`SELECT media_type, title, original_title, production_year, series_name,
 			season_number, episode_number, tmdb_id, imdb_id, tvdb_id FROM media_items WHERE site_id=? AND upstream_item_id=?`,
-			event.SiteID, event.UpstreamItemID).Scan(&previous.mediaType, &previous.title, &previous.originalTitle,
+			event.SiteID, storedItemID).Scan(&previous.mediaType, &previous.title, &previous.originalTitle,
 			&previous.productionYear, &previous.seriesName, &previous.seasonNumber, &previous.episodeNumber,
 			&previous.tmdbID, &previous.imdbID, &previous.tvdbID)
 		if errors.Is(previousErr, sql.ErrNoRows) {
@@ -1549,13 +1780,13 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 			imdb_id=CASE WHEN excluded.imdb_id<>'' THEN excluded.imdb_id ELSE media_items.imdb_id END,
 			tvdb_id=CASE WHEN excluded.tvdb_id<>'' THEN excluded.tvdb_id ELSE media_items.tvdb_id END,
 			updated_at_ms=MAX(media_items.updated_at_ms, excluded.updated_at_ms)`,
-			event.SiteID, event.UpstreamItemID, event.MediaType, event.Title, event.OriginalTitle, event.ProductionYear, event.SeriesName,
+			event.SiteID, storedItemID, event.MediaType, event.Title, event.OriginalTitle, event.ProductionYear, event.SeriesName,
 			event.SeasonNumber, event.EpisodeNumber, event.TMDBType, event.TMDBID, event.IMDBID, event.TVDBID, event.ObservedAtMS, event.ObservedAtMS)
 		if err != nil {
 			return 0, err
 		}
 		var mediaItemID int64
-		if err := tx.QueryRow("SELECT id FROM media_items WHERE site_id=? AND upstream_item_id=?", event.SiteID, event.UpstreamItemID).Scan(&mediaItemID); err != nil {
+		if err := tx.QueryRow("SELECT id FROM media_items WHERE site_id=? AND upstream_item_id=?", event.SiteID, storedItemID).Scan(&mediaItemID); err != nil {
 			return 0, err
 		}
 		stoppedAtMS := int64(0)
@@ -1624,6 +1855,9 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 			return 0, err
 		}
 		if updated {
+			if err := persistWatchHistorySourceTx(tx, resolved); err != nil {
+				return 0, err
+			}
 			committedStops = append(committedStops, resolved)
 		} else {
 			skipped++
@@ -1643,6 +1877,26 @@ func (d *DB) writeWatchHistoryBatch(batch []watchHistoryEvent) (int, error) {
 		}
 	}
 	return skipped, nil
+}
+
+func persistWatchHistorySourceTx(tx *sql.Tx, event watchHistoryEvent) error {
+	if event.SourceAddress == "" {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO watch_history_sources (site_id, source_key, source_address)
+		VALUES (?,?,?) ON CONFLICT(site_id,source_key) DO UPDATE SET source_address=excluded.source_address`,
+		event.SiteID, event.SourceKey, event.SourceAddress)
+	return err
+}
+
+func pruneWatchHistorySourcesTx(tx *sql.Tx) error {
+	// Bound the namespaced prefix with ':' and its next byte ';' so SQLite
+	// can use the existing (site_id,upstream_item_id) index for every source.
+	_, err := tx.Exec(`DELETE FROM watch_history_sources WHERE NOT EXISTS (
+		SELECT 1 FROM media_items mi WHERE mi.site_id=watch_history_sources.site_id
+			AND mi.upstream_item_id>=char(31)||'whs1:'||watch_history_sources.source_key||':'
+			AND mi.upstream_item_id<char(31)||'whs1:'||watch_history_sources.source_key||';')`)
+	return err
 }
 
 func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, error) {
@@ -1706,7 +1960,9 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 	rows, err := d.db.Query(`WITH ranked_history AS (
 		SELECT ws.id AS history_id, ws.last_seen_at_ms,
 		ROW_NUMBER() OVER (
-			PARTITION BY ws.site_id, CASE
+			PARTITION BY ws.site_id,
+			CASE WHEN substr(mi.upstream_item_id,1,6)=char(31)||'whs1:' THEN substr(mi.upstream_item_id,7,64) ELSE '' END,
+			CASE
 				WHEN mi.media_type='episode' AND trim(mi.series_name)<>'' THEN 'series-name:'||lower(trim(mi.series_name))
 				WHEN mi.media_type='episode' AND mi.tmdb_type='tv' AND mi.tmdb_id>0 THEN 'series-tmdb:'||CAST(mi.tmdb_id AS TEXT)
 				ELSE 'media:'||CAST(mi.id AS TEXT)
@@ -1727,7 +1983,7 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 		WHERE `+strings.Join(outerConditions, " AND ")+`
 		ORDER BY last_seen_at_ms DESC, history_id DESC LIMIT ?
 	)
-	SELECT ws.id, ws.site_id, s.name, mi.id, mi.upstream_item_id, mi.media_type,
+	SELECT ws.id, ws.site_id, s.name, COALESCE(whs.source_address,''), mi.id, mi.upstream_item_id, mi.media_type,
 		mi.title, mi.original_title, mi.production_year, mi.series_name, mi.season_number, mi.episode_number,
 		mi.tmdb_type, mi.tmdb_id, mi.overview, mi.poster_path, mi.backdrop_path, mi.release_date, mi.vote_average,
 		mi.genres_json, mi.status, mi.last_air_date, mi.next_air_date, mi.next_season_number, mi.next_episode_number,
@@ -1736,6 +1992,8 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 		ws.user_name, ws.user_id, ws.client_name, ws.device_id, ws.device_name, ws.play_session_id, CASE WHEN ws.token_ciphertext<>'' THEN 1 ELSE 0 END
 	FROM selected_page p JOIN watch_sessions ws ON ws.id=p.history_id
 	JOIN media_items mi ON mi.id=ws.media_item_id JOIN sites s ON s.id=ws.site_id
+	LEFT JOIN watch_history_sources whs ON whs.site_id=ws.site_id AND whs.source_key=
+		CASE WHEN substr(mi.upstream_item_id,1,6)=char(31)||'whs1:' THEN substr(mi.upstream_item_id,7,64) ELSE '' END
 	ORDER BY ws.last_seen_at_ms DESC, ws.id DESC`, args...)
 	if err != nil {
 		return nil, err
@@ -1746,7 +2004,7 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 		var entry WatchHistoryEntry
 		var castJSON, genresJSON, stillsJSON string
 		var completed, tokenStored int
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.MediaItemID, &entry.UpstreamItemID, &entry.MediaType,
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.SourceAddress, &entry.MediaItemID, &entry.UpstreamItemID, &entry.MediaType,
 			&entry.Title, &entry.OriginalTitle, &entry.ProductionYear, &entry.SeriesName, &entry.SeasonNumber, &entry.EpisodeNumber,
 			&entry.TMDBType, &entry.TMDBID, &entry.Overview, &entry.PosterPath, &entry.BackdropPath, &entry.ReleaseDate, &entry.VoteAverage,
 			&genresJSON, &entry.Status, &entry.LastAirDate, &entry.NextAirDate, &entry.NextSeasonNumber, &entry.NextEpisodeNumber,
@@ -1755,6 +2013,8 @@ func (d *DB) ListWatchHistory(filter WatchHistoryFilter) ([]WatchHistoryEntry, e
 			&entry.UserName, &entry.UserID, &entry.ClientName, &entry.DeviceID, &entry.DeviceName, &entry.PlaySessionID, &tokenStored); err != nil {
 			return nil, err
 		}
+		entry.SourceKey, entry.UpstreamItemID = splitWatchHistoryStoredItemID(entry.UpstreamItemID)
+		entry.SourceAddress = watchHistoryDisplaySourceAddress(entry.SourceKey, entry.SourceAddress)
 		entry.Genres = decodeWatchHistoryGenres(genresJSON)
 		entry.Stills = decodeWatchHistoryStills(stillsJSON)
 		entry.Cast = decodeWatchHistoryCast(castJSON)
@@ -1801,7 +2061,7 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 	args = append(args, watchHistoryGlobalRowLimit)
 	// #nosec G202 -- conditions contains only fixed SQL fragments selected by
 	// validated filters; every caller-supplied value remains a bound parameter.
-	rows, err := d.db.Query(`SELECT ws.id, ws.site_id, s.name, mi.id, mi.upstream_item_id, mi.media_type,
+	rows, err := d.db.Query(`SELECT ws.id, ws.site_id, s.name, COALESCE(whs.source_address,''), mi.id, mi.upstream_item_id, mi.media_type,
 		mi.title, mi.original_title, mi.production_year, mi.series_name, mi.season_number, mi.episode_number,
 		mi.tmdb_type, mi.tmdb_id, mi.overview, mi.poster_path, mi.backdrop_path, mi.release_date, mi.vote_average,
 		mi.genres_json, mi.status, mi.last_air_date, mi.next_air_date, mi.next_season_number, mi.next_episode_number,
@@ -1811,6 +2071,8 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 		FROM watch_sessions ws
 		JOIN media_items mi ON mi.id=ws.media_item_id
 		JOIN sites s ON s.id=ws.site_id
+		LEFT JOIN watch_history_sources whs ON whs.site_id=ws.site_id AND whs.source_key=
+			CASE WHEN substr(mi.upstream_item_id,1,6)=char(31)||'whs1:' THEN substr(mi.upstream_item_id,7,64) ELSE '' END
 		WHERE `+strings.Join(conditions, " AND ")+`
 		ORDER BY ws.last_seen_at_ms DESC, ws.id DESC LIMIT ?`, args...)
 	if err != nil {
@@ -1822,7 +2084,7 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 		var entry WatchHistoryEntry
 		var castJSON, genresJSON, stillsJSON string
 		var completed, tokenStored int
-		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.MediaItemID, &entry.UpstreamItemID, &entry.MediaType,
+		if err := rows.Scan(&entry.ID, &entry.SiteID, &entry.SiteName, &entry.SourceAddress, &entry.MediaItemID, &entry.UpstreamItemID, &entry.MediaType,
 			&entry.Title, &entry.OriginalTitle, &entry.ProductionYear, &entry.SeriesName, &entry.SeasonNumber, &entry.EpisodeNumber,
 			&entry.TMDBType, &entry.TMDBID, &entry.Overview, &entry.PosterPath, &entry.BackdropPath, &entry.ReleaseDate, &entry.VoteAverage,
 			&genresJSON, &entry.Status, &entry.LastAirDate, &entry.NextAirDate, &entry.NextSeasonNumber, &entry.NextEpisodeNumber,
@@ -1831,6 +2093,8 @@ func (d *DB) listActiveWatchHistoryAt(filter WatchHistoryFilter, now time.Time) 
 			&entry.UserName, &entry.UserID, &entry.ClientName, &entry.DeviceID, &entry.DeviceName, &entry.PlaySessionID, &tokenStored); err != nil {
 			return nil, err
 		}
+		entry.SourceKey, entry.UpstreamItemID = splitWatchHistoryStoredItemID(entry.UpstreamItemID)
+		entry.SourceAddress = watchHistoryDisplaySourceAddress(entry.SourceKey, entry.SourceAddress)
 		entry.Completed = completed == 1
 		entry.TokenStored = tokenStored == 1
 		d.watchHistoryStops.overlay(&entry)
@@ -1884,6 +2148,9 @@ func (d *DB) clearWatchHistoryRows(siteID int64) error {
 		if _, err := tx.Exec("DELETE FROM media_items WHERE site_id=?", siteID); err != nil {
 			return err
 		}
+		if _, err := tx.Exec("DELETE FROM watch_history_sources WHERE site_id=?", siteID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DELETE FROM tmdb_cache WHERE NOT EXISTS (
 			SELECT 1 FROM media_items mi WHERE mi.tmdb_type=tmdb_cache.tmdb_type AND mi.tmdb_id=tmdb_cache.tmdb_id
 		)`); err != nil {
@@ -1900,6 +2167,9 @@ func (d *DB) clearWatchHistoryRows(siteID int64) error {
 			return err
 		}
 		if _, err := tx.Exec("DELETE FROM media_items"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM watch_history_sources"); err != nil {
 			return err
 		}
 		if _, err := tx.Exec("DELETE FROM tmdb_cache"); err != nil {
@@ -1937,6 +2207,9 @@ func (d *DB) deleteWatchHistoryRow(historyID int64) error {
 	if _, err := tx.Exec("DELETE FROM media_items WHERE id=? AND NOT EXISTS (SELECT 1 FROM watch_sessions WHERE media_item_id=?)", mediaItemID, mediaItemID); err != nil {
 		return err
 	}
+	if err := pruneWatchHistorySourcesTx(tx); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM tmdb_cache WHERE NOT EXISTS (
 		SELECT 1 FROM media_items mi WHERE mi.tmdb_type=tmdb_cache.tmdb_type AND mi.tmdb_id=tmdb_cache.tmdb_id
 	)`); err != nil {
@@ -1971,6 +2244,9 @@ func (d *DB) pruneWatchHistory() error {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM media_items WHERE NOT EXISTS (SELECT 1 FROM watch_sessions ws WHERE ws.media_item_id=media_items.id)"); err != nil {
+		return err
+	}
+	if err := pruneWatchHistorySourcesTx(tx); err != nil {
 		return err
 	}
 	metadataCutoffMS := now.Add(-tmdbCacheLifetime).UnixMilli()

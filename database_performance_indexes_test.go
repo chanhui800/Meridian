@@ -30,7 +30,7 @@ func TestPerformanceIndexesUpgrade55AndPreserveRows(t *testing.T) {
 	}
 	defer db.Close()
 	var version, count int
-	if err := db.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 56 {
+	if err := db.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != databaseSchemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if err := db.db.QueryRow("SELECT COUNT(*) FROM media_items WHERE tmdb_type='movie' AND tmdb_id=42").Scan(&count); err != nil || count != 1 {

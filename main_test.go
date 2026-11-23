@@ -1541,7 +1541,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 			t.Errorf("site form must expose and submit speed limit; missing %q", snippet)
 		}
 	}
-	for _, snippet := range []string{`id="m-public-host"`, `id="m-upstream-headers"`, `type="password"`, "upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders)"} {
+	for _, snippet := range []string{`id="m-public-host"`, `id="m-upstream-headers"`, `type="password"`, "upstream_headers: usesPathTargetMode() ? [] : buildUpstreamHeaderPayload(upstreamHeaders)"} {
 		if !strings.Contains(string(sitesJS), snippet) {
 			t.Errorf("site form must expose safe shared ingress and write-only headers; missing %q", snippet)
 		}

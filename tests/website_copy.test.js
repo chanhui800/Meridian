@@ -18,6 +18,47 @@ test('website uses a versioned script path with the current app source', () => {
   );
 });
 
+test('website release links and cache versions match the announced release', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../website/index.html'), 'utf8');
+  const release = html.match(/class="hero-badge"[^>]*>[\s\S]*?(v\d+\.\d+\.\d+) 已发布/);
+  assert.ok(release, 'the release badge should announce a version');
+  assert.match(html, new RegExp(`<script src="app-${release[1].replaceAll('.', '\\.')}\\.js">`));
+  assert.ok(html.includes(`href="style.css?v=${release[1].slice(1)}"`));
+  const releaseLinks = [...html.matchAll(/<a\b[^>]*href="([^\"]+)"[^>]*>(下载正式版|Release 与校验文件)<\/a>/g)];
+  assert.equal(releaseLinks.length, 2);
+  for (const link of releaseLinks) assert.ok(link[1].endsWith(`/releases/tag/${release[1]}`));
+});
+
+test('website generic proxy client fields produce the documented request and canonical route', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../website/index.html'), 'utf8');
+  assert.match(html, /<a href="#generic-proxy">通用反代<\/a>/);
+  const section = html.match(/<section id="generic-proxy"[^>]*>([\s\S]*?)<\/section>/)?.[1];
+  assert.ok(section, 'generic proxy should have its own navigable section');
+  const fields = section.match(/<dl class="client-fields">([\s\S]*?)<\/dl>/)?.[1];
+  const server = fields?.match(/<dt>服务器地址<\/dt><dd><code>([^<]+)<\/code>/)?.[1];
+  const upstream = fields?.match(/<dt>路径<\/dt><dd><code>([^<]+)<\/code>/)?.[1];
+  assert.ok(server && upstream, 'both client fields should be visible');
+  const serverURL = new URL(server);
+  const upstreamURL = new URL(upstream);
+  assert.equal(serverURL.protocol, 'https:');
+  assert.ok(serverURL.port, 'the gateway example should preserve its explicit port');
+  assert.equal(serverURL.pathname, '/');
+  assert.ok(['http:', 'https:'].includes(upstreamURL.protocol));
+  assert.ok(upstreamURL.port, 'the upstream example should preserve its explicit port');
+  assert.equal(upstreamURL.pathname, '/emby');
+  const request = section.match(/<code class="request-example">([^<]+)<\/code>/)?.[1];
+  assert.equal(request, `${server}/${upstream}/Items`);
+  const canonicalPaths = [...section.matchAll(/<code>(\/_proxy\/v1\/(https?)\/([^/]+)(\/[^<]*))<\/code>/g)];
+  assert.equal(canonicalPaths.length, 2);
+  const httpPath = canonicalPaths.find(match => match[2] === upstreamURL.protocol.slice(0, -1));
+  assert.ok(httpPath);
+  assert.equal(`${httpPath[2]}://${httpPath[3]}${httpPath[4]}`, upstream);
+  assert.ok(canonicalPaths.some(match => match[2] === 'https'));
+  const address = section.match(/<dl class="source-address">[\s\S]*?<code>([^<]+)<\/code>/)?.[1];
+  assert.ok(address, 'multi-source history should include a server address example');
+  assert.equal(address, new URL(address).origin, 'the displayed server address should exclude mount paths');
+});
+
 function copyHarness(writeText) {
   const listeners = new Map();
   const timers = new Map();

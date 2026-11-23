@@ -206,6 +206,16 @@ html .console-shell .modal.site-config-modal { width: min(1040px, calc(100vw - 4
 .console-shell .site-config-modal .form-group { min-width: 0; margin: 0; }
 .console-shell .site-config-modal .site-config-fields > .form-group { grid-area: auto; }
 .console-shell .site-config-modal label { display: block; margin: 0 0 8px; font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--console-ink); }
+.console-shell .site-config-modal .site-upstream-mode-control { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 38px; }
+.console-shell .site-config-modal .site-upstream-mode-title { color: var(--console-ink); font-size: 13px; font-weight: 500; }
+.console-shell .site-config-modal .site-upstream-mode-switch { display: inline-flex; align-items: center; gap: 9px; margin: 0; cursor: pointer; }
+.console-shell .site-config-modal .site-upstream-mode-switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.console-shell .site-config-modal .site-upstream-mode-track { position: relative; width: 40px; height: 23px; flex: 0 0 40px; border-radius: 12px; background: var(--console-line); transition: background-color 150ms; }
+.console-shell .site-config-modal .site-upstream-mode-track::after { position: absolute; top: 3px; left: 3px; width: 17px; height: 17px; border-radius: 50%; background: var(--console-surface); content: ""; transition: transform 150ms; }
+.console-shell .site-config-modal .site-upstream-mode-switch input:checked + .site-upstream-mode-track { background: var(--console-accent); }
+.console-shell .site-config-modal .site-upstream-mode-switch input:checked + .site-upstream-mode-track::after { transform: translateX(17px); }
+.console-shell .site-config-modal .site-upstream-mode-switch input:focus-visible + .site-upstream-mode-track { outline: 2px solid var(--console-accent); outline-offset: 2px; }
+.console-shell .site-config-modal .site-upstream-mode-text { color: var(--console-ink); font-size: 13px; font-weight: 500; }
 html .console-shell .site-config-modal :is(.form-input,.form-select) { display: block; width: 100%; min-width: 0; max-width: 100%; min-height: 42px; padding: 10px 12px; border: 1px solid var(--console-line); border-radius: 7px; color: var(--console-ink); background-color: var(--console-surface); font: 14px/1.5 var(--console-font); box-shadow: none; color-scheme: inherit; }
 .console-shell .site-config-modal .form-select { padding-right: 36px; }
 .console-shell .site-config-modal select.form-select { padding-block: 0; line-height: normal; }

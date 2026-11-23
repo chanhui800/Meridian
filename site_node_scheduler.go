@@ -38,8 +38,9 @@ const (
 	// a bounded opportunity to self-upgrade; if it keeps reporting an old (or
 	// unknown) version while a revocation is pending, the whole Agent
 	// credential is revoked so the old data-plane listener cannot drain forever.
-	legacyForceStopGrace = 10 * time.Minute
-	nodeSchedulerWorkers = 4
+	legacyForceStopGrace          = 10 * time.Minute
+	nodeSchedulerWorkers          = 4
+	pathTargetAgentMinimumVersion = "v1.11.9"
 )
 
 // Health checks retain the scheduler's short cadence. Only successful DNS
@@ -90,7 +91,7 @@ func (a *App) siteDNSMaintenanceFingerprint(schedule SiteNodeSchedule, site Site
 		schedule.SiteID, schedule.ScheduleRevision, schedule.PublicHost, schedule.DesiredNodeID, schedule.AppliedNodeID,
 		schedule.ConfigHash, schedule.cfZoneID, schedule.cfRecordID, schedule.cfRecordType, schedule.AppliedAddress, schedule.DNSStatus,
 		node.GUID, node.Port, node.Address, node.AddressV4, node.AddressV6, node.DNSPublish, node.ConfigRevision, node.DesiredConfigRevision, node.AppliedConfigRevision, node.DesiredConfigHash, node.AppliedConfigHash,
-		site.TargetURL, site.PlaybackTargetURL, site.FailoverTargets, site.StoredFailoverLines, site.StoredUpstreamHeaders,
+		site.UpstreamMode, site.TargetURL, site.PlaybackTargetURL, site.FailoverTargets, site.StoredFailoverLines, site.StoredUpstreamHeaders,
 		settings.ACMEDNSProvider, settings.ACMETokenCiphertext, settings.RouteDomain, a.db.installUUID, addressValues, additional,
 	})
 	if err != nil {
@@ -237,6 +238,7 @@ type SiteNodeSchedule struct {
 	SiteID               int64  `json:"site_id"`
 	SiteName             string `json:"site_name"`
 	PublicHost           string `json:"public_host"`
+	UpstreamMode         string `json:"upstream_mode,omitempty"`
 	Enabled              bool   `json:"enabled"`
 	Mode                 string `json:"mode"`
 	FixedNodeID          int64  `json:"fixed_node_id"`
@@ -328,10 +330,21 @@ func scanSiteNodeSchedule(scanner interface{ Scan(...any) error }) (SiteNodeSche
 	var value SiteNodeSchedule
 	var enabled, siteEnabled int
 	var fixed, desired, applied sql.NullInt64
+	var upstreamMode string
 	err := scanner.Scan(&value.SiteID, &value.SiteName, &value.PublicHost, &enabled, &value.Mode, &fixed, &desired, &applied,
 		&value.cfZoneID, &value.cfRecordID, &value.cfRecordType, &value.AppliedAddress, &value.DNSStatus,
 		&value.ConfigHash, &value.LastError, &value.DesiredNodeName, &value.AppliedNodeName, &value.AppliedNodePort,
-		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.ConfigPendingSinceMS, &value.ScheduleRevision, &value.UpdatedAtMS, &siteEnabled)
+		&value.AgentBootID, &value.AgentRequestCount, &value.AgentLastRequestAtMS, &value.AgentLastStatus, &value.ConfigPendingSinceMS, &value.ScheduleRevision, &value.UpdatedAtMS, &siteEnabled, &upstreamMode)
+	if err != nil {
+		return SiteNodeSchedule{}, err
+	}
+	mode, modeErr := normalizeUpstreamMode(upstreamMode)
+	if modeErr != nil {
+		return SiteNodeSchedule{}, modeErr
+	}
+	if mode == upstreamModePathTarget {
+		value.UpstreamMode = mode
+	}
 	value.Enabled = enabled != 0
 	value.SiteEnabled = siteEnabled != 0
 	if fixed.Valid {
@@ -350,7 +363,7 @@ const siteNodeScheduleSelect = `SELECT s.id,s.name,s.public_host,COALESCE(n.enab
 	n.fixed_node_id,n.desired_node_id,n.applied_node_id,COALESCE(n.cf_zone_id,''),COALESCE(n.cf_record_id,''),
 	COALESCE(n.cf_record_type,''),COALESCE(n.applied_address,''),COALESCE(n.dns_status,'disabled'),
 	COALESCE(n.config_hash,''),COALESCE(n.last_error,''),COALESCE(d.name,''),COALESCE(an.name,''),COALESCE(an.https_port,0),
-	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.config_pending_since_ms,0),COALESCE(n.schedule_revision,1),COALESCE(n.updated_at_ms,0),COALESCE(s.enabled,1)
+	COALESCE(n.agent_boot_id,''),COALESCE(n.agent_request_count,0),COALESCE(n.agent_last_request_at_ms,0),COALESCE(n.agent_last_status,0),COALESCE(n.config_pending_since_ms,0),COALESCE(n.schedule_revision,1),COALESCE(n.updated_at_ms,0),COALESCE(s.enabled,1),COALESCE(s.upstream_mode,'fixed')
 	FROM sites s LEFT JOIN site_node_schedules n ON n.site_id=s.id
 	LEFT JOIN control_nodes d ON d.id=n.desired_node_id LEFT JOIN control_nodes an ON an.id=n.applied_node_id`
 
@@ -517,6 +530,9 @@ func readinessError(kind string, err error) error {
 // to receive traffic. A node-level hash can still match while a newly moved
 // site is waiting for the Agent to fetch and apply its next configuration.
 func siteScheduleConfigReady(schedule SiteNodeSchedule, node ControlNode) bool {
+	if schedule.UpstreamMode == upstreamModePathTarget && !agentSupportsPathTargetUpstream(node.AgentVersion) {
+		return false
+	}
 	if schedule.ConfigPendingSinceMS > 0 {
 		return false
 	}
@@ -585,8 +601,10 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		return err
 	}
 	eligible := make(map[int64]bool, len(snapshot.Nodes))
+	pathTargetEligible := make(map[int64]bool, len(snapshot.Nodes))
 	for _, node := range snapshot.Nodes {
 		eligible[node.ID] = nodeAssignmentEligible(node)
+		pathTargetEligible[node.ID] = eligible[node.ID] && agentSupportsPathTargetUpstream(node.AgentVersion)
 	}
 	values, err := a.db.ListSiteNodeSchedules()
 	if err != nil {
@@ -613,6 +631,7 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 			continue
 		}
 		desired := snapshot.Scheduler.ActiveNodeID
+		requiresPathTarget := value.UpstreamMode == upstreamModePathTarget
 		// Keep the last reconciliation error visible between UI refreshes. The
 		// health/DNS pass clears it only after a successful commit; otherwise a
 		// GET /api/node-scheduler/sites must not hide the reason for waiting.
@@ -627,7 +646,7 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 			desired = 0
 			fallback := int64(0)
 			for _, candidate := range snapshot.Nodes {
-				if !nodeAssignmentEligible(candidate) {
+				if !nodeAssignmentEligible(candidate) || requiresPathTarget && !pathTargetEligible[candidate.ID] {
 					continue
 				}
 				// A probe cooldown means "retry this node later"; it must not
@@ -649,7 +668,17 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 		if desired <= 0 || !eligible[desired] {
 			desired = 0
 			lastError = "no eligible node is available"
-		} else if desired != value.DesiredNodeID {
+			if requiresPathTarget {
+				for _, isEligible := range eligible {
+					if isEligible {
+						lastError = pathTargetAgentUpgradeMessage()
+						break
+					}
+				}
+			}
+		} else if requiresPathTarget && !pathTargetEligible[desired] {
+			lastError = pathTargetAgentUpgradeMessage()
+		} else if desired != value.DesiredNodeID || value.LastError == pathTargetAgentUpgradeMessage() {
 			lastError = ""
 		}
 		status := value.DNSStatus
@@ -657,6 +686,9 @@ func (a *App) refreshSiteAssignments(now time.Time) error {
 			status = "pending"
 		}
 		if desired != value.DesiredNodeID {
+			status = "pending"
+		}
+		if requiresPathTarget && !pathTargetEligible[desired] {
 			status = "pending"
 		}
 		desiredChanged := desired != value.DesiredNodeID
@@ -1174,6 +1206,41 @@ func agentSupportsForceStop(version string) bool {
 	return patch >= 65
 }
 
+func pathTargetAgentUpgradeMessage() string {
+	return "Agent update required: generic proxy scheduling needs " + pathTargetAgentMinimumVersion + " or newer"
+}
+
+// Generic routes reuse the Site wire shape, but the Agent must understand an
+// empty fixed target and the per-request upstream mode before receiving one.
+// The first compatible prerelease includes watching history across sources.
+func agentSupportsPathTargetUpstream(version string) bool {
+	version = strings.SplitN(strings.TrimSpace(version), "+", 2)[0]
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 11 {
+		return minor > 11
+	}
+	if patch != 9 {
+		return patch > 9
+	}
+	_, prerelease, hasPrerelease := strings.Cut(version, "-")
+	if !hasPrerelease {
+		return true
+	}
+	parts := strings.Split(prerelease, ".")
+	if len(parts) != 3 || parts[0] != "pre" {
+		return false
+	}
+	date, dateErr := strconv.Atoi(parts[1])
+	build, buildErr := strconv.Atoi(parts[2])
+	return dateErr == nil && buildErr == nil && build >= 0 && (date > 20261123 || date == 20261123 && build >= 8)
+}
+
 func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (string, error) {
 	if !agentSupportsProbeSecret(version) {
 		config.ProbeSecret = ""
@@ -1364,39 +1431,53 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		return AgentRuntimeConfig{}, err
 	}
 	routes := make([]AgentSiteRoute, 0, len(pending))
+	withheldSites := make([]int64, 0)
 	for _, value := range pending {
 		route := value.route
 		storedHeaders, streamHosts := value.storedHeaders, value.streamHosts
-		target, err := normalizeTargetURL(route.TargetURL)
-		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("site %d target: %w", route.SiteID, err)
-		}
-		route.TargetURL = target.String()
-		playbackTarget, _, err := resolvePlaybackConfiguration(route.PlaybackTargetURL, streamHosts)
-		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("site %d playback target: %w", route.SiteID, err)
-		}
-		if playbackTarget != nil {
-			route.PlaybackTargetURL = playbackTarget.String()
-		}
-		if strings.TrimSpace(streamHosts) != "" {
-			if err := json.Unmarshal([]byte(streamHosts), &route.StreamHosts); err != nil {
-				return AgentRuntimeConfig{}, fmt.Errorf("site %d stream hosts: %w", route.SiteID, err)
-			}
-		}
-		if route.StreamHosts == nil {
-			route.StreamHosts = []string{}
-		}
-		policy, err := resolveUpstreamHeaderPolicy(storedHeaders, a.pm.upstreamHeaderKey, target)
-		if err != nil {
-			return AgentRuntimeConfig{}, fmt.Errorf("site %d headers: %w", route.SiteID, err)
-		}
-		if len(policy.values) > 0 {
-			route.Headers = map[string][]string(policy.values)
-		}
 		site, getErr := getSiteTx(tx, route.SiteID)
 		if getErr != nil {
 			return AgentRuntimeConfig{}, getErr
+		}
+		if siteUsesPathTarget(*site) {
+			if !agentSupportsPathTargetUpstream(clientVersion) {
+				// Let an older Agent validate and apply its compatible fixed/empty
+				// configuration, then reach the existing binary update path. A hard
+				// config error here would prevent that Agent from upgrading itself.
+				withheldSites = append(withheldSites, route.SiteID)
+				continue
+			}
+			route.TargetURL = ""
+			route.PlaybackTargetURL = ""
+			route.StreamHosts = []string{}
+		} else {
+			target, err := normalizeTargetURL(route.TargetURL)
+			if err != nil {
+				return AgentRuntimeConfig{}, fmt.Errorf("site %d target: %w", route.SiteID, err)
+			}
+			route.TargetURL = target.String()
+			playbackTarget, _, err := resolvePlaybackConfiguration(route.PlaybackTargetURL, streamHosts)
+			if err != nil {
+				return AgentRuntimeConfig{}, fmt.Errorf("site %d playback target: %w", route.SiteID, err)
+			}
+			if playbackTarget != nil {
+				route.PlaybackTargetURL = playbackTarget.String()
+			}
+			if strings.TrimSpace(streamHosts) != "" {
+				if err := json.Unmarshal([]byte(streamHosts), &route.StreamHosts); err != nil {
+					return AgentRuntimeConfig{}, fmt.Errorf("site %d stream hosts: %w", route.SiteID, err)
+				}
+			}
+			if route.StreamHosts == nil {
+				route.StreamHosts = []string{}
+			}
+			policy, err := resolveUpstreamHeaderPolicy(storedHeaders, a.pm.upstreamHeaderKey, target)
+			if err != nil {
+				return AgentRuntimeConfig{}, fmt.Errorf("site %d headers: %w", route.SiteID, err)
+			}
+			if len(policy.values) > 0 {
+				route.Headers = map[string][]string(policy.values)
+			}
 		}
 		route.Site = *site
 		// Site icons are presentation-only metadata for the Controller UI. Do
@@ -1474,11 +1555,23 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if rowsAffected != 1 {
 		return AgentRuntimeConfig{}, errors.New("agent configuration changed while it was being built; retry")
 	}
-	if _, err := tx.Exec(`UPDATE site_node_schedules SET
+	scheduleHashUpdate := `UPDATE site_node_schedules SET
 		config_pending_since_ms=CASE WHEN config_hash<>? THEN ? ELSE config_pending_since_ms END,
-		config_hash=?,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?`,
+		config_hash=?,updated_at_ms=? WHERE enabled=1 AND desired_node_id=?`
+	if !agentSupportsPathTargetUpstream(clientVersion) {
+		scheduleHashUpdate += " AND site_id NOT IN (SELECT id FROM sites WHERE upstream_mode='path_target')"
+	}
+	if _, err := tx.Exec(scheduleHashUpdate,
 		config.ConfigHash, now.UnixMilli(), config.ConfigHash, now.UnixMilli(), node.ID); err != nil {
 		return AgentRuntimeConfig{}, err
+	}
+	for _, siteID := range withheldSites {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_hash='',dns_status='pending',
+			config_pending_since_ms=CASE WHEN config_pending_since_ms=0 THEN ? ELSE config_pending_since_ms END,
+			last_error=?,updated_at_ms=? WHERE site_id=? AND enabled=1 AND desired_node_id=?`,
+			now.UnixMilli(), pathTargetAgentUpgradeMessage(), now.UnixMilli(), siteID, node.ID); err != nil {
+			return AgentRuntimeConfig{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return AgentRuntimeConfig{}, err
@@ -1896,7 +1989,7 @@ func (a *App) finalizeDisabledSiteNodeRuntime(schedule SiteNodeSchedule, now tim
 	if err := markAgentConfigsDirtyForNodeIDsTx(tx, ids...); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return a.db.commitControllerNodeAdmission(tx)
 }
 
 // finalizeDisabledSiteNodeSchedule clears every assignment and remote DNS
@@ -1944,7 +2037,7 @@ func (a *App) finalizeDisabledSiteNodeSchedule(schedule SiteNodeSchedule) error 
 	if err := markAgentConfigsDirtyForNodeIDsTx(tx, ids...); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return a.db.commitControllerNodeAdmission(tx)
 }
 
 func siteNodeScheduleNeedsCleanup(value SiteNodeSchedule) bool {
@@ -2366,6 +2459,9 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 	if err != nil {
 		return readinessError(readinessListener, err)
 	}
+	if siteUsesPathTarget(*site) && !agentSupportsPathTargetUpstream(node.AgentVersion) {
+		return readinessError(readinessConfig, errors.New(pathTargetAgentUpgradeMessage()))
+	}
 	if applyErr := strings.TrimSpace(node.AgentApplyError); applyErr != "" {
 		return readinessError(readinessConfig, fmt.Errorf("Agent configuration apply failed: %s", applyErr))
 	}
@@ -2625,7 +2721,7 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 		}
 		return cause
 	}
-	if err = tx.Commit(); err != nil {
+	if err = a.db.commitControllerNodeAdmission(tx); err != nil {
 		return cleanupTransaction(err)
 	}
 	if err := a.syncAdditionalSiteDNS(ctx, schedule, zoneID, desiredAddresses, now); err != nil {
@@ -2964,9 +3060,17 @@ func (a *App) removeSiteNodeSchedule(ctx context.Context, siteID int64) error {
 	// Keep the child row as the durable deletion handle until DeleteSite's
 	// database transaction commits. This avoids the partial-commit window where
 	// Cloudflare has been cleaned but a later site-row deletion fails.
-	_, err = a.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
+	cleanupTx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer cleanupTx.Rollback()
+	_, err = cleanupTx.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,
 		applied_node_id=NULL,cf_zone_id='',cf_record_id='',cf_record_type='',applied_address='',dns_status='disabled',last_error='',schedule_revision=schedule_revision+1,updated_at_ms=? WHERE site_id=?`, time.Now().UnixMilli(), siteID)
-	return err
+	if err != nil {
+		return err
+	}
+	return a.db.commitControllerNodeAdmission(cleanupTx)
 }
 
 func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
@@ -3072,5 +3176,5 @@ func (a *App) prepareNodeDeletion(ctx context.Context, nodeID int64) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return a.db.commitControllerNodeAdmission(tx)
 }

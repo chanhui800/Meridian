@@ -22,6 +22,7 @@ function siteModalHarness() {
     .map(([, name, value]) => [name, value === undefined ? true : decode(value)]));
   const input = attrs => ({
     value: attrs.value || '', checked: attrs.checked === true, disabled: attrs.disabled === true,
+    type: attrs.type || '',
     dataset: Object.fromEntries(Object.entries(attrs).filter(([name]) => name.startsWith('data-'))
       .map(([name, value]) => [name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), value])),
     listeners: new Map(), focus() {}, classList: { toggle() {} },
@@ -87,7 +88,8 @@ function siteModalHarness() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/static/js/app.js'), 'utf8').split('(function()')[0], sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'sites.js'), 'utf8'), sandbox);
   const emit = (control, name, value) => {
-    control.value = value;
+    if (control.type === 'checkbox') control.checked = value === true;
+    else control.value = value;
     const event = { target: control };
     control[`on${name}`]?.(event);
     control.listeners.get(name)?.(event);
@@ -177,6 +179,66 @@ test('saving the site form preserves manually entered ports after protocol edits
 
   assert.equal(saved[0].target_url, 'http://origin.example.com:443/newbase');
   assert.deepEqual(saved[0].failover_lines, [{ name: '线路2', url: 'http://backup.example.com:443/newbase', enabled: true }]);
+});
+
+test('generic proxy switch defaults off and disables fixed-only options when enabled', async () => {
+  const { sandbox, element, saved, emit } = siteModalHarness();
+  await sandbox.showSiteModal();
+  element('m-name').value = 'Generic path proxy';
+  assert.equal(element('m-upstream-mode').checked, false);
+  emit(element('m-upstream-mode'), 'change', true);
+  assert.equal(element('m-fixed-upstream-fields').hidden, true);
+  assert.equal(element('m-ingress-path-option').disabled, true);
+  assert.equal(element('m-target-address').disabled, true);
+  assert.equal(element('m-asset-cache').disabled, true);
+  assert.notEqual(element('m-fixed-history-policy').hidden, true);
+  assert.equal(element('m-watch-history').disabled, false);
+  const help = element('m-upstream-mode-help').textContent;
+  assert.match(help, /http:\/\/192\.168\.1\.10:8096\/emby/);
+  assert.match(help, /服务端会从路径解析协议、主机和端口/);
+  assert.doesNotMatch(help, /\/_proxy\/v1|内网和本机地址/);
+  emit(element('m-upstream-mode'), 'change', false);
+  assert.equal(element('m-fixed-upstream-fields').hidden, false);
+  emit(element('m-upstream-mode'), 'change', true);
+
+  element('m-ingress-mode').value = 'port';
+  emit(element('m-ingress-mode'), 'change', 'port');
+  element('m-port').value = '8009';
+  await element('m-submit').onclick();
+
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].upstream_mode, 'path_target');
+  assert.equal(saved[0].ingress_mode, 'port');
+  assert.equal(saved[0].target_url, '');
+  assert.equal(saved[0].primary_line_name, '');
+  assert.deepEqual(saved[0].failover_lines, []);
+  assert.deepEqual(saved[0].upstream_headers, []);
+  assert.equal(saved[0].asset_cache_enabled, false);
+  assert.equal(saved[0].watch_history_enabled, false);
+  assert.equal(saved[0].main_video_stream_mode, 'proxy');
+});
+
+test('generic proxy creation and edit retain the selected viewing history setting', async () => {
+  const { sandbox, element, saved, emit } = siteModalHarness();
+  await sandbox.showSiteModal();
+  element('m-name').value = 'Generic history';
+  emit(element('m-upstream-mode'), 'change', true);
+  emit(element('m-watch-history'), 'change', 'on');
+  emit(element('m-ingress-mode'), 'change', 'port');
+  element('m-port').value = '8009';
+  await element('m-submit').onclick();
+  assert.equal(saved[0].watch_history_enabled, true);
+  assert.equal(saved[0].upstream_mode, 'path_target');
+  assert.equal(saved[0].target_url, '');
+
+  await sandbox.showSiteModal({ id: 9, name: 'Generic history', ingress_mode: 'port', listen_port: 8009,
+    upstream_mode: 'path_target', target_url: '', watch_history_enabled: true, ua_mode: 'passthrough' });
+  assert.equal(element('m-watch-history').value, 'on');
+  await element('m-submit').onclick();
+  assert.equal(saved[1].watch_history_enabled, true);
+  emit(element('m-watch-history'), 'change', 'off');
+  await element('m-submit').onclick();
+  assert.equal(saved[2].watch_history_enabled, false);
 });
 
 test('backup defaults still follow the protocol after adding and removing another line', async () => {

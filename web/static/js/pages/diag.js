@@ -163,8 +163,9 @@ function renderHeadersCard(headers) {
 function renderProxyCard(proxy) {
   const mode = String(proxy.ingress_mode || (proxy.public_host ? 'host' : 'port')).toLowerCase();
   const modeLabel = { port: '仅独立端口', path: '共享路径', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+  const upstreamModeLabel = String(proxy.upstream_mode || '').toLowerCase() === 'path_target' ? '通用反代' : '固定回源';
   const portValue = proxy.port_listening ? `:${esc(proxy.listen_port || '--')}（监听中）` : mode === 'host' ? `:${esc(proxy.listen_port || '--')}（仅保留，未监听）` : `:${esc(proxy.listen_port || '--')}（未监听）`;
-  return `<section class="diag-check diag-proxy-check"><header class="diag-check-header"><h3>代理状态</h3><span class="diag-result-status ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></header><dl class="diag-rows">${diagReportRow('入口模式', esc(modeLabel))}${proxy.public_host ? diagReportRow('共享域名', esc(proxy.public_host), 'diag-wrap') : ''}${proxy.path_prefix ? diagReportRow('路径前缀', esc(proxy.path_prefix)) : ''}${diagReportRow('端口状态', portValue)}${diagReportRow('总请求数', typeof proxy.total_requests === 'number' ? String(proxy.total_requests) : '--')}</dl></section>`;
+  return `<section class="diag-check diag-proxy-check"><header class="diag-check-header"><h3>代理状态</h3><span class="diag-result-status ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></header><dl class="diag-rows">${diagReportRow('入口模式', esc(modeLabel))}${diagReportRow('回源方式', esc(upstreamModeLabel))}${proxy.public_host ? diagReportRow('共享域名', esc(proxy.public_host), 'diag-wrap') : ''}${proxy.path_prefix ? diagReportRow('路径前缀', esc(proxy.path_prefix)) : ''}${diagReportRow('端口状态', portValue)}${diagReportRow('总请求数', typeof proxy.total_requests === 'number' ? String(proxy.total_requests) : '--')}</dl></section>`;
 }
 function primaryProbeNote(primary) {
   const probe = primary && primary.health ? primary.health.probe || {} : {};
