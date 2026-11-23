@@ -359,7 +359,7 @@ test('main video strategy uses a compact selector and defaults to proxy', () => 
   assert.match(source, /<option value="direct"[^>]*>直连<\/option>/);
   assert.doesNotMatch(source, /m-main-video-(?:proxy|direct)|main-video-mode-control/);
   assert.match(source, /mainVideoModeSelect\.value = isEdit[^\n]+: 'proxy'/);
-  assert.match(source, /main_video_stream_mode: mainVideoModeSelect\.value/);
+	assert.match(source, /main_video_stream_mode: usesPathTargetMode\(\) \? 'proxy' : mainVideoModeSelect\.value/);
 });
 
 test('advanced policies remain grouped with responsive console fields', () => {

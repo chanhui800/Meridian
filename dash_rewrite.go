@@ -199,7 +199,7 @@ func dashTemplatePublicSuffix(expressions []string) string {
 }
 
 func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSession, bindings dashTemplateBindings) (string, error) {
-	if session == nil || session.issuer == nil || session.base == nil || base == nil {
+	if session == nil || session.issuer == nil && !session.pathTargetMode || session.base == nil || base == nil {
 		return "", fmt.Errorf("DASH rewrite session is unavailable")
 	}
 	if err := session.ctx.Err(); err != nil {
@@ -220,6 +220,21 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	}
 	resolvedValidation := base.ResolveReference(validationReference)
 	resolvedClaim := base.ResolveReference(claimReference)
+	if session.pathTargetMode {
+		session.urlCount++
+		if session.urlCount > session.maxURLsPerResponse() {
+			return "", newDynamicPolicyDenialError(fmt.Errorf("discovered URL count exceeds its limit"))
+		}
+		localTemplate, err := restoreDASHLocalTemplateMarkers(resolvedValidation.RequestURI(), markers)
+		if err != nil {
+			return "", err
+		}
+		scheme := strings.ToLower(resolvedValidation.Scheme)
+		if (scheme == "http" || scheme == "https") && resolvedValidation.Host != "" {
+			return pathTargetRoutePrefix + scheme + "/" + resolvedValidation.Host + localTemplate, nil
+		}
+		return "", newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL template"))
+	}
 	configured := session.source == dynamicDiscoverySourceDASH && session.issuer.configuredAuthorities[redirectHostKey(resolvedValidation)]
 	var validationTarget *url.URL
 	var claimURL *url.URL
@@ -242,7 +257,7 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 		return localTemplate, err
 	}
 	session.urlCount++
-	if session.urlCount > session.issuer.policy.limits.MaxURLsPerResponse {
+	if session.urlCount > session.maxURLsPerResponse() {
 		return "", newDynamicPolicyDenialError(fmt.Errorf("discovered URL count exceeds its limit"))
 	}
 	seenKey := "dash-template\x00" + strconv.FormatBool(configured) + "\x00" + claimTarget + "\x00" + strings.Join(expressions, "\x1f") + "\x00" + strings.Join(fixedValues, "\x1f")
@@ -529,7 +544,7 @@ func estimateDASHCloneExpansion(node *dashXMLNode, inheritedNodes, inheritedByte
 }
 
 func rewriteDASHResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
-	if session == nil || session.issuer == nil || session.ctx == nil {
+	if session == nil || session.issuer == nil && !session.pathTargetMode || session.ctx == nil {
 		return nil, fmt.Errorf("DASH rewrite session is unavailable")
 	}
 	root, err := parseDASHXML(session.ctx, payload)

@@ -110,6 +110,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			RoutePrefix          string                `json:"route_prefix"`
 			PathPrefix           string                `json:"path_prefix"`
 			IngressMode          string                `json:"ingress_mode"`
+			UpstreamMode         string                `json:"upstream_mode"`
 			TargetURL            string                `json:"target_url"`
 			PrimaryLineName      string                `json:"primary_line_name"`
 			PlaybackTargetURL    string                `json:"playback_target_url"`
@@ -137,8 +138,13 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
-		if req.Name == "" || req.TargetURL == "" {
-			a.jsonErr(w, 400, "name and target_url are required")
+		upstreamMode, err := normalizeUpstreamMode(req.UpstreamMode)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.Name == "" || upstreamMode == upstreamModeFixed && req.TargetURL == "" {
+			a.jsonErr(w, 400, "name and target_url are required for fixed upstream mode")
 			return
 		}
 		if req.UAMode == "" {
@@ -217,6 +223,23 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, errUnsetIngress.Error())
 			return
 		}
+		if upstreamMode == upstreamModePathTarget {
+			if req.IngressMode != ingressModeHost && req.IngressMode != ingressModePort {
+				a.jsonErr(w, http.StatusBadRequest, "path-target upstream mode requires domain-prefix or dedicated-port ingress")
+				return
+			}
+			if strings.TrimSpace(req.TargetURL) != "" || strings.TrimSpace(req.PlaybackTargetURL) != "" || len(req.StreamHosts) != 0 ||
+				len(req.FailoverTargets) != 0 || len(req.FailoverLines) != 0 || len(req.UpstreamHeaders) != 0 {
+				a.jsonErr(w, http.StatusBadRequest, "path-target upstream mode cannot use fixed upstream settings")
+				return
+			}
+			req.AssetCacheEnabled = false
+			req.AssetCacheRules = ""
+			assetCacheConfig.AssetCacheEnabled = false
+			req.AccountRetentionDays = 0
+			accountRetentionDays = 0
+			req.MainVideoStreamMode = mainVideoStreamModeProxy
+		}
 		if req.IngressMode == ingressModePath && req.PathPrefix == "" {
 			a.jsonErr(w, http.StatusBadRequest, "path_prefix is required for path ingress")
 			return
@@ -266,14 +289,24 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
+		validateErr := error(nil)
+		if upstreamMode == upstreamModePathTarget {
+			validateErr = validatePathTargetSiteSettings(req.Name, req.ListenPort, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit)
+		} else {
+			validateErr = validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit)
+		}
+		if validateErr != nil {
+			a.jsonErr(w, http.StatusBadRequest, validateErr.Error())
 			return
 		}
-		normalizedLines, enabledFailovers, err := normalizeFailoverLines(req.TargetURL, req.FailoverLines, req.FailoverTargets)
-		if err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
+		var normalizedLines []FailoverLine
+		var enabledFailovers []string
+		if upstreamMode == upstreamModeFixed {
+			normalizedLines, enabledFailovers, err = normalizeFailoverLines(req.TargetURL, req.FailoverLines, req.FailoverTargets)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		req.FailoverLines = normalizedLines
 		req.FailoverTargets = enabledFailovers
@@ -289,10 +322,13 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		if req.FailoverLines == nil {
 			failoverLinesJSON = []byte("[]")
 		}
-		storedHeaders, err := mergeUpstreamHeaders("[]", req.UpstreamHeaders, a.pm.upstreamHeaderKey, req.TargetURL)
-		if err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
+		storedHeaders := "[]"
+		if upstreamMode == upstreamModeFixed {
+			storedHeaders, err = mergeUpstreamHeaders("[]", req.UpstreamHeaders, a.pm.upstreamHeaderKey, req.TargetURL)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		if len(req.FailoverTargets) > 0 && storedHeaders != "[]" {
 			a.jsonErr(w, http.StatusBadRequest, "failover_targets cannot be combined with fixed upstream headers")
@@ -318,6 +354,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PublicHost:            req.PublicHost,
 			PathPrefix:            req.PathPrefix,
 			IngressMode:           req.IngressMode,
+			UpstreamMode:          upstreamMode,
 			TargetURL:             req.TargetURL,
 			PrimaryLineName:       req.PrimaryLineName,
 			PlaybackTargetURL:     req.PlaybackTargetURL,
@@ -572,6 +609,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			RoutePrefix          *string                `json:"route_prefix"`
 			PathPrefix           *string                `json:"path_prefix"`
 			IngressMode          *string                `json:"ingress_mode"`
+			UpstreamMode         *string                `json:"upstream_mode"`
 			TargetURL            string                 `json:"target_url"`
 			PrimaryLineName      *string                `json:"primary_line_name"`
 			PlaybackTargetURL    *string                `json:"playback_target_url"`
@@ -599,6 +637,17 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
+		upstreamMode := upstreamModeFixed
+		if siteUsesPathTarget(*oldSite) {
+			upstreamMode = upstreamModePathTarget
+		}
+		if req.UpstreamMode != nil {
+			upstreamMode, err = normalizeUpstreamMode(*req.UpstreamMode)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		playbackTargetURL := oldSite.PlaybackTargetURL
 		if req.PlaybackTargetURL != nil {
 			playbackTargetURL = *req.PlaybackTargetURL
@@ -622,7 +671,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		failoverTargets := oldSite.FailoverTargets
 		failoverLines := oldSite.StoredFailoverLines
-		if req.FailoverLines != nil {
+		if upstreamMode == upstreamModePathTarget {
+			failoverTargets = "[]"
+			failoverLines = "[]"
+		} else if req.FailoverLines != nil {
 			normalizedLines, enabledFailovers, normalizeErr := normalizeFailoverLines(req.TargetURL, *req.FailoverLines, nil)
 			if normalizeErr != nil {
 				a.jsonErr(w, http.StatusBadRequest, normalizeErr.Error())
@@ -704,6 +756,16 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, errUnsetIngress.Error())
 			return
 		}
+		if upstreamMode == upstreamModePathTarget {
+			if ingressMode != ingressModeHost && ingressMode != ingressModePort {
+				a.jsonErr(w, http.StatusBadRequest, "path-target upstream mode requires domain-prefix or dedicated-port ingress")
+				return
+			}
+			if strings.TrimSpace(req.TargetURL) != "" {
+				a.jsonErr(w, http.StatusBadRequest, "target_url must be empty for path-target upstream mode")
+				return
+			}
+		}
 		pathPrefix := oldSite.PathPrefix
 		if req.PathPrefix != nil {
 			pathPrefix, err = normalizePathPrefix(*req.PathPrefix)
@@ -744,30 +806,46 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		oldTarget, oldTargetErr := normalizeTargetURL(oldSite.TargetURL)
-		newTarget, newTargetErr := normalizeTargetURL(req.TargetURL)
-		if newTargetErr != nil {
-			a.jsonErr(w, http.StatusBadRequest, fmt.Sprintf("invalid target_url: %v", newTargetErr))
-			return
-		}
-		if oldTargetErr != nil {
-			a.jsonErr(w, http.StatusInternalServerError, "stored target_url is invalid")
-			return
-		}
-		storedHeaders := oldSite.StoredUpstreamHeaders
-		headerMergeBase := oldSite.StoredUpstreamHeaders
-		if !sameRedirectAuthority(oldTarget, newTarget) {
-			// Fixed upstream headers are origin secrets. Never carry ciphertext
-			// across an authority change, even when the client omits this field.
-			storedHeaders = "[]"
-			headerMergeBase = "[]"
-		}
-		if req.UpstreamHeaders != nil {
-			storedHeaders, err = mergeUpstreamHeaders(headerMergeBase, *req.UpstreamHeaders, a.pm.upstreamHeaderKey, req.TargetURL)
-			if err != nil {
-				a.jsonErr(w, http.StatusBadRequest, err.Error())
+		targetURL := req.TargetURL
+		storedHeaders := "[]"
+		if upstreamMode == upstreamModeFixed {
+			newTarget, newTargetErr := normalizeTargetURL(targetURL)
+			if newTargetErr != nil {
+				a.jsonErr(w, http.StatusBadRequest, fmt.Sprintf("invalid target_url: %v", newTargetErr))
 				return
 			}
+			authorityChanged := siteUsesPathTarget(*oldSite)
+			if !authorityChanged {
+				oldTarget, oldTargetErr := normalizeTargetURL(oldSite.TargetURL)
+				if oldTargetErr != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "stored target_url is invalid")
+					return
+				}
+				authorityChanged = !sameRedirectAuthority(oldTarget, newTarget)
+			}
+			headerMergeBase := oldSite.StoredUpstreamHeaders
+			storedHeaders = oldSite.StoredUpstreamHeaders
+			if authorityChanged {
+				// Fixed upstream headers are origin secrets. Never carry ciphertext
+				// across an authority change, even when the client omits this field.
+				storedHeaders = "[]"
+				headerMergeBase = "[]"
+			}
+			if req.UpstreamHeaders != nil {
+				storedHeaders, err = mergeUpstreamHeaders(headerMergeBase, *req.UpstreamHeaders, a.pm.upstreamHeaderKey, targetURL)
+				if err != nil {
+					a.jsonErr(w, http.StatusBadRequest, err.Error())
+					return
+				}
+			}
+		} else {
+			targetURL = ""
+			playbackTargetURL = ""
+			playbackMode = "direct"
+			mainVideoStreamMode = mainVideoStreamModeProxy
+			streamHosts = "[]"
+			failoverTargets = "[]"
+			failoverLines = "[]"
 		}
 		uaMode, customUserAgent, customClient, customVersion, uaErr := mergeSiteUAConfig(*oldSite, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
 		if uaErr != nil {
@@ -786,9 +864,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, "invalid failover_targets")
 			return
 		}
-		if _, err := parseFailoverTargets(req.TargetURL, failoverTargetList); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
-			return
+		if upstreamMode == upstreamModeFixed {
+			if _, err := parseFailoverTargets(targetURL, failoverTargetList); err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		if len(failoverTargetList) > 0 && storedHeaders != "[]" {
 			a.jsonErr(w, http.StatusBadRequest, "failover_targets cannot be combined with fixed upstream headers")
@@ -826,7 +906,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.PublicHost = publicHost
 		candidate.PathPrefix = pathPrefix
 		candidate.IngressMode = ingressMode
-		candidate.TargetURL = req.TargetURL
+		candidate.UpstreamMode = ""
+		if upstreamMode == upstreamModePathTarget {
+			candidate.UpstreamMode = upstreamModePathTarget
+		}
+		candidate.TargetURL = targetURL
 		if req.PrimaryLineName != nil {
 			candidate.PrimaryLineName, err = normalizePrimaryLineName(*req.PrimaryLineName)
 			if err != nil {
@@ -875,14 +959,24 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if upstreamMode == upstreamModePathTarget {
+			candidate.AssetCacheEnabled = false
+			candidate.AccountRetentionDays = 0
+		}
 		if err := normalizeAssetCacheConfig(&candidate); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		candidate.TrafficQuota = quota
 		candidate.SpeedLimit = speedLimit
-		if err := validateSiteSettings(candidate.Name, candidate.ListenPort, candidate.TargetURL, candidate.PlaybackTargetURL, candidate.PlaybackMode, streamHostList, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit); err != nil {
-			a.jsonErr(w, http.StatusBadRequest, err.Error())
+		validateErr := error(nil)
+		if upstreamMode == upstreamModePathTarget {
+			validateErr = validatePathTargetSiteSettings(candidate.Name, candidate.ListenPort, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit)
+		} else {
+			validateErr = validateSiteSettings(candidate.Name, candidate.ListenPort, candidate.TargetURL, candidate.PlaybackTargetURL, candidate.PlaybackMode, streamHostList, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit)
+		}
+		if validateErr != nil {
+			a.jsonErr(w, http.StatusBadRequest, validateErr.Error())
 			return
 		}
 		if candidate.PublicHost != "" {
@@ -895,6 +989,26 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			if assignedID, exists := a.pm.PathPrefixSiteID(candidate.PathPrefix); exists && assignedID != candidate.ID {
 				a.jsonErr(w, http.StatusBadRequest, "path_prefix is already assigned to another site")
 				return
+			}
+		}
+		if !siteUsesPathTarget(*oldSite) && siteUsesPathTarget(candidate) {
+			// Existing DNS may already point at the applied node. Keep its fixed
+			// route intact until that Agent can serve the replacement mode.
+			schedule, scheduleErr := a.db.siteNodeSchedule(id)
+			if scheduleErr != nil && !errors.Is(scheduleErr, errNodeNotFound) {
+				a.jsonErr(w, http.StatusInternalServerError, "read site node assignment failed")
+				return
+			}
+			if scheduleErr == nil && schedule.Enabled && schedule.AppliedNodeID > 0 {
+				appliedNode, nodeErr := a.db.controlNodeByID(schedule.AppliedNodeID, time.Now())
+				if nodeErr != nil {
+					a.jsonErr(w, http.StatusServiceUnavailable, "read applied node failed")
+					return
+				}
+				if !agentSupportsPathTargetUpstream(appliedNode.AgentVersion) {
+					a.jsonErr(w, http.StatusConflict, "请先升级当前承载站点的节点 Agent 至 "+pathTargetAgentMinimumVersion+" 或更新版本，再切换通用反代")
+					return
+				}
 			}
 		}
 		needsPreStop := oldSite.Enabled && ingressUsesPort(oldSite.IngressMode) && ingressUsesPort(candidate.IngressMode) && oldSite.ListenPort == candidate.ListenPort && a.pm.IsRunning(id)

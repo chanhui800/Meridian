@@ -50,6 +50,8 @@ type DB struct {
 	trafficTotalsSchema         int64
 	installUUID                 string
 	systemSettings              atomic.Pointer[SystemSettings]
+	controllerNodeAdmission     atomic.Pointer[controllerNodeAdmissionSnapshot]
+	controllerNodeAdmissionMu   sync.Mutex
 	nodeTLSMutationMu           sync.Mutex
 	watchHistoryMetadataMu      sync.Mutex
 	watchHistoryMetadata        map[watchHistoryMetadataKey]watchHistoryMetadataEntry
@@ -71,6 +73,12 @@ func openDB(path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
+	admission, err := readControllerNodeAdmission(sqlDB)
+	if err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	d.controllerNodeAdmission.Store(admission)
 	if err := d.ensureInstallationUUID(); err != nil {
 		sqlDB.Close()
 		return nil, err

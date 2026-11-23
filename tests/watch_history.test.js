@@ -27,6 +27,7 @@ function loadWatchHistoryHelpers() {
     String,
     Math,
     Promise,
+    URL,
     API: {
       watchHistoryPosterURL(id) {
         const numeric = Number(id);
@@ -186,6 +187,124 @@ test('live watch cards match the detail view by preferring a horizontal backdrop
   assert.match(html, /watch-history-live-badge/);
 });
 
+test('generic history and live cards identify server authorities while keeping artwork same-origin', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  for (const [sourceKey, address, authority] of [
+    ['a'.repeat(64), 'http://192.0.2.10:8096', 'http://192.0.2.10:8096'],
+    ['b'.repeat(64), 'https://emby.example:8920/private-mount/emby', 'https://emby.example:8920'],
+    ['c'.repeat(64), 'https://[2001:db8::10]:8920/private-mount/emby', 'https://[2001:db8::10]:8920'],
+    ['d'.repeat(64), 'http://default.example:80/private-mount', 'http://default.example:80'],
+    ['e'.repeat(64), 'https://default.example/private-mount', 'https://default.example:443'],
+  ]) {
+    const item = {
+      id: 1, site_id: 4, site_name: '通用站点', title: '同一影片',
+      source_key: sourceKey, source_address: address,
+      media_item_id: 7, poster_available: true, backdrop_path: '/landscape.jpg',
+    };
+    for (const context of [{}, { source: 'live', live: true }]) {
+      const html = sandbox.watchHistoryCardHTML(item, 0, context);
+      assert.match(html, /服务器地址/);
+      assert.ok(html.includes(`<span class="watch-history-source-address-value">${authority}</span>`));
+      assert.doesNotMatch(html, /(?:src|href|data-watch-history-image)="https?:/);
+      assert.doesNotMatch(html, /private-mount/);
+      assert.ok(!html.includes(sourceKey), 'the hash is not a readable server identifier');
+    }
+    const details = sandbox.watchHistoryDetailsHTML(item);
+    assert.ok(details.includes(`<dt>服务器地址</dt><dd>${authority}</dd>`));
+    assert.doesNotMatch(details, /(?:src|href|data-watch-history-image)="https?:/);
+    assert.doesNotMatch(details, /private-mount/);
+  }
+});
+
+test('source address credentials, paths and executable content never render in history, live cards or details', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const address = 'https://private-user:private-password@emby.example:8920/private-mount/\"><img src=x onerror=alert(1)>?api_key=private-token#private-fragment';
+  const item = {
+    id: 1, site_id: 4, site_name: '通用站点', title: '安全显示',
+    source_key: 'a'.repeat(64), source_address: address,
+    media_item_id: 7, poster_available: true,
+    poster_path: 'https://other.example/poster.jpg',
+  };
+  for (const html of [
+    sandbox.watchHistoryCardHTML(item, 0),
+    sandbox.watchHistoryCardHTML(item, 0, { source: 'live', live: true }),
+    sandbox.watchHistoryDetailsHTML(item),
+  ]) {
+    assert.ok(html.includes('https://emby.example:8920'), 'only the server authority is readable');
+    assert.ok(!html.includes(address));
+    assert.doesNotMatch(html, /private-user|private-password|private-mount|private-token|private-fragment|onerror|alert\(1\)|(?:src|href|data-watch-history-image)="https?:/);
+    assert.match(html, /src="\/api\/watch-history\/posters\/7"/);
+    assert.doesNotMatch(html, /other\.example/);
+  }
+});
+
+test('server authority text stays HTML-escaped after URL normalization', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const item = {
+    id: 1, title: '安全显示', source_key: 'a'.repeat(64),
+    source_address: 'https://media&partners.example:8920/private-mount?api_key=private-token',
+  };
+  for (const html of [
+    sandbox.watchHistoryCardHTML(item, 0),
+    sandbox.watchHistoryCardHTML(item, 0, { source: 'live', live: true }),
+    sandbox.watchHistoryDetailsHTML(item),
+  ]) {
+    assert.ok(html.includes('https://media&amp;partners.example:8920'));
+    assert.doesNotMatch(html, /https:\/\/media&partners|private-mount|private-token/);
+  }
+});
+
+test('long server addresses remain complete visible text with wrapping styles for cards and details', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  const hostname = `${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.emby.example`;
+  const address = `https://${hostname}:8920`;
+  const item = { id: 1, title: '长地址', source_key: 'a'.repeat(64), source_address: address };
+  for (const context of [{}, { source: 'live', live: true }]) {
+    const html = sandbox.watchHistoryCardHTML(item, 0, context);
+    assert.ok(html.includes(`<span class="watch-history-source-address-value">${address}</span>`));
+    assert.doesNotMatch(html, /title="https?:|href="https?:/);
+  }
+  assert.ok(sandbox.watchHistoryDetailsHTML(item).includes(`<dt>服务器地址</dt><dd>${address}</dd>`));
+  const css = source('web/static/css/history-console.css');
+  assert.match(css, /\.watch-history-card-body\s*\{[^}]*min-width:\s*0/);
+  assert.match(css, /\.watch-history-source-address\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal/);
+  assert.match(css, /\.watch-history-detail-source-address\s*\{[^}]*grid-column:\s*1\s*\/\s*-1;[^}]*min-width:\s*0/);
+  assert.match(css, /\.watch-history-detail-source-address dd\s*\{[^}]*white-space:\s*normal/);
+});
+
+test('missing or invalid addresses show an update message only for generic source keys', () => {
+  const sandbox = loadWatchHistoryHelpers();
+  for (const sourceKey of ['a'.repeat(64), 'ABCDEF01'.repeat(8)]) {
+    for (const address of [undefined, null, '', '   ', 42, {}, 'not a URL', 'javascript:alert(1)', 'https://', 'https:///private-token', 'https://server.example\\private-token', 'https://server.example:0', 'https://server.example:65536', 'https://\"><img src=x onerror=alert(1)>']) {
+      const item = { id: 1, title: '待补齐记录', source_key: sourceKey, source_address: address };
+      for (const html of [
+        sandbox.watchHistoryCardHTML(item, 0),
+        sandbox.watchHistoryCardHTML(item, 0, { source: 'live', live: true }),
+        sandbox.watchHistoryDetailsHTML(item),
+      ]) {
+        assert.match(html, /服务器地址/);
+        assert.match(html, /来源地址待更新/);
+        assert.doesNotMatch(html, /private-token|onerror|javascript:|alert\(1\)/);
+        assert.ok(!html.includes(sourceKey));
+      }
+    }
+  }
+  for (const sourceKey of [undefined, null, '', 'legacy-source', 'g'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), ` ${'a'.repeat(64)} `]) {
+    for (const address of [undefined, 'https://fixed.example:8920/private-mount?api_key=private-token']) {
+      const item = { id: 1, title: '固定站点记录', site_name: '固定站点', source_key: sourceKey, source_address: address };
+      for (const html of [
+        sandbox.watchHistoryCardHTML(item, 0),
+        sandbox.watchHistoryCardHTML(item, 0, { source: 'live', live: true }),
+        sandbox.watchHistoryDetailsHTML(item),
+      ]) {
+        assert.doesNotMatch(html, /服务器地址|来源地址待更新|watch-history-(?:detail-)?source-address/);
+        assert.doesNotMatch(html, /fixed\.example|private-mount|private-token/);
+        assert.match(html, /固定站点/);
+      }
+    }
+  }
+});
+
 test('watch history details escape synopsis and cast data while exposing the requested metadata', () => {
   const sandbox = loadWatchHistoryHelpers();
   const attack = '<script>alert(1)</script>';
@@ -337,6 +456,78 @@ function historyDetailsHarness() {
   };
 }
 
+for (const detailSource of ['history', 'live']) {
+  test(`background address enrichment redraws history, live cards and the open ${detailSource} detail without changing progress`, async () => {
+    const h = historyDetailsHarness();
+    const makeGrid = () => {
+      let markup = '';
+      const writes = [];
+      const grid = { setAttribute() {}, querySelectorAll() { return []; } };
+      Object.defineProperty(grid, 'innerHTML', {
+        get: () => markup,
+        set(value) { markup = String(value); writes.push(markup); },
+      });
+      return { grid, writes };
+    };
+    const history = makeGrid(), live = makeGrid();
+    const elements = {
+      'page-watch-history': { isConnected: true },
+      'watch-history-grid': history.grid,
+      'watch-history-status': { textContent: '' },
+      'watch-history-more': { hidden: true, disabled: false, textContent: '' },
+      'watch-history-live-section': { hidden: true },
+      'watch-history-live-grid': live.grid,
+      'watch-history-live-count': { textContent: '' },
+      'watch-history-live-description': { textContent: '' },
+    };
+    const getElementById = h.document.getElementById;
+    h.document.getElementById = id => elements[id] || getElementById(id);
+    h.sandbox.setTimeout = () => 1;
+    h.sandbox.clearTimeout = () => {};
+    h.sandbox.API.listSites = async () => [{ id: 4, name: '通用站点', watch_history_enabled: true }];
+    h.sandbox.API.getTMDBSettings = async () => ({ enabled: false, configured: false });
+    const item = {
+      id: 1, site_id: 4, site_name: '通用站点', title: '地址补齐测试',
+      source_key: 'a'.repeat(64), last_seen_at_ms: 1795212345000,
+      position_ticks: 7540000000, runtime_ticks: 36000000000,
+    };
+    let address;
+    const response = () => ({ items: [{ ...item, source_address: address }] });
+    h.sandbox.API.getWatchHistory = async () => response();
+    h.sandbox.API.getActiveWatchHistory = async () => response();
+
+    await vm.runInContext('loadWatchHistory(true)', h.sandbox);
+    h.sandbox.watchHistoryOpenDetails(0, detailSource);
+    h.content.scrollTop = 97;
+    const focused = h.document.activeElement;
+    assert.match(history.grid.innerHTML, /来源地址待更新/);
+    assert.match(live.grid.innerHTML, /来源地址待更新/);
+    assert.match(h.content.innerHTML, /来源地址待更新/);
+
+    for (const newAddress of ['https://server-a.example:8920', 'https://server-b.example:8920']) {
+      const historyWrites = history.writes.length, liveWrites = live.writes.length, detailWrites = h.writes.length;
+      address = newAddress;
+      await vm.runInContext('loadWatchHistory(true, { background: true })', h.sandbox);
+      assert.equal(history.writes.length, historyWrites + 1, 'address-only changes must update visible history rows');
+      assert.equal(live.writes.length, liveWrites + 1, 'address-only changes must update visible live cards');
+      assert.equal(h.writes.length, detailWrites + 1, 'the open detail must display the enriched address');
+      for (const html of [history.grid.innerHTML, live.grid.innerHTML, h.content.innerHTML]) {
+        assert.ok(html.includes(newAddress));
+        assert.doesNotMatch(html, /来源地址待更新/);
+      }
+      assert.equal(h.document.activeElement, focused);
+      assert.equal(h.content.scrollTop, 97);
+      assert.equal(vm.runInContext('watchHistoryState.items[0].position_ticks', h.sandbox), item.position_ticks);
+      assert.equal(vm.runInContext('watchHistoryState.liveItems[0].last_seen_at_ms', h.sandbox), item.last_seen_at_ms);
+
+      await vm.runInContext('loadWatchHistory(true, { background: true })', h.sandbox);
+      assert.equal(history.writes.length, historyWrites + 1, 'an unchanged response preserves the existing history DOM');
+      assert.equal(live.writes.length, liveWrites + 1, 'an unchanged response preserves the existing live DOM');
+      assert.equal(h.writes.length, detailWrites + 1, 'an unchanged response preserves the open detail DOM');
+    }
+  });
+}
+
 test('a live detail remains open on its historical stop record without stealing focus or fabricating a stop time', () => {
   const h = historyDetailsHarness();
   const item = { id: 1, title: 'Active', media_item_id: 7, poster_available: true };
@@ -464,6 +655,83 @@ test('background refresh preserves loaded pages while replacing series represent
   assert.equal(merged.some(item => item.id === 26), true);
   assert.equal(merged.length, 26);
 });
+
+for (const [grouping, metadata] of [
+  ['series name', { series_name: 'Shared Series' }],
+  ['TMDB ID', { series_name: '', tmdb_type: 'tv', tmdb_id: 7001 }],
+]) {
+  test(`background refresh isolates ${grouping} across sources after loading more`, async () => {
+    const sandbox = loadWatchHistoryHelpers();
+    const sourceA = 'a'.repeat(64);
+    const sourceB = 'b'.repeat(64);
+    const firstPage = Array.from({ length: 24 }, (_, index) => ({
+      id: index + 1,
+      site_id: 1,
+      media_type: 'movie',
+      title: `Movie ${index + 1}`,
+    }));
+    const episode = { site_id: 1, media_type: 'episode', ...metadata };
+    const laterPage = [
+      { ...episode, id: 25, source_key: sourceA, title: 'Old source A episode' },
+      { ...episode, id: 26, source_key: sourceB, title: 'Source B episode' },
+      { ...episode, id: 27, title: 'Old fixed source episode' },
+    ];
+    const responses = [
+      { items: firstPage, next_cursor: 'page-two', has_more: true },
+      { items: laterPage, next_cursor: 'page-three', has_more: true },
+      {
+        items: [
+          { ...episode, id: 28, source_key: sourceA, title: 'New source A episode' },
+          { ...episode, id: 29, source_key: '', title: 'New fixed source episode' },
+          ...firstPage.slice(0, 22),
+        ],
+        next_cursor: 'refreshed-first-page',
+        has_more: false,
+      },
+    ];
+    const requests = [];
+    const grid = { innerHTML: '', setAttribute() {}, querySelectorAll() { return []; } };
+    const elements = {
+      'page-watch-history': { isConnected: true },
+      'watch-history-grid': grid,
+      'watch-history-status': { textContent: '' },
+      'watch-history-more': { hidden: true, disabled: false, textContent: '' },
+    };
+    sandbox.document = { getElementById(id) { return elements[id] || null; } };
+    sandbox.Router = { current: 'watch-history' };
+    sandbox.setTimeout = () => 1;
+    sandbox.clearTimeout = () => {};
+    sandbox.API.listSites = async () => [{ id: 1, name: 'Shared site', watch_history_enabled: true }];
+    sandbox.API.getTMDBSettings = async () => ({ enabled: false, configured: false });
+    sandbox.API.getActiveWatchHistory = async () => ({ items: [] });
+    sandbox.API.getWatchHistory = async filters => {
+      requests.push(JSON.parse(JSON.stringify(filters)));
+      return responses.shift();
+    };
+
+    await vm.runInContext('loadWatchHistory(true)', sandbox);
+    await vm.runInContext('loadWatchHistory(false)', sandbox);
+    assert.equal(vm.runInContext('watchHistoryState.items.length', sandbox), 27);
+    assert.match(grid.innerHTML, /Source B episode/);
+
+    await vm.runInContext('loadWatchHistory(true, { background: true })', sandbox);
+    const state = JSON.parse(JSON.stringify(vm.runInContext('watchHistoryState', sandbox)));
+    assert.equal(state.loading, false);
+    assert.equal(state.items.some(item => item.id === 25), false, 'replace the old representative from source A');
+    assert.equal(state.items.some(item => item.id === 28 && item.source_key === sourceA), true);
+    assert.equal(state.items.some(item => item.id === 26 && item.source_key === sourceB), true, 'retain the loaded representative from source B');
+    assert.equal(state.items.some(item => item.id === 27), false, 'missing and empty source keys identify the same fixed source');
+    assert.equal(state.items.some(item => item.id === 29), true);
+    assert.equal(state.items.length, 27);
+    assert.equal(state.nextCursor, 'page-three');
+    assert.equal(state.hasMore, true);
+    assert.match(grid.innerHTML, /Source B episode/);
+    assert.match(grid.innerHTML, /New source A episode/);
+    assert.match(grid.innerHTML, /New fixed source episode/);
+    assert.doesNotMatch(grid.innerHTML, /Old source A episode|Old fixed source episode/);
+    assert.deepEqual(requests, [{ limit: 24 }, { limit: 24, cursor: 'page-two' }, { limit: 24 }]);
+  });
+}
 
 test('TMDB settings never render a returned token and blank saves preserve it', () => {
   const sandbox = loadTMDBHelpers();
@@ -693,6 +961,111 @@ test('history delete control uses its own live source and cannot open details on
   deleteEvents.click({ preventDefault() {}, stopPropagation() {} });
   assert.equal(opened, 0);
   assert.deepEqual(deleted, [2]);
+});
+
+test('live deletion preserves pending and failed cards and reindexes surviving cards on success', async () => {
+  const h = historyDetailsHarness();
+  const section = { hidden: true };
+  const count = { textContent: '' };
+  const description = { textContent: '' };
+  let markup = '', cards = [];
+  const grid = {
+    querySelectorAll(selector) { return selector === '.watch-history-card[data-history-index]' ? cards : []; },
+  };
+  Object.defineProperty(grid, 'innerHTML', {
+    get: () => markup,
+    set(value) {
+      cards.forEach(card => { card.isConnected = false; });
+      markup = String(value);
+      cards = [...markup.matchAll(/<article\b[^>]*data-history-index="(\d+)" data-history-source="(live|history)"[^>]*>/g)].map(([, index, source]) => {
+        const events = {}, deleteEvents = {};
+        const button = { addEventListener(name, handler) { deleteEvents[name] = handler; } };
+        return {
+          isConnected: true,
+          dataset: { historyIndex: index, historySource: source },
+          events, deleteEvents,
+          querySelector() { return button; },
+          addEventListener(name, handler) { events[name] = handler; },
+          classList: { contains() { return false; }, add() {}, remove() {} },
+        };
+      });
+    },
+  });
+  const elements = {
+    'watch-history-live-section': section,
+    'watch-history-live-grid': grid,
+    'watch-history-live-count': count,
+    'watch-history-live-description': description,
+  };
+  const getElementById = h.document.getElementById;
+  h.document.getElementById = id => elements[id] || getElementById(id);
+  const requests = [], errors = [], successes = [], confirmations = [];
+  h.sandbox.confirm = message => { confirmations.push(message); return true; };
+  h.sandbox.Toast = { error: message => errors.push(message), success: message => successes.push(message) };
+  h.sandbox.API.deleteWatchHistory = id => new Promise((resolve, reject) => { requests.push({ id, resolve, reject }); });
+  let deletion;
+  const deleteItem = h.sandbox.watchHistoryDeleteItem;
+  h.sandbox.watchHistoryDeleteItem = item => { deletion = deleteItem(item); return deletion; };
+  const clickDelete = card => {
+    deletion = null;
+    card.deleteEvents.click({ preventDefault() {}, stopPropagation() {} });
+    assert.ok(deletion, 'the bound card control must call the real async deletion function');
+    return deletion;
+  };
+  const firstLive = { id: 2, title: 'Live A' };
+  const secondLive = { id: 3, title: 'Live B' };
+  h.setItems([{ id: 1, title: 'Unrelated history' }, firstLive, secondLive], [firstLive, secondLive]);
+  h.sandbox.watchHistoryRenderLive();
+  const originalCards = cards;
+  const originalMarkup = markup;
+  assert.equal(cards.length, 2);
+  assert.equal(count.textContent, '2');
+
+  const failedDeletion = clickDelete(cards[0]);
+  assert.equal(requests[0].id, 2);
+  assert.equal(markup, originalMarkup, 'pending deletion must leave the visible cards intact');
+  assert.equal(vm.runInContext('watchHistoryState.liveItems.length', h.sandbox), 2);
+  assert.equal(vm.runInContext('watchHistoryState.items.length', h.sandbox), 3);
+  requests[0].reject(new Error('Deletion failed'));
+  await failedDeletion;
+  assert.deepEqual(errors, ['Deletion failed']);
+  assert.deepEqual(successes, []);
+  assert.equal(cards, originalCards, 'failed deletion must leave the bound cards intact');
+  assert.equal(markup, originalMarkup);
+  assert.equal(vm.runInContext('watchHistoryState.liveItems.map(item => item.id).join(",")', h.sandbox), '2,3');
+  assert.equal(vm.runInContext('watchHistoryState.items.map(item => item.id).join(",")', h.sandbox), '1,2,3');
+
+  const firstDeletion = clickDelete(cards[0]);
+  assert.equal(requests[1].id, 2);
+  requests[1].resolve({ deleted: true, id: 2 });
+  await firstDeletion;
+  assert.equal(vm.runInContext('watchHistoryState.liveItems.map(item => item.id).join(",")', h.sandbox), '3');
+  assert.equal(vm.runInContext('watchHistoryState.items.map(item => item.id).join(",")', h.sandbox), '1,3');
+  assert.equal(cards.length, 1, 'redraw live cards immediately after a successful deletion');
+  assert.equal(originalCards[0].isConnected, false);
+  assert.equal(cards[0].dataset.historyIndex, '0');
+  assert.equal(cards[0].dataset.historySource, 'live');
+  assert.equal(count.textContent, '1');
+  assert.match(markup, /Live B/);
+  assert.doesNotMatch(markup, /Live A/);
+
+  cards[0].events.click({ preventDefault() {} });
+  assert.equal(vm.runInContext('watchHistoryDetailItemID', h.sandbox), '3');
+  assert.match(h.content.innerHTML, /Live B/);
+  const lastDeletion = clickDelete(cards[0]);
+  assert.equal(requests[2].id, 3, 'the reindexed survivor must delete its own session');
+  requests[2].resolve({ deleted: true, id: 3 });
+  await lastDeletion;
+  assert.deepEqual(requests.map(request => request.id), [2, 2, 3]);
+  assert.equal(confirmations.length, 3);
+  assert.match(confirmations[2], /Live B/);
+  assert.equal(cards.length, 0);
+  assert.equal(markup, '');
+  assert.equal(count.textContent, '0');
+  assert.equal(section.hidden, true);
+  assert.equal(h.modal.hidden, true);
+  assert.equal(vm.runInContext('watchHistoryState.items.map(item => item.id).join(",")', h.sandbox), '1');
+  assert.equal(successes.length, 2);
 });
 
 test('TMDB official logo is stored locally for the panel CSP', () => {

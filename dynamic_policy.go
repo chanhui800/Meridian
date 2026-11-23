@@ -28,6 +28,8 @@ const (
 	ingressModeUnset                   = "unset"
 	mainVideoStreamModeProxy           = "proxy"
 	mainVideoStreamModeDirect          = "direct"
+	upstreamModeFixed                  = "fixed"
+	upstreamModePathTarget             = "path_target"
 	dynamicRoutePrefix                 = "/_meridian/d/"
 	dynamicDiscoverySourceRedirect     = "redirect"
 	dynamicDiscoverySourcePlaybackInfo = "playback_info"
@@ -37,6 +39,26 @@ const (
 	dynamicCapabilityKindManifest      = "manifest"
 	maxDynamicManifestDepth            = 3
 )
+
+func normalizeUpstreamMode(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", upstreamModeFixed:
+		return upstreamModeFixed, nil
+	case upstreamModePathTarget:
+		return upstreamModePathTarget, nil
+	default:
+		return "", fmt.Errorf("upstream_mode must be fixed or path_target")
+	}
+}
+
+func siteUsesPathTarget(site Site) bool {
+	return strings.EqualFold(strings.TrimSpace(site.UpstreamMode), upstreamModePathTarget)
+}
+
+func storedUpstreamMode(value string) string {
+	mode, _ := normalizeUpstreamMode(value)
+	return mode
+}
 
 const (
 	// dynamicProfileCompatible is the only profile the runtime assigns. The

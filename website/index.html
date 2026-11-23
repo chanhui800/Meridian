@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Meridian · Emby / Jellyfin 多站点反向代理与节点调度</title>
-  <meta name="description" content="Meridian 把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 证书与边缘 Agent 放在一个面板里。">
+  <meta name="description" content="Meridian 为 Emby / Jellyfin 提供固定回源与通用反代、播放地址改写、多来源观看历史、流量统计、TLS 证书和节点调度。">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=1.11.9">
 </head>
 <body>
   <header class="nav">
@@ -18,8 +18,9 @@
         </svg>
         <span>Meridian</span>
       </a>
-      <nav class="nav-links">
+      <nav class="nav-links" aria-label="页面导航">
         <a href="#features">功能</a>
+        <a href="#generic-proxy">通用反代</a>
         <a href="#screenshots">界面</a>
         <a href="#install">安装</a>
         <a href="https://github.com/chanhui800/Meridian/releases" target="_blank" rel="noopener">版本记录</a>
@@ -34,15 +35,16 @@
   <main id="top">
     <section class="hero">
       <div class="hero-inner">
-        <p class="hero-badge"><span class="dot"></span>v1.11.8 已发布</p>
+        <a class="hero-badge" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.9" target="_blank" rel="noopener"><span class="dot"></span>v1.11.9 已发布</a>
         <h1>Emby / Jellyfin 多站点反向代理<br>与节点调度面板</h1>
-        <p class="hero-sub">站点入口、备用线路、播放改写、流量统计、请求日志、观看历史、TLS 证书和边缘 Agent，一个面板全部接管。</p>
+        <p class="hero-sub">固定回源与通用反代两种模式，把站点入口、播放改写、观看历史、流量统计、TLS 证书和边缘节点收进一个面板。</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="#install">快速开始</a>
-          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/latest" target="_blank" rel="noopener">下载正式版</a>
+          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.9" target="_blank" rel="noopener">下载正式版</a>
         </div>
+        <p class="release-overview">本次更新：客户端路径回源、多来源观看历史与节点正式接管。</p>
         <div class="hero-stats">
-          <div><strong>多站点</strong><span>主线路 + 最多 7 条备用线路</span></div>
+          <div><strong>两种回源模式</strong><span>固定线路，或由客户端路径指定回源</span></div>
           <div><strong>节点调度</strong><span>一个 Controller 管理多台 Agent</span></div>
           <div><strong>零侵入</strong><span>不内置伪装 UA，默认透传</span></div>
         </div>
@@ -60,7 +62,7 @@
         <article>
           <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm1 4h5v8H5V9Zm7 0h7v3h-7V9Zm0 5h4v3h-4v-3Z" fill="currentColor"/></svg></div>
           <h3>多站点与线路</h3>
-          <p>独立端口、路径前缀、域名前缀三种入口，主线路加最多七条备用线路，自动故障切换。</p>
+          <p>固定回源支持独立端口、路径前缀、域名前缀三种入口，主线路加最多七条备用线路，自动故障切换。</p>
         </article>
         <article>
           <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 9 9 0 0 0-9-9Zm1 4h-2v5h-3v2h5V7Zm0 10h-2v-2h2v2Z" fill="currentColor"/></svg></div>
@@ -80,7 +82,7 @@
         <article>
           <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 21a9 9 0 1 1 9-9 9 9 0 0 1-9 9Zm0-17v8l5.2 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
           <h3>观看历史</h3>
-          <p>同步当前播放会话与已保存记录，媒体库数量、保号提醒和 TMDB 补全可选开启。</p>
+          <p>同步当前播放会话与已保存记录，通用模式按来源记录；固定回源可开启媒体库数量与保号周期。</p>
         </article>
         <article>
           <div class="feature-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 0 1 10 10c0 5.5-4.5 10-10 10a10 10 0 0 1-6.6-2.5L3 22l1.2-3.6A10 10 0 0 1 2 12 10 10 0 0 1 12 2Zm0 2a8 8 0 0 0-8 8c0 1.8.6 3.4 1.6 4.7l-.8 2.3 1.7-.5a8 8 0 0 0 5.5 1.5 8 8 0 0 0 8-8 8 8 0 0 0-8-8Zm-3 5h6a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2Z" fill="currentColor"/></svg></div>
@@ -100,10 +102,79 @@
       </div>
     </section>
 
+    <section id="generic-proxy" class="section generic-section" aria-labelledby="generic-title">
+      <h2 id="generic-title">通用反代</h2>
+      <p class="section-sub">一个站点入口，连接不同媒体服务器。客户端的路径栏填写完整回源 URL，每个请求使用对应的 HTTP(S) 服务。</p>
+
+      <div class="comparison-card">
+        <table class="mode-comparison">
+          <caption>按使用方式选择回源模式</caption>
+          <thead>
+            <tr><th scope="col">能力</th><th scope="col">固定回源</th><th scope="col">通用反代</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">回源地址</th><td>面板配置主线路与备用线路</td><td>客户端路径填写完整 HTTP(S) URL</td></tr>
+            <tr><th scope="row">访问入口</th><td>独立端口、路径前缀、域名前缀</td><td>独立端口、域名前缀</td></tr>
+            <tr><th scope="row">主视频流</th><td>反代或直连</td><td>反代</td></tr>
+            <tr><th scope="row">观看历史</th><td>站点播放记录</td><td>多来源播放记录与服务器地址</td></tr>
+            <tr><th scope="row">节点调度</th><td>域名前缀入口支持</td><td>域名前缀入口支持</td></tr>
+            <tr><th scope="row">备用线路</th><td>最多 7 条，自动故障切换</td><td>不提供</td></tr>
+            <tr><th scope="row">固定请求头、静态资源缓存、保号周期</th><td>支持</td><td>不提供</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="generic-setup">
+        <div class="generic-instructions">
+          <h3>连接你的媒体服务</h3>
+          <ol>
+            <li>在“站点管理”中新增或编辑站点，开启“通用反代”。</li>
+            <li>选择域名前缀或独立端口入口，保存并启用站点。</li>
+            <li>在 Emby / Jellyfin 客户端中填写服务器地址与路径。</li>
+          </ol>
+          <p>目标可以是主控或所选节点能够访问的本机、局域网及公网 HTTP(S) 服务。节点正式接管后，回源连接由生效节点发起。</p>
+        </div>
+        <div class="client-example" aria-label="客户端连接示例">
+          <p class="example-label">客户端填写示例</p>
+          <dl class="client-fields">
+            <div><dt>服务器地址</dt><dd><code>https://gateway.example:9090</code></dd></div>
+            <div><dt>路径</dt><dd><code>http://origin.example:8096/emby</code></dd></div>
+          </dl>
+          <p class="example-label request-label">请求示例</p>
+          <code class="request-example">https://gateway.example:9090/http://origin.example:8096/emby/Items</code>
+        </div>
+      </div>
+
+      <div class="route-examples">
+        <article>
+          <h3>HTTPS、端口与挂载路径</h3>
+          <p>路径保留回源的协议、主机、端口和实际挂载路径。使用 HTTPS 回源时可填写：</p>
+          <code>https://origin.example:8920/emby</code>
+          <p>服务没有挂载路径时省略 <code>/emby</code>；本机回源也可填写 <code>http://localhost:8096/emby</code>。</p>
+        </article>
+        <article>
+          <h3>内置路由格式</h3>
+          <p>客户端路径栏也可以使用 <code>/_proxy/v1/{http|https}/{主机:端口}/{回源路径}</code>，与完整回源 URL 对应：</p>
+          <code>/_proxy/v1/http/origin.example:8096/emby</code>
+          <code>/_proxy/v1/https/origin.example:8920/emby</code>
+          <p>两种格式都支持播放地址、HLS / DASH、字幕、图片、重定向与 WebSocket 改写。</p>
+        </article>
+      </div>
+
+      <div class="source-history">
+        <div>
+          <h3>观看历史，区分每个来源</h3>
+          <p>在“高级策略”中开启观看历史后，同一入口的播放会话和媒体信息按来源服务器与 API 路径分别记录。正在观看、观看记录和详情页显示服务器地址，只包含协议、主机与端口。</p>
+        </div>
+        <dl class="source-address"><dt>服务器地址</dt><dd><code>https://origin.example:8920</code></dd><dd class="source-address-detail">地址栏不包含挂载路径</dd></dl>
+      </div>
+      <p class="generic-doc-link"><a href="https://github.com/chanhui800/Meridian/blob/main/docs/generic-proxy.md" target="_blank" rel="noopener">阅读通用反代完整用法</a></p>
+    </section>
+
     <section class="flow-section">
       <div class="section">
         <h2>节点调度如何工作</h2>
-        <p class="section-sub">启用调度后，Controller 下发路由、线路、改写与 TLS 配置，Agent 通过健康检查后才切换 DNS。</p>
+        <p class="section-sub">域名前缀入口可交由节点承载。Agent 应用站点配置并通过健康检查后，再切换站点 DNS。</p>
         <div class="flow">
           <div class="flow-node"><strong>客户端</strong><span>播放请求</span></div>
           <div class="flow-arrow">→</div>
@@ -113,13 +184,17 @@
           <div class="flow-arrow">→</div>
           <div class="flow-node"><strong>上游</strong><span>Emby / Jellyfin</span></div>
         </div>
-        <p class="flow-note">Controller 实时下发与校验；DNS 只影响新连接，已有播放不会被强制迁移。</p>
+        <div class="handoff-details">
+          <p>首次接管前，Controller 继续承接站点请求。Agent 配置就绪、HTTPS / SNI 健康检查通过并完成 DNS 切换后，节点正式接管，Controller 对该站点的新请求返回 HTTP 421。</p>
+          <p>DNS 只影响新连接，已开始的视频和 WebSocket 连接继续运行。后续节点切换等待或失败时，主控入口保持关闭；关闭调度并完成 DNS 与节点清理后恢复。</p>
+          <p>通用反代使用支持该模式的 Agent；旧版节点会显示等待升级。域名前缀入口可以选择跟随全局调度或固定节点。</p>
+        </div>
       </div>
     </section>
 
     <section id="screenshots" class="section">
       <h2>界面一览</h2>
-      <p class="section-sub">以下截图使用演示数据，不含任何生产环境域名、IP、令牌或证书。</p>
+      <p class="section-sub">查看仪表盘、站点管理、节点调度与观看历史的操作界面。</p>
       <div class="gallery">
         <figure><button class="shot" data-full="images/dashboard.png" aria-label="放大查看仪表盘"><img src="images/dashboard.png" alt="仪表盘" loading="lazy" width="1440" height="900"></button><figcaption>仪表盘</figcaption></figure>
         <figure><button class="shot" data-full="images/sites.png" aria-label="放大查看站点管理"><img src="images/sites.png" alt="站点管理" loading="lazy" width="1440" height="900"></button><figcaption>站点管理</figcaption></figure>
@@ -156,7 +231,7 @@
       </div>
       <div class="install-actions">
         <a class="btn btn-primary" href="https://github.com/chanhui800/Meridian#readme" target="_blank" rel="noopener">阅读完整文档</a>
-        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/latest" target="_blank" rel="noopener">Release 与校验文件</a>
+        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.9" target="_blank" rel="noopener">Release 与校验文件</a>
       </div>
     </section>
   </main>
@@ -169,7 +244,7 @@
           <path d="M9 28 L15 13 L19 21 L23 15 L31 28" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
         <span>Meridian</span>
-        <p>面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板。</p>
+        <p>面向 Emby 和 Jellyfin，支持固定回源、通用反代与节点调度。</p>
       </div>
       <div class="footer-links">
         <a href="https://github.com/chanhui800/Meridian" target="_blank" rel="noopener">GitHub 仓库</a>
@@ -185,6 +260,6 @@
     <img id="lightboxImg" alt="">
   </div>
 
-  <script src="app-v1.11.8.js"></script>
+  <script src="app-v1.11.9.js"></script>
 </body>
 </html>

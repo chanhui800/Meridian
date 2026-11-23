@@ -168,6 +168,12 @@ func validateHLSURIAttributes(tag, value string, attributes []hlsAttributeSpan) 
 			return newDynamicPolicyDenialError(fmt.Errorf("HLS rendition report URI must be relative"))
 		}
 		return nil
+	case "#EXT-X-CONTENT-STEERING":
+		serverURI, hasServerURI := hlsAttributeValue(value, attributes, "SERVER-URI")
+		if !hasServerURI || serverURI == "" {
+			return fmt.Errorf("HLS content steering requires SERVER-URI")
+		}
+		return nil
 	case "#EXT-X-DATERANGE":
 		return nil
 	default:
@@ -194,10 +200,10 @@ func rewriteHLSURIKind(value string, session *dynamicRewriteSession, kind string
 
 func hlsAttributeResourceKind(tag, name string) string {
 	switch tag {
-	case "#EXT-X-MEDIA", "#EXT-X-I-FRAME-STREAM-INF", "#EXT-X-IMAGE-STREAM-INF", "#EXT-X-RENDITION-REPORT":
+	case "#EXT-X-MEDIA", "#EXT-X-I-FRAME-STREAM-INF", "#EXT-X-IMAGE-STREAM-INF", "#EXT-X-RENDITION-REPORT", "#EXT-X-CONTENT-STEERING":
 		return dynamicCapabilityKindManifest
 	case "#EXT-X-DATERANGE":
-		if name == "X-ASSET-URI" {
+		if name == "X-ASSET-URI" || name == "X-ASSET-LIST" {
 			return dynamicCapabilityKindManifest
 		}
 	}
@@ -265,7 +271,7 @@ func knownHLSManifestTag(tag string) bool {
 }
 
 func rewriteHLSResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
-	if session == nil || session.issuer == nil || !utf8.Valid(payload) || len(payload) == 0 {
+	if session == nil || session.issuer == nil && !session.pathTargetMode || !utf8.Valid(payload) || len(payload) == 0 {
 		return nil, fmt.Errorf("invalid HLS manifest")
 	}
 	sawCRLF := false
@@ -287,7 +293,7 @@ func rewriteHLSResponse(payload []byte, session *dynamicRewriteSession) ([]byte,
 	if sawCRLF && sawLF {
 		return nil, fmt.Errorf("HLS manifest mixes newline styles")
 	}
-	maxLines := session.issuer.policy.limits.MaxURLsPerResponse*8 + 1024
+	maxLines := session.maxURLsPerResponse()*8 + 1024
 	if bytes.Count(payload, []byte{'\n'})+1 > maxLines {
 		return nil, fmt.Errorf("HLS manifest contains too many lines")
 	}
@@ -305,13 +311,14 @@ func rewriteHLSResponse(payload []byte, session *dynamicRewriteSession) ([]byte,
 		"#EXT-X-MAP":                {"URI": true},
 		"#EXT-X-MEDIA":              {"URI": true},
 		"#EXT-X-I-FRAME-STREAM-INF": {"URI": true},
+		"#EXT-X-CONTENT-STEERING":   {"SERVER-URI": true},
 		"#EXT-X-SESSION-KEY":        {"URI": true},
 		"#EXT-X-SESSION-DATA":       {"URI": true},
 		"#EXT-X-IMAGE-STREAM-INF":   {"URI": true},
 		"#EXT-X-RENDITION-REPORT":   {"URI": true},
 		"#EXT-X-PRELOAD-HINT":       {"URI": true},
 		"#EXT-X-PART":               {"URI": true},
-		"#EXT-X-DATERANGE":          {"X-ASSET-URI": true, "X-URI": true},
+		"#EXT-X-DATERANGE":          {"X-ASSET-LIST": true, "X-ASSET-URI": true, "X-URI": true},
 	}
 	singletons := make(map[string]bool)
 	multivariant := false
@@ -378,7 +385,9 @@ func rewriteHLSResponse(payload []byte, session *dynamicRewriteSession) ([]byte,
 		case "#EXT-X-DEFINE":
 			return nil, fmt.Errorf("HLS variable substitution is unsupported")
 		case "#EXT-X-CONTENT-STEERING":
-			return nil, fmt.Errorf("HLS content steering is unsupported")
+			if !session.pathTargetMode {
+				return nil, fmt.Errorf("HLS content steering is unsupported")
+			}
 		case "#EXT-X-VERSION", "#EXT-X-START", "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-SKIP":
 			if singletons[tag] {
 				return nil, fmt.Errorf("duplicate singleton HLS tag")
@@ -414,7 +423,7 @@ func rewriteHLSResponse(payload []byte, session *dynamicRewriteSession) ([]byte,
 				return nil, err
 			}
 			for _, attribute := range attributes {
-				if attribute.name == "X-ASSET-LIST" || attribute.name == "X-ASSET-URI" {
+				if !session.pathTargetMode && (attribute.name == "X-ASSET-LIST" || attribute.name == "X-ASSET-URI") {
 					return nil, fmt.Errorf("HLS interstitial asset URLs require an unavailable absolute public capability base")
 				}
 			}

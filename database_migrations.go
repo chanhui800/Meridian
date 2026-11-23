@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 	"unicode"
@@ -20,7 +21,11 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion = 56
+	databaseSchemaVersion                      = 58
+	watchHistorySourceBackfillSiteLimit        = 128
+	watchHistorySourceBackfillSourceLimit      = 4096
+	watchHistorySourceBackfillPerCategoryLimit = 256
+	watchHistorySourceBackfillCandidateLimit   = 4096
 )
 
 func (d *DB) migrate() error {
@@ -104,6 +109,7 @@ func (d *DB) migrateOnce() error {
 			public_host TEXT NOT NULL DEFAULT '',
 			path_prefix TEXT NOT NULL DEFAULT '',
 			ingress_mode TEXT NOT NULL DEFAULT 'port',
+			upstream_mode TEXT NOT NULL DEFAULT 'fixed',
 			target_url TEXT NOT NULL,
 		primary_line_name TEXT NOT NULL DEFAULT '主线路',
 		playback_target_url TEXT NOT NULL DEFAULT '',
@@ -216,6 +222,12 @@ func (d *DB) migrateOnce() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_media_items_site_updated ON media_items(site_id, updated_at_ms DESC, id DESC);
 	CREATE INDEX IF NOT EXISTS idx_media_items_tmdb ON media_items(tmdb_type, tmdb_id);
+	CREATE TABLE IF NOT EXISTS watch_history_sources (
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		source_key TEXT NOT NULL,
+		source_address TEXT NOT NULL,
+		PRIMARY KEY(site_id, source_key)
+	);
 	CREATE TABLE IF NOT EXISTS watch_sessions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -799,6 +811,7 @@ func (d *DB) migrateOnce() error {
 		}
 	}
 	for _, migration := range []struct{ column, sql string }{
+		{"upstream_mode", "ALTER TABLE sites ADD COLUMN upstream_mode TEXT NOT NULL DEFAULT 'fixed'"},
 		{"traffic_used_in", "ALTER TABLE sites ADD COLUMN traffic_used_in BIGINT NOT NULL DEFAULT -1"},
 		{"traffic_used_out", "ALTER TABLE sites ADD COLUMN traffic_used_out BIGINT NOT NULL DEFAULT -1"},
 	} {
@@ -1286,6 +1299,11 @@ func (d *DB) migrateOnce() error {
 			return err
 		}
 	}
+	if previousSchemaVersion < 58 {
+		if err := backfillWatchHistorySourceAddresses(ctx, conn); err != nil {
+			return err
+		}
+	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)); err != nil {
 		return err
 	}
@@ -1295,6 +1313,137 @@ func (d *DB) migrateOnce() error {
 	}
 	committed = true
 	return nil
+}
+
+// An authority is intentionally absent from the original source digest. Recover
+// it only when a successful API request reproduces an existing namespaced item
+// key exactly. Stream backends and time proximity cannot identify a frontend.
+// All candidate queries are limited so retained request logs do not turn startup
+// into an unbounded URL/hash scan; later playback fills any remaining sources.
+func backfillWatchHistorySourceAddresses(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `SELECT mi.site_id,substr(mi.upstream_item_id,7,64)
+		FROM media_items mi
+		WHERE substr(mi.upstream_item_id,1,6)=char(31)||'whs1:'
+			AND substr(mi.upstream_item_id,71,1)=':' AND length(mi.upstream_item_id)>71
+			AND NOT EXISTS (SELECT 1 FROM watch_history_sources whs
+				WHERE whs.site_id=mi.site_id AND whs.source_key=substr(mi.upstream_item_id,7,64))
+		GROUP BY mi.site_id,substr(mi.upstream_item_id,7,64)
+		ORDER BY MAX(mi.updated_at_ms) DESC LIMIT ?`, watchHistorySourceBackfillSourceLimit)
+	if err != nil {
+		return err
+	}
+	missing := make(map[int64]map[string]bool)
+	var siteIDs []int64
+	for rows.Next() {
+		var siteID int64
+		var sourceKey string
+		if err := rows.Scan(&siteID, &sourceKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if len(sourceKey) != 64 || !isHexString(sourceKey) {
+			continue
+		}
+		if missing[siteID] == nil {
+			if len(siteIDs) == watchHistorySourceBackfillSiteLimit {
+				continue
+			}
+			siteIDs = append(siteIDs, siteID)
+			missing[siteID] = make(map[string]bool)
+		}
+		missing[siteID][sourceKey] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	remaining := watchHistorySourceBackfillCandidateLimit
+	for _, siteID := range siteIDs {
+		// Playback sync has the strongest frontend evidence. Metadata is a
+		// fallback only for still-unresolved digests at the same site.
+		for _, category := range []string{requestLogCategoryPlaybackSync, requestLogCategoryMetadata} {
+			if remaining == 0 || len(missing[siteID]) == 0 {
+				break
+			}
+			limit := watchHistorySourceBackfillPerCategoryLimit
+			if limit > remaining {
+				limit = remaining
+			}
+			rows, err := conn.QueryContext(ctx, `SELECT backend_address,path FROM request_logs
+				WHERE site_id=? AND resource_category=? AND status_code>=200 AND status_code<300
+					AND backend_address<>''
+				ORDER BY recorded_at_ms DESC,id DESC LIMIT ?`, siteID, category, limit)
+			if err != nil {
+				return err
+			}
+			recovered := make(map[string]string)
+			for rows.Next() {
+				var backendAddress, path string
+				if err := rows.Scan(&backendAddress, &path); err != nil {
+					rows.Close()
+					return err
+				}
+				remaining--
+				sourceKey, sourceAddress := watchHistorySourceFromRequestLog(backendAddress, path, category)
+				if missing[siteID][sourceKey] && sourceAddress != "" {
+					recovered[sourceKey] = sourceAddress
+				}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			rows.Close()
+			for sourceKey, sourceAddress := range recovered {
+				if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO watch_history_sources
+					(site_id,source_key,source_address) VALUES (?,?,?)`, siteID, sourceKey, sourceAddress); err != nil {
+					return err
+				}
+				delete(missing[siteID], sourceKey)
+			}
+		}
+		if remaining == 0 {
+			break
+		}
+	}
+	return nil
+}
+
+func watchHistorySourceFromRequestLog(backendAddress, path, category string) (string, string) {
+	if len(backendAddress) > watchHistoryMaxSourceAddressBytes || len(path) > requestLogMaxPathBytes {
+		return "", ""
+	}
+	target, err := url.Parse(backendAddress)
+	if err != nil {
+		return "", ""
+	}
+	requestURL, err := url.Parse(path)
+	if err != nil || requestURL.IsAbs() || requestURL.Host != "" || !strings.HasPrefix(requestURL.Path, "/") {
+		return "", ""
+	}
+	mount, route, matched := watchHistorySourceRoute(requestURL.Path)
+	if !matched {
+		return "", ""
+	}
+	switch category {
+	case requestLogCategoryPlaybackSync:
+		if !isRequestLogPlaybackActivityPath(route) {
+			return "", ""
+		}
+	case requestLogCategoryMetadata:
+		if !isWatchHistoryMetadataPath(route) && !isWatchHistoryMetadataCollectionPath(route) {
+			return "", ""
+		}
+	default:
+		return "", ""
+	}
+	address := watchHistorySourceAddress(target, mount)
+	if address == "" {
+		return "", ""
+	}
+	return watchHistorySourceDigest(watchHistorySourceAuthority(target), mount), address
 }
 
 func ensurePanelSettingsListenPortSchema(ctx context.Context, conn *sql.Conn) error {

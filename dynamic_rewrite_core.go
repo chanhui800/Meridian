@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/idna"
@@ -24,6 +25,7 @@ import (
 type dynamicRewriteSession struct {
 	ctx                  context.Context
 	issuer               *dynamicCapabilityIssuer
+	pathTargetMode       bool
 	base                 *url.URL
 	learningBase         *url.URL
 	source               string
@@ -149,17 +151,33 @@ func (s *dynamicRewriteSession) reuseShallowDynamicManifest(base, target *url.UR
 }
 
 func (s *dynamicRewriteSession) structuredOutputLimit() int64 {
-	if s == nil || s.issuer == nil {
+	if s == nil {
 		return 0
 	}
 	limit := s.outputLimit
 	if limit <= 0 || limit > globalDynamicMaxStructuredOutputBytes {
 		limit = globalDynamicMaxStructuredOutputBytes
 	}
+	if s.pathTargetMode {
+		return limit
+	}
+	if s.issuer == nil {
+		return 0
+	}
 	if limit > s.issuer.policy.limits.MaxBodyBytes {
 		limit = s.issuer.policy.limits.MaxBodyBytes
 	}
 	return limit
+}
+
+func (s *dynamicRewriteSession) maxURLsPerResponse() int {
+	if s != nil && s.issuer != nil {
+		return s.issuer.policy.limits.MaxURLsPerResponse
+	}
+	if s != nil && s.pathTargetMode {
+		return dynamicDefaultProfileLimits().MaxURLsPerResponse
+	}
+	return 0
 }
 
 func (s *dynamicRewriteSession) rewrite(raw string) (string, error) {
@@ -780,7 +798,7 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepth(raw string, base *
 }
 
 func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders(raw string, base *url.URL, source, kind string, depth int, requiredHeaders []dynamicCapabilityHeaderClaim) (string, error) {
-	if s == nil || s.issuer == nil || base == nil {
+	if s == nil || base == nil || s.issuer == nil && !s.pathTargetMode {
 		return "", fmt.Errorf("invalid discovered URL: context")
 	}
 	switch {
@@ -813,7 +831,7 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 		return "", fmt.Errorf("invalid structured resource kind or depth")
 	}
 	s.urlCount++
-	if s.urlCount > s.issuer.policy.limits.MaxURLsPerResponse {
+	if s.urlCount > s.maxURLsPerResponse() {
 		return "", fmt.Errorf("discovered URL count exceeds its limit")
 	}
 	reference, err := url.Parse(raw)
@@ -827,6 +845,22 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 		return "", fmt.Errorf("invalid discovered URL: fragment")
 	}
 	resolved := base.ResolveReference(reference)
+	if s.pathTargetMode {
+		resolved.Scheme = strings.ToLower(resolved.Scheme)
+		if resolved.Scheme != "http" && resolved.Scheme != "https" || resolved.Host == "" || resolved.Hostname() == "" || resolved.Opaque != "" || resolved.User != nil {
+			return "", fmt.Errorf("unsupported path-target URL")
+		}
+		if port := resolved.Port(); port != "" {
+			value, portErr := strconv.Atoi(port)
+			if portErr != nil || value < 1 || value > 65535 {
+				return "", fmt.Errorf("invalid path-target URL port")
+			}
+		}
+		if route := pathTargetRouteURL(resolved); route != "" {
+			return route, nil
+		}
+		return "", fmt.Errorf("invalid path-target URL")
+	}
 	if len(requiredHeaders) == 0 && len(s.inheritedHeaders) > 0 && sameRedirectAuthority(s.base, resolved) {
 		requiredHeaders = s.inheritedHeaders
 	}
@@ -1145,6 +1179,95 @@ func installDynamicStructuredBody(resp *http.Response, payload []byte, rewritten
 	resp.Header.Set("X-Content-Type-Options", "nosniff")
 }
 
+type replayableStructuredBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (body *replayableStructuredBody) Close() error {
+	if body == nil || body.closer == nil {
+		return nil
+	}
+	return body.closer.Close()
+}
+
+func readPathTargetStructuredBody(resp *http.Response, limit int64) ([]byte, func(), func(), error) {
+	if resp == nil || resp.Body == nil || limit <= 0 {
+		return nil, nil, nil, fmt.Errorf("structured response body is unavailable")
+	}
+	originalBody := resp.Body
+	var captured bytes.Buffer
+	replay := func() {
+		resp.Body = &replayableStructuredBody{
+			Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), originalBody),
+			closer: originalBody,
+		}
+	}
+	// gzip.NewReader reads the header before returning, so it needs the same
+	// deadline as the body read. Earlier request deadlines shorten the budget.
+	readTimeout := dynamicStructuredBodyTimeout
+	if resp.Request != nil {
+		if deadline, ok := resp.Request.Context().Deadline(); ok {
+			readTimeout = min(readTimeout, time.Until(deadline))
+		}
+	}
+	closedByTimeout := atomic.Bool{}
+	timer := time.AfterFunc(readTimeout, func() {
+		closedByTimeout.Store(true)
+		_ = originalBody.Close()
+	})
+	defer timer.Stop()
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if resp.ContentLength > limit {
+		return nil, replay, nil, fmt.Errorf("structured response body exceeds its limit")
+	}
+	teed := io.TeeReader(originalBody, &captured)
+	compressed := &io.LimitedReader{R: teed, N: limit + 1}
+	var reader io.Reader = compressed
+	var gzipReader *gzip.Reader
+	switch encoding {
+	case "", "identity":
+		if resp.ContentLength >= 0 {
+			if resp.ContentLength > limit {
+				return nil, replay, nil, fmt.Errorf("structured response body exceeds its limit")
+			}
+			reader = io.LimitReader(teed, limit+1)
+		}
+	case "gzip":
+		var err error
+		gzipReader, err = gzip.NewReader(compressed)
+		if err != nil {
+			replay()
+			return nil, nil, nil, fmt.Errorf("invalid gzip response body")
+		}
+		defer gzipReader.Close()
+		reader = gzipReader
+	default:
+		return nil, replay, nil, fmt.Errorf("unsupported structured response encoding")
+	}
+	payload, readErr := io.ReadAll(io.LimitReader(reader, limit+1))
+	timer.Stop()
+	if closedByTimeout.Load() {
+		readErr = fmt.Errorf("structured response deadline exceeded")
+	}
+	if readErr != nil {
+		replay()
+		return nil, nil, nil, readErr
+	}
+	if int64(len(payload)) > limit || compressed.N == 0 {
+		replay()
+		return nil, nil, nil, fmt.Errorf("structured response body exceeds its limit")
+	}
+	if encoding == "gzip" && int64(len(payload)) > minDynamicCompressionRatioBytes {
+		compressedBytes := int64(captured.Len())
+		if compressedBytes <= 0 || int64(len(payload)) > compressedBytes*maxDynamicCompressionRatio {
+			replay()
+			return nil, nil, nil, fmt.Errorf("structured response compression ratio exceeds its limit")
+		}
+	}
+	return payload, replay, func() { _ = originalBody.Close() }, nil
+}
+
 func sanitizeDynamicUpstreamErrorResponse(resp *http.Response, payload []byte) {
 	if resp == nil {
 		return
@@ -1412,6 +1535,73 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		return newDynamicProxyError(dynamicObservationReasonCapacityLimit)
 	}
 	session.publishLearnedPlaybackPaths()
+	installDynamicStructuredBody(resp, rewritten, !bytes.Equal(payload, rewritten))
+	return nil
+}
+
+func rewritePathTargetStructuredResponse(resp *http.Response, state *dynamicSiteState) error {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil || resp.Request.Method == http.MethodHead || resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	source, contentTypeAllowed := dynamicStructuredResponseSource(resp)
+	expectedSource := dynamicResponseExpectedStructuredSource(resp)
+	if expectedSource != "" && dynamicStructuredContentTypeAllowed(expectedSource, resp) {
+		source = expectedSource
+		contentTypeAllowed = true
+	}
+	if source == "" || !contentTypeAllowed || !dynamicStructuredMethodAllowed(source, resp.Request.Method) {
+		return nil
+	}
+	if state == nil {
+		return fmt.Errorf("path-target structured response budget is unavailable")
+	}
+	limits := dynamicDefaultProfileLimits()
+	workingMemory, inputLimit, outputLimit, err := dynamicStructuredWorkingSetWithin(resp, limits.MaxBodyBytes, state.availableParseMemory())
+	if err != nil {
+		return nil
+	}
+	release, acquired := state.acquireParse(workingMemory)
+	if !acquired {
+		return nil
+	}
+	defer release()
+
+	parseContext, cancelParse := context.WithTimeout(resp.Request.Context(), dynamicStructuredBodyTimeout)
+	defer cancelParse()
+	payload, restoreBody, closeBody, err := readPathTargetStructuredBody(resp, inputLimit)
+	if err != nil {
+		if restoreBody != nil {
+			restoreBody()
+		}
+		return nil
+	}
+	session := &dynamicRewriteSession{
+		ctx:             parseContext,
+		pathTargetMode:  true,
+		base:            resp.Request.URL,
+		source:          source,
+		outputLimit:     outputLimit,
+		rewriteRelative: true,
+	}
+	var rewritten []byte
+	switch source {
+	case dynamicDiscoverySourcePlaybackInfo:
+		rewritten, err = rewritePlaybackInfoResponse(payload, session)
+		if err != nil && playbackInfoAutomaticFallbackAllowed(err) {
+			session.urlCount = 0
+			session.seen = nil
+			rewritten, err = rewriteAutomaticPlaybackInfoResponse(payload, session)
+		}
+	case dynamicDiscoverySourceHLS:
+		rewritten, err = rewriteHLSResponse(payload, session)
+	case dynamicDiscoverySourceDASH:
+		rewritten, err = rewriteDASHResponse(payload, session)
+	}
+	if err != nil {
+		restoreBody()
+		return nil
+	}
+	closeBody()
 	installDynamicStructuredBody(resp, rewritten, !bytes.Equal(payload, rewritten))
 	return nil
 }

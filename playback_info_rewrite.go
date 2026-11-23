@@ -138,7 +138,7 @@ func playbackInfoCapabilityTypeForURL(value string, session *dynamicRewriteSessi
 	if manifestSource == "" {
 		return dynamicDiscoverySourcePlaybackInfo, dynamicCapabilityKindResource, nil
 	}
-	if session == nil || session.issuer == nil || !session.issuer.policy.sourceEnabled(manifestSource) {
+	if session == nil || !session.pathTargetMode && (session.issuer == nil || !session.issuer.policy.sourceEnabled(manifestSource)) {
 		return "", "", fmt.Errorf("external PlaybackInfo manifest source is unavailable")
 	}
 	return manifestSource, dynamicCapabilityKindManifest, nil
@@ -171,12 +171,59 @@ func playbackInfoSafeRelativeURL(value string) bool {
 		!dynamicURLPathHasDotSegments(reference.EscapedPath())
 }
 
+func pathTargetPlaybackInfoReference(value string, base *url.URL) string {
+	if base == nil {
+		return value
+	}
+	reference, err := url.Parse(value)
+	if err != nil || reference.IsAbs() || reference.Host != "" || !strings.HasPrefix(reference.Path, "/") {
+		return value
+	}
+	mountPrefix := pathTargetPlaybackInfoMountPrefix(base.Path)
+	if mountPrefix == "" || pathTargetPlaybackInfoUsesRootRoute(reference.Path) || pathTargetPathHasPrefix(reference.Path, mountPrefix) {
+		return value
+	}
+	reference.Path = mountPrefix + reference.Path
+	reference.RawPath = ""
+	return reference.String()
+}
+
+func pathTargetPlaybackInfoMountPrefix(basePath string) string {
+	parts := strings.Split(strings.Trim(basePath, "/"), "/")
+	for index, part := range parts {
+		if strings.EqualFold(part, "Items") && index > 0 {
+			return "/" + strings.Join(parts[:index], "/")
+		}
+	}
+	return ""
+}
+
+func pathTargetPlaybackInfoUsesRootRoute(value string) bool {
+	first := strings.ToLower(strings.SplitN(strings.TrimLeft(value, "/"), "/", 2)[0])
+	switch first {
+	case "videos", "audio", "items", "subtitles":
+		return true
+	default:
+		return false
+	}
+}
+
+func pathTargetPathHasPrefix(value, prefix string) bool {
+	prefix = strings.TrimSuffix(prefix, "/")
+	return value == prefix || strings.HasPrefix(value, prefix+"/")
+}
+
 func playbackInfoShouldRewriteURL(value string, session *dynamicRewriteSession) bool {
 	return playbackInfoURLCandidate(value) || session != nil && session.rewriteRelative && value != ""
 }
 
 func playbackInfoRequiredHeadersUnsupported(value string, hasRequiredHeaders bool, session *dynamicRewriteSession) bool {
 	if !hasRequiredHeaders || !playbackInfoShouldRewriteURL(value, session) {
+		return false
+	}
+	if session != nil && session.pathTargetMode {
+		// Path-target requests forward the client's resulting headers to the
+		// selected authority directly, so PlaybackInfo header claims remain usable.
 		return false
 	}
 	if session == nil || session.rewriteRelative {
@@ -298,7 +345,7 @@ func playbackInfoCapabilityType(object map[string]any, field, value string, sess
 		return "", "", err
 	}
 	if manifestSource != "" {
-		if session == nil || session.issuer == nil || !session.issuer.policy.sourceEnabled(manifestSource) {
+		if session == nil || !session.pathTargetMode && (session.issuer == nil || !session.issuer.policy.sourceEnabled(manifestSource)) {
 			return "", "", fmt.Errorf("external PlaybackInfo manifest source is unavailable")
 		}
 		source = manifestSource
@@ -463,10 +510,10 @@ func playbackInfoAutomaticFallbackAllowed(err error) bool {
 }
 
 func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
-	if session == nil || session.issuer == nil {
+	if session == nil || session.issuer == nil && !session.pathTargetMode {
 		return nil, fmt.Errorf("PlaybackInfo rewrite session is unavailable")
 	}
-	maxTokens := min(session.issuer.policy.limits.MaxURLsPerResponse*64+8192, globalDynamicMaxJSONTokens)
+	maxTokens := min(session.maxURLsPerResponse()*64+8192, globalDynamicMaxJSONTokens)
 	if _, err := validateDynamicJSONStructureWithin(session.ctx, payload, maxTokens, globalDynamicMaxParseDepth); err != nil {
 		return nil, fmt.Errorf("invalid PlaybackInfo JSON")
 	}
@@ -530,7 +577,18 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 				// client will request it through Meridian, while the short-lived learned
 				// path only enables safe 30x backend discovery for that later request.
 				session.rememberRelativePlaybackPath(text)
-				if session.rewriteRelative && session.issuer != nil && session.issuer.pathPrefix != "" {
+				if session.pathTargetMode {
+					capabilitySource, kind, capabilityErr := playbackInfoCapabilityType(source, field, text, session)
+					if capabilityErr != nil {
+						return nil, capabilityErr
+					}
+					rewriteValue := pathTargetPlaybackInfoReference(text, session.base)
+					route, rewriteErr := session.rewriteAgainstSourceKind(rewriteValue, session.base, capabilitySource, kind)
+					if rewriteErr != nil {
+						return nil, rewriteErr
+					}
+					source[field] = route
+				} else if session.rewriteRelative && session.issuer != nil && session.issuer.pathPrefix != "" {
 					source[field] = addIngressPathPrefix(text, session.issuer.pathPrefix)
 				}
 			}
@@ -555,7 +613,7 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 		if protocolErr != nil {
 			return nil, protocolErr
 		}
-		_, pathValue, pathExists, pathErr := playbackInfoField(source, "Path")
+		pathKey, pathValue, pathExists, pathErr := playbackInfoField(source, "Path")
 		if pathErr != nil {
 			return nil, pathErr
 		}
@@ -589,6 +647,9 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 			case protocolExists && strings.EqualFold(protocol, "Http"):
 				if playbackInfoRequiredHeadersUnsupported(pathText, hasRequiredHeaders, session) {
 					return nil, fmt.Errorf("remote PlaybackInfo Path requires unsupported origin headers")
+				}
+				if session.pathTargetMode {
+					source[pathKey] = pathTargetPlaybackInfoReference(pathText, session.base)
 				}
 				capabilitySource, kind, err := playbackInfoCapabilityType(source, "Path", pathText, session)
 				if err != nil {
@@ -671,10 +732,10 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 // tree is routed back through Meridian. Invalid or unsupported URL candidates
 // are preserved instead of rejecting the entire PlaybackInfo response.
 func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
-	if session == nil || session.issuer == nil || session.base == nil {
+	if session == nil || session.issuer == nil && !session.pathTargetMode || session.base == nil {
 		return nil, fmt.Errorf("automatic PlaybackInfo rewrite session is unavailable")
 	}
-	maxTokens := min(session.issuer.policy.limits.MaxURLsPerResponse*64+8192, globalDynamicMaxJSONTokens)
+	maxTokens := min(session.maxURLsPerResponse()*64+8192, globalDynamicMaxJSONTokens)
 	if _, err := validateDynamicJSONStructureWithin(session.ctx, payload, maxTokens, globalDynamicMaxParseDepth); err != nil {
 		return nil, fmt.Errorf("invalid automatic PlaybackInfo JSON")
 	}
@@ -720,6 +781,9 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 	switch typed := value.(type) {
 	case string:
 		candidate, ok := automaticPlaybackInfoURLCandidate(typed, session.base)
+		if !ok && session.pathTargetMode && playbackInfoFallbackRelativeURLField(field) && playbackInfoSafeRelativeURL(typed) {
+			candidate, ok = typed, true
+		}
 		if !ok && (strings.EqualFold(field, "DirectStreamUrl") || strings.EqualFold(field, "TranscodingUrl")) {
 			session.rememberRelativePlaybackPath(typed)
 		}
@@ -763,6 +827,15 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 		return typed, nil
 	default:
 		return value, nil
+	}
+}
+
+func playbackInfoFallbackRelativeURLField(field string) bool {
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "directstreamurl", "transcodingurl", "deliveryurl":
+		return true
+	default:
+		return false
 	}
 }
 

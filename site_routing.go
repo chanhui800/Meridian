@@ -655,6 +655,26 @@ func validateSiteSettings(name string, listenPort int, targetURL, playbackTarget
 	return nil
 }
 
+func validatePathTargetSiteSettings(name string, listenPort int, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) error {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 100 || strings.ContainsAny(name, "\r\n") {
+		return fmt.Errorf("name must be 1-100 characters without line breaks")
+	}
+	if listenPort < 1 || listenPort > 65535 {
+		return fmt.Errorf("listen_port must be between 1 and 65535")
+	}
+	if _, _, _, _, err := normalizeUAConfig(uaMode, customUserAgent, customClient, customVersion); err != nil {
+		return err
+	}
+	if quota < 0 || speedLimit < 0 {
+		return fmt.Errorf("traffic_quota and speed_limit must not be negative")
+	}
+	if speedLimit > maxSpeedLimitMbps {
+		return fmt.Errorf("speed_limit must not exceed %d Mbps", maxSpeedLimitMbps)
+	}
+	return nil
+}
+
 func normalizeMainVideoStreamMode(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {

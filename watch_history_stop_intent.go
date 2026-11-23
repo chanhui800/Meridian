@@ -84,6 +84,9 @@ func watchHistoryRequestIdentityHash(siteID int64, token string, clientIdentity 
 			_, _ = mac.Write([]byte(clientIdentity[index]))
 		}
 	}
+	if len(clientIdentity) > 2 && clientIdentity[2] != "" {
+		_, _ = mac.Write([]byte("\x00path-target-source-v1\x00" + clientIdentity[2]))
+	}
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -122,12 +125,12 @@ func isWatchHistoryStopRequest(request *http.Request) bool {
 	if request == nil || request.URL == nil || !watchHistoryPlaybackSyncMethod(request.Method) {
 		return false
 	}
-	path := strings.TrimSuffix(strings.ToLower(request.URL.Path), "/")
+	path := strings.TrimSuffix(strings.ToLower(watchHistoryRequestPath(request)), "/")
 	return path == "/sessions/playing/stopped" || path == "/emby/sessions/playing/stopped"
 }
 
 func watchHistorySameObservedClient(expected, incoming watchHistoryEvent) bool {
-	if expected.ClientIdentityHash == "" || !hmac.Equal([]byte(expected.ClientIdentityHash), []byte(incoming.ClientIdentityHash)) || expected.sourceNodeID != incoming.sourceNodeID || expected.SiteID != incoming.SiteID || expected.UpstreamItemID != incoming.UpstreamItemID || expected.PlaySessionID != incoming.PlaySessionID {
+	if expected.ClientIdentityHash == "" || !hmac.Equal([]byte(expected.ClientIdentityHash), []byte(incoming.ClientIdentityHash)) || expected.sourceNodeID != incoming.sourceNodeID || expected.SiteID != incoming.SiteID || expected.SourceKey != incoming.SourceKey || expected.UpstreamItemID != incoming.UpstreamItemID || expected.PlaySessionID != incoming.PlaySessionID {
 		return false
 	}
 	if expected.UserID != "" && incoming.UserID != "" && expected.UserID != incoming.UserID {
@@ -149,7 +152,7 @@ func (state *watchHistoryStopState) rememberPlayback(event watchHistoryEvent) {
 	}
 	if event.ClientIdentityHash == "" && event.TokenCiphertext != "" && event.sourceNodeID == 0 {
 		if token, err := decryptWatchHistoryToken(event.TokenCiphertext); err == nil {
-			event.ClientIdentityHash = watchHistoryRequestIdentityHash(event.SiteID, token, event.DeviceID, event.ClientName)
+			event.ClientIdentityHash = watchHistoryRequestIdentityHash(event.SiteID, token, event.DeviceID, event.ClientName, event.SourceKey)
 		}
 	}
 	if event.ClientIdentityHash == "" {
@@ -461,10 +464,11 @@ func (d *DB) writeWatchHistoryStopTx(tx *sql.Tx, event watchHistoryEvent, succes
 	if err != nil {
 		return event, false, err
 	}
+	stored.SourceKey, stored.UpstreamItemID = splitWatchHistoryStoredItemID(stored.UpstreamItemID)
 	stored.SiteID, stored.ClientIdentityHash, stored.sourceNodeID = resolved.SiteID, resolved.ClientIdentityHash, resolved.sourceNodeID
 	if storedCiphertext != "" && resolved.sourceNodeID == 0 {
 		token, err := decryptWatchHistoryToken(storedCiphertext)
-		if err != nil || !hmac.Equal([]byte(watchHistoryRequestIdentityHash(resolved.SiteID, token, stored.DeviceID, stored.ClientName)), []byte(resolved.ClientIdentityHash)) {
+		if err != nil || !hmac.Equal([]byte(watchHistoryRequestIdentityHash(resolved.SiteID, token, stored.DeviceID, stored.ClientName, stored.SourceKey)), []byte(resolved.ClientIdentityHash)) {
 			return event, false, nil
 		}
 	}

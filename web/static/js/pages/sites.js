@@ -121,7 +121,7 @@ function siteCardsRenderSignature(sites, activeSiteIDs) {
     // save silently reverts the operator's change.
     const retention = siteAccountRetentionStatus(site);
     return [
-      site && site.id, site && site.name, site && site.target_url, site && site.public_host,
+      site && site.id, site && site.name, site && site.upstream_mode, site && site.target_url, site && site.public_host,
       site && site.icon_name, site && site.icon_url,
       site && site.ingress_mode, site && site.listen_port, site && site.ua_mode,
       site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used,
@@ -189,6 +189,8 @@ function siteManagementRowHTML(s, activeSiteIDs) {
   const percent = quota > 0 ? Math.min(100, used / quota * 100) : 0;
   const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
   const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
+  const pathTargetMode = String(s.upstream_mode || '').toLowerCase() === 'path_target';
+  const upstreamSummary = pathTargetMode ? '通用反代' : s.target_url;
   const hasActivePlayback = activeSiteIDs.has(String(s.id));
   const expanded = siteManagementExpanded.has(Number(s.id));
   const ingressReady = normalizedIngressMode(s) !== 'unset';
@@ -205,7 +207,7 @@ function siteManagementRowHTML(s, activeSiteIDs) {
     <div class="management-site-details" id="site-details-${s.id}" ${expanded ? '' : 'hidden'}>
       <div class="management-site-detail-grid">
         <div class="site-access-row"><span class="management-field-label">访问地址</span><span class="site-access-value"><span class="console-mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg></button></span></div>
-        <div><span class="management-field-label">主回源地址</span><span class="console-mono">${esc(s.target_url)}</span></div>
+        <div><span class="management-field-label">${pathTargetMode ? '回源方式' : '主回源地址'}</span><span class="console-mono">${esc(upstreamSummary || '—')}</span></div>
         <div><span class="management-field-label">上游请求头</span><span>${upstreamHeaderCount ? `${upstreamHeaderCount} 个（加密）` : '未配置'}</span></div>
       </div>
       <div class="management-site-supplement">${renderSiteMediaLibraryCounts(s)}${renderSiteAccountRetention(s)}</div>
@@ -1642,6 +1644,7 @@ async function showSiteModal(site) {
   const modalIntent = beginModalIntent('sites');
   const isEdit = !!site;
   const title = isEdit ? '编辑站点' : '添加站点';
+	const initialUpstreamMode = isEdit && String(site.upstream_mode || '').trim().toLowerCase() === 'path_target' ? 'path_target' : 'fixed';
 	let siteCapabilities;
 	try {
 		siteCapabilities = normalizeSiteCapabilities(await API.ingressCapabilities());
@@ -1706,6 +1709,18 @@ async function showSiteModal(site) {
         </div>
       </section>
       <section class="site-config-section" aria-labelledby="site-section-origins">
+        <div class="form-group" id="m-upstream-mode-group">
+          <div class="site-upstream-mode-control">
+            <span class="site-upstream-mode-title">回源方式</span>
+            <label class="site-upstream-mode-switch" for="m-upstream-mode">
+              <input type="checkbox" id="m-upstream-mode" role="switch" aria-label="通用反代" ${initialUpstreamMode === 'path_target' ? 'checked' : ''}>
+              <span class="site-upstream-mode-track" aria-hidden="true"></span>
+              <span class="site-upstream-mode-text">通用反代</span>
+            </label>
+          </div>
+          <div class="form-help" id="m-upstream-mode-help">固定回源会将站点请求转发到下方配置的服务地址。</div>
+        </div>
+        <div id="m-fixed-upstream-fields">
         <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">02</span><div><h4 id="site-section-origins">回源线路</h4><p>优先使用主线路，失败时依次切换备用线路</p></div><div class="upstream-lines-buttons"><button type="button" class="console-button upstream-test-all" id="m-test-all-lines">线路测速</button><button type="button" class="console-button upstream-add-line" id="m-add-failover-line"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加线路</button></div></header>
         <div class="upstream-lines" id="m-upstream-lines">
           <div class="upstream-line is-primary" data-line="primary">
@@ -1720,6 +1735,7 @@ async function showSiteModal(site) {
           <div id="m-failover-lines"></div>
         </div>
         <details class="site-field-help"><summary>地址自动补全与备用线路</summary><p>地址离开输入框时自动拆分端口。直接输入域名默认为 https / 443；带 :8096 等其他端口时使用 http，已填写的独立端口会保留。支持 Base URL 路径。最多 7 条备用线路，停用后保留配置；主线路恢复后自动回切。</p></details>
+        </div>
       </section>
       <section class="site-config-section" aria-labelledby="site-section-ingress">
         <header class="site-section-heading"><span class="site-section-index" aria-hidden="true">03</span><div><h4 id="site-section-ingress">访问入口</h4><p>选择客户端访问这个站点的方式</p></div></header>
@@ -1729,7 +1745,7 @@ async function showSiteModal(site) {
             <select class="form-select modal-select" id="m-ingress-mode">
               ${isEdit && normalizedIngressMode(site) === 'unset' ? '<option value="unset" disabled>未配置（请选择）</option>' : ''}
               <option value="host" ${canUseHostIngress ? '' : 'disabled'}>域名前缀（推荐${canUseHostIngress ? '' : '，需先配置 TLS 和域名'}）</option>
-              <option value="path">路径</option><option value="port">独立端口</option>
+              <option value="path" id="m-ingress-path-option">路径</option><option value="port">独立端口</option>
             </select>
             <div class="form-help" id="m-ingress-warning"></div>
             ${hostIngressBlockedHint ? `<details class="site-field-help"><summary>域名前缀的使用条件</summary><p>${hostIngressBlockedHint}</p></details>` : ''}
@@ -1773,12 +1789,12 @@ async function showSiteModal(site) {
                   <select class="form-select modal-select" id="m-client-ip-mode"><option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>X-Real-IP 与 X-Forwarded-For</option><option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option><option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>不透传</option></select>
                   <div class="form-help">控制发送给回源的来源字段，不影响日志识别客户端 IP。</div>
                 </div>
-                <div class="form-group site-field-video">
+                <div class="form-group site-field-video" id="m-fixed-video-policy">
                   <label for="m-main-video-mode">主视频流策略</label>
                   <select class="form-select modal-select" id="m-main-video-mode"><option value="proxy" ${!isEdit || site.main_video_stream_mode !== 'direct' ? 'selected' : ''}>反代</option><option value="direct" ${isEdit && site.main_video_stream_mode === 'direct' ? 'selected' : ''}>直连</option></select>
                   <details class="site-field-help"><summary>直连范围与限制</summary><p>直连会校验网盘或 CDN 的 302 等最终公网地址，再将 MP4、MKV、MOV、AVI、WebM 及 /Videos/.../stream、original、download、file 等主视频体通过 307 交给播放器；面板、API、PlaybackInfo、HLS / DASH、字幕、图片和必要静态资源仍由 Meridian 反代。自动发现保持启用；localhost、私网、链路本地及回环目标始终拒绝。</p></details>
                 </div>
-                <div class="form-group site-field-history">
+                <div class="form-group site-field-history" id="m-fixed-history-policy">
                   <label for="m-watch-history">观看历史记录</label>
                   <select class="form-select modal-select" id="m-watch-history"><option value="off" ${!isEdit || !site.watch_history_enabled ? 'selected' : ''}>关闭</option><option value="on" ${isEdit && site.watch_history_enabled ? 'selected' : ''}>开启</option></select>
                   <div class="form-help">记录后续成功播放，关闭后保留已有历史。</div>
@@ -1787,7 +1803,7 @@ async function showSiteModal(site) {
               </div>
             </div>
             <div class="site-form-column-secondary">
-              <div class="site-form-column site-form-column-cache">
+              <div class="site-form-column site-form-column-cache" id="m-fixed-cache-policy">
                 <h4 class="site-policy-heading">资源缓存</h4>
                 <div class="site-config-fields">
                   <div class="form-group site-field-cache-toggle"><label for="m-asset-cache">缓存图片与静态资源</label><select class="form-select modal-select" id="m-asset-cache"><option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option><option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option></select><details class="site-field-help"><summary>缓存范围</summary><p>仅缓存图片、CSS、JS、字体和 WASM；视频、音频、HLS、DASH、Range 请求、私有响应及带 Set-Cookie 的响应永不缓存。</p></details></div>
@@ -1800,12 +1816,12 @@ async function showSiteModal(site) {
                 <div class="site-config-fields">
                   <div class="form-group site-field-quota"><label for="m-quota">流量额度（GB）</label><input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" inputmode="numeric"><div class="form-help">0 为不限。达到额度后拒绝后续新请求；已经开始的媒体传输不会中途截断，少量并发请求可能使最终用量略高于额度。</div></div>
                   <div class="form-group site-field-speed"><label for="m-speed">单连接限速（Mbps）</label><input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric"><div class="form-help">0 为不限。仅限制 HTTP 响应与 WebSocket 下行，上传不受影响。</div></div>
-                  <div class="form-group site-field-retention"><label for="m-account-retention-days">保号周期（天）</label><input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="留空关闭，如：30" min="1" max="3650" step="1" inputmode="numeric"><div class="form-help">1–3650 天，留空关闭。同一播放身份完成 5 次有效播放状态同步后重置倒计时；剩余不多于 7 天显示提醒，Telegram 日报同步结果。</div></div>
+                  <div class="form-group site-field-retention" id="m-fixed-retention-policy"><label for="m-account-retention-days">保号周期（天）</label><input type="number" class="form-input" id="m-account-retention-days" value="${isEdit && Number(site.account_retention_days) > 0 ? Number(site.account_retention_days) : ''}" placeholder="留空关闭，如：30" min="1" max="3650" step="1" inputmode="numeric"><div class="form-help">1–3650 天，留空关闭。同一播放身份完成 5 次有效播放状态同步后重置倒计时；剩余不多于 7 天显示提醒，Telegram 日报同步结果。</div></div>
                 </div>
               </div>
             </div>
           </div>
-          <div class="site-advanced-subsection">
+          <div class="site-advanced-subsection" id="m-fixed-upstream-headers">
             <div class="site-policy-head"><h4 class="site-policy-heading">主回源固定请求头</h4><button type="button" class="console-button upstream-header-add" id="m-add-upstream-header" ${upstreamHeadersAvailable ? '' : 'disabled'}>添加请求头</button></div>
             <div id="m-upstream-headers"></div>
             <div class="form-help">已有值留空会保持不变；仅发送给主回源，不能与备用线路同时使用。</div>
@@ -1948,7 +1964,11 @@ async function showSiteModal(site) {
 	const portLabel = document.getElementById('m-port-label');
 	const portHelp = document.getElementById('m-port-help');
 	const ingressWarning = document.getElementById('m-ingress-warning');
+	const upstreamModeToggle = document.getElementById('m-upstream-mode');
+	const pathIngressOption = document.getElementById('m-ingress-path-option');
 	ingressSelect.value = isEdit ? normalizedIngressMode(site) : defaultIngressMode(siteCapabilities);
+	upstreamModeToggle.checked = initialUpstreamMode === 'path_target';
+	const usesPathTargetMode = () => upstreamModeToggle.checked;
 	function updateIngressFields() {
 		const state = ingressFormState(ingressSelect.value);
 		publicHostGroup.hidden = !state.showPublicHost;
@@ -1966,8 +1986,34 @@ async function showSiteModal(site) {
 			: '共享入口不会另外开放站点端口。';
 		ingressWarning.textContent = state.warning;
 	}
-	updateIngressFields();
-	ingressSelect.addEventListener('change', updateIngressFields);
+	function updateUpstreamMode() {
+		const usesPathTarget = usesPathTargetMode();
+		document.getElementById('m-fixed-upstream-fields').hidden = usesPathTarget;
+			document.getElementById('m-upstream-mode-help').textContent = usesPathTarget
+			? '在 Emby 等客户端的路径栏直接填写回源地址，例如 http://192.168.1.10:8096/emby；服务端会从路径解析协议、主机和端口。'
+			: '固定回源会将站点请求转发到下方配置的服务地址。';
+		pathIngressOption.disabled = usesPathTarget;
+		if (usesPathTarget && !['host', 'port'].includes(ingressSelect.value)) {
+			ingressSelect.value = canUseHostIngress ? 'host' : 'port';
+		}
+		for (const id of ['m-fixed-video-policy', 'm-fixed-cache-policy', 'm-fixed-retention-policy', 'm-fixed-upstream-headers']) {
+			document.getElementById(id).hidden = usesPathTarget;
+		}
+		for (const id of ['m-primary-line-name', 'm-target-address', 'm-target-port', 'm-add-failover-line', 'm-test-all-lines', 'm-main-video-mode', 'm-asset-cache', 'm-cache-ttl', 'm-cache-max', 'm-cache-rules', 'm-account-retention-days', 'm-add-upstream-header']) {
+			const control = document.getElementById(id);
+			if (control) control.disabled = usesPathTarget;
+		}
+		updateIngressFields();
+	}
+	updateUpstreamMode();
+	upstreamModeToggle.addEventListener('change', updateUpstreamMode);
+	ingressSelect.addEventListener('change', () => {
+		if (usesPathTargetMode() && !['host', 'port'].includes(ingressSelect.value)) {
+			ingressSelect.value = canUseHostIngress ? 'host' : 'port';
+			Toast.error('通用反代仅支持域名前缀或独立端口入口');
+		}
+		updateIngressFields();
+	});
 
 	const uaSelect = document.getElementById('m-ua');
   const clientIPModeSelect = document.getElementById('m-client-ip-mode');
@@ -2064,41 +2110,46 @@ async function showSiteModal(site) {
 		const accountRetentionDays = accountRetentionRaw === '' ? 0 : Number(accountRetentionRaw);
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
+	      upstream_mode: usesPathTargetMode() ? 'path_target' : 'fixed',
 	      icon_name: isEdit ? String(site.icon_name || '').trim() : '',
 	      icon_url: isEdit ? String(site.icon_url || '').trim() : '',
-	      target_url: primaryTargetURL,
-	      primary_line_name: document.getElementById('m-primary-line-name').value.trim() || '主线路',
-	      failover_lines: failoverLines.map((line, index) => ({
+	      target_url: usesPathTargetMode() ? '' : primaryTargetURL,
+	      primary_line_name: usesPathTargetMode() ? '' : (document.getElementById('m-primary-line-name').value.trim() || '主线路'),
+	      failover_lines: usesPathTargetMode() ? [] : failoverLines.map((line, index) => ({
 	        name: String(line.name || '').trim() || `线路${index + 2}`,
 	        url: joinTargetAddress(line.address, line.port),
 	        enabled: line.enabled !== false,
 	      })),
-	      failover_targets: failoverLines.filter(line => line.enabled !== false).map(line => joinTargetAddress(line.address, line.port)).filter(Boolean),
-      playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
-      playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
-		main_video_stream_mode: mainVideoModeSelect.value,
+	      failover_targets: usesPathTargetMode() ? [] : failoverLines.filter(line => line.enabled !== false).map(line => joinTargetAddress(line.address, line.port)).filter(Boolean),
+	      playback_target_url: usesPathTargetMode() ? '' : (isEdit ? String(site.playback_target_url || '') : ''),
+	      playback_mode: usesPathTargetMode() ? 'direct' : (isEdit ? String(site.playback_mode || 'direct') : 'direct'),
+		main_video_stream_mode: usesPathTargetMode() ? 'proxy' : mainVideoModeSelect.value,
 		watch_history_enabled: watchHistorySelect.value === 'on',
-		stream_hosts: isEdit ? normalizeStreamHosts(site.stream_hosts) : [],
+		stream_hosts: usesPathTargetMode() ? [] : (isEdit ? normalizeStreamHosts(site.stream_hosts) : []),
 			...ingressPayload,
-		upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders),
+		upstream_headers: usesPathTargetMode() ? [] : buildUpstreamHeaderPayload(upstreamHeaders),
       ua_mode: uaMode,
       client_ip_mode: clientIPModeSelect.value,
       ...customUAPayload,
-      asset_cache_enabled: document.getElementById('m-asset-cache').value === 'on',
+	  asset_cache_enabled: !usesPathTargetMode() && document.getElementById('m-asset-cache').value === 'on',
       asset_cache_ttl_sec: parseInt(document.getElementById('m-cache-ttl').value || 24) * 3600,
       asset_cache_max_bytes: parseInt(document.getElementById('m-cache-max').value || 512) * 1048576,
       asset_cache_rules: document.getElementById('m-cache-rules').value.trim(),
-      account_retention_days: accountRetentionDays,
+	  account_retention_days: usesPathTargetMode() ? 0 : accountRetentionDays,
       traffic_quota: parseInt(document.getElementById('m-quota').value || 0) * 1073741824,
       speed_limit: parseInt(document.getElementById('m-speed').value || 0),
     };
 
 		const listenPortRequired = ingressFormState(data.ingress_mode).requireListenPort;
+		if (data.upstream_mode === 'path_target' && !['host', 'port'].includes(data.ingress_mode)) {
+		  Toast.error('通用反代仅支持域名前缀或独立端口入口');
+		  return;
+		}
 		if (data.ingress_mode === 'unset') {
 		  Toast.error('请选择当前服务器可用的入口模式');
 		  return;
 		}
-		if (!data.name || !data.target_url || (listenPortRequired && !data.listen_port) || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host) || (data.ingress_mode === 'path' && !data.path_prefix)) {
+		if (!data.name || (data.upstream_mode !== 'path_target' && !data.target_url) || (listenPortRequired && !data.listen_port) || (data.ingress_mode === 'host' && !data.route_prefix && !data.public_host) || (data.ingress_mode === 'path' && !data.path_prefix)) {
 	      Toast.error('请填写所有必填项');
 	      return;
 	    }
@@ -2106,7 +2157,7 @@ async function showSiteModal(site) {
       Toast.error('请完整填写自定义 User-Agent、Client 和 Version');
 		return;
 	  }
-	  if (!Number.isSafeInteger(data.account_retention_days) || (accountRetentionRaw !== '' && (data.account_retention_days < 1 || data.account_retention_days > 3650))) {
+	  if (data.upstream_mode !== 'path_target' && (!Number.isSafeInteger(data.account_retention_days) || (accountRetentionRaw !== '' && (data.account_retention_days < 1 || data.account_retention_days > 3650)))) {
 		Toast.error('保号周期必须为 1 到 3650 天的整数');
 		return;
 	  }
@@ -2116,19 +2167,19 @@ async function showSiteModal(site) {
 		if (!header.configured && !name && !value) return false;
 		return !name || (!header.configured && !value);
 	  });
-		if (invalidHeader) {
+		if (data.upstream_mode !== 'path_target' && invalidHeader) {
 			Toast.error('请完整填写新增请求头的名称和值；已有值可留空保持不变');
 			return;
 		}
-		if (!document.getElementById('m-target-port').value || data.failover_lines.some((line, index) => !line.url || !String(failoverLines[index].port || '').trim())) {
+		if (data.upstream_mode !== 'path_target' && (!document.getElementById('m-target-port').value || data.failover_lines.some((line, index) => !line.url || !String(failoverLines[index].port || '').trim()))) {
 			Toast.error('请完整填写每条线路的域名和端口，或删除空线路');
 			return;
 		}
-		if (data.failover_targets.length > 0 && upstreamHeaders.some(header => String(header.name || '').trim())) {
+		if (data.upstream_mode !== 'path_target' && data.failover_targets.length > 0 && upstreamHeaders.some(header => String(header.name || '').trim())) {
 			Toast.error('备用线路不能与主回源固定请求头同时使用');
 			return;
 		}
-		if (isEdit && normalizedTargetAuthority(site.target_url) !== normalizedTargetAuthority(data.target_url)) {
+		if (data.upstream_mode !== 'path_target' && isEdit && normalizedTargetAuthority(site.target_url) !== normalizedTargetAuthority(data.target_url)) {
 			const retainedSecret = upstreamHeaders.some(header => header.configured && !String(header.value || '').trim());
 			if (retainedSecret) {
 				Toast.error('主回源的协议、域名或端口已变化，请重新输入每个已配置的固定请求头，或删除对应行');

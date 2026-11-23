@@ -1291,6 +1291,12 @@ func buildEdgeProxy(config AgentRuntimeConfig, runtime *edgeAgentRuntime) (*edge
 	runtime.mu.RUnlock()
 	for _, route := range config.Routes {
 		site := route.Site
+		// UpstreamMode is carried by Site instead of a second route flag. Keep
+		// that mode when TargetURL is empty so the shared proxy core can choose
+		// the HTTP(S) upstream from each request path.
+		if siteUsesPathTarget(site) && (strings.TrimSpace(route.TargetURL) != "" || strings.TrimSpace(route.PlaybackTargetURL) != "" || len(route.StreamHosts) != 0 || len(route.Headers) != 0) {
+			return fail(fmt.Errorf("site %d generic runtime config contains fixed upstream settings", route.SiteID))
+		}
 		site.ID = 0
 		site.runtimeTrafficCounter = runtime.trafficCounterFor(route.SiteID, route.Host)
 		// Site icons are Controller/UI metadata. The Agent's ephemeral site

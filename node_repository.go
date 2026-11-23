@@ -1015,7 +1015,7 @@ func (d *DB) DeleteControlNode(id int64) error {
 	if rows != 1 {
 		return errNodeNotFound
 	}
-	if err := tx.Commit(); err != nil {
+	if err := d.commitControllerNodeAdmission(tx); err != nil {
 		return err
 	}
 	// The database deletion is authoritative. Complete the cleanup immediately

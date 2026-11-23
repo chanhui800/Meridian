@@ -21,6 +21,7 @@ type Site struct {
 	PublicHost                  string               `json:"public_host"`
 	PathPrefix                  string               `json:"path_prefix"`
 	IngressMode                 string               `json:"ingress_mode"`
+	UpstreamMode                string               `json:"upstream_mode,omitempty"`
 	TargetURL                   string               `json:"target_url"`
 	PrimaryLineName             string               `json:"primary_line_name"`
 	PlaybackTargetURL           string               `json:"playback_target_url"`
@@ -77,6 +78,20 @@ type Site struct {
 }
 
 func hydrateSiteConfiguration(site *Site, assetCacheEnabled, watchHistoryEnabled int) error {
+	upstreamMode, err := normalizeUpstreamMode(site.UpstreamMode)
+	if err != nil {
+		return err
+	}
+	// Keep the fixed mode absent from JSON to preserve the existing Agent
+	// runtime payload and hash for every legacy fixed-upstream site.
+	if upstreamMode == upstreamModeFixed {
+		site.UpstreamMode = ""
+	} else {
+		site.UpstreamMode = upstreamMode
+	}
+	if upstreamMode == upstreamModePathTarget && site.IngressMode == ingressModePath {
+		return fmt.Errorf("path-target upstream mode requires host or port ingress")
+	}
 	publicHost, err := normalizePublicHost(site.PublicHost)
 	if err != nil {
 		return err
@@ -118,9 +133,20 @@ func hydrateSiteConfiguration(site *Site, assetCacheEnabled, watchHistoryEnabled
 	if site.FailoverTargetList == nil {
 		site.FailoverTargetList = []string{}
 	}
-	lines, enabledTargets, err := decodeStoredFailoverLines(site.StoredFailoverLines, site.TargetURL, site.FailoverTargetList)
-	if err != nil {
-		return err
+	var lines []FailoverLine
+	var enabledTargets []string
+	if upstreamMode == upstreamModePathTarget {
+		if len(site.FailoverTargetList) != 0 {
+			return fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+		}
+		lines = []FailoverLine{}
+		enabledTargets = []string{}
+		site.StoredFailoverLines = "[]"
+	} else {
+		lines, enabledTargets, err = decodeStoredFailoverLines(site.StoredFailoverLines, site.TargetURL, site.FailoverTargetList)
+		if err != nil {
+			return err
+		}
 	}
 	site.FailoverLines = lines
 	site.FailoverTargetList = enabledTargets
@@ -147,7 +173,7 @@ func hydrateSiteConfiguration(site *Site, assetCacheEnabled, watchHistoryEnabled
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at FROM sites ORDER BY sort_order, id")
+	rows, err := d.db.Query("SELECT id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, upstream_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at FROM sites ORDER BY sort_order, id")
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +182,7 @@ func (d *DB) ListSites() ([]Site, error) {
 	for rows.Next() {
 		var s Site
 		var enabled, assetCacheEnabled, watchHistoryEnabled int
-		if err := rows.Scan(&s.ID, &s.SortOrder, &s.Name, &s.IconName, &s.IconURL, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &watchHistoryEnabled, &s.AccountRetentionDays, &s.AccountRetentionStartedMS, &s.AccountRetentionCompletedMS, &s.MediaMovieCount, &s.MediaSeriesCount, &s.MediaEpisodeCount, &s.MediaCountUpdatedMS, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.TrafficUsedIn, &s.TrafficUsedOut, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SortOrder, &s.Name, &s.IconName, &s.IconURL, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.UpstreamMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &watchHistoryEnabled, &s.AccountRetentionDays, &s.AccountRetentionStartedMS, &s.AccountRetentionCompletedMS, &s.MediaMovieCount, &s.MediaSeriesCount, &s.MediaEpisodeCount, &s.MediaCountUpdatedMS, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.TrafficUsedIn, &s.TrafficUsedOut, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Enabled = enabled == 1
@@ -174,12 +200,12 @@ func (d *DB) ListSites() ([]Site, error) {
 	return sites, nil
 }
 
-const siteSelectColumns = `id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at`
+const siteSelectColumns = `id, sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, upstream_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, account_retention_last_completed_at_ms, media_movie_count, media_series_count, media_episode_count, media_count_updated_at_ms, enabled, traffic_quota, traffic_used, traffic_used_in, traffic_used_out, speed_limit, created_at, updated_at`
 
 func scanSite(scanner rowScanner) (*Site, error) {
 	var s Site
 	var enabled, assetCacheEnabled, watchHistoryEnabled int
-	err := scanner.Scan(&s.ID, &s.SortOrder, &s.Name, &s.IconName, &s.IconURL, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &watchHistoryEnabled, &s.AccountRetentionDays, &s.AccountRetentionStartedMS, &s.AccountRetentionCompletedMS, &s.MediaMovieCount, &s.MediaSeriesCount, &s.MediaEpisodeCount, &s.MediaCountUpdatedMS, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.TrafficUsedIn, &s.TrafficUsedOut, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	err := scanner.Scan(&s.ID, &s.SortOrder, &s.Name, &s.IconName, &s.IconURL, &s.ListenPort, &s.PublicHost, &s.PathPrefix, &s.IngressMode, &s.UpstreamMode, &s.TargetURL, &s.PrimaryLineName, &s.PlaybackTargetURL, &s.PlaybackMode, &s.MainVideoStreamMode, &s.FailoverTargets, &s.StoredFailoverLines, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.ClientIPMode, &s.StoredUpstreamHeaders, &s.DynamicPolicyRevision, &assetCacheEnabled, &s.AssetCacheTTLSec, &s.AssetCacheMaxBytes, &s.AssetCacheRules, &watchHistoryEnabled, &s.AccountRetentionDays, &s.AccountRetentionStartedMS, &s.AccountRetentionCompletedMS, &s.MediaMovieCount, &s.MediaSeriesCount, &s.MediaEpisodeCount, &s.MediaCountUpdatedMS, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.TrafficUsedIn, &s.TrafficUsedOut, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +250,15 @@ func (d *DB) CreateSiteWithCustomUA(name string, port int, targetURL, playbackTa
 
 func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	var err error
+	upstreamMode, err := normalizeUpstreamMode(site.UpstreamMode)
+	if err != nil {
+		return nil, err
+	}
+	if upstreamMode == upstreamModeFixed {
+		site.UpstreamMode = ""
+	} else {
+		site.UpstreamMode = upstreamMode
+	}
 	site.IconName, site.IconURL, err = normalizeSiteIconSelection(site.IconName, site.IconURL)
 	if err != nil {
 		return nil, err
@@ -256,9 +291,20 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	if err := json.Unmarshal([]byte(site.FailoverTargets), &failoverTargetList); err != nil {
 		return nil, fmt.Errorf("invalid failover_targets: %w", err)
 	}
-	lines, enabledTargets, err := decodeStoredFailoverLines(site.StoredFailoverLines, site.TargetURL, failoverTargetList)
-	if err != nil {
-		return nil, err
+	var lines []FailoverLine
+	var enabledTargets []string
+	if upstreamMode == upstreamModePathTarget {
+		if len(failoverTargetList) != 0 || strings.TrimSpace(site.StoredFailoverLines) != "" && strings.TrimSpace(site.StoredFailoverLines) != "[]" {
+			return nil, fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+		}
+		lines = []FailoverLine{}
+		enabledTargets = []string{}
+		site.StoredFailoverLines = "[]"
+	} else {
+		lines, enabledTargets, err = decodeStoredFailoverLines(site.StoredFailoverLines, site.TargetURL, failoverTargetList)
+		if err != nil {
+			return nil, err
+		}
 	}
 	site.FailoverLines = lines
 	failoverJSON, _ := json.Marshal(enabledTargets)
@@ -297,6 +343,20 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	if site.IngressMode != ingressModePath && site.PathPrefix != "" {
 		return nil, fmt.Errorf("path_prefix must be empty when ingress_mode is %s", site.IngressMode)
 	}
+	if upstreamMode == upstreamModePathTarget {
+		if site.IngressMode == ingressModePath {
+			return nil, fmt.Errorf("path-target upstream mode requires host or port ingress")
+		}
+		if strings.TrimSpace(site.TargetURL) != "" || strings.TrimSpace(site.PlaybackTargetURL) != "" ||
+			strings.TrimSpace(site.StreamHosts) != "[]" || len(enabledTargets) != 0 || site.StoredUpstreamHeaders != "[]" {
+			return nil, fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+		}
+		site.AssetCacheEnabled = false
+		site.MainVideoStreamMode = mainVideoStreamModeProxy
+		site.AccountRetentionDays = 0
+	} else if _, err := normalizeTargetURL(site.TargetURL); err != nil {
+		return nil, fmt.Errorf("invalid target URL: %w", err)
+	}
 	site.AccountRetentionDays, err = normalizeAccountRetentionDays(site.AccountRetentionDays)
 	if err != nil {
 		return nil, err
@@ -306,8 +366,8 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	}
 	site.DynamicPolicyRevision = 1
 	res, err := d.db.Exec(
-		"INSERT INTO sites (sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, traffic_quota, speed_limit) VALUES ((SELECT COALESCE(MAX(sort_order), -1) + 1 FROM sites),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-		site.Name, site.IconName, site.IconURL, site.ListenPort, site.PublicHost, site.PathPrefix, site.IngressMode, site.TargetURL, site.PrimaryLineName, site.PlaybackTargetURL, site.PlaybackMode, site.MainVideoStreamMode, site.FailoverTargets, site.StoredFailoverLines, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.ClientIPMode, site.StoredUpstreamHeaders, site.DynamicPolicyRevision, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, sqliteBool(site.WatchHistoryEnabled), site.AccountRetentionDays, site.AccountRetentionStartedMS, site.TrafficQuota, site.SpeedLimit,
+		"INSERT INTO sites (sort_order, name, icon_name, icon_url, listen_port, public_host, path_prefix, ingress_mode, upstream_mode, target_url, primary_line_name, playback_target_url, playback_mode, main_video_stream_mode, failover_targets, failover_lines, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, client_ip_mode, upstream_headers, dynamic_policy_revision, asset_cache_enabled, asset_cache_ttl_sec, asset_cache_max_bytes, asset_cache_rules, watch_history_enabled, account_retention_days, account_retention_started_at_ms, traffic_quota, speed_limit) VALUES ((SELECT COALESCE(MAX(sort_order), -1) + 1 FROM sites),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		site.Name, site.IconName, site.IconURL, site.ListenPort, site.PublicHost, site.PathPrefix, site.IngressMode, upstreamMode, site.TargetURL, site.PrimaryLineName, site.PlaybackTargetURL, site.PlaybackMode, site.MainVideoStreamMode, site.FailoverTargets, site.StoredFailoverLines, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.ClientIPMode, site.StoredUpstreamHeaders, site.DynamicPolicyRevision, sqliteBool(site.AssetCacheEnabled), site.AssetCacheTTLSec, site.AssetCacheMaxBytes, site.AssetCacheRules, sqliteBool(site.WatchHistoryEnabled), site.AccountRetentionDays, site.AccountRetentionStartedMS, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -481,6 +541,15 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 
 func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasSnapshot *[]siteHostAliasSnapshot) error {
 	var err error
+	upstreamMode, err := normalizeUpstreamMode(site.UpstreamMode)
+	if err != nil {
+		return err
+	}
+	if upstreamMode == upstreamModeFixed {
+		site.UpstreamMode = ""
+	} else {
+		site.UpstreamMode = upstreamMode
+	}
 	site.IconName, site.IconURL, err = normalizeSiteIconSelection(site.IconName, site.IconURL)
 	if err != nil {
 		return err
@@ -529,9 +598,20 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 	if err := json.Unmarshal([]byte(site.FailoverTargets), &failoverTargetList); err != nil {
 		return fmt.Errorf("invalid failover_targets: %w", err)
 	}
-	lines, enabledTargets, err := decodeStoredFailoverLines(site.StoredFailoverLines, site.TargetURL, failoverTargetList)
-	if err != nil {
-		return err
+	var lines []FailoverLine
+	var enabledTargets []string
+	if upstreamMode == upstreamModePathTarget {
+		if len(failoverTargetList) != 0 || strings.TrimSpace(site.StoredFailoverLines) != "" && strings.TrimSpace(site.StoredFailoverLines) != "[]" {
+			return fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+		}
+		lines = []FailoverLine{}
+		enabledTargets = []string{}
+		site.StoredFailoverLines = "[]"
+	} else {
+		lines, enabledTargets, err = decodeStoredFailoverLines(site.StoredFailoverLines, site.TargetURL, failoverTargetList)
+		if err != nil {
+			return err
+		}
 	}
 	failoverJSON, _ := json.Marshal(enabledTargets)
 	site.FailoverTargets = string(failoverJSON)
@@ -559,6 +639,20 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 	if site.IngressMode != ingressModePath && site.PathPrefix != "" {
 		return fmt.Errorf("path_prefix must be empty when ingress_mode is %s", site.IngressMode)
 	}
+	if upstreamMode == upstreamModePathTarget {
+		if site.IngressMode == ingressModePath {
+			return fmt.Errorf("path-target upstream mode requires host or port ingress")
+		}
+		if strings.TrimSpace(site.TargetURL) != "" || strings.TrimSpace(site.PlaybackTargetURL) != "" ||
+			strings.TrimSpace(site.StreamHosts) != "[]" || len(enabledTargets) != 0 || site.StoredUpstreamHeaders != "[]" {
+			return fmt.Errorf("path-target upstream mode cannot use fixed upstream settings")
+		}
+		site.AssetCacheEnabled = false
+		site.MainVideoStreamMode = mainVideoStreamModeProxy
+		site.AccountRetentionDays = 0
+	} else if _, err := normalizeTargetURL(site.TargetURL); err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
 	if err := normalizeAssetCacheConfig(&site); err != nil {
 		return err
 	}
@@ -571,12 +665,12 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 		return err
 	}
 	defer tx.Rollback()
-	var currentTargetURL, currentHeaders, currentPublicHost string
-	queryErr := tx.QueryRow("SELECT target_url, upstream_headers, public_host FROM sites WHERE id=?", site.ID).Scan(&currentTargetURL, &currentHeaders, &currentPublicHost)
+	var currentTargetURL, currentHeaders, currentPublicHost, currentUpstreamMode string
+	queryErr := tx.QueryRow("SELECT target_url, upstream_headers, public_host, upstream_mode FROM sites WHERE id=?", site.ID).Scan(&currentTargetURL, &currentHeaders, &currentPublicHost, &currentUpstreamMode)
 	if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
 		return queryErr
 	}
-	if queryErr == nil {
+	if queryErr == nil && currentUpstreamMode == upstreamModeFixed && upstreamMode == upstreamModeFixed {
 		currentTarget, currentErr := normalizeTargetURL(currentTargetURL)
 		newTarget, newErr := normalizeTargetURL(site.TargetURL)
 		if currentErr != nil {
@@ -591,6 +685,12 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 			// encrypted v2 values for the new authority; unchanged ciphertext is
 			// always cleared here, even if a caller bypasses the handler checks.
 			site.StoredUpstreamHeaders = "[]"
+		}
+	} else if upstreamMode == upstreamModePathTarget {
+		site.StoredUpstreamHeaders = "[]"
+	} else if upstreamMode == upstreamModeFixed {
+		if _, err := normalizeTargetURL(site.TargetURL); err != nil {
+			return fmt.Errorf("invalid target URL: %w", err)
 		}
 	}
 	// Restore the exact alias lifecycle captured before a failed update. A
@@ -652,7 +752,7 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 		}
 	}
 	args := []interface{}{
-		site.Name, site.IconName, site.IconURL, site.ListenPort, site.PublicHost, site.PathPrefix, site.IngressMode, site.TargetURL, site.PrimaryLineName,
+		site.Name, site.IconName, site.IconURL, site.ListenPort, site.PublicHost, site.PathPrefix, site.IngressMode, upstreamMode, site.TargetURL, site.PrimaryLineName,
 		site.PlaybackTargetURL, site.PlaybackMode, site.MainVideoStreamMode, site.FailoverTargets, site.StoredFailoverLines, site.StreamHosts, site.UAMode,
 		site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.ClientIPMode, site.StoredUpstreamHeaders,
 	}
@@ -674,7 +774,7 @@ func (d *DB) updateSiteRecordWithAliases(site Site, restoreRevision bool, aliasS
 	}
 	args = append(args, site.TrafficQuota, site.SpeedLimit, site.ID)
 	_, err = tx.Exec(
-		"UPDATE sites SET name=?, icon_name=?, icon_url=?, listen_port=?, public_host=?, path_prefix=?, ingress_mode=?, target_url=?, primary_line_name=?, playback_target_url=?, playback_mode=?, main_video_stream_mode=?, failover_targets=?, failover_lines=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, client_ip_mode=?, upstream_headers=?, "+revisionExpression+", asset_cache_enabled=?, asset_cache_ttl_sec=?, asset_cache_max_bytes=?, asset_cache_rules=?, watch_history_enabled=?, "+retentionExpression+", traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		"UPDATE sites SET name=?, icon_name=?, icon_url=?, listen_port=?, public_host=?, path_prefix=?, ingress_mode=?, upstream_mode=?, target_url=?, primary_line_name=?, playback_target_url=?, playback_mode=?, main_video_stream_mode=?, failover_targets=?, failover_lines=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, client_ip_mode=?, upstream_headers=?, "+revisionExpression+", asset_cache_enabled=?, asset_cache_ttl_sec=?, asset_cache_max_bytes=?, asset_cache_rules=?, watch_history_enabled=?, "+retentionExpression+", traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
 		args...,
 	)
 	if err != nil {
@@ -753,6 +853,9 @@ func (d *DB) DeleteSite(id int64) error {
 	if _, err := tx.Exec("DELETE FROM media_items WHERE site_id=?", id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM watch_history_sources WHERE site_id=?", id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM site_node_schedules WHERE site_id=?", id); err != nil {
 		return err
 	}
@@ -767,7 +870,7 @@ func (d *DB) DeleteSite(id int64) error {
 	if _, err := tx.Exec("DELETE FROM sites WHERE id=?", id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return d.commitControllerNodeAdmission(tx)
 }
 
 func (d *DB) ToggleSite(id int64) (bool, error) {
