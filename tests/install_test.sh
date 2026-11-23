@@ -1543,6 +1543,11 @@ fi
 cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/password-env-before" || { echo 'FAIL: JWT config was not rolled back' >&2; exit 1; }
 assert_contains "${DATA_DIR}/meridian.db" 'old-database-state'
 
+# run_password_case defines an as_root mock for its isolated command path.
+# Bash function definitions in a function are global unless explicitly restored,
+# so put the normal privilege-aware wrapper back before exercising purge.
+as_root() { run_as_test_root "$@"; }
+
 # Uninstall removes only marked panel config and keeps data/backups by default.
 mock_bin_dir="${TEST_ROOT}/mock-bin"
 mkdir -p "$mock_bin_dir" "$(dirname -- "$NGINX_CONFIG")"
