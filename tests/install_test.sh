@@ -7,6 +7,10 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+bash "${REPO_ROOT}/tests/install_purge_guard_test.sh"
+if [ "${MERIDIAN_INSTALL_TEST_FOCUS:-}" = purge-guard ]; then
+    exit 0
+fi
 TEST_ROOT=$(mktemp -d)
 
 cleanup() {
@@ -131,7 +135,9 @@ run_bundled_update_failure_tests() {
             printf '#!/usr/bin/env sh\nprintf "v9.9.11\\n"\n' > "$scenario_root/bin/$binary_name"
             chmod 0755 "$scenario_root/bin/$binary_name"
         done
-        printf 'DB_PATH=%s/data/meridian.db\n' "$scenario_root" > "$scenario_root/data/.env"
+        printf 'JWT_SECRET=synthetic-bundle-legacy-jwt-00000000000000000000\nPORT=9090\nDB_PATH=%s/data/meridian.db\n' \
+            "$scenario_root" > "$scenario_root/data/.env"
+        chmod 0600 "$scenario_root/data/.env"
         printf 'previous database\n' > "$scenario_root/data/meridian.db"
         cp "$scenario_root/data/.env" "$scenario_root/env.before"
         cp "$scenario_root/data/meridian.db" "$scenario_root/db.before"
@@ -906,6 +912,10 @@ if ! (do_install) >"${TEST_ROOT}/install-first.log" 2>&1; then
     cat "${TEST_ROOT}/install-first.log" >&2
     exit 1
 fi
+# Keep the first install isolated in a subshell, then initialize the parent
+# harness's privilege prefix before it reads or edits the root-owned marker and
+# configuration in the following migration tests.
+init_privilege
 assert_eq 'v9.9.9' "$(get_current_version)" 'first installed version'
 assert_file "${INSTALL_DIR}/${AGENT_BIN_NAME}"
 assert_file "${INSTALL_DIR}/${AGENT_BIN_AMD64_NAME}"
@@ -1498,6 +1508,7 @@ run_password_case() {
         if [ "$1" = systemctl ]; then return 0; fi
         command "$@"
     }
+    stop_and_confirm_meridian_service() { return 0; }
     is_systemd() { return 0; }
     wait_for_health() { [ "$health_result" = success ]; }
     fix_database_permissions() { return 0; }

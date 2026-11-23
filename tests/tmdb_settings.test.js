@@ -27,7 +27,15 @@ function tmdbPageHarness(overrides = {}) {
       fields.clear();
       for (const [, , rawAttributes] of html.matchAll(/<(input|select|button|div|b)\b([^>]*\bid="[^"]+"[^>]*)>/g)) {
         const attrs = attributes(rawAttributes);
-        fields.set(attrs.id, { value: attrs.value ?? '', disabled: attrs.disabled === true, isConnected: true, textContent: '' });
+        const listeners = new Map();
+        fields.set(attrs.id, {
+          value: attrs.value ?? '', disabled: attrs.disabled === true, isConnected: true, textContent: '',
+          addEventListener(name, callback) {
+            if (!listeners.has(name)) listeners.set(name, []);
+            listeners.get(name).push(callback);
+          },
+          dispatch(name) { for (const callback of listeners.get(name) || []) callback({ target: this }); },
+        });
       }
       for (const [, rawAttributes, optionsHTML] of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
         const attrs = attributes(rawAttributes);

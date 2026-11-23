@@ -46,15 +46,27 @@ NGINX_MARKER="# Managed by Meridian installer - panel only"
 NGINX_REDACTION_MARKER="# Meridian redacted URI access log"
 NGINX_UPLOAD_START_MARKER="    # Meridian bounded panel uploads"
 NGINX_UPLOAD_END_MARKER="    # End Meridian bounded panel uploads"
+DATA_DIRECTORY_MARKER=".meridian-data-directory"
+DATA_DIRECTORY_SIGNATURE="meridian-data-directory-v1"
+
+is_protected_system_directory() {
+    case "$1" in
+        ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/bin|/usr/lib|/usr/lib64|/usr/libexec|/usr/local|/usr/local/bin|/usr/local/sbin|/usr/local/lib|/usr/local/share|/usr/sbin|/usr/share|/var|/var/backups|/var/cache|/var/lib|/var/local|/var/log|/var/opt|/var/run|/var/spool|/var/tmp|/Applications|/Library|/System|/Users|/Volumes|/private|/private/tmp|/private/var)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 while [ "$INSTALL_DIR" != "/" ] && [[ "$INSTALL_DIR" == */ ]]; do INSTALL_DIR="${INSTALL_DIR%/}"; done
+if is_protected_system_directory "$INSTALL_DIR" && [ "$INSTALL_DIR" != /usr/local/bin ]; then
+    fail "拒绝使用不安全的安装目录: ${INSTALL_DIR:-<empty>}"
+fi
 case "$INSTALL_DIR" in
-    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/bin|/usr/local|/usr/local/share|/usr/share|/var|/var/lib)
-        fail "拒绝使用不安全的安装目录: ${INSTALL_DIR:-<empty>}" ;;
     *//*|*/../*|*/..|*/./*|*/.|*$'
 '*)
         fail "安装目录包含不安全的路径片段: $INSTALL_DIR" ;;
 esac
+[[ "$INSTALL_DIR" = /* ]] || fail "安装目录必须是绝对路径: $INSTALL_DIR"
 while [ "$DATA_DIR" != "/" ] && [[ "$DATA_DIR" == */ ]]; do DATA_DIR="${DATA_DIR%/}"; done
 while [ "$BACKUP_DIR" != "/" ] && [[ "$BACKUP_DIR" == */ ]]; do BACKUP_DIR="${BACKUP_DIR%/}"; done
 
@@ -122,6 +134,31 @@ service_is_active() {
     is_systemd && systemctl is-active --quiet "$SERVICE_NAME"
 }
 
+stop_and_confirm_meridian_service() {
+    local state
+    # A failed stop or failed health probe does not establish that the process
+    # exited. Read all three properties together before touching live files.
+    as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    state=$(as_root systemctl show "$SERVICE_NAME" \
+        --property=ActiveState --property=MainPID --property=ControlPID 2>/dev/null) || {
+        warn "无法确认 Meridian 已停止；程序、数据和恢复快照已保留"
+        return 1
+    }
+    if ! printf '%s\n' "$state" | awk -F= '
+        $1=="ActiveState" { states++; state=$2 }
+        $1=="MainPID" { mains++; main=$2 }
+        $1=="ControlPID" { controls++; control=$2 }
+        END {
+            if (states!=1 || mains!=1 || controls!=1 ||
+                (state!="inactive" && state!="failed") ||
+                main!~/^[0-9]+$/ || control!~/^[0-9]+$/ ||
+                (main+0)!=0 || (control+0)!=0) exit 1
+        }'; then
+        warn "Meridian 尚未确认停止；程序、数据和恢复快照已保留"
+        return 1
+    fi
+}
+
 ask_yes_no() {
     local prompt="$1" default_yes="${2:-0}" answer
     if [ "$ASSUME_YES" = "1" ]; then
@@ -136,17 +173,41 @@ ask_yes_no() {
     fi
 }
 
+resolve_directory_path() {
+    local candidate="$1" suffix="" component resolved
+    while [ "$candidate" != / ] && [[ "$candidate" == */ ]]; do candidate="${candidate%/}"; done
+    while ! as_root test -d "$candidate"; do
+        if as_root test -e "$candidate" || as_root test -L "$candidate"; then return 1; fi
+        [ "$candidate" != / ] || return 1
+        component="${candidate##*/}"
+        suffix="/${component}${suffix}"
+        candidate="${candidate%/*}"
+        [ -n "$candidate" ] || candidate=/
+    done
+    # The path is an argument to a fixed script, never interpolated into code.
+    # shellcheck disable=SC2016
+    resolved=$(as_root bash --noprofile --norc -c 'cd -P -- "$1" && pwd -P' meridian-path "$candidate") || return 1
+    if [ "$resolved" = / ]; then printf '/%s\n' "${suffix#/}"
+    else printf '%s%s\n' "$resolved" "$suffix"
+    fi
+}
+
 validate_safe_directory() {
-    local value="$1" label="$2"
+    local value="$1" label="$2" purpose="${3:-data}" resolved
+    while [ "$value" != / ] && [[ "$value" == */ ]]; do value="${value%/}"; done
+    [[ "$value" = /* ]] || fail "${label}必须是绝对路径: $value"
     case "$value" in
-        ""|/|/bin|/boot|/dev|/etc|/home|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var)
-            fail "拒绝使用不安全的${label}: ${value:-<empty>}"
-            ;;
-        *//*|*/../*|*/..|*/./*|*/.|*$'\n'*)
+        *//*|*/../*|*/..|*/./*|*/.|*$'\n'*|*$'\r'*|*$'\t'*)
             fail "${label}包含不安全的路径片段: $value"
             ;;
     esac
-    [[ "$value" = /* ]] || fail "${label}必须是绝对路径: $value"
+    if is_protected_system_directory "$value" && { [ "$purpose" != install ] || [ "$value" != /usr/local/bin ]; }; then
+        fail "拒绝使用不安全的${label}: $value"
+    fi
+    resolved=$(resolve_directory_path "$value") || fail "无法安全解析${label}: $value"
+    if is_protected_system_directory "$resolved" && { [ "$purpose" != install ] || [ "$resolved" != /usr/local/bin ]; }; then
+        fail "拒绝使用解析后不安全的${label}: $value"
+    fi
 }
 
 validate_data_dir() {
@@ -155,6 +216,102 @@ validate_data_dir() {
 
 validate_backup_dir() {
     validate_safe_directory "$BACKUP_DIR" "备份目录"
+}
+
+trusted_data_identity_file() {
+    local file="$1" require_root="${2:-0}" metadata owner mode
+    as_root test -f "$file" || return 1
+    if as_root test -L "$file"; then return 1; fi
+    metadata=$(as_root stat -c '%u:%a' -- "$file" 2>/dev/null) \
+        || metadata=$(as_root stat -f '%u:%Lp' "$file" 2>/dev/null) || return 1
+    owner="${metadata%%:*}"; mode="${metadata#*:}"
+    [[ "$owner" =~ ^[0-9]+$ && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ "$require_root" = 0 ] || [ "$owner" = 0 ] || return 1
+    (( (8#$mode & 8#22) == 0 ))
+}
+
+legacy_data_directory_identity() {
+    local directory="$1" env_file="${1}/.env" db_path db_directory
+    trusted_data_identity_file "$env_file" || return 1
+    # Identify the installer's configuration without returning its JWT value.
+    # Arbitrary applications with a generic JWT/PORT/DB_PATH are insufficient:
+    # the default Meridian database or an exact managed unit is also required.
+    # shellcheck disable=SC2016
+    db_path=$(as_root awk -F= '
+        function value(line, first, last) {
+            sub(/^[^=]*=/, "", line)
+            first=substr(line,1,1); last=substr(line,length(line),1)
+            if ((first=="\"" && last=="\"") || (first=="\047" && last=="\047")) line=substr(line,2,length(line)-2)
+            return line
+        }
+        $1=="JWT_SECRET" { jwt++; if (length(value($0))>=32) jwt_valid++ }
+        $1=="PORT" { ports++; port=value($0) }
+        $1=="DB_PATH" { paths++; path=value($0) }
+        END {
+            if (jwt!=1 || jwt_valid!=1 || ports!=1 || paths!=1 || port!~/^[0-9]+$/ || (port+0)<1 || (port+0)>65535 || path!~/^\//) exit 1
+            print path
+        }' "$env_file") || return 1
+    validate_db_path "$db_path" || return 1
+    db_directory="${db_path%/*}"; [ -n "$db_directory" ] || db_directory=/
+    db_directory=$(resolve_directory_path "$db_directory") || return 1
+    if [ "${db_path##*/}" = meridian.db ] && { [ "$db_directory" = "$directory" ] || [[ "$db_directory" = "$directory"/* ]]; }; then
+        return 0
+    fi
+    trusted_data_identity_file "$SERVICE_FILE" 1 || return 1
+    { as_root grep -Fqx -- "WorkingDirectory=$DATA_DIR" "$SERVICE_FILE" \
+        || as_root grep -Fqx -- "WorkingDirectory=$directory" "$SERVICE_FILE"; } \
+        && as_root grep -Fqx -- "ExecStart=$INSTALL_DIR/$BIN_NAME" "$SERVICE_FILE"
+}
+
+data_directory_identity() {
+    local directory="$1" marker="${1}/${DATA_DIRECTORY_MARKER}"
+    if as_root test -e "$marker" || as_root test -L "$marker"; then
+        trusted_data_identity_file "$marker" 1 || return 1
+        [ "$(as_root cat "$marker")" = "$DATA_DIRECTORY_SIGNATURE" ]
+    else
+        legacy_data_directory_identity "$directory"
+    fi
+}
+
+validate_data_directory_for_install() {
+    local resolved contents
+    validate_data_dir
+    if as_root test -L "$DATA_DIR"; then fail "数据目录不能是符号链接: $DATA_DIR"; fi
+    as_root test -e "$DATA_DIR" || return 0
+    resolved=$(resolve_directory_path "$DATA_DIR") || return 1
+    data_directory_identity "$resolved" && return 0
+    contents=$(as_root find "$resolved" -mindepth 1 -maxdepth 1 -print -quit) || return 1
+    [ -z "$contents" ] || fail "非空数据目录无法确认为 Meridian 专用目录: $DATA_DIR"
+}
+
+ensure_data_directory_marker() {
+    local expected_directory="${1:-}" resolved marker
+    validate_data_dir
+    if as_root test -L "$DATA_DIR"; then fail "数据目录不能是符号链接: $DATA_DIR"; fi
+    resolved=$(resolve_directory_path "$DATA_DIR") || return 1
+    if [ -n "$expected_directory" ] && [ "$resolved" != "$expected_directory" ]; then
+        fail "数据目录真实路径在确认身份后发生变化，已中止操作"
+    fi
+    marker="${resolved}/${DATA_DIRECTORY_MARKER}"
+    if as_root test -e "$marker" || as_root test -L "$marker"; then
+        data_directory_identity "$resolved"
+        return
+    fi
+    # noclobber creates the marker exclusively; an existing symlink or file is
+    # never followed or replaced. Root ownership and 0600 are checked on reuse.
+    # shellcheck disable=SC2016
+    as_root bash --noprofile --norc -c 'umask 077; set -o noclobber; printf "%s\n" "$2" > "$1"' \
+        meridian-data-marker "$marker" "$DATA_DIRECTORY_SIGNATURE"
+}
+
+validate_purge_data_directory() {
+    local resolved
+    validate_data_dir
+    if as_root test -L "$DATA_DIR"; then fail "拒绝清除符号链接形式的数据目录: $DATA_DIR"; fi
+    as_root test -e "$DATA_DIR" || return 0
+    resolved=$(resolve_directory_path "$DATA_DIR") || return 1
+    data_directory_identity "$resolved" || fail "数据目录无法确认为 Meridian 专用目录: $DATA_DIR"
+    printf '%s\n' "$resolved"
 }
 
 validate_nginx_config_path() {
@@ -780,13 +937,22 @@ health_url() {
 }
 
 wait_for_health() {
-    local attempts="${1:-20}" url code i
-    command -v curl >/dev/null 2>&1 || return 1
-    url=$(health_url)
+    local attempts="${1:-20}" db_path i
+    db_path=$(read_env_value DB_PATH)
+    # Only the database path is needed by --healthcheck. Never execute .env or
+    # load deployment credentials into a shell; handle quoted path values too.
+    case "$db_path" in
+        \"*\") db_path="${db_path:1:${#db_path}-2}" ;;
+        \'*\') db_path="${db_path:1:${#db_path}-2}" ;;
+    esac
+    [ -n "$db_path" ] || db_path="${DATA_DIR}/meridian.db"
+    validate_db_path "$db_path" || return 1
     for ((i = 1; i <= attempts; i++)); do
-        code=$(curl --noproxy '*' --proto '=http' --connect-timeout 1 --max-time 2 \
-            -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
-        [ "$code" = "200" ] && return 0
+        # The application reads its actual panel-port marker and probes both
+        # HTTPS/HTTP and loopback address families, including UI-changed ports.
+        if as_root env "DB_PATH=$db_path" "${INSTALL_DIR}/${BIN_NAME}" --healthcheck >/dev/null 2>&1; then
+            return 0
+        fi
         sleep 1
     done
     return 1
@@ -812,7 +978,7 @@ ensure_service_user() {
 
 prepare_data_and_config() {
     local tmp_dir="$1" env_file secret upstream_header_key dynamic_route_key env_tmp
-    validate_data_dir || return 1
+    validate_data_directory_for_install || return 1
     env_file=$(env_file_path) || return 1
     if as_root test -L "$env_file"; then
         fail "拒绝修改符号链接形式的配置文件: $env_file"
@@ -863,6 +1029,7 @@ prepare_data_and_config() {
         fi
         info "保留现有配置: $env_file"
     fi
+    ensure_data_directory_marker || return 1
 }
 
 write_systemd_service() {
@@ -1022,6 +1189,10 @@ cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
         warn "更新中断，正在恢复更新前的二进制和数据状态..."
+        if is_systemd && ! stop_and_confirm_meridian_service; then
+            warn "回滚已中止；恢复快照保留在: ${UPDATE_TMP_DIR:-${LAST_BACKUP_PATH:-<unknown>}}"
+            return "$exit_code"
+        fi
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
         fi
@@ -2002,6 +2173,7 @@ do_install() {
     need_cmd sed
     need_cmd tr
     init_privilege
+    validate_safe_directory "$INSTALL_DIR" "安装目录" install
     validate_data_dir
     validate_backup_dir
 
@@ -2087,11 +2259,13 @@ do_update() {
     need_cmd sed
     need_cmd cmp
     init_privilege
+    validate_safe_directory "$INSTALL_DIR" "安装目录" install
     is_systemd && [ ! -f "$SERVICE_FILE" ] \
         && fail "找不到 Meridian systemd 服务，请重新运行 install 修复安装"
     as_root test -L "$(env_file_path)" \
         && fail "拒绝修改符号链接形式的配置文件: $(env_file_path)"
     validate_existing_secret_configuration || return 1
+    validate_data_directory_for_install || return 1
     migrate_managed_nginx_redaction \
         || fail "Nginx URI 脱敏日志迁移失败；原配置已恢复"
     current_version=$(get_current_version)
@@ -2119,7 +2293,7 @@ do_update() {
         else
             should_stop_after=1
         fi
-        as_root systemctl stop "$SERVICE_NAME"
+        stop_and_confirm_meridian_service || fail "无法确认 Meridian 已停止，已中止更新"
     else
         ensure_no_manual_process
     fi
@@ -2186,6 +2360,7 @@ do_update() {
         as_root systemctl restart "$SERVICE_NAME"
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
+            stop_and_confirm_meridian_service || fail "无法确认新版本已停止，回滚已中止并保留恢复快照"
             restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             if [ "$UPDATE_AGENT_CHANGED" = "1" ]; then
                 restore_previous_agent_binary || fail "回滚失败：缺少上一版本 Agent，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
@@ -2298,7 +2473,10 @@ cleanup_password_transaction() {
     if [ "$exit_code" -ne 0 ] && [ "$PASSWORD_TRANSACTION" = "1" ] \
         && [ -n "$PASSWORD_SNAPSHOT_DIR" ] && [ -n "$PASSWORD_DB_PATH" ]; then
         warn "密码修改中断，正在恢复旧密码..."
-        as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if ! stop_and_confirm_meridian_service; then
+            warn "凭据回滚已中止；恢复快照保留在: ${PASSWORD_TMP_DIR:-${LAST_BACKUP_PATH:-<unknown>}}"
+            return "$exit_code"
+        fi
         if ! restore_auth_snapshot "$PASSWORD_SNAPSHOT_DIR" "$PASSWORD_DB_PATH" >/dev/null 2>&1; then
             warn "自动恢复凭据失败，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
         fi
@@ -2352,7 +2530,7 @@ do_password() {
     PASSWORD_TMP_DIR="$tmp_dir"
     PASSWORD_SNAPSHOT_DIR="$snapshot_dir"
     PASSWORD_DB_PATH="$db_path"
-    as_root systemctl stop "$SERVICE_NAME"
+    stop_and_confirm_meridian_service || fail "无法确认 Meridian 已停止，已中止密码修改"
     if ! snapshot_auth_files "$snapshot_dir" "$db_path" || ! archive_auth_snapshot "$snapshot_dir"; then
         as_root systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
         as_root rm -rf -- "$tmp_dir"
@@ -2415,8 +2593,9 @@ remove_managed_nginx_config() {
 }
 
 do_uninstall() {
-    local remove_data="$PURGE_DATA"
+    local remove_data="$PURGE_DATA" purge_target="" checked_target=""
     init_privilege
+    validate_safe_directory "$INSTALL_DIR" "安装目录" install
     warn "即将卸载 Meridian；Nginx、Certbot、证书和备份不会删除"
     if [ "$ASSUME_YES" != "1" ]; then
         if [ "$PURGE_DATA" = "1" ]; then
@@ -2429,11 +2608,20 @@ do_uninstall() {
         ask_yes_no "确认卸载 Meridian？" 0 || { info "已取消"; return 0; }
     fi
 
-    [ "$remove_data" = "0" ] || validate_data_dir
+    if [ "$remove_data" = 1 ]; then
+        purge_target=$(validate_purge_data_directory) || fail "数据目录安全检查失败，已中止卸载"
+        # Preserve a validated legacy identity before its managed service unit
+        # is removed, so external-DB installs can still pass the final check.
+        if [ -n "$purge_target" ]; then
+            ensure_data_directory_marker "$purge_target" || fail "无法保存已确认的数据目录身份，已中止卸载"
+        fi
+    fi
 
+    if is_systemd; then
+        stop_and_confirm_meridian_service || fail "无法确认 Meridian 已停止，已中止卸载"
+    fi
     remove_managed_nginx_config || fail "Nginx 配置无法安全移除，已中止卸载"
     if is_systemd && [ -f "$SERVICE_FILE" ]; then
-        as_root systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         as_root systemctl disable "$SERVICE_NAME" 2>/dev/null || true
         as_root rm -f -- "$SERVICE_FILE"
         as_root systemctl daemon-reload
@@ -2448,7 +2636,9 @@ do_uninstall() {
         "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.new" "${INSTALL_DIR}/${AGENT_BIN_ARM64_NAME}.rollback"
 
     if [ "$remove_data" = "1" ]; then
-        as_root rm -rf -- "$DATA_DIR"
+        checked_target=$(validate_purge_data_directory) || fail "数据目录安全检查失败，已中止清除"
+        [ "$checked_target" = "$purge_target" ] || fail "数据目录真实路径在卸载期间发生变化，已中止清除"
+        if [ -n "$purge_target" ]; then as_root rm -rf -- "$purge_target"; fi
         if id "$SERVICE_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
             as_root userdel "$SERVICE_USER" 2>/dev/null || true
         fi

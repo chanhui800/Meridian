@@ -5,7 +5,7 @@
     {
       "id": "admin-diagnostic-egress",
       "ruleId": "go/request-forgery",
-      "path": "diagnostics.go",
+      "path": "cmd/meridian/diagnostics.go",
       "partialFingerprints": {
         "primaryLocationLineHash": "c943ee1e56e53bcb:1"
       },
@@ -16,35 +16,35 @@
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
-          "path": "main.go",
+          "path": "cmd/meridian/main.go",
           "sha256": "262dacee634683c0c7e3622d8925047c3575e8d16a8d21b83c10f361bb8ad1c6"
         },
         {
-          "path": "app_http.go",
+          "path": "cmd/meridian/app_http.go",
           "sha256": "ce8c1d5a05406f1af3b62ed30d6e9f25d9ac9a35324885010da4dd611f7d2764"
         },
         {
-          "path": "trusted_proxy.go",
+          "path": "cmd/meridian/trusted_proxy.go",
           "sha256": "6038640e637f848f60cf47eb4ce120dda37b69f947d94235ce714c09e4460a91"
         },
         {
-          "path": "diagnostics.go",
+          "path": "cmd/meridian/diagnostics.go",
           "sha256": "91d7f9b3a92d306c26ee3d50b5d301a267eb0682164aa80b2cbae05c2e8c98b7"
         },
         {
-          "path": "diagnostics_security.go",
+          "path": "cmd/meridian/diagnostics_security.go",
           "sha256": "3434e6f553170fcdd5f847455dbb42d3fa757728779785188dcf458342bea500"
         },
         {
-          "path": "app_sites.go",
-          "sha256": "b3867baf535757ad7a4cb62d7d0e28d27b4f3f29452d1149c05ee18b34d96c89"
+          "path": "cmd/meridian/app_sites.go",
+          "sha256": "f974ff325c5c846178273934be84a91df16519136f6b584e6a891bee1bb2acdf"
         },
         {
-          "path": "app_core.go",
+          "path": "cmd/meridian/app_core.go",
           "sha256": "af4f6d652c27447d22a396eccff29f38f88cc4247a15f0c6a8b979ae7a1d707f"
         },
         {
-          "path": "diagnostics_security_test.go",
+          "path": "cmd/meridian/diagnostics_security_test.go",
           "sha256": "6e646ca8487c44ea634f1f78d0f43ae223c97979f8bc0dc8893c09cbca717aba"
         },
         {
@@ -52,7 +52,7 @@
           "sha256": "ae14bbce05013f6375d89ff31dc3dda86a0b1981e9cf18e2998660b6d9e908f8"
         },
         {
-          "path": "panel_ingress_configuration_test.go",
+          "path": "cmd/meridian/panel_ingress_configuration_test.go",
           "sha256": "466d4424d32de0eb4a261866e94d8a0e39b42dab544d201342d9d7b446ea61b7"
         }
       ]
@@ -60,7 +60,7 @@
     {
       "id": "isolated-dynamic-media-response",
       "ruleId": "go/reflected-xss",
-      "path": "dynamic_capability_service.go",
+      "path": "cmd/meridian/dynamic_capability_service.go",
       "partialFingerprints": {
         "primaryLocationLineHash": "b62a3d30847d4376:1"
       },
@@ -71,23 +71,23 @@
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
-          "path": "dynamic_capability_service.go",
+          "path": "cmd/meridian/dynamic_capability_service.go",
           "sha256": "af30a20ea13db2dcaf6a7747ecc0a016913cebf2c0993c811b2821cda72d8bdc"
         },
         {
-          "path": "dynamic_rewrite_core.go",
-          "sha256": "dbff94dd84ef3146cf93fef6e16b51cd9168cb14d954469e96cb6e11e96aef2c"
+          "path": "cmd/meridian/dynamic_rewrite_core.go",
+          "sha256": "3c6228b79178cac11540c0e841086807bf0cb47ef7c6675e18d1f7f4942fb315"
         },
         {
-          "path": "dynamic_runtime_state.go",
+          "path": "cmd/meridian/dynamic_runtime_state.go",
           "sha256": "499672e474dfb2005a9eefbdb8d8f69cd220cefcbb9bf23c49801943d4d6efcc"
         },
         {
-          "path": "dynamic_capability_issuer.go",
+          "path": "cmd/meridian/dynamic_capability_issuer.go",
           "sha256": "7f1d24e96ccd61f30d150f1c982e787a939a2a08705b6fc49058376139a24b27"
         },
         {
-          "path": "dynamic_security_boundary_test.go",
+          "path": "cmd/meridian/dynamic_security_boundary_test.go",
           "sha256": "a381745e107b32ac7f2b25c502926a45715a774dfbafbb36e88a1dd39e8b184e"
         },
         {
@@ -95,47 +95,47 @@
           "sha256": "ae14bbce05013f6375d89ff31dc3dda86a0b1981e9cf18e2998660b6d9e908f8"
         },
         {
-          "path": "proxy_response_reliability_test.go",
+          "path": "cmd/meridian/proxy_response_reliability_test.go",
           "sha256": "fb0dfb435f1fe0d47ec9984f3ce64a300b985f0fb150feba405ab9cd388e8099"
         },
         {
-          "path": "dynamic_transport_pool.go",
+          "path": "cmd/meridian/dynamic_transport_pool.go",
           "sha256": "579ffb35684622887fb4ae49309acb99d29a0feed30d54c42c3402f075fcd523"
         },
         {
-          "path": "dynamic_transport_pool_test.go",
+          "path": "cmd/meridian/dynamic_transport_pool_test.go",
           "sha256": "832b60f877abc40d02e1416e76a95bcda0f1bc5723f00abe9ea2d9c1160575b4"
         },
         {
-          "path": "dynamic_authority.go",
+          "path": "cmd/meridian/dynamic_authority.go",
           "sha256": "0539b25150d280080c06f9ed0fab26cf2e3f1fb00ac951f5b907ad2b0b44fec1"
         },
         {
-          "path": "dynamic_network.go",
+          "path": "cmd/meridian/dynamic_network.go",
           "sha256": "eba5fad5a872df60c6525231e3a8091f7d04790a334b2dd522bb7e40593332b5"
         },
         {
-          "path": "request_diagnostics.go",
+          "path": "cmd/meridian/request_diagnostics.go",
           "sha256": "07b580d7c44a1f000ab0cafe6d3eb4d919f1a2f73b69c259588af2b766fddb6c"
         },
         {
-          "path": "request_diagnostics_test.go",
+          "path": "cmd/meridian/request_diagnostics_test.go",
           "sha256": "88fdf0fa9c7d414e561c378040089347d51725f58851ba04560763a8589c8073"
         },
         {
-          "path": "request_upstream_attempts_test.go",
+          "path": "cmd/meridian/request_upstream_attempts_test.go",
           "sha256": "dbbf545965ae0706a89c606d250a43b2dd6b71008a224b25228ee9101b2fa186"
         },
         {
-          "path": "dynamic_rewrite_validation_test.go",
+          "path": "cmd/meridian/dynamic_rewrite_validation_test.go",
           "sha256": "de892315f0c2ec6ff8cb3cc4234c577f7713db499312fbe641f82d487a8bc519"
         },
         {
-          "path": "dynamic_pinned_fallback_test.go",
+          "path": "cmd/meridian/dynamic_pinned_fallback_test.go",
           "sha256": "521246d081b856b3e46cf46dd67841b709d12f54b9fcdc0efb3dbdc0b1d692f5"
         },
         {
-          "path": "path_target_structured_body_timeout_test.go",
+          "path": "cmd/meridian/path_target_structured_body_timeout_test.go",
           "sha256": "860b6333f3f4f02f9315e1385d2cb58eff3a53b25ce56a4f37f3ab73ce967e81"
         }
       ]
@@ -143,7 +143,7 @@
     {
       "id": "fixed-loopback-healthcheck-tls",
       "ruleId": "go/disabled-certificate-check",
-      "path": "command_line.go",
+      "path": "cmd/meridian/command_line.go",
       "partialFingerprints": {
         "primaryLocationLineHash": "6d632b862fb273c2:1"
       },
@@ -154,16 +154,16 @@
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
-          "path": "command_line.go",
+          "path": "cmd/meridian/command_line.go",
           "sha256": "db8ca77654befddc04503e21becf50d7f9606528773122e354c26592bde842cd"
         },
         {
-          "path": "app_core.go",
+          "path": "cmd/meridian/app_core.go",
           "sha256": "af4f6d652c27447d22a396eccff29f38f88cc4247a15f0c6a8b979ae7a1d707f"
         },
         {
-          "path": "main_test.go",
-          "sha256": "54eb4310664f18462e8d8437af7fccb410d40e389623a073458cba608575ea23"
+          "path": "cmd/meridian/main_test.go",
+          "sha256": "2fc23872bcfdcf357777985ffeaa466d33549cbf8028349ed908c8274acfcf54"
         },
         {
           "path": "docs/code-scanning-review.md",
@@ -174,7 +174,7 @@
     {
       "id": "transient-retention-identity-digest",
       "ruleId": "go/weak-sensitive-data-hashing",
-      "path": "account_retention.go",
+      "path": "cmd/meridian/account_retention.go",
       "partialFingerprints": {
         "primaryLocationLineHash": "e96ef967fbc65152:1"
       },
@@ -185,20 +185,20 @@
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
-          "path": "account_retention.go",
+          "path": "cmd/meridian/account_retention.go",
           "sha256": "5d6c43755a6d59983ba63677efdd9df6e403f0f94b4c2b4d5ea6802a15a6bb71"
         },
         {
-          "path": "account_repository.go",
+          "path": "cmd/meridian/account_repository.go",
           "sha256": "4a9afade731735dab3082200d0045c3f6a9da345c9f8bb36db418606425e3b1d"
         },
         {
-          "path": "account_retention_test.go",
+          "path": "cmd/meridian/account_retention_test.go",
           "sha256": "78e45c917dc9ed3753ba24040a3343e1227a385e55c2662324995c62c7fb5693"
         },
         {
-          "path": "main_test.go",
-          "sha256": "54eb4310664f18462e8d8437af7fccb410d40e389623a073458cba608575ea23"
+          "path": "cmd/meridian/main_test.go",
+          "sha256": "2fc23872bcfdcf357777985ffeaa466d33549cbf8028349ed908c8274acfcf54"
         },
         {
           "path": "docs/code-scanning-review.md",

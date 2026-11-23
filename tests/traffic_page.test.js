@@ -1260,7 +1260,7 @@ test('dashboard area fill closes at real samples and cannot imply a boundary dro
 test('global traffic settings expose reset and no-reset billing cycles', () => {
   const source = readScript('pages/global-settings.js');
   assert.match(source, /setting-traffic-reset-day/);
-  assert.match(source, /traffic_reset_day\s*=\s*numericSetting\('setting-traffic-reset-day'/);
+  assert.match(source, /\['traffic_reset_day', 'setting-traffic-reset-day', 'number'\]/);
   assert.match(source, /短月自动使用该月最后一天/);
   assert.match(source, /不重置（累计流量）/);
   assert.match(source, /s\.traffic_reset_day == null \? 1 : s\.traffic_reset_day/);

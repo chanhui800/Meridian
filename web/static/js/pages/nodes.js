@@ -26,6 +26,11 @@ function stopNodesRefresh() {
   nodesRefreshTimer = null;
   siteScheduleReactionTimers.forEach(timer => clearTimeout(timer));
   siteScheduleReactionTimers.clear();
+  if (typeof invalidateModalIntent === 'function' && invalidateModalIntent('nodes')) {
+    const overlay = document.getElementById('modal-overlay');
+    const modal = document.getElementById('modal');
+    if (overlay?.classList.contains('active') && modal?.classList.contains('fleet-modal')) closeModal({ restoreFocus: false });
+  }
 }
 
 function nodeBytes(value) {
@@ -257,13 +262,15 @@ function focusFleetModal(preferredID) {
   if (target) target.focus({ preventScroll: true });
 }
 
-function showNodeScript(script, command) {
+function showNodeScript(script, command, intent) {
+  const modalIntent = intent || beginModalIntent('nodes');
+  if (!isModalIntentCurrent(modalIntent)) return;
   document.getElementById('modal-title').textContent = 'Agent 一键安装脚本';
   document.getElementById('modal-body').innerHTML = `${command ? '<p class="node-script-note">推荐直接执行以下命令（不会进入分页器）：</p><textarea class="node-script" id="node-install-command" readonly></textarea>' : ''}<p class="node-script-note">脚本含一次性令牌，24 小时内有效。请在目标 Linux amd64 或 arm64 VPS 上以 root 执行。</p><textarea class="node-script" id="node-install-script" readonly></textarea>`;
   document.getElementById('node-install-script').value = script;
   if (command) document.getElementById('node-install-command').value = command;
   document.getElementById('modal-footer').innerHTML = `${command ? '<button type="button" class="console-button" id="node-copy-command">复制一键命令</button>' : ''}<button type="button" class="console-button" id="node-copy-script">复制脚本</button><button type="button" class="console-button is-primary" id="node-close-script">完成</button>`;
-  openModal({ closeOnBackdrop: false, modalClass: 'fleet-modal' });
+  openModal({ closeOnBackdrop: false, modalClass: 'fleet-modal', intent: modalIntent });
   focusFleetModal(command ? 'node-install-command' : 'node-install-script');
   const copy = async (value, message) => {
     try { await navigator.clipboard.writeText(value); Toast.success(message); }
@@ -275,6 +282,7 @@ function showNodeScript(script, command) {
 }
 
 function openNodeForm(node) {
+  const modalIntent = beginModalIntent('nodes');
   const editing = !!node;
   document.getElementById('modal-title').textContent = editing ? '编辑节点' : '创建节点';
   document.getElementById('modal-body').innerHTML = `<form id="node-form" class="fleet-form">
@@ -314,7 +322,7 @@ function openNodeForm(node) {
   if (editing) document.getElementById('node-enabled').checked = node.enabled;
   else document.getElementById('node-controller').value = location.origin;
   document.getElementById('modal-footer').innerHTML = '<button type="button" class="console-button" id="node-form-cancel">取消</button><button type="submit" form="node-form" class="console-button is-primary" id="node-form-save">保存节点</button>';
-  openModal({ closeOnBackdrop: false, modalClass: 'fleet-modal' });
+  openModal({ closeOnBackdrop: false, modalClass: 'fleet-modal', intent: modalIntent });
   focusFleetModal('node-name');
   document.getElementById('node-form-cancel').onclick = closeModal;
   let saving = false;
@@ -332,20 +340,25 @@ function openNodeForm(node) {
     try {
       if (editing) {
         payload.enabled = document.getElementById('node-enabled').checked;
-        await API.updateNode(node.id, payload);
+        const result = await API.updateNode(node.id, payload);
+        if (!result) return;
         nodesMutationVersion++;
         if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
-        closeModal(); Toast.success('节点已更新');
+        if (isModalIntentCurrent(modalIntent)) {
+          closeModal({ intent: modalIntent });
+          Toast.success('节点已更新');
+        }
       } else {
         payload.controller_url = document.getElementById('node-controller').value.trim();
         const result = await API.createNode(payload);
+        if (!result) return;
         nodesMutationVersion++;
         if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
-        showNodeScript(result.install_script, result.install_command);
+        showNodeScript(result.install_script, result.install_command, modalIntent);
       }
       await loadNodes(true);
-    } catch (error) { Toast.error(error.message || '保存失败'); }
-    finally { saving = false; button.disabled = false; button.textContent = '保存节点'; }
+    } catch (error) { if (isModalIntentCurrent(modalIntent)) Toast.error(error.message || '保存失败'); }
+    finally { saving = false; if (button.isConnected) { button.disabled = false; button.textContent = '保存节点'; } }
   };
 }
 
@@ -372,7 +385,8 @@ async function handleNodeAction(event) {
     nodesMutationVersion++;
     button.disabled = true;
     try {
-      await API.deleteNode(node.id);
+      const result = await API.deleteNode(node.id);
+      if (!result) return;
       nodesMutationVersion++;
       if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
       nodeDetailOpen.delete(Number(node.id));
@@ -384,14 +398,16 @@ async function handleNodeAction(event) {
   if (button.dataset.action === 'enroll') {
     if (!confirm('这会生成新的注册脚本；当前 Agent 会继续运行，直到新 Agent 注册成功。确认继续？')) return;
     const generation = nodesPageGeneration;
+    const modalIntent = beginModalIntent('nodes');
     nodesMutationVersion++;
     button.disabled = true;
     try {
       const result = await API.refreshNodeEnrollment(node.id, location.origin);
+      if (!result) return;
       nodesMutationVersion++;
       if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
-      showNodeScript(result.install_script, result.install_command); await loadNodes(true);
-    } catch (error) { Toast.error(error.message); }
+      showNodeScript(result.install_script, result.install_command, modalIntent); await loadNodes(true);
+    } catch (error) { if (isModalIntentCurrent(modalIntent)) Toast.error(error.message); }
     finally { button.disabled = false; }
   }
 }

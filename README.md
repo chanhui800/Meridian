@@ -9,7 +9,11 @@
 
 Meridian 是面向 Emby 和 Jellyfin 的多站点反向代理与节点调度面板，同时支持在请求路径中指定目标的通用 HTTP(S) 反代。它把站点入口、备用线路、播放地址改写、流量统计、请求日志、观看历史、TLS 和可选的边缘 Agent 放在一个控制面板里。
 
-当前正式版为 [v1.11.9](https://github.com/chanhui800/Meridian/releases/tag/v1.11.9)，安装文件和 `SHA256SUMS` 可从 Release 获取，变化见 [v1.11.9 发布说明](docs/releases/v1.11.9.md)。节点调度按站点启用，未启用的站点继续使用原面板入口。
+当前正式版为 [v1.11.10](https://github.com/chanhui800/Meridian/releases/tag/v1.11.10)，安装文件和 `SHA256SUMS` 可从 Release 获取，变化见 [v1.11.10 发布说明](docs/releases/v1.11.10.md)。节点调度按站点启用，未启用的站点继续使用原面板入口。
+
+## 仓库结构
+
+Controller 与 Agent 共用 `cmd/meridian/` 中的 Go 主包，包内回归测试和 fuzz 语料与实现放在一起。`web/` 管理面板静态资源，`scripts/` 保存安装器与容器入口脚本，`tests/` 保存前端和安装器测试，`docs/` 保存部署说明、发布记录与审查文档，`website/` 保存 Cloudflare Pages 官网。仓库根目录仅保留 Go 模块、构建和发布入口以及项目文档。
 
 使用说明：[快速安装](#快速安装) · [固定回源模式](#固定回源模式) · [通用反代模式](#通用反代模式) · [节点调度](#节点调度与主控模式) · [通用反代完整指南](docs/generic-proxy.md)
 
@@ -295,7 +299,7 @@ docker exec meridian /app/meridian admin issue-edge-certificate
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
 
-v1.11.9 新增通用反代、多来源观看记录和节点接管后的主控入口管理，完整变化见 [v1.11.9 发布说明](docs/releases/v1.11.9.md)。固定镜像为 `ghcr.io/chanhui800/meridian:v1.11.9`，数据库自动迁移到 schema 58，旧版本回退使用匹配的数据库备份或受控迁移。
+v1.11.10 修复审查确认的节点端口、流量账本、TLS 备份、证书复用、页面异步保存、安装器生命周期及媒体清单路由问题。固定镜像为 `ghcr.io/chanhui800/meridian:v1.11.10`，数据库自动迁移到 schema 60；降级前请先备份并按发布说明恢复兼容的数据快照。
 
 升级 Controller 后，已注册 Agent 会通过受认证的配置和清单接口获取匹配版本的下载信息。正式版从固定 GitHub Release 下载，下载请求不携带 Controller 令牌；开发构建使用需要认证的 Controller 二进制接口。
 
@@ -322,7 +326,7 @@ find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
 node --test tests/*.test.js
 bash -n install.sh
 bash -n scripts/agent-install.sh
-bash -n docker-entrypoint.sh
+bash -n scripts/docker-entrypoint.sh
 ```
 
 CI 另执行漏洞扫描、静态安全检查、安装器回归和 Docker 构建。
@@ -332,7 +336,7 @@ CodeQL 在上传结果后检查未经审阅的严重和高危告警；正式发�
 Fuzz 每次针对根包中的单个目标运行，例如：
 
 ```bash
-go test -run '^$' -fuzz '^FuzzNormalizeDynamicURL$' -fuzztime 60s .
+go test -run '^$' -fuzz '^FuzzNormalizeDynamicURL$' -fuzztime 60s ./cmd/meridian
 ```
 
 项目许可证见 [LICENSE](LICENSE)，安全问题按 [SECURITY.md](SECURITY.md) 的方式私下报告。

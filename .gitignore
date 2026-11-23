@@ -1,6 +1,6 @@
 # Binary
-meridian
-meridian.exe
+/meridian
+/meridian.exe
 *.exe
 
 # Environment / local secrets

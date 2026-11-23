@@ -112,6 +112,49 @@ test('legacy ingress capabilities retain the browser protocol without changing d
   assert.equal(sandbox.siteAccessAddress({ ingress_mode: 'port', listen_port: 8096 }, legacy), 'http://panel.example.test:8096');
 });
 
+for (const upstreamMode of ['fixed', 'path_target']) {
+  for (const controllerPort of ['9090', '']) {
+    test(`${upstreamMode} host access uses the applied Agent port after takeover from controller ${controllerPort || '443'}`, () => {
+      const sandbox = loadHelpers();
+      sandbox.window.location = new URL(`https://panel.example.test${controllerPort ? `:${controllerPort}` : ''}/#sites`);
+      const capabilities = sandbox.normalizeSiteCapabilities({ panel_tls_enabled: true });
+      const site = { ingress_mode: 'host', upstream_mode: upstreamMode, public_host: 'media.example.test',
+        applied_node_id: 11, applied_node_port: 9443, controller_closed: true };
+      assert.equal(sandbox.siteAccessAddress(site, capabilities), 'https://media.example.test:9443');
+      assert.equal(sandbox.siteAccessAddress({ ...site, applied_node_port: Number(controllerPort || 443) }, capabilities), `https://media.example.test:${controllerPort || '443'}`);
+      assert.equal(sandbox.siteAccessAddress({ ...site, controller_closed: false, desired_node_port: 9443 }, capabilities), `https://media.example.test:${controllerPort || '443'}`);
+      assert.equal(sandbox.siteAccessAddress({ ...site, enabled: false }, capabilities), 'https://media.example.test:9443', 'pending cleanup retains the committed owner');
+    });
+  }
+}
+
+test('invalid or absent applied Agent entry waits without copying the controller address; dedicated listeners stay independent', () => {
+  const sandbox = loadHelpers();
+  sandbox.window.location = new URL('https://panel.example.test:9090/#sites');
+  const capabilities = sandbox.normalizeSiteCapabilities({ panel_tls_enabled: true });
+  for (const port of [undefined, 0, -1, 65536, 9443.5]) {
+    assert.equal(sandbox.siteAccessAddress({ ingress_mode: 'host', public_host: 'media.example.test', controller_closed: true, applied_node_port: port }, capabilities), '');
+  }
+  assert.equal(sandbox.siteAccessAddress({ ingress_mode: 'port', listen_port: 8096, controller_closed: true, applied_node_port: 9443 }, capabilities), 'https://panel.example.test:8096');
+});
+
+test('takeover ownership and applied port changes invalidate the site row rendering signature', () => {
+  const sandbox = loadHelpers();
+  const site = { id: 1, name: 'scheduled', ingress_mode: 'host', public_host: 'media.example.test', controller_closed: false, applied_node_id: 0, applied_node_port: 0 };
+  const signature = sandbox.siteCardsRenderSignature([site], new Set());
+  for (const change of [{ controller_closed: true }, { applied_node_id: 11 }, { applied_node_port: 9443 }]) {
+    assert.notEqual(sandbox.siteCardsRenderSignature([{ ...site, ...change }], new Set()), signature);
+  }
+});
+
+test('same-count upstream header edits invalidate the site row rendering signature', () => {
+  const sandbox = loadHelpers();
+  const site = { id: 1, name: 'headers', upstream_headers: [{ name: 'X-Old', configured: true }] };
+  const signature = sandbox.siteCardsRenderSignature([site], new Set());
+  assert.notEqual(sandbox.siteCardsRenderSignature([{ ...site, upstream_headers: [{ name: 'X-New', configured: true }] }], new Set()), signature);
+  assert.notEqual(sandbox.siteCardsRenderSignature([{ ...site, upstream_headers: [{ name: 'X-Old', configured: false }] }], new Set()), signature);
+});
+
 test('site rows retain ingress status, concealed access and secondary actions', () => {
   const sandbox = loadHelpers();
   sandbox.formatBytes = value => `${value} B`;
@@ -205,6 +248,32 @@ test('site cards render media library counts and an accessible retention countdo
   assert.match(retention, /site-retention-row is-urgent/);
   assert.match(retention, /剩余 6 天/);
   assert.doesNotMatch(retention, /合格观看后自动重置|<small/);
+});
+
+test('switching a fixed upstream to generic proxy hides previous media counts and pending totals', () => {
+  const sandbox = loadHelpers();
+  sandbox.formatBytes = value => `${value} B`;
+  sandbox.uaNameMap = { passthrough: '透传' };
+  const site = { id: 3, name: '通用站点', upstream_mode: 'fixed', ingress_mode: 'port', listen_port: 8096,
+    ua_mode: 'passthrough', media_movie_count: 15019, media_series_count: 120, media_episode_count: 840 };
+  const fixedSignature = sandbox.siteCardsRenderSignature([site], new Set());
+  const fixedRow = sandbox.siteManagementRowHTML(site, new Set());
+  assert.match(fixedRow, /电影 <strong>15,019<\/strong>/);
+  assert.match(fixedRow, /剧集 <strong>120<\/strong>/);
+  assert.match(fixedRow, /集 <strong>840<\/strong>/);
+
+  site.upstream_mode = 'path_target';
+  assert.notEqual(sandbox.siteCardsRenderSignature([site], new Set()), fixedSignature, 'changing upstream mode must repaint the row');
+  assert.equal(sandbox.renderSiteMediaLibraryCounts(site), '');
+  assert.equal(sandbox.renderSiteMediaLibraryCounts({ upstream_mode: 'path_target' }), '', 'generic proxy has no pending media-library sync');
+  const genericRow = sandbox.siteManagementRowHTML(site, new Set());
+  assert.match(genericRow, /回源方式<\/span><span class="console-mono">通用反代/);
+  assert.doesNotMatch(genericRow, /site-media-counts|媒体库数量|待同步|15,019/);
+  assert.match(genericRow, /data-site-action="access"/);
+
+  site.upstream_mode = 'fixed';
+  assert.equal(sandbox.siteCardsRenderSignature([site], new Set()), fixedSignature);
+  assert.equal(sandbox.siteManagementRowHTML(site, new Set()), fixedRow, 'switching back must retain all fixed-upstream counts');
 });
 
 test('site card actions stay bottom-aligned without fixed card heights', () => {

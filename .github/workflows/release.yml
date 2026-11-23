@@ -90,16 +90,22 @@ jobs:
           node --test tests/*.test.js
           bash -n install.sh
           bash -n scripts/agent-install.sh
-          bash -n docker-entrypoint.sh
+          bash -n scripts/docker-entrypoint.sh
           bash -n tests/install_test.sh
+          bash -n tests/install_health_test.sh
+          bash -n tests/install_lifecycle_safety_test.sh
+          bash -n tests/install_purge_guard_test.sh
           bash -n tests/docker_entrypoint_test.sh
           bash -n tests/upstream_header_key_test.sh
           bash -n tests/dynamic_route_key_test.sh
           bash -n scripts/release-policy.sh
           bash -n tests/release_policy_test.sh
-          shellcheck install.sh scripts/agent-install.sh docker-entrypoint.sh scripts/release-policy.sh tests/install_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh tests/release_policy_test.sh
+          shellcheck install.sh scripts/agent-install.sh scripts/docker-entrypoint.sh scripts/release-policy.sh tests/install_test.sh tests/install_health_test.sh tests/install_lifecycle_safety_test.sh tests/install_purge_guard_test.sh tests/docker_entrypoint_test.sh tests/upstream_header_key_test.sh tests/dynamic_route_key_test.sh tests/release_policy_test.sh
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
+          bash tests/install_health_test.sh
+          bash tests/install_lifecycle_safety_test.sh
+          bash tests/install_purge_guard_test.sh
           bash tests/install_test.sh
           bash tests/release_policy_test.sh
 
@@ -117,7 +123,7 @@ jobs:
           gosec -quiet -severity medium -confidence medium ./...
 
       - name: Build
-        run: go build -trimpath -buildvcs=false -o meridian .
+        run: go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
 
   build:
     needs: verify
@@ -145,16 +151,16 @@ jobs:
             echo "Building ${goos}/${goarch} -> meridian-${suffix}"
             GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -buildvcs=false \
               -ldflags="-s -w -X main.appVersion=${RELEASE_TAG} -X main.buildMode=controller" \
-              -o "meridian-${suffix}" .
+              -o "meridian-${suffix}" ./cmd/meridian
           }
           build linux amd64 linux-amd64
           build linux arm64 linux-arm64
           GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
             -ldflags="-s -w -X main.appVersion=${RELEASE_TAG} -X main.buildMode=agent" \
-            -o meridian-agent-linux-amd64 .
+            -o meridian-agent-linux-amd64 ./cmd/meridian
           GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false \
             -ldflags="-s -w -X main.appVersion=${RELEASE_TAG} -X main.buildMode=agent" \
-            -o meridian-agent-linux-arm64 .
+            -o meridian-agent-linux-arm64 ./cmd/meridian
           build windows amd64 windows-amd64.exe
           build darwin amd64 darwin-amd64
           build darwin arm64 darwin-arm64
@@ -189,6 +195,10 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
@@ -212,7 +222,7 @@ jobs:
             meridian-*
             install.sh
             SHA256SUMS
-          generate_release_notes: true
+          body_path: docs/releases/${{ needs.verify.outputs.release_tag }}.md
           draft: true
 
       - name: Publish release after all artifacts are attached

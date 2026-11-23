@@ -1,5 +1,7 @@
 // TMDB metadata enrichment settings
 let tmdbSettingsLoadGeneration = 0;
+let tmdbSettingsSaveGeneration = 0;
+let tmdbSettingsEditGeneration = 0;
 let tmdbSettingsCache = null;
 let tmdbSettingsCacheRefreshTimer = null;
 
@@ -111,6 +113,32 @@ function tmdbSettingsCurrentPayload(clearToken) {
   );
 }
 
+function tmdbSettingsFormSnapshot() {
+  return {
+    enabled: document.getElementById('tmdb-enabled')?.value || '',
+    language: document.getElementById('tmdb-language')?.value || '',
+    token: document.getElementById('tmdb-api-token')?.value || '',
+    retention: document.getElementById('tmdb-history-retention')?.value || '',
+  };
+}
+
+function tmdbSettingsFormMatches(snapshot) {
+  const current = tmdbSettingsFormSnapshot();
+  return Object.keys(snapshot).every(key => current[key] === snapshot[key]);
+}
+
+function updateTMDBCacheSummary(rawSettings) {
+  const settings = normalizeTMDBSettings(rawSettings);
+  tmdbSettingsCache = {
+    ...(tmdbSettingsCache || settings),
+    cacheEntries: settings.cacheEntries,
+    cacheSizeBytes: settings.cacheSizeBytes,
+  };
+  const page = document.getElementById('page-settings-tmdb');
+  const summary = page?.querySelector('#tmdb-cache-summary');
+  if (summary) summary.textContent = `${settings.cacheEntries} 条 · ${tmdbFormatCacheSize(settings.cacheSizeBytes)}`;
+}
+
 function validateTMDBSettingsPayload(payload) {
   if (!Number.isSafeInteger(payload.history_retention_days) || payload.history_retention_days < 1 || payload.history_retention_days > 3650) {
     return '观看历史保留时间必须为 1 到 3650 天的整数';
@@ -135,25 +163,38 @@ function setTMDBActionState(button, busy, busyText, normalText) {
   button.textContent = busy ? busyText : normalText;
 }
 
+async function submitTMDBSettingsSave(payload, button, labels) {
+  const page = document.getElementById('page-settings-tmdb');
+  const loadGeneration = tmdbSettingsLoadGeneration;
+  const saveGeneration = ++tmdbSettingsSaveGeneration;
+  const submittedForm = tmdbSettingsFormSnapshot();
+  setTMDBActionState(button, true, labels.busy, labels.idle);
+  try {
+    const updated = await API.saveTMDBSettings(payload);
+    if (!updated) return;
+    if (loadGeneration !== tmdbSettingsLoadGeneration || saveGeneration !== tmdbSettingsSaveGeneration
+      || Router.current !== 'settings-tmdb' || !page?.isConnected) return;
+    tmdbSettingsCache = normalizeTMDBSettings(updated);
+    Toast.success(labels.success);
+    // An older save must not erase edits or a replacement token entered while
+    // the request was in flight. Reload only when the form still matches what
+    // this request submitted.
+    if (tmdbSettingsFormMatches(submittedForm)) await loadTMDBSettings(page);
+  } catch (error) {
+    if (loadGeneration === tmdbSettingsLoadGeneration && saveGeneration === tmdbSettingsSaveGeneration
+      && Router.current === 'settings-tmdb') Toast.error(error.message || labels.failure);
+  } finally {
+    if (button && button.isConnected) setTMDBActionState(button, false, '', labels.idle);
+  }
+}
+
 async function saveTMDBSettings() {
   const payload = tmdbSettingsCurrentPayload(false);
   const validationError = validateTMDBSettingsPayload(payload);
   if (validationError) return Toast.error(validationError);
-  const button = document.getElementById('tmdb-save');
-  setTMDBActionState(button, true, '正在保存…', '保存设置');
-  try {
-    const updated = await API.saveTMDBSettings(payload);
-    if (!updated) return;
-    const tokenInput = document.getElementById('tmdb-api-token');
-    if (tokenInput) tokenInput.value = '';
-    Toast.success('TMDB 设置已保存');
-    const page = document.getElementById('page-settings-tmdb');
-    if (page) await loadTMDBSettings(page);
-  } catch (error) {
-    Toast.error(error.message || '保存 TMDB 设置失败');
-  } finally {
-    if (button && button.isConnected) setTMDBActionState(button, false, '', '保存设置');
-  }
+  return submitTMDBSettingsSave(payload, document.getElementById('tmdb-save'), {
+    busy: '正在保存…', idle: '保存设置', success: 'TMDB 设置已保存', failure: '保存 TMDB 设置失败',
+  });
 }
 
 async function testTMDBConnection() {
@@ -196,19 +237,9 @@ async function removeTMDBToken() {
   const payload = tmdbSettingsCurrentPayload(true);
   const validationError = validateTMDBSettingsPayload(payload);
   if (validationError) return Toast.error(validationError);
-  const button = document.getElementById('tmdb-remove-token');
-  setTMDBActionState(button, true, '正在移除…', '移除 Token');
-  try {
-    const updated = await API.saveTMDBSettings(payload);
-    if (!updated) return;
-    Toast.success('TMDB Token 已移除');
-    const page = document.getElementById('page-settings-tmdb');
-    if (page) await loadTMDBSettings(page);
-  } catch (error) {
-    Toast.error(error.message || '移除 TMDB Token 失败');
-  } finally {
-    if (button && button.isConnected) setTMDBActionState(button, false, '', '移除 Token');
-  }
+  return submitTMDBSettingsSave(payload, document.getElementById('tmdb-remove-token'), {
+    busy: '正在移除…', idle: '移除 Token', success: 'TMDB Token 已移除', failure: '移除 TMDB Token 失败',
+  });
 }
 
 async function clearTMDBCache(scope) {
@@ -218,17 +249,24 @@ async function clearTMDBCache(scope) {
     : '确认清理已过期和未被观看历史引用的 TMDB 缓存？过期记录的资料会在后台重新补全。';
   if (!confirm(prompt)) return;
   const button = document.getElementById(all ? 'tmdb-cache-clear-all' : 'tmdb-cache-clean');
+  const page = document.getElementById('page-settings-tmdb');
+  const loadGeneration = tmdbSettingsLoadGeneration;
   setTMDBActionState(button, true, '正在清理…', all ? '清空全部缓存' : '清理过期与未引用');
   try {
     const result = await API.clearTMDBCache(all ? 'all' : 'stale');
+    if (loadGeneration !== tmdbSettingsLoadGeneration || Router.current !== 'settings-tmdb' || !page?.isConnected) return;
     Toast.success(all ? 'TMDB 缓存已清空' : 'TMDB 缓存已清理');
-    if (result && result.settings) paintTMDBSettings(result.settings);
+    if (result && result.settings) updateTMDBCacheSummary(result.settings);
     else {
-      const page = document.getElementById('page-settings-tmdb');
-      if (page) await loadTMDBSettings(page);
+      const settings = await API.getTMDBSettings();
+      if (loadGeneration === tmdbSettingsLoadGeneration && Router.current === 'settings-tmdb' && page.isConnected && settings) {
+        updateTMDBCacheSummary(settings);
+      }
     }
   } catch (error) {
-    Toast.error(error.message || '清理 TMDB 缓存失败');
+    if (loadGeneration === tmdbSettingsLoadGeneration && Router.current === 'settings-tmdb') {
+      Toast.error(error.message || '清理 TMDB 缓存失败');
+    }
   } finally {
     if (button && button.isConnected) setTMDBActionState(button, false, '', all ? '清空全部缓存' : '清理过期与未引用');
   }
@@ -253,7 +291,13 @@ function paintTMDBSettings(settings) {
   tmdbSettingsCache = normalizeTMDBSettings(settings);
   content.innerHTML = renderTMDBSettingsForm(tmdbSettingsCache);
   bindTMDBSettingsActions(page);
-  startTMDBCacheRefresh(page);
+  ['tmdb-enabled', 'tmdb-language', 'tmdb-api-token', 'tmdb-history-retention'].forEach(id => {
+    const control = document.getElementById(id);
+    if (!control) return;
+    control.addEventListener('input', () => { tmdbSettingsEditGeneration += 1; });
+    control.addEventListener('change', () => { tmdbSettingsEditGeneration += 1; });
+  });
+  startTMDBCacheRefresh(page, tmdbSettingsLoadGeneration);
 }
 
 function stopTMDBCacheRefresh() {
@@ -263,7 +307,7 @@ function stopTMDBCacheRefresh() {
   }
 }
 
-function startTMDBCacheRefresh(page) {
+function startTMDBCacheRefresh(page, generation) {
   stopTMDBCacheRefresh();
   const refresh = async () => {
     if (Router.current !== 'settings-tmdb' || !page.isConnected) {
@@ -272,11 +316,8 @@ function startTMDBCacheRefresh(page) {
     }
     try {
       const settings = await API.getTMDBSettings();
-      if (Router.current !== 'settings-tmdb' || !page.isConnected || !settings) return;
-      const normalized = normalizeTMDBSettings(settings);
-      tmdbSettingsCache = normalized;
-      const summary = page.querySelector('#tmdb-cache-summary');
-      if (summary) summary.textContent = `${normalized.cacheEntries} 条 · ${tmdbFormatCacheSize(normalized.cacheSizeBytes)}`;
+      if (generation !== tmdbSettingsLoadGeneration || Router.current !== 'settings-tmdb' || !page.isConnected || !settings) return;
+      updateTMDBCacheSummary(settings);
     } catch (_) {
       // A transient refresh failure must not replace the form or interrupt edits.
     }
@@ -287,12 +328,17 @@ function startTMDBCacheRefresh(page) {
 
 async function loadTMDBSettings(page) {
   const generation = ++tmdbSettingsLoadGeneration;
+  const editGeneration = tmdbSettingsEditGeneration;
   try {
     const settings = await API.getTMDBSettings();
     if (generation !== tmdbSettingsLoadGeneration || Router.current !== 'settings-tmdb' || !page.isConnected || !settings) return;
+    // A post-save read can take longer than the save itself. If the operator
+    // edits while it is in flight, keep the live form and its newer draft.
+    if (editGeneration !== tmdbSettingsEditGeneration) return;
     paintTMDBSettings(settings);
   } catch (error) {
-    if (generation !== tmdbSettingsLoadGeneration || Router.current !== 'settings-tmdb' || !page.isConnected) return;
+    if (generation !== tmdbSettingsLoadGeneration || editGeneration !== tmdbSettingsEditGeneration
+      || Router.current !== 'settings-tmdb' || !page.isConnected) return;
     const content = page.querySelector('.settings-content');
     if (content) content.innerHTML = `<section class="console-panel settings-panel"><div class="settings-load-error" role="alert">读取 TMDB 设置失败：${esc(error.message || '请求失败')}</div><div class="settings-save-bar"><button type="button" class="console-button" id="tmdb-settings-retry">重新加载</button></div></section>`;
     const retry = page.querySelector('#tmdb-settings-retry');

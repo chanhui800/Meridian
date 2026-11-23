@@ -2,6 +2,55 @@
 let globalSettingsCache = null;
 let globalSettingsSection = 'system-ui';
 let globalSettingsLoadGeneration = 0;
+let globalSettingsModificationRevision = 0;
+let globalSettingsEditRevision = 0;
+let globalSettingsSaving = false;
+let tlsSettingsRenderGeneration = 0;
+const globalSettingsDrafts = new Map();
+let globalSettingsFormBaseline = { section: '', values: {} };
+const globalSettingsFormFields = {
+  'system-ui': [
+    ['traffic_billing_mode', 'traffic-billing-mode-choice', 'choice'],
+    ['traffic_reset_day', 'setting-traffic-reset-day', 'number'],
+    ['ui_radius', 'setting-ui-radius', 'number'],
+    ['probe_timeout_ms', 'setting-probe-timeout', 'number'],
+    ['ping_cache_minutes', 'setting-ping-cache', 'number'],
+    ['schedule_timezone_offset', 'setting-schedule-timezone', 'number'],
+  ],
+  logs: [
+    ['log_enabled', 'setting-log-enabled', 'checked'],
+    ['log_level', 'log-level-choice', 'choice'],
+    ['log_retention_days', 'setting-log-retention', 'number'],
+    ['log_batch_size', 'setting-log-batch', 'number'],
+    ['log_retry_count', 'setting-log-retries', 'number'],
+    ['log_retry_backoff_ms', 'setting-log-backoff', 'number'],
+    ['log_write_image', 'setting-write-image', 'checked'],
+    ['log_write_playback', 'setting-write-playback', 'checked'],
+    ['log_write_metadata', 'setting-write-metadata', 'checked'],
+    ['log_write_video', 'setting-write-video', 'checked'],
+    ['log_write_subtitle', 'setting-write-subtitle', 'checked'],
+    ['log_write_asset', 'setting-write-asset', 'checked'],
+    ['log_write_websocket', 'setting-write-websocket', 'checked'],
+    ['log_write_api', 'setting-write-api', 'checked'],
+    ['log_write_auth', 'setting-write-auth', 'checked'],
+    ['log_write_node', 'setting-write-node', 'checked'],
+    ['log_write_category', 'setting-write-category', 'checked'],
+    ['log_write_status', 'setting-write-status', 'checked'],
+    ['log_write_client_ip', 'setting-write-ip', 'checked'],
+    ['log_write_ua', 'setting-write-ua', 'checked'],
+    ['log_write_upstream_ua', 'setting-write-upstream-ua', 'checked'],
+    ['log_write_backend_address', 'setting-write-backend-address', 'checked'],
+    ['log_write_timeline', 'setting-write-timeline', 'checked'],
+    ['log_display_client_ip', 'setting-display-ip', 'checked'],
+    ['log_display_ua', 'setting-display-ua', 'checked'],
+    ['log_display_upstream_ua', 'setting-display-upstream-ua', 'checked'],
+    ['log_display_backend_address', 'setting-display-backend-address', 'checked'],
+    ['log_display_node', 'setting-display-node', 'checked'],
+    ['log_display_category', 'setting-display-category', 'checked'],
+    ['log_display_status', 'setting-display-status', 'checked'],
+    ['log_display_timeline', 'setting-display-timeline', 'checked'],
+  ],
+};
 
 function applySystemUISettings(settings) {
   if (!settings) return;
@@ -11,9 +60,11 @@ function applySystemUISettings(settings) {
 }
 
 async function loadAppliedSystemSettings() {
+  const generation = ++globalSettingsLoadGeneration;
+  const revision = globalSettingsModificationRevision;
   try {
     const settings = await API.getSystemSettings();
-    if (settings) {
+    if (settings && generation === globalSettingsLoadGeneration && revision === globalSettingsModificationRevision) {
       globalSettingsCache = settings;
       applySystemUISettings(settings);
     }
@@ -158,6 +209,7 @@ function renderGlobalSettings() {
 function bindGlobalSettingsNav(root = document) {
   root.querySelectorAll('[data-settings-section]').forEach(button => {
     button.onclick = () => {
+      captureGlobalSettingsDraft();
       globalSettingsSection = button.dataset.settingsSection;
       if (Router.current !== 'global-settings') Router.navigate('global-settings');
       else paintGlobalSettings(document.getElementById('page-global-settings'));
@@ -167,13 +219,17 @@ function bindGlobalSettingsNav(root = document) {
 
 async function loadGlobalSettings(page = document.getElementById('page-global-settings')) {
   const generation = ++globalSettingsLoadGeneration;
+  const revision = globalSettingsModificationRevision;
+  const editRevision = globalSettingsEditRevision;
   try {
-    globalSettingsCache = await API.getSystemSettings();
-    if (generation !== globalSettingsLoadGeneration || Router.current !== 'global-settings' || !globalSettingsCache || !page) return;
+    const settings = await API.getSystemSettings();
+    if (generation !== globalSettingsLoadGeneration || revision !== globalSettingsModificationRevision || Router.current !== 'global-settings' || !settings || !page) return;
+    captureGlobalSettingsDraft();
+    globalSettingsCache = settings;
     applySystemUISettings(globalSettingsCache);
-    paintGlobalSettings(page);
+    if (editRevision === globalSettingsEditRevision) paintGlobalSettings(page);
   } catch (error) {
-    if (generation !== globalSettingsLoadGeneration || Router.current !== 'global-settings' || !page) return;
+    if (generation !== globalSettingsLoadGeneration || revision !== globalSettingsModificationRevision || Router.current !== 'global-settings' || !page) return;
     if (globalSettingsCache) return;
     const content = page.querySelector('.settings-content');
     if (content) content.innerHTML = `<section class="console-panel settings-panel"><p class="settings-load-error" role="alert">读取设置失败：${esc(error.message)}</p><button type="button" class="console-button" id="settings-retry">重新读取</button></section>`;
@@ -189,11 +245,32 @@ function paintGlobalSettings(page = document.getElementById('page-global-setting
   bindGlobalSettingsNav(page);
   const content = page.querySelector('.settings-content');
   if (!content) return;
+  const focusedID = document.activeElement?.id;
   content.innerHTML = globalSettingsSection === 'logs'
     ? renderLogSettingsForm(globalSettingsCache)
     : renderSystemUIForm(globalSettingsCache);
+  globalSettingsFormBaseline = { section: globalSettingsSection, values: globalSettingsFormValues(globalSettingsSection, true) };
+  const draft = globalSettingsDrafts.get(globalSettingsSection) || {};
+  for (const [key, id, type] of globalSettingsFormFields[globalSettingsSection] || []) {
+    if (!Object.hasOwn(draft, key)) continue;
+    const control = document.getElementById(id);
+    if (!control) continue;
+    if (type === 'choice') {
+      control.querySelectorAll('button').forEach(button => {
+        const selected = button.dataset.settingChoice === draft[key];
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-pressed', String(selected));
+      });
+    } else if (type === 'checked') control.checked = draft[key];
+    else control.value = draft[key];
+  }
   const saveButton = page.querySelector('#settings-save');
-  if (saveButton) saveButton.onclick = saveGlobalSettings;
+  if (saveButton) { saveButton.disabled = globalSettingsSaving; saveButton.onclick = saveGlobalSettings; }
+  const rememberEdit = () => { globalSettingsEditRevision += 1; captureGlobalSettingsDraft(); };
+  page.querySelectorAll('.settings-content input, .settings-content select, .settings-content textarea').forEach(input => {
+    input.addEventListener('input', rememberEdit);
+    input.addEventListener('change', rememberEdit);
+  });
   page.querySelectorAll('[data-setting-choice]').forEach(button => {
     button.onclick = () => {
       const group = button.closest('.settings-choice');
@@ -201,8 +278,10 @@ function paintGlobalSettings(page = document.getElementById('page-global-setting
         item.classList.toggle('active', item === button);
         item.setAttribute('aria-pressed', String(item === button));
       });
+      rememberEdit();
     };
   });
+  if (focusedID && Router.current === 'global-settings') document.getElementById(focusedID)?.focus?.({ preventScroll: true });
 }
 
 function renderSystemUIForm(s) {
@@ -270,60 +349,59 @@ function checkedSetting(id, fallback) {
   return input ? input.checked : fallback;
 }
 
-async function saveGlobalSettings() {
-  const s = { ...globalSettingsCache };
-  if (globalSettingsSection === 'system-ui') {
-    s.traffic_billing_mode = activeSettingChoice('traffic-billing-mode-choice', s.traffic_billing_mode || 'bidirectional');
-    s.traffic_reset_day = numericSetting('setting-traffic-reset-day', s.traffic_reset_day == null ? 1 : s.traffic_reset_day);
-    s.ui_radius = numericSetting('setting-ui-radius', s.ui_radius);
-    s.probe_timeout_ms = numericSetting('setting-probe-timeout', s.probe_timeout_ms);
-    s.ping_cache_minutes = numericSetting('setting-ping-cache', s.ping_cache_minutes);
-    s.schedule_timezone_offset = numericSetting('setting-schedule-timezone', s.schedule_timezone_offset);
-  } else {
-    s.log_enabled = checkedSetting('setting-log-enabled', s.log_enabled);
-    s.log_level = activeSettingChoice('log-level-choice', s.log_level);
-    s.log_retention_days = numericSetting('setting-log-retention', s.log_retention_days);
-    s.log_batch_size = numericSetting('setting-log-batch', s.log_batch_size);
-    s.log_retry_count = numericSetting('setting-log-retries', s.log_retry_count);
-    s.log_retry_backoff_ms = numericSetting('setting-log-backoff', s.log_retry_backoff_ms);
-    s.log_write_image = checkedSetting('setting-write-image', false);
-    s.log_write_playback = checkedSetting('setting-write-playback', true);
-    s.log_write_metadata = checkedSetting('setting-write-metadata', false);
-    s.log_write_video = checkedSetting('setting-write-video', true);
-    s.log_write_subtitle = checkedSetting('setting-write-subtitle', true);
-    s.log_write_asset = checkedSetting('setting-write-asset', true);
-    s.log_write_websocket = checkedSetting('setting-write-websocket', true);
-    s.log_write_api = checkedSetting('setting-write-api', true);
-    s.log_write_auth = checkedSetting('setting-write-auth', true);
-    s.log_write_node = checkedSetting('setting-write-node', true);
-    s.log_write_category = checkedSetting('setting-write-category', true);
-    s.log_write_status = checkedSetting('setting-write-status', true);
-    s.log_write_client_ip = checkedSetting('setting-write-ip', true);
-    s.log_write_colo = checkedSetting('setting-write-colo', s.log_write_colo);
-    s.log_write_ua = checkedSetting('setting-write-ua', true);
-    s.log_write_upstream_ua = checkedSetting('setting-write-upstream-ua', true);
-    s.log_write_backend_address = checkedSetting('setting-write-backend-address', true);
-    s.log_write_timeline = checkedSetting('setting-write-timeline', true);
-    s.log_display_client_ip = checkedSetting('setting-display-ip', true);
-    s.log_display_colo = checkedSetting('setting-display-colo', s.log_display_colo);
-    s.log_display_ua = checkedSetting('setting-display-ua', true);
-    s.log_display_upstream_ua = checkedSetting('setting-display-upstream-ua', true);
-    s.log_display_backend_address = checkedSetting('setting-display-backend-address', true);
-    s.log_display_node = checkedSetting('setting-display-node', true);
-    s.log_display_category = checkedSetting('setting-display-category', true);
-    s.log_display_status = checkedSetting('setting-display-status', true);
-    s.log_display_timeline = checkedSetting('setting-display-timeline', true);
+function globalSettingsFormValues(section = globalSettingsSection, rawNumbers = false) {
+  const values = {};
+  for (const [key, id, type] of globalSettingsFormFields[section] || []) {
+    const control = document.getElementById(id);
+    if (!control) continue;
+    values[key] = type === 'choice' ? activeSettingChoice(id, globalSettingsCache?.[key])
+      : type === 'checked' ? control.checked : rawNumbers ? control.value : Number(control.value);
   }
+  return values;
+}
+
+function captureGlobalSettingsDraft() {
+  if (!globalSettingsCache || Router.current !== 'global-settings' || globalSettingsFormBaseline.section !== globalSettingsSection) return;
+  const values = globalSettingsFormValues(globalSettingsSection, true);
+  const draft = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== globalSettingsFormBaseline.values[key]) draft[key] = value;
+  }
+  if (Object.keys(draft).length) globalSettingsDrafts.set(globalSettingsSection, draft);
+  else globalSettingsDrafts.delete(globalSettingsSection);
+}
+
+async function saveGlobalSettings() {
+  if (globalSettingsSaving || !globalSettingsCache) return;
+  captureGlobalSettingsDraft();
+  const section = globalSettingsSection;
+  const submittedValues = globalSettingsFormValues(section, true);
+  const s = globalSettingsFormValues();
   const button = document.getElementById('settings-save');
+  if (!button) return;
+  globalSettingsSaving = true;
+  globalSettingsLoadGeneration += 1;
+  globalSettingsModificationRevision += 1;
   button.disabled = true;
   try {
-    globalSettingsCache = await API.saveSystemSettings(s);
+    const settings = await API.saveSystemSettings(s);
+    globalSettingsModificationRevision += 1;
+    if (!settings) return;
+    captureGlobalSettingsDraft();
+    const draft = { ...(globalSettingsDrafts.get(section) || {}) };
+    for (const key of Object.keys(draft)) if (draft[key] === submittedValues[key]) delete draft[key];
+    if (Object.keys(draft).length) globalSettingsDrafts.set(section, draft);
+    else globalSettingsDrafts.delete(section);
+    globalSettingsCache = settings;
     applySystemUISettings(globalSettingsCache);
     Toast.success('全局设置已保存');
-    paintGlobalSettings(document.getElementById('page-global-settings'));
+    if (Router.current === 'global-settings') paintGlobalSettings(document.getElementById('page-global-settings'));
   } catch (error) {
     Toast.error('保存失败：' + error.message);
   } finally {
+    globalSettingsSaving = false;
+    const activeButton = document.getElementById('settings-save');
+    if (activeButton) activeButton.disabled = false;
     if (button.isConnected) button.disabled = false;
   }
 }
@@ -331,11 +409,12 @@ async function saveGlobalSettings() {
 async function renderTLSSettings() {
   const page = document.getElementById('page-settings-tls');
   if (!page) return;
+  const generation = ++tlsSettingsRenderGeneration;
   page.innerHTML = settingsPageFrame('tls', 'TLS 与域名', '管理面板地址、HTTPS 证书与自动续签。', '<div class="console-panel settings-loading">正在读取 TLS 配置…</div>');
   bindGlobalSettingsNav(page);
   try {
-    const status = await API.panelCertificate();
-    if (Router.current !== 'settings-tls') return;
+    let status = await API.panelCertificate();
+    if (generation !== tlsSettingsRenderGeneration || Router.current !== 'settings-tls' || !page.isConnected) return;
     page.innerHTML = settingsPageFrame('tls', 'TLS 与域名', '管理面板地址、HTTPS 证书与自动续签。', `
       <section class="console-panel settings-panel tls-overview"><header><h2>证书状态</h2><span class="console-status ${status.configured ? 'is-online' : ''}">${status.configured ? '已配置' : '未配置'}</span></header><div class="global-settings-status" id="p-panel-certificate-status">${renderPanelCertificateStatus(status)}</div></section>
       <section class="console-panel settings-panel"><header><h2>访问地址</h2><span>先保存，再申请证书</span></header><div class="settings-grid">
@@ -353,13 +432,19 @@ async function renderTLSSettings() {
         ${status.restart_required && ((status.configured && (status.certificate_matches_configured_domain ?? status.certificate_current) && status.certificate_valid) || (!status.configured && status.listen_port !== status.active_listen_port)) ? `<button class="console-button is-danger" type="button" id="p-cert-restart">${status.configured ? '启用 HTTPS 并重启' : '重启应用'}</button>` : ''}
         <button class="console-button is-primary" type="button" id="p-cert-issue" ${status.available === false || status.issuing || !status.settings_configured ? 'disabled' : ''}>申请证书</button>
       </div></section>`);    bindGlobalSettingsNav(page);
+    let formRevision = 0;
     const get = id => document.getElementById(`p-${id}`);
     const refreshPreview = () => {
       const domain = get('panel-domain').value.trim().replace(/^\*\./, '');
       const port = Number(get('panel-listen-port').value) || 9090;
       get('panel-address-preview').textContent = domain ? `https://${domain}${port === 443 ? '' : `:${port}`}` : '—';
     };
-    ['panel-domain', 'wildcard-domain', 'panel-listen-port'].forEach(id => get(id).addEventListener('input', refreshPreview));
+    ['panel-domain', 'wildcard-domain', 'panel-listen-port', 'acme-email', 'acme-token', 'acme-staging'].forEach(id => {
+      const field = get(id);
+      field.addEventListener('input', () => { formRevision++; });
+      field.addEventListener('change', () => { formRevision++; });
+      if (['panel-domain', 'wildcard-domain', 'panel-listen-port'].includes(id)) field.addEventListener('input', refreshPreview);
+    });
     const restartButton = get('cert-restart');
     if (restartButton) restartButton.onclick = async () => {
       if (!window.confirm('重启会短暂中断面板和所有站点连接，确定现在重启吗？')) return;
@@ -389,14 +474,23 @@ async function renderTLSSettings() {
       }
       button.disabled = true;
       button.textContent = '保存中…';
+      const submittedRevision = formRevision;
       try {
-        await API.savePanelSettings(payload);
+        const savedStatus = await API.savePanelSettings(payload);
+        if (generation !== tlsSettingsRenderGeneration || Router.current !== 'settings-tls') return;
+        status = savedStatus && typeof savedStatus === 'object' && savedStatus.panel_domain
+          && savedStatus.wildcard_domain && Number.isInteger(savedStatus.listen_port)
+          ? savedStatus : { ...status, ...payload };
         Toast.success('面板设置已保存；证书会覆盖面板域名和节点站点泛域名');
-        await renderTLSSettings();
+        if (formRevision === submittedRevision) await renderTLSSettings();
       } catch (error) {
-        button.disabled = false;
-        button.textContent = '保存设置';
+        if (generation !== tlsSettingsRenderGeneration || Router.current !== 'settings-tls') return;
         Toast.error(error.message);
+      } finally {
+        if (generation === tlsSettingsRenderGeneration && Router.current === 'settings-tls' && page.isConnected && button.isConnected) {
+          button.disabled = false;
+          button.textContent = '保存设置';
+        }
       }
     };
     get('cert-issue').onclick = async () => {
@@ -421,17 +515,24 @@ async function renderTLSSettings() {
       }
       button.disabled = true;
       button.textContent = '申请中…';
+      const submittedRevision = formRevision;
       try {
         const updated = await API.requestPanelCertificate(payload);
+        if (generation !== tlsSettingsRenderGeneration || Router.current !== 'settings-tls') return;
         Toast.success(updated.staging_tested ? 'ACME 测试成功；正式证书未替换' : (updated.certificate_reused ? '证书与当前面板域名一致，继续使用现有证书' : (updated.restart_required ? '证书已签发，请点击重启按钮' : '证书已签发并热加载')));
-        await renderTLSSettings();
+        if (formRevision === submittedRevision) await renderTLSSettings();
       } catch (error) {
-        button.disabled = false;
-        button.textContent = '申请证书';
+        if (generation !== tlsSettingsRenderGeneration || Router.current !== 'settings-tls') return;
         Toast.error(error.message);
+      } finally {
+        if (generation === tlsSettingsRenderGeneration && Router.current === 'settings-tls' && page.isConnected && button.isConnected) {
+          button.disabled = false;
+          button.textContent = '申请证书';
+        }
       }
     };
   } catch (error) {
+    if (generation !== tlsSettingsRenderGeneration || Router.current !== 'settings-tls' || !page.isConnected) return;
     page.innerHTML = settingsPageFrame('tls', 'TLS 与域名', '管理面板地址、HTTPS 证书与自动续签。', `<section class="console-panel settings-panel"><p class="settings-load-error" role="alert">读取 TLS 状态失败：${esc(error.message)}</p><button class="console-button" type="button" id="tls-settings-retry">重新读取</button></section>`);
     bindGlobalSettingsNav(page);
     const retry = page.querySelector('#tls-settings-retry');

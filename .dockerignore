@@ -12,8 +12,8 @@ COLLABORATION_RULES.md
 *.db-wal
 data
 *.pem
-meridian
-meridian.exe
+/meridian
+/meridian.exe
 *.exe
 .idea
 .vscode

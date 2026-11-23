@@ -65,6 +65,7 @@ function normalizedMediaLibraryCount(value) {
 }
 
 function renderSiteMediaLibraryCounts(site) {
+  if (String(site && site.upstream_mode || '').toLowerCase() === 'path_target') return '';
   const items = [
     ['电影', normalizedMediaLibraryCount(site && site.media_movie_count)],
     ['剧集', normalizedMediaLibraryCount(site && site.media_series_count)],
@@ -124,12 +125,15 @@ function siteCardsRenderSignature(sites, activeSiteIDs) {
       site && site.id, site && site.name, site && site.upstream_mode, site && site.target_url, site && site.public_host,
       site && site.icon_name, site && site.icon_url,
       site && site.ingress_mode, site && site.listen_port, site && site.ua_mode,
+      site && site.applied_node_id, site && site.applied_node_port, site && site.controller_closed,
       site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used,
       site && site.media_movie_count, site && site.media_series_count, site && site.media_episode_count,
       site && site.account_retention_days, site && site.account_retention_started_at_ms,
       site && site.account_retention_last_completed_at_ms,
       retention.enabled, retention.remainingDays, retention.overdue,
-      Array.isArray(site && site.upstream_headers) ? site.upstream_headers.length : 0,
+      Array.isArray(site && site.upstream_headers)
+        ? site.upstream_headers.map(header => [String(header?.name || ''), header?.configured === true])
+        : [],
       // Edit-modal inputs: changing any of these without a repaint is what makes a
       // later save write the previous value back.
       site && site.playback_target_url, site && site.playback_mode,
@@ -195,6 +199,9 @@ function siteManagementRowHTML(s, activeSiteIDs) {
   const expanded = siteManagementExpanded.has(Number(s.id));
   const ingressReady = normalizedIngressMode(s) !== 'unset';
   const latency = siteManagementLatency.get(Number(s.id)) || { text: '未测试', className: 'site-latency', title: '' };
+  const appliedEntryPending = s.controller_closed === true && normalizedIngressMode(s) !== 'port'
+    && !(Number.isInteger(Number(s.applied_node_port)) && Number(s.applied_node_port) >= 1 && Number(s.applied_node_port) <= 65535);
+  const accessAddressText = appliedEntryPending ? '等待节点入口确认' : '********';
   return `<article class="site-card management-site-row${expanded ? ' is-expanded' : ''}" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.icon_name || ''} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
     <div class="management-site-summary">
       <button type="button" class="management-site-row-toggle" data-site-row-toggle data-site-id="${s.id}" aria-expanded="${expanded}" aria-controls="site-details-${s.id}" aria-label="${expanded ? '收起' : '展开'} ${esc(s.name)} 的站点详情"></button>
@@ -206,7 +213,7 @@ function siteManagementRowHTML(s, activeSiteIDs) {
     </div>
     <div class="management-site-details" id="site-details-${s.id}" ${expanded ? '' : 'hidden'}>
       <div class="management-site-detail-grid">
-        <div class="site-access-row"><span class="management-field-label">访问地址</span><span class="site-access-value"><span class="console-mono site-access-address is-hidden" data-access-address="${esc(accessAddress)}">********</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false">${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg></button></span></div>
+        <div class="site-access-row"><span class="management-field-label">访问地址</span><span class="site-access-value"><span class="console-mono site-access-address ${appliedEntryPending ? '' : 'is-hidden'}" data-access-address="${esc(accessAddress)}">${accessAddressText}</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false" ${appliedEntryPending ? 'disabled title="等待 Agent 确认实际入口端口"' : ''}>${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" ${appliedEntryPending ? 'disabled title="等待 Agent 确认实际入口端口"' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg></button></span></div>
         <div><span class="management-field-label">${pathTargetMode ? '回源方式' : '主回源地址'}</span><span class="console-mono">${esc(upstreamSummary || '—')}</span></div>
         <div><span class="management-field-label">上游请求头</span><span>${upstreamHeaderCount ? `${upstreamHeaderCount} 个（加密）` : '未配置'}</span></div>
       </div>
@@ -259,10 +266,11 @@ function stopSitesRefresh() {
   siteRefreshTimer = 0;
   siteLoadGeneration += 1;
   siteLiveDetail = null;
+  if (typeof watchHistoryCloseImageViewer === 'function') watchHistoryCloseImageViewer({ restoreFocus: false });
   if (typeof invalidateModalIntent === 'function' && invalidateModalIntent('sites')) {
     const overlay = document.getElementById('modal-overlay');
     const modal = document.getElementById('modal');
-    if (overlay?.classList.contains('active') && ['site-live-modal', 'site-config-modal', 'site-icon-manager-modal', 'site-icon-pack-modal'].some(name => modal?.classList.contains(name))) {
+    if (overlay?.classList.contains('active') && ['site-live-modal', 'site-config-modal', 'site-delete-modal', 'site-icon-manager-modal', 'site-icon-pack-modal'].some(name => modal?.classList.contains(name))) {
       closeModal({ restoreFocus: false });
     }
   }
@@ -334,7 +342,11 @@ async function loadSites() {
       });
     });
     grid.querySelectorAll('[data-site-action]').forEach(button => {
-      button.addEventListener('click', () => {
+      button.addEventListener('click', event => {
+        // Replacing an action's SVG detaches event.target before the card's
+        // disclosure listener can recognize that the click came from a button.
+        event.preventDefault();
+        event.stopPropagation();
         const id = Number(button.dataset.siteId);
         const site = sitesById.get(id);
         if (!site) return;
@@ -812,7 +824,10 @@ function siteAccessAddress(site, capabilities) {
 	}
 	const host = String(site.public_host || '').trim();
 	const panelPort = locationObject.port || (protocol === 'https' ? '443' : '80');
-	return host ? `${protocol}://${host}:${panelPort}` : '';
+	const appliedPort = Number(site.applied_node_port);
+	const nodeOwned = site.controller_closed === true;
+	if (nodeOwned && (!Number.isInteger(appliedPort) || appliedPort < 1 || appliedPort > 65535)) return '';
+	return host ? `${nodeOwned ? 'https' : protocol}://${host}:${nodeOwned ? appliedPort : panelPort}` : '';
 }
 
 function toggleSiteAccessAddress(button) {
@@ -2231,6 +2246,7 @@ window.editSiteAction = async function(id) {
 };
 
 window.deleteSiteAction = function(id, name) {
+  const modalIntent = beginModalIntent('sites');
   document.getElementById('modal-title').textContent = '确认删除';
   const modalBody = document.getElementById('modal-body');
   modalBody.replaceChildren();
@@ -2246,17 +2262,26 @@ window.deleteSiteAction = function(id, name) {
     <button class="btn-modal primary" id="delete-confirm" style="background:var(--red)">删除</button>
   `;
   document.getElementById('delete-cancel').addEventListener('click', closeModal);
-  document.getElementById('delete-confirm').addEventListener('click', () => confirmDelete(id));
-  openModal({ closeOnBackdrop: true });
+  document.getElementById('delete-confirm').addEventListener('click', () => confirmDelete(id, modalIntent));
+  openModal({ closeOnBackdrop: true, modalClass: 'site-delete-modal', intent: modalIntent });
 };
 
-window.confirmDelete = async function(id) {
+window.confirmDelete = async function(id, modalIntent = beginModalIntent('sites')) {
+  if (!isModalIntentCurrent(modalIntent)) return;
+  const button = document.getElementById('delete-confirm');
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
   try {
-    await API.deleteSite(id);
-    Toast.success('站点已删除');
-    closeModal();
-    loadSites();
+    const result = await API.deleteSite(id);
+    if (!result) return;
+    if (isModalIntentCurrent(modalIntent)) {
+      Toast.success('站点已删除');
+      closeModal({ intent: modalIntent });
+    }
+    if (Router.current === 'sites') await loadSites();
   } catch (e) {
-    Toast.error(e.message);
+    if (isModalIntentCurrent(modalIntent)) Toast.error(e.message);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
   }
 };
