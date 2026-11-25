@@ -2826,12 +2826,13 @@ func runEdgeAgent() (runErr error) {
 	defer instanceUnlock()
 	revokedMarker := *statePath + ".revoked"
 	uninstallMarker := *statePath + agentUninstallMarkerSuffix
+	// #nosec G304 -- statePath is an administrator-controlled Agent service option; the destructive uninstall helper separately requires the fixed managed state path.
 	if markerData, markerErr := os.ReadFile(uninstallMarker); markerErr == nil {
 		requestID := strings.TrimSpace(string(markerData))
 		state, stateErr := edgeLoadState(*statePath)
-		if stateErr == nil && state.Token != "" && state.NodeGUID != "" && agentUninstallRequestIDPattern.MatchString(requestID) {
+		if filepath.Clean(*statePath) == agentManagedStatePath && stateErr == nil && state.Token != "" && state.NodeGUID != "" && agentUninstallRequestIDPattern.MatchString(requestID) {
 			for ctx.Err() == nil {
-				if launchErr := launchAgentUninstallHelper(controller, *statePath, state.NodeGUID, requestID); launchErr != nil {
+				if launchErr := launchAgentUninstallHelper(controller, state.NodeGUID, requestID); launchErr != nil {
 					fmt.Fprintf(os.Stderr, "Meridian Agent uninstall helper retry failed: %v\n", launchErr)
 				}
 				timer := time.NewTimer(30 * time.Second)
@@ -2842,6 +2843,9 @@ func runEdgeAgent() (runErr error) {
 				}
 			}
 			return nil
+		}
+		if stateErr == nil {
+			stateErr = errors.New("Agent self-uninstall requires the managed state path")
 		}
 		fmt.Fprintf(os.Stderr, "Meridian Agent uninstall marker is invalid; keeping the service inert: %v\n", stateErr)
 		<-ctx.Done()
@@ -3106,7 +3110,7 @@ func runEdgeAgent() (runErr error) {
 				agentSessionHeader:  []string{bootID},
 				agentEpochHeader:    []string{strconv.FormatInt(sessionEpoch, 10)},
 			}
-			if goruntime.GOOS == "linux" {
+			if goruntime.GOOS == "linux" && filepath.Clean(*statePath) == agentManagedStatePath {
 				headers.Set(agentCapabilitiesHeader, agentSelfUninstallCapability)
 			}
 			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, headers); err != nil {
@@ -3138,7 +3142,7 @@ func runEdgeAgent() (runErr error) {
 						fmt.Fprintf(os.Stderr, "Meridian Agent stopped serving for uninstall; event spool flush failed: %v\n", quiesceErr)
 					}
 					for ctx.Err() == nil {
-						if uninstallErr := edgeScheduleAgentUninstall(controller, *statePath, state.NodeGUID, config.UninstallRequestID); uninstallErr == nil {
+						if uninstallErr := edgeScheduleAgentUninstall(controller, state.NodeGUID, config.UninstallRequestID); uninstallErr == nil {
 							break
 						} else {
 							fmt.Fprintf(os.Stderr, "Meridian Agent could not start the self-uninstall helper; retrying while offline: %v\n", uninstallErr)

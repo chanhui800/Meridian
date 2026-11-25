@@ -4,11 +4,11 @@ package main
 
 import "errors"
 
-func edgeScheduleAgentUninstall(controller, statePath, nodeGUID, requestID string) error {
+func edgeScheduleAgentUninstall(controller, nodeGUID, requestID string) error {
 	return errors.New("Agent self-uninstall is supported only on Linux")
 }
 
-func launchAgentUninstallHelper(controller, statePath, nodeGUID, requestID string) error {
+func launchAgentUninstallHelper(controller, nodeGUID, requestID string) error {
 	return errors.New("Agent self-uninstall is supported only on Linux")
 }
 

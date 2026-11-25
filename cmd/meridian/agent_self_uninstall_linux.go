@@ -28,19 +28,19 @@ type agentUninstallTask struct {
 	RequestID  string `json:"request_id"`
 }
 
-func edgeScheduleAgentUninstall(controller, statePath, nodeGUID, requestID string) error {
+func edgeScheduleAgentUninstall(controller, nodeGUID, requestID string) error {
 	controller, err := edgeNormalizeController(controller)
 	if err != nil {
 		return err
 	}
-	if !validTLSNodeGUID(nodeGUID) || !agentUninstallRequestIDPattern.MatchString(requestID) || filepath.Clean(statePath) != "/var/lib/meridian-agent/state.json" {
-		return errors.New("Agent uninstall request has an invalid identity or state path")
+	if !validTLSNodeGUID(nodeGUID) || !agentUninstallRequestIDPattern.MatchString(requestID) {
+		return errors.New("Agent uninstall request has an invalid identity")
 	}
-	state, err := edgeLoadState(statePath)
+	state, err := edgeLoadState(agentManagedStatePath)
 	if err != nil || state.Token == "" || state.NodeGUID != nodeGUID {
 		return errors.New("Agent uninstall request does not match the enrolled node")
 	}
-	marker := statePath + agentUninstallMarkerSuffix
+	marker := agentManagedStatePath + agentUninstallMarkerSuffix
 	if data, readErr := os.ReadFile(marker); readErr == nil {
 		if strings.TrimSpace(string(data)) != requestID {
 			return errors.New("a different Agent uninstall request is already pending")
@@ -50,13 +50,13 @@ func edgeScheduleAgentUninstall(controller, statePath, nodeGUID, requestID strin
 	} else if err := writeAgentUninstallFile(marker, []byte(requestID+"\n"), 0o600); err != nil {
 		return fmt.Errorf("persist Agent uninstall marker: %w", err)
 	}
-	if err := writeAgentUninstallTask(statePath, agentUninstallTask{Controller: controller, NodeGUID: nodeGUID, RequestID: requestID}); err != nil {
+	if err := writeAgentUninstallTask(agentUninstallTask{Controller: controller, NodeGUID: nodeGUID, RequestID: requestID}); err != nil {
 		return fmt.Errorf("persist Agent uninstall recovery task: %w", err)
 	}
-	return launchAgentUninstallHelper(controller, statePath, nodeGUID, requestID)
+	return launchAgentUninstallHelper(controller, nodeGUID, requestID)
 }
 
-func launchAgentUninstallHelper(controller, statePath, nodeGUID, requestID string) error {
+func launchAgentUninstallHelper(controller, nodeGUID, requestID string) error {
 	paths, err := agentUninstallRecoveryPathsFor(requestID)
 	if err != nil {
 		return err
@@ -65,10 +65,10 @@ func launchAgentUninstallHelper(controller, statePath, nodeGUID, requestID strin
 	if err != nil {
 		return err
 	}
-	args := []string{"--agent-uninstall-helper", "--controller", controller, "--state", statePath, "--node-guid", nodeGUID, "--request-id", requestID}
+	args := []string{"--agent-uninstall-helper", "--controller", controller, "--state", agentManagedStatePath, "--node-guid", nodeGUID, "--request-id", requestID}
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
 		unit := paths.ServiceName + "-bootstrap"
-		command := exec.Command("systemd-run", append([]string{"--quiet", "--no-block", "--collect", "--unit=" + unit, "--property=Type=oneshot"}, append([]string{executable}, args...)...)...)
+		command := exec.Command("systemd-run", append([]string{"--quiet", "--no-block", "--collect", "--unit=" + unit, "--property=Type=oneshot"}, append([]string{executable}, args...)...)...) // #nosec G204 -- executable is the running Agent binary; request IDs/GUIDs are validated and args are passed without a shell.
 		if output, err := command.CombinedOutput(); err != nil {
 			return fmt.Errorf("could not start the systemd Agent uninstall helper: %w: %s", err, strings.TrimSpace(string(output)))
 		}
@@ -76,7 +76,7 @@ func launchAgentUninstallHelper(controller, statePath, nodeGUID, requestID strin
 	}
 	if _, err := os.Stat("/sbin/openrc-run"); err == nil {
 		pidFile := "/run/" + paths.ServiceName + "-bootstrap.pid"
-		command := exec.Command("start-stop-daemon", append([]string{"--start", "--background", "--make-pidfile", "--pidfile", pidFile, "--exec", executable, "--"}, args...)...)
+		command := exec.Command("start-stop-daemon", append([]string{"--start", "--background", "--make-pidfile", "--pidfile", pidFile, "--exec", executable, "--"}, args...)...) // #nosec G204 -- executable is the running Agent binary; request IDs/GUIDs are validated and args are passed without a shell.
 		if output, err := command.CombinedOutput(); err != nil {
 			return fmt.Errorf("could not start the OpenRC Agent uninstall helper: %w: %s", err, strings.TrimSpace(string(output)))
 		}
@@ -95,8 +95,7 @@ func runAgentUninstallHelper(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	statePath := filepath.Clean(*statePathValue)
-	if statePath != "/var/lib/meridian-agent/state.json" {
+	if filepath.Clean(*statePathValue) != agentManagedStatePath {
 		return errors.New("refusing an uninstall request outside the managed Agent identity")
 	}
 	if !*recoveryValue {
@@ -107,16 +106,16 @@ func runAgentUninstallHelper(args []string) error {
 		if !validTLSNodeGUID(*nodeGUIDValue) || !agentUninstallRequestIDPattern.MatchString(*requestIDValue) {
 			return errors.New("refusing an uninstall request with an invalid node identity")
 		}
-		markerData, err := os.ReadFile(statePath + agentUninstallMarkerSuffix)
+		markerData, err := os.ReadFile(agentManagedStatePath + agentUninstallMarkerSuffix)
 		if err != nil || strings.TrimSpace(string(markerData)) != *requestIDValue {
 			return errors.New("Agent uninstall marker does not match the requested operation")
 		}
-		state, err := edgeLoadState(statePath)
+		state, err := edgeLoadState(agentManagedStatePath)
 		if err != nil || state.Token == "" || state.NodeGUID != *nodeGUIDValue {
 			return errors.New("Agent uninstall helper could not verify its local node identity")
 		}
 		task := agentUninstallTask{Controller: controller, NodeGUID: *nodeGUIDValue, RequestID: *requestIDValue}
-		if err := writeAgentUninstallTask(statePath, task); err != nil {
+		if err := writeAgentUninstallTask(task); err != nil {
 			return err
 		}
 		return installAgentUninstallRecoveryService(task.RequestID)
@@ -141,7 +140,7 @@ func runAgentUninstallHelper(args []string) error {
 			return errors.New("Agent uninstall completion marker is invalid")
 		}
 		for attempt := 0; ; attempt++ {
-			if err := finishAgentUninstallRecovery(statePath, completion); err != nil {
+			if err := finishAgentUninstallRecovery(completion); err != nil {
 				fmt.Fprintf(os.Stderr, "Meridian Agent uninstall is waiting for final file cleanup: %v\n", err)
 				sleepAgentUninstallRetry(attempt)
 				continue
@@ -151,36 +150,36 @@ func runAgentUninstallHelper(args []string) error {
 	} else if !errors.Is(doneErr, os.ErrNotExist) {
 		return doneErr
 	}
-	task, err := readAgentUninstallTask(statePath)
+	task, err := readAgentUninstallTask()
 	if err != nil {
 		return err
 	}
-	if err := validateAgentUninstallTask(statePath, task); err != nil {
+	if err := validateAgentUninstallTask(task); err != nil {
 		return err
 	}
-	state, err := edgeLoadState(statePath)
+	state, err := edgeLoadState(agentManagedStatePath)
 	if err != nil || state.Token == "" || state.NodeGUID != task.NodeGUID {
 		return errors.New("Agent uninstall recovery could not verify its local node identity")
 	}
 	if task.RequestID != *requestIDValue {
 		return errors.New("Agent uninstall recovery service request ID does not match its task")
 	}
-	if err := runAgentUninstallToCompletion(statePath, task, state.Token); err != nil {
+	if err := runAgentUninstallToCompletion(task, state.Token); err != nil {
 		return err
 	}
 	return nil
 }
 
-func writeAgentUninstallTask(statePath string, task agentUninstallTask) error {
+func writeAgentUninstallTask(task agentUninstallTask) error {
 	data, err := json.Marshal(task)
 	if err != nil {
 		return err
 	}
-	return writeAgentUninstallFile(statePath+agentUninstallTaskSuffix, append(data, '\n'), 0o600)
+	return writeAgentUninstallFile(agentManagedStatePath+agentUninstallTaskSuffix, append(data, '\n'), 0o600)
 }
 
-func readAgentUninstallTask(statePath string) (agentUninstallTask, error) {
-	data, err := os.ReadFile(statePath + agentUninstallTaskSuffix)
+func readAgentUninstallTask() (agentUninstallTask, error) {
+	data, err := os.ReadFile(agentManagedStatePath + agentUninstallTaskSuffix)
 	if err != nil {
 		return agentUninstallTask{}, err
 	}
@@ -195,8 +194,8 @@ func readAgentUninstallTask(statePath string) (agentUninstallTask, error) {
 	return task, nil
 }
 
-func validateAgentUninstallTask(statePath string, task agentUninstallTask) error {
-	markerData, err := os.ReadFile(statePath + agentUninstallMarkerSuffix)
+func validateAgentUninstallTask(task agentUninstallTask) error {
+	markerData, err := os.ReadFile(agentManagedStatePath + agentUninstallMarkerSuffix)
 	if err != nil || strings.TrimSpace(string(markerData)) != task.RequestID {
 		return errors.New("Agent uninstall marker does not match the recovery task")
 	}
@@ -232,7 +231,7 @@ func writeAgentUninstallFile(path string, data []byte, mode os.FileMode) error {
 		if !errors.Is(err, os.ErrExist) {
 			return err
 		}
-		current, readErr := os.ReadFile(path)
+		current, readErr := os.ReadFile(path) // #nosec G304 -- path is generated from the managed Agent state directory or request-scoped recovery paths.
 		if readErr != nil {
 			return readErr
 		}
@@ -285,10 +284,10 @@ func installAgentUninstallRecoveryService(requestID string) error {
 }
 
 func installAgentUninstallRecoveryBinary(source, destination string) error {
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil { // #nosec G301 -- destination is request-scoped under the standard world-readable /usr/local/libexec directory.
 		return err
 	}
-	input, err := os.Open(source)
+	input, err := os.Open(source) // #nosec G304 -- source is os.Executable(), selected by the kernel.
 	if err != nil {
 		return err
 	}
@@ -332,7 +331,7 @@ func installAgentUninstallRecoveryBinary(source, destination string) error {
 
 func hashAgentUninstallFile(path string) ([32]byte, error) {
 	var empty [32]byte
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- callers pass either the current executable or a request-scoped recovery binary path.
 	if err != nil {
 		return empty, err
 	}
@@ -345,7 +344,7 @@ func hashAgentUninstallFile(path string) ([32]byte, error) {
 	return empty, nil
 }
 
-func runAgentUninstallToCompletion(statePath string, task agentUninstallTask, token string) error {
+func runAgentUninstallToCompletion(task agentUninstallTask, token string) error {
 	paths, err := agentUninstallRecoveryPathsFor(task.RequestID)
 	if err != nil {
 		return err
@@ -393,7 +392,7 @@ func runAgentUninstallToCompletion(statePath string, task agentUninstallTask, to
 		return fmt.Errorf("persist Agent uninstall completion state: %w", err)
 	}
 	for attempt := 0; ; attempt++ {
-		if err := finishAgentUninstallRecovery(statePath, completion); err != nil {
+		if err := finishAgentUninstallRecovery(completion); err != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent uninstall is waiting for final file cleanup: %v\n", err)
 			sleepAgentUninstallRetry(attempt)
 			continue
@@ -446,26 +445,26 @@ func containsOpenRCService(listing, service string) bool {
 	return false
 }
 
-func finishAgentUninstallRecovery(statePath string, completion agentUninstallCompletion) error {
-	state, stateErr := edgeLoadState(statePath)
+func finishAgentUninstallRecovery(completion agentUninstallCompletion) error {
+	state, stateErr := edgeLoadState(agentManagedStatePath)
 	if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
 		return fmt.Errorf("cannot verify Agent identity before final uninstall cleanup: %w", stateErr)
 	}
 	removeAgentState := stateErr == nil && agentUninstallRecoveryMayRemoveState(completion, state)
 	if removeAgentState {
-		if err := os.RemoveAll(filepath.Dir(statePath)); err != nil {
+		if err := os.RemoveAll(filepath.Dir(agentManagedStatePath)); err != nil {
 			return err
 		}
 	} else {
 		// A new Agent may have been installed after the old node was deleted.
 		// Retire only the completed request markers and preserve that new state.
-		if data, err := os.ReadFile(statePath + agentUninstallMarkerSuffix); err == nil && strings.TrimSpace(string(data)) == completion.RequestID {
-			if err := os.Remove(statePath + agentUninstallMarkerSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if data, err := os.ReadFile(agentManagedStatePath + agentUninstallMarkerSuffix); err == nil && strings.TrimSpace(string(data)) == completion.RequestID {
+			if err := os.Remove(agentManagedStatePath + agentUninstallMarkerSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
-		if task, err := readAgentUninstallTask(statePath); err == nil && task.NodeGUID == completion.NodeGUID && task.RequestID == completion.RequestID {
-			if err := os.Remove(statePath + agentUninstallTaskSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if task, err := readAgentUninstallTask(); err == nil && task.NodeGUID == completion.NodeGUID && task.RequestID == completion.RequestID {
+			if err := os.Remove(agentManagedStatePath + agentUninstallTaskSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
@@ -490,7 +489,7 @@ func finishAgentUninstallRecovery(statePath string, completion agentUninstallCom
 			return err
 		}
 	} else if _, err := os.Stat("/sbin/openrc-run"); err == nil {
-		if output, err := exec.Command("rc-update", "del", paths.ServiceName, "default").CombinedOutput(); err != nil {
+		if output, err := exec.Command("rc-update", "del", paths.ServiceName, "default").CombinedOutput(); err != nil { // #nosec G204 -- ServiceName contains only the fixed prefix and validated lowercase hex request ID.
 			listing, listingErr := exec.Command("rc-update", "show", "default").CombinedOutput()
 			if listingErr != nil || containsOpenRCService(string(listing), paths.ServiceName) {
 				return fmt.Errorf("could not disable the OpenRC uninstall recovery service: %w: %s", err, strings.TrimSpace(string(output)))
@@ -516,9 +515,12 @@ func sleepAgentUninstallRetry(attempt int) {
 }
 
 func runAgentUninstallManagerCommand(name string, args ...string) error {
+	if name != "systemctl" && name != "rc-service" && name != "rc-update" {
+		return errors.New("unsupported Agent uninstall service manager command")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, name, args...)
+	command := exec.CommandContext(ctx, name, args...) // #nosec G204 -- name is allowlisted above, callers use fixed manager commands and request-scoped validated service names; no shell is involved.
 	output, err := command.CombinedOutput()
 	if err == nil {
 		return nil

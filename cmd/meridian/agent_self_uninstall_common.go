@@ -6,7 +6,10 @@ import (
 	"strings"
 )
 
-const agentUninstallMarkerSuffix = ".uninstalling"
+const (
+	agentManagedStatePath      = "/var/lib/meridian-agent/state.json"
+	agentUninstallMarkerSuffix = ".uninstalling"
+)
 
 type agentUninstallRecoveryPaths struct {
 	ServiceName string
