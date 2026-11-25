@@ -380,6 +380,19 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		pendingNode, err := a.db.controlNodeByID(id, time.Now())
+		if err != nil {
+			writeNodeAPIError(a, w, err)
+			return
+		}
+		if !pendingNode.DeletionPending {
+			a.jsonErr(w, http.StatusConflict, "node does not have a pending deletion")
+			return
+		}
+		if err := a.prepareNodeDeletion(r.Context(), id); err != nil {
+			a.jsonErr(w, http.StatusBadGateway, "node DNS cleanup failed: "+err.Error())
+			return
+		}
 		if err := a.db.ForceDeletePendingNode(id); err != nil {
 			writeNodeAPIError(a, w, err)
 			return
@@ -410,6 +423,12 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		}
 		a.jsonOK(w, node)
 	case http.MethodDelete:
+		// Make the node ineligible before taking the site snapshot, so the
+		// scheduler cannot assign new work while DNS and route references drain.
+		if _, err := a.db.MarkNodeDeletionPending(id, now); err != nil {
+			writeNodeAPIError(a, w, err)
+			return
+		}
 		if err := a.prepareNodeDeletion(r.Context(), id); err != nil {
 			a.jsonErr(w, http.StatusBadGateway, "node DNS cleanup failed: "+err.Error())
 			return

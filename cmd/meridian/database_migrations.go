@@ -21,7 +21,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion                      = 62
+	databaseSchemaVersion                      = 63
 	watchHistorySourceBackfillSiteLimit        = 128
 	watchHistorySourceBackfillSourceLimit      = 4096
 	watchHistorySourceBackfillPerCategoryLimit = 256
@@ -437,6 +437,7 @@ func (d *DB) migrateOnce() error {
 		enrollment_expires_at_ms INTEGER NOT NULL DEFAULT 0,
 		uninstall_request_id TEXT NOT NULL DEFAULT '',
 		uninstall_requested_at_ms INTEGER NOT NULL DEFAULT 0,
+		deletion_pending INTEGER NOT NULL DEFAULT 0,
 		probe_secret_ciphertext TEXT NOT NULL DEFAULT '',
 		agent_token_hash TEXT NOT NULL DEFAULT '',
 		enrolled_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -596,6 +597,7 @@ func (d *DB) migrateOnce() error {
 		{"listen_interface", "ALTER TABLE control_nodes ADD COLUMN listen_interface TEXT NOT NULL DEFAULT ''"},
 		{"uninstall_request_id", "ALTER TABLE control_nodes ADD COLUMN uninstall_request_id TEXT NOT NULL DEFAULT ''"},
 		{"uninstall_requested_at_ms", "ALTER TABLE control_nodes ADD COLUMN uninstall_requested_at_ms INTEGER NOT NULL DEFAULT 0"},
+		{"deletion_pending", "ALTER TABLE control_nodes ADD COLUMN deletion_pending INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('control_nodes') WHERE name=?", migration.column).Scan(&found); err != nil {

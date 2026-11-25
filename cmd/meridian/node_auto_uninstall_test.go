@@ -181,33 +181,126 @@ func TestDeleteNodeAPIReportsPendingUntilAuthenticatedAgentCompletion(t *testing
 	}
 }
 
-func TestSchema62AddsAgentUninstallStateToSchema61(t *testing.T) {
+func TestNodeUninstallCannotBeQueuedUntilScheduleCleanupIsComplete(t *testing.T) {
 	app := newTestApp(t)
-	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "schema 62", Address: "203.0.113.51"}, time.Now().UTC())
+	now := time.Now().UTC()
+	node, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "cleanup gates uninstall", Address: "203.0.113.52"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.EnrollControlNode(enrollment, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{Name: "cleanup gate", PublicHost: "gate.example.test", TargetURL: "http://127.0.0.1:8096"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.MarkNodeDeletionPending(node.ID, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.db.BeginNodeUninstall(node.ID, now.Add(3*time.Second)); err == nil {
+		t.Fatal("Agent uninstall was queued while a site schedule still referenced the node")
+	}
+	pending, err := app.db.controlNodeByID(node.ID, now)
+	if err != nil || !pending.DeletionPending || pending.UninstallPending || pending.Enabled {
+		t.Fatalf("failed cleanup must leave a disabled, retryable deletion phase without sending Agent command: node=%+v err=%v", pending, err)
+	}
+	if _, err := app.db.SaveSiteNodeSchedule(site.ID, true, "fixed", node.ID, now.Add(4*time.Second)); err == nil {
+		t.Fatal("a pending-deletion node was accepted as a new fixed assignment")
+	}
+	if _, err := app.db.db.Exec(`UPDATE site_node_schedules SET enabled=0,fixed_node_id=NULL,desired_node_id=NULL,applied_node_id=NULL WHERE site_id=?`, site.ID); err != nil {
+		t.Fatal(err)
+	}
+	queued, hasAgent, err := app.db.BeginNodeUninstall(node.ID, now.Add(5*time.Second))
+	if err != nil || !hasAgent || !queued.UninstallPending {
+		t.Fatalf("uninstall was not queued after schedule cleanup: node=%+v hasAgent=%v err=%v", queued, hasAgent, err)
+	}
+}
+
+func TestPrepareNodeDeletionRereadsScheduleAfterAcquiringSiteLock(t *testing.T) {
+	f := newSchedulerDNSFixture(t, false)
+	other, _, err := f.app.db.CreateControlNode(NodeCreateInput{Name: "replacement", Address: "203.0.113.6", Port: 443}, f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.app.db.MarkNodeDeletionPending(f.node.ID, f.now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	unlock := f.app.lockSiteSchedule(f.site.ID)
+	finished := make(chan error, 1)
+	go func() { finished <- f.app.prepareNodeDeletion(context.Background(), f.node.ID) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.app.siteScheduleLocksMu.Lock()
+		lock := f.app.siteScheduleLocks[f.site.ID]
+		waiting := lock != nil && lock.refs >= 2
+		f.app.siteScheduleLocksMu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			unlock()
+			t.Fatal("node deletion did not wait for the held site lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	marker := siteDNSOwnershipMarker(f.site.ID, f.app.db.installUUID)
+	if _, err := f.app.db.db.Exec(`UPDATE site_node_schedules SET fixed_node_id=?,desired_node_id=?,applied_node_id=?,cf_record_id='record-b',applied_address='203.0.113.6',schedule_revision=schedule_revision+1 WHERE site_id=?`, other.ID, other.ID, other.ID, f.site.ID); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	delete(f.records, "record-a")
+	f.records["record-b"] = cloudflareAddressRecord{ID: "record-b", Type: "A", Name: f.host, Content: "203.0.113.6", Comment: marker}
+	f.mu.Unlock()
+	unlock()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("cleanup of a schedule already moved to another node failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("node deletion did not finish after site lock was released")
+	}
+	current, err := f.app.db.siteNodeSchedule(f.site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.Enabled || current.FixedNodeID != other.ID || current.DesiredNodeID != other.ID || current.AppliedNodeID != other.ID || current.cfRecordID != "record-b" {
+		t.Fatalf("deleting old node damaged the replacement assignment: %+v", current)
+	}
+	if f.deletes.Load() != 0 {
+		t.Fatalf("deleting old node removed replacement Cloudflare record: deletes=%d", f.deletes.Load())
+	}
+}
+
+func TestSchema63AddsPendingDeletionStateToSchema62(t *testing.T) {
+	app := newTestApp(t)
+	node, _, err := app.db.CreateControlNode(NodeCreateInput{Name: "schema 63", Address: "203.0.113.51"}, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.db.db.Exec(`DROP INDEX IF EXISTS idx_control_nodes_uninstall`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.db.db.Exec(`ALTER TABLE control_nodes DROP COLUMN uninstall_requested_at_ms`); err != nil {
+	if _, err := app.db.db.Exec(`ALTER TABLE control_nodes DROP COLUMN deletion_pending`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.db.db.Exec(`ALTER TABLE control_nodes DROP COLUMN uninstall_request_id`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.db.db.Exec(`PRAGMA user_version=61`); err != nil {
+	if _, err := app.db.db.Exec(`PRAGMA user_version=62`); err != nil {
 		t.Fatal(err)
 	}
 	if err := app.db.migrate(); err != nil {
 		t.Fatal(err)
 	}
 	var schema int
-	if err := app.db.db.QueryRow(`PRAGMA user_version`).Scan(&schema); err != nil || schema != 62 {
-		t.Fatalf("schema=%d err=%v, want 62", schema, err)
+	if err := app.db.db.QueryRow(`PRAGMA user_version`).Scan(&schema); err != nil || schema != 63 {
+		t.Fatalf("schema=%d err=%v, want 63", schema, err)
 	}
 	upgraded, err := app.db.controlNodeByID(node.ID, time.Now().UTC())
-	if err != nil || upgraded.UninstallPending || upgraded.UninstallRequestedAtMS != 0 {
+	if err != nil || upgraded.UninstallPending || upgraded.UninstallRequestedAtMS != 0 || upgraded.DeletionPending {
 		t.Fatalf("schema migration should leave existing nodes unaffected: node=%+v err=%v", upgraded, err)
 	}
 }
