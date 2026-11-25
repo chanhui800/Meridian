@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	agentConfigSchemaVersion       = 1
-	agentListenerBindingMinVersion = "v1.11.12"
+	agentConfigSchemaVersion      = 1
+	agentListenerFamilyMinVersion = "v1.11.12"
 	// siteNodeDrainWindow is an emergency upper bound only. Normal drains are
 	// retired by a final SiteStats snapshot (NodeSiteStat.Final) and its ACK;
 	// the long TTL prevents a long-lived playback from losing billable traffic
@@ -288,15 +288,17 @@ type AgentSiteRoute struct {
 }
 
 type AgentRuntimeConfig struct {
-	SchemaVersion        int     `json:"schema_version"`
-	ConfigHash           string  `json:"config_hash"`
-	ConfigRevision       int64   `json:"config_revision,omitempty"`
-	NodeGUID             string  `json:"node_guid"`
-	UninstallRequestID   string  `json:"uninstall_request_id,omitempty"`
-	EntryMode            string  `json:"entry_mode"`
-	HTTPPort             int     `json:"http_port"`
-	HTTPSPort            int     `json:"https_port"`
-	ListenFamily         string  `json:"listen_family,omitempty"`
+	SchemaVersion      int    `json:"schema_version"`
+	ConfigHash         string `json:"config_hash"`
+	ConfigRevision     int64  `json:"config_revision,omitempty"`
+	NodeGUID           string `json:"node_guid"`
+	UninstallRequestID string `json:"uninstall_request_id,omitempty"`
+	EntryMode          string `json:"entry_mode"`
+	HTTPPort           int    `json:"http_port"`
+	HTTPSPort          int    `json:"https_port"`
+	ListenFamily       string `json:"listen_family,omitempty"`
+	// ListenInterface is accepted for compatibility with stale Agent config
+	// payloads but is deprecated and never used for listener selection.
 	ListenInterface      string  `json:"listen_interface,omitempty"`
 	CertificatePEM       string  `json:"certificate_pem,omitempty"`
 	PrivateKeyPEM        string  `json:"private_key_pem,omitempty"`
@@ -948,7 +950,6 @@ type agentRuntimeConfigHash struct {
 	HTTPPort             int                  `json:"http_port"`
 	HTTPSPort            int                  `json:"https_port"`
 	ListenFamily         string               `json:"listen_family,omitempty"`
-	ListenInterface      string               `json:"listen_interface,omitempty"`
 	CertificatePEM       string               `json:"certificate_pem,omitempty"`
 	PrivateKeyPEM        string               `json:"private_key_pem,omitempty"`
 	DynamicKey           string               `json:"dynamic_key,omitempty"`
@@ -989,6 +990,11 @@ func agentConfigHashPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiv
 	if legacy {
 		config.CacheClearGeneration = 0
 		config.ForceStopSiteIDs = nil
+		// Listener-family and interface fields were added after legacy Agent
+		// hash contracts. Interface binding is now retired; clear both so old
+		// hashes remain stable even for stale manually populated inputs.
+		config.ListenFamily = ""
+		config.ListenInterface = ""
 		// ProbeSecret was added after the legacy Agent contract. Older Agents
 		// ignore the field, so omit it from the compatibility hash while current
 		// Agents use the runtime hash above and authenticate their health probes.
@@ -1028,7 +1034,6 @@ func agentConfigHashPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiv
 		HTTPPort:             config.HTTPPort,
 		HTTPSPort:            config.HTTPSPort,
 		ListenFamily:         config.ListenFamily,
-		ListenInterface:      config.ListenInterface,
 		CertificatePEM:       config.CertificatePEM,
 		PrivateKeyPEM:        config.PrivateKeyPEM,
 		DynamicKey:           config.DynamicKey,
@@ -1256,10 +1261,10 @@ func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (strin
 	if !agentSupportsCacheClear(version) {
 		config.CacheClearGeneration = 0
 	}
-	if !agentSupportsListenerBinding(version) {
-		// Unknown JSON fields are ignored by older Agents. Keep their checksum
-		// contract stable until their normal self-update installs listener
-		// family and interface binding support.
+	if !agentSupportsListenerFamily(version) {
+		// Older Agents do not implement DNS-family listener isolation. Keep
+		// their checksum contract stable until the normal self-update installs
+		// listener-family support.
 		config.ListenFamily = ""
 		config.ListenInterface = ""
 	}
@@ -1271,12 +1276,12 @@ func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (strin
 	return hashAgentConfigPayloadForVersion(config, legacy, zeroLiveTraffic)
 }
 
-func agentSupportsListenerBinding(version string) bool {
+func agentSupportsListenerFamily(version string) bool {
 	major, minor, patch, ok := parseAgentVersion(version)
 	if !ok {
 		return false
 	}
-	requiredMajor, requiredMinor, requiredPatch, requiredOK := parseAgentVersion(agentListenerBindingMinVersion)
+	requiredMajor, requiredMinor, requiredPatch, requiredOK := parseAgentVersion(agentListenerFamilyMinVersion)
 	if !requiredOK {
 		return false
 	}
@@ -1287,6 +1292,12 @@ func agentSupportsListenerBinding(version string) bool {
 		return minor > requiredMinor
 	}
 	return patch >= requiredPatch
+}
+
+func agentSupportsNetworkInterfaceInventory(version string) bool {
+	// Agents began including the bounded interface inventory in reports with
+	// the same release that added explicit listener-family support.
+	return agentSupportsListenerFamily(version)
 }
 
 // parseAgentVersion accepts the build metadata used by AWS test deployments
@@ -1562,7 +1573,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		// wildcard listener while the node is still enrolling.
 		config.Routes = []AgentSiteRoute{}
 	}
-	if !agentSupportsListenerBinding(clientVersion) {
+	if !agentSupportsListenerFamily(clientVersion) {
 		// Older Agents ignore unknown listener fields and their checksum cannot
 		// cover them. Keep the old contract until the Agent updates itself.
 		config.ListenFamily = ""
@@ -2403,16 +2414,6 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 }
 
 type nodeDNSAddress struct{ family, recordType, address string }
-
-func nodeNetworkInterfaceByName(node ControlNode, name string) (NodeNetworkInterface, bool) {
-	name = strings.TrimSpace(name)
-	for _, iface := range node.NetworkInterfaces {
-		if iface.Name == name {
-			return iface, true
-		}
-	}
-	return NodeNetworkInterface{}, false
-}
 
 func nodePublishedAddressFamilies(node ControlNode) (ipv4, ipv6 bool, err error) {
 	mode := strings.ToLower(strings.TrimSpace(node.DNSPublish))

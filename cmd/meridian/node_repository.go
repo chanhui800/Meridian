@@ -47,7 +47,6 @@ type ControlNode struct {
 	DNSPublish        string                 `json:"dns_publish"`
 	NetAddresses      []NodeNetAddress       `json:"net_addresses,omitempty"`
 	NetworkInterfaces []NodeNetworkInterface `json:"network_interfaces,omitempty"`
-	ListenInterface   string                 `json:"listen_interface"`
 	// AddressSource records where the IPv4 address came from: "manual" when an
 	// operator entered it, "enrollment" when the Agent's registration request
 	// supplied it, or "report" when an authenticated heartbeat supplied it. The
@@ -142,7 +141,6 @@ type NodeCreateInput struct {
 	AddressV4                string
 	AddressV6                string
 	DNSPublish               string
-	ListenInterface          string
 	Port                     int
 	Priority                 int
 	TrafficQuota             int64
@@ -368,13 +366,13 @@ func hashNodeToken(value string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func normalizeListenerInterfaceName(value string) (string, error) {
+func normalizeNetworkInterfaceName(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", nil
 	}
 	if len(value) > 15 || strings.EqualFold(value, "metadata") || strings.ContainsAny(value, "\x00/\\ \t\r\n") {
-		return "", errors.New("listen_interface must be a reported network interface name")
+		return "", errors.New("invalid network interface name")
 	}
 	return value, nil
 }
@@ -385,7 +383,7 @@ func normalizeReportedNetworkInterfaces(interfaces []NodeNetworkInterface) []Nod
 	}
 	byName := make(map[string]NodeNetworkInterface, len(interfaces))
 	for _, iface := range interfaces {
-		name, err := normalizeListenerInterfaceName(iface.Name)
+		name, err := normalizeNetworkInterfaceName(iface.Name)
 		if err != nil || name == "" || (!iface.IPv4 && !iface.IPv6) {
 			continue
 		}
@@ -411,9 +409,6 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	input.Address = strings.TrimSpace(input.Address)
 	input.AddressV4 = strings.TrimSpace(input.AddressV4)
 	input.AddressV6 = strings.TrimSpace(input.AddressV6)
-	// Listener scope is derived from DNS publication. Ignore the deprecated
-	// per-interface setting so older clients cannot restrict or widen it.
-	input.ListenInterface = ""
 	input.DNSPublish = strings.ToLower(strings.TrimSpace(input.DNSPublish))
 	if input.DNSPublish == "" {
 		input.DNSPublish = "auto"
@@ -421,6 +416,10 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	if input.DNSPublish != "auto" && input.DNSPublish != "v4" && input.DNSPublish != "v6" {
 		return input, errors.New("dns_publish must be auto, v4, or v6")
 	}
+	// The selected family may have no public address until the Agent checks in.
+	// Save the policy now; DNS publication waits for that family's address, while
+	// an explicit v4/v6 policy can already prepare its matching listener. Keep
+	// non-empty family-specific addresses strictly checked.
 	if input.AddressV4 != "" {
 		ip := net.ParseIP(input.AddressV4)
 		if ip == nil || ip.To4() == nil || !nodeAddressIsGlobalUnicast(ip) {
@@ -574,9 +573,9 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	// address_source is left to its column default here: a row created from the
 	// panel always carries an operator-entered address.
 	result, err := d.db.Exec(`INSERT INTO control_nodes
-		(guid,name,address,address_v4,address_v6,dns_publish,listen_interface,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
+		(guid,name,address,address_v4,address_v6,dns_publish,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
 		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, input.Priority, input.TrafficQuota,
+		VALUES(?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, input.Priority, input.TrafficQuota,
 		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), probeSecretCiphertext, nowMS, nowMS)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -594,7 +593,7 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,reported_interfaces,listen_interface,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
+const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,reported_interfaces,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
@@ -605,7 +604,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
 	var enabled, configDirty int
 	var reportedAddresses, reportedInterfaces string
-	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &reportedInterfaces, &node.ListenInterface, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
+	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &reportedInterfaces, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
@@ -1035,9 +1034,9 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, err
 	}
 	defer tx.Rollback()
-	var currentAddress, currentDNSPublish, currentListenInterface, currentAddressV4, currentAddressV6, currentReportedInterfaces, uninstallRequestID string
+	var currentAddress, currentDNSPublish, currentAddressV4, currentAddressV6, uninstallRequestID string
 	var currentPort, currentResetDay, currentEnabled int
-	if err := tx.QueryRow("SELECT address,dns_publish,listen_interface,address_v4,address_v6,reported_interfaces,https_port,reset_day,enabled,uninstall_request_id FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentListenInterface, &currentAddressV4, &currentAddressV6, &currentReportedInterfaces, &currentPort, &currentResetDay, &currentEnabled, &uninstallRequestID); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRow("SELECT address,dns_publish,address_v4,address_v6,https_port,reset_day,enabled,uninstall_request_id FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentAddressV4, &currentAddressV6, &currentPort, &currentResetDay, &currentEnabled, &uninstallRequestID); errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errNodeNotFound
 	} else if err != nil {
 		return ControlNode{}, err
@@ -1046,16 +1045,12 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, errors.New("node deletion is waiting for Agent uninstall")
 	}
 	portChanged := currentPort != input.Port
-	var currentInterfaces []NodeNetworkInterface
-	_ = json.Unmarshal([]byte(currentReportedInterfaces), &currentInterfaces)
-	currentListenerNode := ControlNode{Address: currentAddress, AddressV4: currentAddressV4, AddressV6: currentAddressV6,
-		DNSPublish: currentDNSPublish, ListenInterface: currentListenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(currentInterfaces)}
-	nextListenerNode := ControlNode{Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6,
-		DNSPublish: input.DNSPublish, ListenInterface: input.ListenInterface, NetworkInterfaces: currentListenerNode.NetworkInterfaces}
+	currentListenerNode := ControlNode{Address: currentAddress, AddressV4: currentAddressV4, AddressV6: currentAddressV6, DNSPublish: currentDNSPublish}
+	nextListenerNode := ControlNode{Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish}
 	currentListenFamily, currentListenErr := effectiveNodeListenFamily(currentListenerNode)
 	nextListenFamily, nextListenErr := effectiveNodeListenFamily(nextListenerNode)
 	listenerFamilyChanged := currentListenFamily != nextListenFamily || (currentListenErr == nil) != (nextListenErr == nil)
-	listenerChanged := portChanged || currentDNSPublish != input.DNSPublish || currentListenInterface != input.ListenInterface || listenerFamilyChanged
+	listenerChanged := portChanged || currentDNSPublish != input.DNSPublish || listenerFamilyChanged
 	enabledChanged := currentEnabled != sqliteBool(enabled)
 	// Saving from the panel always records the address as operator-confirmed, so
 	// an address that enrollment once inferred loses its "please verify" marker
@@ -1063,12 +1058,12 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,listen_interface=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
 			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
+			input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,listen_interface=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -2056,12 +2051,12 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var id, lastSequence, lastRX, lastTX int64
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID, listenInterface, previousInterfacesJSON string
+	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID, previousInterfacesJSON string
 	var legacyAddress, addressSource, nodeDNSPublish, nodeAddressV4, nodeAddressV6, nodeAddressV6Source string
 	var activeSessionEpoch int64
 	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source,listen_interface,reported_interfaces,dns_publish,address_v4,address_v6,address_v6_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource, &listenInterface, &previousInterfacesJSON, &nodeDNSPublish, &nodeAddressV4, &nodeAddressV6, &nodeAddressV6Source)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source,reported_interfaces,dns_publish,address_v4,address_v6,address_v6_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource, &previousInterfacesJSON, &nodeDNSPublish, &nodeAddressV4, &nodeAddressV6, &nodeAddressV6Source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -2191,20 +2186,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	addressesJSON, _ := json.Marshal(normalizeReportedNodeNetAddresses(report.NetAddresses))
 	reportedInterfaces := normalizeReportedNetworkInterfaces(report.NetworkInterfaces)
-	listenerBindingSupported := agentSupportsListenerBinding(report.AgentVersion)
-	if !listenerBindingSupported {
+	if !agentSupportsNetworkInterfaceInventory(report.AgentVersion) {
 		// Older Agents do not send interface inventory. Preserve a previously
 		// collected list during a rolling upgrade instead of erasing it.
 		_ = json.Unmarshal([]byte(previousInterfacesJSON), &reportedInterfaces)
 		reportedInterfaces = normalizeReportedNetworkInterfaces(reportedInterfaces)
-	}
-	listenerInterfaceChanged := false
-	if listenInterface != "" && listenerBindingSupported {
-		var previousInterfaces []NodeNetworkInterface
-		_ = json.Unmarshal([]byte(previousInterfacesJSON), &previousInterfaces)
-		oldInterface, oldFound := nodeNetworkInterfaceByName(ControlNode{NetworkInterfaces: previousInterfaces}, listenInterface)
-		newInterface, newFound := nodeNetworkInterfaceByName(ControlNode{NetworkInterfaces: reportedInterfaces}, listenInterface)
-		listenerInterfaceChanged = oldFound != newFound || oldInterface != newInterface
 	}
 	interfacesJSON, _ := json.Marshal(reportedInterfaces)
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
@@ -2342,10 +2328,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			return nodeReportCommitResult{}, err
 		}
 	}
-	oldInterfaces := []NodeNetworkInterface(nil)
-	_ = json.Unmarshal([]byte(previousInterfacesJSON), &oldInterfaces)
-	oldListenerNode := ControlNode{Address: legacyAddress, AddressV4: nodeAddressV4, AddressV6: nodeAddressV6,
-		DNSPublish: nodeDNSPublish, ListenInterface: listenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(oldInterfaces)}
+	oldListenerNode := ControlNode{Address: legacyAddress, AddressV4: nodeAddressV4, AddressV6: nodeAddressV6, DNSPublish: nodeDNSPublish}
 	newAddressV4, newAddressV6 := nodeAddressV4, nodeAddressV6
 	if newAddressV4 == "" || replaceObservedV4 {
 		newAddressV4 = hintedV4
@@ -2353,12 +2336,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if newAddressV6 == "" || replaceObservedV6 {
 		newAddressV6 = hintedV6
 	}
-	newListenerNode := ControlNode{Address: legacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6,
-		DNSPublish: nodeDNSPublish, ListenInterface: listenInterface, NetworkInterfaces: reportedInterfaces}
+	newListenerNode := ControlNode{Address: legacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6, DNSPublish: nodeDNSPublish}
 	oldFamily, oldFamilyErr := effectiveNodeListenFamily(oldListenerNode)
 	newFamily, newFamilyErr := effectiveNodeListenFamily(newListenerNode)
 	listenerFamilyChanged := oldFamily != newFamily || (oldFamilyErr == nil) != (newFamilyErr == nil)
-	if listenerInterfaceChanged || listenerFamilyChanged {
+	if listenerFamilyChanged {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_hash='',config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
 			schedule_revision=schedule_revision+1,updated_at_ms=? WHERE desired_node_id=?`, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 			return nodeReportCommitResult{}, err
@@ -2639,18 +2621,15 @@ func (d *DB) RecordNodeObservedAddress(agentToken, family, sourceIP string, now 
 
 	var id int64
 	var legacyAddress, addressSource, addressV4, addressV6, addressV6Source string
-	var dnsPublish, listenInterface, reportedInterfaces string
-	if err := tx.QueryRow(`SELECT id,address,address_source,address_v4,address_v6,address_v6_source,dns_publish,listen_interface,reported_interfaces FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &legacyAddress, &addressSource, &addressV4, &addressV6, &addressV6Source, &dnsPublish, &listenInterface, &reportedInterfaces); errors.Is(err, sql.ErrNoRows) {
+	var dnsPublish string
+	if err := tx.QueryRow(`SELECT id,address,address_source,address_v4,address_v6,address_v6_source,dns_publish FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &legacyAddress, &addressSource, &addressV4, &addressV6, &addressV6Source, &dnsPublish); errors.Is(err, sql.ErrNoRows) {
 		return "", errInvalidAgentToken
 	} else if err != nil {
 		return "", err
 	}
 
-	oldInterfaces := []NodeNetworkInterface(nil)
-	_ = json.Unmarshal([]byte(reportedInterfaces), &oldInterfaces)
-	oldNode := ControlNode{Address: legacyAddress, AddressV4: addressV4, AddressV6: addressV6,
-		DNSPublish: dnsPublish, ListenInterface: listenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(oldInterfaces)}
+	oldNode := ControlNode{Address: legacyAddress, AddressV4: addressV4, AddressV6: addressV6, DNSPublish: dnsPublish}
 
 	legacyV4, legacyV6 := publicNodeAddressFamilies(legacyAddress)
 	manualLegacyV4 := nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, addressV6Source, "v4")
@@ -2703,8 +2682,7 @@ func (d *DB) RecordNodeObservedAddress(agentToken, family, sourceIP string, now 
 		newLegacyAddress, newLegacySource, newAddressV4, newAddressV6, newAddressV6Source, now.UnixMilli(), id); err != nil {
 		return "", err
 	}
-	newNode := ControlNode{Address: newLegacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6,
-		DNSPublish: dnsPublish, ListenInterface: listenInterface, NetworkInterfaces: oldNode.NetworkInterfaces}
+	newNode := ControlNode{Address: newLegacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6, DNSPublish: dnsPublish}
 	oldFamily, oldFamilyErr := effectiveNodeListenFamily(oldNode)
 	newFamily, newFamilyErr := effectiveNodeListenFamily(newNode)
 	listenerFamilyChanged := oldFamily != newFamily || (oldFamilyErr == nil) != (newFamilyErr == nil)

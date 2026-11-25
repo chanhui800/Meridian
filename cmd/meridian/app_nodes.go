@@ -179,11 +179,12 @@ func agentBinaryIdentityForPlatform(platform string) (string, string, error) {
 }
 
 type nodeAPIInput struct {
-	Name                     string  `json:"name"`
-	Address                  string  `json:"address"`
-	AddressV4                string  `json:"address_v4"`
-	AddressV6                string  `json:"address_v6"`
-	DNSPublish               string  `json:"dns_publish"`
+	Name       string `json:"name"`
+	Address    string `json:"address"`
+	AddressV4  string `json:"address_v4"`
+	AddressV6  string `json:"address_v6"`
+	DNSPublish string `json:"dns_publish"`
+	// ListenInterface is accepted from cached clients for compatibility but ignored.
 	ListenInterface          *string `json:"listen_interface"`
 	Port                     int     `json:"port"`
 	HTTPSPort                int     `json:"https_port"` // Deprecated compatibility for cached pre-single-port pages.
@@ -201,12 +202,8 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 	if port == 0 {
 		port = input.HTTPSPort
 	}
-	listenInterface := ""
-	if input.ListenInterface != nil {
-		listenInterface = *input.ListenInterface
-	}
 	return NodeCreateInput{
-		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, ListenInterface: listenInterface, Port: port, Priority: input.Priority,
+		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, Port: port, Priority: input.Priority,
 		TrafficQuota: input.TrafficQuota, BillingMode: input.BillingMode, ResetDay: input.ResetDay,
 		TrafficManualOffsetBytes: input.TrafficManualOffsetBytes,
 	}
@@ -406,16 +403,6 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			enabled = *input.Enabled
 		}
 		nodeInput := nodeCreateInput(input)
-		if input.ListenInterface == nil {
-			// Older cached pages do not send listener-interface settings. Keep
-			// their update requests from clearing a value saved by a newer page.
-			current, lookupErr := a.db.controlNodeByID(id, now)
-			if lookupErr != nil {
-				writeNodeAPIError(a, w, lookupErr)
-				return
-			}
-			nodeInput.ListenInterface = current.ListenInterface
-		}
 		node, err := a.db.UpdateControlNode(id, nodeInput, enabled, now)
 		if err != nil {
 			writeNodeAPIError(a, w, err)

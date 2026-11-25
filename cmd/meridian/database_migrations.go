@@ -393,6 +393,7 @@ func (d *DB) migrateOnce() error {
 		dns_publish TEXT NOT NULL DEFAULT 'auto' CHECK(dns_publish IN ('auto','v4','v6')),
 		reported_net_addresses TEXT NOT NULL DEFAULT '[]',
 		reported_interfaces TEXT NOT NULL DEFAULT '[]',
+		-- Deprecated schema-61 compatibility column; Controller behavior ignores it.
 		listen_interface TEXT NOT NULL DEFAULT '',
 		entry_mode TEXT NOT NULL DEFAULT 'direct' CHECK(entry_mode IN ('direct','shared')),
 		http_port INTEGER NOT NULL DEFAULT 0,
@@ -591,6 +592,7 @@ func (d *DB) migrateOnce() error {
 		{"dns_publish", "ALTER TABLE control_nodes ADD COLUMN dns_publish TEXT NOT NULL DEFAULT 'auto'"},
 		{"reported_net_addresses", "ALTER TABLE control_nodes ADD COLUMN reported_net_addresses TEXT NOT NULL DEFAULT '[]'"},
 		{"reported_interfaces", "ALTER TABLE control_nodes ADD COLUMN reported_interfaces TEXT NOT NULL DEFAULT '[]'"},
+		// Keep the schema-61 column for existing databases/backups; no runtime path reads it.
 		{"listen_interface", "ALTER TABLE control_nodes ADD COLUMN listen_interface TEXT NOT NULL DEFAULT ''"},
 		{"uninstall_request_id", "ALTER TABLE control_nodes ADD COLUMN uninstall_request_id TEXT NOT NULL DEFAULT ''"},
 		{"uninstall_requested_at_ms", "ALTER TABLE control_nodes ADD COLUMN uninstall_requested_at_ms INTEGER NOT NULL DEFAULT 0"},

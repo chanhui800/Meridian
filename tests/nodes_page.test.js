@@ -252,7 +252,7 @@ test('node DNS family auto-fills reported addresses and no longer exposes listen
   await h.element('node-form').onsubmit({ preventDefault() {} });
   assert.equal(h.updates.length, 1);
   assert.equal(h.updates[0].id, node.id);
-  assert.equal(h.updates[0].payload.listen_interface, '');
+  assert.equal(Object.hasOwn(h.updates[0].payload, 'listen_interface'), false);
   assert.equal(h.updates[0].payload.dns_publish, 'v6');
   assert.equal(h.updates[0].payload.address_v6, '2001:db8::42');
 });

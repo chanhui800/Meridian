@@ -271,7 +271,6 @@ type edgeAgentRuntime struct {
 	quiesced             atomic.Bool
 	port                 int
 	listenFamily         string
-	listenInterface      string
 	handler              http.Handler
 	certificate          *tls.Certificate
 	server               *http.Server
@@ -319,7 +318,7 @@ type edgeAgentRuntime struct {
 	trafficHosts map[int64]string
 	resolver     dynamicIPResolver
 	transport    dynamicTransportFactory
-	listen       func(string, string, string) (net.Listener, error)
+	listen       func(string, string) (net.Listener, error)
 }
 
 // beginBundleDrain rejects new work on an old generation but gives streams
@@ -403,7 +402,6 @@ func (runtime *edgeAgentRuntime) forceStopCentralSites(ctx context.Context, site
 type edgeAgentRuntimeState struct {
 	port                 int
 	listenFamily         string
-	listenInterface      string
 	server               *http.Server
 	bundle               *edgeProxyBundle
 	nodeGUID             string
@@ -1527,12 +1525,8 @@ func agentListenerSpecs(family string, port int) ([]agentListenerSpec, error) {
 	}
 }
 
-func (runtime *edgeAgentRuntime) startServer(port int, family, interfaceName string) error {
+func (runtime *edgeAgentRuntime) startServer(port int, family string) error {
 	specs, err := agentListenerSpecs(family, port)
-	if err != nil {
-		return err
-	}
-	interfaceName, err = normalizeListenerInterfaceName(interfaceName)
 	if err != nil {
 		return err
 	}
@@ -1542,13 +1536,10 @@ func (runtime *edgeAgentRuntime) startServer(port int, family, interfaceName str
 	}
 	listeners := make([]net.Listener, 0, len(specs))
 	for _, spec := range specs {
-		listener, listenErr := listen(spec.network, spec.address, interfaceName)
+		listener, listenErr := listen(spec.network, spec.address)
 		if listenErr != nil {
 			for _, opened := range listeners {
 				_ = opened.Close()
-			}
-			if interfaceName != "" {
-				return fmt.Errorf("listen on interface %s (%s %s): %w", interfaceName, spec.network, spec.address, listenErr)
 			}
 			return fmt.Errorf("listen on %s %s: %w", spec.network, spec.address, listenErr)
 		}
@@ -1562,7 +1553,6 @@ func (runtime *edgeAgentRuntime) startServer(port int, family, interfaceName str
 	runtime.server = server
 	runtime.port = port
 	runtime.listenFamily = family
-	runtime.listenInterface = interfaceName
 	runtime.mu.Unlock()
 	for _, listener := range listeners {
 		listener := listener
@@ -1603,7 +1593,6 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 	runtime.appliedRevision = old.appliedRevision
 	runtime.port = old.port
 	runtime.listenFamily = old.listenFamily
-	runtime.listenInterface = old.listenInterface
 	runtime.certificate = old.certificate
 	runtime.handler = old.handler
 	runtime.bundle = old.bundle
@@ -1618,7 +1607,7 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 	}
 	runtime.mu.Unlock()
 	if listenerWasStopped && old.server != nil {
-		if err := runtime.startServer(old.port, old.listenFamily, old.listenInterface); err != nil {
+		if err := runtime.startServer(old.port, old.listenFamily); err != nil {
 			restoreErr := fmt.Errorf("restore old listener on port %d: %w", old.port, err)
 			runtime.mu.Lock()
 			runtime.listenerError = restoreErr.Error()
@@ -1659,10 +1648,6 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	if listenFamily == "" {
 		listenFamily = "auto"
 	}
-	listenInterface, err := normalizeListenerInterfaceName(config.ListenInterface)
-	if err != nil {
-		return err
-	}
 	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
 		return errors.New("Agent port is invalid")
 	}
@@ -1680,7 +1665,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	runtime.mu.RLock()
 	oldState := edgeAgentRuntimeState{
-		port: runtime.port, listenFamily: runtime.listenFamily, listenInterface: runtime.listenInterface,
+		port: runtime.port, listenFamily: runtime.listenFamily,
 		server: runtime.server, bundle: runtime.bundle,
 		nodeGUID: runtime.nodeGUID, appliedHash: runtime.appliedHash, appliedRevision: runtime.appliedRevision, certificate: runtime.certificate, handler: runtime.handler,
 		cacheClearGeneration: runtime.cacheClearGeneration, siteCounterEpoch: runtime.siteCounterEpoch,
@@ -1693,7 +1678,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.mu.RUnlock()
 	oldState.siteReported = oldSiteReported
 	needsListener := len(config.Routes) > 0 && listenFamily != "none"
-	listenerChanged := oldState.port != config.HTTPSPort || oldState.listenFamily != listenFamily || oldState.listenInterface != listenInterface || (oldState.server == nil) != !needsListener
+	listenerChanged := oldState.port != config.HTTPSPort || oldState.listenFamily != listenFamily || (oldState.server == nil) != !needsListener
 	if listenerChanged {
 		// Closing the listener stops new connections, while a non-forcing
 		// shutdown leaves already admitted playback/WebSocket handlers alive.
@@ -1703,7 +1688,6 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.nodeGUID = config.NodeGUID
 	runtime.port = config.HTTPSPort
 	runtime.listenFamily = listenFamily
-	runtime.listenInterface = listenInterface
 	runtime.certificate = certificate
 	runtime.handler = bundle.handler
 	runtime.bundle = bundle
@@ -1714,7 +1698,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.mu.Unlock()
 	newServerStarted := false
 	if listenerChanged && needsListener {
-		if err := runtime.startServer(config.HTTPSPort, listenFamily, listenInterface); err != nil {
+		if err := runtime.startServer(config.HTTPSPort, listenFamily); err != nil {
 			bundle.close()
 			return runtime.rollbackApply(oldState, listenerChanged, false, err)
 		}
@@ -1782,9 +1766,6 @@ func validateAgentConfigEnvelope(config AgentRuntimeConfig) error {
 	}
 	if config.ListenFamily != "" && config.ListenFamily != "auto" && config.ListenFamily != "v4" && config.ListenFamily != "v6" && config.ListenFamily != "none" {
 		return errors.New("Agent listener family is invalid")
-	}
-	if _, err := normalizeListenerInterfaceName(config.ListenInterface); err != nil {
-		return errors.New("Agent listener interface is invalid")
 	}
 	return nil
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,11 +58,6 @@ func TestNodePublishedFamiliesAndListenerFamilyFollowDNSAddresses(t *testing.T) 
 			wantV4:     false,
 			wantV6:     true,
 			wantListen: "v6",
-		},
-		{
-			name:   "deprecated interface setting does not affect DNS/listener family",
-			node:   ControlNode{DNSPublish: "v6", AddressV6: "2001:db8::12", ListenInterface: "eth4", NetworkInterfaces: []NodeNetworkInterface{{Name: "eth4", IPv4: true}}},
-			wantV4: false, wantV6: true, wantListen: "v6",
 		},
 	}
 	for _, test := range tests {
@@ -169,7 +166,7 @@ func TestNodeDNSPublicationUpdateInvalidatesAgentAndScheduleConfig(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.ListenInterface != "" || updated.DNSPublish != "v6" || updated.DesiredConfigHash != "" || !updated.ConfigDirty || updated.ConfigRevision <= before.ConfigRevision {
+	if updated.DNSPublish != "v6" || updated.DesiredConfigHash != "" || !updated.ConfigDirty || updated.ConfigRevision <= before.ConfigRevision {
 		t.Fatalf("DNS publication update was not persisted/applied as new config: before=%#v after=%#v", before, updated)
 	}
 	schedule, err := app.db.siteNodeSchedule(site.ID)
@@ -207,7 +204,7 @@ func TestBuildAgentConfigUsesListenerFamilyAndPreservesOldHashContract(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.ListenInterface != "" || !updated.ConfigDirty {
+	if !updated.ConfigDirty {
 		t.Fatalf("DNS publication setting was not persisted as a pending config: %#v", updated)
 	}
 	config, err := app.buildAgentConfigForRequest(context.Background(), token, now.Add(3*time.Second), "linux/amd64", "v1.11.12")
@@ -215,7 +212,7 @@ func TestBuildAgentConfigUsesListenerFamilyAndPreservesOldHashContract(t *testin
 		t.Fatal(err)
 	}
 	if config.ListenFamily != "v6" || config.ListenInterface != "" {
-		t.Fatalf("Agent listener config = family %q interface %q, want v6/no interface binding", config.ListenFamily, config.ListenInterface)
+		t.Fatalf("Agent listener config = family %q interface %q, want v6 with retired interface unset", config.ListenFamily, config.ListenInterface)
 	}
 	newHash, err := agentConfigHashForVersion(config, "v1.11.12-pre.20261124.1")
 	if err != nil {
@@ -237,6 +234,52 @@ func TestBuildAgentConfigUsesListenerFamilyAndPreservesOldHashContract(t *testin
 	}
 	if oldHash != wantOldHash || oldHash == newHash {
 		t.Fatalf("listener hash compatibility mismatch: old=%q want-old=%q new=%q", oldHash, wantOldHash, newHash)
+	}
+}
+
+func TestAgentRuntimeHashIgnoresRetiredInterfaceAndZerosLegacyListenerFields(t *testing.T) {
+	config := AgentRuntimeConfig{
+		SchemaVersion: agentConfigSchemaVersion, NodeGUID: "legacy-listener-hash", ListenFamily: "v6",
+		ListenInterface: "eth9", Routes: []AgentSiteRoute{},
+	}
+	modernHash, err := agentConfigHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutInterface := config
+	withoutInterface.ListenInterface = ""
+	withoutInterfaceHash, err := agentConfigHash(withoutInterface)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modernHash != withoutInterfaceHash {
+		t.Fatal("retired listen_interface still affects the current Agent runtime hash")
+	}
+	modernPayload, err := json.Marshal(agentConfigHashPayloadForVersion(config, false, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(modernPayload), `"listen_interface"`) {
+		t.Fatalf("current Agent hash payload still includes retired interface binding: %s", modernPayload)
+	}
+
+	legacyPayload := agentConfigHashPayloadForVersion(config, true, true)
+	if legacyPayload.ListenFamily != "" {
+		t.Fatalf("legacy listener family = %q, want empty", legacyPayload.ListenFamily)
+	}
+	legacyHash, err := hashAgentConfigPayload(config, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyExpected := config
+	legacyExpected.ListenFamily = ""
+	legacyExpected.ListenInterface = ""
+	expectedHash, err := hashAgentConfigPayload(legacyExpected, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyHash != expectedHash {
+		t.Fatalf("legacy hash=%q, want listener fields cleared hash=%q", legacyHash, expectedHash)
 	}
 }
 
@@ -342,23 +385,5 @@ func TestAgentListenerOnlyBindsIPv6ForIPv6Publishing(t *testing.T) {
 	}
 	if family != "v6" {
 		t.Fatalf("automatic DNS with only an IPv6 address selected listener family %q, want v6-only", family)
-	}
-	deprecatedInterface := ControlNode{
-		DNSPublish: "auto", ListenInterface: "eth6", AddressV4: "198.51.100.94", AddressV6: "2001:db8::94",
-		NetworkInterfaces: []NodeNetworkInterface{{Name: "eth6", IPv6: true}},
-	}
-	desired, err = desiredNodeDNSAddresses(deprecatedInterface)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(desired) != 2 || desired[0].recordType != "A" || desired[1].recordType != "AAAA" {
-		t.Fatalf("deprecated interface setting changed automatic DNS records: %#v", desired)
-	}
-	family, err = effectiveNodeListenFamily(deprecatedInterface)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if family != "auto" {
-		t.Fatalf("deprecated interface setting changed automatic listener family %q, want auto", family)
 	}
 }
