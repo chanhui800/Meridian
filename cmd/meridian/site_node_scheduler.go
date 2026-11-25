@@ -292,6 +292,7 @@ type AgentRuntimeConfig struct {
 	ConfigHash           string  `json:"config_hash"`
 	ConfigRevision       int64   `json:"config_revision,omitempty"`
 	NodeGUID             string  `json:"node_guid"`
+	UninstallRequestID   string  `json:"uninstall_request_id,omitempty"`
 	EntryMode            string  `json:"entry_mode"`
 	HTTPPort             int     `json:"http_port"`
 	HTTPSPort            int     `json:"https_port"`
@@ -1380,8 +1381,9 @@ func (a *App) buildAgentConfigForPlatform(token string, now time.Time, platform 
 }
 
 type agentSessionRequest struct {
-	ID    string
-	Epoch int64
+	ID           string
+	Epoch        int64
+	Capabilities string
 }
 
 func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now time.Time, platform, clientVersion string, requestedSession ...agentSessionRequest) (AgentRuntimeConfig, error) {
@@ -1394,6 +1396,13 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 		if err != nil {
 			return AgentRuntimeConfig{}, err
 		}
+	}
+	var session agentSessionRequest
+	if len(requestedSession) > 0 {
+		session = requestedSession[0]
+	}
+	if node.UninstallPending && session.Capabilities == agentSelfUninstallCapability {
+		return AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, UninstallRequestID: node.uninstallRequestID}, nil
 	}
 	if err := a.refreshSiteAssignments(now); err != nil {
 		return AgentRuntimeConfig{}, err
@@ -1432,9 +1441,8 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	var session agentSessionRequest
-	if len(requestedSession) > 0 {
-		session = requestedSession[0]
+	if node.UninstallPending && session.Capabilities == agentSelfUninstallCapability {
+		return AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, NodeGUID: node.GUID, UninstallRequestID: node.uninstallRequestID}, nil
 	}
 	leaseID, err := claimAgentLeaseTx(tx, node.ID, session.ID, session.Epoch, now)
 	if err != nil {

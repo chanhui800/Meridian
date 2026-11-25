@@ -195,6 +195,7 @@ test('node API exposes CRUD, enrollment refresh, and scheduler verbs', () => {
   assert.match(api, /createNode\(data\).*'POST', '\/api\/nodes'/s);
   assert.match(api, /updateNode\(id, data\).*'PUT'/s);
   assert.match(api, /deleteNode\(id\).*'DELETE'/s);
+  assert.match(api, /forceDeleteNode\(id\).*'POST'.*force-delete/s);
   assert.match(api, /refreshNodeEnrollment.*'POST'.*\/enrollment/s);
   assert.match(api, /saveNodeScheduler\(data\).*'PUT', '\/api\/node-scheduler'/s);
 });
@@ -203,9 +204,12 @@ test('node page wires selectable manual mode, deletion, and DNS safety', () => {
   assert.match(page, /name="manual-node"/);
   assert.match(page, /请选择一个节点/);
   assert.match(page, /API\.deleteNode/);
+  assert.match(page, /uninstall_pending/);
+  assert.match(page, /强制移除面板记录/);
+  assert.match(page, /卸载指令已发送/);
   assert.match(page, /DNS 仅在 Agent 应用配置并通过域名证书与入口健康检查后切换/);
   assert.match(page, /已有连接不会被强制迁移/);
-  assert.match(page, /当前 Agent 会继续运行，直到新 Agent 注册成功/);
+  assert.match(page, /删除节点.*自动卸载 Agent/);
   assert.doesNotMatch(page, /立即撤销该节点现有 Agent 令牌/);
 });
 

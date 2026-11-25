@@ -192,7 +192,11 @@ func TestDeletingControlNodePreservesBilledSiteMinutes(t *testing.T) {
 				f.assertTraffic(t)
 				for _, node := range f.nodes {
 					if status := f.delete(t, node.ID); status != http.StatusOK {
-						t.Fatalf("full authenticated deletion status=%d", status)
+						t.Fatalf("authenticated deletion request status=%d", status)
+					}
+					f.assertTraffic(t)
+					if err := f.app.db.ForceDeletePendingNode(node.ID); err != nil {
+						t.Fatalf("force-remove pending node after verifying its traffic ledger: %v", err)
 					}
 					f.assertTraffic(t)
 					if status := f.delete(t, node.ID); status != http.StatusNotFound {

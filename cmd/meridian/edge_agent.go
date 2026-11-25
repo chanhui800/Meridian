@@ -2844,6 +2844,30 @@ func runEdgeAgent() (runErr error) {
 	}
 	defer instanceUnlock()
 	revokedMarker := *statePath + ".revoked"
+	uninstallMarker := *statePath + agentUninstallMarkerSuffix
+	if markerData, markerErr := os.ReadFile(uninstallMarker); markerErr == nil {
+		requestID := strings.TrimSpace(string(markerData))
+		state, stateErr := edgeLoadState(*statePath)
+		if stateErr == nil && state.Token != "" && state.NodeGUID != "" && agentUninstallRequestIDPattern.MatchString(requestID) {
+			for ctx.Err() == nil {
+				if launchErr := launchAgentUninstallHelper(controller, *statePath, state.NodeGUID, requestID); launchErr != nil {
+					fmt.Fprintf(os.Stderr, "Meridian Agent uninstall helper retry failed: %v\n", launchErr)
+				}
+				timer := time.NewTimer(30 * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+				case <-timer.C:
+				}
+			}
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "Meridian Agent uninstall marker is invalid; keeping the service inert: %v\n", stateErr)
+		<-ctx.Done()
+		return nil
+	} else if !errors.Is(markerErr, os.ErrNotExist) {
+		return fmt.Errorf("read Agent uninstall marker: %w", markerErr)
+	}
 	if _, statErr := os.Stat(revokedMarker); statErr == nil {
 		if !edgeEnrollmentTokenAvailable(*tokenFile) {
 			fmt.Fprintln(os.Stderr, "Meridian Agent token was revoked; run the generated re-enrollment script to start it again.")
@@ -3095,12 +3119,16 @@ func runEdgeAgent() (runErr error) {
 			// loop while the normal report loop is still running.
 			lastConfigAt = now
 			var config AgentRuntimeConfig
-			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, http.Header{
+			headers := http.Header{
 				agentPlatformHeader: []string{goruntime.GOOS + "/" + goruntime.GOARCH},
 				agentVersionHeader:  []string{appVersion},
 				agentSessionHeader:  []string{bootID},
 				agentEpochHeader:    []string{strconv.FormatInt(sessionEpoch, 10)},
-			}); err != nil {
+			}
+			if goruntime.GOOS == "linux" {
+				headers.Set(agentCapabilitiesHeader, agentSelfUninstallCapability)
+			}
+			if err := edgeAPIRequestWithHeaders(ctx, client, http.MethodGet, controller+"/api/agent/config", state.Token, nil, &config, headers); err != nil {
 				updateConfigValid = false
 				updates.invalidate()
 				if isEdgeAgentRevoked(err) {
@@ -3111,6 +3139,38 @@ func runEdgeAgent() (runErr error) {
 					continue
 				}
 				fmt.Fprintf(os.Stderr, "Meridian Agent config fetch failed: %v\n", err)
+			} else if config.UninstallRequestID != "" {
+				if !agentSelfUninstallRequestMatches(config, state.NodeGUID) {
+					updateConfigValid = false
+					updates.invalidate()
+					fmt.Fprintln(os.Stderr, "Meridian Agent rejected an uninstall command with a mismatched node identity")
+				} else {
+					// A valid uninstall request must stop serving immediately, even
+					// while the detached helper is starting or waiting for network
+					// access. Keep the process alive only to retry helper launch; the
+					// durable marker makes the next service start inert as well.
+					updateConfigValid = false
+					updates.invalidate()
+					pendingConfig = nil
+					stopLiveReporter()
+					if quiesceErr := runtime.quiesce(false); quiesceErr != nil {
+						fmt.Fprintf(os.Stderr, "Meridian Agent stopped serving for uninstall; event spool flush failed: %v\n", quiesceErr)
+					}
+					for ctx.Err() == nil {
+						if uninstallErr := edgeScheduleAgentUninstall(controller, *statePath, state.NodeGUID, config.UninstallRequestID); uninstallErr == nil {
+							break
+						} else {
+							fmt.Fprintf(os.Stderr, "Meridian Agent could not start the self-uninstall helper; retrying while offline: %v\n", uninstallErr)
+						}
+						timer := time.NewTimer(30 * time.Second)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+						case <-timer.C:
+						}
+					}
+					return nil
+				}
 			} else if configErr := validateAgentConfigEnvelope(config); configErr != nil {
 				updateConfigValid = false
 				updates.invalidate()

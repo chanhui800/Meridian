@@ -162,4 +162,6 @@ v1.11.12 Controller 会自动把 v1.11.11 的 schema 60 数据库迁移到 schem
 
 ## 删除节点
 
-先在 Controller 中删除节点，主控会撤销该节点的 Agent 授权。然后在节点执行卸载步骤。删除节点不会自动删除节点上的其他业务进程，也不会修改 Nginx、Caddy 或 Xray 配置。
+在 Controller 中删除节点后，面板先停用该节点的调度并清理 Meridian 管理的 DNS。Linux 上由 systemd 或 OpenRC 管理的 Agent 会收到与节点身份绑定的一次性卸载指令，在目标主机停止服务、删除自身程序和凭据后回传确认；确认后 Controller 才删除节点记录并撤销凭据。独立恢复服务会保存卸载进度，在网络中断或主机重启后继续处理。已安装的服务清理只针对 `meridian-agent`，不会删除节点上的其他业务，也不会修改 Nginx、Caddy 或 Xray 配置。
+
+节点离线或运行旧版 Agent 时，面板会保留“等待 Agent 卸载”状态，Agent 恢复连接并自动升级后继续处理。若主机已不可达且不再需要自动卸载，可在节点卡片中选择“强制移除面板记录”；这只会移除 Controller 记录，主机上的 Agent 仍需按[卸载步骤](agent-installation.md#卸载-agent)手动清除。

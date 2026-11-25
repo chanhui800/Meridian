@@ -77,6 +77,8 @@ type ControlNode struct {
 	AgentApplyErrorAtMS         int64  `json:"agent_apply_error_at_ms"`
 	AgentApplyFailures          int64  `json:"agent_apply_failures"`
 	AgentListenerError          string `json:"agent_listener_error"`
+	UninstallPending            bool   `json:"uninstall_pending"`
+	UninstallRequestedAtMS      int64  `json:"uninstall_requested_at_ms,omitempty"`
 	EventSpoolError             string `json:"event_spool_error"`
 	EventQueueDepth             int    `json:"event_queue_depth"`
 	EventDropped                int64  `json:"event_dropped"`
@@ -103,6 +105,7 @@ type ControlNode struct {
 	lastSequence          int64
 	enrollmentTokenHash   string
 	agentTokenHash        string
+	uninstallRequestID    string
 	enrollmentExpiresMS   int64
 	probeSecretCiphertext string
 }
@@ -595,7 +598,7 @@ const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,add
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
-	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
+	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms,uninstall_request_id,uninstall_requested_at_ms
 	FROM control_nodes`
 
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
@@ -608,7 +611,8 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
 		&node.ConfigRevision, &node.DesiredConfigRevision, &node.AppliedConfigRevision,
 		&node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
-		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
+		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS,
+		&node.uninstallRequestID, &node.UninstallRequestedAtMS)
 	if err != nil {
 		return ControlNode{}, err
 	}
@@ -618,6 +622,7 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	node.NetworkInterfaces = normalizeReportedNetworkInterfaces(node.NetworkInterfaces)
 	node.Enabled = enabled != 0
 	node.ConfigDirty = configDirty != 0
+	node.UninstallPending = node.uninstallRequestID != ""
 	node.EnrollmentAvailable = node.enrollmentTokenHash != "" && now.UnixMilli() < node.enrollmentExpiresMS
 	if node.LastSeenAtMS > 0 && now.Sub(time.UnixMilli(node.LastSeenAtMS)) <= nodeOnlineWindow {
 		node.Status = "online"
@@ -655,6 +660,113 @@ func (d *DB) MigrateControlNodesToSinglePort(defaultPort int, now time.Time) err
 			updated_at_ms=?
 		WHERE entry_mode!='direct' OR http_port!=0 OR https_port NOT BETWEEN 1 AND 65535`, defaultPort, now.UnixMilli())
 	return err
+}
+
+func newAgentUninstallRequestID() (string, error) {
+	value := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
+}
+
+// BeginNodeUninstall disables scheduling immediately but keeps the enrolled
+// identity available until an Agent that supports self-uninstall confirms the
+// operation. An unenrolled node has no remote Agent to command and can be
+// deleted immediately by the caller.
+func (d *DB) BeginNodeUninstall(id int64, now time.Time) (ControlNode, bool, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	defer tx.Rollback()
+	node, err := scanControlNode(tx.QueryRow(controlNodeSelect+" WHERE id=?", id), now)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ControlNode{}, false, errNodeNotFound
+	}
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	if node.UninstallPending {
+		if err := tx.Commit(); err != nil {
+			return ControlNode{}, false, err
+		}
+		return node, true, nil
+	}
+	if node.agentTokenHash == "" {
+		if err := tx.Commit(); err != nil {
+			return ControlNode{}, false, err
+		}
+		return node, false, nil
+	}
+	requestID, err := newAgentUninstallRequestID()
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	result, err := tx.Exec(`UPDATE control_nodes SET enabled=0,uninstall_request_id=?,uninstall_requested_at_ms=?,
+		config_revision=config_revision+1,desired_config_hash='',desired_config_revision=0,config_dirty=1,updated_at_ms=?
+		WHERE id=? AND uninstall_request_id=''`, requestID, now.UnixMilli(), now.UnixMilli(), id)
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	if changed == 0 {
+		return ControlNode{}, false, errors.New("node uninstall request changed concurrently")
+	}
+	if err := d.commitControllerNodeAdmission(tx); err != nil {
+		return ControlNode{}, false, err
+	}
+	node, err = d.controlNodeByID(id, now)
+	return node, true, err
+}
+
+// AcknowledgeNodeUninstall binds completion to the still-pending node token,
+// GUID, and one-shot request ID. The endpoint uses the standard Agent
+// authentication middleware; if the response is lost after deletion commits,
+// a retry receives 401, which the already-uninstalled helper treats as final.
+func (d *DB) AcknowledgeNodeUninstall(agentToken, nodeGUID, requestID string) error {
+	tokenHash := hashNodeToken(strings.TrimSpace(agentToken))
+	nodeGUID = strings.TrimSpace(nodeGUID)
+	requestID = strings.TrimSpace(requestID)
+	if tokenHash == hashNodeToken("") || !validTLSNodeGUID(nodeGUID) || len(requestID) != 32 {
+		return errInvalidAgentToken
+	}
+	if _, err := hex.DecodeString(requestID); err != nil {
+		return errInvalidAgentToken
+	}
+	var nodeID int64
+	var storedGUID, storedRequestID string
+	err := d.db.QueryRow(`SELECT id,guid,uninstall_request_id FROM control_nodes WHERE agent_token_hash=?`, tokenHash).Scan(&nodeID, &storedGUID, &storedRequestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errInvalidAgentToken
+	}
+	if err != nil {
+		return err
+	}
+	if storedGUID != nodeGUID || storedRequestID != requestID || storedRequestID == "" {
+		return errInvalidAgentToken
+	}
+	if err := d.DeleteControlNode(nodeID); errors.Is(err, errNodeNotFound) {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func (d *DB) ForceDeletePendingNode(id int64) error {
+	var pending string
+	if err := d.db.QueryRow(`SELECT uninstall_request_id FROM control_nodes WHERE id=?`, id).Scan(&pending); errors.Is(err, sql.ErrNoRows) {
+		return errNodeNotFound
+	} else if err != nil {
+		return err
+	}
+	if strings.TrimSpace(pending) == "" {
+		return errors.New("node does not have a pending Agent uninstall")
+	}
+	return d.DeleteControlNode(id)
 }
 
 func (d *DB) controlNodeByID(id int64, now time.Time) (ControlNode, error) {
@@ -923,12 +1035,15 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, err
 	}
 	defer tx.Rollback()
-	var currentAddress, currentDNSPublish, currentListenInterface, currentAddressV4, currentAddressV6, currentReportedInterfaces string
+	var currentAddress, currentDNSPublish, currentListenInterface, currentAddressV4, currentAddressV6, currentReportedInterfaces, uninstallRequestID string
 	var currentPort, currentResetDay, currentEnabled int
-	if err := tx.QueryRow("SELECT address,dns_publish,listen_interface,address_v4,address_v6,reported_interfaces,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentListenInterface, &currentAddressV4, &currentAddressV6, &currentReportedInterfaces, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRow("SELECT address,dns_publish,listen_interface,address_v4,address_v6,reported_interfaces,https_port,reset_day,enabled,uninstall_request_id FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentListenInterface, &currentAddressV4, &currentAddressV6, &currentReportedInterfaces, &currentPort, &currentResetDay, &currentEnabled, &uninstallRequestID); errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errNodeNotFound
 	} else if err != nil {
 		return ControlNode{}, err
+	}
+	if uninstallRequestID != "" {
+		return ControlNode{}, errors.New("node deletion is waiting for Agent uninstall")
 	}
 	portChanged := currentPort != input.Port
 	var currentInterfaces []NodeNetworkInterface
@@ -1001,7 +1116,7 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 	if err != nil {
 		return ControlNode{}, "", err
 	}
-	result, err := d.db.Exec(`UPDATE control_nodes SET enrollment_token_hash=?,enrollment_expires_at_ms=?,updated_at_ms=? WHERE id=?`, hashNodeToken(token),
+	result, err := d.db.Exec(`UPDATE control_nodes SET enrollment_token_hash=?,enrollment_expires_at_ms=?,updated_at_ms=? WHERE id=? AND uninstall_request_id=''`, hashNodeToken(token),
 		now.Add(nodeEnrollmentLifetime).UnixMilli(), now.UnixMilli(), id)
 	if err != nil {
 		return ControlNode{}, "", err
@@ -1011,7 +1126,14 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 		return ControlNode{}, "", err
 	}
 	if rows != 1 {
-		return ControlNode{}, "", errNodeNotFound
+		var exists int
+		if lookupErr := d.db.QueryRow(`SELECT COUNT(*) FROM control_nodes WHERE id=?`, id).Scan(&exists); lookupErr != nil {
+			return ControlNode{}, "", lookupErr
+		}
+		if exists == 0 {
+			return ControlNode{}, "", errNodeNotFound
+		}
+		return ControlNode{}, "", errors.New("node deletion is waiting for Agent uninstall")
 	}
 	node, err := d.controlNodeByID(id, now)
 	return node, token, err
@@ -1201,7 +1323,7 @@ func (d *DB) retryNodeTLSCleanupUnlocked(onlyGUID string) error {
 
 func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
 	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>?`, hashNodeToken(token), now.UnixMilli()).Scan(&count)
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>? AND uninstall_request_id=''`, hashNodeToken(token), now.UnixMilli()).Scan(&count)
 	if err != nil {
 		return err
 	}
@@ -1360,7 +1482,7 @@ func (d *DB) EnrollControlNodeFromSource(token string, now time.Time, sourceIP s
 	}
 	defer tx.Rollback()
 	var id int64
-	err = tx.QueryRow(`SELECT id FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>?`, hashNodeToken(token), now.UnixMilli()).Scan(&id)
+	err = tx.QueryRow(`SELECT id FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>? AND uninstall_request_id=''`, hashNodeToken(token), now.UnixMilli()).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, "", errInvalidNodeToken
 	}
