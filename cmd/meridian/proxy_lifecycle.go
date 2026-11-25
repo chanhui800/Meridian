@@ -536,16 +536,55 @@ func (pm *ProxyManager) dashboardSnapshotFromSites(sites []Site, monthlyBySite m
 // snapshot. All endpoints pass one site list and timestamp through this
 // helper, so Controller and Agent traffic use identical aggregation rules.
 func (pm *ProxyManager) dashboardSnapshotWithSites(sites []Site, settings SystemSettings, now time.Time) (*TrafficSnapshot, error) {
-	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, timezoneLocation(settings.ScheduleTimezone))
+	location := timezoneLocation(settings.ScheduleTimezone)
+	cycleStart := trafficCycleStart(now, settings.TrafficResetDay, location)
 	monthlyBySite, err := pm.database.SumTrafficSinceBySite(cycleStart, settings.TrafficBillingMode)
 	if err != nil {
 		return nil, err
+	}
+	_, monthStart, _, _, err := dashboardTrendWindowWithLocation("month", now, time.Time{}, time.Time{}, location)
+	if err != nil {
+		return nil, err
+	}
+	var monthlyRequests int64
+	var pendingBySite map[int64]dashboardPendingTraffic
+	var generations map[int64]uint64
+	for attempt := 0; attempt < 3; attempt++ {
+		pendingBySite, _, generations, _ = pm.lockLocalDashboardTrendSnapshot(nil, now)
+		monthlyRequests, err = pm.database.SumRequestsSince(monthStart)
+		if err != nil {
+			return nil, err
+		}
+		if attempt == 2 || pm.dashboardTrendGenerationsMatch(nil, generations) {
+			break
+		}
+	}
+	for _, pending := range pendingBySite {
+		monthlyRequests = saturatingAddInt64(monthlyRequests, pending.Requests)
 	}
 	nodeLiveBySite, err := pm.database.NodeSiteLiveTrafficSnapshot(now)
 	if err != nil {
 		return nil, err
 	}
-	return pm.dashboardSnapshotFromSites(sites, monthlyBySite, nodeLiveBySite, settings, now), nil
+	for _, live := range nodeLiveBySite {
+		if !live.Running {
+			continue
+		}
+		pendingRequests := live.Requests - live.PersistedRequests
+		counterEpochChanged := live.CounterEpoch != 0 && live.PersistedCounterEpoch != 0 && live.CounterEpoch != live.PersistedCounterEpoch
+		if (live.ReportSessionID != "" && live.ReportSessionID != live.PersistedReportSessionID) || counterEpochChanged || live.Requests < live.PersistedRequests {
+			// A new Agent session or per-site counter epoch restarts the
+			// cumulative value. Its live count must be added in full; subtracting
+			// the previous watermark would hide requests until the next report.
+			pendingRequests = live.Requests
+		}
+		if pendingRequests > 0 {
+			monthlyRequests = saturatingAddInt64(monthlyRequests, pendingRequests)
+		}
+	}
+	snapshot := pm.dashboardSnapshotFromSites(sites, monthlyBySite, nodeLiveBySite, settings, now)
+	snapshot.MonthlyRequests = monthlyRequests
+	return snapshot, nil
 }
 
 // TrafficSnapshot builds the authoritative global traffic payload: every DB

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -73,6 +74,7 @@ type TrafficSnapshot struct {
 	RunningSites         int                      `json:"running_sites"`
 	TotalTraffic         int64                    `json:"total_traffic"`
 	MonthlyTraffic       int64                    `json:"monthly_traffic"`
+	MonthlyRequests      int64                    `json:"monthly_requests"`
 	BillingMode          string                   `json:"billing_mode"`
 	TrafficResetDay      int                      `json:"traffic_reset_day"`
 	TotalRequests        int64                    `json:"total_requests"`
@@ -92,23 +94,26 @@ type TrafficSnapshot struct {
 // NodeSiteLiveTraffic is the last persisted runtime sample from an applied
 // Agent. The dashboard overlays it after taking the local proxy snapshot.
 type NodeSiteLiveTraffic struct {
-	SiteID             int64
-	NodeID             int64
-	Running            bool
-	CumulativeBytesIn  int64
-	CumulativeBytesOut int64
-	Requests           int64
-	SampledAtMS        int64
-	AgentSampledAtMS   int64
-	ReceivedAtMS       int64
-	DownloadBPS        float64
-	UploadBPS          float64
-	RateValid          bool
-	RateReceivedAtMS   int64
-	CounterDomain      uint64
-	ReportSessionID    string
-	CounterEpoch       uint64
-	CacheSizeBytes     int64
+	SiteID                   int64
+	NodeID                   int64
+	Running                  bool
+	CumulativeBytesIn        int64
+	CumulativeBytesOut       int64
+	Requests                 int64
+	PersistedRequests        int64
+	PersistedReportSessionID string
+	PersistedCounterEpoch    uint64
+	SampledAtMS              int64
+	AgentSampledAtMS         int64
+	ReceivedAtMS             int64
+	DownloadBPS              float64
+	UploadBPS                float64
+	RateValid                bool
+	RateReceivedAtMS         int64
+	CounterDomain            uint64
+	ReportSessionID          string
+	CounterEpoch             uint64
+	CacheSizeBytes           int64
 }
 
 // TrafficHistory is the single-site envelope returned by
@@ -280,6 +285,12 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 	return d.cachedTrafficSinceBySite(start, billingMode)
 }
 
+// SumRequestsSince returns persisted request counts in a time range. Request
+// totals use the same Controller and Agent ledgers as the dashboard trend.
+func (d *DB) SumRequestsSince(start time.Time) (int64, error) {
+	return d.cachedRequestTotalSince(start)
+}
+
 type trafficTotalsQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
@@ -409,6 +420,9 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 			COALESCE(c.last_bytes_in, 0),
 			COALESCE(c.last_bytes_out, 0),
 			COALESCE(c.last_request_count, sch.agent_request_count, 0),
+			COALESCE(c.last_request_count, 0),
+			COALESCE(c.report_session_id, ''),
+			COALESCE(c.boot_id, ''),
 			COALESCE(c.cache_size_bytes, 0),
 			COALESCE(c.updated_at_ms, 0),
 			COALESCE(n.last_seen_at_ms, 0),
@@ -434,9 +448,12 @@ func (d *DB) NodeSiteLiveTrafficSnapshot(now time.Time) (map[int64]NodeSiteLiveT
 		var value NodeSiteLiveTraffic
 		var nodeLastSeenMS int64
 		var nodeEnabled int
-		var listenerError, dnsStatus, activeSession, reportedSession string
-		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.CacheSizeBytes, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus, &activeSession, &reportedSession); err != nil {
+		var listenerError, dnsStatus, activeSession, reportedSession, persistedBootID string
+		if err := rows.Scan(&value.SiteID, &value.NodeID, &value.CumulativeBytesIn, &value.CumulativeBytesOut, &value.Requests, &value.PersistedRequests, &value.PersistedReportSessionID, &persistedBootID, &value.CacheSizeBytes, &value.SampledAtMS, &nodeLastSeenMS, &nodeEnabled, &listenerError, &dnsStatus, &activeSession, &reportedSession); err != nil {
 			return nil, err
+		}
+		if separator := strings.LastIndexByte(persistedBootID, ':'); separator >= 0 {
+			value.PersistedCounterEpoch, _ = strconv.ParseUint(persistedBootID[separator+1:], 10, 64)
 		}
 		liveKey := nodeLiveTrafficKey{nodeID: value.NodeID, siteID: value.SiteID}
 		// The overlay orders both report channels by capture sequence. A

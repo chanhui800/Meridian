@@ -35,7 +35,7 @@ func testEdgeRuntimeKey(t *testing.T) string {
 func TestEdgeAgentRollbackSurfacesListenerRestoreFailure(t *testing.T) {
 	cause := errors.New("clear asset cache failed")
 	listenErr := errors.New("address already in use")
-	runtime := &edgeAgentRuntime{listen: func(string, string) (net.Listener, error) {
+	runtime := &edgeAgentRuntime{listen: func(string, string, string) (net.Listener, error) {
 		return nil, listenErr
 	}}
 	oldServer := &http.Server{}
@@ -64,6 +64,35 @@ func TestEdgeAgentApplyFailureIsExposedInRuntimeStatus(t *testing.T) {
 	_, _, _, applyError, _, _ := runtime.status()
 	if applyError == "" || !strings.Contains(applyError, "Agent configuration is invalid") {
 		t.Fatalf("apply error=%q, want the runtime apply failure", applyError)
+	}
+}
+
+func TestEdgeAgentNoneListenerFamilyNeverBindsPort(t *testing.T) {
+	runtime := &edgeAgentRuntime{stateDir: t.TempDir()}
+	defer runtime.close()
+	config := AgentRuntimeConfig{
+		SchemaVersion:  agentConfigSchemaVersion,
+		ConfigRevision: 1,
+		NodeGUID:       "pending-dns-family",
+		HTTPSPort:      19443,
+		ListenFamily:   "none",
+		DynamicKey:     testEdgeRuntimeKey(t),
+		ProbeSecret:    testEdgeRuntimeKey(t),
+		Routes:         []AgentSiteRoute{},
+	}
+	var err error
+	config.ConfigHash, err = agentConfigHash(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.apply(config); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.server != nil {
+		t.Fatal("Agent opened a listener before automatic DNS had any address family")
+	}
+	if runtime.listenFamily != "none" || runtime.appliedHash != config.ConfigHash {
+		t.Fatalf("pending family config was not acknowledged safely: family=%q hash=%q", runtime.listenFamily, runtime.appliedHash)
 	}
 }
 
@@ -201,6 +230,8 @@ func TestEdgeMetadataIPv4FromResponse(t *testing.T) {
 	}{
 		{name: "public ipv4", value: "198.51.100.42\n", want: "198.51.100.42"},
 		{name: "ipv6 rejected", value: "2001:db8::42", want: ""},
+		{name: "private ipv4 rejected", value: "10.0.0.42", want: ""},
+		{name: "carrier nat ipv4 rejected", value: "100.64.0.42", want: ""},
 		{name: "invalid rejected", value: "not-an-ip", want: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -208,6 +239,102 @@ func TestEdgeMetadataIPv4FromResponse(t *testing.T) {
 				t.Fatalf("metadata IPv4=%q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestEdgeControllerObservedAddressProbeUsesRequestedFamilyAndAuth(t *testing.T) {
+	for _, testCase := range []struct {
+		name, requested, response, want string
+		found                           bool
+	}{
+		{"ipv4", "v4", `{"family":"v4","address":"140.245.35.86"}`, "140.245.35.86", true},
+		{"ipv6", "v6", `{"family":"v6","address":"2606:4700:4700::1111"}`, "2606:4700:4700::1111", true},
+		{"private_rejected", "v4", `{"family":"v4","address":"100.64.0.1"}`, "", false},
+		{"mismatched_family_rejected", "v4", `{"family":"v6","address":"2606:4700:4700::1111"}`, "", false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.String() != "https://panel.example.test/base/api/agent/observed-address" {
+					t.Fatalf("probe URL=%q", request.URL.String())
+				}
+				if request.Method != http.MethodPost {
+					t.Fatalf("probe method=%q, want POST", request.Method)
+				}
+				if request.Header.Get("Authorization") != "Bearer agent-token" {
+					t.Fatalf("authorization header=%q", request.Header.Get("Authorization"))
+				}
+				var body struct {
+					Family string `json:"family"`
+				}
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Fatalf("decode probe body: %v", err)
+				}
+				if body.Family != testCase.requested {
+					t.Fatalf("probe family=%q, want %q", body.Family, testCase.requested)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(testCase.response)),
+					Request:    request,
+				}, nil
+			})}
+			address, found := edgeFetchControllerObservedAddress(context.Background(), client, "https://panel.example.test/base", "agent-token", testCase.requested)
+			if found != testCase.found {
+				t.Fatalf("found=%v, want %v", found, testCase.found)
+			}
+			if found && (address.Family != testCase.requested || address.Address != testCase.want || address.Interface != "controller") {
+				t.Fatalf("observed address=%+v", address)
+			}
+		})
+	}
+	if network, ok := edgeControllerAddressProbeNetwork("v4"); !ok || network != "tcp4" {
+		t.Fatalf("IPv4 probe network=%q ok=%v", network, ok)
+	}
+	if network, ok := edgeControllerAddressProbeNetwork("v6"); !ok || network != "tcp6" {
+		t.Fatalf("IPv6 probe network=%q ok=%v", network, ok)
+	}
+}
+
+func TestEdgeDiscoverControllerObservedAddressOnlyProbesMissingFamily(t *testing.T) {
+	controller := "https://panel.example.test/base"
+	v4Key := edgeControllerAddressCacheKey(controller, "agent-token", "v4")
+	v6Key := edgeControllerAddressCacheKey(controller, "agent-token", "v6")
+	checkedAt := time.Now().Add(-10 * time.Minute)
+	edgeControllerAddressCache.Lock()
+	previous := edgeControllerAddressCache.entries
+	edgeControllerAddressCache.entries = map[string]edgeControllerAddressCacheEntry{
+		v4Key: {checkedAt: time.Now(), address: "140.245.35.86"},
+		v6Key: {checkedAt: checkedAt, address: "2606:4700:4700::1111"},
+	}
+	edgeControllerAddressCache.Unlock()
+	t.Cleanup(func() {
+		edgeControllerAddressCache.Lock()
+		edgeControllerAddressCache.entries = previous
+		edgeControllerAddressCache.Unlock()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	edgeDiscoverControllerObservedAddresses(ctx, controller, "agent-token", []NodeNetAddress{
+		{Family: "v6", Address: "2606:4700:4700::1111", Interface: "eth0"},
+	})
+	edgeControllerAddressCache.Lock()
+	defer edgeControllerAddressCache.Unlock()
+	if got := edgeControllerAddressCache.entries[v4Key]; got.address != "140.245.35.86" {
+		t.Fatalf("missing-family cache entry=%+v", got)
+	}
+	if got := edgeControllerAddressCache.entries[v6Key]; got.address != "2606:4700:4700::1111" || !got.checkedAt.Equal(checkedAt) {
+		t.Fatalf("existing-family entry was unexpectedly probed: %+v", got)
+	}
+}
+
+func TestEdgeControllerAddressCacheIsScopedToAgent(t *testing.T) {
+	controller := "https://panel.example.test/base"
+	first := edgeControllerAddressCacheKey(controller, "agent-one", "v4")
+	second := edgeControllerAddressCacheKey(controller, "agent-two", "v4")
+	if first == second || strings.Contains(first, "agent-one") || strings.Contains(second, "agent-two") {
+		t.Fatalf("cache keys must be per-agent without embedding raw tokens: first=%q second=%q", first, second)
 	}
 }
 
@@ -823,10 +950,13 @@ func TestScheduledProbeUsesWireProbeSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node := ControlNode{GUID: nodeGUID, Address: address, Port: port}
+	node := ControlNode{GUID: nodeGUID, Address: address, DNSPublish: "v4", Port: port}
 	roots := x509.NewCertPool()
 	roots.AddCert(certificate)
-	if err := probeScheduledNodeWithRoots(context.Background(), node, host, probeSecret, roots); err != nil {
+	// This test isolates wire-authentication behavior with a loopback listener;
+	// DNS publication rejects loopback addresses, so exercise the production
+	// single-address TLS probe directly rather than the public-address selector.
+	if err := probeScheduledNodeAtAddress(context.Background(), node, host, probeSecret, roots, address); err != nil {
 		t.Fatalf("scheduled probe failed: %v", err)
 	}
 }

@@ -56,7 +56,46 @@ function nodeAvailability(node) {
 }
 
 function nodeAddressLabel(node) {
-  return node.address_v4 || node.address_v6 || node.address || '等待地址上报';
+  const family = String(node?.dns_publish || 'auto').trim().toLowerCase() === 'v6' ? 'v6' : 'v4';
+  return reportedNodeAddress(node, family) || '等待地址上报';
+}
+
+function isPublicNodeAddress(value, family) {
+  const address = String(value || '').trim();
+  if (family === 'v4') {
+    const octets = address.split('.');
+    if (octets.length !== 4 || octets.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false;
+    const [first, second] = octets.map(Number);
+    return first !== 0 && first !== 10 && first !== 127 && first < 224 &&
+      !(first === 169 && second === 254) &&
+      !(first === 172 && second >= 16 && second <= 31) &&
+      !(first === 192 && second === 168) &&
+      !(first === 100 && second >= 64 && second <= 127);
+  }
+  if (family !== 'v6' || !address.includes(':') || address.includes('%')) return false;
+  let normalized;
+  try {
+    const hostname = new URL(`http://[${address}]/`).hostname.toLowerCase();
+    normalized = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : address.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (normalized.startsWith('::') || normalized.startsWith('ff')) return false;
+  const first = Number.parseInt(normalized.split(':')[0], 16);
+  if (!Number.isFinite(first)) return false;
+  return (first & 0xfe00) !== 0xfc00 && (first & 0xffc0) !== 0xfe80;
+}
+
+function reportedNodeAddress(node, family) {
+  const field = family === 'v4' ? 'address_v4' : 'address_v6';
+  const configured = String(node?.[field] || '').trim();
+  if (isPublicNodeAddress(configured, family)) return configured;
+  const reports = Array.isArray(node?.net_addresses) ? node.net_addresses : [];
+  const reported = reports.find(value => String(value?.family || '').toLowerCase() === family && isPublicNodeAddress(value?.address, family));
+  if (reported) return String(reported.address).trim();
+  const legacy = String(node?.address || '').trim();
+  if (isPublicNodeAddress(legacy, family)) return legacy;
+  return '';
 }
 
 function renderNodesOverview() {
@@ -160,7 +199,7 @@ function renderNodeCards() {
       <div class="fleet-row-details" id="node-detail-${id}" ${open ? '' : 'hidden'}>
         ${node.depleted ? '<p class="fleet-warning">已超出流量上限，不再参与调度。提高上限、清除上限或改回每月重置日即可恢复。</p>' : ''}
         <dl class="fleet-detail-grid"><div><dt>IPv4 / IPv6</dt><dd class="console-mono">${esc(node.address_v4 || '—')}<br>${esc(node.address_v6 || '—')}</dd></div><div><dt>入口与版本</dt><dd>HTTPS :${Number(node.port)}<small class="node-agent-version">Agent ${esc(node.agent_version || '未上报')}</small></dd></div><div><dt>流量周期</dt><dd>${esc(reset)}<small>${node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费'} · 优先级 ${Number(node.priority || 0)}</small></dd></div><div><dt>最近心跳</dt><dd>${node.last_seen_at_ms ? esc(meridianFormatDateTime(node.last_seen_at_ms)) : '等待 Agent 上报'}<small>${esc(node.interface_name || '等待识别网卡')}</small></dd></div></dl>
-        ${node.address_source === 'enrollment' || node.address_v6_source === 'enrollment' ? '<p class="fleet-warning">地址来自注册请求，请核对后再用于 DNS 发布。</p>' : ''}
+        ${['enrollment', 'report'].includes(node.address_source) || ['enrollment', 'report'].includes(node.address_v6_source) ? '<p class="fleet-warning">地址由 Agent 自动发现，请核对后再用于 DNS 发布。</p>' : ''}
         <p class="fleet-config-state ${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</p>
         <div class="fleet-row-actions"><button type="button" class="console-button" data-action="edit" data-id="${id}">编辑节点</button><button type="button" class="console-button" data-action="enroll" data-id="${id}">重新生成脚本</button><button type="button" class="console-button is-danger" data-action="delete" data-id="${id}">删除节点</button></div>
       </div>
@@ -262,35 +301,40 @@ function focusFleetModal(preferredID) {
   if (target) target.focus({ preventScroll: true });
 }
 
-function showNodeScript(script, command, intent) {
+function showNodeInstallCommand(command, intent) {
   const modalIntent = intent || beginModalIntent('nodes');
   if (!isModalIntentCurrent(modalIntent)) return;
-  document.getElementById('modal-title').textContent = 'Agent 一键安装脚本';
-  document.getElementById('modal-body').innerHTML = `${command ? '<p class="node-script-note">推荐直接执行以下命令（不会进入分页器）：</p><textarea class="node-script" id="node-install-command" readonly></textarea>' : ''}<p class="node-script-note">脚本含一次性令牌，24 小时内有效。请在目标 Linux amd64 或 arm64 VPS 上以 root 执行。</p><textarea class="node-script" id="node-install-script" readonly></textarea>`;
-  document.getElementById('node-install-script').value = script;
-  if (command) document.getElementById('node-install-command').value = command;
-  document.getElementById('modal-footer').innerHTML = `${command ? '<button type="button" class="console-button" id="node-copy-command">复制一键命令</button>' : ''}<button type="button" class="console-button" id="node-copy-script">复制脚本</button><button type="button" class="console-button is-primary" id="node-close-script">完成</button>`;
+  if (!command) {
+    Toast.error('安装命令生成失败，请重新注册节点');
+    return;
+  }
+  document.getElementById('modal-title').textContent = 'Agent 一键安装';
+  document.getElementById('modal-body').innerHTML = '<p class="node-script-note">在 Linux amd64 或 arm64 节点上，以 root 用户执行下面这条命令。</p><label class="node-install-command-label" for="node-install-command">一键安装命令</label><textarea class="node-script" id="node-install-command" readonly spellcheck="false"></textarea><p class="node-script-note">命令包含一次性注册令牌，有效期 24 小时。</p>';
+  document.getElementById('node-install-command').value = command;
+  document.getElementById('modal-footer').innerHTML = '<button type="button" class="console-button" id="node-copy-command">复制一键命令</button><button type="button" class="console-button is-primary" id="node-close-script">完成</button>';
   openModal({ closeOnBackdrop: false, modalClass: 'fleet-modal', intent: modalIntent });
-  focusFleetModal(command ? 'node-install-command' : 'node-install-script');
+  focusFleetModal('node-install-command');
   const copy = async (value, message) => {
     try { await navigator.clipboard.writeText(value); Toast.success(message); }
     catch (_) { Toast.error('复制失败，请从文本框手动复制'); }
   };
-  if (command) document.getElementById('node-copy-command').onclick = () => copy(command, '一键命令已复制');
-  document.getElementById('node-copy-script').onclick = () => copy(script, '脚本已复制');
+  document.getElementById('node-copy-command').onclick = () => copy(command, '一键命令已复制');
   document.getElementById('node-close-script').onclick = closeModal;
 }
 
 function openNodeForm(node) {
   const modalIntent = beginModalIntent('nodes');
   const editing = !!node;
+  const initialDNSPublish = node ? (node.dns_publish || 'auto') : 'auto';
+  const initialAddressV4 = reportedNodeAddress(node, 'v4');
+  const initialAddressV6 = reportedNodeAddress(node, 'v6');
   document.getElementById('modal-title').textContent = editing ? '编辑节点' : '创建节点';
   document.getElementById('modal-body').innerHTML = `<form id="node-form" class="fleet-form">
     <fieldset><legend>节点信息</legend><div class="fleet-form-grid"><label>节点名称<input class="form-input" id="node-name" maxlength="64" required value="${esc(node ? node.name : '')}"></label><label>端口<input class="form-input" id="node-port" type="number" min="1" max="65535" value="${node && node.port ? node.port : (location.port || 443)}"></label></div>
-    <div class="fleet-form-grid"><label>IPv4 地址<input class="form-input" id="node-address-v4" value="${esc(node ? (node.address_v4 || '') : '')}" placeholder="203.0.113.10"></label><label>IPv6 地址<input class="form-input" id="node-address-v6" value="${esc(node ? (node.address_v6 || '') : '')}" placeholder="2001:db8::10"></label></div>
-    <label>DNS 发布<select class="form-input" id="node-dns-publish"><option value="auto">自动（双栈同时发布）</option><option value="v4">仅 IPv4</option><option value="v6">仅 IPv6</option></select></label>
+    <div class="fleet-form-grid"><label>IPv4 地址<input class="form-input" id="node-address-v4" value="${esc(initialAddressV4)}" placeholder="Agent 上报后自动填写"></label><label>IPv6 地址<input class="form-input" id="node-address-v6" value="${esc(initialAddressV6)}" placeholder="Agent 上报后自动填写"></label></div>
+    <label>DNS 发布<select class="form-input" id="node-dns-publish"><option value="auto">自动（发布可用地址族）</option><option value="v4">仅 IPv4</option><option value="v6">仅 IPv6</option></select></label>
     <div class="form-help" id="node-dns-preview" role="status" aria-live="polite"></div>
-    <div class="form-help">Agent 仅提供 TLS/HTTPS。所有调度站点共用此端口并按域名区分，请确保端口可用。</div>
+    <div class="form-help">监听地址族跟随 DNS 发布：IPv4、IPv6 或双栈。尚无可发布地址时会等待 Agent 上报，不会先占用两族端口。Agent 仅提供 TLS/HTTPS，所有调度站点共用此端口并按域名区分。</div>
     ${editing ? '<label class="fleet-form-check"><input id="node-enabled" type="checkbox" checked> 启用节点</label>' : '<label>控制器地址<input class="form-input" id="node-controller" type="url" required></label>'}
     </fieldset>
     <fieldset><legend>流量额度</legend><div class="fleet-form-grid"><label>流量上限（GiB，0 为不限）<input class="form-input" id="node-quota" type="number" min="0" step="0.01" value="${node ? (Number(node.traffic_quota) / 1073741824).toFixed(2) : '0'}"></label><label>计费方式<select class="form-input" id="node-billing"><option value="outbound">上行</option><option value="bidirectional">上下行</option></select></label></div></fieldset>
@@ -303,7 +347,7 @@ function openNodeForm(node) {
     </div></details>
   </form>`;
   document.getElementById('node-billing').value = node ? node.billing_mode : 'outbound';
-  document.getElementById('node-dns-publish').value = node ? (node.dns_publish || 'auto') : 'auto';
+  document.getElementById('node-dns-publish').value = initialDNSPublish;
   const refreshDNSPreview = () => {
     const v4 = document.getElementById('node-address-v4').value.trim();
     const v6 = document.getElementById('node-address-v6').value.trim();
@@ -311,13 +355,33 @@ function openNodeForm(node) {
     const records = [];
     if (v4 && mode !== 'v6') records.push(`A → ${v4}`);
     if (v6 && mode !== 'v4') records.push(`AAAA → ${v6}`);
-    const missing = mode === 'v4' && !v4 || mode === 'v6' && !v6;
     const preview = document.getElementById('node-dns-preview');
-    preview.textContent = missing ? '所选地址族尚未填写，无法保存。' : (records.length ? `将发布：${records.join('；')}` : '地址上报后将按可用地址族发布。');
-    preview.classList.toggle('is-error', missing);
-    return !missing;
+    if (records.length) preview.textContent = `将发布：${records.join('；')}`;
+    else if (mode === 'v4') preview.textContent = '已选择仅 IPv4；保存后等待 Agent 上报 IPv4 地址，再发布 A 记录并启用 IPv4 监听。';
+    else if (mode === 'v6') preview.textContent = '已选择仅 IPv6；保存后等待 Agent 上报 IPv6 地址，再发布 AAAA 记录并启用 IPv6 监听。';
+    else preview.textContent = '等待 Agent 上报地址；上报前暂不启用监听，上报后按可用地址族发布。';
+    preview.classList.toggle('is-error', false);
+    return true;
   };
-  ['node-address-v4', 'node-address-v6', 'node-dns-publish'].forEach(id => document.getElementById(id).addEventListener('input', refreshDNSPreview));
+  ['node-address-v4', 'node-address-v6'].forEach(id => document.getElementById(id).addEventListener('input', refreshDNSPreview));
+  const dnsPublish = document.getElementById('node-dns-publish');
+  const fillReportedAddresses = () => {
+    const mode = dnsPublish.value;
+    if (mode !== 'v6') {
+      const input = document.getElementById('node-address-v4');
+      if (!input.value.trim()) input.value = reportedNodeAddress(node, 'v4');
+    }
+    if (mode !== 'v4') {
+      const input = document.getElementById('node-address-v6');
+      if (!input.value.trim()) input.value = reportedNodeAddress(node, 'v6');
+    }
+  };
+  const updateDNSPublish = () => {
+    fillReportedAddresses();
+    refreshDNSPreview();
+  };
+  dnsPublish.addEventListener('input', updateDNSPublish);
+  dnsPublish.addEventListener('change', updateDNSPublish);
   refreshDNSPreview();
   if (editing) document.getElementById('node-enabled').checked = node.enabled;
   else document.getElementById('node-controller').value = location.origin;
@@ -329,8 +393,8 @@ function openNodeForm(node) {
   document.getElementById('node-form').onsubmit = async event => {
     event.preventDefault();
     if (saving) return;
-    if (!refreshDNSPreview()) return Toast.error('请填写所选 DNS 地址族');
-    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), address_v4: document.getElementById('node-address-v4').value.trim(), address_v6: document.getElementById('node-address-v6').value.trim(), dns_publish: document.getElementById('node-dns-publish').value, port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
+    refreshDNSPreview();
+    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), address_v4: document.getElementById('node-address-v4').value.trim(), address_v6: document.getElementById('node-address-v6').value.trim(), dns_publish: document.getElementById('node-dns-publish').value, listen_interface: '', port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
     const generation = nodesPageGeneration;
     const button = document.getElementById('node-form-save');
     saving = true;
@@ -354,7 +418,7 @@ function openNodeForm(node) {
         if (!result) return;
         nodesMutationVersion++;
         if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
-        showNodeScript(result.install_script, result.install_command, modalIntent);
+        showNodeInstallCommand(result.install_command, modalIntent);
       }
       await loadNodes(true);
     } catch (error) { if (isModalIntentCurrent(modalIntent)) Toast.error(error.message || '保存失败'); }
@@ -406,7 +470,7 @@ async function handleNodeAction(event) {
       if (!result) return;
       nodesMutationVersion++;
       if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
-      showNodeScript(result.install_script, result.install_command, modalIntent); await loadNodes(true);
+      showNodeInstallCommand(result.install_command, modalIntent); await loadNodes(true);
     } catch (error) { if (isModalIntentCurrent(modalIntent)) Toast.error(error.message); }
     finally { button.disabled = false; }
   }

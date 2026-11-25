@@ -864,7 +864,12 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 				return "", fmt.Errorf("invalid path-target URL port")
 			}
 		}
-		if route := pathTargetRouteURLWithCredentials(resolved, s.pathTargetCredentialless); route != "" {
+		// A PlaybackInfo, HLS, or DASH URL that changes authority must not
+		// inherit the client's credentials from the original generic relay
+		// request. Preserve an existing credentialless restriction through
+		// nested manifests and references as well.
+		credentialless := s.pathTargetCredentialless || !sameRedirectAuthority(base, resolved)
+		if route := pathTargetRouteURLWithCredentials(resolved, credentialless); route != "" {
 			return route, nil
 		}
 		return "", fmt.Errorf("invalid path-target URL")

@@ -80,6 +80,8 @@ function makeTrafficHarness(options) {
     'traffic-totals': makeElement('traffic-totals'),
     trafficChart: makeElement('trafficChart'),
     'dashboard-trend-site': makeElement('dashboard-trend-site'),
+    's-requests': makeElement('s-requests'),
+    'dashboard-requests-summary': makeElement('dashboard-requests-summary'),
   };
 
   const intervals = [];
@@ -607,6 +609,21 @@ test('dashboard keeps SSE samples that arrive before the site list and across pa
   vm.runInContext("updateDashboardSiteSpeeds([{id:1, cumulative_bytes_in:2148, cumulative_bytes_out:1048776, bytes_in:0, bytes_out:0, traffic_used:1050924}], 3000, 'bidirectional')", sandbox);
   assert.ok(elements['dash-table'].innerHTML.includes('↓ 512 KB/s'), 'the sample received before /api/sites must be used');
   assert.ok(elements['dash-table'].innerHTML.includes('↑ 1 KB/s'), 'the bidirectional sample must be retained');
+});
+
+test('dashboard overview request count stays on the full month while the chart follows its selected range', () => {
+  const h = makeTrafficHarness();
+  vm.runInContext(`(() => {
+    dashboardTrendState = { siteId: '7', range: 'day', customStart: '', customEnd: '' };
+    dashboardTrendData = {
+      range: 'day', total_requests: 675, points: [{ timestamp_ms: 1, requests: 7 }],
+    };
+    dashboardUpdateMonthlyRequestSummary({ monthly_requests: 4994, total_requests: 675 });
+    dashboardTrendSummary(dashboardTrendData);
+  })()`, h.sandbox);
+
+  assert.equal(h.elements['s-requests'].textContent, `${h.sandbox.formatNumber(4994)} 请求`);
+  assert.equal(h.elements['dashboard-requests-summary'].textContent, `${h.sandbox.formatNumber(7)} 次`);
 });
 
 test('dashboard trends use pointer interaction and dashed crosshairs', () => {

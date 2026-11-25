@@ -46,6 +46,7 @@ type DB struct {
 	lastTrafficPruneMS          atomic.Int64
 	trafficTotalsMu             sync.Mutex
 	trafficTotals               *trafficTotalsCacheEntry
+	trafficRequestTotal         *trafficRequestTotalsCacheEntry
 	trafficTotalsEpoch          string
 	trafficTotalsSchema         int64
 	installUUID                 string

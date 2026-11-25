@@ -24,9 +24,26 @@ test('website release links and cache versions match the announced release', () 
   assert.ok(release, 'the release badge should announce a version');
   assert.match(html, new RegExp(`<script src="app-${release[1].replaceAll('.', '\\.')}\\.js">`));
   assert.ok(html.includes(`href="style.css?v=${release[1].slice(1)}"`));
-  const releaseLinks = [...html.matchAll(/<a\b[^>]*href="([^\"]+)"[^>]*>(下载正式版|Release 与校验文件)<\/a>/g)];
-  assert.equal(releaseLinks.length, 2);
+  const releaseLinks = [...html.matchAll(/<a\b[^>]*href="([^\"]*\/releases\/tag\/[^\"]+)"/g)];
+  assert.equal(releaseLinks.length, 3, 'every homepage release link should target the announced release');
   for (const link of releaseLinks) assert.ok(link[1].endsWith(`/releases/tag/${release[1]}`));
+});
+
+test('website Agent section explains installation, updates and address-family listeners', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../website/index.html'), 'utf8');
+  const section = html.match(/<section id="agent"[^>]*>([\s\S]*?)<\/section>/)?.[1];
+
+  assert.match(html, /<a href="#agent">Agent<\/a>/, 'Agent section should be reachable from navigation');
+  assert.ok(section, 'Agent should have its own prominent section');
+  assert.match(section, /从面板生成安装命令/);
+  assert.match(section, /自动下载、校验并升级/);
+  assert.match(section, /只监听 IPv4/);
+  assert.match(section, /只监听 IPv6，启用 <code>V6ONLY<\/code>/);
+  assert.match(section, /两族地址齐备时，分别监听 IPv4 与 IPv6/);
+  assert.match(section, /auto 只有一族可发布地址时，使用这一族/);
+  assert.match(section, /回环、私网、链路本地和 CGNAT 地址不会用于 DNS/);
+  assert.match(section, /Agent 通过该地址族连接 Controller/);
+  assert.match(section, /手工填写的地址不会被自动发现覆盖/);
 });
 
 test('website generic proxy client fields produce the documented request and canonical route', () => {

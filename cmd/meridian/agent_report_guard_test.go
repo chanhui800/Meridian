@@ -197,6 +197,30 @@ func TestAgentLiveReportAdmissionIsIndependentFromFullReports(t *testing.T) {
 	}
 }
 
+func TestObservedAddressAdmissionAllowsFamilyPairAndCapsConcurrency(t *testing.T) {
+	app := &App{}
+	limiter := app.agentObservedAddresses()
+	now := time.Now()
+	releaseV4, _, ok := limiter.admit(42, now)
+	if !ok {
+		t.Fatal("IPv4 family probe was rejected")
+	}
+	releaseV6, _, ok := limiter.admit(42, now)
+	if !ok {
+		t.Fatal("concurrent IPv6 family probe was rejected")
+	}
+	if _, retry, ok := limiter.admit(42, now); ok || retry <= 0 {
+		t.Fatalf("third concurrent probe admission = ok %v retry %v, want bounded rejection", ok, retry)
+	}
+	releaseV4()
+	releaseNext, _, ok := limiter.admit(42, now)
+	if !ok {
+		t.Fatal("a released family probe did not free a concurrency slot")
+	}
+	releaseV6()
+	releaseNext()
+}
+
 func TestAgentLiveHandlerIsNotBlockedByFullReport(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now()

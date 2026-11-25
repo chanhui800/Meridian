@@ -106,6 +106,47 @@ func requestClientKey(r *http.Request, trustedProxies []*net.IPNet) string {
 	return "unknown"
 }
 
+// agentReportSourceIP returns a trustworthy observed source address for node
+// address discovery. A trusted reverse proxy must provide one normalized
+// X-Real-IP value; if it does not, do not mistake the proxy address for the
+// Agent. Forwarding headers from an untrusted peer make the hop ambiguous, so
+// they also suppress discovery instead of publishing either the claimed value
+// or a possible proxy address.
+func agentReportSourceIP(r *http.Request, trustedProxies []*net.IPNet, externalProxyEnabled bool) string {
+	if r == nil {
+		return ""
+	}
+	peerIP := remoteAddressIP(r.RemoteAddr)
+	if peerIP == nil {
+		return ""
+	}
+	if externalProxyEnabled && !isTrustedProxy(peerIP, trustedProxies) {
+		return ""
+	}
+	if isTrustedProxy(peerIP, trustedProxies) {
+		value, ok := singleForwardedHeaderValue(r.Header, "X-Real-IP")
+		if !ok {
+			return ""
+		}
+		forwarded := net.ParseIP(value)
+		if forwarded == nil {
+			return ""
+		}
+		return forwarded.String()
+	}
+	for name, values := range r.Header {
+		if !isManagedForwardingHeaderName(name) {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return ""
+			}
+		}
+	}
+	return peerIP.String()
+}
+
 func isManagedForwardingHeaderName(name string) bool {
 	lowerName := strings.ToLower(name)
 	if lowerName == "forwarded" || lowerName == "x-real-ip" || strings.HasPrefix(lowerName, "x-forwarded-") {

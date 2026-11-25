@@ -11,6 +11,99 @@ const page = fs.readFileSync(path.join(root, 'web/static/js/pages/nodes.js'), 'u
 const style = fs.readFileSync(path.join(root, 'web/static/css/nodes-console.css'), 'utf8');
 const router = fs.readFileSync(path.join(root, 'web/static/js/router.js'), 'utf8');
 
+function createElement(id) {
+  const listeners = new Map(), classes = new Set();
+  return {
+    id, innerHTML: '', textContent: '', value: '', checked: false, disabled: false,
+    isConnected: true, tabIndex: 0, onclick: null,
+    classList: {
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+      toggle(name, active) { if (active) classes.add(name); else classes.delete(name); },
+    },
+    addEventListener(type, callback) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(callback);
+    },
+    dispatch(type) { for (const callback of listeners.get(type) || []) callback({ target: this }); },
+    getClientRects() { return [{}]; },
+    focus() {},
+  };
+}
+
+function makeNodeFormHarness(node) {
+  const elements = new Map(), updates = [], errors = [], successes = [];
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, createElement(id));
+    return elements.get(id);
+  };
+  const fields = {
+    'node-name': node.name || 'edge-node',
+    'node-port': String(node.port || 443),
+    'node-address-v4': node.address_v4 || '',
+    'node-address-v6': node.address_v6 || '',
+    'node-quota': String(node.traffic_quota || 0),
+    'node-reset': String(node.reset_day || 1),
+    'node-priority': String(node.priority || 100),
+    'node-address': node.address || '',
+  };
+  for (const [id, value] of Object.entries(fields)) element(id).value = value;
+  const modal = element('modal');
+  modal.contains = () => true;
+  const modalBody = element('modal-body');
+  let modalMarkup = '';
+  Object.defineProperty(modalBody, 'innerHTML', {
+    get() { return modalMarkup; },
+    set(markup) {
+      modalMarkup = String(markup);
+      for (const [, attrs, contents] of modalMarkup.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+        const id = attrs.match(/\bid="([^"]+)"/)?.[1];
+        if (!id) continue;
+        const select = element(id);
+        select.innerHTML = contents;
+        const options = [...contents.matchAll(/<option\b([^>]*)>/g)].map(([, optionAttrs]) => optionAttrs);
+        const selected = options.find(option => /\bselected\b/.test(option));
+        const value = (selected || options[0] || '').match(/\bvalue="([^"]*)"/)?.[1] || '';
+        select.value = value;
+      }
+    },
+  });
+  const document = {
+    activeElement: null,
+    body: element('body'),
+    getElementById: element,
+    querySelectorAll() { return []; },
+  };
+  const sandbox = {
+    console,
+    URL,
+    document,
+    location: { origin: 'https://controller.example.test:9090', port: '9090' },
+    Router: { current: 'nodes' },
+    API: {
+      async updateNode(id, payload) { updates.push({ id, payload }); return { node: { ...node, ...payload } }; },
+    },
+    Toast: {
+      error(message) { errors.push(message); },
+      success(message) { successes.push(message); },
+    },
+    esc(value) {
+      return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+    },
+    openModal() {},
+    closeModal() {},
+    beginModalIntent() { return { id: 'node-form' }; },
+    isModalIntentCurrent() { return true; },
+    async loadNodes() {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  sandbox.openNodeForm(node);
+  return { sandbox, document, element, updates, errors, successes };
+}
+
 test('node scheduling is a first-level page with refresh cleanup', () => {
   assert.match(html, /data-page="nodes"/);
   assert.match(html, /id="page-nodes"/);
@@ -29,6 +122,60 @@ test('node details retain the reported Agent version', () => {
   assert.match(page, /node\.agent_version \|\| '未上报'/);
   assert.match(page, /class="node-agent-version"/);
   assert.match(style, /\.fleet-detail-grid small\s*\{/);
+});
+
+test('node row address follows the configured DNS publication family', () => {
+  const sandbox = { URL, Date, Number, String, Math, Map, console };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  const node = {
+    address_v4: '140.245.35.86',
+    address_v6: '2603:c02b:301:ac39:0:b302:2cf:f545',
+  };
+  assert.equal(sandbox.nodeAddressLabel({ ...node, dns_publish: 'v4' }), '140.245.35.86');
+  assert.equal(sandbox.nodeAddressLabel({ ...node, dns_publish: 'v6' }), '2603:c02b:301:ac39:0:b302:2cf:f545');
+  assert.equal(sandbox.nodeAddressLabel({ ...node, dns_publish: 'auto' }), '140.245.35.86');
+  assert.equal(sandbox.nodeAddressLabel({ address_v4: node.address_v4, address_v6: '', dns_publish: 'v6' }), '等待地址上报');
+  assert.equal(sandbox.nodeAddressLabel({ address_v4: '', address_v6: node.address_v6, dns_publish: 'auto' }), '等待地址上报');
+});
+
+test('Agent install modal shows and copies only the single command', async () => {
+  const elements = new Map(), clipboard = [], successes = [];
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, createElement(id));
+    return elements.get(id);
+  };
+  const modal = element('modal');
+  modal.contains = () => true;
+  const sandbox = {
+    document: { getElementById: element, querySelectorAll() { return []; } },
+    navigator: { clipboard: { async writeText(value) { clipboard.push(value); } } },
+    Toast: { success(message) { successes.push(message); }, error(message) { throw new Error(message); } },
+    isModalIntentCurrent() { return true; },
+    openModal() {},
+    closeModal() {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(page, sandbox);
+  const command = "curl --proto '=https' https://controller.example.test/install.sh | sudo bash -s -- -t synthetic-token";
+  sandbox.showNodeInstallCommand(command, { id: 'install' });
+
+  assert.equal(element('modal-title').textContent, 'Agent 一键安装');
+  assert.equal(element('node-install-command').value, command);
+  assert.match(element('modal-body').innerHTML, /id="node-install-command"/);
+  assert.doesNotMatch(element('modal-body').innerHTML, /node-install-script|SYNTHETIC_FULL_SCRIPT/);
+  assert.equal((element('modal-body').innerHTML.match(/<textarea\b/g) || []).length, 1);
+  assert.match(element('modal-body').innerHTML, /有效期 24 小时/);
+  assert.match(element('modal-body').innerHTML, /Linux amd64 或 arm64/);
+  assert.match(element('modal-body').innerHTML, /root/);
+  assert.match(element('modal-footer').innerHTML, /node-copy-command/);
+  assert.match(element('modal-footer').innerHTML, /node-close-script/);
+  assert.equal((element('modal-footer').innerHTML.match(/<button\b/g) || []).length, 2);
+  assert.doesNotMatch(element('modal-footer').innerHTML, /node-copy-script/);
+
+  await element('node-copy-command').onclick();
+  assert.deepEqual(clipboard, [command]);
+  assert.deepEqual(successes, ['一键命令已复制']);
 });
 
 test('site scheduling distinguishes normal config wait from errors and overdue waits', () => {
@@ -70,6 +217,83 @@ test('node form exposes one HTTPS port without entry or gateway modes', () => {
   assert.match(page, /所有调度站点共用此端口并按域名区分/);
   assert.match(page, /port: Number\(document\.getElementById\('node-port'\)\.value\)/);
   assert.doesNotMatch(page, /entry_mode:|http_port:|https_port:/);
+});
+
+test('node DNS family auto-fills reported addresses and no longer exposes listener-interface selection', async () => {
+  const node = {
+    id: 42, name: 'dual-node', enabled: true, port: 443, dns_publish: 'v4',
+    address_v4: '', address_v6: '',
+    net_addresses: [
+      { family: 'v4', address: '198.51.100.42' },
+      { family: 'v6', address: '2001:db8::42' },
+    ],
+  };
+  const h = makeNodeFormHarness(node);
+  const dnsPublish = h.element('node-dns-publish');
+  const form = h.element('modal-body').innerHTML;
+  assert.doesNotMatch(form, /监听网卡|node-listen-interface/);
+  const v4Value = form.match(/id="node-address-v4" value="([^"]*)"/)?.[1];
+  const v6Value = form.match(/id="node-address-v6" value="([^"]*)"/)?.[1];
+  assert.equal(v4Value, '198.51.100.42');
+  assert.equal(v6Value, '2001:db8::42');
+  h.element('node-address-v4').value = v4Value;
+  h.element('node-address-v6').value = v6Value;
+  h.element('node-address-v4').dispatch('input');
+  assert.match(h.element('node-dns-preview').textContent, /A → 198\.51\.100\.42/);
+
+  dnsPublish.value = 'v6';
+  dnsPublish.dispatch('change');
+  assert.match(h.element('node-dns-preview').textContent, /AAAA → 2001:db8::42/);
+  assert.doesNotMatch(h.element('node-dns-preview').textContent, /^A →/);
+  await h.element('node-form').onsubmit({ preventDefault() {} });
+  assert.equal(h.updates.length, 1);
+  assert.equal(h.updates[0].id, node.id);
+  assert.equal(h.updates[0].payload.listen_interface, '');
+  assert.equal(h.updates[0].payload.dns_publish, 'v6');
+  assert.equal(h.updates[0].payload.address_v6, '2001:db8::42');
+});
+
+test('node DNS address fallback ignores private and carrier-grade NAT values', () => {
+  const node = { id: 43, name: 'private-legacy-node', address_v4: '', address_v6: '', address: '10.0.0.5' };
+  const h = makeNodeFormHarness(node);
+  assert.equal(h.sandbox.reportedNodeAddress(node, 'v4'), '');
+  assert.equal(h.sandbox.reportedNodeAddress(node, 'v6'), '');
+  assert.equal(h.sandbox.reportedNodeAddress({
+    address: '100.127.255.254',
+    net_addresses: [{ family: 'v4', address: '100.64.0.1' }],
+  }, 'v4'), '');
+  assert.equal(h.sandbox.reportedNodeAddress({
+    address: 'fd00::5',
+    net_addresses: [{ family: 'v6', address: 'fd00::6' }],
+  }, 'v6'), '');
+  assert.equal(h.sandbox.reportedNodeAddress({
+    net_addresses: [
+      { family: 'v4', address: '100.64.0.1' },
+      { family: 'v4', address: '140.245.35.86' },
+    ],
+  }, 'v4'), '140.245.35.86');
+});
+
+test('node can save a DNS family before the Agent reports its address', async () => {
+  const node = {
+    id: 9, name: 'v6-edge', enabled: true, port: 443, dns_publish: 'v6',
+    address_v4: '', address_v6: '', net_addresses: [],
+  };
+  const h = makeNodeFormHarness(node);
+  assert.match(h.element('node-dns-preview').textContent, /等待 Agent 上报 IPv6/);
+  assert.equal(h.element('node-dns-preview').classList.contains('is-error'), false);
+  await h.element('node-form').onsubmit({ preventDefault() {} });
+  assert.equal(h.updates.length, 1);
+  assert.equal(h.updates[0].payload.dns_publish, 'v6');
+  assert.equal(h.updates[0].payload.address_v6, '');
+  assert.equal(h.errors.length, 0);
+});
+
+test('automatic DNS waits without a listener family until an address is reported', async () => {
+  const node = { id: 10, name: 'pending-edge', enabled: true, port: 443, dns_publish: 'auto' };
+  const h = makeNodeFormHarness(node);
+  assert.match(h.element('node-dns-preview').textContent, /上报前暂不启用监听/);
+  assert.doesNotMatch(h.element('modal-body').innerHTML, /监听网卡/);
 });
 
 test('site scheduling is opt-in and uses authenticated scheduler APIs', () => {

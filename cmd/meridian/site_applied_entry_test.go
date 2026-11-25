@@ -208,6 +208,6 @@ func TestSchema60AppliedNodePortBackfillRequiresAcknowledgedConfig(t *testing.T)
 		t.Fatalf("schema-59 port backfill = acknowledged:%d pending:%d, want 9443/0", readyPort, pendingPort)
 	}
 	if err := app.db.migrate(); err != nil {
-		t.Fatalf("schema-60 migration is not idempotent: %v", err)
+		t.Fatalf("schema-61 migration is not idempotent: %v", err)
 	}
 }

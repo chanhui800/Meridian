@@ -30,7 +30,7 @@ func TestPathTargetRewriteSessionMapsPrivateAndRelativeURLsWithoutIssuer(t *test
 	}
 	for _, test := range []struct{ input, want string }{
 		{"../Videos/1/original.mkv?api_key=private", "/_proxy/v1/https/192.168.1.20:9443/emby/Items/Videos/1/original.mkv?api_key=private"},
-		{"http://127.0.0.1:8096/Videos/2/stream.mkv?api_key=local", "/_proxy/v1/http/127.0.0.1:8096/Videos/2/stream.mkv?api_key=local"},
+		{"http://127.0.0.1:8096/Videos/2/stream.mkv?api_key=local", "/_proxy/v1/_redirect/http/127.0.0.1:8096/Videos/2/stream.mkv?api_key=local"},
 	} {
 		got, err := session.rewriteAgainstSourceKind(test.input, base, dynamicDiscoverySourcePlaybackInfo, dynamicCapabilityKindResource)
 		if err != nil {
@@ -60,7 +60,7 @@ func TestPathTargetPlaybackInfoRewritesRelativeAndPrivateURLs(t *testing.T) {
 	for _, expected := range []string{
 		"/_proxy/v1/http/127.0.0.1:8096/Videos/1/original.mkv?api_key=relative",
 		"/_proxy/v1/http/127.0.0.1:8096/emby/Items/1/master.m3u8?api_key=manifest",
-		"/_proxy/v1/http/localhost:8096/emby/Subtitles/1/Stream.vtt?api_key=subtitle",
+		"/_proxy/v1/_redirect/http/localhost:8096/emby/Subtitles/1/Stream.vtt?api_key=subtitle",
 	} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("PlaybackInfo missing mapped URL %q: %s", expected, text)
@@ -108,7 +108,7 @@ func TestPathTargetHLSRewritesRelativeAndPrivateManifestLinks(t *testing.T) {
 	text := string(rewritten)
 	for _, expected := range []string{
 		`URI="/_proxy/v1/https/10.0.0.8:9443/media/audio.m3u8?sig=private"`,
-		"/_proxy/v1/http/127.0.0.1:8096/media/variant.m3u8?sig=local",
+		"/_proxy/v1/_redirect/http/127.0.0.1:8096/media/variant.m3u8?sig=local",
 	} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("HLS manifest missing mapped link %q: %s", expected, text)
@@ -116,6 +116,30 @@ func TestPathTargetHLSRewritesRelativeAndPrivateManifestLinks(t *testing.T) {
 	}
 	if strings.Contains(text, dynamicRoutePrefix) {
 		t.Fatalf("path-target HLS unexpectedly minted a capability URL: %s", text)
+	}
+}
+
+func TestPathTargetCrossAuthorityHLSAndDASHReferencesAreCredentialless(t *testing.T) {
+	base := pathTargetRewriteTestURL(t, "https://frontend.example.test/emby/media/master")
+	hls := &dynamicRewriteSession{ctx: context.Background(), base: base, source: dynamicDiscoverySourceHLS, pathTargetMode: true, rewriteRelative: true}
+	hlsPayload := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:4.0,\nhttps://cdn.example.test/video/segment.ts?sig=private\n")
+	hlsRewritten, err := rewriteHLSResponse(hlsPayload, hls)
+	if err != nil {
+		t.Fatalf("rewrite cross-authority HLS segment: %v", err)
+	}
+	if !strings.Contains(string(hlsRewritten), "/_proxy/v1/_redirect/https/cdn.example.test/video/segment.ts?sig=private") {
+		t.Fatalf("cross-authority HLS segment was not marked credentialless: %s", hlsRewritten)
+	}
+
+	dash := &dynamicRewriteSession{ctx: context.Background(), base: base, source: dynamicDiscoverySourceDASH, pathTargetMode: true, rewriteRelative: true}
+	dashPayload := []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet mimeType="video/mp4"><SegmentTemplate initialization="https://cdn.example.test/video/init-$RepresentationID$.mp4" media="https://cdn.example.test/video/chunk-$Number%05d$.m4s"/><Representation id="main" bandwidth="1000"/></AdaptationSet></Period></MPD>`)
+	dashRewritten, err := rewriteDASHResponse(dashPayload, dash)
+	if err != nil {
+		t.Fatalf("rewrite cross-authority DASH template: %v", err)
+	}
+	if !strings.Contains(string(dashRewritten), "/_proxy/v1/_redirect/https/cdn.example.test/video/init-main.mp4") ||
+		!strings.Contains(string(dashRewritten), "/_proxy/v1/_redirect/https/cdn.example.test/video/chunk-$Number%05d$.m4s") {
+		t.Fatalf("cross-authority DASH resources were not marked credentialless: %s", dashRewritten)
 	}
 }
 
@@ -130,7 +154,7 @@ func TestPathTargetDASHRewritesPrivateTemplateAndKeepsNumberExpression(t *testin
 	text := string(rewritten)
 	for _, expected := range []string{
 		"/_proxy/v1/http/10.1.2.3:8096/media/init-video-main.mp4",
-		"/_proxy/v1/http/127.0.0.1:8096/chunk-$Number%05d$.m4s",
+		"/_proxy/v1/_redirect/http/127.0.0.1:8096/chunk-$Number%05d$.m4s",
 	} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("DASH manifest missing mapped template %q: %s", expected, text)
@@ -202,7 +226,7 @@ func TestPathTargetHLSContentSteeringURLIsRewritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rewrite HLS content steering: %v", err)
 	}
-	if !strings.Contains(string(rewritten), `SERVER-URI="/_proxy/v1/http/127.0.0.1:8096/steering.json"`) {
+	if !strings.Contains(string(rewritten), `SERVER-URI="/_proxy/v1/_redirect/http/127.0.0.1:8096/steering.json"`) {
 		t.Fatalf("content steering URL was not routed: %s", rewritten)
 	}
 }

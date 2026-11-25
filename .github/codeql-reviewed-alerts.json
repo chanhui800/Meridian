@@ -11,13 +11,13 @@
       },
       "reason": "Authenticated administrator diagnostics intentionally support local and private origins. Diagnostic HTTP and TLS connections now reject cloud metadata and other special destinations, validate every DNS answer before dialing checked numeric addresses, disable environment proxies, and retain credential, redirect and response isolation. The arbitrary URL endpoint also has independent concurrency and rate limits; this review accepts only that constrained administrator capability.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-23T00:00:00Z",
-      "expiresAt": "2027-02-20T00:00:00Z",
+      "reviewedAt": "2026-11-25T00:00:00Z",
+      "expiresAt": "2027-02-23T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
           "path": "cmd/meridian/main.go",
-          "sha256": "262dacee634683c0c7e3622d8925047c3575e8d16a8d21b83c10f361bb8ad1c6"
+          "sha256": "c09e877496ba4d12ee67ebc89cb7060bd210c207e6e54267c6a90da6f7b72a47"
         },
         {
           "path": "cmd/meridian/app_http.go",
@@ -25,7 +25,7 @@
         },
         {
           "path": "cmd/meridian/trusted_proxy.go",
-          "sha256": "6038640e637f848f60cf47eb4ce120dda37b69f947d94235ce714c09e4460a91"
+          "sha256": "23c0ec21bd7c37e797fb955397a4ede1e040049707af1d1d3e4b42d06013f4fc"
         },
         {
           "path": "cmd/meridian/diagnostics.go",
@@ -41,7 +41,7 @@
         },
         {
           "path": "cmd/meridian/app_core.go",
-          "sha256": "af4f6d652c27447d22a396eccff29f38f88cc4247a15f0c6a8b979ae7a1d707f"
+          "sha256": "3e3723a79b106e47ed9d945a66d4ef00220f8b06ce0a03586ee83518ce732a40"
         },
         {
           "path": "cmd/meridian/diagnostics_security_test.go",
@@ -49,7 +49,7 @@
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "ae14bbce05013f6375d89ff31dc3dda86a0b1981e9cf18e2998660b6d9e908f8"
+          "sha256": "a552b6558783a9a7dcd292db9a895ab4bbd50f9caa175686a8d449c6517c702c"
         },
         {
           "path": "cmd/meridian/panel_ingress_configuration_test.go",
@@ -66,8 +66,8 @@
       },
       "reason": "The flagged copy serves authorized media capabilities rather than panel HTML. It always rebuilds headers with a restrictive CSP sandbox, default-src none, nosniff and DENY; upstream CSP and cookies cannot relax the boundary. Resource paths reject active MIME types. Regression tests confirm opaque media bytes and restrictive headers remain intact, so escaping the media body would break supported content without fixing an established XSS.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-23T00:00:00Z",
-      "expiresAt": "2027-02-20T00:00:00Z",
+      "reviewedAt": "2026-11-25T00:00:00Z",
+      "expiresAt": "2027-02-23T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
@@ -76,7 +76,7 @@
         },
         {
           "path": "cmd/meridian/dynamic_rewrite_core.go",
-          "sha256": "3c6228b79178cac11540c0e841086807bf0cb47ef7c6675e18d1f7f4942fb315"
+          "sha256": "988d8e7d6f2e3bcf79578d5db79c993a1abbf2802544972988627434960f22c3"
         },
         {
           "path": "cmd/meridian/dynamic_runtime_state.go",
@@ -92,7 +92,7 @@
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "ae14bbce05013f6375d89ff31dc3dda86a0b1981e9cf18e2998660b6d9e908f8"
+          "sha256": "a552b6558783a9a7dcd292db9a895ab4bbd50f9caa175686a8d449c6517c702c"
         },
         {
           "path": "cmd/meridian/proxy_response_reliability_test.go",
@@ -149,8 +149,8 @@
       },
       "reason": "The verification exception is restricted to the separate local healthcheck client, fixed 127.0.0.1 and ::1 targets, a range-validated panel-port marker and a constant unauthenticated path. Redirects are disabled, no credentials are sent, and upstream business clients retain certificate verification. Public-domain panel certificates do not normally name loopback, so this narrowly scoped liveness probe is an intentional exception.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-23T00:00:00Z",
-      "expiresAt": "2027-02-20T00:00:00Z",
+      "reviewedAt": "2026-11-25T00:00:00Z",
+      "expiresAt": "2027-02-23T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
@@ -159,15 +159,15 @@
         },
         {
           "path": "cmd/meridian/app_core.go",
-          "sha256": "af4f6d652c27447d22a396eccff29f38f88cc4247a15f0c6a8b979ae7a1d707f"
+          "sha256": "3e3723a79b106e47ed9d945a66d4ef00220f8b06ce0a03586ee83518ce732a40"
         },
         {
           "path": "cmd/meridian/main_test.go",
-          "sha256": "2fc23872bcfdcf357777985ffeaa466d33549cbf8028349ed908c8274acfcf54"
+          "sha256": "b2f09cfe3eaf9308f074ace5b66ca5dae126f3233626024e5d0bbed22f77e657"
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "ae14bbce05013f6375d89ff31dc3dda86a0b1981e9cf18e2998660b6d9e908f8"
+          "sha256": "a552b6558783a9a7dcd292db9a895ab4bbd50f9caa175686a8d449c6517c702c"
         }
       ]
     },
@@ -180,8 +180,8 @@
       },
       "reason": "The input is an API token or transient viewer identity used only as a bounded in-memory retention counter key, not a stored administrator password or an authentication verifier. Retention sessions expire and only site-level completion events are persisted. Administrator password storage and verification use bcrypt. The review does not claim that an unkeyed digest provides anonymization of low-entropy credentials.",
       "reviewedBy": "Codex source review and isolated regression tests, authorized by repository owner",
-      "reviewedAt": "2026-11-23T00:00:00Z",
-      "expiresAt": "2027-02-20T00:00:00Z",
+      "reviewedAt": "2026-11-25T00:00:00Z",
+      "expiresAt": "2027-02-23T00:00:00Z",
       "evidence": "docs/code-scanning-review.md",
       "files": [
         {
@@ -198,11 +198,11 @@
         },
         {
           "path": "cmd/meridian/main_test.go",
-          "sha256": "2fc23872bcfdcf357777985ffeaa466d33549cbf8028349ed908c8274acfcf54"
+          "sha256": "b2f09cfe3eaf9308f074ace5b66ca5dae126f3233626024e5d0bbed22f77e657"
         },
         {
           "path": "docs/code-scanning-review.md",
-          "sha256": "ae14bbce05013f6375d89ff31dc3dda86a0b1981e9cf18e2998660b6d9e908f8"
+          "sha256": "a552b6558783a9a7dcd292db9a895ab4bbd50f9caa175686a8d449c6517c702c"
         }
       ]
     }

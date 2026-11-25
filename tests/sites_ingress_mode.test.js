@@ -181,6 +181,29 @@ test('site rows retain ingress status, concealed access and secondary actions', 
   assert.match(unset, /disabled title="请先编辑并配置入口"/);
 });
 
+test('site management shows current-cycle usage and quota progress while keeping lifetime usage in details', () => {
+  const sandbox = loadHelpers();
+  sandbox.formatBytes = value => `${value} B`;
+  sandbox.uaNameMap = { passthrough: '透传' };
+  const site = {
+    id: 9, name: 'cycle usage', ingress_mode: 'unset', ua_mode: 'passthrough',
+    traffic_used: 1000, monthly_traffic: 400, traffic_quota: 500,
+  };
+  const signature = sandbox.siteCardsRenderSignature([site], new Set());
+  assert.notEqual(
+    sandbox.siteCardsRenderSignature([{ ...site, monthly_traffic: 401 }], new Set()),
+    signature,
+    'a changed current-cycle total must repaint the site row',
+  );
+
+  vm.runInContext('siteManagementExpanded.add(9)', sandbox);
+  const row = sandbox.siteManagementRowHTML(site, new Set());
+  assert.match(row, /class="management-site-usage"><strong>400 B<\/strong>/);
+  assert.match(row, /aria-valuenow="80"/);
+  assert.match(row, /width:80\.00%/);
+  assert.match(row, /累计流量<\/span><span class="console-mono">1000 B<\/span>/);
+});
+
 test('access address visibility uses closed and open eye icons with accessible state', () => {
   const sandbox = loadHelpers();
   assert.match(sandbox.renderSiteAccessVisibilityIcon(true), /site-access-eye-closed/);

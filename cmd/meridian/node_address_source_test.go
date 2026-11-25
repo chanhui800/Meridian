@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,11 +9,9 @@ import (
 	"time"
 )
 
-// The readiness probe and DNS scheduling both dial the node, so the source
-// address has to be the one the Controller observed rather than one the caller
-// claims. requestClientKey only honours X-Real-IP from a configured trusted
-// proxy, which is what stops a node from nominating an arbitrary address for its
-// own DNS record.
+// A forwarded header from an untrusted peer makes the ingress path ambiguous.
+// Do not guess whether the peer is the Agent or a reverse proxy; wait for a
+// trusted proxy configuration instead of publishing a potentially wrong IP.
 func TestEnrollHandlerIgnoresClaimedRealIPFromUntrustedPeer(t *testing.T) {
 	app := newTestApp(t)
 	now := time.Now().UTC()
@@ -36,11 +35,11 @@ func TestEnrollHandlerIgnoresClaimedRealIPFromUntrustedPeer(t *testing.T) {
 	}
 
 	node := findNodeByName(t, app, now, "spoofed-source")
-	if node.Address != "198.51.100.7" {
-		t.Fatalf("address = %q, want the observed peer rather than the claimed header", node.Address)
+	if node.Address != "" {
+		t.Fatalf("address = %q, want no guessed address from an untrusted forwarding hop", node.Address)
 	}
-	if node.AddressSource != nodeAddressSourceEnrollment {
-		t.Fatalf("address_source = %q, want %q", node.AddressSource, nodeAddressSourceEnrollment)
+	if node.AddressSource != nodeAddressSourceManual {
+		t.Fatalf("address_source = %q, want manual for an unfilled address", node.AddressSource)
 	}
 }
 
@@ -105,6 +104,125 @@ func TestEnrollHandlerLeavesAddressBlankForPrivatePeer(t *testing.T) {
 	}
 	if node.AddressSource != nodeAddressSourceManual {
 		t.Fatalf("address_source = %q, want manual", node.AddressSource)
+	}
+}
+
+func TestAgentReportHandlerAdoptsObservedNATAddress(t *testing.T) {
+	for _, testCase := range []struct {
+		name, remoteAddr, realIP, trustedCIDRs, wantV4, wantV6, wantSource string
+		externalProxyEnabled                                               bool
+	}{
+		{name: "direct_ipv4", remoteAddr: "140.245.35.86:51234", wantV4: "140.245.35.86", wantSource: nodeAddressSourceReport},
+		{name: "trusted_proxy_ipv6", remoteAddr: "172.17.0.1:51234", realIP: "2606:4700:4700::1111", trustedCIDRs: "172.17.0.0/16", wantV6: "2606:4700:4700::1111", wantSource: nodeAddressSourceReport, externalProxyEnabled: true},
+		{name: "trusted_proxy_without_client_ip", remoteAddr: "172.17.0.1:51234", trustedCIDRs: "172.17.0.0/16"},
+		{name: "untrusted_proxy_is_not_published", remoteAddr: "140.245.35.87:51234", realIP: "203.0.113.99"},
+		{name: "external_proxy_mode_rejects_untrusted_public_peer", remoteAddr: "140.245.35.88:51234", externalProxyEnabled: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			app := newTestApp(t)
+			if testCase.trustedCIDRs != "" {
+				trusted, err := parseTrustedProxyCIDRs(testCase.trustedCIDRs)
+				if err != nil {
+					t.Fatal(err)
+				}
+				app.trustedProxies = trusted
+			}
+			now := time.Now().UTC()
+			app.panelExternalProxyEnabled = testCase.externalProxyEnabled
+			_, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "observed-report-source"}, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, agentToken, err := app.db.EnrollControlNodeFromSource(enrollment, now, "10.0.0.5")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			request := httptest.NewRequest(http.MethodPost, "/api/agent/report", strings.NewReader(`{"boot_id":"nat-report","sequence":1,"interface_name":"eth0"}`))
+			request.RemoteAddr = testCase.remoteAddr
+			request.Header.Set("Authorization", "Bearer "+agentToken)
+			request.Header.Set("Content-Type", "application/json")
+			if testCase.realIP != "" {
+				request.Header.Set("X-Real-IP", testCase.realIP)
+			}
+			recorder := httptest.NewRecorder()
+			app.handleAgentReport(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("report status=%d, body=%s", recorder.Code, recorder.Body.String())
+			}
+
+			updated := findNodeByName(t, app, now.Add(time.Second), "observed-report-source")
+			if updated.AddressV4 != testCase.wantV4 || updated.AddressV6 != testCase.wantV6 {
+				t.Fatalf("NAT source result: v4=%q v6=%q", updated.AddressV4, updated.AddressV6)
+			}
+			if testCase.wantSource != "" && updated.AddressSource != testCase.wantSource && updated.AddressV6Source != testCase.wantSource {
+				t.Fatalf("inferred source was not marked for review: v4 source=%q v6 source=%q", updated.AddressSource, updated.AddressV6Source)
+			}
+		})
+	}
+}
+
+func TestAgentObservedAddressHandlerReturnsOnlyTrustedRequestedFamily(t *testing.T) {
+	app := newTestApp(t)
+	trusted, err := parseTrustedProxyCIDRs("172.17.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.trustedProxies = trusted
+	app.panelExternalProxyEnabled = true
+	now := time.Now().UTC()
+	for _, testCase := range []struct {
+		name, family, peer, realIP, want string
+	}{
+		{"trusted_ipv4", "v4", "172.17.0.1:443", "140.245.35.86", "140.245.35.86"},
+		{"family_mismatch", "v6", "172.17.0.1:443", "140.245.35.86", ""},
+		{"untrusted_public_peer", "v4", "140.245.35.87:443", "203.0.113.5", ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, enrollment, err := app.db.CreateControlNode(NodeCreateInput{Name: "observed-address-probe-" + testCase.name}, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, agentToken, err := app.db.EnrollControlNode(enrollment, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/agent/observed-address", strings.NewReader(`{"family":"`+testCase.family+`"}`))
+			request.RemoteAddr = testCase.peer
+			request.Header.Set("Authorization", "Bearer "+agentToken)
+			request.Header.Set("Content-Type", "application/json")
+			if testCase.realIP != "" {
+				request.Header.Set("X-Real-IP", testCase.realIP)
+			}
+			recorder := httptest.NewRecorder()
+			app.handleAgentObservedAddress(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("cache-control=%q, want no-store", recorder.Header().Get("Cache-Control"))
+			}
+			var result struct {
+				Family  string `json:"family"`
+				Address string `json:"address"`
+			}
+			if err := json.NewDecoder(recorder.Body).Decode(&result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Family != testCase.family || result.Address != testCase.want {
+				t.Fatalf("observed response=%+v, want family=%q address=%q", result, testCase.family, testCase.want)
+			}
+			updated := findNodeByName(t, app, now.Add(time.Second), "observed-address-probe-"+testCase.name)
+			if testCase.want == "" {
+				if updated.AddressV4 != "" || updated.AddressV6 != "" {
+					t.Fatalf("untrusted observed address was persisted: v4=%q v6=%q", updated.AddressV4, updated.AddressV6)
+				}
+			} else if testCase.family == "v4" && updated.AddressV4 != testCase.want {
+				t.Fatalf("observed IPv4 was not persisted: %+v", updated)
+			} else if testCase.family == "v6" && updated.AddressV6 != testCase.want {
+				t.Fatalf("observed IPv6 was not persisted: %+v", updated)
+			}
+		})
 	}
 }
 
