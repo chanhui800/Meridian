@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Meridian · Emby / Jellyfin 多站点反向代理与节点调度</title>
-  <meta name="description" content="Meridian 为 Emby / Jellyfin 提供固定回源与通用反代、播放地址改写、多来源观看历史、流量统计、TLS 证书和节点调度。">
+  <meta name="description" content="Meridian 为 Emby / Jellyfin 提供固定回源与通用反代、播放地址改写、观看历史、流量统计和 TLS 证书，通过 Agent 扩展节点入口，按 IPv4 / IPv6 发布 DNS 与监听端口。">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <link rel="stylesheet" href="style.css?v=1.11.11">
+  <link rel="stylesheet" href="style.css?v=1.11.12">
 </head>
 <body>
   <header class="nav">
@@ -21,6 +21,7 @@
       <nav class="nav-links" aria-label="页面导航">
         <a href="#features">功能</a>
         <a href="#generic-proxy">通用反代</a>
+        <a href="#agent">Agent</a>
         <a href="#screenshots">界面</a>
         <a href="#install">安装</a>
         <a href="https://github.com/chanhui800/Meridian/releases" target="_blank" rel="noopener">版本记录</a>
@@ -35,14 +36,14 @@
   <main id="top">
     <section class="hero">
       <div class="hero-inner">
-        <a class="hero-badge" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.11" target="_blank" rel="noopener"><span class="dot"></span>v1.11.11 已发布</a>
+        <a class="hero-badge" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.12" target="_blank" rel="noopener"><span class="dot"></span>v1.11.12 已发布</a>
         <h1>Emby / Jellyfin 多站点反向代理<br>与节点调度面板</h1>
         <p class="hero-sub">固定回源与通用反代两种模式，把站点入口、播放改写、观看历史、流量统计、TLS 证书和边缘节点收进一个面板。</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="#install">快速开始</a>
-          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.11" target="_blank" rel="noopener">下载正式版</a>
+          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.12" target="_blank" rel="noopener">下载正式版</a>
         </div>
-        <p class="release-overview">本次更新：修复节点流量计量、入口端口确认、证书备份与清单播放路由。</p>
+        <p class="release-overview">本次更新：Agent 按 DNS 发布族独立监听端口，并支持 NAT 节点按族发现公网出口地址。</p>
         <div class="hero-stats">
           <div><strong>两种回源模式</strong><span>固定线路，或由客户端路径指定回源</span></div>
           <div><strong>节点调度</strong><span>一个 Controller 管理多台 Agent</span></div>
@@ -171,23 +172,71 @@
       <p class="generic-doc-link"><a href="https://github.com/chanhui800/Meridian/blob/main/docs/generic-proxy.md" target="_blank" rel="noopener">阅读通用反代完整用法</a></p>
     </section>
 
-    <section class="flow-section">
+    <section id="agent" class="agent-section" aria-labelledby="agent-title">
       <div class="section">
-        <h2>节点调度如何工作</h2>
-        <p class="section-sub">域名前缀入口可交由节点承载。Agent 应用站点配置并通过健康检查后，再切换站点 DNS。</p>
-        <div class="flow">
-          <div class="flow-node"><strong>客户端</strong><span>播放请求</span></div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-node"><strong>站点域名</strong><span>精确 DNS A/AAAA</span></div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-node accent"><strong>Edge Agent</strong><span>心跳 · 配置 · 流量</span></div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-node"><strong>上游</strong><span>Emby / Jellyfin</span></div>
+        <div class="agent-heading">
+          <p class="agent-eyebrow">EDGE AGENT</p>
+          <h2 id="agent-title">Agent，让节点承载你的站点</h2>
+          <p class="section-sub">把 Linux 节点接入面板，统一管理安装、配置、版本与流量。每个站点可跟随全局调度，也可指定承载节点。</p>
         </div>
-        <div class="handoff-details">
-          <p>首次接管前，Controller 继续承接站点请求。Agent 配置就绪、HTTPS / SNI 健康检查通过并完成 DNS 切换后，节点正式接管，Controller 对该站点的新请求返回 HTTP 421。</p>
-          <p>DNS 只影响新连接，已开始的视频和 WebSocket 连接继续运行。后续节点切换等待或失败时，主控入口保持关闭；关闭调度并完成 DNS 与节点清理后恢复。</p>
-          <p>通用反代使用支持该模式的 Agent；旧版节点会显示等待升级。域名前缀入口可以选择跟随全局调度或固定节点。</p>
+        <ol class="agent-steps" role="list">
+          <li>
+            <span class="agent-step-index" aria-hidden="true">01</span>
+            <h3>从面板生成安装命令</h3>
+            <p>在“节点调度”中创建节点，复制面板生成的专用安装命令，在目标 Linux 服务器上运行。安装器下载对应架构的 Agent，并完成文件校验。</p>
+          </li>
+          <li>
+            <span class="agent-step-index" aria-hidden="true">02</span>
+            <h3>自动跟随主控版本</h3>
+            <p>已注册 Agent 通过 Controller 获取匹配版本的更新清单，自动下载、校验并升级。下载失败时保留当前程序，节点身份与配置继续保留。</p>
+          </li>
+          <li>
+            <span class="agent-step-index" aria-hidden="true">03</span>
+            <h3>按站点启用节点调度</h3>
+            <p>为域名前缀入口选择节点，面板展示在线状态、配置应用情况与流量。Agent 应用配置并通过健康检查后，再切换站点 DNS。</p>
+          </li>
+        </ol>
+
+        <div class="agent-network">
+          <div class="agent-listeners">
+            <h3>DNS 发布与端口监听保持一致</h3>
+            <table class="agent-family-table" aria-label="DNS 发布族与 Agent 监听方式">
+              <thead>
+                <tr><th scope="col">发布族</th><th scope="col">DNS 记录</th><th scope="col">端口监听</th></tr>
+              </thead>
+              <tbody>
+                <tr><th scope="row">V4</th><td>A</td><td>只监听 IPv4。</td></tr>
+                <tr><th scope="row">V6</th><td>AAAA</td><td>只监听 IPv6，启用 <code>V6ONLY</code>，为其他服务保留同端口的 IPv4 监听空间。</td></tr>
+                <tr><th scope="row">auto</th><td>按可用公网地址族发布</td><td>两族地址齐备时，分别监听 IPv4 与 IPv6。</td></tr>
+              </tbody>
+            </table>
+            <p class="agent-family-note">auto 只有一族可发布地址时，使用这一族；两族地址均未知时，等待地址发现后再监听。</p>
+          </div>
+          <div class="agent-discovery">
+            <h3>公网地址，按族发现</h3>
+            <p>回环、私网、链路本地和 CGNAT 地址不会用于 DNS。某个地址族缺少本机公网地址时，Agent 通过该地址族连接 Controller，由主控观测认证请求的来源 IP，补全公网出口地址。</p>
+            <p>手工填写的地址不会被自动发现覆盖。自动发现结果会在节点卡片标记“自动探测，请核对”，可在面板核对并保存。</p>
+            <p>NAT 节点需配置端口映射与防火墙，公网入口由 HTTPS / SNI 健康检查确认。</p>
+          </div>
+        </div>
+        <p class="agent-doc-link"><a href="https://github.com/chanhui800/Meridian/blob/main/docs/agent-installation.md" target="_blank" rel="noopener">阅读 Agent 安装与升级说明</a></p>
+
+        <div class="agent-handoff">
+          <h3>节点就绪，再切换站点 DNS</h3>
+          <div class="flow">
+            <div class="flow-node"><strong>客户端</strong><span>播放请求</span></div>
+            <div class="flow-arrow" aria-hidden="true">→</div>
+            <div class="flow-node"><strong>站点域名</strong><span>精确 DNS A/AAAA</span></div>
+            <div class="flow-arrow" aria-hidden="true">→</div>
+            <div class="flow-node accent"><strong>Edge Agent</strong><span>心跳 · 配置 · 流量</span></div>
+            <div class="flow-arrow" aria-hidden="true">→</div>
+            <div class="flow-node"><strong>上游</strong><span>Emby / Jellyfin</span></div>
+          </div>
+          <div class="handoff-details">
+            <p>首次接管前，Controller 继续承接站点请求。Agent 配置就绪、HTTPS / SNI 健康检查通过并完成 DNS 切换后，节点正式接管，Controller 对该站点的新请求返回 HTTP 421。</p>
+            <p>DNS 只影响新连接，已开始的视频和 WebSocket 连接继续运行。后续节点切换等待或失败时，主控入口保持关闭；关闭调度并完成 DNS 与节点清理后恢复。</p>
+            <p>通用反代使用支持该模式的 Agent；旧版节点会显示等待升级。</p>
+          </div>
         </div>
       </div>
     </section>
@@ -231,7 +280,7 @@
       </div>
       <div class="install-actions">
         <a class="btn btn-primary" href="https://github.com/chanhui800/Meridian#readme" target="_blank" rel="noopener">阅读完整文档</a>
-        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.11" target="_blank" rel="noopener">Release 与校验文件</a>
+        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.12" target="_blank" rel="noopener">Release 与校验文件</a>
       </div>
     </section>
   </main>
@@ -260,6 +309,6 @@
     <img id="lightboxImg" alt="">
   </div>
 
-  <script src="app-v1.11.11.js"></script>
+  <script src="app-v1.11.12.js"></script>
 </body>
 </html>

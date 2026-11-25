@@ -14,6 +14,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -36,19 +37,21 @@ var (
 )
 
 type ControlNode struct {
-	ID              int64            `json:"id"`
-	GUID            string           `json:"guid"`
-	Name            string           `json:"name"`
-	Address         string           `json:"address"`
-	AddressV4       string           `json:"address_v4"`
-	AddressV6       string           `json:"address_v6"`
-	AddressV6Source string           `json:"address_v6_source,omitempty"`
-	DNSPublish      string           `json:"dns_publish"`
-	NetAddresses    []NodeNetAddress `json:"net_addresses,omitempty"`
-	// AddressSource records where Address came from: "manual" when an operator
-	// entered it, "enrollment" when it was inferred from the source address of
-	// the Agent's own enrollment request. The panel surfaces the difference so
-	// an inferred address is reviewed rather than trusted silently.
+	ID                int64                  `json:"id"`
+	GUID              string                 `json:"guid"`
+	Name              string                 `json:"name"`
+	Address           string                 `json:"address"`
+	AddressV4         string                 `json:"address_v4"`
+	AddressV6         string                 `json:"address_v6"`
+	AddressV6Source   string                 `json:"address_v6_source,omitempty"`
+	DNSPublish        string                 `json:"dns_publish"`
+	NetAddresses      []NodeNetAddress       `json:"net_addresses,omitempty"`
+	NetworkInterfaces []NodeNetworkInterface `json:"network_interfaces,omitempty"`
+	ListenInterface   string                 `json:"listen_interface"`
+	// AddressSource records where the IPv4 address came from: "manual" when an
+	// operator entered it, "enrollment" when the Agent's registration request
+	// supplied it, or "report" when an authenticated heartbeat supplied it. The
+	// panel surfaces inferred addresses so they are reviewed before DNS use.
 	AddressSource               string `json:"address_source"`
 	Port                        int    `json:"port"`
 	Enabled                     bool   `json:"enabled"`
@@ -136,6 +139,7 @@ type NodeCreateInput struct {
 	AddressV4                string
 	AddressV6                string
 	DNSPublish               string
+	ListenInterface          string
 	Port                     int
 	Priority                 int
 	TrafficQuota             int64
@@ -158,6 +162,7 @@ type NodeReport struct {
 	SampledAtMS           int64                    `json:"sampled_at_ms,omitempty"`
 	InterfaceName         string                   `json:"interface_name"`
 	NetAddresses          []NodeNetAddress         `json:"net_addresses,omitempty"`
+	NetworkInterfaces     []NodeNetworkInterface   `json:"network_interfaces,omitempty"`
 	RXBytes               int64                    `json:"rx_bytes"`
 	TXBytes               int64                    `json:"tx_bytes"`
 	AgentVersion          string                   `json:"agent_version"`
@@ -182,6 +187,15 @@ type NodeNetAddress struct {
 	Family    string `json:"family"`
 	Address   string `json:"address"`
 	Interface string `json:"interface,omitempty"`
+}
+
+// NodeNetworkInterface reports only an interface name and supported address
+// families. Local/private addresses remain on the Agent and are never exposed
+// through the Controller API.
+type NodeNetworkInterface struct {
+	Name string `json:"name"`
+	IPv4 bool   `json:"ipv4"`
+	IPv6 bool   `json:"ipv6"`
 }
 
 // NodeLiveReport is the lightweight runtime sample used by the dashboard.
@@ -351,11 +365,52 @@ func hashNodeToken(value string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func normalizeListenerInterfaceName(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > 15 || strings.EqualFold(value, "metadata") || strings.ContainsAny(value, "\x00/\\ \t\r\n") {
+		return "", errors.New("listen_interface must be a reported network interface name")
+	}
+	return value, nil
+}
+
+func normalizeReportedNetworkInterfaces(interfaces []NodeNetworkInterface) []NodeNetworkInterface {
+	if len(interfaces) == 0 {
+		return []NodeNetworkInterface{}
+	}
+	byName := make(map[string]NodeNetworkInterface, len(interfaces))
+	for _, iface := range interfaces {
+		name, err := normalizeListenerInterfaceName(iface.Name)
+		if err != nil || name == "" || (!iface.IPv4 && !iface.IPv6) {
+			continue
+		}
+		value := byName[name]
+		value.Name = name
+		value.IPv4 = value.IPv4 || iface.IPv4
+		value.IPv6 = value.IPv6 || iface.IPv6
+		byName[name] = value
+	}
+	values := make([]NodeNetworkInterface, 0, len(byName))
+	for _, iface := range byName {
+		values = append(values, iface)
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Name < values[j].Name })
+	if len(values) > 64 {
+		values = values[:64]
+	}
+	return values
+}
+
 func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	input.Address = strings.TrimSpace(input.Address)
 	input.AddressV4 = strings.TrimSpace(input.AddressV4)
 	input.AddressV6 = strings.TrimSpace(input.AddressV6)
+	// Listener scope is derived from DNS publication. Ignore the deprecated
+	// per-interface setting so older clients cannot restrict or widen it.
+	input.ListenInterface = ""
 	input.DNSPublish = strings.ToLower(strings.TrimSpace(input.DNSPublish))
 	if input.DNSPublish == "" {
 		input.DNSPublish = "auto"
@@ -365,31 +420,27 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	}
 	if input.AddressV4 != "" {
 		ip := net.ParseIP(input.AddressV4)
-		if ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		if ip == nil || ip.To4() == nil || !nodeAddressIsGlobalUnicast(ip) {
 			return input, errors.New("address_v4 must be an IPv4 address")
 		}
 		input.AddressV4 = ip.To4().String()
 	}
 	if input.AddressV6 != "" {
 		ip := net.ParseIP(input.AddressV6)
-		if ip == nil || ip.To4() != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		if ip == nil || ip.To4() != nil || !nodeAddressIsGlobalUnicast(ip) {
 			return input, errors.New("address_v6 must be an IPv6 address")
 		}
 		input.AddressV6 = ip.String()
 	}
 	if ip := net.ParseIP(input.Address); ip != nil {
-		if ip.To4() != nil && input.AddressV4 == "" {
-			input.AddressV4 = ip.To4().String()
+		if nodeAddressIsGlobalUnicast(ip) {
+			if ip.To4() != nil && input.AddressV4 == "" {
+				input.AddressV4 = ip.To4().String()
+			}
+			if ip.To4() == nil && input.AddressV6 == "" {
+				input.AddressV6 = ip.String()
+			}
 		}
-		if ip.To4() == nil && input.AddressV6 == "" {
-			input.AddressV6 = ip.String()
-		}
-	}
-	if input.DNSPublish == "v4" && input.AddressV4 == "" {
-		return input, errors.New("dns_publish v4 requires an IPv4 address")
-	}
-	if input.DNSPublish == "v6" && input.AddressV6 == "" {
-		return input, errors.New("dns_publish v6 requires an IPv6 address")
 	}
 	// The browser supplies the controller's current port for new nodes. Keep a
 	// 443 fallback for API callers that omit the optional convenience default.
@@ -520,9 +571,9 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	// address_source is left to its column default here: a row created from the
 	// panel always carries an operator-entered address.
 	result, err := d.db.Exec(`INSERT INTO control_nodes
-		(guid,name,address,address_v4,address_v6,dns_publish,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
+		(guid,name,address,address_v4,address_v6,dns_publish,listen_interface,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
 		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, input.Priority, input.TrafficQuota,
+		VALUES(?,?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, input.Priority, input.TrafficQuota,
 		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), probeSecretCiphertext, nowMS, nowMS)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -540,7 +591,7 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
+const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,reported_interfaces,listen_interface,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
@@ -550,8 +601,8 @@ const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,add
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
 	var enabled, configDirty int
-	var reportedAddresses string
-	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
+	var reportedAddresses, reportedInterfaces string
+	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &reportedInterfaces, &node.ListenInterface, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
@@ -562,6 +613,9 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 		return ControlNode{}, err
 	}
 	_ = json.Unmarshal([]byte(reportedAddresses), &node.NetAddresses)
+	node.NetAddresses = normalizeReportedNodeNetAddresses(node.NetAddresses)
+	_ = json.Unmarshal([]byte(reportedInterfaces), &node.NetworkInterfaces)
+	node.NetworkInterfaces = normalizeReportedNetworkInterfaces(node.NetworkInterfaces)
 	node.Enabled = enabled != 0
 	node.ConfigDirty = configDirty != 0
 	node.EnrollmentAvailable = node.enrollmentTokenHash != "" && now.UnixMilli() < node.enrollmentExpiresMS
@@ -869,15 +923,24 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, err
 	}
 	defer tx.Rollback()
-	var currentAddress string
+	var currentAddress, currentDNSPublish, currentListenInterface, currentAddressV4, currentAddressV6, currentReportedInterfaces string
 	var currentPort, currentResetDay, currentEnabled int
-	if err := tx.QueryRow("SELECT address,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRow("SELECT address,dns_publish,listen_interface,address_v4,address_v6,reported_interfaces,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentListenInterface, &currentAddressV4, &currentAddressV6, &currentReportedInterfaces, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errNodeNotFound
 	} else if err != nil {
 		return ControlNode{}, err
 	}
-
 	portChanged := currentPort != input.Port
+	var currentInterfaces []NodeNetworkInterface
+	_ = json.Unmarshal([]byte(currentReportedInterfaces), &currentInterfaces)
+	currentListenerNode := ControlNode{Address: currentAddress, AddressV4: currentAddressV4, AddressV6: currentAddressV6,
+		DNSPublish: currentDNSPublish, ListenInterface: currentListenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(currentInterfaces)}
+	nextListenerNode := ControlNode{Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6,
+		DNSPublish: input.DNSPublish, ListenInterface: input.ListenInterface, NetworkInterfaces: currentListenerNode.NetworkInterfaces}
+	currentListenFamily, currentListenErr := effectiveNodeListenFamily(currentListenerNode)
+	nextListenFamily, nextListenErr := effectiveNodeListenFamily(nextListenerNode)
+	listenerFamilyChanged := currentListenFamily != nextListenFamily || (currentListenErr == nil) != (nextListenErr == nil)
+	listenerChanged := portChanged || currentDNSPublish != input.DNSPublish || currentListenInterface != input.ListenInterface || listenerFamilyChanged
 	enabledChanged := currentEnabled != sqliteBool(enabled)
 	// Saving from the panel always records the address as operator-confirmed, so
 	// an address that enrollment once inferred loses its "please verify" marker
@@ -885,12 +948,12 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,listen_interface=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
 			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
+			input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,listen_interface=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -905,7 +968,7 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	if rows != 1 {
 		return ControlNode{}, errNodeNotFound
 	}
-	if portChanged {
+	if listenerChanged {
 		if _, err := tx.Exec(`UPDATE control_nodes SET desired_config_hash='',desired_config_revision=0 WHERE id=?`, id); err != nil {
 			return ControlNode{}, err
 		}
@@ -922,7 +985,7 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		if err := markAgentConfigsDirtyTx(tx); err != nil {
 			return ControlNode{}, err
 		}
-	} else if portChanged {
+	} else if listenerChanged {
 		if err := markAgentConfigsDirtyForNodeIDsTx(tx, id); err != nil {
 			return ControlNode{}, err
 		}
@@ -1152,7 +1215,27 @@ func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
 const (
 	nodeAddressSourceManual     = "manual"
 	nodeAddressSourceEnrollment = "enrollment"
+	nodeAddressSourceReport     = "report"
 )
+
+func nodeAddressSourceIsAutomatic(value string) bool {
+	return value == nodeAddressSourceEnrollment || value == nodeAddressSourceReport
+}
+
+// nodeLegacyAddressProtectsFamily identifies an older manually entered
+// address whose family-specific column is still empty. Once discovered, that
+// empty column must not shadow the existing manual DNS value.
+func nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, addressV6Source, family string) bool {
+	v4, v6 := publicNodeAddressFamilies(legacyAddress)
+	switch family {
+	case "v4":
+		return v4 != "" && addressSource == nodeAddressSourceManual
+	case "v6":
+		return v6 != "" && (addressV6Source == nodeAddressSourceManual || (addressV6Source == "" && addressSource == nodeAddressSourceManual))
+	default:
+		return false
+	}
+}
 
 // enrollSourceAddressAnswer decides whether the source address of an enrollment
 // request may stand in for a node address the operator left empty.
@@ -1167,8 +1250,8 @@ func enrollSourceAddressAnswer(sourceIP string) (string, bool) {
 	if trimmed == "" {
 		return "", false
 	}
-	// requestClientKey can fall back to a raw RemoteAddr string; only a real IP
-	// is usable here.
+	// The caller supplies the direct peer or a single validated proxy client IP;
+	// only a real address can be published.
 	parsed := net.ParseIP(trimmed)
 	if parsed == nil || !nodeAddressIsGlobalUnicast(parsed) {
 		return "", false
@@ -1177,18 +1260,24 @@ func enrollSourceAddressAnswer(sourceIP string) (string, bool) {
 }
 
 // nodeAddressIsGlobalUnicast reports whether an address could be published as a
-// public DNS record. Link-local, loopback, private and unspecified ranges are
-// rejected, as are IPv6 addresses that are not globally routable.
+// public DNS record. Link-local, loopback, private, carrier-grade NAT, and
+// unspecified ranges are rejected, as are IPv6 addresses that are not globally
+// routable.
 func nodeAddressIsGlobalUnicast(ip net.IP) bool {
 	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast() {
 		return false
 	}
+	if address, ok := netip.AddrFromSlice(ip); ok && nodeCarrierGradeNATPrefix.Contains(address.Unmap()) {
+		return false
+	}
 	// IPv4-mapped IPv6 addresses compare as IPv4 for routability, which is what
 	// the DNS record type will be derived from anyway.
 	return true
 }
+
+var nodeCarrierGradeNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 func publicNodeAddressFamilies(value string) (v4, v6 string) {
 	ip := net.ParseIP(strings.TrimSpace(value))
@@ -1199,6 +1288,46 @@ func publicNodeAddressFamilies(value string) (v4, v6 string) {
 		return ipv4.String(), ""
 	}
 	return "", ip.String()
+}
+
+func normalizeReportedNodeNetAddresses(addresses []NodeNetAddress) []NodeNetAddress {
+	if len(addresses) == 0 {
+		return []NodeNetAddress{}
+	}
+	capacity := len(addresses)
+	if capacity > 32 {
+		capacity = 32
+	}
+	result := make([]NodeNetAddress, 0, capacity)
+	seen := make(map[string]bool, capacity)
+	for _, candidate := range addresses {
+		// "controller" was once used as a client-supplied provenance marker.
+		// Server-observed addresses now use an authenticated endpoint, so this
+		// reserved label must never turn report JSON into trusted address data.
+		if strings.EqualFold(strings.TrimSpace(candidate.Interface), "controller") {
+			continue
+		}
+		v4, v6 := publicNodeAddressFamilies(candidate.Address)
+		family, address := "v4", v4
+		if v6 != "" {
+			family, address = "v6", v6
+		}
+		if address == "" || (candidate.Family != "" && candidate.Family != family) {
+			continue
+		}
+		key := family + ":" + address
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		candidate.Family = family
+		candidate.Address = address
+		result = append(result, candidate)
+		if len(result) == 32 {
+			break
+		}
+	}
+	return result
 }
 
 func (d *DB) EnrollControlNode(token string, now time.Time) (ControlNode, string, error) {
@@ -1283,6 +1412,9 @@ func validateNodeReport(report NodeReport) error {
 	}
 	if len(report.NetAddresses) > 32 {
 		return errors.New("too many network addresses")
+	}
+	if len(report.NetworkInterfaces) > maxNodeTelemetryItemsPerReport {
+		return errors.New("too many network interfaces")
 	}
 	for _, candidate := range report.NetAddresses {
 		ip := net.ParseIP(strings.TrimSpace(candidate.Address))
@@ -1776,7 +1908,7 @@ func saturatingAddInt64(a, b int64) int64 {
 	return a + b
 }
 
-func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now time.Time) (nodeReportCommitResult, error) {
+func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now time.Time, sourceIP string) (nodeReportCommitResult, error) {
 	result := nodeReportCommitResult{}
 	validEvents := make([]NodeRequestEvent, 0, len(report.Events))
 	for _, event := range report.Events {
@@ -1802,12 +1934,12 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var id, lastSequence, lastRX, lastTX int64
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID string
-	var legacyAddress, addressSource string
+	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID, listenInterface, previousInterfacesJSON string
+	var legacyAddress, addressSource, nodeDNSPublish, nodeAddressV4, nodeAddressV6, nodeAddressV6Source string
 	var activeSessionEpoch int64
 	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source,listen_interface,reported_interfaces,dns_publish,address_v4,address_v6,address_v6_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource, &listenInterface, &previousInterfacesJSON, &nodeDNSPublish, &nodeAddressV4, &nodeAddressV6, &nodeAddressV6Source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -1935,12 +2067,29 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 		applyErrorAtMS = 0
 		applyFailures = 0
 	}
-	addressesJSON, _ := json.Marshal(report.NetAddresses)
+	addressesJSON, _ := json.Marshal(normalizeReportedNodeNetAddresses(report.NetAddresses))
+	reportedInterfaces := normalizeReportedNetworkInterfaces(report.NetworkInterfaces)
+	listenerBindingSupported := agentSupportsListenerBinding(report.AgentVersion)
+	if !listenerBindingSupported {
+		// Older Agents do not send interface inventory. Preserve a previously
+		// collected list during a rolling upgrade instead of erasing it.
+		_ = json.Unmarshal([]byte(previousInterfacesJSON), &reportedInterfaces)
+		reportedInterfaces = normalizeReportedNetworkInterfaces(reportedInterfaces)
+	}
+	listenerInterfaceChanged := false
+	if listenInterface != "" && listenerBindingSupported {
+		var previousInterfaces []NodeNetworkInterface
+		_ = json.Unmarshal([]byte(previousInterfacesJSON), &previousInterfaces)
+		oldInterface, oldFound := nodeNetworkInterfaceByName(ControlNode{NetworkInterfaces: previousInterfaces}, listenInterface)
+		newInterface, newFound := nodeNetworkInterfaceByName(ControlNode{NetworkInterfaces: reportedInterfaces}, listenInterface)
+		listenerInterfaceChanged = oldFound != newFound || oldInterface != newInterface
+	}
+	interfacesJSON, _ := json.Marshal(reportedInterfaces)
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
 			lifetime_rx_bytes=lifetime_rx_bytes+?,lifetime_tx_bytes=lifetime_tx_bytes+?,last_raw_rx_bytes=?,last_raw_tx_bytes=?,
-			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,reported_net_addresses=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,agent_lease_expires_at_ms=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
+			last_boot_id=?,last_report_session_id=?,last_sequence=?,interface_name=?,agent_version=?,reported_net_addresses=?,reported_interfaces=?,applied_config_hash=?,applied_config_revision=?,agent_apply_error=?,agent_apply_error_at_ms=?,agent_apply_failures=?,agent_listener_error=?,event_spool_error=?,event_queue_depth=?,event_dropped=?,config_dirty=CASE WHEN ? THEN 0 ELSE config_dirty END,cache_clear_applied_generation=CASE WHEN ? > cache_clear_applied_generation AND ? <= ? THEN ? ELSE cache_clear_applied_generation END,agent_lease_expires_at_ms=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?`,
 		deltaRX, deltaTX, deltaRX, deltaTX, report.RXBytes, report.TXBytes, counterEpoch, sessionID, report.Sequence,
-		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), string(addressesJSON), appliedHash, report.AppliedConfigRevision, applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
+		strings.TrimSpace(report.InterfaceName), strings.TrimSpace(report.AgentVersion), string(addressesJSON), string(interfacesJSON), appliedHash, report.AppliedConfigRevision, applyError, applyErrorAtMS, applyFailures, strings.TrimSpace(report.ListenerError), strings.TrimSpace(report.EventSpoolError), report.EventQueueDepth, report.EventDropped,
 		clearAppliedConfig,
 		report.CacheClearGeneration, report.CacheClearGeneration, cacheClearGeneration, report.CacheClearGeneration,
 		now.Add(agentLeaseTTL).UnixMilli(), now.UnixMilli(), now.UnixMilli(), id); err != nil {
@@ -1959,33 +2108,140 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	// overwritten; DNS publication remains controlled by dns_publish. Older NAT
 	// enrollments stored only the observed legacy address, so repair that family
 	// even when the Agent legitimately reports no public interface addresses.
+	manualLegacyV4 := nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, nodeAddressV6Source, "v4")
+	manualLegacyV6 := nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, nodeAddressV6Source, "v6")
 	var hintedV4, hintedV6 string
+	var inferredV4Source, inferredV6Source string
 	for _, candidate := range report.NetAddresses {
+		if strings.EqualFold(strings.TrimSpace(candidate.Interface), "controller") {
+			continue
+		}
 		v4, v6 := publicNodeAddressFamilies(candidate.Address)
 		if hintedV4 == "" {
 			hintedV4 = v4
+			if v4 != "" && strings.TrimSpace(nodeAddressV4) == "" {
+				inferredV4Source = nodeAddressSourceReport
+			}
 		}
 		if hintedV6 == "" {
 			hintedV6 = v6
+			if v6 != "" && strings.TrimSpace(nodeAddressV6) == "" {
+				inferredV6Source = nodeAddressSourceReport
+			}
 		}
+	}
+	// Agent interface reports correctly omit NAT/private addresses. The
+	// authenticated request's observed source supplies the public egress
+	// address in that case, including when the Controller sits behind a
+	// configured trusted reverse proxy.
+	observedV4, observedV6 := publicNodeAddressFamilies(sourceIP)
+	if manualLegacyV4 {
+		hintedV4, observedV4 = "", ""
+		inferredV4Source = ""
+	}
+	if manualLegacyV6 {
+		hintedV6, observedV6 = "", ""
+		inferredV6Source = ""
 	}
 	// A real public interface hint takes precedence over an old observed
 	// enrollment address. The legacy value is only a fallback for NAT-only
 	// reports, not a replacement for newly observed public-family telemetry.
-	var inferredV6 string
+	// Agent interface hints may fill empty family slots, but only an address
+	// observed by this Controller can refresh an already populated automatic
+	// slot. This keeps a token holder from redirecting DNS through report JSON.
+	// Controller-observed addresses are a NAT fallback. If the Agent reports a
+	// real public interface address for this family, keep that ingress address:
+	// a multi-homed node may egress through a different SNAT address that cannot
+	// accept incoming proxy traffic.
+	replaceObservedV4 := (hintedV4 == "" || hintedV4 == observedV4) && observedV4 != "" && strings.TrimSpace(nodeAddressV4) != "" && nodeAddressSourceIsAutomatic(addressSource) && observedV4 != strings.TrimSpace(nodeAddressV4)
+	replaceObservedV6 := (hintedV6 == "" || hintedV6 == observedV6) && observedV6 != "" && strings.TrimSpace(nodeAddressV6) != "" && nodeAddressSourceIsAutomatic(nodeAddressV6Source) && observedV6 != strings.TrimSpace(nodeAddressV6)
+	if replaceObservedV4 {
+		hintedV4, inferredV4Source = observedV4, nodeAddressSourceReport
+	} else if hintedV4 == "" {
+		hintedV4 = observedV4
+		if hintedV4 != "" && strings.TrimSpace(nodeAddressV4) == "" {
+			inferredV4Source = nodeAddressSourceReport
+		}
+	}
+	if replaceObservedV6 {
+		hintedV6, inferredV6Source = observedV6, nodeAddressSourceReport
+	} else if hintedV6 == "" {
+		hintedV6 = observedV6
+		if hintedV6 != "" && strings.TrimSpace(nodeAddressV6) == "" {
+			inferredV6Source = nodeAddressSourceReport
+		}
+	}
 	if addressSource == nodeAddressSourceEnrollment {
 		v4, v6 := publicNodeAddressFamilies(legacyAddress)
 		if hintedV4 == "" {
 			hintedV4 = v4
+			if v4 != "" && strings.TrimSpace(nodeAddressV4) == "" {
+				inferredV4Source = nodeAddressSourceEnrollment
+			}
 		}
 		if hintedV6 == "" {
-			hintedV6, inferredV6 = v6, v6
+			hintedV6 = v6
+			if v6 != "" {
+				inferredV6Source = nodeAddressSourceEnrollment
+			}
 		}
 	}
 	if hintedV4 != "" || hintedV6 != "" {
-		if _, err := tx.Exec(`UPDATE control_nodes SET address_v4=CASE WHEN TRIM(address_v4)='' THEN ? ELSE address_v4 END,
-			address_v6_source=CASE WHEN TRIM(address_v6)='' AND ?<>'' THEN ? ELSE address_v6_source END,
-			address_v6=CASE WHEN TRIM(address_v6)='' THEN ? ELSE address_v6 END,updated_at_ms=? WHERE id=?`, hintedV4, inferredV6, nodeAddressSourceEnrollment, hintedV6, now.UnixMilli(), id); err != nil {
+		newLegacyAddress := legacyAddress
+		legacyV4, legacyV6 := publicNodeAddressFamilies(legacyAddress)
+		if strings.TrimSpace(legacyAddress) == "" {
+			if hintedV4 != "" {
+				newLegacyAddress = hintedV4
+			} else if hintedV6 != "" {
+				newLegacyAddress = hintedV6
+			}
+		} else if hintedV4 != "" && legacyV4 != "" && nodeAddressSourceIsAutomatic(addressSource) &&
+			(strings.TrimSpace(nodeAddressV4) == "" || replaceObservedV4) {
+			newLegacyAddress = hintedV4
+		} else if hintedV6 != "" && legacyV6 != "" &&
+			(nodeAddressSourceIsAutomatic(nodeAddressV6Source) || (nodeAddressV6Source == "" && nodeAddressSourceIsAutomatic(addressSource))) &&
+			(strings.TrimSpace(nodeAddressV6) == "" || replaceObservedV6) {
+			newLegacyAddress = hintedV6
+		}
+		newAddressV6Source := nodeAddressV6Source
+		if manualLegacyV6 && newAddressV6Source == "" && hintedV4 != "" {
+			// Preserve provenance for a legacy manual IPv6 address when an
+			// automatically discovered IPv4 address changes address_source.
+			newAddressV6Source = nodeAddressSourceManual
+		}
+		if _, err := tx.Exec(`UPDATE control_nodes SET address=?,address_source=CASE WHEN (TRIM(address_v4)='' OR ?) AND ?<>'' THEN ? ELSE address_source END,
+			address_v4=CASE WHEN TRIM(address_v4)='' OR ? THEN ? ELSE address_v4 END,
+			address_v6_source=CASE WHEN (TRIM(address_v6)='' OR ?) AND ?<>'' THEN ? ELSE ? END,
+			address_v6=CASE WHEN TRIM(address_v6)='' OR ? THEN ? ELSE address_v6 END,updated_at_ms=? WHERE id=?`,
+			newLegacyAddress, replaceObservedV4, inferredV4Source, inferredV4Source,
+			replaceObservedV4, hintedV4,
+			replaceObservedV6, inferredV6Source, inferredV6Source, newAddressV6Source,
+			replaceObservedV6, hintedV6, now.UnixMilli(), id); err != nil {
+			return nodeReportCommitResult{}, err
+		}
+	}
+	oldInterfaces := []NodeNetworkInterface(nil)
+	_ = json.Unmarshal([]byte(previousInterfacesJSON), &oldInterfaces)
+	oldListenerNode := ControlNode{Address: legacyAddress, AddressV4: nodeAddressV4, AddressV6: nodeAddressV6,
+		DNSPublish: nodeDNSPublish, ListenInterface: listenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(oldInterfaces)}
+	newAddressV4, newAddressV6 := nodeAddressV4, nodeAddressV6
+	if newAddressV4 == "" || replaceObservedV4 {
+		newAddressV4 = hintedV4
+	}
+	if newAddressV6 == "" || replaceObservedV6 {
+		newAddressV6 = hintedV6
+	}
+	newListenerNode := ControlNode{Address: legacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6,
+		DNSPublish: nodeDNSPublish, ListenInterface: listenInterface, NetworkInterfaces: reportedInterfaces}
+	oldFamily, oldFamilyErr := effectiveNodeListenFamily(oldListenerNode)
+	newFamily, newFamilyErr := effectiveNodeListenFamily(newListenerNode)
+	listenerFamilyChanged := oldFamily != newFamily || (oldFamilyErr == nil) != (newFamilyErr == nil)
+	if listenerInterfaceChanged || listenerFamilyChanged {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_hash='',config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
+			schedule_revision=schedule_revision+1,updated_at_ms=? WHERE desired_node_id=?`, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+			return nodeReportCommitResult{}, err
+		}
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, id); err != nil {
 			return nodeReportCommitResult{}, err
 		}
 	}
@@ -2195,7 +2451,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 }
 
 func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Time) (ControlNode, error) {
-	result, err := d.recordNodeReportCommit(agentToken, report, now)
+	result, err := d.recordNodeReportCommit(agentToken, report, now, "")
 	if err != nil {
 		return ControlNode{}, err
 	}
@@ -2206,7 +2462,15 @@ func (d *DB) RecordNodeReport(agentToken string, report NodeReport, now time.Tim
 // and WebSocket handlers. It authenticates, snapshots authorization, commits
 // mutations, and derives ACK/discarded lists from that same transaction.
 func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now time.Time) (NodeReportResult, error) {
-	committed, err := d.recordNodeReportCommit(agentToken, report, now)
+	return d.RecordNodeReportResultFromSource(agentToken, report, now, "")
+}
+
+// RecordNodeReportResultFromSource is the acknowledgement-safe report path
+// with the request source supplied by the authenticated HTTP/WebSocket handler.
+// The source is used only as a public-address hint when a DNS family is still
+// empty; the Agent payload cannot claim or override it.
+func (d *DB) RecordNodeReportResultFromSource(agentToken string, report NodeReport, now time.Time, sourceIP string) (NodeReportResult, error) {
+	committed, err := d.recordNodeReportCommit(agentToken, report, now, sourceIP)
 	if err != nil {
 		return NodeReportResult{}, err
 	}
@@ -2228,6 +2492,114 @@ func (d *DB) RecordNodeReportResult(agentToken string, report NodeReport, now ti
 	result.DiscardedEventIDs = committed.discardedIDs
 	result.DiscardedEventUIDs = committed.discardedUIDs
 	return result, nil
+}
+
+// RecordNodeObservedAddress adopts the public source address of a family-
+// specific, authenticated Agent request. The address never comes from the
+// Agent's JSON payload, so only server-observed, routable sources can update
+// automatic address slots.
+func (d *DB) RecordNodeObservedAddress(agentToken, family, sourceIP string, now time.Time) (string, error) {
+	v4, v6 := publicNodeAddressFamilies(sourceIP)
+	observed := v4
+	if family == "v6" {
+		observed = v6
+	} else if family != "v4" {
+		return "", errors.New("family must be v4 or v6")
+	}
+	if observed == "" {
+		return "", nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var id int64
+	var legacyAddress, addressSource, addressV4, addressV6, addressV6Source string
+	var dnsPublish, listenInterface, reportedInterfaces string
+	if err := tx.QueryRow(`SELECT id,address,address_source,address_v4,address_v6,address_v6_source,dns_publish,listen_interface,reported_interfaces FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &legacyAddress, &addressSource, &addressV4, &addressV6, &addressV6Source, &dnsPublish, &listenInterface, &reportedInterfaces); errors.Is(err, sql.ErrNoRows) {
+		return "", errInvalidAgentToken
+	} else if err != nil {
+		return "", err
+	}
+
+	oldInterfaces := []NodeNetworkInterface(nil)
+	_ = json.Unmarshal([]byte(reportedInterfaces), &oldInterfaces)
+	oldNode := ControlNode{Address: legacyAddress, AddressV4: addressV4, AddressV6: addressV6,
+		DNSPublish: dnsPublish, ListenInterface: listenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(oldInterfaces)}
+
+	legacyV4, legacyV6 := publicNodeAddressFamilies(legacyAddress)
+	manualLegacyV4 := nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, addressV6Source, "v4")
+	manualLegacyV6 := nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, addressV6Source, "v6")
+	updateV4, updateV6 := false, false
+	newAddressV4, newAddressV6 := addressV4, addressV6
+	newAddressV6Source := addressV6Source
+	if family == "v4" {
+		updateV4 = !manualLegacyV4 && (strings.TrimSpace(addressV4) == "" || (nodeAddressSourceIsAutomatic(addressSource) && strings.TrimSpace(addressV4) != observed))
+		if updateV4 {
+			newAddressV4 = observed
+		}
+	} else {
+		updateV6 = !manualLegacyV6 && (strings.TrimSpace(addressV6) == "" || (nodeAddressSourceIsAutomatic(addressV6Source) && strings.TrimSpace(addressV6) != observed))
+		if updateV6 {
+			newAddressV6 = observed
+			newAddressV6Source = nodeAddressSourceReport
+		}
+	}
+	if manualLegacyV6 && updateV4 && newAddressV6Source == "" {
+		// Keep a migrated manual legacy IPv6 address marked manual if the
+		// IPv4 discovery below changes address_source to report.
+		newAddressV6Source = nodeAddressSourceManual
+	}
+	if !updateV4 && !updateV6 {
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return observed, nil
+	}
+
+	newLegacyAddress, newLegacySource := legacyAddress, addressSource
+	if updateV4 {
+		newLegacySource = nodeAddressSourceReport
+	}
+	if strings.TrimSpace(legacyAddress) == "" {
+		newLegacyAddress = observed
+		if family == "v4" {
+			newLegacySource = nodeAddressSourceReport
+		}
+	} else if family == "v4" && updateV4 && nodeAddressSourceIsAutomatic(addressSource) && legacyV4 != "" &&
+		(strings.TrimSpace(addressV4) == "" || legacyV4 == strings.TrimSpace(addressV4)) {
+		newLegacyAddress = observed
+	} else if family == "v6" && updateV6 && legacyV6 != "" &&
+		(nodeAddressSourceIsAutomatic(addressV6Source) || (addressV6Source == "" && nodeAddressSourceIsAutomatic(addressSource))) &&
+		(strings.TrimSpace(addressV6) == "" || legacyV6 == strings.TrimSpace(addressV6)) {
+		newLegacyAddress = observed
+	}
+	if _, err := tx.Exec(`UPDATE control_nodes SET address=?,address_source=?,address_v4=?,address_v6=?,address_v6_source=?,updated_at_ms=? WHERE id=?`,
+		newLegacyAddress, newLegacySource, newAddressV4, newAddressV6, newAddressV6Source, now.UnixMilli(), id); err != nil {
+		return "", err
+	}
+	newNode := ControlNode{Address: newLegacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6,
+		DNSPublish: dnsPublish, ListenInterface: listenInterface, NetworkInterfaces: oldNode.NetworkInterfaces}
+	oldFamily, oldFamilyErr := effectiveNodeListenFamily(oldNode)
+	newFamily, newFamilyErr := effectiveNodeListenFamily(newNode)
+	listenerFamilyChanged := oldFamily != newFamily || (oldFamilyErr == nil) != (newFamilyErr == nil)
+	if listenerFamilyChanged {
+		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_hash='',config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
+			schedule_revision=schedule_revision+1,updated_at_ms=? WHERE desired_node_id=?`, now.UnixMilli(), now.UnixMilli(), id); err != nil {
+			return "", err
+		}
+		if err := markAgentConfigsDirtyForNodeIDsTx(tx, id); err != nil {
+			return "", err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	_, _ = d.NodeControlSnapshot(now)
+	return observed, nil
 }
 
 func (d *DB) recordNodeWatchHistoryEvent(event NodeRequestEvent) error {

@@ -270,6 +270,8 @@ type edgeAgentRuntime struct {
 	leaseID              string
 	quiesced             atomic.Bool
 	port                 int
+	listenFamily         string
+	listenInterface      string
 	handler              http.Handler
 	certificate          *tls.Certificate
 	server               *http.Server
@@ -317,7 +319,7 @@ type edgeAgentRuntime struct {
 	trafficHosts map[int64]string
 	resolver     dynamicIPResolver
 	transport    dynamicTransportFactory
-	listen       func(string, string) (net.Listener, error)
+	listen       func(string, string, string) (net.Listener, error)
 }
 
 // beginBundleDrain rejects new work on an old generation but gives streams
@@ -400,6 +402,8 @@ func (runtime *edgeAgentRuntime) forceStopCentralSites(ctx context.Context, site
 
 type edgeAgentRuntimeState struct {
 	port                 int
+	listenFamily         string
+	listenInterface      string
 	server               *http.Server
 	bundle               *edgeProxyBundle
 	nodeGUID             string
@@ -1491,14 +1495,64 @@ func (runtime *edgeAgentRuntime) stopServer(force ...bool) {
 	}
 }
 
-func (runtime *edgeAgentRuntime) startServer(port int) error {
-	listen := runtime.listen
-	if listen == nil {
-		listen = net.Listen
+type agentListenerSpec struct {
+	network string
+	address string
+}
+
+func agentListenerSpecs(family string, port int) ([]agentListenerSpec, error) {
+	if port < 1 || port > 65535 {
+		return nil, errors.New("Agent port is invalid")
 	}
-	listener, err := listen("tcp", ":"+strconv.Itoa(port))
+	family = strings.ToLower(strings.TrimSpace(family))
+	if family == "" {
+		family = "auto"
+	}
+	portText := strconv.Itoa(port)
+	switch family {
+	case "auto":
+		// Bind both families explicitly. The generic tcp wildcard relies on
+		// OS-specific dual-stack defaults and can claim IPv4 even when only an
+		// IPv6 DNS record is published.
+		return []agentListenerSpec{
+			{network: "tcp4", address: net.JoinHostPort("0.0.0.0", portText)},
+			{network: "tcp6", address: net.JoinHostPort("::", portText)},
+		}, nil
+	case "v4":
+		return []agentListenerSpec{{network: "tcp4", address: net.JoinHostPort("0.0.0.0", portText)}}, nil
+	case "v6":
+		return []agentListenerSpec{{network: "tcp6", address: net.JoinHostPort("::", portText)}}, nil
+	default:
+		return nil, errors.New("Agent listener family must be auto, v4, or v6")
+	}
+}
+
+func (runtime *edgeAgentRuntime) startServer(port int, family, interfaceName string) error {
+	specs, err := agentListenerSpecs(family, port)
 	if err != nil {
 		return err
+	}
+	interfaceName, err = normalizeListenerInterfaceName(interfaceName)
+	if err != nil {
+		return err
+	}
+	listen := runtime.listen
+	if listen == nil {
+		listen = listenAgent
+	}
+	listeners := make([]net.Listener, 0, len(specs))
+	for _, spec := range specs {
+		listener, listenErr := listen(spec.network, spec.address, interfaceName)
+		if listenErr != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			if interfaceName != "" {
+				return fmt.Errorf("listen on interface %s (%s %s): %w", interfaceName, spec.network, spec.address, listenErr)
+			}
+			return fmt.Errorf("listen on %s %s: %w", spec.network, spec.address, listenErr)
+		}
+		listeners = append(listeners, listener)
 	}
 	server := &http.Server{
 		Handler: runtime, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
@@ -1506,18 +1560,31 @@ func (runtime *edgeAgentRuntime) startServer(port int) error {
 	}
 	runtime.mu.Lock()
 	runtime.server = server
+	runtime.port = port
+	runtime.listenFamily = family
+	runtime.listenInterface = interfaceName
 	runtime.mu.Unlock()
-	go func() {
-		if err := server.Serve(tls.NewListener(listener, server.TLSConfig)); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			runtime.mu.Lock()
-			if runtime.server == server {
-				runtime.listenerError = agentStatusError(err)
-				runtime.server = nil
+	for _, listener := range listeners {
+		listener := listener
+		go func() {
+			if err := server.Serve(tls.NewListener(listener, server.TLSConfig)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				reportFailure := false
+				runtime.mu.Lock()
+				if runtime.server == server {
+					runtime.listenerError = agentStatusError(err)
+					runtime.server = nil
+					reportFailure = true
+				}
+				runtime.mu.Unlock()
+				if reportFailure {
+					// This server owns the complete family set. Do not leave only one
+					// address family accepting after its sibling listener fails.
+					_ = server.Close()
+					fmt.Fprintf(os.Stderr, "Meridian Agent listener failed: %v\n", err)
+				}
 			}
-			runtime.mu.Unlock()
-			fmt.Fprintf(os.Stderr, "Meridian Agent listener failed: %v\n", err)
-		}
-	}()
+		}()
+	}
 	return nil
 }
 
@@ -1535,6 +1602,8 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 	runtime.appliedHash = old.appliedHash
 	runtime.appliedRevision = old.appliedRevision
 	runtime.port = old.port
+	runtime.listenFamily = old.listenFamily
+	runtime.listenInterface = old.listenInterface
 	runtime.certificate = old.certificate
 	runtime.handler = old.handler
 	runtime.bundle = old.bundle
@@ -1549,7 +1618,7 @@ func (runtime *edgeAgentRuntime) rollbackApply(old edgeAgentRuntimeState, listen
 	}
 	runtime.mu.Unlock()
 	if listenerWasStopped && old.server != nil {
-		if err := runtime.startServer(old.port); err != nil {
+		if err := runtime.startServer(old.port, old.listenFamily, old.listenInterface); err != nil {
 			restoreErr := fmt.Errorf("restore old listener on port %d: %w", old.port, err)
 			runtime.mu.Lock()
 			runtime.listenerError = restoreErr.Error()
@@ -1586,7 +1655,14 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	if err := validateAgentConfigEnvelope(config); err != nil {
 		return err
 	}
-	var err error
+	listenFamily := strings.ToLower(strings.TrimSpace(config.ListenFamily))
+	if listenFamily == "" {
+		listenFamily = "auto"
+	}
+	listenInterface, err := normalizeListenerInterfaceName(config.ListenInterface)
+	if err != nil {
+		return err
+	}
 	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
 		return errors.New("Agent port is invalid")
 	}
@@ -1604,7 +1680,8 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	runtime.mu.RLock()
 	oldState := edgeAgentRuntimeState{
-		port: runtime.port, server: runtime.server, bundle: runtime.bundle,
+		port: runtime.port, listenFamily: runtime.listenFamily, listenInterface: runtime.listenInterface,
+		server: runtime.server, bundle: runtime.bundle,
 		nodeGUID: runtime.nodeGUID, appliedHash: runtime.appliedHash, appliedRevision: runtime.appliedRevision, certificate: runtime.certificate, handler: runtime.handler,
 		cacheClearGeneration: runtime.cacheClearGeneration, siteCounterEpoch: runtime.siteCounterEpoch,
 		listenerError: runtime.listenerError,
@@ -1615,8 +1692,8 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	}
 	runtime.mu.RUnlock()
 	oldState.siteReported = oldSiteReported
-	needsListener := len(config.Routes) > 0
-	listenerChanged := oldState.port != config.HTTPSPort || (oldState.server == nil) != !needsListener
+	needsListener := len(config.Routes) > 0 && listenFamily != "none"
+	listenerChanged := oldState.port != config.HTTPSPort || oldState.listenFamily != listenFamily || oldState.listenInterface != listenInterface || (oldState.server == nil) != !needsListener
 	if listenerChanged {
 		// Closing the listener stops new connections, while a non-forcing
 		// shutdown leaves already admitted playback/WebSocket handlers alive.
@@ -1625,6 +1702,8 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.mu.Lock()
 	runtime.nodeGUID = config.NodeGUID
 	runtime.port = config.HTTPSPort
+	runtime.listenFamily = listenFamily
+	runtime.listenInterface = listenInterface
 	runtime.certificate = certificate
 	runtime.handler = bundle.handler
 	runtime.bundle = bundle
@@ -1635,7 +1714,7 @@ func (runtime *edgeAgentRuntime) apply(config AgentRuntimeConfig) (retErr error)
 	runtime.mu.Unlock()
 	newServerStarted := false
 	if listenerChanged && needsListener {
-		if err := runtime.startServer(config.HTTPSPort); err != nil {
+		if err := runtime.startServer(config.HTTPSPort, listenFamily, listenInterface); err != nil {
 			bundle.close()
 			return runtime.rollbackApply(oldState, listenerChanged, false, err)
 		}
@@ -1700,6 +1779,12 @@ func validateAgentConfigEnvelope(config AgentRuntimeConfig) error {
 	}
 	if len(config.Routes) > 0 && (config.HTTPSPort < 1 || config.HTTPSPort > 65535) {
 		return errors.New("Agent port is invalid")
+	}
+	if config.ListenFamily != "" && config.ListenFamily != "auto" && config.ListenFamily != "v4" && config.ListenFamily != "v6" && config.ListenFamily != "none" {
+		return errors.New("Agent listener family is invalid")
+	}
+	if _, err := normalizeListenerInterfaceName(config.ListenInterface); err != nil {
+		return errors.New("Agent listener interface is invalid")
 	}
 	return nil
 }
@@ -2224,7 +2309,7 @@ func edgeCollect(sessionID string, sequence int64) (NodeReport, error) {
 	if err != nil {
 		return NodeReport{}, err
 	}
-	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion, NetAddresses: edgeCollectNetAddresses(interfaceName)}, nil
+	return NodeReport{BootID: sessionID, ReportSessionID: sessionID, CounterEpoch: edgeCounterEpoch(interfaceName), Sequence: sequence, InterfaceName: interfaceName, RXBytes: rx, TXBytes: tx, AgentVersion: appVersion, NetAddresses: edgeCollectNetAddresses(interfaceName), NetworkInterfaces: edgeCollectNetworkInterfaces()}, nil
 }
 
 var edgeAWSMetadataMu sync.Mutex
@@ -2235,7 +2320,7 @@ const edgeAWSMetadataCacheDuration = 5 * time.Minute
 
 func edgeMetadataIPv4FromResponse(value string) string {
 	ip := net.ParseIP(strings.TrimSpace(value))
-	if ip == nil || ip.To4() == nil {
+	if ip == nil || ip.To4() == nil || !nodeAddressIsGlobalUnicast(ip) {
 		return ""
 	}
 	return ip.To4().String()
@@ -2313,11 +2398,7 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 	result := make([]NodeNetAddress, 0, 8)
 	seen := map[string]bool{}
 	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		name := strings.ToLower(iface.Name)
-		if strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "virbr") || strings.HasPrefix(name, "tun") || strings.HasPrefix(name, "tap") {
+		if !edgeNetworkInterfaceEligible(iface) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -2333,7 +2414,7 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 				text = text[:slash]
 			}
 			ip := net.ParseIP(text)
-			if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			if ip == nil || !nodeAddressIsGlobalUnicast(ip) {
 				continue
 			}
 			family := "v6"
@@ -2364,6 +2445,181 @@ func edgeCollectNetAddresses(preferred string) []NodeNetAddress {
 		}
 	}
 	return result
+}
+
+const edgeControllerAddressCacheDuration = 5 * time.Minute
+
+type edgeControllerAddressCacheEntry struct {
+	checkedAt time.Time
+	address   string
+}
+
+var edgeControllerAddressCache struct {
+	sync.Mutex
+	entries map[string]edgeControllerAddressCacheEntry
+}
+
+func edgeControllerAddressProbeNetwork(family string) (string, bool) {
+	switch family {
+	case "v4":
+		return "tcp4", true
+	case "v6":
+		return "tcp6", true
+	default:
+		return "", false
+	}
+}
+
+func edgeControllerAddressCacheKey(controller, token, family string) string {
+	tokenDigest := sha256.Sum256([]byte(token))
+	return strings.TrimRight(controller, "/") + "|" + hex.EncodeToString(tokenDigest[:]) + "|" + family
+}
+
+func edgeFetchControllerObservedAddress(ctx context.Context, client *http.Client, controller, token, family string) (NodeNetAddress, bool) {
+	if client == nil || (family != "v4" && family != "v6") {
+		return NodeNetAddress{}, false
+	}
+	var response struct {
+		Family  string `json:"family"`
+		Address string `json:"address"`
+	}
+	endpoint := strings.TrimRight(controller, "/") + "/api/agent/observed-address"
+	if err := edgeAPIRequest(ctx, client, http.MethodPost, endpoint, token, map[string]string{"family": family}, &response); err != nil {
+		return NodeNetAddress{}, false
+	}
+	if response.Family != family {
+		return NodeNetAddress{}, false
+	}
+	v4, v6 := publicNodeAddressFamilies(response.Address)
+	address := v4
+	if family == "v6" {
+		address = v6
+	}
+	if address == "" {
+		return NodeNetAddress{}, false
+	}
+	return NodeNetAddress{Family: family, Address: address, Interface: "controller"}, true
+}
+
+func edgeProbeControllerObservedAddress(ctx context.Context, controller, token, family string) string {
+	network, ok := edgeControllerAddressProbeNetwork(family)
+	if !ok {
+		return ""
+	}
+	dialer := &net.Dialer{Timeout: 900 * time.Millisecond, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DisableKeepAlives:     true,
+		TLSHandshakeTimeout:   900 * time.Millisecond,
+		ResponseHeaderTimeout: 900 * time.Millisecond,
+		DialContext: func(dialContext context.Context, _, address string) (net.Conn, error) {
+			return dialer.DialContext(dialContext, network, address)
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	defer client.CloseIdleConnections()
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	address, ok := edgeFetchControllerObservedAddress(probeCtx, client, controller, token, family)
+	if !ok {
+		return ""
+	}
+	return address.Address
+}
+
+func edgeCachedControllerObservedAddress(ctx context.Context, controller, token, family string) (NodeNetAddress, bool) {
+	key := edgeControllerAddressCacheKey(controller, token, family)
+	now := time.Now()
+	edgeControllerAddressCache.Lock()
+	if edgeControllerAddressCache.entries == nil {
+		edgeControllerAddressCache.entries = make(map[string]edgeControllerAddressCacheEntry)
+	}
+	if cached, ok := edgeControllerAddressCache.entries[key]; ok && now.Sub(cached.checkedAt) < edgeControllerAddressCacheDuration {
+		edgeControllerAddressCache.Unlock()
+		if cached.address == "" {
+			return NodeNetAddress{}, false
+		}
+		return NodeNetAddress{Family: family, Address: cached.address, Interface: "controller"}, true
+	}
+	edgeControllerAddressCache.Unlock()
+	address := edgeProbeControllerObservedAddress(ctx, controller, token, family)
+	edgeControllerAddressCache.Lock()
+	edgeControllerAddressCache.entries[key] = edgeControllerAddressCacheEntry{checkedAt: time.Now(), address: address}
+	edgeControllerAddressCache.Unlock()
+	if address == "" {
+		return NodeNetAddress{}, false
+	}
+	return NodeNetAddress{Family: family, Address: address, Interface: "controller"}, true
+}
+
+func edgeDiscoverControllerObservedAddresses(ctx context.Context, controller, token string, existing []NodeNetAddress) {
+	var probes sync.WaitGroup
+	for _, family := range []string{"v4", "v6"} {
+		if hasNetworkAddressFamily(existing, family) {
+			continue
+		}
+		probes.Add(1)
+		go func(family string) {
+			defer probes.Done()
+			_, _ = edgeCachedControllerObservedAddress(ctx, controller, token, family)
+		}(family)
+	}
+	probes.Wait()
+}
+
+func edgeNetworkInterfaceEligible(iface net.Interface) bool {
+	if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+		return false
+	}
+	name := strings.ToLower(iface.Name)
+	return !strings.HasPrefix(name, "docker") && !strings.HasPrefix(name, "br-") &&
+		!strings.HasPrefix(name, "veth") && !strings.HasPrefix(name, "virbr") &&
+		!strings.HasPrefix(name, "tun") && !strings.HasPrefix(name, "tap")
+}
+
+func edgeCollectNetworkInterfaces() []NodeNetworkInterface {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	result := make([]NodeNetworkInterface, 0, len(interfaces))
+	for _, iface := range interfaces {
+		if !edgeNetworkInterfaceEligible(iface) || len(iface.Name) > 15 || strings.EqualFold(iface.Name, "metadata") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		reported := NodeNetworkInterface{Name: iface.Name}
+		for _, raw := range addrs {
+			text := strings.TrimSpace(raw.String())
+			if slash := strings.IndexByte(text, '/'); slash >= 0 {
+				text = text[:slash]
+			}
+			ip := net.ParseIP(text)
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			if ip.To4() != nil {
+				reported.IPv4 = true
+				continue
+			}
+			if ip.IsGlobalUnicast() && !ip.IsPrivate() {
+				reported.IPv6 = true
+			}
+		}
+		if reported.IPv4 || reported.IPv6 {
+			result = append(result, reported)
+		}
+	}
+	return normalizeReportedNetworkInterfaces(result)
 }
 
 func hasNetworkAddressFamily(addresses []NodeNetAddress, family string) bool {
@@ -2957,6 +3213,7 @@ func runEdgeAgent() (runErr error) {
 		if collectErr != nil {
 			fmt.Fprintf(os.Stderr, "Meridian Agent traffic collection failed: %v\n", collectErr)
 		} else {
+			edgeDiscoverControllerObservedAddresses(ctx, controller, state.Token, report.NetAddresses)
 			report.AppliedConfigHash, report.AppliedConfigRevision, report.ListenerError, report.ApplyError, report.ApplyErrorAtMS, report.ApplyFailures = runtime.status()
 			report.AgentLeaseID, report.SessionEpoch = runtime.reportIdentity()
 			runtime.mu.RLock()

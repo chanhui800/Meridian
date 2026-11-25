@@ -21,7 +21,7 @@ const (
 	// databaseSchemaVersion is independent from the application and backup
 	// format versions. It is persisted in SQLite so restores can reject a
 	// database whose columns/state are newer than this binary understands.
-	databaseSchemaVersion                      = 60
+	databaseSchemaVersion                      = 61
 	watchHistorySourceBackfillSiteLimit        = 128
 	watchHistorySourceBackfillSourceLimit      = 4096
 	watchHistorySourceBackfillPerCategoryLimit = 256
@@ -392,6 +392,8 @@ func (d *DB) migrateOnce() error {
 		address_v6_source TEXT NOT NULL DEFAULT '',
 		dns_publish TEXT NOT NULL DEFAULT 'auto' CHECK(dns_publish IN ('auto','v4','v6')),
 		reported_net_addresses TEXT NOT NULL DEFAULT '[]',
+		reported_interfaces TEXT NOT NULL DEFAULT '[]',
+		listen_interface TEXT NOT NULL DEFAULT '',
 		entry_mode TEXT NOT NULL DEFAULT 'direct' CHECK(entry_mode IN ('direct','shared')),
 		http_port INTEGER NOT NULL DEFAULT 0,
 		https_port INTEGER NOT NULL DEFAULT 443,
@@ -586,6 +588,8 @@ func (d *DB) migrateOnce() error {
 		{"address_v6_source", "ALTER TABLE control_nodes ADD COLUMN address_v6_source TEXT NOT NULL DEFAULT ''"},
 		{"dns_publish", "ALTER TABLE control_nodes ADD COLUMN dns_publish TEXT NOT NULL DEFAULT 'auto'"},
 		{"reported_net_addresses", "ALTER TABLE control_nodes ADD COLUMN reported_net_addresses TEXT NOT NULL DEFAULT '[]'"},
+		{"reported_interfaces", "ALTER TABLE control_nodes ADD COLUMN reported_interfaces TEXT NOT NULL DEFAULT '[]'"},
+		{"listen_interface", "ALTER TABLE control_nodes ADD COLUMN listen_interface TEXT NOT NULL DEFAULT ''"},
 	} {
 		var found int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('control_nodes') WHERE name=?", migration.column).Scan(&found); err != nil {

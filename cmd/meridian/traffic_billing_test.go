@@ -290,11 +290,16 @@ func TestTrafficAggregatesIncludeControllerAndAgentSources(t *testing.T) {
 	}
 	now := time.Now().In(time.Local)
 	start := now.Add(-time.Hour)
-	if err := app.db.addTrafficWithRequestsAt(site.ID, 100, 200, 1, now.Add(-20*time.Minute)); err != nil {
+	localAt := now.Add(-20 * time.Minute)
+	nodeAt := now.Add(-10 * time.Minute)
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 100, 200, 1, localAt); err != nil {
 		t.Fatalf("controller traffic: %v", err)
 	}
-	if _, err := app.db.db.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?)`, 77, site.ID, 300, 400, 2, now.Add(-10*time.Minute).UnixMilli()); err != nil {
+	if _, err := app.db.db.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?)`, 77, site.ID, 300, 400, 2, nodeAt.UnixMilli()); err != nil {
 		t.Fatalf("agent traffic: %v", err)
+	}
+	if got, err := app.db.SumRequestsSince(start); err != nil || got != 3 {
+		t.Fatalf("SumRequestsSince = %d, %v; want 3", got, err)
 	}
 	if got, err := app.db.SumTrafficSince(start, trafficBillingModeBidirectional); err != nil || got != 2000 {
 		t.Fatalf("SumTrafficSince = %d, %v; want 2000", got, err)
@@ -305,6 +310,64 @@ func TestTrafficAggregatesIncludeControllerAndAgentSources(t *testing.T) {
 	}
 	if got, err := app.db.SumTrafficSinceForSite(site.ID, start, trafficBillingModeOutbound); err != nil || got != 600 {
 		t.Fatalf("SumTrafficSinceForSite = %d, %v; want 600 outbound", got, err)
+	}
+	// Request-only upserts must invalidate the cached totals even when neither
+	// directional byte counter changes.
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 0, 0, 4, localAt); err != nil {
+		t.Fatalf("controller request-only checkpoint: %v", err)
+	}
+	if got, err := app.db.SumRequestsSince(start); err != nil || got != 7 {
+		t.Fatalf("SumRequestsSince after controller checkpoint = %d, %v; want 7", got, err)
+	}
+	if _, err := app.db.db.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(node_id,site_id,recorded_at_ms) DO UPDATE SET requests=requests+excluded.requests`, 77, site.ID, 0, 0, 5, nodeAt.UnixMilli()); err != nil {
+		t.Fatalf("agent request-only checkpoint: %v", err)
+	}
+	if got, err := app.db.SumRequestsSince(start); err != nil || got != 12 {
+		t.Fatalf("SumRequestsSince after Agent checkpoint = %d, %v; want 12", got, err)
+	}
+}
+
+func TestDashboardMonthlyRequestsIncludeNaturalMonthLogsAndPendingLocalRequests(t *testing.T) {
+	app := newTestApp(t)
+	settings := app.db.currentSystemSettings()
+	settings.ScheduleTimezone = beijingTimezoneOffsetMinutes
+	if err := app.db.saveSystemSettings(settings); err != nil {
+		t.Fatalf("save scheduling timezone: %v", err)
+	}
+	location := timezoneLocation(settings.ScheduleTimezone)
+	now := time.Date(2026, time.November, 24, 17, 0, 0, 0, location)
+	_, monthStart, _, _, err := dashboardTrendWindowWithLocation("month", now, time.Time{}, time.Time{}, location)
+	if err != nil {
+		t.Fatalf("month window: %v", err)
+	}
+	site, err := app.db.CreateSite("monthly-requests", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 0, 0, 5, monthStart.Add(-time.Minute)); err != nil {
+		t.Fatalf("add prior-month requests: %v", err)
+	}
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 0, 0, 7, monthStart.Add(time.Hour)); err != nil {
+		t.Fatalf("add current-month requests: %v", err)
+	}
+	inst := &ProxyInstance{Site: *site}
+	inst.reqCount.Store(9)
+	inst.pendingRequests.Store(2)
+	app.pm.proxies[site.ID] = inst
+	sites, err := app.db.ListSites()
+	if err != nil {
+		t.Fatalf("ListSites: %v", err)
+	}
+	snapshot, err := app.pm.dashboardSnapshotWithSites(sites, settings, now)
+	if err != nil {
+		t.Fatalf("dashboard snapshot: %v", err)
+	}
+	if snapshot.MonthlyRequests != 9 {
+		t.Fatalf("monthly requests = %d, want 7 persisted + 2 pending (excluding 5 before month start)", snapshot.MonthlyRequests)
+	}
+	if snapshot.TotalRequests != 9 {
+		t.Fatalf("runtime total requests = %d, want 9; existing live counter contract should remain intact", snapshot.TotalRequests)
 	}
 }
 
@@ -335,10 +398,17 @@ func TestDashboardIncludesScheduledAgentTraffic(t *testing.T) {
 		CounterEpoch:    "dashboard-counter",
 		Sequence:        1,
 		InterfaceName:   "eth0",
-		SiteStats:       []NodeSiteStat{{Host: site.PublicHost, RequestCount: 7, LastRequestAtMS: now.UnixMilli(), LastStatus: 200, BytesIn: 300, BytesOut: 400, CumulativeBytesIn: 300, CumulativeBytesOut: 400}},
+		SiteStats:       []NodeSiteStat{{Host: site.PublicHost, RequestCount: 7, LastRequestAtMS: now.UnixMilli(), LastStatus: 200, BytesIn: 300, BytesOut: 400, CumulativeBytesIn: 300, CumulativeBytesOut: 400, CounterEpoch: 1}},
 	}
 	if _, err := app.db.RecordNodeReport(token, report, now); err != nil {
 		t.Fatalf("RecordNodeReport: %v", err)
+	}
+	if _, _, err := app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
+		ReportSessionID: "dashboard-session", CounterEpoch: "dashboard-counter", Sequence: 2,
+		SampledAtMS: now.Add(time.Second).UnixMilli(),
+		SiteStats:   []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 300, CumulativeBytesOut: 400, Requests: 8, CounterEpoch: 2}},
+	}, now.Add(time.Second)); err != nil {
+		t.Fatalf("record live Agent sample: %v", err)
 	}
 	sites, err := app.db.ListSites()
 	if err != nil {
@@ -350,10 +420,10 @@ func TestDashboardIncludesScheduledAgentTraffic(t *testing.T) {
 		t.Fatalf("dashboard snapshot: %v", err)
 	}
 	live := findLiveSite(t, snapshot, site.ID)
-	if !live.Running || live.CumulativeBytesIn != 300 || live.CumulativeBytesOut != 400 || live.Requests != 7 {
+	if !live.Running || live.CumulativeBytesIn != 300 || live.CumulativeBytesOut != 400 || live.Requests != 8 {
 		t.Fatalf("scheduled Agent live site = %+v", live)
 	}
-	if live.MonthlyTraffic != 1400 || snapshot.MonthlyTraffic != 1400 || snapshot.TotalTraffic != 1400 || snapshot.TotalRequests != 7 {
+	if live.MonthlyTraffic != 1400 || snapshot.MonthlyTraffic != 1400 || snapshot.TotalTraffic != 1400 || snapshot.TotalRequests != 8 || snapshot.MonthlyRequests != 15 {
 		t.Fatalf("scheduled Agent dashboard totals = snapshot=%+v live=%+v", snapshot, live)
 	}
 	if snapshot.GeneratedAtMS != now.Add(time.Second).UnixMilli() {
@@ -365,6 +435,20 @@ func TestDashboardIncludesScheduledAgentTraffic(t *testing.T) {
 	}
 	if len(bootstrap.Sites) != 1 || bootstrap.Sites[0].TrafficUsed != 1400 || !bootstrap.Sites[0].Running {
 		t.Fatalf("dashboard bootstrap site = %+v", bootstrap.Sites)
+	}
+	if _, _, err := app.db.recordNodeLiveReport(node.ID, NodeLiveReport{
+		ReportSessionID: "dashboard-session", CounterEpoch: "dashboard-counter", Sequence: 3,
+		SampledAtMS: now.Add(2 * time.Second).UnixMilli(),
+		SiteStats:   []NodeLiveSiteTraffic{{SiteID: site.ID, Host: site.PublicHost, CumulativeBytesIn: 300, CumulativeBytesOut: 400, Requests: 2, CounterEpoch: 3}},
+	}, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("record reset live Agent sample: %v", err)
+	}
+	snapshot, err = app.pm.dashboardSnapshotWithSites(sites, settings, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("dashboard snapshot after counter reset: %v", err)
+	}
+	if snapshot.MonthlyRequests != 9 {
+		t.Fatalf("monthly requests after a decreasing new counter epoch = %d, want 7 persisted + 2 live", snapshot.MonthlyRequests)
 	}
 }
 

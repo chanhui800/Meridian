@@ -122,6 +122,8 @@
 .fleet-modal .fleet-form .form-input:focus { border-color: var(--console-accent); outline: 2px solid var(--console-accent-soft); }
 .fleet-modal .fleet-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .fleet-modal .fleet-form .form-help { font-size: 12px; color: var(--console-muted); line-height: 1.6; margin: 0; }
+.fleet-modal .fleet-form .form-help.is-error { color: var(--console-danger); }
+.fleet-modal .fleet-form select.form-input option:disabled { color: var(--console-muted); }
 .fleet-modal .fleet-form fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 14px; min-width: 0; }
 .fleet-modal .fleet-form legend { font-weight: 600; color: var(--console-ink); font-size: 13px; padding: 0 0 14px; }
 .fleet-modal .fleet-form details { padding-top: 18px; border-top: 1px solid var(--console-line); }
@@ -131,6 +133,7 @@
 .fleet-form-check input { accent-color: var(--console-accent); }
 .fleet-modal .node-script { border-color: var(--console-line); background: var(--console-bg); color: var(--console-ink); border-radius: 8px; font: 12px/1.6 Consolas, monospace; }
 .fleet-modal #node-install-command { min-height: 95px; }
+.fleet-modal .node-install-command-label { font-size: 12px; font-weight: 500; color: var(--console-ink); }
 .fleet-modal .node-script-note { color: var(--console-muted); font-size: 13px; line-height: 1.6; }
 @media (max-width: 1100px) {
   .fleet-list-heading, .fleet-row-summary { grid-template-columns: minmax(190px, 1.3fr) 75px minmax(130px, 1fr) auto; gap: 14px; }

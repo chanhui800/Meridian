@@ -345,8 +345,56 @@ a:focus-visible, button:focus-visible {
 .generic-doc-link { margin: 24px 0 0; text-align: center; font-size: 14px; }
 .generic-doc-link a { color: var(--accent-strong); text-underline-offset: 4px; }
 
-.flow-section { background: var(--surface); border-block: 1px solid var(--border); margin-top: 80px; }
-.flow-section .section { padding-bottom: 64px; }
+.agent-section { background: var(--surface); border-block: 1px solid var(--border); margin-top: 80px; }
+.agent-section > .section { padding-bottom: 64px; }
+.agent-heading { max-width: 740px; margin: 0 auto 32px; text-align: center; }
+.agent-eyebrow {
+  display: inline-block;
+  margin: 0 0 16px;
+  border-radius: 999px;
+  padding: 5px 14px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+}
+.agent-heading .section-sub { margin-bottom: 0; }
+.agent-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.agent-steps li { padding: 24px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.agent-step-index { display: block; margin-bottom: 20px; color: var(--accent-strong); font: 600 14px ui-monospace, "Cascadia Code", Consolas, monospace; }
+.agent-steps h3, .agent-network h3 { margin: 0 0 12px; font-size: 18px; }
+.agent-steps p, .agent-discovery p { margin: 0; color: var(--muted); font-size: 14px; }
+.agent-network { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 32px; margin-top: 40px; }
+.agent-listeners { min-width: 0; }
+.agent-family-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.agent-family-table th, .agent-family-table td {
+  padding: 14px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+.agent-family-table thead th { background: var(--accent-soft); }
+.agent-family-table th:first-child { width: 17%; }
+.agent-family-table th:nth-child(2) { width: 25%; }
+.agent-family-table td { color: var(--muted); }
+.agent-family-table code { font: 13px ui-monospace, "Cascadia Code", Consolas, monospace; }
+.agent-family-note { margin: 14px 0 0; color: var(--muted); font-size: 14px; }
+.agent-discovery { padding: 24px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.agent-discovery p + p { margin-top: 14px; }
+.agent-doc-link { margin: 24px 0 0; text-align: center; font-size: 14px; }
+.agent-doc-link a { color: var(--accent-strong); text-underline-offset: 4px; }
+.agent-handoff { margin-top: 40px; padding-top: 32px; border-top: 1px solid var(--border); }
+.agent-handoff > h3 { margin: 0 0 24px; text-align: center; font-size: 22px; }
 .flow {
   display: flex;
   align-items: stretch;
@@ -525,6 +573,9 @@ a:focus-visible, button:focus-visible {
   .hero-stats { grid-template-columns: 1fr; }
   .gallery { grid-template-columns: 1fr; }
   .source-history { grid-template-columns: 1fr; gap: 20px; }
+  .agent-steps { grid-template-columns: 1fr; }
+  .agent-step-index { margin-bottom: 12px; }
+  .agent-network { grid-template-columns: 1fr; gap: 24px; margin-top: 32px; }
 }
 @media (max-width: 560px) {
   .nav-inner { padding-inline: 20px; }
@@ -538,6 +589,9 @@ a:focus-visible, button:focus-visible {
   .generic-setup, .route-examples { grid-template-columns: 1fr; gap: 24px; margin-top: 24px; }
   .client-example, .source-history { padding: 20px; }
   .feature-grid { grid-template-columns: 1fr; }
+  .agent-steps li, .agent-discovery { padding: 20px; }
+  .agent-family-table th, .agent-family-table td { padding: 12px 8px; font-size: 13px; }
+  .agent-handoff > h3 { font-size: 20px; }
   .flow-node { min-width: 100%; }
   .flow-arrow { transform: rotate(90deg); }
 }

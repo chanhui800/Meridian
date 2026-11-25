@@ -25,7 +25,6 @@ import (
 // agentInstallerScript is the single canonical installer served by the panel
 // and published under scripts/. Keep the generated response and install
 // command on the same implementation.
-//
 var agentInstallerScript = agentscripts.AgentInstaller
 
 var agentBinaryIdentityCache struct {
@@ -174,20 +173,21 @@ func agentBinaryIdentityForPlatform(platform string) (string, string, error) {
 }
 
 type nodeAPIInput struct {
-	Name                     string `json:"name"`
-	Address                  string `json:"address"`
-	AddressV4                string `json:"address_v4"`
-	AddressV6                string `json:"address_v6"`
-	DNSPublish               string `json:"dns_publish"`
-	Port                     int    `json:"port"`
-	HTTPSPort                int    `json:"https_port"` // Deprecated compatibility for cached pre-single-port pages.
-	Enabled                  *bool  `json:"enabled"`
-	Priority                 int    `json:"priority"`
-	TrafficQuota             int64  `json:"traffic_quota"`
-	TrafficManualOffsetBytes int64  `json:"traffic_manual_offset_bytes"`
-	BillingMode              string `json:"billing_mode"`
-	ResetDay                 int    `json:"reset_day"`
-	ControllerURL            string `json:"controller_url"`
+	Name                     string  `json:"name"`
+	Address                  string  `json:"address"`
+	AddressV4                string  `json:"address_v4"`
+	AddressV6                string  `json:"address_v6"`
+	DNSPublish               string  `json:"dns_publish"`
+	ListenInterface          *string `json:"listen_interface"`
+	Port                     int     `json:"port"`
+	HTTPSPort                int     `json:"https_port"` // Deprecated compatibility for cached pre-single-port pages.
+	Enabled                  *bool   `json:"enabled"`
+	Priority                 int     `json:"priority"`
+	TrafficQuota             int64   `json:"traffic_quota"`
+	TrafficManualOffsetBytes int64   `json:"traffic_manual_offset_bytes"`
+	BillingMode              string  `json:"billing_mode"`
+	ResetDay                 int     `json:"reset_day"`
+	ControllerURL            string  `json:"controller_url"`
 }
 
 func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
@@ -195,8 +195,12 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 	if port == 0 {
 		port = input.HTTPSPort
 	}
+	listenInterface := ""
+	if input.ListenInterface != nil {
+		listenInterface = *input.ListenInterface
+	}
 	return NodeCreateInput{
-		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, Port: port, Priority: input.Priority,
+		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, ListenInterface: listenInterface, Port: port, Priority: input.Priority,
 		TrafficQuota: input.TrafficQuota, BillingMode: input.BillingMode, ResetDay: input.ResetDay,
 		TrafficManualOffsetBytes: input.TrafficManualOffsetBytes,
 	}
@@ -382,7 +386,18 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		if input.Enabled != nil {
 			enabled = *input.Enabled
 		}
-		node, err := a.db.UpdateControlNode(id, nodeCreateInput(input), enabled, now)
+		nodeInput := nodeCreateInput(input)
+		if input.ListenInterface == nil {
+			// Older cached pages do not send listener-interface settings. Keep
+			// their update requests from clearing a value saved by a newer page.
+			current, lookupErr := a.db.controlNodeByID(id, now)
+			if lookupErr != nil {
+				writeNodeAPIError(a, w, lookupErr)
+				return
+			}
+			nodeInput.ListenInterface = current.ListenInterface
+		}
+		node, err := a.db.UpdateControlNode(id, nodeInput, enabled, now)
 		if err != nil {
 			writeNodeAPIError(a, w, err)
 			return
@@ -673,7 +688,7 @@ func (a *App) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 	// check then rejects.
 	enrollmentSource := ""
 	if peer := remoteAddressIP(r.RemoteAddr); peer != nil {
-		enrollmentSource = requestClientKey(r, a.trustedProxies)
+		enrollmentSource = agentReportSourceIP(r, a.trustedProxies, a.panelExternalProxyEnabled)
 	}
 	node, agentToken, err := a.db.EnrollControlNodeFromSource(identity.Token, time.Now(), enrollmentSource)
 	if err != nil {
@@ -731,7 +746,7 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	result, err := a.db.RecordNodeReportResult(token, report, time.Now())
+	result, err := a.db.RecordNodeReportResultFromSource(token, report, time.Now(), agentReportSourceIP(r, a.trustedProxies, a.panelExternalProxyEnabled))
 	if errors.Is(err, errInvalidAgentToken) {
 		writeAgentAuthFailure(a, w, r)
 		return
@@ -757,6 +772,69 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		"config_hash":    result.Node.DesiredConfigHash,
 		"config_changed": configChanged,
 	})
+}
+
+// handleAgentObservedAddress records the public source address the Controller
+// sees over a requested IP family. It is used only when local interfaces have
+// no public address for that family (for example IPv4 behind NAT while the
+// normal control connection uses IPv6).
+func (a *App) handleAgentObservedAddress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	identity, authErr := agentNodeIdentityForRequest(a, r)
+	if authErr != nil {
+		writeAgentAuthenticationError(a, w, r, authErr)
+		return
+	}
+	var input struct {
+		Family string `json:"family"`
+	}
+	if err := decodeJSONBodyWithLimit(w, r, &input, 1024); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	family := strings.ToLower(strings.TrimSpace(input.Family))
+	if family != "v4" && family != "v6" {
+		a.jsonErr(w, http.StatusBadRequest, "family must be v4 or v6")
+		return
+	}
+	release, retryAfter, admitted := a.agentObservedAddresses().admit(identity.Node.ID, time.Now())
+	if !admitted {
+		seconds := int(retryAfter.Seconds())
+		if retryAfter-time.Duration(seconds)*time.Second > 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		a.jsonErr(w, http.StatusTooManyRequests, "agent observed-address rate or concurrency limit exceeded")
+		return
+	}
+	defer release()
+	w.Header().Set("Cache-Control", "no-store")
+	observed := agentReportSourceIP(r, a.trustedProxies, a.panelExternalProxyEnabled)
+	v4, v6 := publicNodeAddressFamilies(observed)
+	address := v4
+	if family == "v6" {
+		address = v6
+	}
+	if address != "" {
+		recordedAddress, recordErr := a.db.RecordNodeObservedAddress(identity.Token, family, address, time.Now())
+		if errors.Is(recordErr, errInvalidAgentToken) {
+			writeAgentAuthFailure(a, w, r)
+			return
+		}
+		if recordErr != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "could not record observed address")
+			return
+		}
+		address = recordedAddress
+	}
+	a.jsonOK(w, map[string]string{"family": family, "address": address})
 }
 
 // handleAgentLive accepts the small, high-frequency traffic sample used by
@@ -865,6 +943,7 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 		}
 	}
 	ws.MaxPayloadBytes = maxAgentReportBodyBytes
+	sourceIP := agentReportSourceIP(ws.Request(), a.trustedProxies, a.panelExternalProxyEnabled)
 	defer ws.Close()
 	for {
 		if err := ws.SetReadDeadline(time.Now().Add(nodeOnlineWindow)); err != nil {
@@ -898,7 +977,7 @@ func (a *App) handleAgentWebSocket(ws *websocket.Conn) {
 			})
 			continue
 		}
-		result, err := a.db.RecordNodeReportResult(token, report, time.Now())
+		result, err := a.db.RecordNodeReportResultFromSource(token, report, time.Now(), sourceIP)
 		release()
 		if err != nil {
 			if errors.Is(err, errStaleAgentSession) {

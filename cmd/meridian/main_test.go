@@ -74,7 +74,11 @@ func TestAgentWebSocketReportAcknowledgesHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := &App{db: db}
+	trustedProxies, err := parseTrustedProxyCIDRs("127.0.0.1/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{db: db, trustedProxies: trustedProxies}
 	server := httptest.NewServer(websocket.Server{
 		Handshake: func(_ *websocket.Config, r *http.Request) error {
 			if _, err := db.nodeByAgentToken(requestBearerToken(r), time.Now()); err != nil {
@@ -90,6 +94,7 @@ func TestAgentWebSocketReportAcknowledgesHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.Header.Set("Authorization", "Bearer "+agentToken)
+	config.Header.Set("X-Real-IP", "203.0.113.5")
 	conn, err := websocket.DialConfig(config)
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +113,10 @@ func TestAgentWebSocketReportAcknowledgesHeartbeat(t *testing.T) {
 	}
 	if !ack.Accepted || ack.NodeID != node.ID {
 		t.Fatalf("ack=%+v", ack)
+	}
+	updated, err := db.controlNodeByID(node.ID, time.Now())
+	if err != nil || updated.AddressV4 != "203.0.113.5" || updated.AddressSource != nodeAddressSourceReport {
+		t.Fatalf("WebSocket source address was not adopted: node=%+v err=%v", updated, err)
 	}
 	snapshot, err := db.NodeControlSnapshot(time.Now())
 	if err != nil || len(snapshot.Nodes) != 1 || snapshot.Nodes[0].Status != "online" {

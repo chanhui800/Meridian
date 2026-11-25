@@ -139,7 +139,7 @@ function renderDashboard() {
       <section class="console-metrics" aria-label="运行摘要">
         <div class="console-metric"><div class="console-metric-label">运行站点</div><div class="console-metric-value"><strong id="s-running">—</strong><span class="console-metric-fraction">/ <span id="s-total">—</span></span></div><div class="console-metric-note">已启用的反代入口</div></div>
         <div class="console-metric"><div class="console-metric-label" id="s-traffic-title">已用流量</div><div class="console-metric-value" id="s-traffic">—</div><div class="console-metric-note" id="console-cycle-label">当前计费周期</div></div>
-        <div class="console-metric"><div class="console-metric-label">累计请求</div><div class="console-metric-value" id="s-requests">—</div><div class="console-metric-note">全部站点</div></div>
+        <div class="console-metric"><div class="console-metric-label">本月请求</div><div class="console-metric-value" id="s-requests">—</div><div class="console-metric-note">全部站点 · 自然月</div></div>
         <div class="console-metric"><div class="console-metric-label">当前下载</div><div class="console-metric-value" id="console-current-download">—</div><div class="console-metric-note" id="console-current-upload">上传 —</div></div>
       </section>
       <div class="console-load-error" id="console-bootstrap-error" role="alert" hidden><span>站点信息暂时无法读取，稍后重试。</span><button type="button" class="console-button" id="console-bootstrap-retry">重新读取</button></div>
@@ -2044,14 +2044,23 @@ function updateDashboardLive(stats) {
   const uptimeEl = document.getElementById('s-uptime');
   if (uptimeEl) uptimeEl.textContent = formatUptime(stats.uptime_seconds || 0);
 
-	const requestsEl = document.getElementById('s-requests');
-	if (requestsEl) requestsEl.textContent = formatNumber(stats.total_requests || 0) + ' 请求';
+  dashboardUpdateMonthlyRequestSummary(stats);
   if (stats?.realtime_trend) dashboardControllerRealtimeEnabled = true;
 	updateDashboardSiteSpeeds(stats.live_sites || [], generatedAt, dashboardBillingMode);
   dashboardUpdateConsoleRates();
   if (metadata) dashboardApplyRealtimePacket(stats, metadata);
   else if (stats?.realtime_trend) dashboardAppendServerRealtimeTrendSample(stats.realtime_trend);
   updateDashboardTrendRealtime();
+}
+
+function dashboardUpdateMonthlyRequestSummary(stats) {
+  const requestsEl = document.getElementById('s-requests');
+  if (!requestsEl) return;
+  if (stats?.monthly_requests == null) {
+    requestsEl.textContent = '—';
+    return;
+  }
+  requestsEl.textContent = `${formatNumber(stats.monthly_requests)} 请求`;
 }
 
 function updateDashboardSiteSpeeds(liveSites, snapshotMS, billingModeOverride) {

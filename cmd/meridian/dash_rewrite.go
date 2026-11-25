@@ -234,7 +234,8 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 		}
 		scheme := strings.ToLower(resolvedValidation.Scheme)
 		if (scheme == "http" || scheme == "https") && resolvedValidation.Host != "" {
-			return pathTargetRoutePrefixForCredentials(session.pathTargetCredentialless) + scheme + "/" + resolvedValidation.Host + localTemplate, nil
+			credentialless := session.pathTargetCredentialless || !sameRedirectAuthority(base, resolvedValidation)
+			return pathTargetRoutePrefixForCredentials(credentialless) + scheme + "/" + resolvedValidation.Host + localTemplate, nil
 		}
 		return "", newDynamicPolicyDenialError(fmt.Errorf("invalid DASH URL template"))
 	}

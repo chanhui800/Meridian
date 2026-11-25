@@ -57,3 +57,14 @@
 原媒体能力路由仍保留强制 CSP 沙箱、类型限制和 Cookie 隔离。新增通用结构化响应读取器的大小、压缩比、解析额度与正文重放上限有回归覆盖；gzip 头初始化也被同一个读取期限包裹，避免上游只发响应头后占住解析额度。请求存在更短期限时使用该期限，早退时停止关闭器并保留原正文重放语义。`path_target_structured_body_timeout_test.go` 在修复前复现 gzip 头阻塞，修复后及竞态测试通过；相关媒体响应隔离、诊断、loopback 与保号回归也通过。
 
 本次仅刷新原规则、路径和指纹对应实现与证据的规范化哈希，不增加宽泛例外，不降低发布门槛。正式发布仍要求最终主分支精确提交完成自身 CodeQL 分析并通过同一策略。
+
+## 2026-11-25 发布前复核
+
+本次检查了 `main.go`、`app_core.go`、`trusted_proxy.go`、`dynamic_rewrite_core.go` 和 `main_test.go` 的变化，并分别复核四条已有精确告警记录。没有改变原指纹、规则范围或安全例外。
+
+- **#15 诊断 SSRF：** 新增的 `/api/agent/observed-address` 是独立的 Agent 上报路由，不调用管理员诊断 HTTP 客户端，也不接受客户端提交的地址值。路由由 `withAgentPreAuth` 验证 Bearer 凭据，处理器再要求已注册节点身份；请求只允许 POST，JSON 正文限制为 1 KiB，地址族只能是 `v4` 或 `v6`。地址来自 Controller 观察到的 socket 对端：直连请求使用对端 IP；可信代理请求仅接受单一、可解析的 `X-Real-IP`，启用外部代理模式时拒绝非 allowlist 对端，非可信链路带有转发头时不推测来源。入库前 `publicNodeAddressFamilies` / `nodeAddressIsGlobalUnicast` 排除私有、环回、链路本地、CGNAT、多播和未指定地址；节点更新仍在 token 哈希匹配的事务中执行。端点每节点有独立速率和并发上限，成功响应设 `Cache-Control: no-store`。Agent 按缺少的地址族分别经 `tcp4` / `tcp6` 探测 Controller，拨号不继承环境代理，TLS 校验保持开启，连接与响应头有短超时，重定向返回原响应且不会把 Bearer 凭据带到其他目标。原管理员诊断的认证、同源、DNS 固定拨号、特殊目标拒绝、限速和跳转边界未改变。
+- **#9 媒体响应 XSS：** `dynamic_rewrite_core.go` 的变化只作用于通用反代的 `pathTargetMode` URL 路由生成。当 PlaybackInfo、HLS 或 DASH 引用切换 authority 时，地址使用 credentialless 路由；已有 credentialless 状态会继续传递到嵌套清单与资源。密封 capability 的响应服务、CSP 沙箱、活跃 MIME 类型拒绝和 Cookie 隔离逻辑没有变化。
+- **#10 健康检查证书校验：** `app_core.go` 只增加 Agent 地址观察 limiter 的状态字段；`main_test.go` 的变更仅扩展 WebSocket 上报来源地址测试。`command_line.go` 中健康检查目标仍为固定 loopback 地址与持久化端口标记，路径固定，不携带凭据，TLS 例外仍只属于此客户端，重定向仍以 `http.ErrUseLastResponse` 终止。业务 HTTP 客户端的证书验证未放宽。
+- **#16 临时身份摘要：** `main_test.go` 没有修改账号保号摘要逻辑。保号身份仍只用于有容量与过期限制的内存计数；管理员密码仍由 bcrypt 校验。测试变化仅验证 WebSocket 报告中的 Controller 观察来源地址能够被识别。
+
+上述边界由对应的诊断、capability、healthcheck、账号保号、Agent 身份、代理来源、地址族及 WebSocket 测试覆盖。发布前 race 回归通过：诊断与 SSRF、防 XSS capability、loopback TLS healthcheck、保号、NAT 观察地址 admission/来源验证、Agent report fencing、WebSocket 与 Agent family probe。CodeQL 告警仍按原始指纹逐条记录；本次只刷新与这些实现、测试和本文直接相关的 `sha256-lf` 值，不关闭告警或扩大规则例外。

@@ -101,6 +101,43 @@ func TestTrafficTotalsCacheTracksCommittedRawWritesAndPreservesUnrelatedHits(t *
 	trafficCacheTestRead(t, db, start, "outbound", map[int64]int64{})
 }
 
+func TestTrafficRequestTotalsCacheInvalidatesWhenTimestampsCrossRangeBoundary(t *testing.T) {
+	db := openWatchHistoryTestDB(t)
+	trafficCacheTestSite(t, db, 1)
+	start := time.Now().Truncate(time.Minute)
+	inside := start.Add(time.Minute).UnixMilli()
+	outside := start.Add(-time.Minute).UnixMilli()
+	if _, err := db.db.Exec(`INSERT INTO traffic_logs(site_id,bytes_in,bytes_out,requests,recorded_at,recorded_at_ms) VALUES(1,0,0,2,?,?)`, trafficMinuteBucket(time.UnixMilli(inside)), inside); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO node_site_traffic_logs(node_id,site_id,bytes_in,bytes_out,requests,recorded_at_ms) VALUES(7,1,0,0,3,?)`, inside); err != nil {
+		t.Fatal(err)
+	}
+	read := func(want int64) {
+		t.Helper()
+		got, err := db.SumRequestsSince(start)
+		if err != nil || got != want {
+			t.Fatalf("request total=%d err=%v, want %d", got, err, want)
+		}
+	}
+	read(5)
+	if _, err := db.db.Exec(`UPDATE traffic_logs SET recorded_at_ms=?,recorded_at=? WHERE site_id=1`, outside, trafficMinuteBucket(time.UnixMilli(outside))); err != nil {
+		t.Fatal(err)
+	}
+	read(3)
+	if _, err := db.db.Exec(`UPDATE node_site_traffic_logs SET recorded_at_ms=? WHERE node_id=7 AND site_id=1`, outside); err != nil {
+		t.Fatal(err)
+	}
+	read(0)
+	if _, err := db.db.Exec(`UPDATE traffic_logs SET recorded_at_ms=?,recorded_at=? WHERE site_id=1`, inside, trafficMinuteBucket(time.UnixMilli(inside))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`UPDATE node_site_traffic_logs SET recorded_at_ms=? WHERE node_id=7 AND site_id=1`, inside); err != nil {
+		t.Fatal(err)
+	}
+	read(5)
+}
+
 func TestTrafficTotalsCacheTracksExternalCommitConnectionReplacementAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "traffic-cache.db")
 	db, err := openDB(path)

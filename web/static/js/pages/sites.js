@@ -126,7 +126,7 @@ function siteCardsRenderSignature(sites, activeSiteIDs) {
       site && site.icon_name, site && site.icon_url,
       site && site.ingress_mode, site && site.listen_port, site && site.ua_mode,
       site && site.applied_node_id, site && site.applied_node_port, site && site.controller_closed,
-      site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used,
+      site && site.running, site && site.enabled, site && site.traffic_quota, site && site.traffic_used, site && site.monthly_traffic,
       site && site.media_movie_count, site && site.media_series_count, site && site.media_episode_count,
       site && site.account_retention_days, site && site.account_retention_started_at_ms,
       site && site.account_retention_last_completed_at_ms,
@@ -189,7 +189,8 @@ function renderSites() {
 
 function siteManagementRowHTML(s, activeSiteIDs) {
   const quota = Math.max(0, Number(s.traffic_quota || 0));
-  const used = Math.max(0, Number(s.traffic_used || 0));
+  const used = Math.max(0, Number(s.monthly_traffic != null ? s.monthly_traffic : (s.traffic_used || 0)));
+  const lifetimeUsed = Math.max(0, Number(s.traffic_used || 0));
   const percent = quota > 0 ? Math.min(100, used / quota * 100) : 0;
   const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
   const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
@@ -207,7 +208,7 @@ function siteManagementRowHTML(s, activeSiteIDs) {
       <button type="button" class="management-site-row-toggle" data-site-row-toggle data-site-id="${s.id}" aria-expanded="${expanded}" aria-controls="site-details-${s.id}" aria-label="${expanded ? '收起' : '展开'} ${esc(s.name)} 的站点详情"></button>
       <div class="management-site-identity"><button type="button" class="site-drag-handle" data-site-drag-handle aria-label="调整 ${esc(s.name)} 的顺序" title="拖动或使用上下方向键调整顺序"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"/><circle cx="13" cy="5" r="1.25"/><circle cx="7" cy="10" r="1.25"/><circle cx="13" cy="10" r="1.25"/><circle cx="7" cy="15" r="1.25"/><circle cx="13" cy="15" r="1.25"/></svg></button>${renderSiteIconButton(s)}<div><h2 class="site-name">${esc(s.name)}</h2><p>${esc(siteIngressModeLabel(s))} · ${esc(uaNameMap[s.ua_mode] || s.ua_mode || '透传')}</p></div></div>
       <div class="site-card-state"><span class="console-status ${s.running ? 'is-online' : 'is-muted'}">${!ingressReady ? '待配置' : s.running ? '运行中' : s.enabled ? '启动异常' : '已停用'}</span>${hasActivePlayback ? `<button type="button" class="site-live-link" data-site-action="live" data-site-id="${s.id}"><i class="site-live-pulse" aria-hidden="true"></i>正在播放</button>` : ''}</div>
-      <div class="management-site-usage"><strong>${formatBytes(used)}</strong><small>${quota ? `额度 ${formatBytes(quota)}` : '未设额度'}</small>${quota ? `<div class="management-quota-track ${percent >= 85 ? 'is-warning' : ''}" role="meter" aria-label="${esc(s.name)}流量额度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(percent)}"><i style="width:${percent.toFixed(2)}%"></i></div>` : ''}</div>
+      <div class="management-site-usage"><strong>${formatBytes(used)}</strong><small>${quota ? `本周期额度 ${formatBytes(quota)}` : '本周期'}</small>${quota ? `<div class="management-quota-track ${percent >= 85 ? 'is-warning' : ''}" role="meter" aria-label="${esc(s.name)}流量额度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(percent)}"><i style="width:${percent.toFixed(2)}%"></i></div>` : ''}</div>
       <div class="management-site-latency"><button type="button" class="site-latency-button" data-site-action="latency" data-site-id="${s.id}" aria-label="点击重新测速" title="点击重新测速"><strong class="${latency.className}" id="site-latency-${s.id}" title="${esc(latency.title)}">${esc(latency.text)}</strong></button></div>
       <div class="management-site-primary-actions"><button type="button" class="console-button" data-site-action="edit" data-site-id="${s.id}">编辑</button><span class="management-site-chevron" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span></div>
     </div>
@@ -216,6 +217,7 @@ function siteManagementRowHTML(s, activeSiteIDs) {
         <div class="site-access-row"><span class="management-field-label">访问地址</span><span class="site-access-value"><span class="console-mono site-access-address ${appliedEntryPending ? '' : 'is-hidden'}" data-access-address="${esc(accessAddress)}">${accessAddressText}</span><button type="button" class="icon-button site-access-toggle" data-site-action="access" data-site-id="${s.id}" aria-label="显示访问地址" aria-pressed="false" ${appliedEntryPending ? 'disabled title="等待 Agent 确认实际入口端口"' : ''}>${renderSiteAccessVisibilityIcon(true)}</button><button type="button" class="icon-button site-access-copy" data-site-action="copy" data-site-id="${s.id}" aria-label="复制访问地址" ${appliedEntryPending ? 'disabled title="等待 Agent 确认实际入口端口"' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg></button></span></div>
         <div><span class="management-field-label">${pathTargetMode ? '回源方式' : '主回源地址'}</span><span class="console-mono">${esc(upstreamSummary || '—')}</span></div>
         <div><span class="management-field-label">上游请求头</span><span>${upstreamHeaderCount ? `${upstreamHeaderCount} 个（加密）` : '未配置'}</span></div>
+        <div><span class="management-field-label">累计流量</span><span class="console-mono">${formatBytes(lifetimeUsed)}</span></div>
       </div>
       <div class="management-site-supplement">${renderSiteMediaLibraryCounts(s)}${renderSiteAccountRetention(s)}</div>
       <div class="management-site-secondary-actions"><button type="button" class="console-button" data-site-action="toggle" data-site-id="${s.id}" ${ingressReady ? '' : 'disabled title="请先编辑并配置入口"'}>${!ingressReady ? '待配置' : s.enabled ? '停用站点' : '启用站点'}</button><button type="button" class="console-button is-danger" data-site-action="delete" data-site-id="${s.id}">删除站点</button></div>

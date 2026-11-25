@@ -62,6 +62,88 @@ type nodeReportAdmission struct {
 }
 
 const (
+	nodeObservedAddressRatePerSecond = 0.5
+	nodeObservedAddressBurst         = 4.0
+	nodeObservedAddressConcurrency   = 2
+)
+
+type nodeObservedAddressEntry struct {
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
+	active   int
+}
+
+type nodeObservedAddressAdmission struct {
+	mu      sync.Mutex
+	entries map[int64]*nodeObservedAddressEntry
+}
+
+func newNodeObservedAddressAdmission() *nodeObservedAddressAdmission {
+	return &nodeObservedAddressAdmission{entries: make(map[int64]*nodeObservedAddressEntry)}
+}
+
+func (a *nodeObservedAddressAdmission) admit(nodeID int64, now time.Time) (func(), time.Duration, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if nodeID <= 0 {
+		return func() {}, time.Second, false
+	}
+	for id, entry := range a.entries {
+		if entry.active == 0 && now.Sub(entry.lastSeen) > nodeReportEntryTTL {
+			delete(a.entries, id)
+		}
+	}
+	entry := a.entries[nodeID]
+	if entry == nil {
+		entry = &nodeObservedAddressEntry{tokens: nodeObservedAddressBurst, last: now, lastSeen: now}
+		a.entries[nodeID] = entry
+	}
+	entry.lastSeen = now
+	if entry.active >= nodeObservedAddressConcurrency {
+		return func() {}, time.Second, false
+	}
+	if elapsed := now.Sub(entry.last).Seconds(); elapsed > 0 {
+		entry.tokens += elapsed * nodeObservedAddressRatePerSecond
+		if entry.tokens > nodeObservedAddressBurst {
+			entry.tokens = nodeObservedAddressBurst
+		}
+		entry.last = now
+	}
+	if entry.tokens < 1 {
+		wait := time.Duration((1 - entry.tokens) / nodeObservedAddressRatePerSecond * float64(time.Second))
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		return func() {}, wait, false
+	}
+	entry.tokens--
+	entry.active++
+	return func() {
+		a.mu.Lock()
+		if current := a.entries[nodeID]; current != nil {
+			if current.active > 0 {
+				current.active--
+			}
+			current.lastSeen = time.Now()
+		}
+		a.mu.Unlock()
+	}, 0, true
+}
+
+func (a *App) agentObservedAddresses() *nodeObservedAddressAdmission {
+	if a == nil {
+		return newNodeObservedAddressAdmission()
+	}
+	a.agentObservedAddressMu.Lock()
+	defer a.agentObservedAddressMu.Unlock()
+	if a.agentObservedAddressLimiter == nil {
+		a.agentObservedAddressLimiter = newNodeObservedAddressAdmission()
+	}
+	return a.agentObservedAddressLimiter
+}
+
+const (
 	agentPreAuthRatePerSecond     = 10.0
 	agentPreAuthBurst             = 20.0
 	agentPreAuthEntryTTL          = 15 * time.Minute

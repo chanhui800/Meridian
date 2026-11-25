@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	agentConfigSchemaVersion = 1
+	agentConfigSchemaVersion       = 1
+	agentListenerBindingMinVersion = "v1.11.12"
 	// siteNodeDrainWindow is an emergency upper bound only. Normal drains are
 	// retired by a final SiteStats snapshot (NodeSiteStat.Final) and its ACK;
 	// the long TTL prevents a long-lived playback from losing billable traffic
@@ -294,6 +295,8 @@ type AgentRuntimeConfig struct {
 	EntryMode            string  `json:"entry_mode"`
 	HTTPPort             int     `json:"http_port"`
 	HTTPSPort            int     `json:"https_port"`
+	ListenFamily         string  `json:"listen_family,omitempty"`
+	ListenInterface      string  `json:"listen_interface,omitempty"`
 	CertificatePEM       string  `json:"certificate_pem,omitempty"`
 	PrivateKeyPEM        string  `json:"private_key_pem,omitempty"`
 	DynamicKey           string  `json:"dynamic_key,omitempty"`
@@ -943,6 +946,8 @@ type agentRuntimeConfigHash struct {
 	EntryMode            string               `json:"entry_mode"`
 	HTTPPort             int                  `json:"http_port"`
 	HTTPSPort            int                  `json:"https_port"`
+	ListenFamily         string               `json:"listen_family,omitempty"`
+	ListenInterface      string               `json:"listen_interface,omitempty"`
 	CertificatePEM       string               `json:"certificate_pem,omitempty"`
 	PrivateKeyPEM        string               `json:"private_key_pem,omitempty"`
 	DynamicKey           string               `json:"dynamic_key,omitempty"`
@@ -1021,6 +1026,8 @@ func agentConfigHashPayloadForVersion(config AgentRuntimeConfig, legacy, zeroLiv
 		EntryMode:            config.EntryMode,
 		HTTPPort:             config.HTTPPort,
 		HTTPSPort:            config.HTTPSPort,
+		ListenFamily:         config.ListenFamily,
+		ListenInterface:      config.ListenInterface,
 		CertificatePEM:       config.CertificatePEM,
 		PrivateKeyPEM:        config.PrivateKeyPEM,
 		DynamicKey:           config.DynamicKey,
@@ -1248,12 +1255,37 @@ func agentConfigHashForVersion(config AgentRuntimeConfig, version string) (strin
 	if !agentSupportsCacheClear(version) {
 		config.CacheClearGeneration = 0
 	}
+	if !agentSupportsListenerBinding(version) {
+		// Unknown JSON fields are ignored by older Agents. Keep their checksum
+		// contract stable until their normal self-update installs listener
+		// family and interface binding support.
+		config.ListenFamily = ""
+		config.ListenInterface = ""
+	}
 	legacy := !agentUsesRuntimeConfigHash(version)
 	zeroLiveTraffic := agentSupportsTrafficBaseline(version)
 	if !agentSupportsDynamicPolicyRemoval(version) {
 		return hashAgentConfigPayloadLegacyDynamic(config, legacy, zeroLiveTraffic)
 	}
 	return hashAgentConfigPayloadForVersion(config, legacy, zeroLiveTraffic)
+}
+
+func agentSupportsListenerBinding(version string) bool {
+	major, minor, patch, ok := parseAgentVersion(version)
+	if !ok {
+		return false
+	}
+	requiredMajor, requiredMinor, requiredPatch, requiredOK := parseAgentVersion(agentListenerBindingMinVersion)
+	if !requiredOK {
+		return false
+	}
+	if major != requiredMajor {
+		return major > requiredMajor
+	}
+	if minor != requiredMinor {
+		return minor > requiredMinor
+	}
+	return patch >= requiredPatch
 }
 
 // parseAgentVersion accepts the build metadata used by AWS test deployments
@@ -1508,9 +1540,26 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	}
 	// Keep the legacy field names in the Agent wire contract during rolling
 	// upgrades. Their values now describe one HTTPS-only listener.
+	listenFamily, err := effectiveNodeListenFamily(node)
+	if err != nil {
+		return AgentRuntimeConfig{}, err
+	}
 	config := AgentRuntimeConfig{SchemaVersion: agentConfigSchemaVersion, ConfigRevision: node.ConfigRevision, NodeGUID: node.GUID, EntryMode: "direct",
-		HTTPPort: 0, HTTPSPort: node.Port, DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText, AgentLeaseID: leaseID,
+		HTTPPort: 0, HTTPSPort: node.Port, ListenFamily: listenFamily,
+		DynamicKey: encodeRuntimeKey(dynamicKey), ProbeSecret: probeSecretText, AgentLeaseID: leaseID,
 		CacheClearGeneration: node.CacheClearGeneration, RequestLogPolicy: newAgentRequestLogPolicy(settings), Routes: routes}
+	if listenFamily == "none" {
+		// With automatic DNS and no observed publishable address, an empty route
+		// set keeps both new and legacy Agents from opening an unknown-family
+		// wildcard listener while the node is still enrolling.
+		config.Routes = []AgentSiteRoute{}
+	}
+	if !agentSupportsListenerBinding(clientVersion) {
+		// Older Agents ignore unknown listener fields and their checksum cannot
+		// cover them. Keep the old contract until the Agent updates itself.
+		config.ListenFamily = ""
+		config.ListenInterface = ""
+	}
 	forceRows, forceErr := tx.Query("SELECT site_id FROM agent_route_revocations WHERE node_id=? ORDER BY site_id", node.ID)
 	if forceErr != nil {
 		return AgentRuntimeConfig{}, forceErr
@@ -1528,7 +1577,7 @@ func (a *App) buildAgentConfigForRequest(ctx context.Context, token string, now 
 	if err := forceRows.Close(); err != nil {
 		return AgentRuntimeConfig{}, err
 	}
-	if len(routes) > 0 {
+	if len(config.Routes) > 0 {
 		config.CertificatePEM, config.PrivateKeyPEM, err = a.readNodeEdgeCertificatePair(node.GUID)
 		if err != nil {
 			return AgentRuntimeConfig{}, err
@@ -2223,6 +2272,62 @@ func nodeDialAddress(address string, port int) (string, error) {
 	return net.JoinHostPort(host, fmt.Sprint(port)), nil
 }
 
+func scheduledNodeHealthAddresses(node ControlNode) ([]string, error) {
+	mode := strings.ToLower(strings.TrimSpace(node.DNSPublish))
+	if mode == "" {
+		mode = "auto"
+	}
+	legacyV4, legacyV6 := publicNodeAddressFamilies(node.Address)
+	fieldV4, _ := publicNodeAddressFamilies(node.AddressV4)
+	_, fieldV6 := publicNodeAddressFamilies(node.AddressV6)
+	switch mode {
+	case "v4":
+		if fieldV4 == "" {
+			fieldV4 = legacyV4
+		}
+		if fieldV4 == "" {
+			return nil, errors.New("node has no IPv4 address for its DNS publication mode")
+		}
+		return []string{fieldV4}, nil
+	case "v6":
+		if fieldV6 == "" {
+			fieldV6 = legacyV6
+		}
+		if fieldV6 == "" {
+			return nil, errors.New("node has no IPv6 address for its DNS publication mode")
+		}
+		return []string{fieldV6}, nil
+	case "auto":
+		if fieldV4 == "" {
+			fieldV4 = legacyV4
+		}
+		if fieldV6 == "" {
+			fieldV6 = legacyV6
+		}
+	default:
+		return nil, errors.New("node DNS publication mode is invalid")
+	}
+	addresses := make([]string, 0, 2)
+	if fieldV4 != "" {
+		addresses = append(addresses, fieldV4)
+	}
+	if fieldV6 != "" {
+		addresses = append(addresses, fieldV6)
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("node has no public address for its DNS publication mode")
+	}
+	return addresses, nil
+}
+
+func scheduledNodeHealthAddress(node ControlNode) (string, error) {
+	addresses, err := scheduledNodeHealthAddresses(node)
+	if err != nil {
+		return "", err
+	}
+	return addresses[0], nil
+}
+
 func nodeHTTPSProbePort(node ControlNode) int {
 	return node.Port
 }
@@ -2235,7 +2340,23 @@ func probeScheduledNodeWithRoots(ctx context.Context, node ControlNode, host str
 	if len(probeSecret) == 0 {
 		return errors.New("node health probe secret is unavailable")
 	}
-	address, err := nodeDialAddress(node.Address, nodeHTTPSProbePort(node))
+	addresses, err := scheduledNodeHealthAddresses(node)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for _, probeAddress := range addresses {
+		if err := probeScheduledNodeAtAddress(ctx, node, host, probeSecret, roots, probeAddress); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return fmt.Errorf("node health check failed for all published address families: %w", lastErr)
+}
+
+func probeScheduledNodeAtAddress(ctx context.Context, node ControlNode, host string, probeSecret []byte, roots *x509.CertPool, probeAddress string) error {
+	address, err := nodeDialAddress(probeAddress, nodeHTTPSProbePort(node))
 	if err != nil {
 		return err
 	}
@@ -2275,31 +2396,101 @@ func (a *App) reconcileOneSiteSchedule(ctx context.Context, schedule SiteNodeSch
 
 type nodeDNSAddress struct{ family, recordType, address string }
 
-func desiredNodeDNSAddresses(node ControlNode) ([]nodeDNSAddress, error) {
-	v4, v6 := strings.TrimSpace(node.AddressV4), strings.TrimSpace(node.AddressV6)
-	if ip := net.ParseIP(strings.TrimSpace(node.Address)); ip != nil {
-		if ip.To4() != nil && v4 == "" {
-			v4 = ip.To4().String()
-		}
-		if ip.To4() == nil && v6 == "" {
-			v6 = ip.String()
+func nodeNetworkInterfaceByName(node ControlNode, name string) (NodeNetworkInterface, bool) {
+	name = strings.TrimSpace(name)
+	for _, iface := range node.NetworkInterfaces {
+		if iface.Name == name {
+			return iface, true
 		}
 	}
+	return NodeNetworkInterface{}, false
+}
+
+func nodePublishedAddressFamilies(node ControlNode) (ipv4, ipv6 bool, err error) {
 	mode := strings.ToLower(strings.TrimSpace(node.DNSPublish))
 	if mode == "" {
 		mode = "auto"
 	}
+	switch mode {
+	case "auto":
+		ipv4, ipv6 = true, true
+	case "v4":
+		ipv4 = true
+	case "v6":
+		ipv6 = true
+	default:
+		return false, false, errors.New("node DNS publication mode is invalid")
+	}
+	return ipv4, ipv6, nil
+}
+
+func effectiveNodeListenFamily(node ControlNode) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(node.DNSPublish))
+	if mode == "" {
+		mode = "auto"
+	}
+	allowedIPv4, allowedIPv6, err := nodePublishedAddressFamilies(node)
+	if err != nil {
+		return "", err
+	}
+	addressV4, addressV6 := strings.TrimSpace(node.AddressV4), strings.TrimSpace(node.AddressV6)
+	publicV4, _ := publicNodeAddressFamilies(addressV4)
+	_, publicV6 := publicNodeAddressFamilies(addressV6)
+	legacyV4, legacyV6 := publicNodeAddressFamilies(node.Address)
+	if publicV4 == "" {
+		publicV4 = legacyV4
+	}
+	if publicV6 == "" {
+		publicV6 = legacyV6
+	}
+	ipv4 := allowedIPv4 && publicV4 != ""
+	ipv6 := allowedIPv6 && publicV6 != ""
+	switch {
+	case ipv4 && ipv6:
+		return "auto", nil
+	case ipv4:
+		return "v4", nil
+	case ipv6:
+		return "v6", nil
+	}
+	// Explicit publication modes determine their listener family even before
+	// the Agent has reported the public address. Automatic mode waits for at
+	// least one publishable address so it never opens an unknown dual-stack
+	// listener while a new node is still enrolling.
+	if mode == "v4" || mode == "v6" {
+		return mode, nil
+	}
+	if mode == "auto" {
+		return "none", nil
+	}
+	return "", errors.New("node DNS publication mode is invalid")
+}
+
+func desiredNodeDNSAddresses(node ControlNode) ([]nodeDNSAddress, error) {
+	v4, _ := publicNodeAddressFamilies(node.AddressV4)
+	_, v6 := publicNodeAddressFamilies(node.AddressV6)
+	legacyV4, legacyV6 := publicNodeAddressFamilies(node.Address)
+	if v4 == "" {
+		v4 = legacyV4
+	}
+	if v6 == "" {
+		v6 = legacyV6
+	}
+	ipv4, ipv6, err := nodePublishedAddressFamilies(node)
+	if err != nil {
+		return nil, err
+	}
 	result := make([]nodeDNSAddress, 0, 2)
-	if mode != "v6" && v4 != "" {
+	if ipv4 && v4 != "" {
 		ip := net.ParseIP(v4)
-		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		if ip == nil || ip.To4() == nil || !nodeAddressIsGlobalUnicast(ip) {
 			return nil, errors.New("node IPv4 address is not publicly routable")
 		}
 		result = append(result, nodeDNSAddress{"v4", "A", v4})
 	}
-	if mode != "v4" && v6 != "" {
+	if ipv6 && v6 != "" {
 		ip := net.ParseIP(v6)
-		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		if ip == nil || ip.To4() != nil || !nodeAddressIsGlobalUnicast(ip) {
 			return nil, errors.New("node IPv6 address is not publicly routable")
 		}
 		result = append(result, nodeDNSAddress{"v6", "AAAA", v6})
@@ -2357,11 +2548,90 @@ func (a *App) syncAdditionalSiteDNS(ctx context.Context, schedule SiteNodeSchedu
 	recordID := oldID
 	if !siteDNSRecordMatches(previous, secondary.recordType, schedule.PublicHost, secondary.address, marker) {
 		recordID, err = cf.writeAddressRecord(ctx, zoneID, oldID, secondary.recordType, schedule.PublicHost, secondary.address, marker)
+		if err != nil && oldID != "" && isCloudflareDuplicateAddressError(err) {
+			adopted, ok, adoptErr := recoverOwnedDuplicateSiteDNSRecord(ctx, cf, schedule.SiteID, zoneID, oldID,
+				schedule.PublicHost, secondary.recordType, secondary.address, a.db.installUUID)
+			if adoptErr != nil {
+				return adoptErr
+			}
+			if ok {
+				recordID, err = adopted.ID, nil
+			}
+		}
+		if err != nil && oldID == "" {
+			// A concurrent reconcile or a previous POST with a lost response may
+			// have created the secondary record after the preflight list. Recover
+			// only by finding one exact-family record with this site's ownership
+			// marker, then re-read it by ID before adopting or updating it.
+			records, listErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
+			if listErr != nil {
+				return errors.Join(err, listErr)
+			}
+			owned, ok, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, secondary.recordType), schedule.PublicHost, func(comment string) bool {
+				return siteDNSMarkerOwned(comment, schedule.SiteID, a.db.installUUID)
+			})
+			if ambiguous {
+				return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
+			}
+			if unowned > 0 {
+				return fmt.Errorf("an untracked exact %s record already exists; Meridian will not overwrite it", secondary.recordType)
+			}
+			if ok {
+				tracked := SiteNodeSchedule{SiteID: schedule.SiteID, cfZoneID: zoneID, cfRecordID: owned.ID, cfRecordType: owned.Type}
+				latest, readErr, stillOwned := readOwnedTrackedSiteDNSRecord(ctx, cf, tracked)
+				if readErr != nil {
+					return readErr
+				}
+				if stillOwned && latest.Type == secondary.recordType && strings.EqualFold(latest.Name, schedule.PublicHost) {
+					if siteDNSRecordMatches(&latest, secondary.recordType, schedule.PublicHost, secondary.address, marker) {
+						recordID, err = latest.ID, nil
+					} else {
+						recordID, err = cf.writeAddressRecord(ctx, zoneID, latest.ID, secondary.recordType, schedule.PublicHost, secondary.address, marker)
+					}
+				}
+			}
+		}
 		if err != nil {
 			return err
 		}
 	}
 	_, err = a.db.db.Exec(`INSERT INTO site_node_dns_records(site_id,family,zone_id,record_id,record_type,address,updated_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id,family) DO UPDATE SET zone_id=excluded.zone_id,record_id=excluded.record_id,record_type=excluded.record_type,address=excluded.address,updated_at_ms=excluded.updated_at_ms`, schedule.SiteID, secondary.family, zoneID, recordID, secondary.recordType, secondary.address, now.UnixMilli())
+	return err
+}
+
+// stageSiteDNSFamilySwitchCleanupTx promotes the target-family record into the
+// primary schedule columns and temporarily tracks the old primary under its
+// address family. The normal additional-record cleanup then deletes that old
+// record with the same ownership checks used for any other secondary record.
+// This keeps A↔AAAA switches resumable if Cloudflare deletion temporarily fails.
+func stageSiteDNSFamilySwitchCleanupTx(tx *sql.Tx, schedule SiteNodeSchedule, zoneID string, oldPrimary cloudflareAddressRecord, primaryFamily, primaryRecordID string, now time.Time) error {
+	oldFamily := ""
+	switch oldPrimary.Type {
+	case "A":
+		oldFamily = "v4"
+	case "AAAA":
+		oldFamily = "v6"
+	default:
+		return errors.New("tracked primary DNS record has an unsupported type")
+	}
+	if oldFamily == primaryFamily || strings.TrimSpace(oldPrimary.ID) == "" || strings.TrimSpace(primaryRecordID) == "" {
+		return errors.New("DNS family switch has invalid tracked record identities")
+	}
+	var oldZone, oldID string
+	err := tx.QueryRow(`SELECT zone_id,record_id FROM site_node_dns_records WHERE site_id=? AND family=?`, schedule.SiteID, oldFamily).Scan(&oldZone, &oldID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil && (oldID != oldPrimary.ID || oldZone != zoneID) {
+		return fmt.Errorf("another Meridian %s DNS record is already tracked for this site", oldFamily)
+	}
+	if _, err := tx.Exec(`INSERT INTO site_node_dns_records(site_id,family,zone_id,record_id,record_type,address,updated_at_ms)
+		VALUES(?,?,?,?,?,?,?) ON CONFLICT(site_id,family) DO UPDATE SET zone_id=excluded.zone_id,record_id=excluded.record_id,
+			record_type=excluded.record_type,address=excluded.address,updated_at_ms=excluded.updated_at_ms`,
+		schedule.SiteID, oldFamily, zoneID, oldPrimary.ID, oldPrimary.Type, oldPrimary.Content, now.UnixMilli()); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`DELETE FROM site_node_dns_records WHERE site_id=? AND family=? AND record_id=?`, schedule.SiteID, primaryFamily, primaryRecordID)
 	return err
 }
 
@@ -2432,6 +2702,70 @@ func siteDNSRecordMatches(record *cloudflareAddressRecord, recordType, host, add
 	return record != nil && record.ID != "" && record.Type == recordType && strings.EqualFold(record.Name, host) && record.Content == address && record.Comment == marker
 }
 
+func isCloudflareDuplicateAddressError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "81058") || strings.Contains(message, "identical record already exists")
+}
+
+// recoverOwnedDuplicateSiteDNSRecord handles a same-family Cloudflare 81058
+// only when the requested exact record is uniquely owned by this site. The
+// currently tracked record is deleted through the normal ownership guard; an
+// unmarked or ambiguous duplicate remains untouched and blocks reconciliation.
+func recoverOwnedDuplicateSiteDNSRecord(ctx context.Context, cf *cloudflareClient, siteID int64, zoneID, currentRecordID, host, recordType, address, installUUID string) (cloudflareAddressRecord, bool, error) {
+	records, err := cf.exactAddressRecords(ctx, zoneID, host)
+	if err != nil {
+		return cloudflareAddressRecord{}, false, err
+	}
+	wantIP := net.ParseIP(strings.TrimSpace(address))
+	if wantIP == nil {
+		return cloudflareAddressRecord{}, false, errors.New("requested DNS address is invalid")
+	}
+	var matching []cloudflareAddressRecord
+	for _, record := range addressRecordsOfType(records, recordType) {
+		if !strings.EqualFold(record.Name, host) {
+			continue
+		}
+		contentIP := net.ParseIP(strings.TrimSpace(record.Content))
+		if contentIP != nil && contentIP.Equal(wantIP) {
+			matching = append(matching, record)
+		}
+	}
+	owned, found, unowned, ambiguous := classifyOwnedAddressRecords(matching, host, func(comment string) bool {
+		return siteDNSMarkerOwned(comment, siteID, installUUID)
+	})
+	if ambiguous {
+		return cloudflareAddressRecord{}, false, errors.New("multiple Meridian DNS records contain the requested address; manual cleanup required")
+	}
+	if unowned > 0 {
+		return cloudflareAddressRecord{}, false, fmt.Errorf("an untracked exact %s record already contains the requested address; Meridian will not overwrite or delete it", recordType)
+	}
+	if !found {
+		return cloudflareAddressRecord{}, false, nil
+	}
+	if owned.ID == currentRecordID {
+		return cloudflareAddressRecord{}, false, nil
+	}
+	trackedTarget := SiteNodeSchedule{SiteID: siteID, cfZoneID: zoneID, cfRecordID: owned.ID, cfRecordType: recordType}
+	latest, readErr, stillOwned := readOwnedTrackedSiteDNSRecord(ctx, cf, trackedTarget)
+	if readErr != nil {
+		return cloudflareAddressRecord{}, false, readErr
+	}
+	latestIP := net.ParseIP(strings.TrimSpace(latest.Content))
+	if !stillOwned || latest.Type != recordType || !strings.EqualFold(latest.Name, host) || latestIP == nil || !latestIP.Equal(wantIP) {
+		return cloudflareAddressRecord{}, false, errors.New("owned DNS duplicate changed during recovery; refusing to adopt it")
+	}
+	if strings.TrimSpace(currentRecordID) != "" {
+		tracked := SiteNodeSchedule{SiteID: siteID, cfZoneID: zoneID, cfRecordID: currentRecordID, cfRecordType: recordType}
+		if err := deleteTrackedSiteDNSRemote(ctx, cf, tracked); err != nil {
+			return cloudflareAddressRecord{}, false, err
+		}
+	}
+	return latest, true, nil
+}
+
 func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, schedule SiteNodeSchedule, now time.Time, probe func(context.Context, ControlNode, string, []byte) error) (resultErr error) {
 	defer func() {
 		if resultErr != nil {
@@ -2496,6 +2830,9 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 	for _, candidate := range desiredAddresses {
 		probeNode := node
 		probeNode.Address = candidate.address
+		probeNode.AddressV4 = ""
+		probeNode.AddressV6 = ""
+		probeNode.DNSPublish = candidate.family
 		if err := probe(ctx, probeNode, schedule.PublicHost, probeSecret); err != nil {
 			return readinessError(readinessProbe, fmt.Errorf("%s entry health check: %w", candidate.recordType, err))
 		}
@@ -2538,6 +2875,7 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 	dnsRecordCreated := false
 	var previousRecord *cloudflareAddressRecord
 	var replacedRecord *cloudflareAddressRecord
+	var familySwitchRecord *cloudflareAddressRecord
 	if recordID != "" {
 		// Re-read the tracked record by ID and require that it still proves
 		// Meridian ownership before any PUT. A name-scoped listing is not
@@ -2560,10 +2898,57 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 		}
 		if owned {
 			previousRecord = &record
+			if record.Type != recordType {
+				// A tracked A record cannot be PUT into an AAAA record (or vice
+				// versa) when the target family already exists. Resolve that
+				// family independently and adopt only a unique record carrying
+				// this site's Meridian ownership marker.
+				familySwitchRecord = &record
+				records, listErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
+				if listErr != nil {
+					return listErr
+				}
+				owned, found, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, recordType), schedule.PublicHost, isOwnedComment)
+				if ambiguous {
+					return errors.New("multiple Meridian DNS records match this site; manual cleanup required")
+				}
+				if unowned > 0 {
+					return fmt.Errorf("an untracked exact %s record already exists; Meridian will not overwrite it", recordType)
+				}
+				if found {
+					recordID = owned.ID
+					previousRecord = &owned
+				} else {
+					recordID = ""
+					previousRecord = nil
+				}
+			}
+		} else {
+			recordID = ""
+			previousRecord = nil
 		}
-		// A missing tracked record (owned == false, no error) falls through to
-		// the create path below; the PUT that follows returns a not-found
-		// error, which the existing missing-record recovery handles.
+	}
+	if recordID == "" && familySwitchRecord == nil {
+		// A missing or empty tracked ID does not prove the old family has no
+		// record. Recover a unique marked record under its current ID so normal
+		// ownership-checked cleanup can retire it after committing the new family.
+		oldType := strings.ToUpper(strings.TrimSpace(schedule.cfRecordType))
+		if oldType != recordType && (oldType == "A" || oldType == "AAAA") {
+			records, listErr := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
+			if listErr != nil {
+				return listErr
+			}
+			old, found, unowned, ambiguous := classifyOwnedAddressRecords(addressRecordsOfType(records, oldType), schedule.PublicHost, isOwnedComment)
+			if ambiguous {
+				return fmt.Errorf("multiple Meridian %s DNS records match this site; manual cleanup required", oldType)
+			}
+			if unowned > 0 {
+				return fmt.Errorf("an untracked exact %s record remains; Meridian will not remove it", oldType)
+			}
+			if found {
+				familySwitchRecord = &old
+			}
+		}
 	}
 	if recordID == "" {
 		records, err := cf.exactAddressRecords(ctx, zoneID, schedule.PublicHost)
@@ -2599,11 +2984,21 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 	creatingRecord := strings.TrimSpace(recordID) == ""
 	if !siteDNSRecordMatches(previousRecord, recordType, schedule.PublicHost, ip.String(), marker) {
 		recordID, err = cf.writeAddressRecord(ctx, zoneID, recordID, recordType, schedule.PublicHost, ip.String(), marker)
+		if err != nil && familySwitchRecord == nil && previousRecord != nil && previousRecord.Type == recordType && isCloudflareDuplicateAddressError(err) {
+			adopted, ok, adoptErr := recoverOwnedDuplicateSiteDNSRecord(ctx, cf, schedule.SiteID, zoneID, previousRecord.ID,
+				schedule.PublicHost, recordType, ip.String(), a.db.installUUID)
+			if adoptErr != nil {
+				return adoptErr
+			}
+			if ok {
+				recordID, previousRecord, err = adopted.ID, &adopted, nil
+			}
+		}
 	}
 	if err == nil {
 		dnsRecordCreated = creatingRecord
 	}
-	if err != nil && trackedRecordID == "" {
+	if err != nil && (trackedRecordID == "" || familySwitchRecord != nil) && creatingRecord {
 		// POST is not safely retryable: the remote side may have created the
 		// record even when the response was lost. Re-read exact records and
 		// adopt only a uniquely matching Meridian marker.
@@ -2614,11 +3009,26 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 			} else if unowned > 0 {
 				return errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
 			} else if ok && owned.Type == recordType {
-				recordID, err = owned.ID, nil
-				// The adopted record was created by this attempt's lost POST, so
-				// compensation must delete it if the schedule generation no
-				// longer matches; otherwise it would leak an untracked record.
-				dnsRecordCreated = creatingRecord
+				tracked := SiteNodeSchedule{SiteID: schedule.SiteID, cfZoneID: zoneID, cfRecordID: owned.ID, cfRecordType: owned.Type}
+				latest, readErr, stillOwned := readOwnedTrackedSiteDNSRecord(ctx, cf, tracked)
+				switch {
+				case readErr != nil:
+					err = readErr
+				case !stillOwned || latest.Type != recordType || !strings.EqualFold(latest.Name, schedule.PublicHost):
+					err = errors.New("tracked Meridian DNS record changed during recovery")
+				default:
+					recordID, previousRecord = latest.ID, &latest
+					if siteDNSRecordMatches(&latest, recordType, schedule.PublicHost, ip.String(), marker) {
+						err = nil
+					} else {
+						recordID, err = cf.writeAddressRecord(ctx, zoneID, latest.ID, recordType, schedule.PublicHost, ip.String(), marker)
+					}
+				}
+				// A rejected POST followed by an owned exact record is ambiguous:
+				// another reconcile may have created it, or our response may have
+				// been lost after Cloudflare committed it. Track the preimage above
+				// so a content correction can be restored if the local CAS fails.
+				dnsRecordCreated = false
 			}
 		}
 	}
@@ -2639,11 +3049,27 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 				case unowned > 0:
 					err = errors.New("an untracked exact A/AAAA record already exists; Meridian will not overwrite it")
 				case ok && owned.Type == recordType:
-					recordID, err, recoveredRecord = owned.ID, nil, true
-					// The adopted marker record is untracked in this schedule
-					// generation, so compensation must remove it if the local
-					// transaction still fails; otherwise it would leak.
-					dnsRecordCreated = true
+					// Re-read the candidate by ID before updating or adopting it.
+					// The exact-name listing may have raced with an operator change.
+					tracked := SiteNodeSchedule{SiteID: schedule.SiteID, cfZoneID: zoneID, cfRecordID: owned.ID, cfRecordType: owned.Type}
+					latest, readErr, stillOwned := readOwnedTrackedSiteDNSRecord(ctx, cf, tracked)
+					switch {
+					case readErr != nil:
+						err = readErr
+					case !stillOwned || latest.Type != recordType || !strings.EqualFold(latest.Name, schedule.PublicHost):
+						err = errors.New("tracked Meridian DNS record changed during recovery")
+					default:
+						recordID, previousRecord, recoveredRecord = latest.ID, &latest, true
+						if siteDNSRecordMatches(&latest, recordType, schedule.PublicHost, ip.String(), marker) {
+							err = nil
+						} else {
+							recordID, err = cf.writeAddressRecord(ctx, zoneID, latest.ID, recordType, schedule.PublicHost, ip.String(), marker)
+						}
+						// This is an existing owned record, not a new POST. Leave it
+						// intact on a local CAS failure; if we updated it, the exact
+						// preimage above lets compensation restore its prior content.
+						dnsRecordCreated = false
+					}
 				case ok:
 					if deleteErr := cf.deleteRecord(ctx, zoneID, owned.ID); deleteErr != nil && !isCloudflareRecordNotFoundError(deleteErr) {
 						err = deleteErr
@@ -2720,6 +3146,11 @@ func (a *App) reconcileOneSiteScheduleWithProbeLocked(ctx context.Context, sched
 			return errors.Join(cause, cleanupErr)
 		}
 		return cause
+	}
+	if familySwitchRecord != nil {
+		if err := stageSiteDNSFamilySwitchCleanupTx(tx, schedule, zoneID, *familySwitchRecord, desiredAddresses[0].family, recordID, now); err != nil {
+			return cleanupTransaction(err)
+		}
 	}
 	if err = a.db.commitControllerNodeAdmission(tx); err != nil {
 		return cleanupTransaction(err)
