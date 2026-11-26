@@ -6,7 +6,7 @@
   <title>Meridian · Emby / Jellyfin 多站点反向代理与节点调度</title>
   <meta name="description" content="Meridian 为 Emby / Jellyfin 提供固定回源与通用反代、播放地址改写、观看历史、流量统计和 TLS 证书，通过 Agent 扩展节点入口，按 IPv4 / IPv6 发布 DNS 与监听端口。">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <link rel="stylesheet" href="style.css?v=1.11.12">
+  <link rel="stylesheet" href="style.css?v=1.11.13">
 </head>
 <body>
   <header class="nav">
@@ -36,14 +36,14 @@
   <main id="top">
     <section class="hero">
       <div class="hero-inner">
-        <a class="hero-badge" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.12" target="_blank" rel="noopener"><span class="dot"></span>v1.11.12 已发布</a>
+        <a class="hero-badge" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.13" target="_blank" rel="noopener"><span class="dot"></span>v1.11.13 已发布</a>
         <h1>Emby / Jellyfin 多站点反向代理<br>与节点调度面板</h1>
         <p class="hero-sub">固定回源与通用反代两种模式，把站点入口、播放改写、观看历史、流量统计、TLS 证书和边缘节点收进一个面板。</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="#install">快速开始</a>
-          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.12" target="_blank" rel="noopener">下载正式版</a>
+          <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.13" target="_blank" rel="noopener">下载正式版</a>
         </div>
-        <p class="release-overview">本次更新：Agent 按 DNS 发布族独立监听端口，并支持 NAT 节点按族发现公网出口地址。</p>
+        <p class="release-overview">本次更新：删除节点后自动清理站点路由并卸载 Agent；收紧 WebSocket 握手响应头读取上限。</p>
         <div class="hero-stats">
           <div><strong>两种回源模式</strong><span>固定线路，或由客户端路径指定回源</span></div>
           <div><strong>节点调度</strong><span>一个 Controller 管理多台 Agent</span></div>
@@ -280,7 +280,7 @@
       </div>
       <div class="install-actions">
         <a class="btn btn-primary" href="https://github.com/chanhui800/Meridian#readme" target="_blank" rel="noopener">阅读完整文档</a>
-        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.12" target="_blank" rel="noopener">Release 与校验文件</a>
+        <a class="btn btn-ghost" href="https://github.com/chanhui800/Meridian/releases/tag/v1.11.13" target="_blank" rel="noopener">Release 与校验文件</a>
       </div>
     </section>
   </main>
@@ -309,6 +309,6 @@
     <img id="lightboxImg" alt="">
   </div>
 
-  <script src="app-v1.11.12.js"></script>
+  <script src="app-v1.11.13.js"></script>
 </body>
 </html>

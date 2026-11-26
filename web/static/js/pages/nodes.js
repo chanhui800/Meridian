@@ -181,7 +181,9 @@ function renderNodeCards() {
   }
   container.innerHTML = '<div class="fleet-list-heading" aria-hidden="true"><span>节点</span><span>状态</span><span>流量用量</span><span></span></div>' + nodes.map(node => {
     const id = Number(node.id);
-    const state = nodeAvailability(node);
+    const uninstallPending = node.uninstall_pending === true;
+    const deletionPending = node.deletion_pending === true;
+    const state = uninstallPending ? { label: '等待 Agent 卸载', kind: 'warning' } : (deletionPending ? { label: '等待删除清理', kind: 'warning' } : nodeAvailability(node));
     const quota = Number(node.traffic_quota || 0);
     const ratio = quota > 0 ? Math.min(100, Math.max(0, Number(node.traffic_used || 0) / quota * 100)) : 0;
     const reset = node.reset_day === 0 ? '不自动重置（上限为累计值）' : `每月 ${node.reset_day} 日重置`;
@@ -200,8 +202,9 @@ function renderNodeCards() {
         ${node.depleted ? '<p class="fleet-warning">已超出流量上限，不再参与调度。提高上限、清除上限或改回每月重置日即可恢复。</p>' : ''}
         <dl class="fleet-detail-grid"><div><dt>IPv4 / IPv6</dt><dd class="console-mono">${esc(node.address_v4 || '—')}<br>${esc(node.address_v6 || '—')}</dd></div><div><dt>入口与版本</dt><dd>HTTPS :${Number(node.port)}<small class="node-agent-version">Agent ${esc(node.agent_version || '未上报')}</small></dd></div><div><dt>流量周期</dt><dd>${esc(reset)}<small>${node.billing_mode === 'bidirectional' ? '上下行计费' : '上行计费'} · 优先级 ${Number(node.priority || 0)}</small></dd></div><div><dt>最近心跳</dt><dd>${node.last_seen_at_ms ? esc(meridianFormatDateTime(node.last_seen_at_ms)) : '等待 Agent 上报'}<small>${esc(node.interface_name || '等待识别网卡')}</small></dd></div></dl>
         ${['enrollment', 'report'].includes(node.address_source) || ['enrollment', 'report'].includes(node.address_v6_source) ? '<p class="fleet-warning">地址由 Agent 自动发现，请核对后再用于 DNS 发布。</p>' : ''}
+        ${uninstallPending ? '<p class="fleet-warning">主控已停止为此节点调度并清理 DNS，正在等待 Agent 回传卸载完成。节点离线时会保留此状态；若主机已无法恢复，可强制移除面板记录，Agent 上的文件需手动清理。</p>' : (deletionPending ? '<p class="fleet-warning">主控已将此节点移出调度，站点或 DNS 清理尚未完成。可以重试完整删除流程，或先重试清理再强制移除面板记录。</p>' : '')}
         <p class="fleet-config-state ${applyError || listenerError ? 'is-error' : ''}">${esc(configState)}</p>
-        <div class="fleet-row-actions"><button type="button" class="console-button" data-action="edit" data-id="${id}">编辑节点</button><button type="button" class="console-button" data-action="enroll" data-id="${id}">重新生成脚本</button><button type="button" class="console-button is-danger" data-action="delete" data-id="${id}">删除节点</button></div>
+        <div class="fleet-row-actions">${uninstallPending ? `<button type="button" class="console-button is-danger" data-action="force-delete" data-id="${id}">强制移除面板记录</button>` : (deletionPending ? `<button type="button" class="console-button" data-action="delete" data-id="${id}">重试清理并卸载</button><button type="button" class="console-button is-danger" data-action="force-delete" data-id="${id}">清理后强制移除</button>` : `<button type="button" class="console-button" data-action="edit" data-id="${id}">编辑节点</button><button type="button" class="console-button" data-action="enroll" data-id="${id}">重新生成脚本</button><button type="button" class="console-button is-danger" data-action="delete" data-id="${id}">删除节点并卸载 Agent</button>`)}</div>
       </div>
     </article>`;
   }).join('');
@@ -394,7 +397,7 @@ function openNodeForm(node) {
     event.preventDefault();
     if (saving) return;
     refreshDNSPreview();
-    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), address_v4: document.getElementById('node-address-v4').value.trim(), address_v6: document.getElementById('node-address-v6').value.trim(), dns_publish: document.getElementById('node-dns-publish').value, listen_interface: '', port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
+    const payload = { name: document.getElementById('node-name').value.trim(), address: document.getElementById('node-address').value.trim(), address_v4: document.getElementById('node-address-v4').value.trim(), address_v6: document.getElementById('node-address-v6').value.trim(), dns_publish: document.getElementById('node-dns-publish').value, port: Number(document.getElementById('node-port').value), traffic_quota: Math.round(Number(document.getElementById('node-quota').value || 0) * 1073741824), reset_day: Number(document.getElementById('node-reset').value), billing_mode: document.getElementById('node-billing').value, priority: Number(document.getElementById('node-priority').value), traffic_manual_offset_bytes: Math.round(Number(document.getElementById('node-offset')?.value || 0) * 1073741824) };
     const generation = nodesPageGeneration;
     const button = document.getElementById('node-form-save');
     saving = true;
@@ -444,7 +447,7 @@ async function handleNodeAction(event) {
   }
   if (button.dataset.action === 'edit') return openNodeForm(node);
   if (button.dataset.action === 'delete') {
-    if (!confirm(`确认删除节点“${node.name}”？已安装的 Agent 也将失去授权。`)) return;
+    if (!confirm(`确认删除节点“${node.name}”并自动卸载 Agent？主控会先清理该节点的 DNS，再让 Linux systemd/OpenRC Agent 停服并删除自身文件。离线节点会保留为待卸载状态；不会修改 Nginx、Caddy、Xray 或其他业务。`)) return;
     const generation = nodesPageGeneration;
     nodesMutationVersion++;
     button.disabled = true;
@@ -453,8 +456,33 @@ async function handleNodeAction(event) {
       if (!result) return;
       nodesMutationVersion++;
       if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
+      if (result.uninstall_pending) {
+        Toast.info(result.agent_online ? '卸载指令已发送，等待 Agent 完成并确认' : '节点离线，卸载请求已保存；Agent 恢复连接后会自动处理');
+      } else {
+        nodeDetailOpen.delete(Number(node.id));
+        Toast.success('节点已删除');
+      }
+      await loadNodes(true);
+    } catch (error) { Toast.error(error.message); }
+    finally { button.disabled = false; }
+    return;
+  }
+  if (button.dataset.action === 'force-delete') {
+    const message = node.uninstall_pending === true
+      ? `“${node.name}”仍在等待 Agent 卸载。强制移除只删除主控中的节点记录，无法卸载离线主机上的 Agent。确认继续？`
+      : `“${node.name}”的站点与 DNS 清理尚未完成。强制移除会先重试清理，成功后删除主控记录，但不会下发 Agent 自卸载命令。确认继续？`;
+    if (!confirm(message)) return;
+    const generation = nodesPageGeneration;
+    nodesMutationVersion++;
+    button.disabled = true;
+    try {
+      const result = await API.forceDeleteNode(node.id);
+      if (!result) return;
+      nodesMutationVersion++;
+      if (generation !== nodesPageGeneration || Router.current !== 'nodes') return;
       nodeDetailOpen.delete(Number(node.id));
-      Toast.success('节点已删除'); await loadNodes(true);
+      Toast.success('节点记录已强制移除；离线主机上的 Agent 仍需手动卸载');
+      await loadNodes(true);
     } catch (error) { Toast.error(error.message); }
     finally { button.disabled = false; }
     return;

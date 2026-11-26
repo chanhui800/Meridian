@@ -308,6 +308,7 @@ const API = {
   createNode(data) { return this.request('POST', '/api/nodes', data); },
   updateNode(id, data) { return this.request('PUT', '/api/nodes/' + encodeURIComponent(id), data); },
   deleteNode(id) { return this.request('DELETE', '/api/nodes/' + encodeURIComponent(id)); },
+  forceDeleteNode(id) { return this.request('POST', '/api/nodes/' + encodeURIComponent(id) + '/force-delete'); },
   refreshNodeEnrollment(id, controllerURL) {
     return this.request('POST', '/api/nodes/' + encodeURIComponent(id) + '/enrollment', { controller_url: controllerURL });
   },

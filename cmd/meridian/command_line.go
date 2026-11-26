@@ -21,6 +21,11 @@ func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, err
 		return false, nil
 	}
 	switch args[0] {
+	case "--agent-uninstall-helper":
+		if !strings.EqualFold(strings.TrimSpace(buildMode), "agent") {
+			return true, errors.New("Agent uninstall helper is available only in Agent builds")
+		}
+		return true, runAgentUninstallHelper(args[1:])
 	case "--version", "-v":
 		if len(args) != 1 {
 			return true, errors.New("version command does not accept arguments")

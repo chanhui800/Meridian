@@ -53,10 +53,12 @@ func configuredAgentBinaryPath() string {
 }
 
 const (
-	agentPlatformHeader = "X-Meridian-Agent-Platform"
-	agentVersionHeader  = "X-Meridian-Agent-Version"
-	agentSessionHeader  = "X-Meridian-Agent-Session"
-	agentEpochHeader    = "X-Meridian-Agent-Session-Epoch"
+	agentPlatformHeader          = "X-Meridian-Agent-Platform"
+	agentVersionHeader           = "X-Meridian-Agent-Version"
+	agentSessionHeader           = "X-Meridian-Agent-Session"
+	agentEpochHeader             = "X-Meridian-Agent-Session-Epoch"
+	agentCapabilitiesHeader      = "X-Meridian-Agent-Capabilities"
+	agentSelfUninstallCapability = "self-uninstall-v1"
 )
 
 func requestedAgentSession(r *http.Request) (agentSessionRequest, error) {
@@ -65,8 +67,12 @@ func requestedAgentSession(r *http.Request) (agentSessionRequest, error) {
 	}
 	id := strings.TrimSpace(r.Header.Get(agentSessionHeader))
 	epochText := strings.TrimSpace(r.Header.Get(agentEpochHeader))
+	capabilities := strings.TrimSpace(r.Header.Get(agentCapabilitiesHeader))
+	if len(capabilities) > 128 {
+		return agentSessionRequest{}, errors.New("invalid agent capabilities")
+	}
 	if id == "" && epochText == "" {
-		return agentSessionRequest{}, nil
+		return agentSessionRequest{Capabilities: capabilities}, nil
 	}
 	if id == "" || len(id) > 128 {
 		return agentSessionRequest{}, errors.New("invalid agent session")
@@ -75,7 +81,7 @@ func requestedAgentSession(r *http.Request) (agentSessionRequest, error) {
 	if err != nil || epoch <= 0 {
 		return agentSessionRequest{}, errors.New("invalid agent session epoch")
 	}
-	return agentSessionRequest{ID: id, Epoch: epoch}, nil
+	return agentSessionRequest{ID: id, Epoch: epoch, Capabilities: capabilities}, nil
 }
 
 func normalizeAgentPlatform(value string) string {
@@ -173,11 +179,12 @@ func agentBinaryIdentityForPlatform(platform string) (string, string, error) {
 }
 
 type nodeAPIInput struct {
-	Name                     string  `json:"name"`
-	Address                  string  `json:"address"`
-	AddressV4                string  `json:"address_v4"`
-	AddressV6                string  `json:"address_v6"`
-	DNSPublish               string  `json:"dns_publish"`
+	Name       string `json:"name"`
+	Address    string `json:"address"`
+	AddressV4  string `json:"address_v4"`
+	AddressV6  string `json:"address_v6"`
+	DNSPublish string `json:"dns_publish"`
+	// ListenInterface is accepted from cached clients for compatibility but ignored.
 	ListenInterface          *string `json:"listen_interface"`
 	Port                     int     `json:"port"`
 	HTTPSPort                int     `json:"https_port"` // Deprecated compatibility for cached pre-single-port pages.
@@ -195,12 +202,8 @@ func nodeCreateInput(input nodeAPIInput) NodeCreateInput {
 	if port == 0 {
 		port = input.HTTPSPort
 	}
-	listenInterface := ""
-	if input.ListenInterface != nil {
-		listenInterface = *input.ListenInterface
-	}
 	return NodeCreateInput{
-		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, ListenInterface: listenInterface, Port: port, Priority: input.Priority,
+		Name: input.Name, Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish, Port: port, Priority: input.Priority,
 		TrafficQuota: input.TrafficQuota, BillingMode: input.BillingMode, ResetDay: input.ResetDay,
 		TrafficManualOffsetBytes: input.TrafficManualOffsetBytes,
 	}
@@ -371,6 +374,32 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, map[string]interface{}{"node": node, "install_script": buildNodeInstallScriptWithOptions(controllerURL, token, true), "install_command": buildNodeInstallCommandWithOptions(controllerURL, token, true)})
 		return
 	}
+	if action == "force-delete" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		pendingNode, err := a.db.controlNodeByID(id, time.Now())
+		if err != nil {
+			writeNodeAPIError(a, w, err)
+			return
+		}
+		if !pendingNode.DeletionPending {
+			a.jsonErr(w, http.StatusConflict, "node does not have a pending deletion")
+			return
+		}
+		if err := a.prepareNodeDeletion(r.Context(), id); err != nil {
+			a.jsonErr(w, http.StatusBadGateway, "node DNS cleanup failed: "+err.Error())
+			return
+		}
+		if err := a.db.ForceDeletePendingNode(id); err != nil {
+			writeNodeAPIError(a, w, err)
+			return
+		}
+		a.jsonOK(w, map[string]bool{"deleted": true, "agent_uninstalled": false})
+		return
+	}
 	if action != "" {
 		writeNodeAPIError(a, w, errNodeNotFound)
 		return
@@ -387,16 +416,6 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			enabled = *input.Enabled
 		}
 		nodeInput := nodeCreateInput(input)
-		if input.ListenInterface == nil {
-			// Older cached pages do not send listener-interface settings. Keep
-			// their update requests from clearing a value saved by a newer page.
-			current, lookupErr := a.db.controlNodeByID(id, now)
-			if lookupErr != nil {
-				writeNodeAPIError(a, w, lookupErr)
-				return
-			}
-			nodeInput.ListenInterface = current.ListenInterface
-		}
 		node, err := a.db.UpdateControlNode(id, nodeInput, enabled, now)
 		if err != nil {
 			writeNodeAPIError(a, w, err)
@@ -404,15 +423,30 @@ func (a *App) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		}
 		a.jsonOK(w, node)
 	case http.MethodDelete:
+		// Make the node ineligible before taking the site snapshot, so the
+		// scheduler cannot assign new work while DNS and route references drain.
+		if _, err := a.db.MarkNodeDeletionPending(id, now); err != nil {
+			writeNodeAPIError(a, w, err)
+			return
+		}
 		if err := a.prepareNodeDeletion(r.Context(), id); err != nil {
 			a.jsonErr(w, http.StatusBadGateway, "node DNS cleanup failed: "+err.Error())
+			return
+		}
+		node, pending, err := a.db.BeginNodeUninstall(id, time.Now())
+		if err != nil {
+			writeNodeAPIError(a, w, err)
+			return
+		}
+		if pending {
+			a.jsonOK(w, map[string]any{"deleted": false, "uninstall_pending": true, "agent_online": node.Status == "online"})
 			return
 		}
 		if err := a.db.DeleteControlNode(id); err != nil {
 			writeNodeAPIError(a, w, err)
 			return
 		}
-		a.jsonOK(w, map[string]bool{"deleted": true})
+		a.jsonOK(w, map[string]bool{"deleted": true, "agent_uninstalled": false})
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -772,6 +806,36 @@ func (a *App) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		"config_hash":    result.Node.DesiredConfigHash,
 		"config_changed": configChanged,
 	})
+}
+
+func (a *App) handleAgentUninstallComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	identity, authErr := agentNodeIdentityForRequest(a, r)
+	if authErr != nil {
+		writeAgentAuthenticationError(a, w, r, authErr)
+		return
+	}
+	var input struct {
+		NodeGUID  string `json:"node_guid"`
+		RequestID string `json:"request_id"`
+	}
+	if err := decodeJSONBodyWithLimit(w, r, &input, 1024); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := a.db.AcknowledgeNodeUninstall(identity.Token, input.NodeGUID, input.RequestID); errors.Is(err, errInvalidAgentToken) {
+		writeAgentAuthFailure(a, w, r)
+		return
+	} else if err != nil {
+		a.jsonErr(w, http.StatusServiceUnavailable, "Agent uninstall completion could not be persisted")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	a.jsonOK(w, map[string]bool{"accepted": true})
 }
 
 // handleAgentObservedAddress records the public source address the Controller

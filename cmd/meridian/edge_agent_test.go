@@ -35,7 +35,7 @@ func testEdgeRuntimeKey(t *testing.T) string {
 func TestEdgeAgentRollbackSurfacesListenerRestoreFailure(t *testing.T) {
 	cause := errors.New("clear asset cache failed")
 	listenErr := errors.New("address already in use")
-	runtime := &edgeAgentRuntime{listen: func(string, string, string) (net.Listener, error) {
+	runtime := &edgeAgentRuntime{listen: func(string, string) (net.Listener, error) {
 		return nil, listenErr
 	}}
 	oldServer := &http.Server{}

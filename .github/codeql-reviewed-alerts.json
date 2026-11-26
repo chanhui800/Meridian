@@ -17,7 +17,7 @@
       "files": [
         {
           "path": "cmd/meridian/main.go",
-          "sha256": "c09e877496ba4d12ee67ebc89cb7060bd210c207e6e54267c6a90da6f7b72a47"
+          "sha256": "12c689f0a5dfa6e12808e706429748c38cc1d31cc8333652e1740721efd55c67"
         },
         {
           "path": "cmd/meridian/app_http.go",
@@ -155,7 +155,7 @@
       "files": [
         {
           "path": "cmd/meridian/command_line.go",
-          "sha256": "db8ca77654befddc04503e21becf50d7f9606528773122e354c26592bde842cd"
+          "sha256": "cde0b57a5bd2c3adde8049366d382ef9c3599626c76bde39c9134246b9ead3b7"
         },
         {
           "path": "cmd/meridian/app_core.go",

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,51 @@ import (
 	"strings"
 	"time"
 )
+
+const (
+	// Match net/http.Transport's default response-header limit so the manual
+	// WebSocket handshake path has the same compatibility envelope.
+	websocketResponseHeaderLimit = 10 << 20
+	websocketHandshakeReadBuffer = 4 << 10
+)
+
+var errWebSocketResponseHeaderTooLarge = errors.New("websocket upstream response headers exceed limit")
+
+type websocketHandshakeReader struct {
+	reader io.Reader
+	read   int64
+}
+
+func (r *websocketHandshakeReader) Read(payload []byte) (int, error) {
+	const maxReadAhead = websocketResponseHeaderLimit + websocketHandshakeReadBuffer
+	remaining := maxReadAhead - r.read
+	if remaining <= 0 {
+		return 0, errWebSocketResponseHeaderTooLarge
+	}
+	if int64(len(payload)) > remaining {
+		payload = payload[:remaining]
+	}
+	n, err := r.reader.Read(payload)
+	r.read += int64(n)
+	return n, err
+}
+
+func readWebSocketHandshakeResponse(conn net.Conn, request *http.Request) (*bufio.Reader, *http.Response, error) {
+	limited := &websocketHandshakeReader{reader: conn}
+	reader := bufio.NewReaderSize(limited, websocketHandshakeReadBuffer)
+	response, err := http.ReadResponse(reader, request)
+	if err != nil {
+		return reader, nil, err
+	}
+	// ReadResponse may have read a few tunnel bytes past the header delimiter.
+	// Keep the same bufio.Reader for the relay and exclude its unread bytes from
+	// the header-size calculation.
+	consumed := limited.read - int64(reader.Buffered())
+	if consumed > websocketResponseHeaderLimit {
+		return reader, nil, errWebSocketResponseHeaderTooLarge
+	}
+	return reader, response, nil
+}
 
 func writeWebSocketGatewayError(conn net.Conn) {
 	const body = `{"error":"upstream refused websocket upgrade"}`
@@ -115,8 +161,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 	}
 	// Read through a buffered reader and keep using it below: ReadResponse may
 	// consume bytes past the headers, and those belong to the tunnel.
-	upstreamReader := bufio.NewReader(upstreamConn)
-	resp, err := http.ReadResponse(upstreamReader, r)
+	upstreamReader, resp, err := readWebSocketHandshakeResponse(upstreamConn, r)
 	if err != nil {
 		log.Printf("[WS] read upstream handshake: %v", err)
 		writeWebSocketGatewayError(clientConn)

@@ -47,7 +47,6 @@ type ControlNode struct {
 	DNSPublish        string                 `json:"dns_publish"`
 	NetAddresses      []NodeNetAddress       `json:"net_addresses,omitempty"`
 	NetworkInterfaces []NodeNetworkInterface `json:"network_interfaces,omitempty"`
-	ListenInterface   string                 `json:"listen_interface"`
 	// AddressSource records where the IPv4 address came from: "manual" when an
 	// operator entered it, "enrollment" when the Agent's registration request
 	// supplied it, or "report" when an authenticated heartbeat supplied it. The
@@ -77,6 +76,9 @@ type ControlNode struct {
 	AgentApplyErrorAtMS         int64  `json:"agent_apply_error_at_ms"`
 	AgentApplyFailures          int64  `json:"agent_apply_failures"`
 	AgentListenerError          string `json:"agent_listener_error"`
+	UninstallPending            bool   `json:"uninstall_pending"`
+	UninstallRequestedAtMS      int64  `json:"uninstall_requested_at_ms,omitempty"`
+	DeletionPending             bool   `json:"deletion_pending"`
 	EventSpoolError             string `json:"event_spool_error"`
 	EventQueueDepth             int    `json:"event_queue_depth"`
 	EventDropped                int64  `json:"event_dropped"`
@@ -103,6 +105,8 @@ type ControlNode struct {
 	lastSequence          int64
 	enrollmentTokenHash   string
 	agentTokenHash        string
+	uninstallRequestID    string
+	deletionPending       bool
 	enrollmentExpiresMS   int64
 	probeSecretCiphertext string
 }
@@ -139,7 +143,6 @@ type NodeCreateInput struct {
 	AddressV4                string
 	AddressV6                string
 	DNSPublish               string
-	ListenInterface          string
 	Port                     int
 	Priority                 int
 	TrafficQuota             int64
@@ -365,13 +368,13 @@ func hashNodeToken(value string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func normalizeListenerInterfaceName(value string) (string, error) {
+func normalizeNetworkInterfaceName(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", nil
 	}
 	if len(value) > 15 || strings.EqualFold(value, "metadata") || strings.ContainsAny(value, "\x00/\\ \t\r\n") {
-		return "", errors.New("listen_interface must be a reported network interface name")
+		return "", errors.New("invalid network interface name")
 	}
 	return value, nil
 }
@@ -382,7 +385,7 @@ func normalizeReportedNetworkInterfaces(interfaces []NodeNetworkInterface) []Nod
 	}
 	byName := make(map[string]NodeNetworkInterface, len(interfaces))
 	for _, iface := range interfaces {
-		name, err := normalizeListenerInterfaceName(iface.Name)
+		name, err := normalizeNetworkInterfaceName(iface.Name)
 		if err != nil || name == "" || (!iface.IPv4 && !iface.IPv6) {
 			continue
 		}
@@ -408,9 +411,6 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	input.Address = strings.TrimSpace(input.Address)
 	input.AddressV4 = strings.TrimSpace(input.AddressV4)
 	input.AddressV6 = strings.TrimSpace(input.AddressV6)
-	// Listener scope is derived from DNS publication. Ignore the deprecated
-	// per-interface setting so older clients cannot restrict or widen it.
-	input.ListenInterface = ""
 	input.DNSPublish = strings.ToLower(strings.TrimSpace(input.DNSPublish))
 	if input.DNSPublish == "" {
 		input.DNSPublish = "auto"
@@ -418,6 +418,10 @@ func normalizeNodeInput(input NodeCreateInput) (NodeCreateInput, error) {
 	if input.DNSPublish != "auto" && input.DNSPublish != "v4" && input.DNSPublish != "v6" {
 		return input, errors.New("dns_publish must be auto, v4, or v6")
 	}
+	// The selected family may have no public address until the Agent checks in.
+	// Save the policy now; DNS publication waits for that family's address, while
+	// an explicit v4/v6 policy can already prepare its matching listener. Keep
+	// non-empty family-specific addresses strictly checked.
 	if input.AddressV4 != "" {
 		ip := net.ParseIP(input.AddressV4)
 		if ip == nil || ip.To4() == nil || !nodeAddressIsGlobalUnicast(ip) {
@@ -571,9 +575,9 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 	// address_source is left to its column default here: a row created from the
 	// panel always carries an operator-entered address.
 	result, err := d.db.Exec(`INSERT INTO control_nodes
-		(guid,name,address,address_v4,address_v6,dns_publish,listen_interface,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
+		(guid,name,address,address_v4,address_v6,dns_publish,entry_mode,http_port,https_port,priority,traffic_quota,billing_mode,reset_day,cycle_started_at_ms,
 		 enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,created_at_ms,updated_at_ms)
-		VALUES(?,?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, input.Priority, input.TrafficQuota,
+		VALUES(?,?,?,?,?,?,'direct',0,?,?,?,?,?,?,?,?,?,?,?)`, guid, input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, input.Priority, input.TrafficQuota,
 		input.BillingMode, input.ResetDay, cycleStart, hashNodeToken(enrollmentToken), now.Add(nodeEnrollmentLifetime).UnixMilli(), probeSecretCiphertext, nowMS, nowMS)
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -591,24 +595,25 @@ func (d *DB) CreateControlNode(input NodeCreateInput, now time.Time) (ControlNod
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,reported_interfaces,listen_interface,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
+const controlNodeSelect = `SELECT id,guid,name,address,address_v4,address_v6,address_v6_source,dns_publish,reported_net_addresses,reported_interfaces,address_source,https_port,enabled,priority,traffic_quota,billing_mode,reset_day,
 	cycle_started_at_ms,period_rx_bytes,period_tx_bytes,lifetime_rx_bytes,lifetime_tx_bytes,traffic_manual_offset_bytes,
 	last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,last_sequence,interface_name,agent_version,desired_config_hash,config_dirty,applied_config_hash,agent_apply_error,agent_apply_error_at_ms,agent_apply_failures,agent_listener_error,event_spool_error,event_queue_depth,event_dropped,
 	config_revision,desired_config_revision,applied_config_revision,
-	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms
+	enrollment_token_hash,enrollment_expires_at_ms,probe_secret_ciphertext,agent_token_hash,cache_clear_generation,cache_clear_applied_generation,enrolled_at_ms,last_seen_at_ms,created_at_ms,updated_at_ms,uninstall_request_id,uninstall_requested_at_ms,deletion_pending
 	FROM control_nodes`
 
 func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	var node ControlNode
 	var enabled, configDirty int
 	var reportedAddresses, reportedInterfaces string
-	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &reportedInterfaces, &node.ListenInterface, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
+	err := scanner.Scan(&node.ID, &node.GUID, &node.Name, &node.Address, &node.AddressV4, &node.AddressV6, &node.AddressV6Source, &node.DNSPublish, &reportedAddresses, &reportedInterfaces, &node.AddressSource, &node.Port, &enabled, &node.Priority, &node.TrafficQuota,
 		&node.BillingMode, &node.ResetDay, &node.CycleStartedAtMS, &node.PeriodRXBytes, &node.PeriodTXBytes,
 		&node.LifetimeRXBytes, &node.LifetimeTXBytes, &node.TrafficManualOffset, &node.lastRawRXBytes, &node.lastRawTXBytes, &node.lastBootID, &node.lastReportSessionID, &node.activeAgentSessionID, &node.agentSessionEpoch, &node.agentLeaseID,
 		&node.lastSequence, &node.InterfaceName, &node.AgentVersion, &node.DesiredConfigHash, &configDirty, &node.AppliedConfigHash, &node.AgentApplyError, &node.AgentApplyErrorAtMS, &node.AgentApplyFailures, &node.AgentListenerError, &node.EventSpoolError, &node.EventQueueDepth, &node.EventDropped,
 		&node.ConfigRevision, &node.DesiredConfigRevision, &node.AppliedConfigRevision,
 		&node.enrollmentTokenHash, &node.enrollmentExpiresMS, &node.probeSecretCiphertext,
-		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS)
+		&node.agentTokenHash, &node.CacheClearGeneration, &node.CacheClearAppliedGeneration, &node.EnrolledAtMS, &node.LastSeenAtMS, &node.CreatedAtMS, &node.UpdatedAtMS,
+		&node.uninstallRequestID, &node.UninstallRequestedAtMS, &node.deletionPending)
 	if err != nil {
 		return ControlNode{}, err
 	}
@@ -618,6 +623,8 @@ func scanControlNode(scanner rowScanner, now time.Time) (ControlNode, error) {
 	node.NetworkInterfaces = normalizeReportedNetworkInterfaces(node.NetworkInterfaces)
 	node.Enabled = enabled != 0
 	node.ConfigDirty = configDirty != 0
+	node.UninstallPending = node.uninstallRequestID != ""
+	node.DeletionPending = node.deletionPending
 	node.EnrollmentAvailable = node.enrollmentTokenHash != "" && now.UnixMilli() < node.enrollmentExpiresMS
 	if node.LastSeenAtMS > 0 && now.Sub(time.UnixMilli(node.LastSeenAtMS)) <= nodeOnlineWindow {
 		node.Status = "online"
@@ -657,6 +664,168 @@ func (d *DB) MigrateControlNodesToSinglePort(defaultPort int, now time.Time) err
 	return err
 }
 
+func newAgentUninstallRequestID() (string, error) {
+	value := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
+}
+
+// MarkNodeDeletionPending removes a node from scheduling before external DNS
+// cleanup starts. Keeping this phase separate from the uninstall request means
+// an Agent cannot remove itself while the Controller is still cleaning routes.
+func (d *DB) MarkNodeDeletionPending(id int64, now time.Time) (ControlNode, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return ControlNode{}, err
+	}
+	defer tx.Rollback()
+	_, err = scanControlNode(tx.QueryRow(controlNodeSelect+" WHERE id=?", id), now)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ControlNode{}, errNodeNotFound
+	}
+	if err != nil {
+		return ControlNode{}, err
+	}
+	result, err := tx.Exec(`UPDATE control_nodes SET enabled=0,deletion_pending=1,
+		config_revision=config_revision+CASE WHEN deletion_pending=0 OR enabled!=0 THEN 1 ELSE 0 END,
+		desired_config_hash=CASE WHEN deletion_pending=0 OR enabled!=0 THEN '' ELSE desired_config_hash END,
+		desired_config_revision=CASE WHEN deletion_pending=0 OR enabled!=0 THEN 0 ELSE desired_config_revision END,
+		config_dirty=CASE WHEN deletion_pending=0 OR enabled!=0 THEN 1 ELSE config_dirty END,updated_at_ms=? WHERE id=?`, now.UnixMilli(), id)
+	if err != nil {
+		return ControlNode{}, err
+	}
+	if changed, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return ControlNode{}, rowsErr
+	} else if changed != 1 {
+		return ControlNode{}, errNodeNotFound
+	}
+	if err := d.commitControllerNodeAdmission(tx); err != nil {
+		return ControlNode{}, err
+	}
+	return d.controlNodeByID(id, now)
+}
+
+// BeginNodeUninstall queues a remote uninstall only after local site/DNS
+// cleanup removed every schedule reference to the node. An unenrolled node has
+// no remote Agent to command and can be deleted immediately by the caller.
+func (d *DB) BeginNodeUninstall(id int64, now time.Time) (ControlNode, bool, error) {
+	node, err := d.MarkNodeDeletionPending(id, now)
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	defer tx.Rollback()
+	node, err = scanControlNode(tx.QueryRow(controlNodeSelect+" WHERE id=?", id), now)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ControlNode{}, false, errNodeNotFound
+		}
+		return ControlNode{}, false, err
+	}
+	if node.UninstallPending {
+		if err := tx.Commit(); err != nil {
+			return ControlNode{}, false, err
+		}
+		return node, true, nil
+	}
+	if !node.DeletionPending {
+		return ControlNode{}, false, errors.New("node deletion has not been prepared")
+	}
+	var hasSchedules int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM site_node_schedules WHERE fixed_node_id=? OR desired_node_id=? OR applied_node_id=?`, id, id, id).Scan(&hasSchedules); err != nil {
+		return ControlNode{}, false, err
+	}
+	if hasSchedules != 0 {
+		return ControlNode{}, false, errors.New("node still has site schedules; clean up its routes before uninstalling the Agent")
+	}
+	if node.agentTokenHash == "" {
+		if err := tx.Commit(); err != nil {
+			return ControlNode{}, false, err
+		}
+		return node, false, nil
+	}
+	requestID, err := newAgentUninstallRequestID()
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	result, err := tx.Exec(`UPDATE control_nodes SET uninstall_request_id=?,uninstall_requested_at_ms=?,
+		config_revision=config_revision+1,desired_config_hash='',desired_config_revision=0,config_dirty=1,updated_at_ms=?
+		WHERE id=? AND deletion_pending=1 AND uninstall_request_id=''`, requestID, now.UnixMilli(), now.UnixMilli(), id)
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return ControlNode{}, false, err
+	}
+	if changed == 0 {
+		return ControlNode{}, false, errors.New("node uninstall request changed concurrently")
+	}
+	if err := d.commitControllerNodeAdmission(tx); err != nil {
+		return ControlNode{}, false, err
+	}
+	node, err = d.controlNodeByID(id, now)
+	return node, true, err
+}
+
+// AcknowledgeNodeUninstall binds completion to the still-pending node token,
+// GUID, and one-shot request ID. The endpoint uses the standard Agent
+// authentication middleware; if the response is lost after deletion commits,
+// a retry receives 401, which the already-uninstalled helper treats as final.
+func (d *DB) AcknowledgeNodeUninstall(agentToken, nodeGUID, requestID string) error {
+	tokenHash := hashNodeToken(strings.TrimSpace(agentToken))
+	nodeGUID = strings.TrimSpace(nodeGUID)
+	requestID = strings.TrimSpace(requestID)
+	if tokenHash == hashNodeToken("") || !validTLSNodeGUID(nodeGUID) || len(requestID) != 32 {
+		return errInvalidAgentToken
+	}
+	if _, err := hex.DecodeString(requestID); err != nil {
+		return errInvalidAgentToken
+	}
+	var nodeID int64
+	var storedGUID, storedRequestID string
+	err := d.db.QueryRow(`SELECT id,guid,uninstall_request_id FROM control_nodes WHERE agent_token_hash=?`, tokenHash).Scan(&nodeID, &storedGUID, &storedRequestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errInvalidAgentToken
+	}
+	if err != nil {
+		return err
+	}
+	if storedGUID != nodeGUID || storedRequestID != requestID || storedRequestID == "" {
+		return errInvalidAgentToken
+	}
+	if err := d.DeleteControlNode(nodeID); errors.Is(err, errNodeNotFound) {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func (d *DB) ForceDeletePendingNode(id int64) error {
+	var deletionPending int
+	if err := d.db.QueryRow(`SELECT deletion_pending FROM control_nodes WHERE id=?`, id).Scan(&deletionPending); errors.Is(err, sql.ErrNoRows) {
+		return errNodeNotFound
+	} else if err != nil {
+		return err
+	}
+	if deletionPending == 0 {
+		return errors.New("node does not have a pending Agent uninstall")
+	}
+	var hasSchedules int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM site_node_schedules WHERE fixed_node_id=? OR desired_node_id=? OR applied_node_id=?`, id, id, id).Scan(&hasSchedules); err != nil {
+		return err
+	}
+	if hasSchedules != 0 {
+		return errors.New("node still has site schedules; clean up its routes before removing the node")
+	}
+	return d.DeleteControlNode(id)
+}
+
 func (d *DB) controlNodeByID(id int64, now time.Time) (ControlNode, error) {
 	node, err := scanControlNode(d.db.QueryRow(controlNodeSelect+" WHERE id=?", id), now)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -687,7 +856,7 @@ func (d *DB) listControlNodes(now time.Time) ([]ControlNode, error) {
 // an apply failure must not make the scheduler erase the desired node and
 // create a self-reinforcing "no eligible node" loop.
 func nodeAssignmentEligible(node ControlNode) bool {
-	return node.Enabled && node.Status == "online" && !node.Depleted &&
+	return node.Enabled && !node.DeletionPending && node.Status == "online" && !node.Depleted &&
 		strings.TrimSpace(node.AgentListenerError) == ""
 }
 
@@ -897,6 +1066,16 @@ func (d *DB) UpdateNodeScheduler(mode string, manualNodeID int64, now time.Time)
 		return NodeControlSnapshot{}, err
 	}
 	defer tx.Rollback()
+	if mode == "manual" {
+		var enabled, deletionPending int
+		if err := tx.QueryRow("SELECT enabled,deletion_pending FROM control_nodes WHERE id=?", manualNodeID).Scan(&enabled, &deletionPending); errors.Is(err, sql.ErrNoRows) {
+			return NodeControlSnapshot{}, errNodeNotFound
+		} else if err != nil {
+			return NodeControlSnapshot{}, err
+		} else if enabled == 0 || deletionPending != 0 {
+			return NodeControlSnapshot{}, errManualNodeUnavailable
+		}
+	}
 	if _, err := tx.Exec("UPDATE node_scheduler_settings SET mode=?,manual_node_id=?,updated_at_ms=? WHERE id=1", mode, nullableNodeID(manualNodeID), now.UnixMilli()); err != nil {
 		return NodeControlSnapshot{}, err
 	}
@@ -923,24 +1102,24 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 		return ControlNode{}, err
 	}
 	defer tx.Rollback()
-	var currentAddress, currentDNSPublish, currentListenInterface, currentAddressV4, currentAddressV6, currentReportedInterfaces string
+	var currentAddress, currentDNSPublish, currentAddressV4, currentAddressV6, uninstallRequestID string
+	var deletionPending int
 	var currentPort, currentResetDay, currentEnabled int
-	if err := tx.QueryRow("SELECT address,dns_publish,listen_interface,address_v4,address_v6,reported_interfaces,https_port,reset_day,enabled FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentListenInterface, &currentAddressV4, &currentAddressV6, &currentReportedInterfaces, &currentPort, &currentResetDay, &currentEnabled); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRow("SELECT address,dns_publish,address_v4,address_v6,https_port,reset_day,enabled,uninstall_request_id,deletion_pending FROM control_nodes WHERE id=?", id).Scan(&currentAddress, &currentDNSPublish, &currentAddressV4, &currentAddressV6, &currentPort, &currentResetDay, &currentEnabled, &uninstallRequestID, &deletionPending); errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, errNodeNotFound
 	} else if err != nil {
 		return ControlNode{}, err
 	}
+	if uninstallRequestID != "" || deletionPending != 0 {
+		return ControlNode{}, errors.New("node deletion is already pending")
+	}
 	portChanged := currentPort != input.Port
-	var currentInterfaces []NodeNetworkInterface
-	_ = json.Unmarshal([]byte(currentReportedInterfaces), &currentInterfaces)
-	currentListenerNode := ControlNode{Address: currentAddress, AddressV4: currentAddressV4, AddressV6: currentAddressV6,
-		DNSPublish: currentDNSPublish, ListenInterface: currentListenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(currentInterfaces)}
-	nextListenerNode := ControlNode{Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6,
-		DNSPublish: input.DNSPublish, ListenInterface: input.ListenInterface, NetworkInterfaces: currentListenerNode.NetworkInterfaces}
+	currentListenerNode := ControlNode{Address: currentAddress, AddressV4: currentAddressV4, AddressV6: currentAddressV6, DNSPublish: currentDNSPublish}
+	nextListenerNode := ControlNode{Address: input.Address, AddressV4: input.AddressV4, AddressV6: input.AddressV6, DNSPublish: input.DNSPublish}
 	currentListenFamily, currentListenErr := effectiveNodeListenFamily(currentListenerNode)
 	nextListenFamily, nextListenErr := effectiveNodeListenFamily(nextListenerNode)
 	listenerFamilyChanged := currentListenFamily != nextListenFamily || (currentListenErr == nil) != (nextListenErr == nil)
-	listenerChanged := portChanged || currentDNSPublish != input.DNSPublish || currentListenInterface != input.ListenInterface || listenerFamilyChanged
+	listenerChanged := portChanged || currentDNSPublish != input.DNSPublish || listenerFamilyChanged
 	enabledChanged := currentEnabled != sqliteBool(enabled)
 	// Saving from the panel always records the address as operator-confirmed, so
 	// an address that enrollment once inferred loses its "please verify" marker
@@ -948,12 +1127,12 @@ func (d *DB) UpdateControlNode(id int64, input NodeCreateInput, enabled bool, no
 	var result sql.Result
 	if currentResetDay != input.ResetDay {
 		cycleStart := nodeCycleStart(now, input.ResetDay, scheduleTimezone)
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,listen_interface=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,reset_day=?,traffic_manual_offset_bytes=?,
 			cycle_started_at_ms=?,period_rx_bytes=0,period_tx_bytes=0,updated_at_ms=? WHERE id=?`, input.Name, input.Address,
-			input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
+			input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.ResetDay, input.TrafficManualOffsetBytes, cycleStart, now.UnixMilli(), id)
 	} else {
-		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,listen_interface=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
-			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.ListenInterface, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
+		result, err = tx.Exec(`UPDATE control_nodes SET name=?,address=?,address_v4=?,address_v6=?,dns_publish=?,address_source='manual',address_v6_source='manual',entry_mode='direct',http_port=0,https_port=?,enabled=?,priority=?,traffic_quota=?,billing_mode=?,traffic_manual_offset_bytes=?,updated_at_ms=? WHERE id=?`,
+			input.Name, input.Address, input.AddressV4, input.AddressV6, input.DNSPublish, input.Port, sqliteBool(enabled), input.Priority, input.TrafficQuota, input.BillingMode, input.TrafficManualOffsetBytes, now.UnixMilli(), id)
 	}
 	if err != nil {
 		if isSQLiteUniqueConstraintError(err) {
@@ -1001,7 +1180,7 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 	if err != nil {
 		return ControlNode{}, "", err
 	}
-	result, err := d.db.Exec(`UPDATE control_nodes SET enrollment_token_hash=?,enrollment_expires_at_ms=?,updated_at_ms=? WHERE id=?`, hashNodeToken(token),
+	result, err := d.db.Exec(`UPDATE control_nodes SET enrollment_token_hash=?,enrollment_expires_at_ms=?,updated_at_ms=? WHERE id=? AND uninstall_request_id='' AND deletion_pending=0`, hashNodeToken(token),
 		now.Add(nodeEnrollmentLifetime).UnixMilli(), now.UnixMilli(), id)
 	if err != nil {
 		return ControlNode{}, "", err
@@ -1011,7 +1190,14 @@ func (d *DB) RefreshNodeEnrollment(id int64, now time.Time) (ControlNode, string
 		return ControlNode{}, "", err
 	}
 	if rows != 1 {
-		return ControlNode{}, "", errNodeNotFound
+		var exists int
+		if lookupErr := d.db.QueryRow(`SELECT COUNT(*) FROM control_nodes WHERE id=?`, id).Scan(&exists); lookupErr != nil {
+			return ControlNode{}, "", lookupErr
+		}
+		if exists == 0 {
+			return ControlNode{}, "", errNodeNotFound
+		}
+		return ControlNode{}, "", errors.New("node deletion is already pending")
 	}
 	node, err := d.controlNodeByID(id, now)
 	return node, token, err
@@ -1201,7 +1387,7 @@ func (d *DB) retryNodeTLSCleanupUnlocked(onlyGUID string) error {
 
 func (d *DB) AuthorizeEnrollmentToken(token string, now time.Time) error {
 	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>?`, hashNodeToken(token), now.UnixMilli()).Scan(&count)
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>? AND uninstall_request_id='' AND deletion_pending=0`, hashNodeToken(token), now.UnixMilli()).Scan(&count)
 	if err != nil {
 		return err
 	}
@@ -1360,7 +1546,7 @@ func (d *DB) EnrollControlNodeFromSource(token string, now time.Time, sourceIP s
 	}
 	defer tx.Rollback()
 	var id int64
-	err = tx.QueryRow(`SELECT id FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>?`, hashNodeToken(token), now.UnixMilli()).Scan(&id)
+	err = tx.QueryRow(`SELECT id FROM control_nodes WHERE enrollment_token_hash=? AND enrollment_expires_at_ms>? AND uninstall_request_id='' AND deletion_pending=0`, hashNodeToken(token), now.UnixMilli()).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ControlNode{}, "", errInvalidNodeToken
 	}
@@ -1934,12 +2120,12 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	var id, lastSequence, lastRX, lastTX int64
 	var previousApplyFailures int64
 	var cacheClearGeneration int64
-	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID, listenInterface, previousInterfacesJSON string
+	var lastBootID, lastSessionID, activeSessionID, desiredConfigHash, previousApplyError, previousAgentVersion, agentLeaseID, previousInterfacesJSON string
 	var legacyAddress, addressSource, nodeDNSPublish, nodeAddressV4, nodeAddressV6, nodeAddressV6Source string
 	var activeSessionEpoch int64
 	var configDirty, configRevision, desiredConfigRevision, appliedConfigRevision int64
-	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source,listen_interface,reported_interfaces,dns_publish,address_v4,address_v6,address_v6_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource, &listenInterface, &previousInterfacesJSON, &nodeDNSPublish, &nodeAddressV4, &nodeAddressV6, &nodeAddressV6Source)
+	err = tx.QueryRow(`SELECT id,last_sequence,last_raw_rx_bytes,last_raw_tx_bytes,last_boot_id,last_report_session_id,active_agent_session_id,agent_session_epoch,agent_lease_id,cache_clear_generation,desired_config_hash,config_dirty,agent_apply_error,agent_apply_failures,config_revision,desired_config_revision,applied_config_revision,agent_version,address,address_source,reported_interfaces,dns_publish,address_v4,address_v6,address_v6_source FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &lastSequence, &lastRX, &lastTX, &lastBootID, &lastSessionID, &activeSessionID, &activeSessionEpoch, &agentLeaseID, &cacheClearGeneration, &desiredConfigHash, &configDirty, &previousApplyError, &previousApplyFailures, &configRevision, &desiredConfigRevision, &appliedConfigRevision, &previousAgentVersion, &legacyAddress, &addressSource, &previousInterfacesJSON, &nodeDNSPublish, &nodeAddressV4, &nodeAddressV6, &nodeAddressV6Source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nodeReportCommitResult{}, errInvalidAgentToken
 	}
@@ -2069,20 +2255,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	}
 	addressesJSON, _ := json.Marshal(normalizeReportedNodeNetAddresses(report.NetAddresses))
 	reportedInterfaces := normalizeReportedNetworkInterfaces(report.NetworkInterfaces)
-	listenerBindingSupported := agentSupportsListenerBinding(report.AgentVersion)
-	if !listenerBindingSupported {
+	if !agentSupportsNetworkInterfaceInventory(report.AgentVersion) {
 		// Older Agents do not send interface inventory. Preserve a previously
 		// collected list during a rolling upgrade instead of erasing it.
 		_ = json.Unmarshal([]byte(previousInterfacesJSON), &reportedInterfaces)
 		reportedInterfaces = normalizeReportedNetworkInterfaces(reportedInterfaces)
-	}
-	listenerInterfaceChanged := false
-	if listenInterface != "" && listenerBindingSupported {
-		var previousInterfaces []NodeNetworkInterface
-		_ = json.Unmarshal([]byte(previousInterfacesJSON), &previousInterfaces)
-		oldInterface, oldFound := nodeNetworkInterfaceByName(ControlNode{NetworkInterfaces: previousInterfaces}, listenInterface)
-		newInterface, newFound := nodeNetworkInterfaceByName(ControlNode{NetworkInterfaces: reportedInterfaces}, listenInterface)
-		listenerInterfaceChanged = oldFound != newFound || oldInterface != newInterface
 	}
 	interfacesJSON, _ := json.Marshal(reportedInterfaces)
 	if _, err = tx.Exec(`UPDATE control_nodes SET period_rx_bytes=period_rx_bytes+?,period_tx_bytes=period_tx_bytes+?,
@@ -2220,10 +2397,7 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 			return nodeReportCommitResult{}, err
 		}
 	}
-	oldInterfaces := []NodeNetworkInterface(nil)
-	_ = json.Unmarshal([]byte(previousInterfacesJSON), &oldInterfaces)
-	oldListenerNode := ControlNode{Address: legacyAddress, AddressV4: nodeAddressV4, AddressV6: nodeAddressV6,
-		DNSPublish: nodeDNSPublish, ListenInterface: listenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(oldInterfaces)}
+	oldListenerNode := ControlNode{Address: legacyAddress, AddressV4: nodeAddressV4, AddressV6: nodeAddressV6, DNSPublish: nodeDNSPublish}
 	newAddressV4, newAddressV6 := nodeAddressV4, nodeAddressV6
 	if newAddressV4 == "" || replaceObservedV4 {
 		newAddressV4 = hintedV4
@@ -2231,12 +2405,11 @@ func (d *DB) recordNodeReportCommit(agentToken string, report NodeReport, now ti
 	if newAddressV6 == "" || replaceObservedV6 {
 		newAddressV6 = hintedV6
 	}
-	newListenerNode := ControlNode{Address: legacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6,
-		DNSPublish: nodeDNSPublish, ListenInterface: listenInterface, NetworkInterfaces: reportedInterfaces}
+	newListenerNode := ControlNode{Address: legacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6, DNSPublish: nodeDNSPublish}
 	oldFamily, oldFamilyErr := effectiveNodeListenFamily(oldListenerNode)
 	newFamily, newFamilyErr := effectiveNodeListenFamily(newListenerNode)
 	listenerFamilyChanged := oldFamily != newFamily || (oldFamilyErr == nil) != (newFamilyErr == nil)
-	if listenerInterfaceChanged || listenerFamilyChanged {
+	if listenerFamilyChanged {
 		if _, err := tx.Exec(`UPDATE site_node_schedules SET config_hash='',config_pending_since_ms=CASE WHEN enabled=1 THEN ? ELSE 0 END,
 			schedule_revision=schedule_revision+1,updated_at_ms=? WHERE desired_node_id=?`, now.UnixMilli(), now.UnixMilli(), id); err != nil {
 			return nodeReportCommitResult{}, err
@@ -2517,18 +2690,15 @@ func (d *DB) RecordNodeObservedAddress(agentToken, family, sourceIP string, now 
 
 	var id int64
 	var legacyAddress, addressSource, addressV4, addressV6, addressV6Source string
-	var dnsPublish, listenInterface, reportedInterfaces string
-	if err := tx.QueryRow(`SELECT id,address,address_source,address_v4,address_v6,address_v6_source,dns_publish,listen_interface,reported_interfaces FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
-		&id, &legacyAddress, &addressSource, &addressV4, &addressV6, &addressV6Source, &dnsPublish, &listenInterface, &reportedInterfaces); errors.Is(err, sql.ErrNoRows) {
+	var dnsPublish string
+	if err := tx.QueryRow(`SELECT id,address,address_source,address_v4,address_v6,address_v6_source,dns_publish FROM control_nodes WHERE agent_token_hash=?`, hashNodeToken(agentToken)).Scan(
+		&id, &legacyAddress, &addressSource, &addressV4, &addressV6, &addressV6Source, &dnsPublish); errors.Is(err, sql.ErrNoRows) {
 		return "", errInvalidAgentToken
 	} else if err != nil {
 		return "", err
 	}
 
-	oldInterfaces := []NodeNetworkInterface(nil)
-	_ = json.Unmarshal([]byte(reportedInterfaces), &oldInterfaces)
-	oldNode := ControlNode{Address: legacyAddress, AddressV4: addressV4, AddressV6: addressV6,
-		DNSPublish: dnsPublish, ListenInterface: listenInterface, NetworkInterfaces: normalizeReportedNetworkInterfaces(oldInterfaces)}
+	oldNode := ControlNode{Address: legacyAddress, AddressV4: addressV4, AddressV6: addressV6, DNSPublish: dnsPublish}
 
 	legacyV4, legacyV6 := publicNodeAddressFamilies(legacyAddress)
 	manualLegacyV4 := nodeLegacyAddressProtectsFamily(legacyAddress, addressSource, addressV6Source, "v4")
@@ -2581,8 +2751,7 @@ func (d *DB) RecordNodeObservedAddress(agentToken, family, sourceIP string, now 
 		newLegacyAddress, newLegacySource, newAddressV4, newAddressV6, newAddressV6Source, now.UnixMilli(), id); err != nil {
 		return "", err
 	}
-	newNode := ControlNode{Address: newLegacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6,
-		DNSPublish: dnsPublish, ListenInterface: listenInterface, NetworkInterfaces: oldNode.NetworkInterfaces}
+	newNode := ControlNode{Address: newLegacyAddress, AddressV4: newAddressV4, AddressV6: newAddressV6, DNSPublish: dnsPublish}
 	oldFamily, oldFamilyErr := effectiveNodeListenFamily(oldNode)
 	newFamily, newFamilyErr := effectiveNodeListenFamily(newNode)
 	listenerFamilyChanged := oldFamily != newFamily || (oldFamilyErr == nil) != (newFamilyErr == nil)

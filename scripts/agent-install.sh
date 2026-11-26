@@ -48,6 +48,21 @@ case "$(uname -s):$(uname -m)" in
   *) echo 'This Agent installer supports Linux amd64 and arm64 only.' >&2; exit 1 ;;
 esac
 
+# Do not let a re-install race the detached uninstall recovery process. The
+# state marker is written before the helper is launched; the init files remain
+# until after the Controller ACK and final local cleanup have completed.
+if [ -e "$state_file.uninstalling" ] || [ -e "$state_file.uninstall.json" ]; then
+  echo 'A Meridian Agent uninstall is still pending; wait for it to finish before installing again.' >&2
+  exit 1
+fi
+for recovery_marker in /etc/systemd/system/meridian-agent-uninstall-*.service \
+                      /etc/init.d/meridian-agent-uninstall-* \
+                      /etc/meridian-agent-uninstall-*.done; do
+  [ -e "$recovery_marker" ] || continue
+  echo 'A Meridian Agent uninstall recovery service is still running; wait for it to finish before installing again.' >&2
+  exit 1
+done
+
 command -v curl >/dev/null 2>&1 || { echo 'curl is required.' >&2; exit 1; }
 command -v mktemp >/dev/null 2>&1 || { echo 'mktemp is required.' >&2; exit 1; }
 
