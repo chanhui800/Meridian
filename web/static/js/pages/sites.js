@@ -279,6 +279,35 @@ function stopSitesRefresh() {
   if (typeof siteSortingCleanup === 'function') siteSortingCleanup();
 }
 
+function captureSitesViewport(grid) {
+  if (typeof window.scrollTo !== 'function') return null;
+  const viewport = { left: window.scrollX || 0, top: window.scrollY || 0, anchors: [] };
+  if (!viewport.top) return viewport;
+  for (const card of grid.querySelectorAll('.site-card[data-site-id]')) {
+    if (card.hidden || typeof card.getBoundingClientRect !== 'function') continue;
+    const rect = card.getBoundingClientRect();
+    if (rect.bottom <= 72) continue;
+    if (rect.top >= window.innerHeight) break;
+    viewport.anchors.push({ id: card.dataset.siteId, top: rect.top });
+    if (viewport.anchors.length === 2) break;
+  }
+  return viewport;
+}
+
+function restoreSitesViewport(grid, viewport) {
+  if (!viewport) return;
+  let top = viewport.top;
+  for (const anchor of viewport.anchors) {
+    const card = grid.querySelector(`.site-card[data-site-id="${Number(anchor.id)}"]`);
+    if (!card || card.hidden) continue;
+    top = (window.scrollY || 0) + card.getBoundingClientRect().top - anchor.top;
+    break;
+  }
+  if (window.scrollX !== viewport.left || window.scrollY !== top) {
+    window.scrollTo({ left: viewport.left, top, behavior: 'instant' });
+  }
+}
+
 async function loadSites() {
   const page = document.getElementById('page-sites');
   const options = arguments[0] || {};
@@ -316,57 +345,62 @@ async function loadSites() {
     for (const id of siteManagementLatency.keys()) if (!knownSiteIDs.has(id)) siteManagementLatency.delete(id);
     const renderSignature = siteCardsRenderSignature(sites, activeSiteIDs);
     if (renderSignature === String(grid.dataset.siteRenderSignature || '')) return;
-    if (!sites || sites.length === 0) {
-      grid.innerHTML = '<div class="console-empty">还没有站点，添加一个访问入口开始使用。</div>';
+    const viewport = captureSitesViewport(grid);
+    try {
+      if (!sites || sites.length === 0) {
+        grid.innerHTML = '<div class="console-empty">还没有站点，添加一个访问入口开始使用。</div>';
+        grid.dataset.siteRenderSignature = renderSignature;
+        return;
+      }
+
+      const focused = document.activeElement;
+      const focusedCard = focused?.closest?.('.site-card');
+      const focusedSiteID = Number(focusedCard?.dataset?.siteId || 0);
+      const focusSelector = focused?.dataset?.siteAction ? `[data-site-action="${focused.dataset.siteAction}"]`
+        : focused?.dataset?.siteIconId ? '[data-site-icon-id]'
+        : focused?.matches?.('[data-site-drag-handle]') ? '[data-site-drag-handle]'
+        : focused?.matches?.('[data-site-row-toggle]') ? '[data-site-row-toggle]' : '';
+      grid.innerHTML = sites.map(site => siteManagementRowHTML(site, activeSiteIDs)).join('');
       grid.dataset.siteRenderSignature = renderSignature;
-      return;
-    }
+      bindSiteIconFallbacks(grid);
+      grid.querySelectorAll('.site-card').forEach(bindSiteRowDisclosure);
 
-    const focused = document.activeElement;
-    const focusedCard = focused?.closest?.('.site-card');
-    const focusedSiteID = Number(focusedCard?.dataset?.siteId || 0);
-    const focusSelector = focused?.dataset?.siteAction ? `[data-site-action="${focused.dataset.siteAction}"]`
-      : focused?.dataset?.siteIconId ? '[data-site-icon-id]'
-      : focused?.matches?.('[data-site-drag-handle]') ? '[data-site-drag-handle]'
-      : focused?.matches?.('[data-site-row-toggle]') ? '[data-site-row-toggle]' : '';
-	grid.innerHTML = sites.map(site => siteManagementRowHTML(site, activeSiteIDs)).join('');
-    grid.dataset.siteRenderSignature = renderSignature;
-    bindSiteIconFallbacks(grid);
-    grid.querySelectorAll('.site-card').forEach(bindSiteRowDisclosure);
-
-    const sitesById = new Map(sites.map(site => [site.id, site]));
-    grid.querySelectorAll('.site-icon-button[data-site-icon-id]').forEach(button => {
-      button.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
-        const site = sitesById.get(Number(button.dataset.siteIconId));
-        if (site) void showSiteIconManager(site);
+      const sitesById = new Map(sites.map(site => [site.id, site]));
+      grid.querySelectorAll('.site-icon-button[data-site-icon-id]').forEach(button => {
+        button.addEventListener('click', event => {
+          event.preventDefault();
+          event.stopPropagation();
+          const site = sitesById.get(Number(button.dataset.siteIconId));
+          if (site) void showSiteIconManager(site);
+        });
       });
-    });
-    grid.querySelectorAll('[data-site-action]').forEach(button => {
-      button.addEventListener('click', event => {
-        // Replacing an action's SVG detaches event.target before the card's
-        // disclosure listener can recognize that the click came from a button.
-        event.preventDefault();
-        event.stopPropagation();
-        const id = Number(button.dataset.siteId);
-        const site = sitesById.get(id);
-        if (!site) return;
-		if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
-		if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
-		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
-		if (button.dataset.siteAction === 'live') showSiteLiveDetails(site, button);
-		if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
-        if (button.dataset.siteAction === 'edit') showSiteModal(site);
-        if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
+      grid.querySelectorAll('[data-site-action]').forEach(button => {
+        button.addEventListener('click', event => {
+          // Replacing an action's SVG detaches event.target before the card's
+          // disclosure listener can recognize that the click came from a button.
+          event.preventDefault();
+          event.stopPropagation();
+          const id = Number(button.dataset.siteId);
+          const site = sitesById.get(id);
+          if (!site) return;
+          if (button.dataset.siteAction === 'latency') testSiteLatency(id, button);
+          if (button.dataset.siteAction === 'access') toggleSiteAccessAddress(button);
+          if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
+          if (button.dataset.siteAction === 'live') showSiteLiveDetails(site, button);
+          if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
+          if (button.dataset.siteAction === 'edit') showSiteModal(site);
+          if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
+        });
       });
-    });
-    setupSiteSorting(grid);
-    if (focusedSiteID && focusSelector) {
-      grid.querySelector?.(`.site-card[data-site-id="${focusedSiteID}"]`)?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
+      setupSiteSorting(grid);
+      if (focusedSiteID && focusSelector) {
+        grid.querySelector?.(`.site-card[data-site-id="${focusedSiteID}"]`)?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
+      }
+      const currentSearch = document.getElementById('sites-search');
+      filterSiteCards(String(currentSearch?.value || preservedSearch));
+    } finally {
+      restoreSitesViewport(grid, viewport);
     }
-    const currentSearch = document.getElementById('sites-search');
-    filterSiteCards(String(currentSearch?.value || preservedSearch));
   } catch (e) {
     if (generation !== siteLoadGeneration || Router.current !== 'sites' || !page.isConnected) return;
     const loadState = document.getElementById('sites-load-state');

@@ -8,6 +8,8 @@ const vm = require('node:vm');
 
 function siteActionsHarness() {
   const elements = new Map(), calls = [], copied = [];
+  let scrollY = 0;
+  const maxScrollY = () => Math.max(0, grid.children.filter(card => !card.hidden).length * 100 + 300 - 600);
   const decode = value => String(value || '').replaceAll('&quot;', '"').replaceAll('&amp;', '&');
   const attributes = text => Object.fromEntries([...text.matchAll(/([\w-]+)(?:="([^"]*)")?/g)]
     .map(([, name, value]) => [name, value === undefined ? '' : decode(value)]));
@@ -54,6 +56,11 @@ function siteActionsHarness() {
         return this.children.flatMap(child => [...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector)]);
       },
       querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+      getBoundingClientRect() {
+        const visible = grid.children.filter(card => !card.hidden);
+        const top = 300 + visible.indexOf(this) * 100 - scrollY;
+        return { top, bottom: top + (this.hidden ? 0 : 100) };
+      },
       click() {
         // DOM dispatch fixes the propagation path before listeners run. Replacing
         // the eye SVG detaches the target but does not change that event path.
@@ -111,21 +118,27 @@ function siteActionsHarness() {
         button.innerHTML = buttonContents;
       }
     }
+    scrollY = Math.min(scrollY, maxScrollY());
   };
   Object.defineProperty(grid, 'innerHTML', { set: renderRows });
   for (const id of ['page-sites', 'sites-search', 'sites-count', 'sites-load-state']) element('div', { id });
   const site = { id: 3, name: '测试站点', upstream_mode: 'fixed', ingress_mode: 'port', listen_port: 8096,
     target_url: 'http://origin.example.test:8096', ua_mode: 'passthrough', enabled: true, running: true };
+  let sites = [site];
   const sandbox = {
     URL, console, Router: { current: 'sites' }, esc: value => String(value ?? ''),
-    window: { getSelection: () => '', setTimeout: () => 1, clearTimeout() {} },
+    window: {
+      getSelection: () => '', setTimeout: () => 1, clearTimeout() {},
+      scrollX: 0, get scrollY() { return scrollY; }, innerHeight: 600,
+      scrollTo({ top }) { scrollY = Math.max(0, Math.min(top, maxScrollY())); },
+    },
     document: { getElementById: id => elements.get(id) || null },
     navigator: { clipboard: { async writeText(value) { copied.push(value); } } },
     formatBytes: value => `${value} B`, uaNameMap: { passthrough: '透传' },
     API: {
       async ingressCapabilities() { return { panel_tls_enabled: false }; },
       async getActiveWatchHistory() { return { items: [{ id: 'active-session', site_id: 3 }] }; },
-      async listSites() { return [{ ...site }]; },
+      async listSites() { return sites.map(site => ({ ...site })); },
     },
     Toast: { success() {}, error(message) { throw new Error(message); } },
   };
@@ -139,6 +152,8 @@ function siteActionsHarness() {
     sandbox[name] = (...args) => { calls.push({ action, id: typeof args[0] === 'object' ? args[0].id : args[0] }); };
   }
   return { sandbox, calls, copied, elements, grid,
+    site, setSites(values) { sites = values; },
+    scrollTo(top) { sandbox.window.scrollTo({ top }); }, scrollTop: () => scrollY,
     button: action => grid.querySelector(`[data-site-action="${action}"]`),
     trigger: () => grid.querySelector('[data-site-row-toggle]'),
     details: () => elements.get('site-details-3'),
@@ -182,4 +197,55 @@ test('site action bindings survive unchanged refreshes and preserve disclosure a
   assert.equal(h.details().hidden, false, 'drag-handle clicks must not toggle disclosure');
   h.grid.querySelector('.site-card').click();
   assert.equal(h.details().hidden, true, 'a noninteractive row area still toggles disclosure');
+});
+
+for (const removed of ['above', 'first-visible']) {
+  test(`refresh keeps the visible site in place after deleting a site ${removed}`, async () => {
+    const h = siteActionsHarness();
+    const sites = Array.from({ length: 30 }, (_, index) => ({ ...h.site, id: index + 1 }));
+    h.setSites(sites);
+    await h.sandbox.loadSites();
+    h.scrollTo(1250);
+    const anchorID = removed === 'above' ? 11 : 12;
+    const anchor = () => h.grid.querySelector(`.site-card[data-site-id="${anchorID}"]`);
+    const top = anchor().getBoundingClientRect().top;
+    h.setSites(sites.filter(site => site.id !== (removed === 'above' ? 1 : 11)));
+    await h.sandbox.loadSites({ background: true });
+    assert.equal(anchor().getBoundingClientRect().top, top);
+    assert.equal(h.scrollTop(), 1150);
+  });
+}
+
+test('a delayed site refresh preserves scrolling performed while the request was pending', async () => {
+  const h = siteActionsHarness();
+  const sites = Array.from({ length: 30 }, (_, index) => ({ ...h.site, id: index + 1 }));
+  h.setSites(sites);
+  await h.sandbox.loadSites();
+  h.scrollTo(1250);
+  let finishRead, started;
+  const reading = new Promise(resolve => { started = resolve; });
+  h.sandbox.API.listSites = () => new Promise(resolve => { finishRead = resolve; started(); });
+  const refresh = h.sandbox.loadSites({ background: true });
+  await reading;
+  h.scrollTo(1800);
+  finishRead(sites.map(site => ({ ...site, traffic_used: 100 })));
+  await refresh;
+  assert.equal(h.scrollTop(), 1800);
+  assert.equal(h.grid.querySelector('.site-card[data-site-id="20"]').getBoundingClientRect().top, 400);
+});
+
+test('deleting the last site clamps to the new bottom and deleting all sites leaves a usable empty page', async () => {
+  const h = siteActionsHarness();
+  const sites = Array.from({ length: 10 }, (_, index) => ({ ...h.site, id: index + 1 }));
+  h.setSites(sites);
+  await h.sandbox.loadSites();
+  h.scrollTo(10000);
+  assert.equal(h.scrollTop(), 700);
+  h.setSites(sites.slice(0, -1));
+  await h.sandbox.loadSites();
+  assert.equal(h.scrollTop(), 600);
+  h.setSites([]);
+  await h.sandbox.loadSites();
+  assert.equal(h.scrollTop(), 0);
+  assert.equal(h.grid.children.length, 0);
 });
