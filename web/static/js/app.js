@@ -143,7 +143,7 @@ function invalidateModalIntent(owner) {
     overlay.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('modal-open');
     if (options?.restoreFocus !== false && modalPreviousFocus && modalPreviousFocus.isConnected) {
-      modalPreviousFocus.focus();
+      modalPreviousFocus.focus({ preventScroll: true });
     } else if (overlay.contains(document.activeElement)) {
       document.activeElement?.blur();
     }

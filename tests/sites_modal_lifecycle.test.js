@@ -14,6 +14,7 @@ function deferred() {
 
 function modalHarness() {
   const elements = new Map(), frames = [], errors = [], infos = [], focuses = [];
+  let scrollY = 0;
   let document;
   const decode = value => String(value || '').replaceAll('&amp;', '&').replaceAll('&quot;', '"').replaceAll('&#39;', "'");
   const attributes = text => Object.fromEntries([...text.matchAll(/([\w-]+)(?:="([^"]*)")?/g)]
@@ -42,7 +43,10 @@ function modalHarness() {
       getClientRects() { return this.isConnected ? [{}] : []; },
       matches() { return ['INPUT', 'SELECT', 'TEXTAREA'].includes(this.tagName) && this.type !== 'hidden'; },
       contains(other) { for (; other; other = other.parentElement) if (other === this) return true; return false; },
-      focus() { document.activeElement = this; focuses.push(this); },
+      focus(options) {
+        document.activeElement = this; focuses.push(this);
+        if (!options?.preventScroll && Number.isFinite(this.fixtureTop)) scrollY = this.fixtureTop;
+      },
       blur() { if (document.activeElement === this) document.activeElement = document.body; },
       querySelectorAll(selector) {
         if (selector.includes('input,') || selector.includes('button,')) {
@@ -100,7 +104,8 @@ function modalHarness() {
     document, console, URL, location: { hash: '#sites', origin: 'https://controller.example.test:9090', port: '9090' },
     getComputedStyle() { return { visibility: 'visible' }; },
     confirm() { return true; },
-    matchMedia() { return { matches: false }; }, addEventListener() {}, scrollTo() {},
+    matchMedia() { return { matches: false }; }, addEventListener() {},
+    scrollTo({ top }) { scrollY = top; }, get scrollY() { return scrollY; },
     clearTimeout() {}, clearInterval() {}, setTimeout() { return 1; },
     requestAnimationFrame(callback) { frames.push(callback); },
     API: {
@@ -576,4 +581,19 @@ test('a late site delete failure cannot interrupt a newer site draft', async () 
   assert.equal(h.element('m-name'), name);
   assert.equal(h.document.activeElement, name);
   assert.deepEqual(h.errors, []);
+});
+
+test('deleting a site restores focus without scrolling to an earlier offscreen control', async () => {
+  const h = modalHarness();
+  const search = h.element('sites-search');
+  search.fixtureTop = 0;
+  search.focus();
+  h.sandbox.scrollTo({ top: 1600 });
+  h.sandbox.API.deleteSite = async () => ({ status: 'deleted' });
+  h.sandbox.deleteSiteAction(1, 'First site');
+  h.frames.shift()();
+  await h.element('delete-confirm').click();
+  assert.equal(h.document.activeElement, search);
+  assert.equal(h.sandbox.scrollY, 1600);
+  assert.equal(h.element('modal-overlay').classList.contains('active'), false);
 });

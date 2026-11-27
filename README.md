@@ -336,7 +336,7 @@ v1.11.12 Agent 的监听范围跟随 DNS 发布策略，所有调度站点共用
 
 正式版本、校验文件和变更说明见 [GitHub Releases](https://github.com/chanhui800/Meridian/releases)。固定版本镜像格式为 `ghcr.io/chanhui800/meridian:<版本号>`，`latest` 只指向最新成功的正式 Release。
 
-v1.11.13 增加节点删除后自动卸载 Agent，阻止删除与站点迁移并发时清理错误路由，并为 WebSocket 上游握手响应头增加 10 MiB 上限。固定镜像为 `ghcr.io/chanhui800/meridian:v1.11.13`。此前 v1.11.12 的 Agent 公网发现、DNS 与监听地址族、Cloudflare 记录恢复、月度请求与周期流量展示，以及通用反代跨回源播放凭据修复仍然适用。
+v1.11.14 修复站点列表刷新或删除后页面跳回顶部的问题，并保留关闭确认弹窗时的当前滚动位置。固定镜像为 `ghcr.io/chanhui800/meridian:v1.11.14`。此前 v1.11.13 加入节点删除后自动卸载 Agent、删除与站点迁移并发保护，以及 WebSocket 上游握手响应头限制；v1.11.12 的 Agent 公网发现、DNS 与监听地址族、Cloudflare 记录恢复、月度请求与周期流量展示，以及通用反代跨回源播放凭据修复仍然适用。
 
 升级前保存数据库及需要的 TLS 备份。从正式版 v1.11.12 的 schema 61 升级到 v1.11.13 时，数据库自动迁移至 schema 63；旧版二进制不能直接打开已升级的数据库。回退到 v1.11.12 时，先停止服务，再恢复升级前的 schema 61 数据库及配套 TLS 状态；不要只替换旧版程序。更早版本需恢复该版本支持的备份。Agent 删除和重新注册的行为见 [v1.11.13 发布说明](docs/releases/v1.11.13.md) 和上方 [Agent 节点](#agent-节点)。
 
